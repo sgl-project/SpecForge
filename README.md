@@ -59,7 +59,9 @@ python3 tools/filter_data.py  --dataset-name Magpie-Align/Magpie-Llama-3.1-Pro-3
 
 ### 3.1 Download model from HF
 
+```bash
 tune download meta-llama/Llama-4-Scout-17B-16E-Instruct --hf-token xxx
+```
 
 ### 3.2 Training from scratch
 
