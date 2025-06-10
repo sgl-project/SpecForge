@@ -15,15 +15,16 @@ We use hacked torchtune for training. need install torchtune.
 
 # Training Eagle3
 
-## 0. Install env
-
-- SGLang
-
-- torchtune
+## Installation
 
 ```bash
+# Clone and install locally
+git clone <https://github.com/sgl-project/sgl-spec.git>
+cd sgl-spec
 pip install .
 ```
+
+Note: This will automatically install SGLang and TorchTune with all dependencies.
 
 ## 1. Training Data Fetch
 
