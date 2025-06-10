@@ -21,6 +21,8 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=[
+        "sglang[all]>=0.4.6.post5",  # SGLang serving framework
+        "torchtune>=0.6.1",    # TorchTune training framework
     ],
     extras_require={
         "dev": [
