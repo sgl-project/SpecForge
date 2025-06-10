@@ -13,7 +13,8 @@ from torch import nn
 from torchtune.models.clip._component_builders import (
     clip_vision_encoder,
 )
-from torchtune.models.llama4._chunked_attention import get_chunked_attention_mask
+# from torchtune.models.llama4._chunked_attention import get_chunked_attention_mask
+from spec.models.llama4._eagle_attention import create_ttt_mask
 
 from torchtune.models.llama4._encoder import (
     Llama4VisionEncoder,
@@ -81,7 +82,7 @@ def llama4_draft_decoder(
         mask_mod = None
         if skip_rope_interval is not None and (i + 1) % skip_rope_interval != 0:
             mask_mod = partial(
-                get_chunked_attention_mask, chunk_size=attention_chunk_size
+                create_ttt_mask, chunk_size=attention_chunk_size
             )
             # Note: this is the value in llama-models, which doesn't match the config
             pos_embeddings = rope
@@ -165,7 +166,8 @@ class EAGLE3DraftModel(nn.Module):
         # 1. fusion low mid high hidden size
         self.feature_fusion = nn.Linear(
             self.num_feature_layers * self.embed_dim,
-            self.embed_dim
+            self.embed_dim,
+            bias=False
         )
 
         # 2. input norm

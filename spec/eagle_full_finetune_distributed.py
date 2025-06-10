@@ -54,6 +54,8 @@ from torchtune.training.quantization import (
 from tqdm import tqdm
 
 
+from spec.utils import padding
+
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
     Full finetuning recipe for dense transformer-based LLMs such as Llama2. This recipe supports
@@ -136,6 +138,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def __init__(self, cfg: DictConfig) -> None:
         device_type = cfg.device
+        
+        self.ttt_step = 7
+        
         self._device = utils.get_device(device=device_type)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
 
@@ -830,28 +835,79 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         with self.activations_handling_ctx:
             outputs = self._model(**batch)
 
-        output_draft, output_backbone = outputs
+        output, output_backbone = outputs
 
-        # post process for third party loss functions
-        if not isinstance(self._loss_fn, SFTLoss):
-            labels = labels.reshape(-1)
-            output_draft = output_draft.reshape(-1, output_draft.size(-1))
-            output_backbone = output_backbone.reshape(
-                -1, output_backbone.size(-1)
+        # ttt logic here, draft model need kv cache for
+        # multi step inference/training
+        
+        # 0. prepare loss list for ttt training
+        plosses = []
+        ploss_weight = [0.8 ** i for i in range(self.ttt_step)]
+        
+        # 1. padding here, make input shift right
+        output_backbone = padding(output_backbone, left=False)
+        ttt_tokens = padding(batch["tokens"], left=False)
+        
+        # 2. flush cache if cache are not empty
+        # We need a new fresh cache for each step
+        if self._model.draft_decoder.cache_are_setup():
+            self._model.draft_decoder.reset_cache()
+        
+        draft_mask = mask
+        
+        for i in range (self.ttt_step):
+            # 2. make kvcache for draft model
+            self._model.draft_decoder.setup_caches(
+                batch_size=ttt_tokens.shape[0],
+                dtype=torch.bfloat16,
+                decoder_max_seq_len=2048*self.ttt_step
             )
-            if isinstance(output_draft, DTensor):
-                output_draft = output_draft.full_tensor()
-            if isinstance(output_backbone, DTensor):
-                output_backbone = output_backbone.full_tensor()
+            # 3. embedding token for each ttt step
+            with torch.no_grad():
+                # We dont want to training the embedding
+                ttt_embedding = self._model._decoder_embed(ttt_tokens)
+            
+            output_draft = self._model.draft(
+                tokens=None,
+                mask=draft_mask,
+                # seems dont need update freq for ttt
+                input_pos=batch["input_pos"],
+                input_embeds=ttt_embedding,
+                input_hidden=output
+            )
 
-        # Compute loss with mask
-        # DraftLoss will handle the mask internally based on labels != ignore_index
-        loss = self._loss_fn(output_backbone, output_draft, labels, mask=mask)
+            # 4. calculate loss for each ttt step (total is 7)
+            if not isinstance(self._loss_fn, SFTLoss):
+                labels = labels.reshape(-1)
+                output_draft = output_draft.reshape(-1, output_draft.size(-1))
+                output_backbone = output_backbone.reshape(
+                    -1, output_backbone.size(-1)
+                )
+                if isinstance(output_draft, DTensor):
+                    output_draft = output_draft.full_tensor()
+                if isinstance(output_backbone, DTensor):
+                    output_backbone = output_backbone.full_tensor()
+
+            # Compute loss with mask
+            # DraftLoss will handle the mask internally based on labels != ignore_index
+            # In torchtune place, mask equals loss_mask
+            loss = self._loss_fn(output_backbone, output_draft, labels, mask=draft_mask)
+
+            # 5. Append loss to plosses
+            plosses.append(loss)
+            
+            # 6. shift backbone(label) and draft_mask for next ttt step
+            if i != self.ttt_step - 1:
+                output_backbone = padding(output_backbone, left=False)
+                draft_mask = padding(draft_mask, left=False)
+            
+        # 6. Scored plosses
+        final_loss = sum(w * loss for w, loss in zip(ploss_weight, plosses))
 
         # free logits otherwise it peaks backward memory
         del outputs
 
-        return loss
+        return final_loss
 
     def validate(self) -> dict[str, float]:
         """
