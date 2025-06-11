@@ -76,23 +76,11 @@ tune run --nproc_per_node 8 spec/eagle_full_finetune_distributed.py --config spe
 
 ```bash
 # this is for node 1
-tune run --nproc-per-node 8 \
-         --nnodes 2 \
-         --node-rank 0 \
-         --master-addr "xx.xx.xx.xx" \
-         --master-port 10999 \
-         spec/eagle_full_finetune_distributed.py \
-         --config spec/configs/llama4/scout_17B_16E_eagle.yaml
+tune run --nproc-per-node 8 --nnodes 2 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "xx.xx.xx.xx:29500" spec/eagle_full_finetune_distributed.py --config spec/configs/llama4/scout_17B_16E_eagle.yaml > log 2>&1
 
 # use node1 master-addr
 # this is for node 2
-tune run --nproc-per-node 8 \
-         --nnodes 2 \
-         --node-rank 1 \
-         --master-addr "xx.xx.xx.xx" \
-         --master-port 10999 \
-         spec/eagle_full_finetune_distributed.py \
-         --config spec/configs/llama4/scout_17B_16E_eagle.yaml
+tune run --nproc-per-node 8 --nnodes 2 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "xx.xx.xx.xx:29500" spec/eagle_full_finetune_distributed.py --config spec/configs/llama4/scout_17B_16E_eagle.yaml > log 2>&1
 ```
 
 ## 4. Export spec
