@@ -30,6 +30,7 @@ class TransformerDraftAttentionLayer(nn.Module):
 
     def __init__(
         self,
+        embed_dim:int,
         attn: DraftMultiHeadAttention,
         mlp: nn.Module,
         *,
@@ -47,6 +48,7 @@ class TransformerDraftAttentionLayer(nn.Module):
         self.sa_scale = sa_scale or nn.Identity()
         self.mlp_scale = mlp_scale or nn.Identity()
         self.mask_mod = mask_mod or None
+        self.embed_dim = embed_dim
 
     def setup_caches(
         self,
@@ -124,7 +126,7 @@ class TransformerDraftAttentionLayer(nn.Module):
         # [b, s, d]
         # Norm applied before self-attention
         
-        residual = x[..., 5120:]
+        residual = x[..., self.embed_dim:]
         
         ttt_step = kwargs["ttt_step"]
         past_k = kwargs["past_k"]
