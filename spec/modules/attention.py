@@ -9,9 +9,10 @@ from typing import Optional
 
 import torch
 from torch import nn
-from spec.modules.attention_utils import _MaskType, _sdpa_or_flex_attention
 
 from torchtune.modules.kv_cache import KVCache
+
+from spec.modules.attention_utils import _MaskType, _sdpa_or_flex_attention
 from spec.modules.kv_cache import TrainableKVCache
 
 logger = logging.getLogger(__name__)
@@ -283,8 +284,8 @@ class MultiHeadAttention(nn.Module):
             if self.kv_cache is not None and self.cache_enabled:
                 k, v = self.kv_cache.update(k, v)
                 # get real kv
-                k = k[:, :, :self.kv_cache.size, :]
-                v = v[:, :, :self.kv_cache.size, :]
+                k = k[:, :, : self.kv_cache.size, :]
+                v = v[:, :, : self.kv_cache.size, :]
 
         # If needed, expand the key and value tensors to have the same shape
         # as the query tensor by copying values across the relevant dim
@@ -379,7 +380,6 @@ class DraftMultiHeadAttention(nn.Module):
         # perform normal forward passes
         self.cache_enabled = False
 
-
     def forward(
         self,
         x: torch.Tensor,
@@ -388,7 +388,7 @@ class DraftMultiHeadAttention(nn.Module):
         mask: Optional[_MaskType] = None,
         input_pos: Optional[torch.Tensor] = None,
         past_k: Optional[torch.Tensor] = None,
-        past_v: Optional[torch.Tensor] = None
+        past_v: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -451,7 +451,6 @@ class DraftMultiHeadAttention(nn.Module):
         # Normalize q
         if self.q_norm is not None:
             q = self.q_norm(q)
-
 
         # k,v shape [b, s_y, num_kv_heads * head_dim]
         k = self.k_proj(y)

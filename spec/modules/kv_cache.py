@@ -1,6 +1,8 @@
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+
 
 class TrainableKVCache(nn.Module):
     """
@@ -9,15 +11,16 @@ class TrainableKVCache(nn.Module):
     instead of performing in-place modifications. This module itself is stateless;
     the actual cache tensors are managed and passed externally.
     """
+
     def __init__(self):
         super().__init__()
 
     def forward(
-        self, 
-        k_new: torch.Tensor, 
-        v_new: torch.Tensor, 
-        past_k: Optional[torch.Tensor] = None, 
-        past_v: Optional[torch.Tensor] = None
+        self,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        past_k: Optional[torch.Tensor] = None,
+        past_v: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Updates the KV cache. If a past cache exists, it appends the new k/v values.

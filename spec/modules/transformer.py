@@ -8,10 +8,12 @@ from typing import Callable, Optional, Union
 
 import torch
 from torch import nn
-from spec.modules.attention import MultiHeadAttention, DraftMultiHeadAttention
 from torchtune.modules.attention_utils import _MaskType
 
 from torchtune.utils import deprecated
+
+from spec.modules.attention import DraftMultiHeadAttention, MultiHeadAttention
+
 
 class TransformerDraftAttentionLayer(nn.Module):
     """
@@ -30,7 +32,7 @@ class TransformerDraftAttentionLayer(nn.Module):
 
     def __init__(
         self,
-        embed_dim:int,
+        embed_dim: int,
         attn: DraftMultiHeadAttention,
         mlp: nn.Module,
         *,
@@ -125,19 +127,21 @@ class TransformerDraftAttentionLayer(nn.Module):
         # Input tensor and attention output have the same shape
         # [b, s, d]
         # Norm applied before self-attention
-        
-        residual = x[..., self.embed_dim:]
-        
+
+        residual = x[..., self.embed_dim :]
+
         ttt_step = kwargs["ttt_step"]
         past_k = kwargs["past_k"]
         past_v = kwargs["past_v"]
-        
+
         h = self.sa_norm(x)
         if self.mask_mod is not None:
             # With TP we need to use a replicated tensor here
             bsz, seq_len, *_ = h.shape
             mask = self.mask_mod(mask=mask, seq_len=seq_len, bsz=bsz, ttt_step=ttt_step)
-        attn_out, full_k, full_v = self.attn(h, h, mask=mask, input_pos=input_pos, past_k=past_k, past_v=past_v)
+        attn_out, full_k, full_v = self.attn(
+            h, h, mask=mask, input_pos=input_pos, past_k=past_k, past_v=past_v
+        )
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         h = self.sa_scale(attn_out) + residual
 
@@ -147,8 +151,8 @@ class TransformerDraftAttentionLayer(nn.Module):
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         out = h + self.mlp_scale(mlp_out)
         return out, full_k, full_v
-    
-    
+
+
 class TransformerSelfAttentionLayer(nn.Module):
     """
     Transformer layer derived from the Llama2 model. Normalization is applied before the attention **and** FF layer.
@@ -569,8 +573,9 @@ class TransformerDecoder(nn.Module):
             isinstance(m, TransformerCrossAttentionLayer) for m in self.modules()
         )
         has_decoder_layers = any(
-            isinstance(m, TransformerSelfAttentionLayer) or
-            isinstance(m, TransformerDraftAttentionLayer) for m in self.modules()
+            isinstance(m, TransformerSelfAttentionLayer)
+            or isinstance(m, TransformerDraftAttentionLayer)
+            for m in self.modules()
         )
 
         if has_encoder_layers:
@@ -716,7 +721,7 @@ class TransformerDecoder(nn.Module):
         encoder_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_embeds: Optional[torch.Tensor] = None,
-        **kwargs: dict
+        **kwargs: dict,
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
@@ -787,7 +792,7 @@ class TransformerDecoder(nn.Module):
 
         # shape: [b, s, d]
         h = self.tok_embeddings(tokens) if input_embeds is None else input_embeds
-        
+
         hidden = []
         for i, layer in enumerate(self.layers):
             if i in self.output_hidden_states:
@@ -799,7 +804,7 @@ class TransformerDecoder(nn.Module):
                 encoder_input=encoder_input,
                 encoder_mask=encoder_mask,
                 input_pos=input_pos,
-                **kwargs
+                **kwargs,
             )
 
         if len(self.layers) in self.output_hidden_states:
@@ -807,7 +812,7 @@ class TransformerDecoder(nn.Module):
 
         # shape: [b, seq_len, out_dim]
         output = self.unembed(h)
-        
+
         # Output list if hidden states are requested, otherwise just the output
         # TODO: always output a list to have a consistent output type
         output = output if not hidden else [*hidden, output]
@@ -825,7 +830,7 @@ class TransformerDecoder(nn.Module):
             output = self.output(h).float()
 
         return output
-    
+
 
 class TransformerDraftDecoder(nn.Module):
     """
@@ -933,8 +938,9 @@ class TransformerDraftDecoder(nn.Module):
             isinstance(m, TransformerCrossAttentionLayer) for m in self.modules()
         )
         has_decoder_layers = any(
-            isinstance(m, TransformerSelfAttentionLayer) or
-            isinstance(m, TransformerDraftAttentionLayer) for m in self.modules()
+            isinstance(m, TransformerSelfAttentionLayer)
+            or isinstance(m, TransformerDraftAttentionLayer)
+            for m in self.modules()
         )
 
         if has_encoder_layers:
@@ -1080,7 +1086,7 @@ class TransformerDraftDecoder(nn.Module):
         encoder_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_embeds: Optional[torch.Tensor] = None,
-        **kwargs: dict
+        **kwargs: dict,
     ):
         """
         Args:
@@ -1151,7 +1157,7 @@ class TransformerDraftDecoder(nn.Module):
 
         # shape: [b, s, d]
         h = self.tok_embeddings(tokens) if input_embeds is None else input_embeds
-        
+
         hidden = []
         for i, layer in enumerate(self.layers):
             if i in self.output_hidden_states:
@@ -1163,7 +1169,7 @@ class TransformerDraftDecoder(nn.Module):
                 encoder_input=encoder_input,
                 encoder_mask=encoder_mask,
                 input_pos=input_pos,
-                **kwargs
+                **kwargs,
             )
 
         if len(self.layers) in self.output_hidden_states:
@@ -1171,7 +1177,7 @@ class TransformerDraftDecoder(nn.Module):
 
         # shape: [b, seq_len, out_dim]
         output = self.unembed(h)
-        
+
         # Output list if hidden states are requested, otherwise just the output
         # TODO: always output a list to have a consistent output type
         output = output if not hidden else [*hidden, output]

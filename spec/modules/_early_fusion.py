@@ -14,6 +14,7 @@ from torchtune.utils import deprecated
 
 from spec.modules.transformer import TransformerDecoder
 
+
 class EarlyFusionModel(nn.Module):
     """EarlyFusion is a type of fused model architecture where pretrained encoder(s) are combined
     with a pretrained decoder (LLM) at the model input and not in internal layers. This is a popular architecture
@@ -115,9 +116,7 @@ class EarlyFusionModel(nn.Module):
             trainable_params |= set(get_fusion_params(self))
         else:
             trainable_params -= set(get_fusion_params(self))
-        trainable_params |= {
-            f"draft.{n}" for n, p in self.draft.named_parameters()
-        }
+        trainable_params |= {f"draft.{n}" for n, p in self.draft.named_parameters()}
 
         set_trainable_params(self, trainable_params)
 
@@ -292,12 +291,12 @@ class EarlyFusionModel(nn.Module):
         output = self.decoder(
             tokens=None, mask=mask, input_pos=input_pos, input_embeds=fused_embeds
         )
-        
+
         output_backbone = output[3]
         output = [output[0], output[1], output[2]]
-        
+
         # We dont call the draft module here, cauz ttt
         # It need for looping call in _loss_step func.
         # output = self.draft(tokens=None, mask=mask, input_pos=input_pos, input_embeds=fused_embeds, input_hidden=output) if self.draft is not None else output
-        
-        return (output, output_backbone) 
+
+        return (output, output_backbone)
