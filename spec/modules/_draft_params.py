@@ -1,5 +1,6 @@
 import torch.nn as nn
 
+
 def get_draft_params(model: nn.Module) -> dict[str, nn.Parameter]:
     """
     Return the subset of parameters from a model that correspond to draft layers.

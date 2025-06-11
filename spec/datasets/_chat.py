@@ -13,15 +13,14 @@ from torchtune.modules.transforms.tokenizers import ModelTokenizer
 
 from spec.datasets._sft import SFTDataset
 
+
 def filter_valid_conversations(example):
-    if 'conversations' not in example:
-        conversations = example.get('messages', [])
-        return (len(conversations) > 1 and 
-                conversations[0].get('role') == 'user')
+    if "conversations" not in example:
+        conversations = example.get("messages", [])
+        return len(conversations) > 1 and conversations[0].get("role") == "user"
     else:
-        conversations = example.get('conversations', [])
-        return (len(conversations) > 1 and 
-                conversations[0].get('from') == 'human')
+        conversations = example.get("conversations", [])
+        return len(conversations) > 1 and conversations[0].get("from") == "human"
 
 
 def chat_dataset(

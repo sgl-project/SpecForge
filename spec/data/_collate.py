@@ -1,10 +1,10 @@
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-from torchtune.data._common import CROSS_ENTROPY_IGNORE_IDX, PACK_TYPE
-from torchtune.modules.attention_utils import packed_block_causal_mask
+from torchtune.data._common import CROSS_ENTROPY_IGNORE_IDX
+
 
 def padded_collate_sft_with_mask(
     batch: list[dict[str, Any]],

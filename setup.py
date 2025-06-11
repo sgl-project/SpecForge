@@ -1,11 +1,14 @@
-from setuptools import setup, find_packages
 import os
+
+from setuptools import find_packages, setup
 
 setup(
     name="sgl-spec",
     version="0.0.1",
     description="Speculative decoding implementation for SGL",
-    long_description=open("README.md", "r", encoding="utf-8").read() if os.path.exists("README.md") else "",
+    long_description=open("README.md", "r", encoding="utf-8").read()
+    if os.path.exists("README.md")
+    else "",
     long_description_content_type="text/markdown",
     packages=find_packages(),
     classifiers=[
@@ -22,7 +25,7 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "sglang[all]>=0.4.6.post5",  # SGLang serving framework
-        "torchtune>=0.6.1",    # TorchTune training framework
+        "torchtune>=0.6.1",  # TorchTune training framework
     ],
     extras_require={
         "dev": [

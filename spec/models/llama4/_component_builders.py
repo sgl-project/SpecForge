@@ -110,6 +110,7 @@ def llama4_draft_decoder(
         mlp_layer = llama4_mlp(dim=embed_dim, hidden_dim=hidden_dim)
 
         layer = TransformerDraftAttentionLayer(
+            embed_dim=embed_dim,
             attn=self_attn,
             mlp=mlp_layer,
             sa_norm=None,
