@@ -8,11 +8,11 @@ from typing import Any, Optional, Union
 
 import torch
 from torch import nn
-from torchtune.modules import TransformerDecoder
 from torchtune.modules.model_fusion._fusion_utils import get_fusion_params
 from torchtune.modules.peft._utils import set_trainable_params
 from torchtune.utils import deprecated
 
+from spec.modules.transformer import TransformerDecoder
 
 class EarlyFusionModel(nn.Module):
     """EarlyFusion is a type of fused model architecture where pretrained encoder(s) are combined
@@ -300,4 +300,4 @@ class EarlyFusionModel(nn.Module):
         # It need for looping call in _loss_step func.
         # output = self.draft(tokens=None, mask=mask, input_pos=input_pos, input_embeds=fused_embeds, input_hidden=output) if self.draft is not None else output
         
-        return (output, output_backbone, fused_embeds) 
+        return (output, output_backbone) 

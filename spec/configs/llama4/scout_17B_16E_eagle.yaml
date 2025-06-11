@@ -37,12 +37,12 @@ dataset:
   #   conversation_style: sharegpt
   #   packed: False
   #   split: train
-  - _component_: spec.datasets.chat_dataset
-    source: HuggingFaceH4/ultrachat_200k
-    conversation_column: messages
-    conversation_style: openai
-    packed: False
-    split: train_sft
+  # - _component_: spec.datasets.chat_dataset
+  #   source: HuggingFaceH4/ultrachat_200k
+  #   conversation_column: messages
+  #   conversation_style: openai
+  #   packed: False
+  #   split: train_sft
   # - _component_: torchtune.datasets.chat_dataset
   #   source: HuggingFaceH4/ultrachat_200k
   #   conversation_column: messages

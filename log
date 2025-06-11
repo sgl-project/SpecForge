@@ -1,0 +1,574 @@
+W0611 08:47:15.272000 256409 torch/distributed/run.py:792] 
+W0611 08:47:15.272000 256409 torch/distributed/run.py:792] *****************************************
+W0611 08:47:15.272000 256409 torch/distributed/run.py:792] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0611 08:47:15.272000 256409 torch/distributed/run.py:792] *****************************************
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Running FullFinetuneRecipeDistributed with resolved config:
+
+batch_size: 2
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-4-Scout-17B-16E-Instruct
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: '00050'
+  model_type: LLAMA4
+  output_dir: /tmp/torchtune/llama4_17Bx16E/full
+  recipe_checkpoint: null
+clip_grad_norm: null
+compile: false
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+dataset:
+- _component_: spec.datasets.chat_dataset
+  conversation_column: conversations
+  conversation_style: sharegpt
+  packed: false
+  source: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  split: train
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false
+enable_activation_offloading: false
+epochs: 1
+fsdp_cpu_offload: false
+gradient_accumulation_steps: 8
+log_every_n_steps: 1
+log_level: INFO
+log_peak_memory_stats: true
+loss:
+  _component_: spec.modules.loss.DraftLoss
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  last_epoch: -1
+  num_training_steps: 6910
+  num_warmup_steps: 600
+max_steps_per_epoch: null
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: /tmp/torchtune/llama4_17Bx16E/full/logs
+model:
+  _component_: spec.models.llama4.llama4_scout_17b_16e
+optimizer:
+  _component_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  fused: false
+  lr: 5.0e-05
+  weight_decay: 0.0
+optimizer_in_bwd: false
+output_dir: /tmp/torchtune/llama4_17Bx16E/full
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+resume_from_checkpoint: false
+seed: null
+shuffle: true
+tensor_parallel_dim: 1
+tensor_parallel_plan:
+  _component_: torchtune.models.llama4.decoder_only_tp_plan
+tokenizer:
+  _component_: torchtune.models.llama4.llama4_transform
+  max_num_tiles: 16
+  max_seq_len: 2048
+  path: /tmp/Llama-4-Scout-17B-16E-Instruct/tokenizer.model
+
+Writing logs to /tmp/torchtune/llama4_17Bx16E/full/logs/log_1749631657.txt
+Distributed training is enabled. Instantiating model and loading checkpoint on Rank 0 ...

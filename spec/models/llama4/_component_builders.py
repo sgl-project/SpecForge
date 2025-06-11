@@ -13,7 +13,7 @@ from torch import nn
 from torchtune.models.clip._component_builders import (
     clip_vision_encoder,
 )
-# from torchtune.models.llama4._chunked_attention import get_chunked_attention_mask
+from torchtune.models.llama4._chunked_attention import get_chunked_attention_mask
 from spec.models.llama4._eagle_attention import create_ttt_mask
 
 from torchtune.models.llama4._encoder import (
@@ -24,13 +24,16 @@ from torchtune.models.llama4._position_embeddings import Llama4ScaledRoPE
 from torchtune.modules import (
     FeedForward,
     FrozenNF4Linear,
-    MultiHeadAttention,
     rms_norm,
     RMSNorm,
     RotaryPositionalEmbeddings,
-    TransformerDecoder,
+)
+from spec.modules.attention import MultiHeadAttention, DraftMultiHeadAttention
+from spec.modules.transformer import (
+    TransformerDraftAttentionLayer,
     TransformerSelfAttentionLayer,
-    TransformerDraftAttentionLayer
+    TransformerDecoder,
+    TransformerDraftDecoder
 )
 from torchtune.modules.moe import (
     GroupedExperts,
@@ -62,7 +65,7 @@ def llama4_draft_decoder(
     attn_dropout: float = 0.0,
     rope_base: int = 500_000,
     norm_eps: float = 1e-5,
-    use_qk_norm: bool = True,
+    use_qk_norm: bool = False,
     skip_rope_interval: Optional[int] = None,
     attention_chunk_size: Optional[int] = None,
 ) -> TransformerDecoder:
@@ -79,20 +82,16 @@ def llama4_draft_decoder(
     layers = []
     for i in range(num_layers):
 
-        mask_mod = None
-        if skip_rope_interval is not None and (i + 1) % skip_rope_interval != 0:
-            mask_mod = partial(
-                create_ttt_mask, chunk_size=attention_chunk_size
-            )
-            # Note: this is the value in llama-models, which doesn't match the config
-            pos_embeddings = rope
+        mask_mod = partial(
+            create_ttt_mask
+        )
+        # Note: this is the value in llama-models, which doesn't match the config
+        pos_embeddings = rope
 
-            q_norm = partial(rms_norm, eps=norm_eps) if use_qk_norm else None
-            k_norm = partial(rms_norm, eps=norm_eps) if use_qk_norm else None
-        else:
-            pos_embeddings, q_norm, k_norm = None, None, None
+        q_norm = partial(rms_norm, eps=norm_eps) if use_qk_norm else None
+        k_norm = partial(rms_norm, eps=norm_eps) if use_qk_norm else None
 
-        self_attn = MultiHeadAttention(
+        self_attn = DraftMultiHeadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -121,9 +120,9 @@ def llama4_draft_decoder(
     layers = nn.ModuleList(layers)
 
     tok_embeddings = nn.Identity()
-    output_proj = nn.Identity
+    output_proj = nn.Identity()
     
-    return TransformerDecoder(
+    return TransformerDraftDecoder(
         tok_embeddings=tok_embeddings,
         layers=layers,
         max_seq_len=max_seq_len,
@@ -176,7 +175,6 @@ class EAGLE3DraftModel(nn.Module):
 
         # 3. Draft decoder (one layer for base model, but using mlp rather than moe)
         self.draft_decoder = llama4_draft_decoder(
-            vocab_size=self.vocab_size,
             num_layers=self.num_layers,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -248,6 +246,9 @@ class EAGLE3DraftModel(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         input_embeds: Optional[torch.Tensor] = None,
         input_hidden: Optional[List[torch.Tensor]] = None,
+        ttt_step: int,
+        past_k,
+        past_v
     ):
         feature_list = []
         for feature in input_hidden:
@@ -259,7 +260,7 @@ class EAGLE3DraftModel(nn.Module):
         input_embeds = self.input_embeds_norm(input_embeds)
         fused_features = self.fused_features_norm(fused_features)
         
-        # [B, seq_len, 2*embed_dim] -> [B, seq_len, embed_dim]
+        # [B, seq_len, 2*embed_dim]
         combined_input = torch.cat([input_embeds, fused_features], dim=-1)
         # projected_input = self.input_projection(combined_input)
 
@@ -267,6 +268,9 @@ class EAGLE3DraftModel(nn.Module):
             tokens=None,
             mask=mask,
             input_embeds=combined_input,
+            ttt_step=ttt_step,
+            past_k=past_k,
+            past_v=past_v
         )
 
         hidden_states = draft_outputs

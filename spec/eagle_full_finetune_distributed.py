@@ -25,14 +25,17 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchtune import config, modules, training, utils
 from torchtune.config._utils import _get_component_from_path
-from torchtune.data import padded_collate_packed, padded_collate_sft_with_mask
+from torchtune.data import padded_collate_packed
+
+from spec.data import padded_collate_sft_with_mask
+
 from torchtune.datasets import ConcatDataset
 from torchtune.modules.embedding_utils import resize_token_embeddings
 from torchtune.modules.loss import SFTLoss
 from torchtune.modules.peft import (
-    set_trainable_params,
-    get_draft_params
+    set_trainable_params
 )
+from spec.modules._draft_params import get_draft_params
 
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
@@ -55,6 +58,8 @@ from tqdm import tqdm
 
 
 from spec.utils import padding
+
+torch.autograd.set_detect_anomaly(True)
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -679,7 +684,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )
 
         with training.set_default_dtype(self._dtype), self._device:
-            from torchtune.models.llama4._component_builders import EAGLE3DraftModel
+            from spec.models.llama4._component_builders import EAGLE3DraftModel
             
             for m in model.modules():
                 if isinstance(m, EAGLE3DraftModel):
@@ -832,7 +837,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         labels = batch.pop("labels")
         mask = batch.pop("mask")  # Get mask from batch
 
-        with self.activations_handling_ctx:
+        with torch.no_grad():
             outputs = self._model(**batch)
 
         output, output_backbone = outputs
@@ -848,33 +853,36 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         output_backbone = padding(output_backbone, left=False)
         ttt_tokens = padding(batch["tokens"], left=False)
         
-        # 2. flush cache if cache are not empty
-        # We need a new fresh cache for each step
-        if self._model.draft_decoder.cache_are_setup():
-            self._model.draft_decoder.reset_cache()
+        # 2. We need management a kv cache for our own
+        past_k, past_v = None, None
         
         draft_mask = mask
         
         for i in range (self.ttt_step):
-            # 2. make kvcache for draft model
-            self._model.draft_decoder.setup_caches(
-                batch_size=ttt_tokens.shape[0],
-                dtype=torch.bfloat16,
-                decoder_max_seq_len=2048*self.ttt_step
-            )
             # 3. embedding token for each ttt step
             with torch.no_grad():
                 # We dont want to training the embedding
-                ttt_embedding = self._model._decoder_embed(ttt_tokens)
+                _, ttt_embed_tmp = self._model._decoder_embed(ttt_tokens)
+                bsz, seq_lens = ttt_tokens.shape
+                ttt_embedding = torch.empty(
+                    bsz, seq_lens, ttt_embed_tmp.shape[-1], dtype=ttt_embed_tmp.dtype, device=ttt_embed_tmp.device, 
+                )
+                ttt_embedding = ttt_embedding.masked_scatter(_.unsqueeze(-1), ttt_embed_tmp)
             
-            output_draft = self._model.draft(
-                tokens=None,
-                mask=draft_mask,
-                # seems dont need update freq for ttt
-                input_pos=batch["input_pos"],
-                input_embeds=ttt_embedding,
-                input_hidden=output
-            )
+            
+            with self.activations_handling_ctx:
+                output_draft, new_k, new_v = self._model.draft(
+                    tokens=None,
+                    # Mask in flex attention
+                    mask=mask,
+                    # seems dont need update freq for ttt
+                    input_embeds=ttt_embedding,
+                    input_hidden=output,
+                    ttt_step=i,
+                    # Put kv cache here
+                    past_k=past_k,
+                    past_v=past_v
+                )
 
             # 4. calculate loss for each ttt step (total is 7)
             if not isinstance(self._loss_fn, SFTLoss):
@@ -895,6 +903,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
             # 5. Append loss to plosses
             plosses.append(loss)
+            
+            past_k, past_v = new_k, new_v
             
             # 6. shift backbone(label) and draft_mask for next ttt step
             if i != self.ttt_step - 1:

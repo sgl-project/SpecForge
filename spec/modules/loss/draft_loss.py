@@ -70,6 +70,7 @@ class DraftLoss(nn.Module, SFTLoss):
     def set_model_output(self, model: nn.Module) -> None:
         """Modify model output to match the expected input for the loss function."""
         model.skip_output_layer = True
+        model.draft.draft_decoder.skip_output_layer = True
         self.linear_projection = model.output
 
     def compute_draft_loss(
