@@ -152,7 +152,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     def __init__(self, cfg: DictConfig) -> None:
         device_type = cfg.device
         
-        self.ttt_step = 4
+        self.ttt_step = 7
         
         self._device = utils.get_device(device=device_type)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
