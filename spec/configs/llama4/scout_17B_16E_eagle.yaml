@@ -61,8 +61,8 @@ shuffle: True
 # Training arguments
 epochs: 1
 max_steps_per_epoch: null
-batch_size: 2
-gradient_accumulation_steps: 8 # Use to increase effective batch size
+batch_size: 1
+gradient_accumulation_steps: 1 # Use to increase effective batch size
 optimizer:
   _component_: torch.optim.AdamW
   lr: 5e-5
@@ -83,7 +83,7 @@ clip_grad_norm: null
 device: cuda
 
 # Memory management / performance
-enable_activation_checkpointing: False
+enable_activation_checkpointing: True
 enable_activation_offloading: False
 fsdp_cpu_offload: False
 # compile True means use torch.compile for all components

@@ -17,7 +17,7 @@ from omegaconf import DictConfig, ListConfig
 
 from torch import nn
 from torch.distributed import destroy_process_group, init_process_group
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.optim import Optimizer
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -53,6 +53,7 @@ from torchtune.training.quantization import (
     convert_to_float8_training,
     is_fp8_tensorwise_scaling,
 )
+from torch.utils.checkpoint import checkpoint
 
 from tqdm import tqdm
 
@@ -60,6 +61,13 @@ from tqdm import tqdm
 from spec.utils import padding
 
 torch.autograd.set_detect_anomaly(True)
+
+
+def get_tensor_memory_mb(tensor: torch.Tensor | None) -> float:
+    if tensor is None:
+        return 0.0
+    return tensor.nbytes / (1024 * 1024)
+
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -144,7 +152,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     def __init__(self, cfg: DictConfig) -> None:
         device_type = cfg.device
         
-        self.ttt_step = 7
+        self.ttt_step = 4
         
         self._device = utils.get_device(device=device_type)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
@@ -869,20 +877,17 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 )
                 ttt_embedding = ttt_embedding.masked_scatter(_.unsqueeze(-1), ttt_embed_tmp)
             
-            
             with self.activations_handling_ctx:
-                output_draft, new_k, new_v = self._model.draft(
+                outputs_checkpoint = self._model.draft(
                     tokens=None,
-                    # Mask in flex attention
                     mask=mask,
-                    # seems dont need update freq for ttt
                     input_embeds=ttt_embedding,
                     input_hidden=output,
                     ttt_step=i,
-                    # Put kv cache here
                     past_k=past_k,
-                    past_v=past_v
+                    past_v=past_v,
                 )
+                output_draft, new_k, new_v = outputs_checkpoint
 
             # 4. calculate loss for each ttt step (total is 7)
             if not isinstance(self._loss_fn, SFTLoss):
@@ -904,7 +909,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             # 5. Append loss to plosses
             plosses.append(loss)
             
-            past_k, past_v = new_k, new_v
+            past_k, past_v = new_k.clone(), new_v.clone()
             
             # 6. shift backbone(label) and draft_mask for next ttt step
             if i != self.ttt_step - 1:
