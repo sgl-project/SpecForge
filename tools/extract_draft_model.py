@@ -64,7 +64,7 @@ def extract_draft_model(checkpoint_dir, output_dir):
     save_file(draft_state_dict, os.path.join(output_dir, "model.safetensors"))
 
     config = {
-        "architectures": ["LlamaForCausalLM"],
+        "architectures": ["LlamaForCausalLMEagle3"],
         "eagle_config": {
             "eagle_aux_hidden_state_layer_ids": [1, 23, 44],
             "use_aux_hidden_state": True,
