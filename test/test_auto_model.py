@@ -1,5 +1,4 @@
 import unittest
-import shutil
 from sgl_eagle.modeling.draft.llama3_eagle import LlamaForCausalLMEagle3
 from sgl_eagle.modeling.auto_model import AutoModelForCausalLM
 
