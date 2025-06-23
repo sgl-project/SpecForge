@@ -3,7 +3,8 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 from sgl_eagle.utils import load_config, build_optimizer, build_criterion, build_model
 from sgl_eagle import OfflineEagleTrainer
-
+from sgl_eagle.data.eagle_data_wapper import EagleDatasetWrapper,custom_eagle_collate_fn
+from torch.utils.data import DataLoader, DistributedSampler
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Eagle3 with online data')
@@ -32,16 +33,16 @@ def main():
     criterion = build_criterion(config.criterion)
 
     # TODO: refactor the dataset and dataloader
-    # traindataset = build_dataset_rank(tokenizer, args.trainpath)
+    traindataset = EagleDatasetWrapper(args.trainpath)
     # testdataset = build_dataset_rank(tokenizer, args.testpath)
     # sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
     # test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
     #                         collate_fn=DataCollatorWithPadding())
 
-    # train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
-    # train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
-    #                         pin_memory=True,
-    #                         collate_fn=DataCollatorWithPadding())
+    train_sampler = DistributedSampler(traindataset, num_replicas=1, rank=1, shuffle=True)
+    train_loader = DataLoader(traindataset, batch_size=1, sampler=train_sampler, num_workers=4,
+                             pin_memory=True,
+                             collate_fn=custom_eagle_collate_fn())
 
     for epoch in range(config.train.num_epochs):
         print(f"Now training epoch {epoch}")
@@ -49,18 +50,18 @@ def main():
 
         # TODO: complete the training loop, evaluation, checkpoint saving, wandb logging, etc.
         for batch_idx, data in enumerate(tqdm(train_loader)):
+            print("input_ids",data["input_ids"].shape,data["input_ids"])
+            import os
+            os.exit()
             optimizer.zero_grad()
-            output = offline_trainer.step(...)
-
-            # calculate weighted loss
-            ploss_weight = [0.8 ** i for i in range(len(plosses))]
-            ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-            loss = ploss
+            loss = offline_trainer.step(
+                input_ids=data["input_ids"],
+                hidden_state=data["hidden_state"],
+                target_hidden_states=data["target_hidden_states"],
+            )
             loss.backward()
             optimizer.step()
 
-            epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-            epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
     # save the model
     draft_model.save_pretrained("./output")

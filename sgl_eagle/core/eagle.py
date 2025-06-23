@@ -53,6 +53,8 @@ class EagleRunner:
 
 
 class EagleTrainer(ABC):
+    def __init__(self, draft_model_path) -> None:
+        self.draft_model = AutoModelForCausalLM.from_pretrained(draft_model_path)
 
     def step(self):
         pass
@@ -63,10 +65,19 @@ class OnlineEagleTrainer(EagleRunner):
         pass
 
 class OfflineEagleTrainer(EagleTrainer):
-
     def __init__(self, draft_model, tokenizer):
         self.draft_model = draft_model
         self.tokenizer = tokenizer
 
-    def step(self, hidden_states, attention_mask) -> torch.Tensor:
-        pass
+    def step(self, input_ids, hidden_state, target_hidden_states):
+        
+        #process  
+        attention_mask = (input_ids > 0).long()
+        # fc(target_hidden_states),lmhead(hidden_state)
+        outputs, _ = self.draft_model(
+            input_emb=hidden_state,
+            hidden_states=hidden_state,
+            attention_mask=attention_mask
+        )
+        # outputs: (batch, seq_len, hidden_dim)
+        return outputs
