@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GenerationMixin, PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel, LlamaConfig
 from transformers.activations import ACT2FN
 
 
@@ -458,6 +458,8 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaForCausalLMEagle3(GenerationMixin, PreTrainedModel):
+    config_class = LlamaConfig
+
     def __init__(self, config, last=True):
         super().__init__(config)
         self.hidden_size = config.hidden_size

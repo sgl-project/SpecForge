@@ -64,5 +64,9 @@ class OnlineEagleTrainer(EagleRunner):
 
 class OfflineEagleTrainer(EagleTrainer):
 
+    def __init__(self, draft_model, tokenizer):
+        self.draft_model = draft_model
+        self.tokenizer = tokenizer
+
     def step(self, hidden_states, attention_mask) -> torch.Tensor:
         pass

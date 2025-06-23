@@ -1,7 +1,7 @@
 model:
-  target_model:
+  target:
     pretrained_model_name_or_path: meta-llama/Meta-Llama-3-8B-Instruct
-  base:
+  draft:
     type: LlamaForCausalLMEagle3
 
 criterion:

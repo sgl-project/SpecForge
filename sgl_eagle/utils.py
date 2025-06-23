@@ -28,8 +28,9 @@ def build_optimizer(model, config):
     """
     from torch import optim
     optim_cls = getattr(optim, config.type)
-    optim_kwargs = config.copy().pop('type')
-    return optim_cls(model.parameters(), **optim_kwargs)\
+    cfg_copy = config.copy()
+    cfg_copy.pop('type')
+    return optim_cls(model.parameters(), **cfg_copy)
 
 def build_criterion(config):
     """
@@ -37,5 +38,21 @@ def build_criterion(config):
     """
     from torch import nn
     criterion_cls = getattr(nn, config.type)
-    criterion_kwargs = config.copy().pop('type')
-    return criterion_cls(**criterion_kwargs)
+    cfg_copy = config.copy()
+    cfg_copy.pop('type')
+    return criterion_cls(**cfg_copy)
+
+def build_model(config):
+    """
+    Build the model from the config.
+    """
+    # separate the model type and config kwargs
+    import sgl_eagle.modeling as modeling
+    cfg_copy = config.copy()
+    model_type = cfg_copy.pop('type')
+    model_cls = getattr(modeling, model_type)
+
+    # get the config class
+    cfg_cls = model_cls.config_class
+    model_cfg = cfg_cls(**cfg_copy)
+    return model_cls(model_cfg)
