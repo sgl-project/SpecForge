@@ -274,7 +274,7 @@ if __name__ == "__main__":
     os.makedirs(args.outdir, exist_ok=True)
     print(f"Saving to {args.outdir}", flush=True)
 
-    s, e = 0, DATASET_INFO[args.dataset]["num_samples"]
+    s, e = 0, 64 # DATASET_INFO[args.dataset]["num_samples"]
     data_a = split_range(s, e, num_gpus, over=True)
     workers = []
     for gpu_index, (start, end) in enumerate(data_a):
