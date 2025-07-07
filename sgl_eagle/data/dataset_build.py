@@ -44,6 +44,7 @@ def build_dataset_rank(tokenizer=None,ds=None, assistant_header: str = assistant
             assistant_header=assistant_header,
             user_header=user_header,
             max_length=max_length)
+    #TODO opt Merge and process, just process dataset once.
     dataset = ds.map(
         preprocess_function,
         batched=True,
