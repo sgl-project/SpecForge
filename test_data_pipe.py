@@ -141,8 +141,6 @@ def main():
     # Create configuration object
     config = DataConfig(
         model_type=ModelType.LLAMA4,
-        batch_size=4,  # Adjustable batch size
-        num_processes=8,  # Adjustable number of processes
         max_length=2048,
         load_from_cache_file=True  # Enable cache
     )

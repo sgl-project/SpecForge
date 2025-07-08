@@ -35,7 +35,7 @@ CHAT_TEMPLATES = {
 
 @dataclass
 class DataConfig:
-    batch_size: int = 2  # Training batch size
+    batch_size: int = 8  # Training batch size
     num_processes: int = 8
     max_length: int = 2048
     test_size: float = 0.1
