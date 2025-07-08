@@ -35,7 +35,7 @@ CHAT_TEMPLATES = {
 
 @dataclass
 class DataConfig:
-    batch_size: int = 2
+    batch_size: int = 2  # Training batch size
     num_processes: int = 8
     max_length: int = 2048
     test_size: float = 0.1
@@ -43,6 +43,9 @@ class DataConfig:
     pin_memory: bool = True
     num_workers: int = 4
     load_from_cache_file: bool = True
+    
+    # Performance settings
+    preprocess_batch_size: int = 1024  # Batch size for data preprocessing
     
     model_type: ModelType = ModelType.LLAMA4
     custom_assistant_header: Optional[str] = None

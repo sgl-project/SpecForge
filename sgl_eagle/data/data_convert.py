@@ -21,22 +21,21 @@ class ShareGPTProcessor(DataProcessorBase):
             "human": "user",
             "gpt": "assistant"
         }
-        all_data = []
-        for item in tqdm(ds["train"]):
-            conversations = item['conversations']
-            new_conversations = []
-            for message in conversations:
-                new_role = ROLE_MAPPING[message['from']]
-                content = message['value']
-                new_conversations.append({
-                    "role": new_role,
-                    "content": content
-                })
-            row = {
+        
+        def process_item(item):
+            new_conversations = [
+                {
+                    "role": ROLE_MAPPING[message['from']],
+                    "content": message['value']
+                }
+                for message in item['conversations']
+            ]
+            return {
                 "id": item["id"],
                 "conversations": new_conversations
             }
-            all_data.append(row)
+        
+        all_data = [process_item(item) for item in tqdm(ds["train"], desc="Processing ShareGPT")]
         return Dataset.from_list(all_data)
 
 class Ultrachat200KProcessor(DataProcessorBase):
@@ -44,21 +43,20 @@ class Ultrachat200KProcessor(DataProcessorBase):
 
     def _process(self):
         ds = load_dataset(self.dataset_name)
-        all_data = []
-        for item in tqdm(ds["train_sft"]):
-            conversations = item['messages']
-            new_conversations = []
-            for message in conversations:
-                role = message['role']
-                content = message['content']
-                assert role in ["user", "assistant"]
-                new_conversations.append({
-                    "role": role,
-                    "content": content
-                })
-            row = {
+        
+        def process_item(item):
+            new_conversations = [
+                {
+                    "role": message['role'],
+                    "content": message['content']
+                }
+                for message in item['messages']
+                if message['role'] in ["user", "assistant"]
+            ]
+            return {
                 "id": item["prompt_id"],
                 "conversations": new_conversations
             }
-            all_data.append(row)
+        
+        all_data = [process_item(item) for item in tqdm(ds["train_sft"], desc="Processing Ultrachat200K")]
         return Dataset.from_list(all_data)

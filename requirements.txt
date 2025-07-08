@@ -8,3 +8,4 @@ omegaconf
 tqdm
 wandb
 psutil
+numpy

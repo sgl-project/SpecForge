@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import torch.distributed as dist
 import torch
 import re
+import numpy as np
 from datasets import Dataset
 from sgl_eagle.data.config import DataConfig
 from typing import Optional
@@ -126,15 +127,19 @@ def preprocess_conversations(
             re.escape(assistant_header) + r"(.*?)(?=" + re.escape(user_header) + "|$)"
         )
 
-        for match in re.finditer(pattern, conversation, re.DOTALL):
-            start_char = match.start(1)
-            end_char = match.end(1)
-            for idx, (token_start, token_end) in enumerate(offsets):
-                if token_end <= start_char:
-                    continue
-                if token_start >= end_char:
-                    continue
-                mask[idx] = 1
+        # Vectorized mask construction
+        matches = list(re.finditer(pattern, conversation, re.DOTALL))
+        if matches:
+            match_starts = np.array([m.start(1) for m in matches])
+            match_ends = np.array([m.end(1) for m in matches])
+            
+            token_starts = offsets[:, 0].numpy()
+            token_ends = offsets[:, 1].numpy()
+            
+            overlaps = (token_ends[:, None] > match_starts[None, :]) & \
+                      (token_starts[:, None] < match_ends[None, :])
+            
+            mask = torch.tensor(overlaps.any(axis=1), dtype=torch.long)
 
         results["input_ids"].append(ids[None, :])
         results["loss_mask"].append(mask[None, :])

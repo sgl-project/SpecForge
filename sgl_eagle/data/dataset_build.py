@@ -9,26 +9,51 @@ import tempfile
 import pickle
 from typing import Optional
 
-def do_word_count(dataset, num_processes: int = 8):
+def do_word_count(dataset, num_processes: int = 8, config: Optional[DataConfig] = None):
+    if config is None:
+        config = DataConfig()
+    
     def _process_data(rows):
-        input_ids = torch.cat([torch.LongTensor(i) for i in rows["input_ids"]], dim=-1).view(-1)
-        loss_mask = torch.cat([torch.LongTensor(i) for i in rows["loss_mask"]], dim=-1).view(-1)
-        masked_ids = input_ids[loss_mask == 1]
+        # Calculate total length to avoid repeated concatenation
+        total_length = sum(len(ids) for ids in rows["input_ids"])
+        if total_length == 0:
+            return {"unique_ids": [[]], "counts": [[]]}
+        
+        # Pre-allocate tensors for better performance
+        all_input_ids = torch.zeros(total_length, dtype=torch.long)
+        all_loss_mask = torch.zeros(total_length, dtype=torch.long)
+        
+        # Fill tensors
+        offset = 0
+        for ids, mask in zip(rows["input_ids"], rows["loss_mask"]):
+            length = len(ids)
+            if length > 0:
+                all_input_ids[offset:offset+length] = torch.LongTensor(ids)
+                all_loss_mask[offset:offset+length] = torch.LongTensor(mask)
+                offset += length
+        
+        masked_ids = all_input_ids[all_loss_mask == 1]
+        if len(masked_ids) == 0:
+            return {"unique_ids": [[]], "counts": [[]]}
+            
         unique_ids, counts = masked_ids.unique(return_counts=True)
         return {
             "unique_ids": [unique_ids.tolist()],
             "counts": [counts.tolist()]
         }
+        
     new_ds = dataset.map(
         _process_data,
         batched=True,
+        batch_size=config.preprocess_batch_size,
         num_proc=num_processes,
         remove_columns=dataset.column_names,
     )
+    
     token_dict = Counter()
     for row in new_ds:
-        if len(row["unique_ids"]) > 0:
-            token_dict.update(dict(zip(row["unique_ids"], row["counts"])))
+        if row["unique_ids"] and len(row["unique_ids"]) > 0 and len(row["unique_ids"][0]) > 0:
+            token_dict.update(dict(zip(row["unique_ids"][0], row["counts"][0])))
     return token_dict
 
 
@@ -75,20 +100,11 @@ def build_dataset_rank(tokenizer=None, ds=None, assistant_header: Optional[str] 
         )
         
         if compute_token_dict and token_stats_filename:
-            # In the same pass, calculate token statistics and save to file
-            all_input_ids = []
-            all_loss_masks = []
+            # Vectorized tensor processing
+            all_input_ids = torch.cat([torch.LongTensor(item[0]) for item in processed["input_ids"]], dim=0)
+            all_loss_masks = torch.cat([torch.LongTensor(item[0]) for item in processed["loss_mask"]], dim=0)
             
-            for i in range(len(processed["input_ids"])):
-                input_ids = torch.LongTensor(processed["input_ids"][i][0])
-                loss_mask = torch.LongTensor(processed["loss_mask"][i][0])
-                all_input_ids.append(input_ids)
-                all_loss_masks.append(loss_mask)
-            
-            # Concatenate all input_ids and loss_masks for this batch
-            batch_input_ids = torch.cat(all_input_ids, dim=0)
-            batch_loss_mask = torch.cat(all_loss_masks, dim=0)
-            masked_ids = batch_input_ids[batch_loss_mask == 1]
+            masked_ids = all_input_ids[all_loss_masks == 1]
             
             if len(masked_ids) > 0:
                 unique_ids, counts = masked_ids.unique(return_counts=True)
