@@ -7,3 +7,4 @@ deepspeed
 omegaconf
 tqdm
 wandb
+psutil

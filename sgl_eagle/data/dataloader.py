@@ -1,8 +1,9 @@
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
-from sgl_eagle.data.dataset_build import build_dataset_rank
+from sgl_eagle.data.dataset_build import build_dataset_rank, build_test_dataset
+from sgl_eagle.data.config import DataConfig
 import torch
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 class DataCollatorWithPadding:
     def paddingtensor(self, intensors, N):
@@ -32,18 +33,22 @@ class DataCollatorWithPadding:
         return batch 
 
 
-#TODO hard code batch_size
-BATCH_SIZE=2
-def prepare_dataloaders(train_data, test_data,tokenizer):
-    train_dataset,token_dict = build_dataset_rank(tokenizer, train_data)
-    test_dataset,_ = build_dataset_rank(tokenizer, test_data)
+def prepare_dataloaders(train_data, test_data, tokenizer, config: Optional[DataConfig] = None):
+    if config is None:
+        config = DataConfig()
+    
+    # Only compute token dictionary for training data
+    train_dataset, token_dict = build_dataset_rank(tokenizer, train_data, compute_token_dict=True, config=config)
+    # Test data doesn't need token counting - use simplified version
+    test_dataset, _ = build_test_dataset(tokenizer, test_data, config=config)
+    
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler, num_workers=4,
-                              pin_memory=True,
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, sampler=train_sampler, num_workers=config.num_workers,
+                              pin_memory=config.pin_memory,
                               collate_fn=DataCollatorWithPadding())
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, sampler=test_sampler, num_workers=4, pin_memory=True,
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, sampler=test_sampler, num_workers=config.num_workers, pin_memory=config.pin_memory,
                              collate_fn=DataCollatorWithPadding())
-    return train_loader, test_loader, train_sampler, test_sampler,token_dict
+    return train_loader, test_loader, train_sampler, test_sampler, token_dict

@@ -4,11 +4,12 @@ from collections import Counter
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from sgl_eagle.data.data_utils import preprocess_conversations
+from sgl_eagle.data.config import DataConfig
+import tempfile
+import pickle
+from typing import Optional
 
-user_template = "<|header_start|>user<|header_end|>"
-assistant_template = "<|header_start|>assistant<|header_end|>\n\n"
-
-def do_word_count(dataset, num_processes=8):
+def do_word_count(dataset, num_processes: int = 8):
     def _process_data(rows):
         input_ids = torch.cat([torch.LongTensor(i) for i in rows["input_ids"]], dim=-1).view(-1)
         loss_mask = torch.cat([torch.LongTensor(i) for i in rows["loss_mask"]], dim=-1).view(-1)
@@ -31,27 +32,116 @@ def do_word_count(dataset, num_processes=8):
     return token_dict
 
 
-def build_dataset_rank(tokenizer=None,ds=None, assistant_header: str = assistant_template, user_header: str = user_template, max_length: int = 2048):
+def build_dataset_rank(tokenizer=None, ds=None, assistant_header: Optional[str] = None, user_header: Optional[str] = None, max_length: Optional[int] = None, compute_token_dict: bool = True, config: Optional[DataConfig] = None):
     
-    ds = ds.shuffle(seed=42)
+    if ds is None:
+        raise ValueError("ds parameter cannot be None")
+    
+    if config is None:
+        config = DataConfig()
+    
+    if max_length is None:
+        max_length = config.max_length
+    
+    # Get chat template from config
+    template = config.get_chat_template()
+    if assistant_header is None:
+        assistant_header = template["assistant_header"]
+    if user_header is None:
+        user_header = template["user_header"]
+    
+    ds = ds.shuffle(seed=config.shuffle_seed)
     original_cols = ds.column_names
-    num_proc = 8
+    num_proc = config.num_processes
+    
+    # Create a temporary file to collect token statistics during processing
+    token_stats_file = None
+    token_stats_filename = None
+    if compute_token_dict:
+        token_stats_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+        token_stats_filename = token_stats_file.name
+        token_stats_file.close()  # Close immediately, we'll append to it
+    
     def preprocess_function(examples):
-        return preprocess_conversations(
+        # Always do preprocessing
+        processed = preprocess_conversations(
             tokenizer,
             examples["conversations"],
             return_attention_mask=False,
             assistant_header=assistant_header,
             user_header=user_header,
-            max_length=max_length)
-    #TODO opt Merge and process, just process dataset once.
+            max_length=max_length,
+            config=config
+        )
+        
+        if compute_token_dict and token_stats_filename:
+            # In the same pass, calculate token statistics and save to file
+            all_input_ids = []
+            all_loss_masks = []
+            
+            for i in range(len(processed["input_ids"])):
+                input_ids = torch.LongTensor(processed["input_ids"][i][0])
+                loss_mask = torch.LongTensor(processed["loss_mask"][i][0])
+                all_input_ids.append(input_ids)
+                all_loss_masks.append(loss_mask)
+            
+            # Concatenate all input_ids and loss_masks for this batch
+            batch_input_ids = torch.cat(all_input_ids, dim=0)
+            batch_loss_mask = torch.cat(all_loss_masks, dim=0)
+            masked_ids = batch_input_ids[batch_loss_mask == 1]
+            
+            if len(masked_ids) > 0:
+                unique_ids, counts = masked_ids.unique(return_counts=True)
+                batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
+                
+                # Save token statistics to file immediately
+                with open(token_stats_filename, 'ab') as f:
+                    pickle.dump(batch_token_dict, f)
+        
+        return processed
+    
+    # Process dataset only once
     dataset = ds.map(
         preprocess_function,
         batched=True,
         num_proc=num_proc,
         remove_columns=original_cols,
-        load_from_cache_file=False,
+        load_from_cache_file=config.load_from_cache_file,
     )
-    token_dict=do_word_count(dataset)
-    ds.set_format(type="torch")
-    return ds,token_dict
+    
+    # Collect token dictionary from file if needed
+    token_dict = None
+    if compute_token_dict and token_stats_filename:
+        token_dict = Counter()
+        # Read all token statistics from file
+        try:
+            with open(token_stats_filename, 'rb') as f:
+                while True:
+                    try:
+                        batch_dict = pickle.load(f)
+                        token_dict.update(batch_dict)
+                    except EOFError:
+                        break
+        except FileNotFoundError:
+            pass  # No token statistics were saved
+        finally:
+            # Clean up temporary file
+            if os.path.exists(token_stats_filename):
+                os.unlink(token_stats_filename)
+    
+    dataset.set_format(type="torch")
+    
+    return dataset, token_dict
+
+
+def build_test_dataset(tokenizer=None, ds=None, assistant_header: Optional[str] = None, user_header: Optional[str] = None, max_length: Optional[int] = None, config: Optional[DataConfig] = None):
+    """
+    Simplified version for test data that doesn't need token counting
+    """
+    if config is None:
+        config = DataConfig()
+    
+    if max_length is None:
+        max_length = config.max_length
+    
+    return build_dataset_rank(tokenizer, ds, assistant_header, user_header, max_length, compute_token_dict=False, config=config)

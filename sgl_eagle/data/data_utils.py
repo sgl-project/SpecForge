@@ -3,6 +3,8 @@ import torch.distributed as dist
 import torch
 import re
 from datasets import Dataset
+from sgl_eagle.data.config import DataConfig
+from typing import Optional
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -33,10 +35,11 @@ def preprocess_conversations(
     conversations,
     return_attention_mask=True,
     *,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    assistant_header: str = "<|header_start|>assistant<|header_end|>\n\n",
-    user_header: str = "<|header_start|>user<|header_end|>",
+    system_prompt: Optional[str] = None,
+    assistant_header: Optional[str] = None,
+    user_header: Optional[str] = None,
     max_length=2048,
+    config: Optional[DataConfig] = None,
 ):
     """Preprocess a batch of ShareGPT style conversations.
 
@@ -49,11 +52,15 @@ def preprocess_conversations(
     return_attention_mask : bool, optional
         Whether to also return attention masks.
     system_prompt : str, optional
-        System prompt prepended to every conversation.
+        System prompt prepended to every conversation. If None, use config template.
     assistant_header : str, optional
-        Token sequence that marks the assistant role in the conversation.
+        Token sequence that marks the assistant role in the conversation. If None, use config template.
     user_header : str, optional
-        Token sequence that marks the user role in the conversation.
+        Token sequence that marks the user role in the conversation. If None, use config template.
+    max_length : int, optional
+        Maximum sequence length.
+    config : DataConfig, optional
+        Configuration object containing chat template settings.
 
     Returns
     -------
@@ -62,6 +69,19 @@ def preprocess_conversations(
         ``return_attention_mask`` is True an ``attention_mask`` list is also
         included.
     """
+    # Get chat template from config if not provided
+    if config is None:
+        config = DataConfig()
+    
+    template = config.get_chat_template()
+    
+    # Use provided parameters or fall back to config template
+    if system_prompt is None:
+        system_prompt = template["system_prompt"]
+    if assistant_header is None:
+        assistant_header = template["assistant_header"]
+    if user_header is None:
+        user_header = template["user_header"]
 
     results = {"input_ids": [], "loss_mask": []}
     if return_attention_mask:
