@@ -1,8 +1,13 @@
+import glob
+import json
+import os
 from abc import ABC, abstractmethod
 from typing import Tuple
 
 import torch
 import torch.nn as nn
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from transformers import PreTrainedModel
 
 from sgl_spec.modeling._mask_utils import _expand_mask, _make_causal_mask
@@ -84,12 +89,66 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         pass
 
-    @abstractmethod
-    def load_embedding(self, model_path: str):
+    def freeze_embedding(self) -> None:
+        """
+        Freeze the embeddings of the draft model so that they are not updated during training.
+        """
+        self.embed_tokens.weight.requires_grad = False
+
+    def load_embedding(
+        self, model_path: str, embedding_name: str = "embed_tokens"
+    ) -> None:
         """
         Load the embedding of the draft model.
 
         Args:
-            model_path (str): The path to the model.
+            model_path (str): The path to the huggingface repository.
         """
-        pass
+        embedding_weight_name = f"{embedding_name}.weight"
+
+        if os.path.exists(model_path):
+            # model_path is a local directory
+            # check if there is file ending with index.json
+            glob_path = os.path.join(model_path, "**", "*.safetensors.index.json")
+            index_json_path = glob.glob(glob_path)
+
+            if len(index_json_path) == 0:
+                raise FileNotFoundError(f"No index.json file found in {model_path}")
+            if len(index_json_path) > 1:
+                raise FileNotFoundError(
+                    f"Multiple index.json files found in {model_path}"
+                )
+            index_json_path = index_json_path[0]
+
+            with open(index_json_path, "r") as f:
+                index_json = json.load(f)
+            ckpt_file = index_json["weight_map"][embedding_weight_name]
+
+            if ckpt_file.endswith(".safetensors"):
+                with safe_open(
+                    os.path.join(model_path, ckpt_file), framework="pt"
+                ) as f:
+                    emb_tokens = f.get_tensor(embedding_weight_name)
+            else:
+                state_dict = torch.load(os.path.join(model_path, ckpt_file))
+                emb_tokens = state_dict[embedding_name]
+            self.embed_tokens.weight.copy_(emb_tokens)
+        else:
+            # this is the case where model_path is a huggingface repository
+            # we first need to locate its local cache
+            local_cache_path = snapshot_download(repo_id=model_path)
+            self.load_embedding(local_cache_path, embedding_name)
+
+    def load_vocab_mapping(self, file_path: str) -> None:
+        """
+        Load the vocab buffers of the draft model.
+
+        Args:
+            file_path (str): The path to the vocab mapping file.
+        """
+        assert hasattr(self, "t2d") and hasattr(
+            self, "d2t"
+        ), "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
+        vocab_mapping = torch.load(file_path)
+        self.t2d.copy_(vocab_mapping["t2d"])
+        self.d2t.copy_(vocab_mapping["d2t"])

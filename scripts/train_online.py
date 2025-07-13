@@ -53,6 +53,9 @@ def main():
     )
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     draft_model = AutoEagle3DraftModel.from_config(draft_model_config).cuda()
+    draft_model.load_vocab_mapping(args.target_model_path)
+    draft_model.freeze_embedding()
+
     eagle3_pipeline = OnlineEagle3Pipeline(
         target_model=target_model,
         draft_model=draft_model,
