@@ -76,8 +76,8 @@ def main():
         num_processes=1,
     )
 
-    train_dataloader, eval_dataloader, train_sampler, _, _ = prepare_full_dataloaders(
-        tokenizer, args.train_data_path, args.eval_data_path, config=data_config
+    train_dataloader, eval_dataloader, train_sampler, _, d2t_path = prepare_full_dataloaders(
+        tokenizer, args.train_data_path, args.eval_data_path, draft_model=draft_model, config=data_config,
     )
 
     # build other components
