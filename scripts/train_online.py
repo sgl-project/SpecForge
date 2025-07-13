@@ -1,76 +1,129 @@
 import argparse
-import deepspeed
-import json
-import re
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
-from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 from tqdm import tqdm
-from sgl_eagle.utils import load_config, build_optimizer, build_criterion
-from sgl_eagle import AutoModelForCausalLM, OnlineEagleTrainer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from sgl_spec import AutoEagle3DraftModel, OnlineEagle3Pipeline
+from sgl_spec.data.config import DataConfig, ModelType
+from sgl_spec.data.data_pipeline import prepare_full_dataloaders
+from sgl_spec.utils import init_distributed
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train Eagle3 with online data')
-    parser.add_argument('--config', type=str, required=True)
+    parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
+
+    # add model-related arguments
+    parser.add_argument("--target-model-path", type=str, required=True)
+    parser.add_argument("--draft-model-config", type=str, required=True)
+
+    # add training-related arguments
+    parser.add_argument("--train-data-path", type=str, required=True)
+    parser.add_argument("--eval-data-path", type=str, required=True)
+    parser.add_argument("--num-epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--max-length", type=int, default=2048)
+
+    # data processing type
+    parser.add_argument("--data-type", type=str, default="llama3")
+
+    # other args
+    parser.add_argument("--cache-key", type=str, default=None)
+    parser.add_argument("--cache-dir", type=str, default="./cache")
+    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--eval-interval", type=int, default=1)
+    parser.add_argument("--save-interval", type=int, default=1)
     args = parser.parse_args()
     return args
 
 
 def main():
+    # initialize
     args = parse_args()
-    config = load_config(args.config)
+    init_distributed()
 
-    # load draft model and base model
-    target_model = AutoModelForCausalLM.from_pretrained(**config.model.target_model).eval()
-    draft_model = AutoModelForCausalLM(target_model.config)
-    tokenizer = AutoTokenizer.from_pretrained(config.model.target_model.pretrained_model_name_or_path)
-    online_trainer = OnlineEagleTrainer(draft_model, target_model, tokenizer)
+    # build target and draft model
+    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_path).eval()
+    draft_model_config = AutoConfig.from_pretrained(args.draft_model_config)
+    draft_model = AutoEagle3DraftModel(draft_model_config)
+    draft_model = FSDP(draft_model, sharding_strategy=ShardingStrategy.SHARD_GRAD_OP)
+    eagle3_pipeline = OnlineEagle3Pipeline(draft_model, target_model)
 
     # build dataset and dataloader
-    # TODO: refactor the dataset and dataloader
-    traindataset = build_dataset_rank(tokenizer, args.trainpath)
-    testdataset = build_dataset_rank(tokenizer, args.testpath)
-    sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-    test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
-                            collate_fn=DataCollatorWithPadding())
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    data_config = DataConfig(
+        model_type=ModelType[args.data_type],
+        max_length=2048,
+        load_from_cache_file=True,  # Enable cache
+    )
 
-    train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
-    train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
-                            pin_memory=True,
-                            collate_fn=DataCollatorWithPadding())
-    
-    # build optimizer
-    optimizer = build_optimizer(config.optimizer)
+    train_dataloader, eval_dataloader, train_sampler, _, _ = prepare_full_dataloaders(
+        tokenizer, args.train_data_path, args.eval_data_path, config=data_config
+    )
 
-    # build
-    criterion = build_criterion(config.criterion)
+    # build other components
+    optimizer = torch.optim.AdamW(draft_model.parameters(), lr=args.learning_rate)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
 
-    for epoch in range(config.train.num_epochs):
-        train_sampler.set_epoch(epoch+1)
-        print(f"Now training epoch {epoch}")
+    # start running
+    for epoch in range(args.num_epochs):
+        # Run training
+        train_sampler.set_epoch(epoch)
         draft_model.train()
-        epoch_acces = [[] for _ in range(model.length)]
-        epoch_plosses = [[] for _ in range(model.length)]
+        epoch_acces = [[] for _ in range(eagle3_pipeline.length)]
+        epoch_plosses = [[] for _ in range(eagle3_pipeline.length)]
 
-        # TODO: complete the training loop, evaluation, checkpoint saving, wandb logging, etc.
-        for batch_idx, data in enumerate(tqdm(train_loader)):
+        for batch_idx, data in enumerate(
+            tqdm(train_dataloader), desc=f"Training Epoch {epoch}"
+        ):
             optimizer.zero_grad()
-            output = online_trainer.step(data)
+            plosses, _, acces = eagle3_pipeline.step(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+            )
 
             # calculate weighted loss
-            ploss_weight = [0.8 ** i for i in range(len(plosses))]
+            ploss_weight = [0.8**i for i in range(len(plosses))]
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-            loss = ploss
-            loss.backward()
+            ploss.backward()
             optimizer.step()
 
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-            epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
+            epoch_plosses = [
+                epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
+            ]
 
-    # save the model
-    draft_model.save_pretrained("./output")
+        if epoch % args.eval_interval == 0:
+            # Run evaluation
+            draft_model.eval()
+            eval_acces = [[] for _ in range(eagle3_pipeline.length)]
+            eval_plosses = [[] for _ in range(eagle3_pipeline.length)]
+            for batch_idx, data in enumerate(
+                tqdm(eval_dataloader), desc=f"Evaluating Epoch {epoch}"
+            ):
+                plosses, _, acces = eagle3_pipeline.step(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
+                eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
+                eval_plosses = [
+                    eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
+                ]
+
+        if epoch % args.save_interval == 0:
+            # Save the model
+            if dist.get_rank() == 0:
+                draft_model.save_pretrained(
+                    os.path.join(args.output_dir, f"epoch_{epoch}")
+                )
+
 
 if __name__ == "__main__":
     main()
