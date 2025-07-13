@@ -3,6 +3,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import wandb
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from tqdm import tqdm
@@ -38,14 +39,38 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--eval-interval", type=int, default=1)
     parser.add_argument("--save-interval", type=int, default=1)
+
+    # wandb wandb args
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument("--wandb-key", type=str, default=None)
     args = parser.parse_args()
     return args
+
+
+def init_wandb(args):
+    wandb.login(key=args.wandb_key)
+    wandb.init(project=args.wandb_project, name=args.wandb_name)
+
+
+def wandb_log_if_initialized(log_dict):
+    if dist.get_rank() == 0 and wandb.run is not None:
+        wandb.log(log_dict)
+
+
+def print_on_rank0(message):
+    if dist.get_rank() == 0:
+        print(message)
 
 
 def main():
     # initialize
     args = parse_args()
     init_distributed()
+
+    if args.wandb and dist.get_rank() == 0:
+        init_wandb(args)
 
     # build target and draft model
     target_model = (
@@ -105,6 +130,27 @@ def main():
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
 
+        for i in range(len(epoch_acces)):
+            acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+            dist.all_reduce(acc_i)
+            acc_i = acc_i / dist.get_world_size()
+            acc_i = acc_i.item()
+            wandb_log_if_initialized({f"train/epochacc_{i}": acc_i})
+            print_on_rank0(
+                f"Train Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
+            )
+
+        for i in range(len(epoch_plosses)):
+            loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+            dist.all_reduce(loss_i)
+            loss_i = loss_i / dist.get_world_size()
+            loss_i = loss_i.item()
+            wandb_log_if_initialized({f"train/epochploss_{i}": loss_i})
+            print_on_rank0(
+                f"Train Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
+            )
+
+        # run evaluation
         if epoch % args.eval_interval == 0:
             # Run evaluation
             draft_model.eval()
@@ -120,6 +166,28 @@ def main():
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
                 ]
+
+            for i in range(len(epoch_acces)):
+                acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+                dist.all_reduce(acc_i)
+                acc_i = acc_i / dist.get_world_size()
+                acc_i = acc_i.item()
+
+                wandb_log_if_initialized({f"test/epochacc_{i}": acc_i})
+                print_on_rank0(
+                    f"Test Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
+                )
+
+            for i in range(len(epoch_plosses)):
+                loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+                dist.all_reduce(loss_i)
+                loss_i = loss_i / dist.get_world_size()
+                loss_i = loss_i.item()
+
+                wandb_log_if_initialized({f"test/epochploss_{i}": loss_i})
+                print_on_rank0(
+                    f"Test Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
+                )
 
         if epoch % args.save_interval == 0:
             # Save the model
