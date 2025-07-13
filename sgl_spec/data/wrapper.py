@@ -1,7 +1,7 @@
-'''
+"""
 
 import torch
-from sgl_eagle.data.dataset_build import scandata, do_word_count
+from sgl_spec.data.dataset_build import scandata, do_word_count
 
 class EagleDatasetWrapper:
     def __init__(self, ds_path, max_len=2048):
@@ -30,6 +30,6 @@ class EagleDatasetWrapper:
         item["loss_mask"] = torch.tensor(item["loss_mask"])
         item["hidden_state"] = torch.tensor(item["hidden_state"])
         item["target_hidden_states"] = torch.tensor(item["target_hidden_states"])
-        return item 
+        return item
 
-'''
+"""

@@ -1,6 +1,6 @@
 {
   "architectures": [
-    "LlamaForCausalLM"
+    "LlamaForCausalLMEagle3"
   ],
   "bos_token_id": 128000,
   "eos_token_id": 128001,

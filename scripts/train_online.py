@@ -4,11 +4,11 @@ import os
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sgl_spec import AutoEagle3DraftModel, OnlineEagle3Pipeline
+from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Pipeline
 from sgl_spec.data.config import DataConfig, ModelType
 from sgl_spec.data.data_pipeline import prepare_full_dataloaders
 from sgl_spec.utils import init_distributed
@@ -23,7 +23,7 @@ def parse_args():
 
     # add training-related arguments
     parser.add_argument("--train-data-path", type=str, required=True)
-    parser.add_argument("--eval-data-path", type=str, required=True)
+    parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--num-epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -48,18 +48,32 @@ def main():
     init_distributed()
 
     # build target and draft model
-    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_path).eval()
-    draft_model_config = AutoConfig.from_pretrained(args.draft_model_config)
-    draft_model = AutoEagle3DraftModel(draft_model_config)
-    draft_model = FSDP(draft_model, sharding_strategy=ShardingStrategy.SHARD_GRAD_OP)
-    eagle3_pipeline = OnlineEagle3Pipeline(draft_model, target_model)
+    target_model = (
+        AutoModelForCausalLM.from_pretrained(args.target_model_path).eval().cuda()
+    )
+    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+    draft_model = AutoEagle3DraftModel.from_config(draft_model_config).cuda()
+    # draft_model = FSDP(
+    #     draft_model,
+    #     sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+    #     mixed_precision=MixedPrecision(
+    #         param_dtype=torch.bfloat16,
+    #         buffer_dtype=torch.bfloat16,
+    #     )
+    # )
+    eagle3_pipeline = OnlineEagle3Pipeline(
+        target_model=target_model,
+        draft_model=draft_model,
+    )
 
     # build dataset and dataloader
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     data_config = DataConfig(
-        model_type=ModelType[args.data_type],
-        max_length=2048,
-        load_from_cache_file=True,  # Enable cache
+        batch_size=args.batch_size,
+        model_type=ModelType(args.data_type),
+        max_length=args.max_length,
+        load_from_cache_file=True,
+        num_processes=1,
     )
 
     train_dataloader, eval_dataloader, train_sampler, _, _ = prepare_full_dataloaders(
@@ -68,7 +82,6 @@ def main():
 
     # build other components
     optimizer = torch.optim.AdamW(draft_model.parameters(), lr=args.learning_rate)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
 
     # start running
     for epoch in range(args.num_epochs):
@@ -78,10 +91,9 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_pipeline.length)]
         epoch_plosses = [[] for _ in range(eagle3_pipeline.length)]
 
-        for batch_idx, data in enumerate(
-            tqdm(train_dataloader), desc=f"Training Epoch {epoch}"
-        ):
+        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
+
             plosses, _, acces = eagle3_pipeline.step(
                 input_ids=data["input_ids"].cuda(),
                 attention_mask=data["attention_mask"].cuda(),
@@ -104,9 +116,7 @@ def main():
             draft_model.eval()
             eval_acces = [[] for _ in range(eagle3_pipeline.length)]
             eval_plosses = [[] for _ in range(eagle3_pipeline.length)]
-            for batch_idx, data in enumerate(
-                tqdm(eval_dataloader), desc=f"Evaluating Epoch {epoch}"
-            ):
+            for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                 plosses, _, acces = eagle3_pipeline.step(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),

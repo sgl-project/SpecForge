@@ -1,12 +1,13 @@
-from contextlib import contextmanager
-import torch.distributed as dist
-import torch
 import re
-import numpy as np
-from datasets import Dataset
-from sgl_eagle.data.config import DataConfig
+from contextlib import contextmanager
 from typing import Optional
 
+import numpy as np
+import torch
+import torch.distributed as dist
+from datasets import Dataset
+
+from sgl_spec.data.config import DataConfig
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful, respectful and honest assistant. Always answer as "
@@ -18,6 +19,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "correct. If you don't know the answer to a question, please don't share "
     "false information."
 )
+
 
 @contextmanager
 def rank_0_priority():
@@ -73,9 +75,9 @@ def preprocess_conversations(
     # Get chat template from config if not provided
     if config is None:
         config = DataConfig()
-    
+
     template = config.get_chat_template()
-    
+
     # Use provided parameters or fall back to config template
     if system_prompt is None:
         system_prompt = template["system_prompt"]
@@ -132,13 +134,14 @@ def preprocess_conversations(
         if matches:
             match_starts = np.array([m.start(1) for m in matches])
             match_ends = np.array([m.end(1) for m in matches])
-            
+
             token_starts = offsets[:, 0].numpy()
             token_ends = offsets[:, 1].numpy()
-            
-            overlaps = (token_ends[:, None] > match_starts[None, :]) & \
-                      (token_starts[:, None] < match_ends[None, :])
-            
+
+            overlaps = (token_ends[:, None] > match_starts[None, :]) & (
+                token_starts[:, None] < match_ends[None, :]
+            )
+
             mask = torch.tensor(overlaps.any(axis=1), dtype=torch.long)
 
         results["input_ids"].append(ids[None, :])

@@ -7,9 +7,10 @@ import time
 import psutil
 import torch
 import torch.distributed as dist
-from sgl_eagle.data.config import DataConfig, ModelType
-from sgl_eagle.data.data_pipeline import prepare_full_dataloaders
 from transformers import AutoTokenizer
+
+from sgl_spec.data.config import DataConfig, ModelType
+from sgl_spec.data.data_pipeline import prepare_full_dataloaders
 
 
 def get_memory_usage():
@@ -85,8 +86,9 @@ def load_dataloader_cache(cache_key, config, cache_dir):
             cache_data = pickle.load(f)
 
         # Recreate DataLoader objects
-        from sgl_eagle.data.dataloader import DataCollatorWithPadding
         from torch.utils.data import DataLoader, DistributedSampler
+
+        from sgl_spec.data.dataloader import DataCollatorWithPadding
 
         world_size = dist.get_world_size()
         rank = dist.get_rank()

@@ -10,6 +10,7 @@ from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from ..utils import padding
+from .base import Eagle3DraftModel
 
 logger = logging.getLogger(__name__)
 
@@ -548,11 +549,10 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         # outputs = (hidden_states, return_hidden)
-
         return hidden_states
 
 
-class LlamaForCausalLMEagle3(PreTrainedModel):
+class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
@@ -562,6 +562,10 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
+        self.draft_vocab_size = config.draft_vocab_size
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
         self.midlayer = LlamaDecoderLayer(config)
 
         if hasattr(config, "target_hidden_size"):
@@ -574,10 +578,27 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
             )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
+
+        # create vocab buffers
+        t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
+        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
+        self.register_buffer("t2d", t2d)
+        self.register_buffer("d2t", d2t)
+        self.load_vocab_buffers()
+
+    def load_vocab_buffers(self):
+        ckpt_path = (
+            "/data/eagle_data/shenggui/projects/EAGLE/eagle/traineagle3/cache.pt"
+        )
+        ckpt = torch.load(ckpt_path)
+        self.t2d.copy_(ckpt["t2d"])
+        self.d2t.copy_(ckpt["d2t"])
+
+    def load_embeddings(self, model_path: str):
+        pass
 
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length
@@ -662,5 +683,37 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
 
         return hidden_states
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
-EntryClass = [LlamaForCausalLMEagle3]
+    def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # eagle 3 requires hidden states from 3 layers
+        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        return self.fc(hidden_states)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        norm_hidden_states = self.norm(hidden_states)
+        return self.lm_head(norm_hidden_states)
+
+    def backbone(
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        return self.midlayer(
+            input_emb=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+        )
+
+    def load_embedding(self, model_path: str):
+        pass
