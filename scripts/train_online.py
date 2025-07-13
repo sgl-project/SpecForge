@@ -64,7 +64,6 @@ def main():
         batch_size=args.batch_size,
         model_type=ModelType(args.data_type),
         max_length=args.max_length,
-        load_from_cache_file=True,
         num_processes=1,
     )
 
