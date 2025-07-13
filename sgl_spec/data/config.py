@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 
@@ -57,7 +58,7 @@ class DataConfig:
     shuffle_seed: int = 42
     pin_memory: bool = True
     num_workers: int = 4
-    load_from_cache_file: bool = True
+    load_from_cache_file: str = field(default_factory=lambda: str(Path(__file__).resolve().parent.parent / 'cache.pt'))
 
     # Performance settings
     preprocess_batch_size: int = 1024  # Batch size for data preprocessing
