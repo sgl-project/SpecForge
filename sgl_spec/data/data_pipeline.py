@@ -72,12 +72,8 @@ def prepare_full_dataloaders(
     if draft_model is not None and token_dict is not None:
         draft_vocab_size = draft_model.draft_vocab_size
         vocab_size = draft_model.vocab_size
-        _load_from_cache_file = getattr(config, 'load_from_cache_file', False)
         d2t_path = process_token_dict_to_mappings(
-            token_dict, draft_vocab_size, vocab_size,load_from_cache_file=_load_from_cache_file
+            token_dict, draft_vocab_size, vocab_size,config.load_from_cache_file
         )
-        # Update draft model's vocab buffers
-        draft_model.d2t.copy_(torch.tensor(d2t, dtype=torch.int64))
-        draft_model.t2d.copy_(torch.tensor(t2d, dtype=torch.bool))
     
     return train_loader, test_loader, train_sampler, test_sampler, d2t_path
