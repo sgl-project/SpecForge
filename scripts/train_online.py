@@ -53,14 +53,6 @@ def main():
     )
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     draft_model = AutoEagle3DraftModel.from_config(draft_model_config).cuda()
-    # draft_model = FSDP(
-    #     draft_model,
-    #     sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-    #     mixed_precision=MixedPrecision(
-    #         param_dtype=torch.bfloat16,
-    #         buffer_dtype=torch.bfloat16,
-    #     )
-    # )
     eagle3_pipeline = OnlineEagle3Pipeline(
         target_model=target_model,
         draft_model=draft_model,
