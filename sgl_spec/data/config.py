@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
+import os
 
 
 class ModelType(Enum):
@@ -49,6 +50,36 @@ CHAT_TEMPLATES = {
 }
 
 
+def _get_default_cache_path() -> str:
+    current_file = Path(__file__).resolve()
+    
+
+    project_root = None
+
+    for parent in [current_file.parent] + list(current_file.parents):
+        if (parent / "setup.py").exists() or (parent / "pyproject.toml").exists():
+            project_root = parent
+            break
+
+    if project_root is None:
+        for parent in [current_file.parent] + list(current_file.parents):
+            if (parent / "sgl_spec" / "__init__.py").exists():
+                project_root = parent
+                break
+    
+
+    if project_root is None:
+        home_dir = Path.home()
+        project_root = home_dir / ".sgl_spec"
+        project_root.mkdir(exist_ok=True)
+    
+    # Create cache directory if it doesn't exist
+    cache_dir = project_root / "cache"
+    cache_dir.mkdir(exist_ok=True)
+    
+    return str(cache_dir / "cache.pt")
+
+
 @dataclass
 class DataConfig:
     batch_size: int = 8  # Training batch size
@@ -58,7 +89,7 @@ class DataConfig:
     shuffle_seed: int = 42
     pin_memory: bool = True
     num_workers: int = 4
-    load_from_cache_file: str = field(default_factory=lambda: str(Path(__file__).resolve().parent.parent / 'cache.pt'))
+    load_from_cache_file: str = field(default_factory=_get_default_cache_path)
 
     # Performance settings
     preprocess_batch_size: int = 1024  # Batch size for data preprocessing

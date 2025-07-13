@@ -12,7 +12,7 @@ def process_token_dict_to_mappings(
     draft_vocab_size: int, 
     vocab_size: int, 
     load_from_cache_file: str = ''
-) -> Tuple[List[int], List[bool]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Process token_dict to create d2t and t2d mappings, with optional caching.
     """
@@ -33,10 +33,11 @@ def process_token_dict_to_mappings(
     used_tokens_set = set(used_tokens)
     
     # Create d2t mapping: draft token index -> target token index
-    d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
+    d2t = torch.tensor([used_tokens[i] - i for i in range(len(used_tokens))], dtype=torch.long)
     
     # Create t2d mapping: target token index -> boolean (whether in draft vocab)
-    t2d = [i in used_tokens_set for i in range(vocab_size)]
+    t2d = torch.tensor([i in used_tokens_set for i in range(vocab_size)], dtype=torch.bool
+                       )
 
     if load_from_cache_file:
         # Create the directory for the cache file if it doesn't exist
