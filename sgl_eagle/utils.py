@@ -1,6 +1,7 @@
 import os
 from omegaconf import OmegaConf
-
+from contextlib import contextmanager
+import torch.distributed as dist
 
 def load_config(config_path: str):
     """
@@ -56,3 +57,14 @@ def build_model(config):
     cfg_cls = model_cls.config_class
     model_cfg = cfg_cls(**cfg_copy)
     return model_cls(model_cfg)
+
+@contextmanager
+def rank_0_priority():
+    rank = dist.get_rank()
+
+    if rank == 0:
+        yield
+        dist.barrier()
+    else:
+        dist.barrier()
+        yield

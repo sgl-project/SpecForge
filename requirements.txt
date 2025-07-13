@@ -7,3 +7,5 @@ deepspeed
 omegaconf
 tqdm
 wandb
+psutil
+numpy
