@@ -9,7 +9,6 @@ from datasets import Dataset
 
 from sgl_spec.data.config import DataConfig
 
-
 @contextmanager
 def rank_0_priority():
     rank = dist.get_rank()
@@ -82,56 +81,43 @@ def preprocess_conversations(
             truncation=True,
         )
 
-        ids = encoding.input_ids[0]
-        offsets = encoding.offset_mapping[0]
+        input_ids = encoding.input_ids[0]
         
-        # 模拟原始代码：初始化为全1，然后逐步设为0
-        mask = torch.ones_like(ids)
-        
-        # 对应原始代码：cur_len = 1, loss_mask[:cur_len] = 0
-        mask[0] = 0  # 跳过第0个token
+        turns = conversation.split(user_header)
 
-        # 模拟原始代码的turn处理逻辑
-        sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-        turns = conversation.split(sep2)
-        
-        if len(turns) > 1:
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
-            
-            cur_len = 1  # 对应原始代码的起始位置
-            
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                    
-                turn_len = len(tokenizer(turn).input_ids)
-                parts = turn.split(sep)
-                
-                if len(parts) != 2:
-                    break
-                    
-                parts[0] += sep
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-                
-                # 模拟原始代码的边界处理
-                if i == 0:
-                    mask[cur_len: cur_len + instruction_len - 2] = 0
-                else:
-                    mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                    
-                cur_len += turn_len
-                if i != 0:
-                    cur_len += 3
-                    
-            # 关键：模拟原始代码的结尾处理
-            mask[cur_len:] = 0
+        turns[1] = turns[0] + user_header + turns[1]
+        turns = turns[1:]
 
-        results["input_ids"].append(ids[None, :])
-        results["loss_mask"].append(mask[None, :])
+        cur_len = 1
+        loss_mask = torch.ones_like(input_ids)
+        loss_mask[:cur_len] = 0
+        for i, turn in enumerate(turns):
+            if turn == "":
+                break
+            turn_len = len(tokenizer(turn).input_ids)
+
+            parts = turn.split(assistant_header)
+            if len(parts) != 2:
+                break
+            parts[0] += assistant_header
+            instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+
+            if i == 0:
+                loss_mask[cur_len: cur_len + instruction_len - 2] = 0
+            else:
+                loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
+            cur_len += turn_len
+            if i != 0:
+                cur_len += 3
+
+
+        loss_mask[cur_len:] = 0
+
+
+        results["input_ids"].append(input_ids[None, :])
+        results["loss_mask"].append(loss_mask[None, :])
 
         if return_attention_mask:
-            results["attention_mask"].append(torch.ones_like(mask)[None, :])
-        
+            results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+
     return results
