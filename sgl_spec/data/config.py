@@ -15,8 +15,8 @@ class ModelType(Enum):
 # Predefined chat template configurations
 CHAT_TEMPLATES = {
     ModelType.LLAMA3: {
-        "assistant_header": "<|start_header_id|>assistant<|end_header_id|>\n\n",
-        "user_header": "<|start_header_id|>user<|end_header_id|>",
+        "assistant_header": "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        "user_header": "<|eot_id|><|start_header_id|>user<|end_header_id|>",
         "system_prompt": (
             "You are a helpful, respectful and honest assistant. Always answer as "
             "helpfully as possible, while being safe.  Your answers should not "
