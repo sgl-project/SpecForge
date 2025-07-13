@@ -3,17 +3,16 @@ import logging
 import os
 
 import torch
+import wandb
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import wandb
-from sgl_eagle import OfflineEagleTrainer
-from sgl_eagle.data.eagle_data_wrapper import (
+from sgl_spec import OfflineEagleTrainer
+from sgl_spec.data.eagle_data_wrapper import (
     EagleDatasetWrapper,
     custom_eagle_collate_fn,
 )
-from sgl_eagle.utils import build_criterion, build_model, build_optimizer, load_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -153,7 +152,9 @@ def main():
     os.makedirs(final_output_dir, exist_ok=True)
 
     # 这样保存不会有 DictConfig 问题
-    torch.save(draft_model.state_dict(), os.path.join(final_output_dir, "pytorch_model.bin"))
+    torch.save(
+        draft_model.state_dict(), os.path.join(final_output_dir, "pytorch_model.bin")
+    )
 
 
 if __name__ == "__main__":
