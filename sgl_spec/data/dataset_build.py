@@ -92,12 +92,12 @@ def build_dataset_rank(
     num_proc = config.num_processes
 
     # Create a temporary file to collect token statistics during processing
-    token_stats_file = None
-    token_stats_filename = None
     if compute_token_dict:
-        token_stats_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
-        token_stats_filename = token_stats_file.name
-        token_stats_file.close()  # Close immediately, we'll append to it
+        token_stats_filename = tempfile.mktemp()
+        token_stats_file_prefix = token_stats_filename
+    else:
+        token_stats_filename = None
+        token_stats_file_prefix = None
 
     def preprocess_function(examples):
         # Always do preprocessing
@@ -111,7 +111,7 @@ def build_dataset_rank(
             config=config,
         )
 
-        if compute_token_dict and token_stats_filename:
+        if compute_token_dict and token_stats_file_prefix:
             # Vectorized tensor processing
             all_input_ids = torch.cat(
                 [torch.LongTensor(item[0]) for item in processed["input_ids"]], dim=0
@@ -126,8 +126,8 @@ def build_dataset_rank(
                 unique_ids, counts = masked_ids.unique(return_counts=True)
                 batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
 
-                # Save token statistics to file immediately
-                with open(token_stats_filename, "ab") as f:
+                pid = os.getpid()
+                with open(f"{token_stats_file_prefix}.{pid}", "ab") as f:
                     pickle.dump(batch_token_dict, f)
 
         return processed
@@ -143,23 +143,24 @@ def build_dataset_rank(
 
     # Collect token dictionary from file if needed
     token_dict = None
-    if compute_token_dict and token_stats_filename:
+    if compute_token_dict and token_stats_file_prefix:
+        import glob
+
         token_dict = Counter()
-        # Read all token statistics from file
-        try:
-            with open(token_stats_filename, "rb") as f:
-                while True:
-                    try:
-                        batch_dict = pickle.load(f)
-                        token_dict.update(batch_dict)
-                    except EOFError:
-                        break
-        except FileNotFoundError:
-            pass  # No token statistics were saved
-        finally:
-            # Clean up temporary file
-            if os.path.exists(token_stats_filename):
-                os.unlink(token_stats_filename)
+        for fname in glob.glob(f"{token_stats_file_prefix}.*"):
+            try:
+                with open(fname, "rb") as f:
+                    while True:
+                        try:
+                            batch_dict = pickle.load(f)
+                            token_dict.update(batch_dict)
+                        except EOFError:
+                            break
+            except FileNotFoundError:
+                pass
+            finally:
+                if os.path.exists(fname):
+                    os.unlink(fname)
 
     dataset.set_format(type="torch")
 
