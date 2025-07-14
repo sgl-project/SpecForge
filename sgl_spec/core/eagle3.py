@@ -7,8 +7,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.distributed.fsdp import FSDPModule
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from sgl_spec.modeling.draft import Eagle3DraftModel
@@ -74,6 +72,12 @@ class OnlineEagle3Pipeline(Eagle3Pipeline):
         loss_mask = loss_mask.to(device)
         return hidden_states, target, loss_mask, input_ids
 
+    def _unwrap_draft_model(self):
+        if isinstance(self.draft_model, DDP):
+            return self.draft_model.module
+        else:
+            return self.draft_model
+
     def step(
         self,
         input_ids,
@@ -93,7 +97,7 @@ class OnlineEagle3Pipeline(Eagle3Pipeline):
         past_key_values_length = 0
 
         # Step 2: project the concatenated hidden states to the target hidden size
-        hidden_states = self.draft_model.project_hidden_states(hidden_states)
+        hidden_states = self._unwrap_draft_model().project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
         if past_key_values is not None:
@@ -118,7 +122,7 @@ class OnlineEagle3Pipeline(Eagle3Pipeline):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        attention_mask = self.draft_model.prepare_decoder_attention_mask(
+        attention_mask = self._unwrap_draft_model().prepare_decoder_attention_mask(
             attention_mask=attention_mask,
             hidden_states=hidden_states,
             batch_size=batch_size,
@@ -136,11 +140,11 @@ class OnlineEagle3Pipeline(Eagle3Pipeline):
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+            inputs_embeds = self._unwrap_draft_model().embed_input_ids(input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
-            hidden_states_out = self.draft_model.backbone(
+            hidden_states_out = self._unwrap_draft_model().backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
                 cache_hidden=cache_hidden,
@@ -153,10 +157,10 @@ class OnlineEagle3Pipeline(Eagle3Pipeline):
             with torch.no_grad():
                 target_head = target
                 target_max_token = target_head.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token]
+                target_mask = self._unwrap_draft_model().t2d[target_max_token]
                 target_mask = target_mask[..., None].int()
                 position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.draft_model.t2d]
+                target_head = target_head[..., self._unwrap_draft_model().t2d]
                 target_head = target_head.float()
                 target_p = nn.Softmax(dim=2)(target_head)
                 target_p = target_p.detach()
@@ -165,7 +169,7 @@ class OnlineEagle3Pipeline(Eagle3Pipeline):
             hidden_states = hidden_states_out
 
             # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
+            logits = self._unwrap_draft_model().compute_logits(hidden_states)
             logits = logits.float()
 
             # Step 5.5: calculate loss

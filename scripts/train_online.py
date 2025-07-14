@@ -4,8 +4,7 @@ import os
 import torch
 import torch.distributed as dist
 import wandb
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -80,7 +79,11 @@ def main():
     draft_model = AutoEagle3DraftModel.from_config(draft_model_config).cuda()
     draft_model.load_embedding(args.target_model_path)
     draft_model.freeze_embedding()
+    draft_model.load_vocab_mapping(
+        "/data/eagle_data/shenggui/projects/EAGLE/eagle/traineagle3/cache.pt"
+    )
 
+    draft_model = DDP(draft_model)
     eagle3_pipeline = OnlineEagle3Pipeline(
         target_model=target_model,
         draft_model=draft_model,
