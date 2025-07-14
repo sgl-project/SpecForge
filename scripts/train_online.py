@@ -79,6 +79,7 @@ def main():
     draft_model = AutoEagle3DraftModel.from_config(draft_model_config).cuda()
     draft_model.load_embedding(args.target_model_path)
     draft_model.freeze_embedding()
+    dist.barrier()
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
