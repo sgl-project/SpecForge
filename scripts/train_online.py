@@ -64,12 +64,11 @@ def main():
         batch_size=args.batch_size,
         model_type=ModelType(args.data_type),
         max_length=args.max_length,
-        load_from_cache_file=True,
         num_processes=1,
     )
 
-    train_dataloader, eval_dataloader, train_sampler, _, _ = prepare_full_dataloaders(
-        tokenizer, args.train_data_path, args.eval_data_path, config=data_config
+    train_dataloader, eval_dataloader, train_sampler, _, d2t_path = prepare_full_dataloaders(
+        tokenizer, args.train_data_path, args.eval_data_path, draft_model=draft_model, config=data_config,
     )
 
     # build other components
