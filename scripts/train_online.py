@@ -87,6 +87,7 @@ def main():
         batch_size=args.batch_size,
         model_type=ModelType(args.data_type),
         max_length=args.max_length,
+        num_processes=1,
     )
     train_dataloader, eval_dataloader, train_sampler, _, d2t_path = (
         prepare_full_dataloaders(
