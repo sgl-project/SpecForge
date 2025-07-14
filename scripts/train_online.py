@@ -79,27 +79,30 @@ def main():
     draft_model = AutoEagle3DraftModel.from_config(draft_model_config).cuda()
     draft_model.load_embedding(args.target_model_path)
     draft_model.freeze_embedding()
-    draft_model.load_vocab_mapping(
-        "/data/eagle_data/shenggui/projects/EAGLE/eagle/traineagle3/cache.pt"
-    )
 
-    draft_model = DDP(draft_model)
-    eagle3_pipeline = OnlineEagle3Pipeline(
-        target_model=target_model,
-        draft_model=draft_model,
-    )
-
-    # build dataset and dataloader
+    # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     data_config = DataConfig(
         batch_size=args.batch_size,
         model_type=ModelType(args.data_type),
         max_length=args.max_length,
-        num_processes=1,
     )
+    train_dataloader, eval_dataloader, train_sampler, _, d2t_path = (
+        prepare_full_dataloaders(
+            tokenizer,
+            args.train_data_path,
+            args.eval_data_path,
+            draft_model=draft_model,
+            config=data_config,
+        )
+    )
+    draft_model.load_vocab_mapping(d2t_path)
 
-    train_dataloader, eval_dataloader, train_sampler, _, d2t_path = prepare_full_dataloaders(
-        tokenizer, args.train_data_path, args.eval_data_path, draft_model=draft_model, config=data_config,
+    # build pipeline
+    draft_model = DDP(draft_model)
+    eagle3_pipeline = OnlineEagle3Pipeline(
+        target_model=target_model,
+        draft_model=draft_model,
     )
 
     # build other components

@@ -95,8 +95,9 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         self.embed_tokens.weight.requires_grad = False
 
+    @torch.no_grad()
     def load_embedding(
-        self, model_path: str, embedding_name: str = "embed_tokens"
+        self, model_path: str, embedding_key: str = "model.embed_tokens.weight"
     ) -> None:
         """
         Load the embedding of the draft model.
@@ -104,12 +105,10 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         Args:
             model_path (str): The path to the huggingface repository.
         """
-        embedding_weight_name = f"{embedding_name}.weight"
-
         if os.path.exists(model_path):
             # model_path is a local directory
             # check if there is file ending with index.json
-            glob_path = os.path.join(model_path, "**", "*.safetensors.index.json")
+            glob_path = os.path.join(model_path, "*.index.json")
             index_json_path = glob.glob(glob_path)
 
             if len(index_json_path) == 0:
@@ -122,22 +121,22 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
             with open(index_json_path, "r") as f:
                 index_json = json.load(f)
-            ckpt_file = index_json["weight_map"][embedding_weight_name]
+            ckpt_file = index_json["weight_map"][embedding_key]
 
             if ckpt_file.endswith(".safetensors"):
                 with safe_open(
                     os.path.join(model_path, ckpt_file), framework="pt"
                 ) as f:
-                    emb_tokens = f.get_tensor(embedding_weight_name)
+                    emb_tokens = f.get_tensor(embedding_key)
             else:
                 state_dict = torch.load(os.path.join(model_path, ckpt_file))
-                emb_tokens = state_dict[embedding_name]
+                emb_tokens = state_dict[embedding_key]
             self.embed_tokens.weight.copy_(emb_tokens)
         else:
             # this is the case where model_path is a huggingface repository
             # we first need to locate its local cache
             local_cache_path = snapshot_download(repo_id=model_path)
-            self.load_embedding(local_cache_path, embedding_name)
+            self.load_embedding(local_cache_path, embedding_key)
 
     def load_vocab_mapping(self, file_path: str) -> None:
         """

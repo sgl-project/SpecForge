@@ -8,7 +8,7 @@ torchrun \
     $ROOT_DIR/scripts/train_online.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/sharegpt_top100.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
     --eval-data-path $ROOT_DIR/cache/dataset/sharegpt_top100.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3 \
     --num-epochs 10 \
