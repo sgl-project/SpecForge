@@ -66,9 +66,11 @@ def preprocess_conversations(
             return_offsets_mapping=True,
             max_length=max_length,
             truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
         )
-        input_ids = encoding.input_ids
-        offsets = encoding.offset_mapping
+        input_ids = encoding.input_ids[0]
+        offsets = encoding.offset_mapping[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
 
         # Find spans of assistant responses using regex

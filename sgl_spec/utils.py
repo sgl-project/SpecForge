@@ -1,6 +1,7 @@
 import json
 import os
 from contextlib import contextmanager
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -30,8 +31,13 @@ def padding(tensor, left=True):
     return tensor
 
 
-def init_distributed():
-    dist.init_process_group(backend="nccl")
+def init_distributed(timeout: int = 10):
+    """Initialize distributed training.
+
+    Args:
+        timeout(int): Timeout for collective communication in minutes
+    """
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
     torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
 
 

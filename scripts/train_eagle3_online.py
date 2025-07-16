@@ -7,7 +7,7 @@ import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -48,12 +48,19 @@ def parse_args():
     parser.add_argument("--eval-interval", type=int, default=1)
     parser.add_argument("--save-interval", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--dist-timeout",
+        type=int,
+        default=20,
+        help="Timeout for collective communication in minutes",
+    )
 
     # wandb wandb args
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
+
     args = parser.parse_args()
     return args
 
@@ -77,7 +84,7 @@ def main():
     # initialize
     args = parse_args()
     set_seed(args.seed)
-    init_distributed()
+    init_distributed(timeout=args.dist_timeout)
 
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
@@ -276,11 +283,20 @@ def main():
 
         if epoch % args.save_interval == 0:
             # Save the model
-            if dist.get_rank() == 0:
-                draft_model.save_pretrained(
-                    os.path.join(args.output_dir, f"epoch_{epoch}")
-                )
-            dist.barrier()
+            with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+                model_state_dict = eagle3_model.state_dict()
+                draft_model_state_dict = {
+                    k.replace("draft_model.", ""): v
+                    for k, v in model_state_dict.items()
+                    if "draft_model." in k
+                }
+
+                if dist.get_rank() == 0:
+                    draft_model.save_pretrained(
+                        os.path.join(args.output_dir, f"epoch_0"),
+                        state_dict=draft_model_state_dict,
+                    )
+                dist.barrier()
 
 
 if __name__ == "__main__":

@@ -3,11 +3,11 @@ import logging
 import os
 
 import torch
-import wandb
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+import wandb
 from sgl_spec import OfflineEagleTrainer
 from sgl_spec.data.eagle_data_wrapper import (
     EagleDatasetWrapper,
