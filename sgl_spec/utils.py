@@ -32,7 +32,7 @@ def padding(tensor, left=True):
 
 def init_distributed():
     dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(dist.get_rank())
+    torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
 
 
 def load_config_from_file(config_path: str):

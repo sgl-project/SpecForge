@@ -11,10 +11,10 @@ torchrun \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
-    --eval-data-path $ROOT_DIR/cache/dataset/sharegpt_top100.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \
     --learning-rate 1e-4 \
     --max-length 2048 \
-    --data-type llama3
+    --chat-template llama3 \
+    --cache-dir $ROOT_DIR/cache

@@ -193,3 +193,4 @@ cython_debug/
 .cursorindexingignore
 cache/
 outputs/
+wandb/

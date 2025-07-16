@@ -2,10 +2,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+from datasets import Dataset
 from torch.utils.data import DataLoader, DistributedSampler
-
-from sgl_spec.data.config import DataConfig
-from sgl_spec.data.dataset_build import build_dataset_rank, build_test_dataset
+from transformers import PreTrainedTokenizer
 
 
 class DataCollatorWithPadding:
@@ -43,42 +42,27 @@ class DataCollatorWithPadding:
         return batch
 
 
-def prepare_dataloaders(
-    train_data, test_data, tokenizer, config: Optional[DataConfig] = None
+def prepare_dp_dataloaders(
+    dataset: Dataset,
+    batch_size: int,
+    num_workers: int = 4,
+    process_group: Optional[dist.ProcessGroup] = None,
+    pin_memory: Optional[bool] = False,
+    shuffle: Optional[bool] = False,
+    **dataloader_kwargs
 ):
-    if config is None:
-        config = DataConfig()
-
-    # Only compute token dictionary for training data
-    train_dataset, token_dict = build_dataset_rank(
-        tokenizer, train_data, compute_token_dict=True, config=config
+    world_size = dist.get_world_size(process_group)
+    rank = dist.get_rank(process_group)
+    sampler = DistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
     )
-
-    # Test data doesn't need token counting - use simplified version
-    test_dataset, _ = build_test_dataset(tokenizer, test_data, config=config)
-
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        sampler=train_sampler,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         collate_fn=DataCollatorWithPadding(),
+        **dataloader_kwargs
     )
-    test_sampler = DistributedSampler(
-        test_dataset, num_replicas=world_size, rank=rank, shuffle=False
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.batch_size,
-        sampler=test_sampler,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
-        collate_fn=DataCollatorWithPadding(),
-    )
-    return train_loader, test_loader, train_sampler, test_sampler, token_dict
+    return dataloader

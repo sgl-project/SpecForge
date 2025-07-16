@@ -1,17 +1,23 @@
 import argparse
+import hashlib
 import os
 
 import torch
 import torch.distributed as dist
-import wandb
+from datasets import load_dataset
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import wandb
 from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Pipeline
-from sgl_spec.data.config import DataConfig, ModelType
-from sgl_spec.data.data_pipeline import prepare_full_dataloaders
-from sgl_spec.utils import init_distributed
+from sgl_spec.data import (
+    build_eagle3_dataset,
+    generate_vocab_mapping_file,
+    prepare_dp_dataloaders,
+)
+from sgl_spec.lr_scheduler import CosineAnnealingWarmupLR
+from sgl_spec.utils import init_distributed, rank_0_priority
 
 
 def parse_args():
@@ -28,9 +34,10 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--warmup-ratio", type=int, default=0.01)
 
     # data processing type
-    parser.add_argument("--data-type", type=str, default="llama3")
+    parser.add_argument("--chat-template", type=str, default="llama3")
 
     # other args
     parser.add_argument("--cache-key", type=str, default=None)
@@ -73,32 +80,64 @@ def main():
 
     # build target and draft model
     target_model = (
-        AutoModelForCausalLM.from_pretrained(args.target_model_path).eval().cuda()
+        AutoModelForCausalLM.from_pretrained(
+            args.target_model_path, torch_dtype=torch.bfloat16
+        )
+        .eval()
+        .cuda()
     )
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-    draft_model = AutoEagle3DraftModel.from_config(draft_model_config).cuda()
+    draft_model = (
+        AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
+    )
     draft_model.load_embedding(args.target_model_path)
     draft_model.freeze_embedding()
-    dist.barrier()
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    data_config = DataConfig(
-        batch_size=args.batch_size,
-        model_type=ModelType(args.data_type),
-        max_length=args.max_length,
-        num_processes=1,
-    )
-    train_dataloader, eval_dataloader, train_sampler, _, d2t_path = (
-        prepare_full_dataloaders(
-            tokenizer,
-            args.train_data_path,
-            args.eval_data_path,
-            draft_model=draft_model,
-            config=data_config,
+
+    # convert to dataloader
+    cache_key = hashlib.md5(args.train_data_path.encode()).hexdigest()
+    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    with rank_0_priority():
+        train_eagle3_dataset = build_eagle3_dataset(
+            dataset=train_dataset,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_key=cache_key,
         )
+        vocab_mapping_path = generate_vocab_mapping_file(
+            dataset=train_eagle3_dataset,
+            target_vocab_size=draft_model_config.vocab_size,
+            draft_vocab_size=draft_model_config.draft_vocab_size,
+            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+            cache_key=cache_key,
+        )
+    train_dataloader = prepare_dp_dataloaders(
+        train_eagle3_dataset,
+        args.batch_size,
+        num_workers=4,
+        shuffle=True,
     )
-    draft_model.load_vocab_mapping(d2t_path)
+    # we load the vocab mapping then
+    draft_model.load_vocab_mapping(vocab_mapping_path)
+
+    if args.eval_data_path is not None:
+        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+        eval_eagle3_dataset = build_eagle3_dataset(
+            eval_dataset,
+            tokenizer,
+            args.chat_template,
+            args.max_length,
+        )
+        eval_dataloader = prepare_dp_dataloaders(
+            eval_eagle3_dataset,
+            args.batch_size,
+            num_workers=4,
+            shuffle=False,
+        )
 
     # build pipeline
     draft_model = DDP(draft_model)
@@ -109,11 +148,16 @@ def main():
 
     # build other components
     optimizer = torch.optim.AdamW(draft_model.parameters(), lr=args.learning_rate)
+    total_steps = args.num_epochs * len(train_dataloader)
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = CosineAnnealingWarmupLR(
+        optimizer, total_steps=total_steps, warmup_steps=warmup_steps
+    )
 
     # start running
     for epoch in range(args.num_epochs):
         # Run training
-        train_sampler.set_epoch(epoch)
+        train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
         epoch_acces = [[] for _ in range(eagle3_pipeline.length)]
         epoch_plosses = [[] for _ in range(eagle3_pipeline.length)]
@@ -121,17 +165,26 @@ def main():
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
 
-            plosses, _, acces = eagle3_pipeline.step(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
-            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                plosses, _, acces = eagle3_pipeline.step(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
             optimizer.step()
+            scheduler.step()
+
+            logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
+            for i in range(len(plosses)):
+                logdict[f"train/ploss_{i}"] = plosses[i].item()
+            for i in range(len(acces)):
+                logdict[f"train/acc_{i}"] = acces[i]
+            wandb_log_if_initialized(logdict)
 
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [
@@ -159,17 +212,21 @@ def main():
             )
 
         # run evaluation
-        if epoch % args.eval_interval == 0:
+        if args.eval_data_path is not None and epoch % args.eval_interval == 0:
             # Run evaluation
             draft_model.eval()
             eval_acces = [[] for _ in range(eagle3_pipeline.length)]
             eval_plosses = [[] for _ in range(eagle3_pipeline.length)]
+
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                plosses, _, acces = eagle3_pipeline.step(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
+                with torch.no_grad(), torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16
+                ):
+                    plosses, _, acces = eagle3_pipeline.step(
+                        input_ids=data["input_ids"].cuda(),
+                        attention_mask=data["attention_mask"].cuda(),
+                        loss_mask=data["loss_mask"].cuda(),
+                    )
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
@@ -181,9 +238,9 @@ def main():
                 acc_i = acc_i / dist.get_world_size()
                 acc_i = acc_i.item()
 
-                wandb_log_if_initialized({f"test/epochacc_{i}": acc_i})
+                wandb_log_if_initialized({f"eval/epochacc_{i}": acc_i})
                 print_on_rank0(
-                    f"Test Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
+                    f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
                 )
 
             for i in range(len(epoch_plosses)):
@@ -192,17 +249,18 @@ def main():
                 loss_i = loss_i / dist.get_world_size()
                 loss_i = loss_i.item()
 
-                wandb_log_if_initialized({f"test/epochploss_{i}": loss_i})
+                wandb_log_if_initialized({f"eval/epochploss_{i}": loss_i})
                 print_on_rank0(
-                    f"Test Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
+                    f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
                 )
 
         if epoch % args.save_interval == 0:
             # Save the model
             if dist.get_rank() == 0:
-                draft_model.save_pretrained(
+                draft_model.module.save_pretrained(
                     os.path.join(args.output_dir, f"epoch_{epoch}")
                 )
+            dist.barrier()
 
 
 if __name__ == "__main__":
