@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import re
 from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
@@ -61,42 +62,33 @@ def preprocess_conversations(
             tokenizer.pad_token_id = tokenizer.unk_token_id
 
         encoding = tokenizer(
-            conversation,
-            return_tensors="pt",
-            max_length=max_length,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-            truncation=True,
+                   conversation,
+                    return_offsets_mapping=True,
+                    max_length=max_length,
+                    truncation=True,
+                )
+        input_ids = encoding.input_ids
+        offsets = encoding.offset_mapping
+        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+
+        # Find spans of assistant responses using regex
+        assistant_pattern = (
+            re.escape(assistant_message_separator) + r"(.*?)(?=" + re.escape(user_message_separator) + "|$)"
         )
+        for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+            # Assistant response text span (excluding assistant_header itself)
+            assistant_start_char = match.start(1)
+            assistant_end_char = match.end(1)
 
-        input_ids = encoding.input_ids[0]
-        turns = conversation.split(user_message_separator)
-        turns[1] = turns[0] + user_message_separator + turns[1]
-        turns = turns[1:]
+            # Mark tokens overlapping with assistant response
+            for idx, (token_start, token_end) in enumerate(offsets):
+                # Token is part of the assistant response span
+                if token_end <= assistant_start_char:
+                    continue  # token before assistant text
+                if token_start > assistant_end_char:
+                    continue  # token after assistant text
+                loss_mask[idx] = 1
 
-        cur_len = 1
-        loss_mask = torch.ones_like(input_ids)
-        loss_mask[:cur_len] = 0
-        for i, turn in enumerate(turns):
-            if turn == "":
-                break
-            turn_len = len(tokenizer(turn).input_ids)
-
-            parts = turn.split(assistant_message_separator)
-            if len(parts) != 2:
-                break
-            parts[0] += assistant_message_separator
-            instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-            if i == 0:
-                loss_mask[cur_len : cur_len + instruction_len - 2] = 0
-            else:
-                loss_mask[cur_len - 3 : cur_len + instruction_len + 1] = 0
-            cur_len += turn_len
-            if i != 0:
-                cur_len += 3
-
-        loss_mask[cur_len:] = 0
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
