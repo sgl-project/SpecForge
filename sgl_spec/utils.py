@@ -1,11 +1,9 @@
 import json
-import os
 from contextlib import contextmanager
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf
 from transformers import PretrainedConfig
 
 
