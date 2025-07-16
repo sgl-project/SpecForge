@@ -10,7 +10,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3_online.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
-    --train-data-path /data/eagle_data/shenggui/data/data.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \
