@@ -1,3 +1,3 @@
-from .eagle3 import OfflineEagle3Pipeline, OnlineEagle3Pipeline
+from .eagle3 import OfflineEagle3Model, OnlineEagle3Model
 
-__all__ = ["OnlineEagle3Pipeline", "OfflineEagle3Pipeline"]
+__all__ = ["OnlineEagle3Model", "OfflineEagle3Model"]

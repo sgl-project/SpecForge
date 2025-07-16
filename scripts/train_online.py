@@ -4,13 +4,15 @@ import os
 
 import torch
 import torch.distributed as dist
-import wandb
+from accelerate.utils import set_seed
 from datasets import load_dataset
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Pipeline
+import wandb
+from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
 from sgl_spec.data import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
@@ -34,7 +36,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--warmup-ratio", type=int, default=0.01)
+    parser.add_argument("--warmup-ratio", type=int, default=0.02)
 
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
@@ -45,6 +47,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--eval-interval", type=int, default=1)
     parser.add_argument("--save-interval", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
 
     # wandb wandb args
     parser.add_argument("--wandb", action="store_true")
@@ -73,6 +76,7 @@ def print_on_rank0(message):
 def main():
     # initialize
     args = parse_args()
+    set_seed(args.seed)
     init_distributed()
 
     if args.wandb and dist.get_rank() == 0:
@@ -139,15 +143,26 @@ def main():
             shuffle=False,
         )
 
-    # build pipeline
-    draft_model = DDP(draft_model)
-    eagle3_pipeline = OnlineEagle3Pipeline(
+    # build Eagle3 model
+    # broadcast draft model
+    eagle3_model = OnlineEagle3Model(
         target_model=target_model,
         draft_model=draft_model,
     )
+    # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
+    eagle3_model = FSDP(
+        eagle3_model,
+        use_orig_params=True,
+        mixed_precision=MixedPrecision(
+            param_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        ignored_modules=[target_model],
+    )
 
     # build other components
-    optimizer = torch.optim.AdamW(draft_model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
     total_steps = args.num_epochs * len(train_dataloader)
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = CosineAnnealingWarmupLR(
@@ -157,20 +172,18 @@ def main():
     # start running
     for epoch in range(args.num_epochs):
         # Run training
-        train_dataloader.sampler.set_epoch(epoch)
+        train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
-        epoch_acces = [[] for _ in range(eagle3_pipeline.length)]
-        epoch_plosses = [[] for _ in range(eagle3_pipeline.length)]
+        epoch_acces = [[] for _ in range(eagle3_model.module.length)]
+        epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                plosses, _, acces = eagle3_pipeline.step(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
+            plosses, _, acces = eagle3_model(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+            )
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -178,6 +191,16 @@ def main():
             ploss.backward()
             optimizer.step()
             scheduler.step()
+
+            # assert all weights are equal
+            # torch.cuda.synchronize()
+            # for name, p in draft_model.named_parameters():
+            #     param_list = [torch.empty_like(p) for _ in range(dist.get_world_size())]
+            #     dist.all_gather(param_list, p)
+            #     for i in range(len(param_list)):
+            #         if i == dist.get_rank():
+            #             continue
+            #         assert torch.all(param_list[i] == param_list[dist.get_rank()]), f"rank {dist.get_rank()} and rank {i} have different weights for {name}, {param_list[i]} vs {param_list[dist.get_rank()]}"
 
             logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
             for i in range(len(plosses)):
@@ -215,18 +238,15 @@ def main():
         if args.eval_data_path is not None and epoch % args.eval_interval == 0:
             # Run evaluation
             draft_model.eval()
-            eval_acces = [[] for _ in range(eagle3_pipeline.length)]
-            eval_plosses = [[] for _ in range(eagle3_pipeline.length)]
+            eval_acces = [[] for _ in range(eagle3_model.length)]
+            eval_plosses = [[] for _ in range(eagle3_model.length)]
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                with torch.no_grad(), torch.autocast(
-                    device_type="cuda", dtype=torch.bfloat16
-                ):
-                    plosses, _, acces = eagle3_pipeline.step(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].cuda(),
-                    )
+                plosses, _, acces = eagle3_model(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
@@ -257,7 +277,7 @@ def main():
         if epoch % args.save_interval == 0:
             # Save the model
             if dist.get_rank() == 0:
-                draft_model.module.save_pretrained(
+                draft_model.save_pretrained(
                     os.path.join(args.output_dir, f"epoch_{epoch}")
                 )
             dist.barrier()

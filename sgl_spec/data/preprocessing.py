@@ -103,7 +103,7 @@ def build_eagle3_dataset(
     tokenizer: PreTrainedTokenizer,
     chat_template: str,
     max_length: Optional[int] = 2048,
-    shuffle_seed: Optional[int] = 0,
+    shuffle_seed: Optional[int] = 42,
     num_proc: Optional[int] = 8,
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
@@ -167,7 +167,7 @@ def generate_vocab_mapping_file(
 ):
     # prepare cache direcotory
     os.makedirs(cache_dir, exist_ok=True)
-    vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pkl")
+    vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")
 
     if os.path.exists(vocab_mapping_path):
         print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
@@ -212,18 +212,10 @@ def process_token_dict_to_mappings(
     top_N_frequency_sum = sum(freq for key, freq in top_N)
     top_N_ratio = top_N_frequency_sum / total_frequency
     print(f"top {draft_vocab_size} token frequency ratio: {top_N_ratio:.2%}")
-
     used_tokens = [key for key, freq in top_N]
     used_tokens.sort()
-    used_tokens_set = set(used_tokens)
-
-    # Create d2t mapping: draft token index -> target token index
-    d2t = torch.tensor(
-        [used_tokens[i] - i for i in range(len(used_tokens))], dtype=torch.long
-    )
-
-    # Create t2d mapping: target token index -> boolean (whether in draft vocab)
-    t2d = torch.tensor(
-        [i in used_tokens_set for i in range(target_vocab_size)], dtype=torch.bool
-    )
+    d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
+    t2d = [i in used_tokens for i in range(target_vocab_size)]
+    d2t = torch.tensor(d2t)
+    t2d = torch.tensor(t2d)
     return d2t, t2d
