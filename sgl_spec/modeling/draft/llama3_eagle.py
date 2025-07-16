@@ -587,29 +587,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
-        # Load vocab buffers dynamically from data processing
-        self.load_vocab_buffers()
-
-    def load_vocab_buffers(self, cache_path: str = None):
-        """
-        Load vocabulary buffers from cache file or wait for dynamic loading.
-        
-        Args:
-            cache_path: Optional path to cache file. If None, buffers will be set dynamically.
-        """
-        if cache_path is not None:
-            try:
-                ckpt = torch.load(cache_path)
-                self.t2d.copy_(ckpt["t2d"])
-                self.d2t.copy_(ckpt["d2t"])
-                print(f"Loaded vocab buffers from {cache_path}")
-            except FileNotFoundError:
-                print(f"Cache file {cache_path} not found, vocab buffers will be set dynamically")
-        else:
-            print("No cache path provided, vocab buffers will be set dynamically")
-
-    def load_embeddings(self, model_path: str):
-        pass
 
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length
@@ -725,6 +702,3 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=False,
             use_cache=False,
         )
-
-    def load_embedding(self, model_path: str):
-        pass

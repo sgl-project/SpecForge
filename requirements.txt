@@ -3,9 +3,8 @@ torch
 transformers
 datasets
 setuptools
-deepspeed
-omegaconf
 tqdm
 wandb
 psutil
 numpy
+accelerate
