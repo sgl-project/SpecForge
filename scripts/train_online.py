@@ -4,12 +4,12 @@ import os
 
 import torch
 import torch.distributed as dist
+import wandb
 from datasets import load_dataset
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import wandb
 from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Pipeline
 from sgl_spec.data import (
     build_eagle3_dataset,

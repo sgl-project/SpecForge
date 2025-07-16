@@ -1,10 +1,10 @@
 import os
+import re
 import warnings
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import re
 from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
@@ -62,18 +62,21 @@ def preprocess_conversations(
             tokenizer.pad_token_id = tokenizer.unk_token_id
 
         encoding = tokenizer(
-                   conversation,
-                    return_offsets_mapping=True,
-                    max_length=max_length,
-                    truncation=True,
-                )
+            conversation,
+            return_offsets_mapping=True,
+            max_length=max_length,
+            truncation=True,
+        )
         input_ids = encoding.input_ids
         offsets = encoding.offset_mapping
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
 
         # Find spans of assistant responses using regex
         assistant_pattern = (
-            re.escape(assistant_message_separator) + r"(.*?)(?=" + re.escape(user_message_separator) + "|$)"
+            re.escape(assistant_message_separator)
+            + r"(.*?)(?="
+            + re.escape(user_message_separator)
+            + "|$)"
         )
         for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
             # Assistant response text span (excluding assistant_header itself)
