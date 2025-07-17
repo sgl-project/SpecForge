@@ -96,7 +96,7 @@ class AutoDraftModelConfig:
 
 **Customize Data**: If you want to use your own dataset, make sure you prepared the dataset in the same format as given in the [data preparation section](#-data-preparation). If you have multiple datasets, you can just merge them into the one jsonl file. For example, you can do something like `cat dataset1.jsonl dataset2.jsonl > merged_dataset.jsonl`.
 
-**Wandb integration**: If you wish to log the training progress to WanDB, you can add `--wandb`, `--wandb-key`, `--wandb-project` and `--wandb-name` to the command line in the provided sh file.
+**Wandb integration**: If you wish to log the training progress to Wandb, you can add `--wandb`, `--wandb-key`, `--wandb-project` and `--wandb-name` to the command line in the provided sh file.
 
 
 ### 💨 Offline Training
