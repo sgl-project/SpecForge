@@ -78,11 +78,11 @@ class MyModelEagle3(Eagle3DraftModel):
 You can then register these models to the `AutoEagle3TargetModel` and `AutoDraftModelConfig` classes in the `sgl_spec.modeling.auto.py` file for the automatic model loading.
 
 ```diff
-class AutoEagle3TargetModel(AutoModelForCausalLMBase):
+class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
         LlamaConfig: [LlamaForCausalLMEagle3],
-+       MyModelConfig: [MyModelEagle3],
++       MyModelConfig: MyModelEagle3,
     }
 
 
