@@ -1,6 +1,10 @@
+from datetime import timedelta
+
+import torch
 import torch.distributed as dist
 
 _TP_GROUP = None
+_DP_GROUP = None
 
 
 def get_tp_group():
@@ -8,7 +12,23 @@ def get_tp_group():
     return _TP_GROUP
 
 
-def create_tp_group(tp_size):
+def get_dp_group():
+    global _DP_GROUP
+    return _DP_GROUP
+
+
+def init_distributed(timeout: int = 10, tp_size: int = 1):
+    """Initialize distributed training.
+
+    Args:
+        timeout(int): Timeout for collective communication in minutes
+    """
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
+    torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
+    _create_tp_group(tp_size)
+
+
+def _create_tp_group(tp_size):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     assert world_size % tp_size == 0, "world size must be divisible by tp size"

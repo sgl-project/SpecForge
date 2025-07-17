@@ -1,7 +1,7 @@
 # Source: https://github.com/huggingface/transformers/blob/ebfbcd42da327b4a9f2d73c93a962be0a581faaa/src/transformers/models/llama4/modeling_llama4.py
 # Modifications are denoted by the symbol: [MODIFIED]
 
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -33,6 +33,11 @@ from transformers.utils import (
     logging,
 )
 
+from sgl_spec.distributed import get_tp_group
+from sgl_spec.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+from .base import DistributedTargetModel
+
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
     from transformers.integrations.flex_attention import make_flex_block_causal_mask
@@ -47,8 +52,6 @@ class Llama4TextExperts(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
-
-        from comm import get_tp_group
 
         self.tp_group = get_tp_group()
         self.expert_dim_per_shard = self.expert_dim // dist.get_world_size(
@@ -101,9 +104,6 @@ class Llama4TextMLP(nn.Module):
 
         self.config = config
 
-        from comm import get_tp_group
-        from layers import ColumnParallelLinear, RowParallelLinear
-
         self.tp_group = get_tp_group()
         self.gate_proj = ColumnParallelLinear(
             config.hidden_size, intermediate_size, bias=False
@@ -119,7 +119,7 @@ class Llama4TextMLP(nn.Module):
     def forward(self, x):
         down_proj = self.activation_fn(self.gate_proj(x)) * self.up_proj(x)
         out = self.down_proj(down_proj)
-        out = dist.all_reduce(out, group=self.tp_group)
+        dist.all_reduce(out, group=self.tp_group)
         return out
 
 
@@ -341,9 +341,6 @@ class Llama4TextAttention(nn.Module):
         self.is_causal = True
         self.use_rope = config.no_rope_layers[layer_idx]
 
-        from comm import get_tp_group
-        from layers import ColumnParallelLinear, RowParallelLinear
-
         self.tp_group = get_tp_group()
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -447,7 +444,7 @@ class Llama4TextAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         # apply all reduce
-        attn_output = dist.all_reduce(attn_output, group=self.tp_group)
+        dist.all_reduce(attn_output, group=self.tp_group)
         return attn_output, attn_weights
 
 
@@ -1016,7 +1013,7 @@ class Llama4TextModel(Llama4PreTrainedModel):
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
-class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin):
+class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin, DistributedTargetModel):
     _no_split_modules = ["Llama4TextDecoderLayer"]
     base_model_prefix = "language_model"
     _tied_weights_keys = ["lm_head.weight"]
@@ -1027,9 +1024,6 @@ class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Llama4TextModel(config)
         self.vocab_size = config.vocab_size
-
-        from comm import get_tp_group
-        from layers import ColumnParallelLinear
 
         self.tp_group = get_tp_group()
         self.lm_head = ColumnParallelLinear(
@@ -1157,3 +1151,48 @@ class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def load_weights(self, state_dict: Dict[str, torch.Tensor]):
+        tp_group = get_tp_group()
+
+        updated_state_dict = {}
+        for key, value in state_dict.items():
+            # Ensure that the state dict is a flat dict of keys and tensors. Breaking this assumption
+            # will break recipe code
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    f"Expected all values in the state dict to be torch.Tensor. "
+                    f"Found {type(value)} instead."
+                )
+
+            # update key
+            if key.startswith("language_model."):
+                key = key[len("language_model.") :]
+            else:
+                # ignore non-language model weights
+                continue
+
+            module_key = ".".join(key.split(".")[:-1])
+            module = self.get_submodule(module_key)
+
+            # get the module type based on key
+            if "experts.gate_up_proj" in key:
+                gate, up = value.chunk(2, dim=-1)
+
+                # shard the gate and up based on tp
+                gate = self._shard_tensor(gate, tp_group, -1)
+                up = self._shard_tensor(up, tp_group, -1)
+                value = torch.cat((gate, up), dim=-1)
+            elif "experts.down_proj" in key:
+                value = self._shard_tensor(value, tp_group, 1)
+            elif isinstance(module, RowParallelLinear) and key.endswith(".weight"):
+                value = self._shard_tensor(value, tp_group, -1)
+            elif isinstance(module, ColumnParallelLinear) and key.endswith(".weight"):
+                value = self._shard_tensor(value, tp_group, 0)
+            elif isinstance(module, ColumnParallelLinear) and key.endswith(".bias"):
+                value = self._shard_tensor(value, tp_group, 0)
+
+            updated_state_dict[key] = value
+
+        # load state dict
+        self.load_state_dict(updated_state_dict, strict=False)
