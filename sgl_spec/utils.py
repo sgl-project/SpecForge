@@ -29,16 +29,6 @@ def padding(tensor, left=True):
     return tensor
 
 
-def init_distributed(timeout: int = 10):
-    """Initialize distributed training.
-
-    Args:
-        timeout(int): Timeout for collective communication in minutes
-    """
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
-
-
 def load_config_from_file(config_path: str):
     with open(config_path, "r") as f:
         config = json.load(f)

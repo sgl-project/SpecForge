@@ -18,8 +18,9 @@ from sgl_spec.data import (
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
+from sgl_spec.distributed import destroy_distributed, init_distributed
 from sgl_spec.lr_scheduler import CosineAnnealingWarmupLR
-from sgl_spec.utils import init_distributed, rank_0_priority
+from sgl_spec.utils import rank_0_priority
 
 
 def parse_args():
@@ -297,6 +298,8 @@ def main():
                         state_dict=draft_model_state_dict,
                     )
                 dist.barrier()
+
+    destroy_distributed()
 
 
 if __name__ == "__main__":
