@@ -10,6 +10,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.trainer_utils import get_last_checkpoint
 
 import wandb
 from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
@@ -55,6 +56,12 @@ def parse_args():
         default=20,
         help="Timeout for collective communication in minutes",
     )
+    
+    # resume
+    parser.add_argument(
+        "--resume",
+        action="store_true"
+    )
 
     # wandb wandb args
     parser.add_argument("--wandb", action="store_true")
@@ -90,6 +97,12 @@ def main():
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
 
+    # detecting last ckpt for draft model
+    draft_model_last_checkpoint = None
+    if os.path.isdir(args.output_dir):
+        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
+        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
     # build target and draft model
     target_model = (
         AutoModelForCausalLM.from_pretrained(
@@ -98,10 +111,13 @@ def main():
         .eval()
         .cuda()
     )
-    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-    draft_model = (
-        AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
-    )
+    if draft_model_last_checkpoint:
+        draft_model = AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint).cuda().to(torch.bfloat16)
+    else:
+        draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+        draft_model = (
+            AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
+        )
     draft_model.load_embedding(args.target_model_path)
     draft_model.freeze_embedding()
 
@@ -177,8 +193,32 @@ def main():
         optimizer, total_steps=total_steps, warmup_steps=warmup_steps
     )
 
+    # resume
+    start_epoch = 0
+    if draft_model_last_checkpoint is not None:
+        print_on_rank0(f"Resuming draft model training from checkpoint: {draft_model_last_checkpoint}")
+        state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
+        
+        if os.path.exists(state_path):
+            state = torch.load(state_path, map_location="cpu")
+
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            print_on_rank0("Successfully loaded optimizer state_dict.")
+
+            scheduler.load_state_dict(state['scheduler_state_dict'])
+            print_on_rank0("Successfully loaded scheduler state_dict.")
+
+            start_epoch = state['epoch'] + 1
+            print_on_rank0(f"Resuming from epoch {start_epoch}")
+        else:
+            print_on_rank0(f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch.")
+
+    # 在所有进程加载完检查点之前，设置一个屏障
+    dist.barrier()
+
     # start running
-    for epoch in range(args.num_epochs):
+    print_on_rank0(f"Starting training from epoch {start_epoch}")
+    for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
@@ -284,8 +324,20 @@ def main():
 
         if epoch % args.save_interval == 0:
             # Save the model
+            epoch_output_dir = os.path.join(args.output_dir, f"epoch_0")
+            
+            if dist.get_rank() == 0:
+                os.makedirs(epoch_output_dir, exist_ok=True)
+            dist.barrier()
+            
             with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
                 model_state_dict = eagle3_model.state_dict()
+                state_to_save = {
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': args,
+                }
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
                     for k, v in model_state_dict.items()
@@ -293,10 +345,13 @@ def main():
                 }
 
                 if dist.get_rank() == 0:
+                    torch.save(state_to_save, os.path.join(epoch_output_dir, "training_state.pt"))
+                    print_on_rank0(f"Saved full training state to {epoch_output_dir}/training_state.pt")
                     draft_model.save_pretrained(
-                        os.path.join(args.output_dir, f"epoch_0"),
+                        epoch_output_dir,
                         state_dict=draft_model_state_dict,
                     )
+                    print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
                 dist.barrier()
 
     destroy_distributed()
