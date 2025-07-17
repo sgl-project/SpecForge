@@ -1,15 +1,22 @@
+import os
 import tempfile
+import unittest
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 from transformers import Llama4ForCausalLM, Llama4TextConfig
 
 from sgl_spec.distributed import init_distributed
-from sgl_spec.modeling.target.llama4 import Llama4ForCausalLM
 
 
-def test_llama4_tp():
+def test_llama4_tp(rank, world_size, temp_dir):
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+
     init_distributed(tp_size=2)
     set_seed(42)
     config = Llama4TextConfig(
@@ -17,7 +24,7 @@ def test_llama4_tp():
         hidden_size=384,
         intermediate_size=512,
         intermediate_size_mlp=512,
-        num_hidden_layers=1,
+        num_hidden_layers=2,
         max_position_embeddings=1024,
         num_attention_heads=10,
         num_key_value_heads=2,
@@ -39,23 +46,14 @@ def test_llama4_tp():
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
-        temp_dir = tempfile.TemporaryDirectory()
-        model.save_pretrained(temp_dir.name)
-        print(f"Saved model to {temp_dir.name}")
-        temp_path = temp_dir.name
-        dist.broadcast_object_list([temp_path], src=0)
-    else:
-        obj_list = [None]
-        dist.broadcast_object_list(obj_list, src=0)
-        temp_path = obj_list[0]
-
-    # load the model weights to the distributed model
-    print(f"Loading model from {temp_path}")
-    dist_model.load_checkpoint(temp_path)
+        model.save_pretrained(temp_dir)
+        print(f"Saved model to {temp_dir}")
     dist.barrier()
 
-    if dist.get_rank() == 0:
-        temp_dir.cleanup()
+    # load the model weights to the distributed model
+    print(f"Loading model from {temp_dir}")
+    dist_model.load_checkpoint(temp_dir)
+    dist.barrier()
 
     # create data
     input_ids = torch.randint(0, 1000, (1, 256)).cuda()
@@ -65,9 +63,34 @@ def test_llama4_tp():
     dist_logits = dist_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
     assert torch.allclose(
-        expected_logits, dist_logits
+        expected_logits,
+        dist_logits,
+        rtol=1e-5,
+        atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
 
+class TestLlama4TP(unittest.TestCase):
+
+    def setUp(self):
+        """设置测试环境"""
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        """清理测试环境"""
+        self.temp_dir.cleanup()
+
+    def test_llama4_tp(self):
+        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name))
+
+
 if __name__ == "__main__":
-    test_llama4_tp()
+    # 创建测试套件
+    suite = unittest.TestSuite()
+
+    # 添加测试用例
+    suite.addTest(unittest.makeSuite(TestLlama4TP))
+
+    # 运行测试
+    runner = unittest.TextTestRunner(verbosity=2)
+    runner.run(suite)

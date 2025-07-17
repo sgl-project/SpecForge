@@ -81,6 +81,13 @@ class DistributedTargetModel(ABC):
         size = dist.get_world_size(process_group)
         return tensor.chunk(size, dim=dim)[rank].contiguous()
 
+    def _gather_tensor(self, tensor, process_group=None, dim=-1):
+        size = dist.get_world_size(process_group)
+        obj_list = [torch.empty_like(tensor) for _ in range(size)]
+        dist.all_gather(obj_list, tensor, group=process_group)
+        gather_tensor = torch.cat(obj_list, dim=dim)
+        return gather_tensor
+
     def load_checkpoint(self, checkpoint_path: str):
         for ckpt_file in self._load_ckpt_files(checkpoint_path):
             state_dict = self._open_ckpt_file(ckpt_file)
