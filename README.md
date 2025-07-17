@@ -69,7 +69,7 @@ class MyModelConfig(PretrainedConfig):
 
 class MyModelEagle3(Eagle3DraftModel):
 
-    config_class = XXXConfig
+    config_class = MyModelConfig
 
     def __init__(self, config, quant_config=None) -> None:
         ...
