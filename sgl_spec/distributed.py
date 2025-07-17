@@ -22,29 +22,35 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
 
     Args:
         timeout(int): Timeout for collective communication in minutes
+        tp_size(int): The degree of tensor parallelism
     """
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
     torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
-    _create_tp_group(tp_size)
 
-
-def _create_tp_group(tp_size):
+    # initialize sub groups
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    assert world_size % tp_size == 0, "world size must be divisible by tp size"
+    dp_size = world_size // tp_size
+    assert world_size == tp_size * dp_size, "world size must be divisible by tp size"
+    global _TP_GROUP, _DP_GROUP
 
-    num_tp_groups = world_size // tp_size
-    tp_ranks = [
-        list(range(i * tp_size, (i + 1) * tp_size)) for i in range(num_tp_groups)
-    ]
-
-    tp_group_of_current_rank = None
+    # create tp group
+    tp_ranks = [list(range(i * tp_size, (i + 1) * tp_size)) for i in range(dp_size)]
     for ranks in tp_ranks:
         tp_group = dist.new_group(ranks=ranks)
         if rank in ranks:
-            tp_group_of_current_rank = tp_group
+            _TP_GROUP = tp_group
 
-    global _TP_GROUP
-    _TP_GROUP = tp_group_of_current_rank
+    # create dp group
+    dp_ranks = [list(range(i, world_size, tp_size)) for i in range(tp_size)]
+    for ranks in dp_ranks:
+        dp_group = dist.new_group(ranks=ranks)
+        if rank in ranks:
+            _DP_GROUP = dp_group
 
-    return _TP_GROUP
+
+def destroy_distributed():
+    global _TP_GROUP, _DP_GROUP
+    dist.destroy_process_group(_TP_GROUP)
+    dist.destroy_process_group(_DP_GROUP)
+    dist.destroy_process_group()
