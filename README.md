@@ -47,7 +47,7 @@ We have provided a simple startup script to train the Eagle3 model for Llama-3.1
 
 ```bash
 # make sure you have sharegpt data prepared
-bash ./examples/run_llama3_eagle3.sh
+bash ./examples/run_llama3_eagle3_online.sh
 ```
 
 **Customize target model**: If you wish to train Eagle3 for other models, you need to modify the `--target-model-path` value. We support loading these models directly from HuggingFace.
