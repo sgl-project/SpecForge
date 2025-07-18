@@ -287,6 +287,7 @@ class LlamaAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
+        self._init_rope()
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
