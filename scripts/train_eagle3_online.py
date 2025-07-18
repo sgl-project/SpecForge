@@ -200,16 +200,6 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            # assert all weights are equal
-            # torch.cuda.synchronize()
-            # for name, p in draft_model.named_parameters():
-            #     param_list = [torch.empty_like(p) for _ in range(dist.get_world_size())]
-            #     dist.all_gather(param_list, p)
-            #     for i in range(len(param_list)):
-            #         if i == dist.get_rank():
-            #             continue
-            #         assert torch.all(param_list[i] == param_list[dist.get_rank()]), f"rank {dist.get_rank()} and rank {i} have different weights for {name}, {param_list[i]} vs {param_list[dist.get_rank()]}"
-
             logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
             for i in range(len(plosses)):
                 logdict[f"train/ploss_{i}"] = plosses[i].item()
@@ -294,7 +284,7 @@ def main():
 
                 if dist.get_rank() == 0:
                     draft_model.save_pretrained(
-                        os.path.join(args.output_dir, f"epoch_0"),
+                        os.path.join(args.output_dir, f"epoch_{epoch}"),
                         state_dict=draft_model_state_dict,
                     )
                 dist.barrier()
