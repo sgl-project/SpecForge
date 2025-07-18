@@ -19,6 +19,14 @@ def rank_0_priority():
         yield
 
 
+@contextmanager
+def default_torch_dtype(dtype: torch.dtype):
+    current_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    yield
+    torch.set_default_dtype(current_dtype)
+
+
 @torch.no_grad()
 def padding(tensor, left=True):
     zeropadding = torch.zeros_like(tensor[:, -1:])
@@ -34,3 +42,7 @@ def load_config_from_file(config_path: str):
         config = json.load(f)
 
     return PretrainedConfig.from_dict(config)
+
+
+def print_with_rank(message):
+    print(f"rank {dist.get_rank()}: {message}")

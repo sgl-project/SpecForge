@@ -65,7 +65,7 @@ class DistributedTargetModel(ABC):
             # this is the case where model_path is a huggingface repository
             # we first need to locate its local cache
             local_cache_path = snapshot_download(repo_id=model_path)
-            self.load_state_dict(local_cache_path)
+            yield from self._load_ckpt_files(local_cache_path)
 
     def _open_ckpt_file(self, ckpt_file: str) -> Dict[str, torch.Tensor]:
         if ckpt_file.endswith(".safetensors"):

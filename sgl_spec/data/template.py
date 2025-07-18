@@ -99,7 +99,7 @@ TEMPLATE_REGISTRY.register(
         assistant_header="<|header_start|>assistant<|header_end|>\n\n",
         user_header="<|header_start|>user<|header_end|>",
         system_prompt="You are a helpful assistant.",
-        end_of_turn_token="<|eot_id|>",
+        end_of_turn_token="<|eot|>",
     ),
 )
 
