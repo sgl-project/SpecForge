@@ -49,7 +49,11 @@ from transformers.utils import auto_docstring, can_return_tuple, logging
 
 # [MODIFIED] Import from transformers library
 from sgl_spec.distributed import get_tp_group
-from sgl_spec.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sgl_spec.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 from .base import DistributedTargetModel
 
@@ -417,7 +421,7 @@ class Llama4TextModel(Llama4PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(

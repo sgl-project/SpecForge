@@ -102,3 +102,69 @@ class ColumnParallelLinear(nn.Module):
 
     def __repr__(self):
         return f"ColumnParallelLinear(in_features={self.in_features}, out_features={self.out_features_per_shard}, tp_size={self.tp_size}, tp_rank={self.tp_rank})"
+
+
+class VocabParallelEmbedding(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        embedding_dim,
+        config=None,
+        padding_idx=None,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.tp_group = get_tp_group()
+        self.tp_size = dist.get_world_size(self.tp_group)
+        self.tp_rank = dist.get_rank(self.tp_group)
+
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.vocab_start = vocab_size * self.tp_rank // self.tp_size
+        self.vocab_end = vocab_size * (self.tp_rank + 1) // self.tp_size
+        self.vocab_size_per_shard = self.vocab_end - self.vocab_start
+
+        if (
+            padding_idx is None
+            and config is not None
+            and hasattr(config, "pad_token_id")
+        ):
+            padding_idx = config.pad_token_id
+        self.padding_idx = padding_idx
+
+        self.weight = nn.Parameter(
+            torch.empty(self.vocab_size_per_shard, embedding_dim, **factory_kwargs)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.weight, mean=0, std=self.embedding_dim**-0.5)
+        if self.padding_idx is not None:
+            if self.vocab_start <= self.padding_idx < self.vocab_end:
+                local_idx = self.padding_idx - self.vocab_start
+                with torch.no_grad():
+                    self.weight[local_idx].zero_()
+
+    def forward(self, input):
+        mask = (input >= self.vocab_start) & (input < self.vocab_end)
+        local_input = input.clone() - self.vocab_start
+        local_input[~mask] = 0
+
+        output = torch.zeros(
+            *input.shape,
+            self.embedding_dim,
+            device=input.device,
+            dtype=self.weight.dtype,
+        )
+        output[mask] = self.weight[local_input[mask]]
+
+        if self.padding_idx is not None:
+            output[input == self.padding_idx] = 0
+
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
+        return output
+
+    def extra_repr(self):
+        return f"vocab_size={self.vocab_size}, embedding_dim={self.embedding_dim}, tp_size={self.tp_size}, tp_rank={self.tp_rank}, padding_idx={self.padding_idx}"
