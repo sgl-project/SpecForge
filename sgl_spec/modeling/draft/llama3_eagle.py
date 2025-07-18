@@ -449,7 +449,7 @@ class LlamaMLP(nn.Module):
         self.down_proj = RowParallelLinear(
             self.intermediate_size, config.hidden_size, bias=False
         )
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.activation_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         down_proj = self.activation_fn(self.gate_proj(x)) * self.up_proj(x)
