@@ -9,10 +9,18 @@ from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from sgl_spec.distributed import get_tp_group
+from sgl_spec.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
+
 from ..utils import padding
 from .base import Eagle3DraftModel
 
 logger = logging.getLogger(__name__)
+import torch.distributed as dist
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -259,19 +267,26 @@ class LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+        self.q_proj = ColumnParallelLinear(
+            config.hidden_size * 2,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        self.k_proj = ColumnParallelLinear(
+            config.hidden_size * 2,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        self.v_proj = ColumnParallelLinear(
+            config.hidden_size * 2,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
         )
-        self._init_rope()
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -423,46 +438,23 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        # if last:
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        # else:
-        #     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size * 2, bias=False)
+        self.tp_group = get_tp_group()
+        self.gate_proj = ColumnParallelLinear(
+            config.hidden_size, self.intermediate_size, bias=False
+        )
+        self.up_proj = ColumnParallelLinear(
+            config.hidden_size, self.intermediate_size, bias=False
+        )
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size, config.hidden_size, bias=False
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-        return down_proj
+        down_proj = self.activation_fn(self.gate_proj(x)) * self.up_proj(x)
+        out = self.down_proj(down_proj)
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
+        return out
 
 
 class LlamaRMSNorm(nn.Module):
@@ -563,22 +555,22 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = config.draft_vocab_size
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.midlayer = LlamaDecoderLayer(config)
 
         if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
+            self.fc = ColumnParallelLinear(
                 config.target_hidden_size * 3, config.hidden_size, bias=False
             )
         else:
-            self.fc = torch.nn.Linear(
+            self.fc = ColumnParallelLinear(
                 config.hidden_size * 3, config.hidden_size, bias=False
             )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(
+        self.lm_head = ColumnParallelLinear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
 
@@ -655,6 +647,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # fc
         hidden_states = self.fc(hidden_states)
+        dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM, group=get_tp_group())
         hidden_states = self.midlayer(
             input_emb=inputs_embeds,
             hidden_states=hidden_states,
@@ -677,7 +670,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers
         assert hidden_states.size(-1) == self.config.hidden_size * 3
-        return self.fc(hidden_states)
+        out = self.fc(hidden_states)
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=get_tp_group())
+        return out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)
