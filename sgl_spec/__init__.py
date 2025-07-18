@@ -1,4 +1,10 @@
 from .core import *
 from .modeling import *
 
-__all__ = ["OnlineEagle3Pipeline", "OfflineEagle3Pipeline", "AutoEagle3DraftModel"]
+__all__ = [
+    "OnlineEagle3Model",
+    "OfflineEagle3Model",
+    "AutoEagle3DraftModel",
+    "AutoDistributedTargetModel",
+    "AutoDraftModelConfig",
+]

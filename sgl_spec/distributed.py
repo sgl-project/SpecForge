@@ -3,6 +3,8 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
+from sgl_spec.utils import print_with_rank
+
 _TP_GROUP = None
 _DP_GROUP = None
 
@@ -25,7 +27,9 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
         tp_size(int): The degree of tensor parallelism
     """
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
+    local_rank = dist.get_rank() % torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
+    print_with_rank(f"bind to device {local_rank}")
 
     # initialize sub groups
     rank = dist.get_rank()
