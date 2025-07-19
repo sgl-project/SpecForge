@@ -10,7 +10,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.trainer_utils import get_last_checkpoint
+from sgl_spec.utils import get_last_checkpoint
 
 import wandb
 from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
@@ -100,6 +100,7 @@ def main():
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
     if os.path.isdir(args.output_dir):
+        print(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
@@ -111,10 +112,10 @@ def main():
         .eval()
         .cuda()
     )
+    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint).cuda().to(torch.bfloat16)
     else:
-        draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
         draft_model = (
             AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
         )
@@ -200,7 +201,7 @@ def main():
         state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
         
         if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu")
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
 
             optimizer.load_state_dict(state['optimizer_state_dict'])
             print_on_rank0("Successfully loaded optimizer state_dict.")
