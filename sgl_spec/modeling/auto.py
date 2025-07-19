@@ -1,9 +1,16 @@
 import json
+import os
+from typing import Union
 
+import torch
+from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
-from transformers import LlamaConfig, PretrainedConfig
+from transformers import Llama4Config, Llama4TextConfig, LlamaConfig, PretrainedConfig
+
+from sgl_spec.utils import default_torch_dtype
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .target.llama4 import Llama4ForCausalLM
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
@@ -29,11 +36,50 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         return _model_cls(config)
 
 
-class AutoEagle3TargetModel(AutoModelForCausalLMBase):
+class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
-        LlamaConfig: [LlamaForCausalLMEagle3],
+        Llama4TextConfig: [Llama4ForCausalLM],
     }
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
+        torch_dtype: torch.dtype = None,
+        device: str = None,
+        **config_kwargs,
+    ):
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, **config_kwargs
+        )
+
+        if isinstance(config, Llama4Config):
+            config = config.text_config
+
+        assert (
+            type(config) in cls._model_mapping
+        ), f"Unsupported config type: {type(config)}"
+        model_cls = cls._model_mapping[type(config)][0]
+
+        if device is None:
+            device = torch.device("cpu")
+        else:
+            device = torch.device(device)
+
+        if torch_dtype is None:
+            torch_dtype = torch.get_default_dtype()
+
+        # load model
+        with default_torch_dtype(torch_dtype), torch.device(device):
+            model = model_cls(config)
+        model.load_checkpoint(pretrained_model_name_or_path)
+
+        # just ensure that all the parameters follow the same dtype and device
+        # model = model.to(torch_dtype)
+        # model = model.to(device)
+
+        return model
 
 
 class AutoDraftModelConfig:

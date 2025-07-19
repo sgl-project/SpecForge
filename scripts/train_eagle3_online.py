@@ -13,15 +13,20 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from sgl_spec.utils import get_last_checkpoint
 
 import wandb
-from sgl_spec import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
+from sgl_spec import (
+    AutoDistributedTargetModel,
+    AutoDraftModelConfig,
+    AutoEagle3DraftModel,
+    OnlineEagle3Model,
+)
 from sgl_spec.data import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from sgl_spec.distributed import destroy_distributed, init_distributed
+from sgl_spec.distributed import destroy_distributed, get_dp_group, init_distributed
 from sgl_spec.lr_scheduler import CosineAnnealingWarmupLR
-from sgl_spec.utils import rank_0_priority
+from sgl_spec.utils import print_with_rank, rank_0_priority
 
 
 def parse_args():
@@ -30,6 +35,12 @@ def parse_args():
     # add model-related arguments
     parser.add_argument("--target-model-path", type=str, required=True)
     parser.add_argument("--draft-model-config", type=str, required=True)
+    parser.add_argument(
+        "--embedding-key",
+        type=str,
+        default="model.embed_tokens.weight",
+        help="The key of the embedding weight to load from the target model",
+    )
 
     # add training-related arguments
     parser.add_argument("--train-data-path", type=str, required=True)
@@ -42,6 +53,9 @@ def parse_args():
 
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
+
+    # distributed training
+    parser.add_argument("--tp-size", type=int, default=1)
 
     # other args
     parser.add_argument("--cache-key", type=str, default=None)
@@ -92,7 +106,8 @@ def main():
     # initialize
     args = parse_args()
     set_seed(args.seed)
-    init_distributed(timeout=args.dist_timeout)
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    print_with_rank(f"Initialized distributed environment")
 
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
@@ -105,13 +120,23 @@ def main():
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     # build target and draft model
-    target_model = (
-        AutoModelForCausalLM.from_pretrained(
-            args.target_model_path, torch_dtype=torch.bfloat16
+    if args.tp_size > 1:
+        # to avoid CPU RAM OOM, we directly init the model on CUDA
+        target_model = AutoDistributedTargetModel.from_pretrained(
+            pretrained_model_name_or_path=args.target_model_path,
+            torch_dtype=torch.bfloat16,
+            device="cuda",
+        ).eval()
+    else:
+        target_model = (
+            AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=args.target_model_path,
+                torch_dtype=torch.bfloat16,
+            )
+            .eval()
+            .cuda()
         )
-        .eval()
-        .cuda()
-    )
+    print_with_rank(f"Initialized target model")
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint).cuda().to(torch.bfloat16)
@@ -121,6 +146,7 @@ def main():
         )
     draft_model.load_embedding(args.target_model_path)
     draft_model.freeze_embedding()
+    print_with_rank(f"Initialized draft model")
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
@@ -149,9 +175,13 @@ def main():
         args.batch_size,
         num_workers=4,
         shuffle=True,
+        process_group=get_dp_group(),
     )
+    print_with_rank(f"Initialized train dataloader")
+
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
+    print_with_rank(f"Loaded vocab mapping")
 
     if args.eval_data_path is not None:
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
@@ -166,7 +196,9 @@ def main():
             args.batch_size,
             num_workers=4,
             shuffle=False,
+            process_group=get_dp_group(),
         )
+        print_with_rank(f"Initialized eval dataloader")
 
     # build Eagle3 model
     # broadcast draft model
@@ -184,7 +216,9 @@ def main():
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         ignored_modules=[target_model],
+        process_group=get_dp_group(),
     )
+    print_with_rank(f"Initialized Eagle3 FSDP model")
 
     # build other components
     optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
@@ -193,6 +227,7 @@ def main():
     scheduler = CosineAnnealingWarmupLR(
         optimizer, total_steps=total_steps, warmup_steps=warmup_steps
     )
+    print_with_rank(f"Initialized optimizer and scheduler")
 
     # resume
     start_epoch = 0
@@ -240,16 +275,6 @@ def main():
             ploss.backward()
             optimizer.step()
             scheduler.step()
-
-            # assert all weights are equal
-            # torch.cuda.synchronize()
-            # for name, p in draft_model.named_parameters():
-            #     param_list = [torch.empty_like(p) for _ in range(dist.get_world_size())]
-            #     dist.all_gather(param_list, p)
-            #     for i in range(len(param_list)):
-            #         if i == dist.get_rank():
-            #             continue
-            #         assert torch.all(param_list[i] == param_list[dist.get_rank()]), f"rank {dist.get_rank()} and rank {i} have different weights for {name}, {param_list[i]} vs {param_list[dist.get_rank()]}"
 
             logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
             for i in range(len(plosses)):
