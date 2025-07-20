@@ -249,7 +249,6 @@ def main():
         else:
             print_on_rank0(f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch.")
 
-    # 在所有进程加载完检查点之前，设置一个屏障
     dist.barrier()
 
     # start running
