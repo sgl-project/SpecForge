@@ -138,3 +138,8 @@ wget -O question.jsonl https://raw.githubusercontent.com/lm-sys/FastChat/main/fa
 # run benchmarking
 python3 bench_sglang_eagle.py --num-questions 80 --port 30000
 ```
+
+### ✨ Acknowledgements
+
+We would like to express our sincere gratitude to the EAGLE official team, especially Hongyang Zhang and Yuhui Li, for their valuable work and support. We are also thankful to the NVIDIA team, in particular Avery H and Izzy Putterman, as well as the Google team, especially Ying Wang, for their insightful discussions and generous help throughout this project.
+This project has also been inspired by many outstanding open-source projects from the LLM community, including EAGLE, BaldEagle, TensorRT-Model-Optimizer and others. Their contributions and shared knowledge have greatly benefited our work.
