@@ -41,6 +41,16 @@ def parse_args():
 
 
 def process_ultrachat_row(row) -> Dict:
+    """Process a row from the ultrachat dataset.
+
+    The function expects a row with the following schema:
+    "messages": [
+        {
+            "role": "user" | "assistant",
+            "content": str
+        }
+    ]
+    """
     conversations = row["messages"]
     formatted_conversations = []
     for message in conversations:
@@ -53,6 +63,18 @@ def process_ultrachat_row(row) -> Dict:
 
 
 def process_sharegpt_row(row) -> Dict:
+    """
+    sharegpt dataset schema:
+    {
+        "conversations": [
+            {
+                "from": <system|human|gpt>,
+                "value": <message>,
+            },
+            ...
+        ]
+    }
+    """
     conversations = row["conversations"]
     formatted_conversations = []
 
