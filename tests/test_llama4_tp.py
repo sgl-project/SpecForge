@@ -73,11 +73,9 @@ def test_llama4_tp(rank, world_size, temp_dir):
 class TestLlama4TP(unittest.TestCase):
 
     def setUp(self):
-        """设置测试环境"""
         self.temp_dir = tempfile.TemporaryDirectory()
 
     def tearDown(self):
-        """清理测试环境"""
         self.temp_dir.cleanup()
 
     def test_llama4_tp(self):
@@ -85,12 +83,7 @@ class TestLlama4TP(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    # 创建测试套件
     suite = unittest.TestSuite()
-
-    # 添加测试用例
     suite.addTest(unittest.makeSuite(TestLlama4TP))
-
-    # 运行测试
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

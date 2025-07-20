@@ -1,3 +1,4 @@
+# Modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/main.py#L171
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -8,19 +9,58 @@ from transformers import PreTrainedTokenizer
 
 
 class DataCollatorWithPadding:
-    def paddingtensor(self, intensors, N):
+    """
+    Datacollator that will dynamically pad the inputs for batching.
+    """
+
+    def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
+        """
+        Pad to the longest sequence in the batch.
+
+        Args:
+            intensors: (B, n, S)
+            N: the length to pad to, N >= n
+
+        Returns:
+            outtensors: (B, N, S)
+        """
         B, n, S = intensors.shape
         padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
-    def paddingtensor2D(self, intensors, N):
+    def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
+        """
+        Pad 2D tensor to the longest sequence in the batch.
+
+        Args:
+            intensors: (B, n)
+            N: the length to pad to, N >= n
+
+        Returns:
+            outtensors: (B, N)
+        """
         B, n = intensors.shape
         padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Collate a batch of features.
+
+        Args:
+            features: A list of features, where each feature is a dictionary containing:
+                - input_ids: torch.Tensor of shape (n,)
+                - attention_mask: torch.Tensor of shape (n,)
+                - loss_mask: torch.Tensor of shape (n,)
+
+        Returns:
+            A dictionary containing:
+                - input_ids: torch.Tensor of shape (B, N)
+                - attention_mask: torch.Tensor of shape (B, N)
+                - loss_mask: torch.Tensor of shape (B, N)
+        """
         max_length = max(item["input_ids"].shape[1] for item in features)
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -50,7 +90,22 @@ def prepare_dp_dataloaders(
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
     **dataloader_kwargs
-):
+) -> DataLoader:
+    """
+    Prepare dataloader for distributed data parallel training.
+
+    Args:
+        dataset: The dataset to load data from.
+        batch_size: The batch size for each GPU.
+        num_workers: The number of workers for data loading.
+        process_group: The process group for distributed training.
+        pin_memory: Whether to pin memory for data loading.
+        shuffle: Whether to shuffle the dataset.
+        **dataloader_kwargs: Additional keyword arguments for the DataLoader.
+
+    Returns:
+        A DataLoader for the dataset.
+    """
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
     sampler = DistributedSampler(

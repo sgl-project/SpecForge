@@ -15,14 +15,13 @@ from sgl_spec.modeling.draft.llama3_eagle import (
     LlamaRMSNorm,
 )
 
-# 假设你的模型代码在一个名为 model_module 的模块中
 # from model_module import LlamaForCausalLMEagle3
 
 
 class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
     def setUp(self):
-        """设置测试环境"""
+        """init"""
         self.temp_dir = tempfile.mkdtemp()
 
         config_dict = {
@@ -48,82 +47,64 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             "draft_vocab_size": 32000,
         }
 
-        # 创建一个简单的配置
         self.config = LlamaConfig(**config_dict)
 
     def tearDown(self):
-        """清理测试环境"""
         shutil.rmtree(self.temp_dir)
 
     def test_model_initialization(self):
-        """测试模型初始化"""
         model = LlamaForCausalLMEagle3(self.config)
 
-        # 检查模型组件是否正确初始化
         self.assertIsInstance(model.self_attn, LlamaAttention)
         self.assertIsInstance(model.mlp, LlamaMLP)
         self.assertIsInstance(model.hidden_norm, LlamaRMSNorm)
         self.assertIsInstance(model.input_layernorm, LlamaRMSNorm)
         self.assertIsInstance(model.post_attention_layernorm, LlamaRMSNorm)
 
-        # 检查隐藏层大小
         self.assertEqual(model.hidden_size, self.config.hidden_size)
 
     def test_save_pretrained(self):
-        """测试模型保存功能"""
+        """save"""
         model = LlamaForCausalLMEagle3(self.config)
 
-        # 保存配置
         self.config.save_pretrained(self.temp_dir)
 
-        # 保存模型权重
         model_path = os.path.join(self.temp_dir, "pytorch_model.bin")
         torch.save(model.state_dict(), model_path)
 
-        # 验证文件是否存在
         self.assertTrue(os.path.exists(os.path.join(self.temp_dir, "config.json")))
         self.assertTrue(os.path.exists(model_path))
 
     @patch("transformers.modeling_utils.PreTrainedModel.from_pretrained")
     def test_from_pretrained_mock(self, mock_from_pretrained):
-        """使用mock测试from_pretrained方法"""
-        # 创建一个模型实例作为返回值
+        """mock"""
         mock_model = LlamaForCausalLMEagle3(self.config)
         mock_from_pretrained.return_value = mock_model
 
-        # 测试from_pretrained调用
         loaded_model = LlamaForCausalLMEagle3.from_pretrained(self.temp_dir)
-
-        # 验证mock被调用
         mock_from_pretrained.assert_called_once_with(self.temp_dir)
-
-        # 验证返回的模型类型正确
         self.assertIsInstance(loaded_model, LlamaForCausalLMEagle3)
 
     def test_model_forward_pass(self):
-        """测试模型前向传播"""
+        """forward"""
         model = LlamaForCausalLMEagle3(self.config)
         model.eval()
 
         batch_size = 2
         seq_len = 10
 
-        # 创建输入数据
         input_emb = torch.randn(batch_size, seq_len, self.config.hidden_size)
         hidden_states = torch.randn(batch_size, seq_len, self.config.hidden_size)
-        cache_hidden = [[], []]  # 初始化空缓存
+        cache_hidden = [[], []]
 
-        # 创建attention mask
         attention_mask = torch.ones(batch_size, 1, seq_len, seq_len)
         attention_mask = attention_mask.triu(diagonal=1)
         attention_mask = attention_mask.masked_fill(
             attention_mask.bool(), float("-inf")
         )
 
-        # 创建position ids
         position_ids = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
 
-        # 前向传播
         with torch.no_grad():
             outputs = model(
                 input_emb=input_emb,
@@ -133,7 +114,6 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
                 position_ids=position_ids,
             )
 
-        # 验证输出形状
         self.assertEqual(len(outputs), 2)
         hidden_output, return_hidden = outputs
 
@@ -145,27 +125,21 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         )
 
     def test_state_dict_compatibility(self):
-        """测试state_dict的兼容性"""
         model1 = LlamaForCausalLMEagle3(self.config)
         model2 = LlamaForCausalLMEagle3(self.config)
 
-        # 保存第一个模型的state_dict
         state_dict = model1.state_dict()
 
-        # 加载到第二个模型
         model2.load_state_dict(state_dict)
 
-        # 验证权重是否相同
         for name, param1 in model1.named_parameters():
             param2 = dict(model2.named_parameters())[name]
             self.assertTrue(torch.equal(param1, param2))
 
     def test_config_validation(self):
-        """测试配置验证"""
-        # 测试无效配置
         invalid_config = LlamaConfig(
             vocab_size=1000,
-            hidden_size=127,  # 不能被num_heads整除
+            hidden_size=127,
             num_attention_heads=4,
             num_key_value_heads=2,
         )
@@ -174,25 +148,20 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             LlamaForCausalLMEagle3(invalid_config)
 
     def test_different_last_parameter(self):
-        """测试不同的last参数"""
         model_last_true = LlamaForCausalLMEagle3(self.config, last=True)
         model_last_false = LlamaForCausalLMEagle3(self.config, last=False)
 
         self.assertTrue(model_last_true.last)
         self.assertFalse(model_last_false.last)
 
-        # 验证MLP层的last参数也相应设置
         self.assertTrue(model_last_true.mlp.last)
         self.assertFalse(model_last_false.mlp.last)
 
 
 if __name__ == "__main__":
-    # 创建测试套件
     suite = unittest.TestSuite()
 
-    # 添加测试用例
     suite.addTest(unittest.makeSuite(TestLlamaForCausalLMEagle3Loading))
 
-    # 运行测试
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

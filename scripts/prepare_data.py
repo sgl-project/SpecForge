@@ -41,6 +41,16 @@ def parse_args():
 
 
 def process_ultrachat_row(row) -> Dict:
+    """
+    TODO(yinfan.1024): change rename process_ultrachat to process_openai
+    ultrachat dataset schema:
+    "messages": [
+        {
+            "role": "user" | "assistant",
+            "content": str
+        }
+    ]
+    """
     conversations = row["messages"]
     formatted_conversations = []
     for message in conversations:
@@ -53,6 +63,18 @@ def process_ultrachat_row(row) -> Dict:
 
 
 def process_sharegpt_row(row) -> Dict:
+    """
+    sharegpt dataset schema:
+    {
+        "conversations": [
+            {
+                "from": <system|human|gpt>,
+                "value": <message>,
+            },
+            ...
+        ]
+    }
+    """
     conversations = row["conversations"]
     formatted_conversations = []
 

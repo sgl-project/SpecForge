@@ -4,15 +4,14 @@ import os
 
 import torch
 import torch.distributed as dist
+import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from sgl_spec.utils import get_last_checkpoint
 
-import wandb
 from sgl_spec import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
@@ -26,7 +25,7 @@ from sgl_spec.data import (
 )
 from sgl_spec.distributed import destroy_distributed, get_dp_group, init_distributed
 from sgl_spec.lr_scheduler import CosineAnnealingWarmupLR
-from sgl_spec.utils import print_with_rank, rank_0_priority
+from sgl_spec.utils import get_last_checkpoint, print_with_rank, rank_0_priority
 
 
 def parse_args():
@@ -70,12 +69,9 @@ def parse_args():
         default=20,
         help="Timeout for collective communication in minutes",
     )
-    
+
     # resume
-    parser.add_argument(
-        "--resume",
-        action="store_true"
-    )
+    parser.add_argument("--resume", action="store_true")
 
     # wandb wandb args
     parser.add_argument("--wandb", action="store_true")
@@ -137,12 +133,19 @@ def main():
             .cuda()
         )
     print_with_rank(f"Initialized target model")
+    # load model with resume
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     if draft_model_last_checkpoint:
-        draft_model = AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint).cuda().to(torch.bfloat16)
+        draft_model = (
+            AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint)
+            .cuda()
+            .to(torch.bfloat16)
+        )
     else:
         draft_model = (
-            AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
+            AutoEagle3DraftModel.from_config(draft_model_config)
+            .cuda()
+            .to(torch.bfloat16)
         )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
@@ -232,22 +235,26 @@ def main():
     # resume
     start_epoch = 0
     if draft_model_last_checkpoint is not None:
-        print_on_rank0(f"Resuming draft model training from checkpoint: {draft_model_last_checkpoint}")
+        print_on_rank0(
+            f"Resuming draft model training from checkpoint: {draft_model_last_checkpoint}"
+        )
         state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
-        
+
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location="cpu", weights_only=False)
 
-            optimizer.load_state_dict(state['optimizer_state_dict'])
+            optimizer.load_state_dict(state["optimizer_state_dict"])
             print_on_rank0("Successfully loaded optimizer state_dict.")
 
-            scheduler.load_state_dict(state['scheduler_state_dict'])
+            scheduler.load_state_dict(state["scheduler_state_dict"])
             print_on_rank0("Successfully loaded scheduler state_dict.")
 
-            start_epoch = state['epoch'] + 1
+            start_epoch = state["epoch"] + 1
             print_on_rank0(f"Resuming from epoch {start_epoch}")
         else:
-            print_on_rank0(f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch.")
+            print_on_rank0(
+                f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch."
+            )
 
     dist.barrier()
 
@@ -350,18 +357,18 @@ def main():
         if epoch % args.save_interval == 0:
             # Save the model
             epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
-            
+
             if dist.get_rank() == 0:
                 os.makedirs(epoch_output_dir, exist_ok=True)
             dist.barrier()
-            
+
             with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
                 model_state_dict = eagle3_model.state_dict()
                 state_to_save = {
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "args": args,
                 }
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
@@ -370,8 +377,13 @@ def main():
                 }
 
                 if dist.get_rank() == 0:
-                    torch.save(state_to_save, os.path.join(epoch_output_dir, "training_state.pt"))
-                    print_on_rank0(f"Saved full training state to {epoch_output_dir}/training_state.pt")
+                    torch.save(
+                        state_to_save,
+                        os.path.join(epoch_output_dir, "training_state.pt"),
+                    )
+                    print_on_rank0(
+                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                    )
                     draft_model.save_pretrained(
                         epoch_output_dir,
                         state_dict=draft_model_state_dict,

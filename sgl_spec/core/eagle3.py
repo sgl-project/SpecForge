@@ -15,8 +15,24 @@ class Eagle3Model(nn.Module):
 
 
 class OnlineEagle3Model(Eagle3Model):
+    """
+    In sgl-spec, we implement offline/online training.
+    Online training means we have the target hidden_states available during training.
+    Eagle3 using test time training technique (TTT) to train the draft model.
+    1. We first extract the hidden states from the target model.
+    2. Then concatenate the hidden states from 3 aux layers (layer 1, layer num_layers//2, layer num_layers-4).
+    3. We project the concatenated hidden states to the target hidden size. from (batch, seq_len, 3*hidden_size) to (batch, seq_len, hidden_size)
+    4. We concat the projected hidden states and embedding output as the input for the draft model.
+    5. finally, we run TTT to train the draft model. input size is (batch, seq_len, hidden_size * 2)
+    """
 
     def __init__(self, target_model, draft_model: Eagle3DraftModel, length: int = 7):
+        """
+        Args:
+            target_model: the target model to extract hidden states.
+            draft_model: the draft model to be trained.
+            length: TTT length, it means how many turns to unroll during TTT.
+        """
         super().__init__()
         self.target_model = target_model
         self.draft_model = draft_model
@@ -31,7 +47,20 @@ class OnlineEagle3Model(Eagle3Model):
         device: Optional[torch.device] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L692
         Extract the hidden states from the target model outputs.
+
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len)
+            loss_mask: (batch, seq_len)
+            device: the device to run the target model, if None, use the input_ids device
+
+        Returns:
+            hidden_states: (batch, seq_len, 3*hidden_size)
+            target: (batch, seq_len, vocab_size)
+            loss_mask: (batch, seq_len)
+            input_ids: (batch, seq_len)
         """
 
         if device is None:
@@ -50,6 +79,8 @@ class OnlineEagle3Model(Eagle3Model):
         num_hidden_states = len(outputs.hidden_states)
         offset = 1
         num_layers = num_hidden_states - 1
+
+        # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
         low_aux_layer = 1 + offset
         mid_aux_layer = num_layers // 2 - 1 + offset
         last_aux_layer = num_layers - 4 + offset
@@ -76,12 +107,22 @@ class OnlineEagle3Model(Eagle3Model):
 
     def forward(
         self,
-        input_ids,
-        attention_mask,
-        loss_mask,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
+
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len)
+            loss_mask: (batch, seq_len)
+            past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
+            position_ids: (batch, seq_len)
+        """
         # Step 1: prepare data with the target model
         hidden_states, target, loss_mask, input_ids = self._prepare_data(
             input_ids, attention_mask, loss_mask
@@ -199,6 +240,10 @@ class OnlineEagle3Model(Eagle3Model):
 
 
 class OfflineEagle3Model(Eagle3Model):
+    """
+    In sgl-spec, we implement offline/online training.
+    Offline training means we have the target hidden_states available before training.
+    """
 
     def __init__(self, draft_model, length: int = 7):
         super().__init__()

@@ -24,7 +24,21 @@ def preprocess_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
 ) -> Dict[str, List[torch.Tensor]]:
-    """Preprocess a batch of ShareGPT style conversations."""
+    """
+    Preprocess a batch of ShareGPT style conversations.
+
+    Args:
+        tokenizer: The tokenizer to use for tokenization.
+        conversations: A list of conversations, where each conversation is a list of messages.
+        chat_template: The chat template to use for formatting the conversations.
+        max_length: The maximum length of the tokenized input.
+
+    Returns:
+        A dictionary containing:
+            - input_ids: List of tokenized input IDs.
+            - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
+            - attention_mask: List of attention masks.
+    """
     system_prompt = chat_template.system_prompt
     user_message_separator = (
         f"{chat_template.end_of_turn_token}{chat_template.user_header}"
@@ -109,7 +123,23 @@ def build_eagle3_dataset(
     num_proc: Optional[int] = 8,
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
-):
+) -> HFDataset:
+    """
+    build eagle3 dataset
+
+    Args:
+        dataset: HF dataset to process.
+        tokenizer: The tokenizer to use for tokenization.
+        chat_template: The chat template to use for formatting the conversations.
+        max_length: The maximum length of the tokenized input.
+        shuffle_seed: The seed for shuffling the dataset.
+        num_proc: The number of processes to use for multiprocessing.
+        cache_dir: The directory to use for caching the processed dataset.
+        cache_key: The key to use for caching the processed dataset.
+
+    Returns:
+        The processed HF dataset.
+    """
     # Get chat template
     assert (
         chat_template in TEMPLATE_REGISTRY.get_all_template_names()
@@ -166,7 +196,20 @@ def generate_vocab_mapping_file(
     draft_vocab_size: int,
     cache_dir: str = "./cache/vocab_mapping",
     cache_key: str = "vocab_mapping",
-):
+) -> str:
+    """
+    Generate a vocab mapping file for the dataset.
+
+    Args:
+        dataset: The dataset to process.
+        target_vocab_size: The target vocabulary size.
+        draft_vocab_size: The draft vocabulary size.
+        cache_dir: The directory to use for caching the vocab mapping file.
+        cache_key: The key to use for caching the vocab mapping file.
+
+    Returns:
+        The path to the vocab mapping file.
+    """
     # prepare cache direcotory
     os.makedirs(cache_dir, exist_ok=True)
     vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")
@@ -208,16 +251,29 @@ def process_token_dict_to_mappings(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Process token_dict to create d2t and t2d mappings, with optional caching.
+
+    Args:
+        token_dict: A Counter object mapping token ids to their frequencies.
+        draft_vocab_size: The size of the draft vocabulary.
+        target_vocab_size: The size of the target vocabulary.
+
+    Returns:
+        A tuple containing:
+            - d2t: A tensor mapping draft token ids to target token ids.
+            - t2d: A tensor mapping target token ids to draft token ids.
     """
     total_frequency = sum(token_dict.values())
     top_N = token_dict.most_common(draft_vocab_size)
     top_N_frequency_sum = sum(freq for key, freq in top_N)
     top_N_ratio = top_N_frequency_sum / total_frequency
+
     print(f"top {draft_vocab_size} token frequency ratio: {top_N_ratio:.2%}")
     used_tokens = [key for key, freq in top_N]
     used_tokens.sort()
+
     d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
     t2d = [i in used_tokens for i in range(target_vocab_size)]
     d2t = torch.tensor(d2t)
     t2d = torch.tensor(t2d)
+
     return d2t, t2d
