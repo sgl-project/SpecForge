@@ -115,9 +115,9 @@ def main():
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
     if args.resume and os.path.isdir(args.output_dir):
-        print(args.output_dir)
+        print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
-        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     # build target and draft model
     if args.tp_size > 1:
