@@ -21,7 +21,7 @@ from sgl_spec.modeling.draft.llama3_eagle import (
 class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
     def setUp(self):
-        """init"""
+        """Set up the test environment before each test."""
         self.temp_dir = tempfile.mkdtemp()
 
         config_dict = {
