@@ -6,18 +6,19 @@ By generating hidden states in advance, we can avoid:
 
 e.g:
 python scripts/prepare_data.py --dataset sharegpt --output_path cache/dataset/sharegpt
-python scripts/prepare_hidden_states.py \
-    --target-model-path /path/to/model \
-    --data-path cache/dataset/sharegpt \
-    --output-path cache/hidden_states/sharegpt
+export TP=8
+torchrun --nproc_per_node=$TP --master_port=29500 scripts/prepare_hidden_states.py \
+    --model-path /root/huggingface_cache/Llama-3.1-8B-Instruct --enable-aux-hidden-states \
+    --data-path cache/dataset/sharegpt.jsonl --chat-template llama3 --max-length 2048 \
+    --tp-size $TP --batch-size 4 --mem-frac=0.75 \
+    --num-samples 1000
 """
 
 import os
 import hashlib
 import argparse
-from sgl_spec.data import build_eagle3_dataset
+from pathlib import Path
 from datasets import load_dataset, Dataset
-from sgl_spec.utils import print_with_rank, rank_0_priority
 from transformers import AutoTokenizer, AutoConfig
 from tqdm import tqdm
 
@@ -42,11 +43,17 @@ from sglang.srt.utils import (
 )
 from sglang.bench_one_batch import load_model, BenchArgs
 
+from sgl_spec.data import build_eagle3_dataset
+from sgl_spec.utils import print_with_rank, rank_0_priority
+
 class SglangHiddenStatesGenerator:
     def __init__(self, args, tp_rank: int):
         self.args = args
         self.bench_args = BenchArgs.from_cli_args(args)
         self.server_args = ServerArgs.from_cli_args(args)
+        self.server_args.enable_return_hidden_states = True
+        self.server_args.context_length = args.max_length
+
         self.server_args.cuda_graph_max_bs = max(self.bench_args.batch_size)
         self.server_args.cuda_graph_bs = list(self.bench_args.batch_size)
         _set_envs_and_config(self.server_args)
@@ -70,7 +77,7 @@ class SglangHiddenStatesGenerator:
             assert len(args.aux_hidden_states_layers) == 3, "aux_hidden_states_layers is expected to be 3 layers"
             print_with_rank(f"Capturing Aux hidden states layers: {args.aux_hidden_states_layers}, num_layers: {num_layers}")
 
-    def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
+    def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch, model_runner):
         if require_mlp_sync(model_runner.server_args):
             Scheduler.prepare_mlp_sync_batch_raw(
                 batch,
@@ -176,14 +183,14 @@ class SglangHiddenStatesGenerator:
                 continue
 
             batch_save_info.append(({
-                "input_ids": row["input_ids"],
-                "loss_mask": row["loss_mask"]
+                "input_ids": row["input_ids"].view(-1),
+                "loss_mask": row["loss_mask"].view(-1)
             }, output_file))
 
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=row["input_ids"].tolist(),
+                origin_input_ids=row["input_ids"].view(-1).tolist(),
                 sampling_params=sampling_params,
             )
             req.prefix_indices = []
@@ -210,30 +217,31 @@ class SglangHiddenStatesGenerator:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target-model-path", type=str, required=True)
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--cache-dir", type=str, default="./cache")
-    parser.add_argument("--output-path", type=str, required=True)
+    parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--chat-template", type=str, default="llama3")
+    # parser.add_argument("--chat-template", type=str, default="llama3")
 
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--enable-aux-hidden-states", action="store_true")
     parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
+    ServerArgs.add_cli_args(parser)
+    BenchArgs.add_cli_args(parser)
     return parser.parse_args()
 
 def main():
     args = parse_args()
+    torch.distributed.init_process_group(backend="nccl")
     assert os.path.exists(args.data_path), f"Dataset path {args.data_path} does not exist"
-    if not os.path.exists(args.output_path):
-        os.makedirs(args.output_path)
-    else:
-        assert os.path.isdir(args.output_path), f"Output path {args.output_path} is not a directory"
+    if args.output_path is None:
+        root_path = Path(__file__).parent.parent
+        args.output_path = root_path.joinpath("cache", "hidden_states")
     
     dataset = load_dataset("json", data_files=args.data_path)["train"]
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     cache_key = hashlib.md5(args.data_path.encode()).hexdigest()
     with rank_0_priority():
         eagle3_dataset = build_eagle3_dataset(
@@ -246,7 +254,7 @@ def main():
         )
         print_with_rank(f"Built dataset")
     
-    hidden_states_generator = SglangHiddenStatesGenerator(args, tp_rank=0)
+    hidden_states_generator = SglangHiddenStatesGenerator(args, tp_rank=torch.distributed.get_rank())
     hidden_states_generator.generate(eagle3_dataset)
 
 
