@@ -64,7 +64,7 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         self.assertEqual(model.hidden_size, self.config.hidden_size)
 
     def test_save_pretrained(self):
-        """save"""
+        """Test the model's save_pretrained functionality."""
         model = LlamaForCausalLMEagle3(self.config)
 
         self.config.save_pretrained(self.temp_dir)
