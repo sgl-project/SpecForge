@@ -144,7 +144,7 @@ def main():
         draft_model = (
             AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
         )
-    draft_model.load_embedding(args.target_model_path)
+    draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank(f"Initialized draft model")
 
