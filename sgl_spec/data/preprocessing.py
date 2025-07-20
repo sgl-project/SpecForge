@@ -213,6 +213,7 @@ def build_eagle3_dataset(
 # ==============================
 # Offline Eagle3 Dataset
 # ==============================
+# modified from https://github.com/NickL77/BaldEagle/blob/master/train/modules/data/data.py
 def list_local_files(path, suffixes=[".ckpt"]):
     datapaths = []
     for root, directories, files in os.walk(path):
