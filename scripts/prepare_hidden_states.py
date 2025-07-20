@@ -3,15 +3,6 @@ This script will generate the hidden states for the dataset.
 By generating hidden states in advance, we can avoid:
 - the memory overhead of loading target model
 - the latency overhead of generating hidden states for each request.
-
-e.g:
-python scripts/prepare_data.py --dataset sharegpt --output_path cache/dataset/sharegpt
-export TP=8
-torchrun --nproc_per_node=$TP --master_port=29500 scripts/prepare_hidden_states.py \
-    --model-path /root/huggingface_cache/Llama-3.1-8B-Instruct --enable-aux-hidden-states \
-    --data-path cache/dataset/sharegpt.jsonl --chat-template llama3 --max-length 2048 \
-    --tp-size $TP --batch-size 4 --mem-frac=0.75 \
-    --num-samples 1000
 """
 
 import os
@@ -73,6 +64,7 @@ class SglangHiddenStatesGenerator:
                 num_layers = config.text_config.num_hidden_layers
             else:
                 raise ValueError(f"config {config} does not have num_hidden_layers or text_config.num_hidden_layers")
+            # in sglang, when we do set_eagle3_layers_to_capture, we will add 1 to the layer index
             args.aux_hidden_states_layers = [2 - 1, num_layers // 2 - 1, num_layers - 3 - 1]
             assert len(args.aux_hidden_states_layers) == 3, "aux_hidden_states_layers is expected to be 3 layers"
             print_with_rank(f"Capturing Aux hidden states layers: {args.aux_hidden_states_layers}, num_layers: {num_layers}")

@@ -32,6 +32,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .template import TEMPLATE_REGISTRY, ChatTemplate
+from sgl_spec.utils import padding
 
 # define a type called conversation
 Conversation = List[Dict[str, str]]
@@ -208,6 +209,68 @@ def build_eagle3_dataset(
 
     dataset.set_format(type="torch")
     return dataset
+
+# ==============================
+# Offline Eagle3 Dataset
+# ==============================
+def list_local_files(path, suffixes=[".ckpt"]):
+    datapaths = []
+    for root, directories, files in os.walk(path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            datapaths.append(file_path)
+    for suffix in suffixes:
+        datapaths = [f_name for f_name in datapaths if f_name.endswith(suffix)]
+    return datapaths
+class OfflineEagle3Dataset(torch.utils.data.Dataset):
+    def __init__(self, datapath, transform=None, max_len=2048):
+        self.datapaths = datapath
+        self.transform = transform
+        self._epoch = 0
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.datapaths)
+
+    def _open_file(self, index):
+        return torch.load(self.datapaths[index], weights_only=False)
+
+    def __getitem__(self, index):
+        try:
+            data = self._open_file(index)
+        except Exception as e:
+            print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
+            data = self._open_file(0)
+            # raise e
+        new_data = {}
+
+        # Squeeze due to our data generation script adding a batch dimension
+        hidden_state = data["aux_hidden_state"].squeeze(0)[: self.max_len][None, :]
+        target = data["hidden_state"].squeeze(0)[: self.max_len][None, :]
+
+        input_ids = data["input_ids"][: self.max_len][None, :]
+        loss_mask = data["loss_mask"][: self.max_len][None, :]
+        loss_mask[0, -1] = 0
+
+        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
+        new_data["loss_mask"] = loss_mask
+        new_data["target"] = padding(target, left=False)
+        new_data["hidden_state"] = hidden_state
+        new_data["input_ids"] = padding(input_ids, left=False)
+        if self.transform:
+            new_data = self.transform(new_data)
+
+        return new_data
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+
+def build_offline_eagle3_dataset(
+    hidden_states_path: str,
+) -> torch.utils.data.Dataset:
+    return OfflineEagle3Dataset(
+        list_local_files(hidden_states_path),
+    )
 
 
 # ==============================
