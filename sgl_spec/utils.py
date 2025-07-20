@@ -1,6 +1,6 @@
+import json
 import os
 import re
-import json
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -49,15 +49,22 @@ def load_config_from_file(config_path: str):
 def print_with_rank(message):
     print(f"rank {dist.get_rank()}: {message}")
 
+
 PREFIX_CHECKPOINT_DIR = "epoch"
 _re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"_(\d+)$")
+
+
 def get_last_checkpoint(folder):
     content = os.listdir(folder)
     checkpoints = [
         path
         for path in content
-        if _re_checkpoint.search(path) is not None and os.path.isdir(os.path.join(folder, path))
+        if _re_checkpoint.search(path) is not None
+        and os.path.isdir(os.path.join(folder, path))
     ]
     if len(checkpoints) == 0:
         return
-    return os.path.join(folder, max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])))
+    return os.path.join(
+        folder,
+        max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])),
+    )
