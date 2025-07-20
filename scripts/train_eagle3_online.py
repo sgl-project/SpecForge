@@ -114,7 +114,7 @@ def main():
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
-    if os.path.isdir(args.output_dir):
+    if args.resume and os.path.isdir(args.output_dir):
         print(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
