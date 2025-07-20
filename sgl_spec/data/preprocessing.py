@@ -40,7 +40,7 @@ Conversation = List[Dict[str, str]]
 # ==============================
 # This file is for preprocessing the data
 # ==============================
-#copy from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
+# Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
 def preprocess_conversations(
     tokenizer: PreTrainedTokenizer,
     conversations: List[Conversation],
