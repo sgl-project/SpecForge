@@ -41,9 +41,9 @@ def parse_args():
 
 
 def process_ultrachat_row(row) -> Dict:
-    """
-    TODO(yinfan.1024): change rename process_ultrachat to process_openai
-    ultrachat dataset schema:
+    """Process a row from the ultrachat dataset.
+
+    The function expects a row with the following schema:
     "messages": [
         {
             "role": "user" | "assistant",
