@@ -349,7 +349,7 @@ def main():
 
         if epoch % args.save_interval == 0:
             # Save the model
-            epoch_output_dir = os.path.join(args.output_dir, f"epoch_0")
+            epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
             
             if dist.get_rank() == 0:
                 os.makedirs(epoch_output_dir, exist_ok=True)
