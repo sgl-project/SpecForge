@@ -366,11 +366,6 @@ class OfflineEagle3Model(Eagle3Model):
             # Step 5.5: calculate loss
             out_logp = nn.LogSoftmax(dim=2)(logits)
             plogp = target_p * out_logp
-            # if torch.distributed.get_rank() == 0:
-            #     from IPython import embed; embed()
-            # import time
-            # time.sleep(100)
-            # torch.distributed.barrier()
             loss = -torch.sum(position_mask * plogp, 2).mean()
 
             # Step 5.6: record metrics
