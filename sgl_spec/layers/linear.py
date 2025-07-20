@@ -168,3 +168,10 @@ class VocabParallelEmbedding(nn.Module):
 
     def extra_repr(self):
         return f"vocab_size={self.vocab_size}, embedding_dim={self.embedding_dim}, tp_size={self.tp_size}, tp_rank={self.tp_rank}, padding_idx={self.padding_idx}"
+
+    def load_state_dict(self, state_dict, strict=True):
+        # 只加载属于本shard的embedding参数
+        weight_of_current_shard = state_dict["weight"][
+            self.vocab_start : self.vocab_end, :
+        ]
+        self.weight.data.copy_(weight_of_current_shard)
