@@ -140,6 +140,6 @@ python3 bench_sglang_eagle.py --num-questions 80 --port 30000
 ```
 
 ### ✨ Acknowledgements
-
 We would like to express our sincere gratitude to the EAGLE official team, especially Hongyang Zhang and Yuhui Li, for their valuable work and support. We are also thankful to the NVIDIA team, in particular Avery H and Izzy Putterman, as well as the Google team, especially Ying Wang, for their insightful discussions and generous help throughout this project.
-This project has also been inspired by many outstanding open-source projects from the LLM community, including EAGLE, BaldEagle, TensorRT-Model-Optimizer and others. Their contributions and shared knowledge have greatly benefited our work.
+We would like to extend our special thanks to Meituan for their strong support and contributions, which have played a key role in driving this project forward.
+This project has also been inspired by many outstanding open-source projects from the LLM community, including [EAGLE](https://github.com/SafeAILab/EAGLE), [BaldEagle](https://huggingface.co/google/BaldEagle-7B-Instruct-v0), and [TensorRT-Model-Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) and others. Their contributions and shared knowledge have greatly benefited our work.
