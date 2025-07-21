@@ -89,12 +89,20 @@ def main(args):
     )
 
     output_throughput = num_output_tokens / latency
-    num_verify_tokens = sum(
-        s.get_meta_info("answer_1")["spec_verify_ct"]
-        + s.get_meta_info("answer_2")["spec_verify_ct"]
-        for s in rets
-    )
-    accept_length = num_output_tokens / num_verify_tokens
+
+    has_verify = "spec_verify_ct" in rets[0].get_meta_info("answer_1")
+    if has_verify:
+        num_verify_tokens = sum(
+            s.get_meta_info("answer_1")["spec_verify_ct"]
+            + s.get_meta_info("answer_2")["spec_verify_ct"]
+            for s in rets
+        )
+        if num_verify_tokens == 0:
+            accept_length = 1.0
+        else:
+            accept_length = num_output_tokens / num_verify_tokens
+    else:
+        accept_length = 1.0
 
     print(f"Number of questions: {len(questions)}")
     print(f"Output throughput: {output_throughput:.3f} token/s")

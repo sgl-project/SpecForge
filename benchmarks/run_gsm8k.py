@@ -108,7 +108,10 @@ def main(args):
         num_verify_tokens = sum(
             s.get_meta_info("answer")["spec_verify_ct"] for s in states
         )
-        accept_length = num_output_tokens / num_verify_tokens
+        if num_verify_tokens == 0:
+            accept_length = 1.0
+        else:
+            accept_length = num_output_tokens / num_verify_tokens
     else:
         accept_length = 1.0
 
