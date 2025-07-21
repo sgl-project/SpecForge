@@ -1,14 +1,15 @@
-<div align="center">
+<div align="center" id="sglangtop">
+<img src="./assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
-  <img src="./assets/logo.png" alt="SpecForge Logo" width="500">
-  <br>
-  <a href="https://huggingface.co/spaces/<your-org-or-username>/<your-repo>">
-    <img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Eagle3-yellow.svg?style=flat" alt="Hugging Face">
-  </a>
-  <a href="./LICENSE">
-    <img src="https://img.shields.io/badge/License-MIT%202.0-blue" alt="License">
-  </a>
+[![HF-llama4-eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Eagle3-yellow.svg?style=flat)](https://huggingface.co/models/<user>/<repo>)
+[![license](https://img.shields.io/badge/License-MIT%202.0-blue)](./LICENSE)
+
+
+
+
 </div>
+
+
 
 ## Table of Contents
 
