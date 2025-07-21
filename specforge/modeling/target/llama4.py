@@ -48,8 +48,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 
 # [MODIFIED] Import from transformers library
-from sgl_spec.distributed import get_tp_group
-from sgl_spec.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import get_tp_group
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .base import DistributedTargetModel
 

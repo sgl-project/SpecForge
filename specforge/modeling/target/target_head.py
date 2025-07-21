@@ -1,6 +1,7 @@
-import os
-import json
 import glob
+import json
+import os
+
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
@@ -47,7 +48,6 @@ class TargetHead(nn.Module):
             state_dict = torch.load(os.path.join(self.model_path, ckpt_file))
             lm_head = state_dict[lm_head_key]
         self.fc.weight.copy_(lm_head)
-            
 
     def freeze_weights(self):
         for param in self.fc.parameters():

@@ -12,7 +12,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from tqdm import tqdm
 
-from sgl_spec.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 
 class DistributedTargetModel(ABC):

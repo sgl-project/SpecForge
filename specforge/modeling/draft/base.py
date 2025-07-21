@@ -32,7 +32,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PreTrainedModel
 
-from sgl_spec.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
 
 class Eagle3DraftModel(PreTrainedModel, ABC):

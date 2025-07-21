@@ -7,7 +7,7 @@ from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import Llama4Config, Llama4TextConfig, LlamaConfig, PretrainedConfig
 
-from sgl_spec.utils import default_torch_dtype
+from specforge.utils import default_torch_dtype
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.llama4 import Llama4ForCausalLM

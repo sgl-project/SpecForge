@@ -3,7 +3,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from sgl_spec.utils import print_with_rank
+from specforge.utils import print_with_rank
 
 _TP_GROUP = None
 _DP_GROUP = None

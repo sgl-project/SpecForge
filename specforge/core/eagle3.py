@@ -26,8 +26,8 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from sgl_spec.modeling.draft import Eagle3DraftModel
-from sgl_spec.utils import padding
+from specforge.modeling.draft import Eagle3DraftModel
+from specforge.utils import padding
 
 
 class Eagle3Model(nn.Module):

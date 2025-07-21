@@ -12,12 +12,12 @@ def read_readme():
 
 
 setup(
-    name="sgl-spec",
+    name="specforge",
     packages=find_packages(exclude=["configs", "scripts", "tests"]),
     version="0.0.1",
     install_requires=read_requirements(),
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    author="sgl-project",
-    url="https://github.com/sgl-project",
+    author="SGLang Team",
+    url="https://github.com/sgl-project/SpecForge",
 )

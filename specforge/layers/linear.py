@@ -1,10 +1,9 @@
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sgl_spec.distributed import get_tp_group
+from specforge.distributed import get_tp_group
 
 
 class RowParallelLinear(nn.Module):
