@@ -1,0 +1,11 @@
+pre-commit
+torch==2.6.0
+transformers==4.53.2
+datasets
+setuptools
+tqdm
+wandb
+psutil
+numpy
+accelerate
+pydantic
