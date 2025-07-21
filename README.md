@@ -6,6 +6,9 @@
   <a href="https://huggingface.co/spaces/<your-org-or-username>/<your-repo>">
     <img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Eagle3-yellow.svg?style=flat" alt="Hugging Face">
   </a>
+  <a href="./LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT%202.0-blue" alt="License">
+  </a>
 </div>
 
 ## Table of Contents
@@ -59,7 +62,7 @@ We provide two orthogonal paths so everyone can start training in minutes, regar
 
 ### ⚡️ SGLang-ready
 
-Whichever mode you pick, the checkpoint format is **byte-for-byte compatible** with [SGLang](https://github.com/sgl-project/sglang). There is post-processing or weights manipulation required.
+Whichever mode you pick, the checkpoint format is **byte-for-byte compatible** with [SGLang](https://github.com/sgl-project/sglang). There is no post-processing or weights manipulation required.
 
 Happy training!
 
@@ -78,7 +81,7 @@ In this section, we will introduce how to prepare the dataset for both online an
 
 ### ☁️ Prepare Online Training Dataset
 
-We have provided a script to prepare some sample datasets including ultrachat (200k) and sharegpt (120k) for demo purpose. You can easily process the dataset by running the following command. The jsonl files will be placed in the `cache/dataset/<dataset_name>` directory of the project path by default. These datasets will processed into `jsonl` files and congratulations you have the raw dataset ready for online training!
+We have provided a script to prepare some sample datasets including ultrachat (200k) and sharegpt (120k) for demo purpose. You can easily process the dataset by running the following command. The jsonl files will be placed in the `cache/dataset/<dataset_name>` directory of the project path by default. These datasets will be processed into `jsonl` files, which are the raw dataset ready for online training!
 
 ```bash
 # ultrachat
@@ -158,7 +161,7 @@ bash ./examples/run_llama4_eagle3_online.sh
 
 ### 💨 Offline Training
 
-We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct model in an offline manner. You can run the following command to start the training. Almost Everything is the same as the Online Training Step, except that you don't need to configure anything about target model. Instead, you need to parse `--train-hidden-states-path` to the file.
+We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct model in an offline manner. You can run the following command to start the training. Almost Everything is the same as the Online Training Step, except that you don't need to configure anything about target model. Instead, you need to pass `--train-hidden-states-path` to the file.
 
 ```bash
 # make sure you have sharegpt data prepared
@@ -173,7 +176,7 @@ If you wish to log the training progress to Wandb, you can add `--wandb`, `--wan
 
 ### 🔧 Customize Training Args
 
-```python
+```bash
 torchrun \
     --standalone \
     --nproc_per_node 8 \
@@ -196,7 +199,7 @@ If you wish to understand what each argument does, you can run `python scripts/t
 
 ### 💬 Customize Chat Template
 
-You can register a new chat ptemplate for your model by adding a new entry to the `TEMPLATE_REGISTRY` in the `sgl_spec.data.template.py` file.
+You can register a new chat template for your model by adding a new entry to the `TEMPLATE_REGISTRY` in the `sgl_spec.data.template.py` file.
 
 ```python
 TEMPLATE_REGISTRY.register(
@@ -216,7 +219,7 @@ TEMPLATE_REGISTRY.register(
 
 If you wish to train Eagle3 for other models, you need to modify the `--target-model-path` value. We support loading these models directly from HuggingFace.
 
-However, if you model is too large and requires tensor parallelism, you can implement its tensor parallel version on your own in the `sgl_spec.modeling.target` directory. The CausalLM model should inherit the `DistributedTargetModel` class in the `sgl_spec.modeling.target.base.py` file and apply `ColumnParallelLinear` and `RowParallelLinear` to the its submodules.
+However, if your model is too large and requires tensor parallelism, you can implement its tensor parallel version on your own in the `sgl_spec.modeling.target` directory. The CausalLM model should inherit the `DistributedTargetModel` class in the `sgl_spec.modeling.target.base.py` file and apply `ColumnParallelLinear` and `RowParallelLinear` to its submodules.
 
 ```python
 from .base import DistributedTargetModel
@@ -230,7 +233,7 @@ class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin, DistributedTar
         ...
 ```
 
-Afterwards, you need to regsiter this model to the `AutoEagle3TargetModel` class in the `sgl_spec.modeling.auto.py` file.
+Afterwards, you need to register this model to the `AutoEagle3TargetModel` class in the `sgl_spec.modeling.auto.py` file.
 
 ```diff
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
