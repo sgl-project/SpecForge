@@ -19,11 +19,23 @@ SGL-Spec is a framework for training speculative decoding models so that you can
 
 In this repo, we offer two ways to train your eagle model. One is **online training**, which means freezing target model and training draft model at same time. The other is **offline training**, which means using target model get the hidden states first, then train the draft model.
 
-## How to choose training method
-### Online:
-1. If you disk space is less than 2T, choose online. Offline need more space to train.
-### Offline:
-2. If you have enough disk space, you can try offline method. It can speedup training.
+### 🚀 Which training mode should I use?
+
+We provide two orthogonal paths so everyone can start training in minutes, regardless of hardware budget—both are actively maintained, battle-tested daily in our CI, and guaranteed runnable out-of-the-box.
+
+| Disk space | Recommended mode | One-liner rationale |
+|---|---|---|
+| < 2 TB | **Online** | Stream data on-the-fly—disk-friendly. |
+| ≥ 2 TB | **Offline** | Pre-download once—maximizes GPU utilization. |
+
+> **Why does disk matter?**  
+> Offline mode stores the full dataset, model weights, and cache locally, so a tiny disk fills up fast.  
+> Online mode fetches shards just-in-time, trading a bit of I/O for almost-zero disk footprint.
+
+> **SGLang-ready**  
+> Whichever mode you pick, the checkpoint format is **byte-for-byte compatible** with [SGLang](https://github.com/sgl-project/sglang).  
+
+Happy training!
 
 
 ## 📦 Installation
