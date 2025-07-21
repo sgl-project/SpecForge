@@ -48,8 +48,8 @@ We provide two orthogonal paths so everyone can start training in minutes, regar
 
 | Method | Target Model | Disk Space Requirement | GPU Requirement | One-liner rationale |
 | --- | --- | --- | --- | --- |
-| Online | Used during training | Huge (e.g. ultrachat+sharegpt will need 12TB storage ) | as low as 1 GPU, as only need to accommodate the draft model | Generating auxiliary hidden states on the fly |
-| Offline | Only used during data preparation | Small | More GPUs are needed if your target model is large | Preparing auxiliary hidden states beforehand and only once |
+| Online | Used during training | Small | More GPUs are needed if your target model is large | Generating auxiliary hidden states on the fly |
+| Offline | Only used during data preparation | Huge (e.g. ultrachat+sharegpt will need 12TB storage ) | as low as 1 GPU, as only need to accommodate the draft model  | Preparing auxiliary hidden states beforehand and only once |
 
 > **Why does disk matter?**
 > During Eagle3 training, the frozen target model will first generate the hidden states for each token given the data sample. The hidden states are fed to the draft model for training.
