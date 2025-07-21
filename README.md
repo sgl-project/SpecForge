@@ -1,8 +1,9 @@
-# <center> SGLang Speculative </center>
-
-#### <center> This repository contains code to train Eagle3 models which are compatible with the SGLang framework. </center>
-
 <div align="center">
+
+  # SGLang Speculative
+
+####  This repository contains code to train Eagle3 models which are compatible with the SGLang framework. 
+
   <a href="https://huggingface.co/spaces/<your-org-or-username>/<your-repo>">
     <img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Repo-yellow.svg?style=flat&logo=huggingface" alt="Hugging Face">
   </a>
