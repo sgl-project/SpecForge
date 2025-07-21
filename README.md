@@ -39,6 +39,20 @@ python scripts/prepare_data.py --dataset ultrachat
 python scripts/prepare_data.py --dataset sharegpt
 ```
 
+### Data Preparation For Offline Training
+
+You need to do one more step for Offline Training: Hidden states generation. the data-path is actuall the output path from the previous `prepare_data.py` script.
+- For now this script assumes `TP == WORLD_SIZE`.
+- `--num-samples` are used to control the storage. By default it will use all the data from `data-path`.
+```bash
+export TP=8
+torchrun --nproc_per_node=$TP --master_port=29500 scripts/prepare_hidden_states.py \
+    --model-path $MODEL_PATH --enable-aux-hidden-states \
+    --data-path $DATA_PATH --chat-template llama3 --max-length 2048 \
+    --tp-size $TP --batch-size 4 --mem-frac=0.75 \
+    --num-samples 1000
+```
+
 ## 🚀 Training
 
 ### 🔥 Online Training
@@ -101,7 +115,13 @@ class AutoDraftModelConfig:
 
 ### 💨 Offline Training
 
-To be added.
+We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct model. You can run the following command to start the training. Almost Everything is the same as the Online Training Step, except that you don't need to config anything about target model. You need to parse `--train-hidden-states-path` to the file.
+
+```bash
+# make sure you have sharegpt data prepared
+bash ./examples/run_llama3_eagle3_offline.sh
+```
+
 
 ## 🤖 Serving and Benchmarking
 

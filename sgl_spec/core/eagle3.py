@@ -265,9 +265,10 @@ class OfflineEagle3Model(Eagle3Model):
     Offline training means we have the target hidden_states available before training.
     """
 
-    def __init__(self, draft_model, length: int = 7):
+    def __init__(self, target_head, draft_model, length: int = 7):
         super().__init__()
         self.draft_model = draft_model
+        self.target_head = target_head
         self.length = length
 
     def forward(
@@ -281,6 +282,7 @@ class OfflineEagle3Model(Eagle3Model):
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         # basic info
+        target = self.target_head(target)
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
