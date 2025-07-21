@@ -1,6 +1,5 @@
 <div align="center">
 
-  # SpecForge
   <img src="./assets/logo.png" alt="SpecForge Logo" width="500">
   <br>
   <a href="https://huggingface.co/spaces/<your-org-or-username>/<your-repo>">
