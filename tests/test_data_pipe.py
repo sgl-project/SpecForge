@@ -9,8 +9,8 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
-from sgl_spec.data.config import DataConfig, ModelType
-from sgl_spec.data.data_pipeline import prepare_full_dataloaders
+from specforge.data.config import DataConfig, ModelType
+from specforge.data.data_pipeline import prepare_full_dataloaders
 
 
 def get_memory_usage():
@@ -88,7 +88,7 @@ def load_dataloader_cache(cache_key, config, cache_dir):
         # Recreate DataLoader objects
         from torch.utils.data import DataLoader, DistributedSampler
 
-        from sgl_spec.data.dataloader import DataCollatorWithPadding
+        from specforge.data.dataloader import DataCollatorWithPadding
 
         world_size = dist.get_world_size()
         rank = dist.get_rank()

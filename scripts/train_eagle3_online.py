@@ -12,20 +12,20 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sgl_spec import (
+from specforge import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
     OnlineEagle3Model,
 )
-from sgl_spec.data import (
+from specforge.data import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from sgl_spec.distributed import destroy_distributed, get_dp_group, init_distributed
-from sgl_spec.lr_scheduler import CosineAnnealingWarmupLR
-from sgl_spec.utils import get_last_checkpoint, print_with_rank, rank_0_priority
+from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.lr_scheduler import CosineAnnealingWarmupLR
+from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
 
 
 def parse_args():

@@ -1,7 +1,7 @@
 import unittest
 
-from sgl_spec.modeling.draft.llama3_eagle import LlamaForCausalLMEagle3
-from sgl_spec.modeling.target.llama4 import Llama4ForCausalLM
+from specforge.modeling.draft.llama3_eagle import LlamaForCausalLMEagle3
+from specforge.modeling.target.llama4 import Llama4ForCausalLM
 
 
 class TestAutoModelForCausalLM(unittest.TestCase):

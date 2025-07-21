@@ -199,7 +199,7 @@ If you wish to understand what each argument does, you can run `python scripts/t
 
 ### 💬 Customize Chat Template
 
-You can register a new chat template for your model by adding a new entry to the `TEMPLATE_REGISTRY` in the `sgl_spec.data.template.py` file.
+You can register a new chat template for your model by adding a new entry to the `TEMPLATE_REGISTRY` in the `specforge.data.template.py` file.
 
 ```python
 TEMPLATE_REGISTRY.register(
@@ -219,11 +219,11 @@ TEMPLATE_REGISTRY.register(
 
 If you wish to train Eagle3 for other models, you need to modify the `--target-model-path` value. We support loading these models directly from HuggingFace.
 
-However, if your model is too large and requires tensor parallelism, you can implement its tensor parallel version on your own in the `sgl_spec.modeling.target` directory. The CausalLM model should inherit the `DistributedTargetModel` class in the `sgl_spec.modeling.target.base.py` file and apply `ColumnParallelLinear` and `RowParallelLinear` to its submodules.
+However, if your model is too large and requires tensor parallelism, you can implement its tensor parallel version on your own in the `specforge.modeling.target` directory. The CausalLM model should inherit the `DistributedTargetModel` class in the `specforge.modeling.target.base.py` file and apply `ColumnParallelLinear` and `RowParallelLinear` to its submodules.
 
 ```python
 from .base import DistributedTargetModel
-from sgl_spec.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 
 class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin, DistributedTargetModel):
@@ -233,7 +233,7 @@ class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin, DistributedTar
         ...
 ```
 
-Afterwards, you need to register this model to the `AutoEagle3TargetModel` class in the `sgl_spec.modeling.auto.py` file.
+Afterwards, you need to register this model to the `AutoEagle3TargetModel` class in the `specforge.modeling.auto.py` file.
 
 ```diff
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
@@ -247,7 +247,7 @@ When `tp_size` is greater than 1, the script will automatically load the distrib
 
 #### Customize Draft Model
 
-If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `sgl_spec.modeling.draft.base.py` file.
+If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `specforge.modeling.draft.base.py` file.
 
 
 ```python
@@ -270,7 +270,7 @@ class MyModelEagle3(Eagle3DraftModel):
         ...
 ```
 
-You can then register these models to the `AutoEagle3TargetModel` and `AutoDraftModelConfig` classes in the `sgl_spec.modeling.auto.py` file for the automatic model loading.
+You can then register these models to the `AutoEagle3TargetModel` and `AutoDraftModelConfig` classes in the `specforge.modeling.auto.py` file for the automatic model loading.
 
 ```diff
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):

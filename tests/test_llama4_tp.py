@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 from transformers import Llama4ForCausalLM, Llama4TextConfig
 
-from sgl_spec.distributed import init_distributed
+from specforge.distributed import init_distributed
 
 
 def test_llama4_tp(rank, world_size, temp_dir):
@@ -38,7 +38,7 @@ def test_llama4_tp(rank, world_size, temp_dir):
     # create the single-gpu
     model = Llama4ForCausalLM(config).cuda()
 
-    from sgl_spec.modeling.target.llama4 import (
+    from specforge.modeling.target.llama4 import (
         Llama4ForCausalLM as DistLlama4ForCausalLM,
     )
 

@@ -4,6 +4,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -11,22 +12,17 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import wandb
-from sgl_spec import (
-    AutoDraftModelConfig,
-    AutoEagle3DraftModel,
-    OfflineEagle3Model,
-)
-from sgl_spec.data import (
+from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OfflineEagle3Model
+from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from sgl_spec.modeling.target.target_head import TargetHead
-from sgl_spec.distributed import destroy_distributed, get_dp_group, init_distributed
-from sgl_spec.lr_scheduler import CosineAnnealingWarmupLR
-from sgl_spec.utils import print_with_rank, rank_0_priority
+from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.lr_scheduler import CosineAnnealingWarmupLR
+from specforge.modeling.target.target_head import TargetHead
+from specforge.utils import print_with_rank, rank_0_priority
 
 
 def parse_args():
@@ -116,7 +112,9 @@ def main():
 
     # build target and draft model
     target_head = TargetHead(args.target_model_path)
-    target_head.load_weights(model_path=args.target_model_path, lm_head_key=args.lm_head_key)
+    target_head.load_weights(
+        model_path=args.target_model_path, lm_head_key=args.lm_head_key
+    )
     target_head.freeze_weights()
     target_head = target_head.eval().cuda().to(torch.bfloat16)
     print_with_rank(f"Initialized target head")
@@ -228,11 +226,13 @@ def main():
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
-                input_ids=data["input_ids"].cuda(), # [B, S]
-                attention_mask=data["attention_mask"].cuda(), # [B, S]
-                loss_mask=data["loss_mask"].unsqueeze(-1).cuda(), # [B, S, 1] This is different from the online version
-                hidden_states=data["hidden_state"].cuda(), # [B, S, D]
-                target=data["target"].cuda(), # [B, S, D*3]
+                input_ids=data["input_ids"].cuda(),  # [B, S]
+                attention_mask=data["attention_mask"].cuda(),  # [B, S]
+                loss_mask=data["loss_mask"]
+                .unsqueeze(-1)
+                .cuda(),  # [B, S, 1] This is different from the online version
+                hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
+                target=data["target"].cuda(),  # [B, S, D*3]
             )
 
             # calculate weighted loss

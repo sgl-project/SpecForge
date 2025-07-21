@@ -28,7 +28,7 @@ class TemplateRegistry:
 
     Example:
     ```python
-        from sgl_spec.data.template import TEMPLATE_REGISTRY, ChatTemplate
+        from specforge.data.template import TEMPLATE_REGISTRY, ChatTemplate
         TEMPLATE_REGISTRY.register(
             name="custom",
             template=ChatTemplate(

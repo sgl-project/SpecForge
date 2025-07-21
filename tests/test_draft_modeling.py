@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from transformers import LlamaConfig
 
-from sgl_spec.modeling.draft.llama3_eagle import (
+from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaForCausalLMEagle3,
     LlamaMLP,

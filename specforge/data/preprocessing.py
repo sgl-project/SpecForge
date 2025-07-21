@@ -31,8 +31,9 @@ from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
+from specforge.utils import padding
+
 from .template import TEMPLATE_REGISTRY, ChatTemplate
-from sgl_spec.utils import padding
 
 # define a type called conversation
 Conversation = List[Dict[str, str]]
@@ -210,6 +211,7 @@ def build_eagle3_dataset(
     dataset.set_format(type="torch")
     return dataset
 
+
 # ==============================
 # Offline Eagle3 Dataset
 # ==============================
@@ -223,6 +225,8 @@ def list_local_files(path, suffixes=[".ckpt"]):
     for suffix in suffixes:
         datapaths = [f_name for f_name in datapaths if f_name.endswith(suffix)]
     return datapaths
+
+
 class OfflineEagle3Dataset(torch.utils.data.Dataset):
     def __init__(self, datapath, transform=None, max_len=2048):
         self.datapaths = datapath
@@ -265,6 +269,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
     def set_epoch(self, epoch):
         self._epoch = epoch
+
 
 def build_offline_eagle3_dataset(
     hidden_states_path: str,
