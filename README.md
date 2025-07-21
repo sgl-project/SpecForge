@@ -1,71 +1,84 @@
 <div align="center">
 
-  # SGLang Speculative
-
-####  This repository contains code to train Eagle3 models which are compatible with the SGLang framework. 
+  # SpecForge
+  <img src="./assets/logo.png" alt="SpecForge Logo" width="500">
 
   <a href="https://huggingface.co/spaces/<your-org-or-username>/<your-repo>">
-    <img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Repo-yellow.svg?style=flat&logo=huggingface" alt="Hugging Face">
+    <img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Eagle3-yellow.svg?style=flat" alt="Hugging Face">
   </a>
-
-[Online Training Quick Start]() |
-[Offline Training Quick Start]()
-
 </div>
+
+## Table of Contents
+
+- [📍 Overview](#-overview)
+    - [🤔 Why SpecForge?](#-why-specforge)
+    - [🔥 Which training mode should I use?](#-which-training-mode-should-i-use)
+    - [⚡️ SGLang-ready](#-sglang-ready)
+- [📦 Installation](#-installation)
+- [📝 Data Preparation](#-data-preparation)
+    - [☁️ Prepare Online Training Dataset](#-prepare-online-training-dataset)
+    - [💾 Prepare Offline Training Dataset](#-prepare-offline-training-dataset)
+    - [🤩 Prepare your own dataset](#-prepare-your-own-dataset)
+- [🚀 Training](#-training)
+    - [🔥 Online Training](#-online-training)
+    - [💨 Offline Training](#-offline-training)
+    - [📈 Wandb Integration](#-wandb-integration)
+- [💡 Customize Your Own Training](#-customize-your-own-training)
+    - [🔧 Customize Training Args](#-customize-training-args)
+    - [💬 Customize Chat Template](#-customize-chat-template)
+    - [🪅 Customize model](#-customize-model)
+- [🤖 Serving and Benchmarking On SGLang](#-serving-and-benchmarking-on-sglang)
+- [✨ Acknowledgements](#-acknowledgements)
 
 ## 📍 Overview
 
-SGL-Spec is a framework for training speculative decoding models so that you can smoothly port them over to the SGLang serving framework to speed up your inference. We prepared this repository because other open-source repositories are either not well-maintained or not directly compatible with SGLang.
+SpecForge is an ecosystem project developed by the SGLang team. It is a framework for training speculative decoding models so that you can smoothly port them over to the SGLang serving framework to speed up your inference.
 
-In this repo, we offer two ways to train your eagle model. One is **online training**, which means freezing target model and training draft model at same time. The other is **offline training**, which means using target model get the hidden states first, then train the draft model.
+Particularly, we offer two ways to train your eagle model. One is **online training**, which means freezing target model and training draft model at same time. The other is **offline training**, which means generating and saving the hidden states using the target model first and then training the draft model in a separate process.
+
+### 🤔 Why SpecForge?
+
+We have seen many open-source projects for speculative decoding, but most of them are not well-maintained or not directly compatible with SGLang. We prepared this project because we wish that the open-source community can enjoy a speculative decoding framework that is
+- regularly maintained by the SGLang team: the code is runnable out-of-the-box
+- directly compatible with SGLang: there is no additional efforts for porting to SGLang
+- provide performant training capabilities: we provided online/offline/tensor-parallel/FSDP to suit your needs
 
 ### 🚀 Which training mode should I use?
 
-We provide two orthogonal paths so everyone can start training in minutes, regardless of hardware budget—both are actively maintained, battle-tested daily in our CI, and guaranteed runnable out-of-the-box.
+We provide two orthogonal paths so everyone can start training in minutes, regardless of hardware budget — both are actively maintained, battle-tested daily in our CI, and guaranteed runnable out-of-the-box. Below is a comparison of the two methods.
 
-| Disk space | Recommended mode | One-liner rationale |
-|---|---|---|
-| < 2 TB | **Online** | Stream data on-the-fly—disk-friendly. |
-| ≥ 2 TB | **Offline** | Pre-download once—maximizes GPU utilization. |
+| Method | Target Model | Disk Space Requirement | GPU Requirement | One-liner rationale |
+| --- | --- | --- | --- | --- |
+| Online | Used during training | Huge (e.g. ultrachat+sharegpt will need 12TB storage ) | as low as 1 GPU, as only need to accommodate the draft model | Generating auxiliary hidden states on the fly |
+| Offline | Only used during data preparation | Small | More GPUs are needed if your target model is large | Preparing auxiliary hidden states beforehand and only once |
 
-> **Why does disk matter?**  
-> Offline mode stores the full dataset, model weights, and cache locally, so a tiny disk fills up fast.  
-> Online mode fetches shards just-in-time, trading a bit of I/O for almost-zero disk footprint.
+> **Why does disk matter?**
+> During Eagle3 training, the frozen target model will first generate the hidden states for each token given the data sample. The hidden states are fed to the draft model for training.
+> Offline mode stores these hidden states to the local disk, so a small disk fills can be filled up fast.
+> Online mode only generates these hidden states on the fly without storing them to the disk, but needs to keep the draft model alive during training, trading GPU RAM for almost-zero disk footprint.
 
-> **SGLang-ready**  
-> Whichever mode you pick, the checkpoint format is **byte-for-byte compatible** with [SGLang](https://github.com/sgl-project/sglang).  
+### ⚡️ SGLang-ready
+
+Whichever mode you pick, the checkpoint format is **byte-for-byte compatible** with [SGLang](https://github.com/sgl-project/sglang). There is post-processing or weights manipulation required.
 
 Happy training!
 
 
 ## 📦 Installation
 
+To install this project, you can simply run the following command.
+
 ```bash
-pip install -v -e .
+pip install -v .
 ```
 
 ## 📝 Data Preparation
 
-### Prepare Online Training Dataset
+In this section, we will introduce how to prepare the dataset for both online and offline training. As mentioned in the [Overview](#-overview) section, online training only requires the raw dataset while offline training requires the hidden states generated from the target model. In the section below, we will introduce how to prepare both the raw dataset and the hidden states.
 
-#### Using dataset on huggingface
+### ☁️ Prepare Online Training Dataset
 
-We have provided a script to prepare ultrachat (200k) and sharegpt (120k) datasets for demo purpose. You can easily process the dataset by running the following command. The jsonl files will be placed in the `cache/dataset/<dataset_name>` directory of the project path by default.
-
-```bash
-# ultrachat
-python scripts/prepare_data.py --dataset ultrachat
-
-# sharegpt
-python scripts/prepare_data.py --dataset sharegpt
-```
-
-
-### Prepare Offline Training Dataset
-
-#### Using dataset on huggingface
-
-We need to filter Dataset same with Online Training, We have provided a script to prepare ultrachat (200k) and sharegpt (120k) datasets for demo purpose. You can easily process the dataset by running the following command. The jsonl files will be placed in the `cache/dataset/<dataset_name>` directory of the project path by default.
+We have provided a script to prepare some sample datasets including ultrachat (200k) and sharegpt (120k) for demo purpose. You can easily process the dataset by running the following command. The jsonl files will be placed in the `cache/dataset/<dataset_name>` directory of the project path by default. These datasets will processed into `jsonl` files and congratulations you have the raw dataset ready for online training!
 
 ```bash
 # ultrachat
@@ -75,83 +88,163 @@ python scripts/prepare_data.py --dataset ultrachat
 python scripts/prepare_data.py --dataset sharegpt
 ```
 
-#### Extract dataset hidden states (Offline Only)
+### 💾 Prepare Offline Training Dataset
 
-> ⚠️ This extract may take about 5T Disk
+Compared to online data, offline data requires one more step for hidden states generation. Thus, before you delve into this section, make sure you have your `jsonl` files ready as mentioned in the [Prepare Online Training Dataset](#-prepare-online-training-dataset) section. Once you have the `jsonl` files, you can start the hidden states generation.
 
-You need to do one more step for Offline Training: Hidden states generation. the data-path is actuall the output path from the previous `prepare_data.py` script. **This may take about 2 hours**.
-- For now this script assumes `TP == WORLD_SIZE`.
-- `--num-samples` are used to control the storage. By default it will use all the data from `data-path`.
+You can run the following command to obtain the hidden states.
+
 ```bash
-export TP=8
-torchrun --nproc_per_node=$TP --master_port=29500 scripts/prepare_hidden_states.py \
-    --model-path $MODEL_PATH --enable-aux-hidden-states \
-    --data-path $DATA_PATH --chat-template llama3 --max-length 2048 \
-    --tp-size $TP --batch-size 4 --mem-frac=0.75 \
+torchrun --nproc_per_node=8 \
+    scripts/prepare_hidden_states.py \
+    --model-path <target-model-path> \
+    --enable-aux-hidden-states \
+    --data-path <jsonl-file-path> \
+    --chat-template llama3 \
+    --max-length 2048 \
+    --tp-size 8 \
+    --batch-size 4 \
+    --mem-frac=0.75 \
     --num-samples 1000
 ```
+> ⚠️ This extract may take 2 hours and about 5T Disk
 
-### Prepare your own dataset
+You need to specify the following arguments:
+- `--model-path`: this is the huggingface repo name or path to the target model.
+- `--data-path`: this is actual output path from the previous `prepare_data.py` script.
+- `--chat-template`: this is the chat template to use for this model.
+- `--num-samples`: this specifies how many data samples to use for hidden states generation. By default it will use all the data from `data-path`.
 
-#### Custom data schema
 
-In order to run the training script smoothly, you should prepare the dataset in jsonl format and the schema should look like this:
+### 🤩 Prepare your own dataset
+
+Besides the provided ShareGPT/Ultrachat datasets, you can also prepare your own dataset. You should prepare the dataset in jsonl format and the schema should look like this:
 
 ```json
 {
     "id": "xxxx",
     "conversations": [
         {
-            "role": "user" | "assistant",
+            "role": "user | assistant",
             "content": "The message content"
         }
     ],
 }
 ```
 
-#### Prepare data
+Once you have the `jsonl` file ready, you can go straight for online training or hidden states generation for offline training.
 
-Then you can following Online/Offline Training.
+If you have multiple datasets, you can just merge them into the one jsonl file. For example, you can do something like this
+
+```bash
+cat dataset1.jsonl dataset2.jsonl > merged_dataset.jsonl
+```
+
 
 ## 🚀 Training
 
-### 🔥 Online Training
+### 🏎️ Online Training
 
-We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct model. You can run the following command to start the training.
+We have provided a simple startup script to train the Eagle3 model for the Llama 3 and 4 models. You can run the following command to start the training.
 
 ```bash
 # make sure you have sharegpt data prepared
+# train llama3-8B-instruct
 bash ./examples/run_llama3_eagle3_online.sh
+
+# train llama4-scout
+bash ./examples/run_llama4_eagle3_online.sh
 ```
 
-### Custom Training
+### 💨 Offline Training
+
+We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct model in an offline manner. You can run the following command to start the training. Almost Everything is the same as the Online Training Step, except that you don't need to configure anything about target model. Instead, you need to parse `--train-hidden-states-path` to the file.
+
+```bash
+# make sure you have sharegpt data prepared
+bash ./examples/run_llama3_eagle3_offline.sh
+```
+
+### 📈 Wandb Integration
+
+If you wish to log the training progress to Wandb, you can add `--wandb`, `--wandb-key`, `--wandb-project` and `--wandb-name` to the command line in the provided sh file.
+
+## 💡 Customize Your Own Training
+
+### 🔧 Customize Training Args
 
 ```python
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-ROOT_DIR=$(dirname $SCRIPT_DIR)
-
-# train eagle3 for llama3.1-8b
-NUM_GPUS=${1:-8}
-
 torchrun \
     --standalone \
-    --nproc_per_node $NUM_GPUS \
-    $ROOT_DIR/scripts/train_eagle3_online.py \
+    --nproc_per_node 8 \
+    ./scripts/train_eagle3_online.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
-    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3 \
+    --draft-model-config ./configs/llama3-8B-eagle3.json \
+    --train-data-path ./cache/dataset/sharegpt.jsonl \
+    --output-dir ./outputs/llama3-8b-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template llama3 \
-    --cache-dir $ROOT_DIR/cache
+    --cache-dir ./cache
 ```
 
-**Customize target model**: If you wish to train Eagle3 for other models, you need to modify the `--target-model-path` value. We support loading these models directly from HuggingFace.
+If you wish to understand what each argument does, you can run `python scripts/train_eagle3_online.py --help` to see the full list of arguments. Particularly, we will discuss some important arguments below.
+- `--chat-template`: This should be the chat template to use for the model, so please make sure you set it to the correct value.
+- `--cache-dir`: This directory contains the dataset cache including the `input_ids`, `loss_mask`, `attention_mask` and `vocab_mapping`. These caches can make your data loading much faster once a cache is generated. The cache file has a name which is obtained by hashing the dataset path to avoid cache collision. **However, if you use the same cache for different models, that might cause problems because configs like vocab size is not consistent for different models. Thus please delete the old cache before you start training with a new model.**
 
-**Customize draft model**: If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. The architecture name must match the draft model types provided in the SGL-Spec library. If you want to implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `sgl_spec.modeling.draft.base.py` file.
+### 💬 Customize Chat Template
+
+You can register a new chat ptemplate for your model by adding a new entry to the `TEMPLATE_REGISTRY` in the `sgl_spec.data.template.py` file.
+
+```python
+TEMPLATE_REGISTRY.register(
+    name="your-template-name",
+    template=ChatTemplate(
+        assistant_header="xxx",
+        user_header="xxx",
+        system_prompt="xxx",
+        end_of_turn_token="xxx",
+    ),
+)
+```
+
+### 🪅 Customize Model
+
+#### Customize Target Model
+
+If you wish to train Eagle3 for other models, you need to modify the `--target-model-path` value. We support loading these models directly from HuggingFace.
+
+However, if you model is too large and requires tensor parallelism, you can implement its tensor parallel version on your own in the `sgl_spec.modeling.target` directory. The CausalLM model should inherit the `DistributedTargetModel` class in the `sgl_spec.modeling.target.base.py` file and apply `ColumnParallelLinear` and `RowParallelLinear` to the its submodules.
+
+```python
+from .base import DistributedTargetModel
+from sgl_spec.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+
+class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin, DistributedTargetModel):
+    ...
+
+    def load_weights(self, state_dict: Dict[str, torch.Tensor]):
+        ...
+```
+
+Afterwards, you need to regsiter this model to the `AutoEagle3TargetModel` class in the `sgl_spec.modeling.auto.py` file.
+
+```diff
+class AutoDistributedTargetModel(AutoModelForCausalLMBase):
+    _model_mapping = {
+        Llama4TextConfig: [Llama4ForCausalLM],
++       MyModelConfig: [MyModelForCausalLM],
+    }
+```
+
+When `tp_size` is greater than 1, the script will automatically load the distributed version of the model for tensor parallelism.
+
+#### Customize Draft Model
+
+If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `sgl_spec.modeling.draft.base.py` file.
 
 
 ```python
@@ -193,56 +286,11 @@ class AutoDraftModelConfig:
     }
 ```
 
-**Customize Data**: If you want to use your own dataset, make sure you prepared the dataset in the same format as given in the [data preparation section](#-data-preparation). If you have multiple datasets, you can just merge them into the one jsonl file. For example, you can do something like `cat dataset1.jsonl dataset2.jsonl > merged_dataset.jsonl`.
-
-**Wandb integration**: If you wish to log the training progress to Wandb, you can add `--wandb`, `--wandb-key`, `--wandb-project` and `--wandb-name` to the command line in the provided sh file.
-
-
-### 💨 Offline Training
-
-We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct model. You can run the following command to start the training. Almost Everything is the same as the Online Training Step, except that you don't need to config anything about target model. You need to parse `--train-hidden-states-path` to the file.
-
-```bash
-# make sure you have sharegpt data prepared
-bash ./examples/run_llama3_eagle3_offline.sh
-```
-
+In this way, as long as your `config.json` specifies the correct architecture name, the script will automatically load the correct draft model for you.
 
 ## 🤖 Serving and Benchmarking On SGLang
 
-
-You can serve your trained model with SGLang with the following command.
-
-```bash
-python3 -m sglang.launch_server \
-    --model meta-llama/Llama-3.1-8B-Instruct  \
-    --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path <saved_checkpoint_path> \
-    --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4 \
-    --mem-fraction-static 0.75 \
-    --cuda-graph-max-bs 2 \
-    --tp 1 \
-    --context-length 8192 \
-    --trust-remote-code \
-    --host 0.0.0.0 \
-    --port 30000 \
-    --dtype bfloat16
-```
-
-
-In SGLang, we have provided a benchmark script to evaluate the performance of the trained Eagle model. You can run the following command in SGLang to execute the benchmark script.
-
-```bash
-# prepare data
-cd sglang/benchmark/mtbench
-wget -O question.jsonl https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl
-
-
-# run benchmarking
-python3 bench_sglang_eagle.py --num-questions 80 --port 30000
-```
+Please refer to the [benchmarks](./benchmarks/README.md) document for more details.
 
 ## ✨ Acknowledgements
 We would like to express our sincere gratitude to the EAGLE official team, especially Hongyang Zhang and Yuhui Li, for their valuable work and support. We are also thankful to the NVIDIA team, in particular Avery H and Izzy Putterman, as well as the Google team, especially Ying Wang, for their insightful discussions and generous help throughout this project.
