@@ -266,6 +266,12 @@ class OfflineEagle3Model(Eagle3Model):
     """
 
     def __init__(self, target_head, draft_model, length: int = 7):
+        """
+        Args:
+            target_head: the target head to process the target hidden states.
+            draft_model: the draft model to be trained.
+            length: TTT length, it means how many turns to unroll during TTT.
+        """
         super().__init__()
         self.draft_model = draft_model
         self.target_head = target_head
@@ -281,6 +287,23 @@ class OfflineEagle3Model(Eagle3Model):
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Forward pass for the offline Eagle3 model.
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len)
+            loss_mask: (batch, seq_len, 1)
+            target: (batch, seq_len, vocab_size)
+            hidden_states: (batch, seq_len, 3*hidden_size)
+            past_key_values: We dont use this past_key_values in eagle3, but keep it
+                for compatibility. We control kvcache by cache_hidden.
+            position_ids: (batch, seq_len)
+
+        Returns:
+            plosses: List of losses for each TTT step.
+            vlosses: List of validation losses (not used in this implementation).
+            acces: List of accuracies for each TTT step.
+        """
         # basic info
         target = self.target_head(target)
         batch_size, seq_length, _ = hidden_states.shape

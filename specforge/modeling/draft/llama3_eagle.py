@@ -312,7 +312,6 @@ class LlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         if cache_hidden is None:
-            # 使用 SDPA 的标准因果注意力机制
             cos, sin = self.rotary_emb(query_states, seq_len=q_len)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             query_states, key_states = apply_rotary_pos_emb(
@@ -322,18 +321,16 @@ class LlamaAttention(nn.Module):
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            # 使用 SDPA
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
                 value_states,
                 attn_mask=attention_mask,
-                is_causal=attention_mask is None,  # 如果没有提供mask，使用因果mask
+                is_causal=attention_mask is None,
                 dropout_p=0.0,
             )
 
         else:
-            # 使用缓存的注意力机制（你原来的逻辑）
             lck = len(cache_hidden[0])
 
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
