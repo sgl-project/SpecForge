@@ -278,7 +278,9 @@ def main():
                 plosses, _, acces = eagle3_model(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                    loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
+                    hidden_states=data["hidden_state"].cuda(),
+                    target=data["target"].cuda(),
                 )
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
