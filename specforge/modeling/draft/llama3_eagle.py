@@ -215,32 +215,6 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         )
 
 
-def mask(attention_mask, sn=None):
-    device = attention_mask.device
-    # probabilities = torch.tensor([0.5, 0.25, 0.1, 0.1, 0.05]).to(device)
-    bs, _, n, _ = attention_mask.shape
-    min_value = torch.finfo(attention_mask.dtype).min
-    # # Step 1: 生成每个 token 的屏蔽数 N
-    # N = torch.multinomial(probabilities, num_samples=n, replacement=True)  # shape: (n,)
-    # if sn is not None:
-    N = torch.ones(n, device=device) * sn
-    N = N.unsqueeze(0).repeat(bs, 1)  # 扩展到 batch_size，shape: (bs, n)
-    # Step 2: 构造屏蔽矩阵
-    # 构造一个序列索引矩阵
-    indices = torch.arange(n).unsqueeze(0).unsqueeze(-1).to(device)  # shape: (1, n, 1)
-    row_diff = indices - indices.transpose(-1, -2)  # 得到差值矩阵，shape: (1, n, n)
-    # 扩展到 batch_size 和 (bs, 1, n, n)
-    row_diff = row_diff.unsqueeze(0).expand(bs, 1, n, n)
-    # 扩展 N 的形状以匹配 row_diff 的形状
-    N_expanded = N.view(bs, 1, n, 1)  # shape: (bs, 1, n, 1)
-    # 创建屏蔽 mask：屏蔽最近的 N 个 token
-    mask = (row_diff > -1) & (row_diff <= N_expanded - 1)  # shape: (bs, 1, n, n)
-    attention_mask = attention_mask.masked_fill(mask, min_value)
-    # attention_mask_ex = torch.ones_like(attention_mask) * min_value
-    # attention_mask_ex = attention_mask_ex.masked_fill(mask, 0)
-    return attention_mask
-
-
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
