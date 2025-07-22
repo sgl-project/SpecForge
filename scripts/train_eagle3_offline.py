@@ -167,22 +167,15 @@ def main():
     print_with_rank(f"Loaded vocab mapping")
 
     if args.eval_data_path is not None:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
-        eval_eagle3_dataset_tmp = build_eagle3_dataset(
-            eval_dataset,
-            tokenizer,
-            args.chat_template,
-            args.max_length,
+        eval_eagle3_dataset = build_offline_eagle3_dataset(
+            args.eval_hidden_states_path,
         )
         eval_dataloader = prepare_dp_dataloaders(
-            eval_eagle3_dataset_tmp,
+            eval_eagle3_dataset,
             args.batch_size,
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
-        )
-        eval_eagle3_dataset = build_offline_eagle3_dataset(
-            args.eval_hidden_states_path,
         )
         print_with_rank(f"Initialized eval dataloader")
 
