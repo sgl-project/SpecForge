@@ -1,5 +1,5 @@
 <div align="center" id="sglangtop">
-<img src="./assets/logo.png" alt="logo" width="400" margin="10px"></img>
+<img src="./assets/logo.svg" alt="logo" width="400" margin="10px"></img>
 
 [![HF-llama4-eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Eagle3-yellow.svg?style=flat)](https://huggingface.co/models/<user>/<repo>)
 [![license](https://img.shields.io/badge/License-MIT%202.0-blue)](./LICENSE)
