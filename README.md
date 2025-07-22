@@ -1,10 +1,10 @@
 <div align="center" id="sglangtop">
 <img src="./assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
-[![HF-llama4-eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Eagle3-yellow.svg?style=flat)](https://huggingface.co/models/<user>/<repo>)
+[![HF-llama4-scout-eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Scout-yellow.svg?style=flat)](https://huggingface.co/lmsys/sglang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-v1)
+[![HF-llama4-maverick-eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Maverick-yellow.svg?style=flat)](https://huggingface.co/lmsys/sglang-EAGLE3-Llama-4-Maverick-17B-128E-Instruct-v1)
 [![license](https://img.shields.io/badge/License-MIT%202.0-blue)](./LICENSE)
 </div>
-
 
 
 ## Table of Contents
