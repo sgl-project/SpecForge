@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--warmup-ratio", type=int, default=0.02)
+    parser.add_argument("--warmup-ratio", type=float, default=0.02)
 
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
