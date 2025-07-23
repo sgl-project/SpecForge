@@ -28,6 +28,7 @@
     - [🪅 Customize model](#-customize-model)
 - [🤖 Serving and Benchmarking On SGLang](#-serving-and-benchmarking-on-sglang)
 - [✨ Acknowledgements](#-acknowledgements)
+- [💡 Special Thanks to Voltage Park](#-special-thanks-to-voltage-park)
 
 ## 📍 Overview
 
@@ -292,6 +293,9 @@ In this way, as long as your `config.json` specifies the correct architecture na
 Please refer to the [benchmarks](./benchmarks/README.md) document for more details.
 
 ## ✨ Acknowledgements
+
+<img src="./assets/acknowledgements.png" alt="acknowledgements"></img>
+
 We would like to express our sincere gratitude to the EAGLE official team, especially Hongyang Zhang and Yuhui Li, for their valuable work and support. We are also thankful to the NVIDIA team, in particular Avery H and Izzy Putterman, as well as the Google team, especially Ying Wang, for their insightful discussions and generous help throughout this project.
 
 We would like to extend our special thanks to Meituan for their strong support and contributions, which have played a key role in driving this project forward.
