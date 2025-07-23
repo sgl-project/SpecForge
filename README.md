@@ -144,7 +144,7 @@ cat dataset1.jsonl dataset2.jsonl > merged_dataset.jsonl
 
 ### 🏎️ Online Training
 
-We have provided a simple startup script to train the Eagle3 model for the Llama 3 and 4 models. You can run the following command to start the training.
+We have provided a simple startup script to train the Eagle3 model for the Llama 3 and 4, Qwen3 models. You can run the following command to start the training.
 
 ```bash
 # make sure you have sharegpt data prepared
@@ -153,6 +153,9 @@ bash ./examples/run_llama3_eagle3_online.sh
 
 # train llama4-scout
 bash ./examples/run_llama4_eagle3_online.sh
+
+# train Qwen3-30B-A3B
+bash ./examples/run_qwen3_eagle3_online.sh
 ```
 
 ### 💨 Offline Training
