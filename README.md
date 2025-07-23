@@ -53,7 +53,7 @@ We provide two orthogonal paths so everyone can start training in minutes, regar
 
 > **Why does disk matter?**
 > During Eagle3 training, the frozen target model will first generate the hidden states for each token given the data sample. The hidden states are fed to the draft model for training.
-> Offline mode stores these hidden states to the local disk, so a small disk fills can be filled up fast.
+> Offline mode stores these hidden states to the local disk, so a small disk can be filled up fast.
 > Online mode only generates these hidden states on the fly without storing them to the disk, but needs to keep the draft model alive during training, trading GPU RAM for almost-zero disk footprint.
 
 ### ⚡️ SGLang-ready
