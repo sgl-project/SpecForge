@@ -20,8 +20,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from specforge.distributed import get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 from transformers import Qwen3MoeConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -43,6 +41,9 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+
+from specforge.distributed import get_tp_group
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .base import DistributedTargetModel
 

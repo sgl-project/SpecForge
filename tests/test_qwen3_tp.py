@@ -6,10 +6,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-
-from specforge.distributed import init_distributed
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+from specforge.distributed import init_distributed
+
 
 def test_qwen3_moe_tp(rank, world_size, temp_dir):
     os.environ["RANK"] = str(rank)
@@ -40,6 +41,7 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
     from specforge.modeling.target.qwen3_moe import (
         Qwen3MoeForCausalLM as DistQwen3MoeForCausalLM,
     )
+
     dist_model = DistQwen3MoeForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
@@ -92,4 +94,4 @@ if __name__ == "__main__":
 
     # 运行测试
     runner = unittest.TextTestRunner(verbosity=2)
-    runner.run(suite) 
+    runner.run(suite)
