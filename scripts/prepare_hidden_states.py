@@ -10,12 +10,13 @@ import hashlib
 import os
 from pathlib import Path
 from typing import Optional
-import torch.nn as nn
 
 import torch
+import torch.nn as nn
 from datasets import Dataset, load_dataset
 from sglang.bench_one_batch import BenchArgs, load_model
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -30,22 +31,32 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from specforge.data import build_eagle3_dataset
 from specforge.utils import print_with_rank, rank_0_priority
 
+
 class LogitsProcessorForEAGLE3(torch.nn.Module):
     def __init__(self, logits_processor: LogitsProcessor):
         super().__init__()
         self.logits_processor = logits_processor
-    
-    def forward(self, input_ids, hidden_states, lm_head, logits_metadata, aux_hidden_states: Optional[torch.Tensor] = None) -> LogitsProcessorOutput:
-        ret = self.logits_processor.forward(input_ids, hidden_states, lm_head, logits_metadata, aux_hidden_states)
+
+    def forward(
+        self,
+        input_ids,
+        hidden_states,
+        lm_head,
+        logits_metadata,
+        aux_hidden_states: Optional[torch.Tensor] = None,
+    ) -> LogitsProcessorOutput:
+        ret = self.logits_processor.forward(
+            input_ids, hidden_states, lm_head, logits_metadata, aux_hidden_states
+        )
         ret.last_hidden_states = hidden_states
         return ret
+
 
 def wrap_logits_processors_in_module(module: nn.Module):
     for name, submodule in module.named_modules():
@@ -53,6 +64,7 @@ def wrap_logits_processors_in_module(module: nn.Module):
             wrapped = LogitsProcessorForEAGLE3(submodule)
             setattr(module, name, wrapped)
             print(f"wrapped {name} with LogitsProcessorForEAGLE3")
+
 
 class SglangHiddenStatesGenerator:
     def __init__(self, args, tp_rank: int):
