@@ -20,8 +20,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_spec.distributed import get_tp_group
-from sgl_spec.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import get_tp_group
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 from transformers import Qwen3MoeConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
