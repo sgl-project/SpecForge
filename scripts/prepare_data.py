@@ -20,7 +20,13 @@ This script will convert the ultrachat/sharegpt dataset to the following schema 
 }
 """
 
-ROLE_MAPPING = {"human": "user", "gpt": "assistant"}
+ROLE_MAPPING = {
+    "human": "user",
+    "gpt": "assistant",
+    "chatgpt": "assistant",
+    "bing": "assistant",
+    "bard": "assistant",
+}
 
 
 def parse_args():
@@ -36,6 +42,12 @@ def parse_args():
         type=str,
         default=None,
         help="The path to save the processed dataset, if not specified, the dataset will be saved in the cache/dataset/dataset_name directory of the root path",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="The path to the custom dataset, if not specified, the default dataset will be loaded",
     )
     return parser.parse_args()
 
@@ -77,25 +89,37 @@ def process_sharegpt_row(row) -> Dict:
     """
     conversations = row["conversations"]
     formatted_conversations = []
-
+    skipped_count = 0
     for message in conversations:
+        if message["from"] not in ROLE_MAPPING:
+            skipped_count += 1
+            continue
         new_role = ROLE_MAPPING[message["from"]]
         content = message["value"]
         formatted_conversations.append({"role": new_role, "content": content})
 
     row = {"id": row["id"], "conversations": formatted_conversations}
-    return row
+    return row, skipped_count
+
+
+def load_dataset_from_path(data_path: Path):
+    suffix = data_path.suffix.split(".")[1]
+    ds = load_dataset(suffix, data_files=str(data_path), split="train")
+    return ds
 
 
 def main():
     args = parse_args()
-
     # load dataset
     if args.dataset == "ultrachat":
         ds = load_dataset("HuggingFaceH4/ultrachat_200k")["train_sft"]
         proc_fn = process_ultrachat_row
     elif args.dataset == "sharegpt":
-        ds = load_dataset("Aeala/ShareGPT_Vicuna_unfiltered")["train"]
+        if args.data_path is None:
+            ds = load_dataset("Aeala/ShareGPT_Vicuna_unfiltered")["train"]
+        else:
+            print("Loading dataset from custom data path: ", args.data_path)
+            ds = load_dataset_from_path(Path(args.data_path))
         proc_fn = process_sharegpt_row
     else:
         raise ValueError(
@@ -117,11 +141,15 @@ def main():
         )
         return
 
+    total_skipped_count = 0
     with open(output_jsonl_path, "w") as f:
         for item in tqdm(ds, desc=f"Processing {args.dataset} dataset"):
-            row = proc_fn(item)
+            row, skipped_count = proc_fn(item)
+            total_skipped_count += skipped_count
             f.write(json.dumps(row) + "\n")
 
+    if total_skipped_count > 0:
+        print(f"Skipped {total_skipped_count}/{len(ds)} messages for {args.dataset}")
 
 if __name__ == "__main__":
     main()
