@@ -22,7 +22,7 @@ from specforge.data import (
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.modeling.target.target_head import TargetHead
-from specforge.utils import print_with_rank, rank_0_priority
+from specforge.utils import print_with_rank, rank_0_priority, get_last_checkpoint
 
 
 def parse_args():
@@ -75,6 +75,9 @@ def parse_args():
         help="Timeout for collective communication in minutes",
     )
 
+    # resume
+    parser.add_argument("--resume", action="store_true")
+
     # wandb wandb args
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
@@ -109,6 +112,13 @@ def main():
 
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
+    
+    # detecting last ckpt for draft model
+    draft_model_last_checkpoint = None
+    if args.resume and os.path.isdir(args.output_dir):
+        print_on_rank0(args.output_dir)
+        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
+        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     # build target and draft model
     target_head = TargetHead(args.target_model_path)
@@ -120,9 +130,16 @@ def main():
     print_with_rank(f"Initialized target head")
 
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-    draft_model = (
-        AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
-    )
+    if draft_model_last_checkpoint:
+        draft_model = (
+            AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint)
+            .cuda()
+            .to(torch.bfloat16)
+        )
+    else:
+        draft_model = (
+            AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
+        )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank(f"Initialized draft model")
@@ -208,8 +225,35 @@ def main():
     )
     print_with_rank(f"Initialized optimizer and scheduler")
 
+    # resume
+    start_epoch = 0
+    if draft_model_last_checkpoint is not None:
+        print_on_rank0(
+            f"Resuming draft model training from checkpoint: {draft_model_last_checkpoint}"
+        )
+        state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
+
+        if os.path.exists(state_path):
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            print_on_rank0("Successfully loaded optimizer state_dict.")
+
+            scheduler.load_state_dict(state["scheduler_state_dict"])
+            print_on_rank0("Successfully loaded scheduler state_dict.")
+
+            start_epoch = state["epoch"] + 1
+            print_on_rank0(f"Resuming from epoch {start_epoch}")
+        else:
+            print_on_rank0(
+                f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch."
+            )
+
+    dist.barrier()
+
     # start running
-    for epoch in range(args.num_epochs):
+    print_on_rank0(f"Starting training from epoch {start_epoch}")
+    for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
@@ -287,8 +331,8 @@ def main():
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
                 ]
 
-            for i in range(len(epoch_acces)):
-                acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+            for i in range(len(eval_acces)):
+                acc_i = torch.tensor(eval_acces[i]).cuda().mean()
                 dist.all_reduce(acc_i)
                 acc_i = acc_i / dist.get_world_size()
                 acc_i = acc_i.item()
@@ -298,8 +342,8 @@ def main():
                     f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
                 )
 
-            for i in range(len(epoch_plosses)):
-                loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+            for i in range(len(eval_plosses)):
+                loss_i = torch.tensor(eval_plosses[i]).cuda().mean()
                 dist.all_reduce(loss_i)
                 loss_i = loss_i / dist.get_world_size()
                 loss_i = loss_i.item()
@@ -311,8 +355,19 @@ def main():
 
         if epoch % args.save_interval == 0:
             # Save the model
+            epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
+
+            if dist.get_rank() == 0:
+                os.makedirs(epoch_output_dir, exist_ok=True)
+            dist.barrier()
             with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
                 model_state_dict = eagle3_model.state_dict()
+                state_to_save = {
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "args": args,
+                }
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
                     for k, v in model_state_dict.items()
@@ -320,10 +375,18 @@ def main():
                 }
 
                 if dist.get_rank() == 0:
+                    torch.save(
+                        state_to_save,
+                        os.path.join(epoch_output_dir, "training_state.pt"),
+                    )
+                    print_on_rank0(
+                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                    )
                     draft_model.save_pretrained(
-                        os.path.join(args.output_dir, f"epoch_{epoch}"),
+                        epoch_output_dir,
                         state_dict=draft_model_state_dict,
                     )
+                    print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
                 dist.barrier()
 
     destroy_distributed()
