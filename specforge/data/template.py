@@ -113,3 +113,13 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant",
+        user_header="<|im_start|>user",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
