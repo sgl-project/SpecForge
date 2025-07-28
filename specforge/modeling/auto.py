@@ -70,8 +70,6 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
 
         if isinstance(config, Llama4Config):
             config = config.text_config
-        # elif isinstance(config, Qwen2Config):
-        #     config = config.text_config
 
         assert (
             type(config) in cls._model_mapping

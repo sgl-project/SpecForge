@@ -86,7 +86,7 @@ def parse_args():
 
     # wandb wandb args
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", type=str, default='specforge')
+    parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
 
@@ -96,9 +96,7 @@ def parse_args():
 
 
 def init_wandb(args):
-    import swanlab
-    swanlab.sync_wandb(mode='cloud', wandb_run=False)
-    # wandb.login(key=args.wandb_key)
+    wandb.login(key=args.wandb_key)
     wandb.init(project=args.wandb_project, name=args.wandb_name)
 
 
