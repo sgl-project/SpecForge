@@ -11,6 +11,7 @@ from transformers import (
     LlamaConfig,
     PretrainedConfig,
     Qwen3MoeConfig,
+    Qwen2Config,
 )
 
 from specforge.utils import default_torch_dtype
@@ -19,11 +20,15 @@ from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.llama4 import Llama4ForCausalLM
 from .target.qwen3_moe import Qwen3MoeForCausalLM
 
+from .draft.qwen2_eagle import Qwen2ForCausalLMEagle3
+from .target.qwen2 import Qwen2ForCausalLM
+
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
+        Qwen2Config: Qwen2ForCausalLMEagle3,
     }
 
     @classmethod
@@ -48,6 +53,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     _model_mapping = {
         Llama4TextConfig: [Llama4ForCausalLM],
         Qwen3MoeConfig: [Qwen3MoeForCausalLM],
+        Qwen2Config: [Qwen2ForCausalLM],
     }
 
     @classmethod
@@ -64,6 +70,8 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
 
         if isinstance(config, Llama4Config):
             config = config.text_config
+        # elif isinstance(config, Qwen2Config):
+        #     config = config.text_config
 
         assert (
             type(config) in cls._model_mapping
@@ -94,6 +102,7 @@ class AutoDraftModelConfig:
 
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
+        "Qwen2ForCausalLMEagle3": Qwen2Config,
     }
 
     @classmethod
