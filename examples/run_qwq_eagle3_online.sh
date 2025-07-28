@@ -2,7 +2,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 # train eagle3 for qwq-32b
-NUM_GPUS=${1:-9}
+NUM_GPUS=${1:-8}
 
 torchrun \
     --standalone \
