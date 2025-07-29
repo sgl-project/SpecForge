@@ -38,7 +38,11 @@ def validate_wandb_args(parser, args):
     if args.wandb_key is None:
         if dist.get_rank() == 0:
             parser.error(
-                f"When --wandb is enabled, the following arguments are required: --wandb-key"
+                "When --wandb is enabled, you must provide a wandb API key via one of:\n"
+                "  1. --wandb-key argument\n"
+                "  2. WANDB_API_KEY environment variable\n"
+                "  3. WANDB_LOCAL environment variable (for local mode)\n"
+                "  4. wandb login api-key"
             )
 
 
