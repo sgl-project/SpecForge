@@ -9,6 +9,28 @@ import torch.distributed as dist
 from transformers import PretrainedConfig
 
 
+def validate_wandb_args(parser, args):
+    """Validate that required wandb arguments are provided when --wandb is enabled.
+
+    Args:
+        parser: The argparse.ArgumentParser instance
+        args: The parsed arguments
+    """
+    if args.wandb:
+        missing_args = []
+        if args.wandb_project is None:
+            missing_args.append("--wandb-project")
+        if args.wandb_name is None:
+            missing_args.append("--wandb-name")
+        if args.wandb_key is None:
+            missing_args.append("--wandb-key")
+
+        if missing_args:
+            parser.error(
+                f"When --wandb is enabled, the following arguments are required: {', '.join(missing_args)}"
+            )
+
+
 @contextmanager
 def rank_0_priority():
     rank = dist.get_rank()
