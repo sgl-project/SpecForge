@@ -1,4 +1,5 @@
 import json
+import netrc
 import os
 import re
 from contextlib import contextmanager
@@ -10,24 +11,34 @@ from transformers import PretrainedConfig
 
 
 def validate_wandb_args(parser, args):
-    """Validate that required wandb arguments are provided when --wandb is enabled.
+    if args.wandb_key is not None:
+        return
 
-    Args:
-        parser: The argparse.ArgumentParser instance
-        args: The parsed arguments
-    """
-    if args.wandb:
-        missing_args = []
-        if args.wandb_project is None:
-            missing_args.append("--wandb-project")
-        if args.wandb_name is None:
-            missing_args.append("--wandb-name")
-        if args.wandb_key is None:
-            missing_args.append("--wandb-key")
+    if "WANDB_LOCAL" in os.environ:
+        args.wandb_key = "LOCAL"
+        return
+    if "WANDB_API_KEY" in os.environ:
+        args.wandb_key = os.environ["WANDB_API_KEY"]
+        return
 
-        if missing_args:
+    # Check ~/.netrc file for wandb credentials
+    try:
+        netrc_path = os.path.expanduser("~/.netrc")
+        if os.path.exists(netrc_path):
+            netrc_file = netrc.netrc(netrc_path)
+            # Check for api.wandb.ai machine
+            if "api.wandb.ai" in netrc_file.hosts:
+                login, account, password = netrc_file.authenticators("api.wandb.ai")
+                if password:
+                    args.wandb_key = password
+                    return True
+    except (FileNotFoundError, netrc.NetrcParseError):
+        pass
+
+    if args.wandb_key is None:
+        if dist.get_rank() == 0:
             parser.error(
-                f"When --wandb is enabled, the following arguments are required: {', '.join(missing_args)}"
+                f"When --wandb is enabled, the following arguments are required: --wandb-key"
             )
 
 
