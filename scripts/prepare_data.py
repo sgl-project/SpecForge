@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt"],
+        choices=["ultrachat", "sharegpt","sharegpt4v","allava4v"],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -102,6 +102,43 @@ def process_sharegpt_row(row) -> Dict:
     return row, skipped_count
 
 
+def process_sharegpt4v_row(row) -> Dict:
+    """
+    sharegpt4v dataset schema:
+    {
+        "id": str,
+        "image": str,  # path to the image
+        "conversations": [
+            {
+                "from": <human|gpt>,
+                "value": <message>,
+            },
+            ...
+        ]
+    }
+    """
+    conversations = row["conversations"]
+    image = f'/data1/nfs15/nfs/bigdata/zhanglei/ml/datasets/FreedomIntelligence/ALLaVA-4V/{row["image"]}'
+    # if not os.path.exists(image):
+    #     print(f"Image path {image} does not exist, skipping this sample.")
+    #     return None, None
+    formatted_conversations = []
+    skipped_count = 0
+    for message in conversations:
+        if message["from"] not in ROLE_MAPPING:
+            skipped_count += 1
+            continue
+        new_role = ROLE_MAPPING[message["from"]]
+        if new_role == "user":
+            text_content = message["value"].replace("<image>\n", "")
+            content = text_content
+        else:
+            content = message["value"]
+        formatted_conversations.append({"role": new_role, "content": content})
+
+    row = {"id": row["id"], "image":image, "conversations": formatted_conversations}
+    return row, skipped_count
+
 def load_dataset_from_path(data_path: Path):
     suffix = data_path.suffix.split(".")[1]
     ds = load_dataset(suffix, data_files=str(data_path), split="train")
@@ -121,6 +158,12 @@ def main():
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))
         proc_fn = process_sharegpt_row
+    elif args.dataset == "sharegpt4v":
+        ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
+        proc_fn = process_sharegpt4v_row
+    elif args.dataset == "allava4v":
+        ds = load_dataset("/data1/nfs15/nfs/bigdata/zhanglei/ml/datasets/FreedomIntelligence/ALLaVA-4V",name="allava_laion")["instruct"]
+        proc_fn = process_sharegpt4v_row
     else:
         raise ValueError(
             f"This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
@@ -145,6 +188,8 @@ def main():
     with open(output_jsonl_path, "w") as f:
         for item in tqdm(ds, desc=f"Processing {args.dataset} dataset"):
             row, skipped_count = proc_fn(item)
+            if row is None:
+                continue
             total_skipped_count += skipped_count
             f.write(json.dumps(row) + "\n")
 

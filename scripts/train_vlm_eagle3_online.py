@@ -10,14 +10,13 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from specforge import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
     OnlineEagle3Model,
-    OnlineEagle3VlmModel,
 )
 from specforge.data import (
     build_eagle3_dataset,
@@ -41,7 +40,6 @@ def parse_args():
         default="model.embed_tokens.weight",
         help="The key of the embedding weight to load from the target model",
     )
-    parser.add_argument("--is-vlm", action="store_true", help="Whether the target model is a VLM")
 
     # add training-related arguments
     parser.add_argument("--train-data-path", type=str, required=True)
@@ -126,25 +124,14 @@ def main():
             device="cuda",
         ).eval()
     else:
-        if args.is_vlm:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            target_model = (
-                Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    torch_dtype=torch.bfloat16,
-                )
-                .eval()
-                .cuda()
+        target_model = (
+            AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=args.target_model_path,
+                torch_dtype=torch.bfloat16,
             )
-        else:
-            target_model = (
-                AutoModelForCausalLM.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    torch_dtype=torch.bfloat16,
-                )
-                .eval()
-                .cuda()
-            )
+            .eval()
+            .cuda()
+        )
     print_with_rank(f"Initialized target model")
     # load model with resume
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
@@ -166,15 +153,10 @@ def main():
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    if args.is_vlm:
-        processor = AutoProcessor.from_pretrained(args.target_model_path)
-    else:
-        processor = None
 
     # convert to dataloader
     cache_key = hashlib.md5(args.train_data_path.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_dataset = train_dataset.shuffle(seed=args.seed).select(range(20000))
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -183,8 +165,6 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
-            is_vlm=args.is_vlm,
-            processor=processor,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -199,7 +179,6 @@ def main():
         num_workers=4,
         shuffle=True,
         process_group=get_dp_group(),
-        is_vlm=args.is_vlm,
     )
     print_with_rank(f"Initialized train dataloader")
 
@@ -214,8 +193,6 @@ def main():
             tokenizer,
             args.chat_template,
             args.max_length,
-            is_vlm=args.is_vlm,
-            processor=processor,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -228,17 +205,10 @@ def main():
 
     # build Eagle3 model
     # broadcast draft model
-    if args.is_vlm:
-        eagle3_model = OnlineEagle3VlmModel(
-            target_model=target_model,
-            draft_model=draft_model,
-            processor=processor,
-        )
-    else:
-        eagle3_model = OnlineEagle3Model(
-            target_model=target_model,
-            draft_model=draft_model,
-        )
+    eagle3_model = OnlineEagle3Model(
+        target_model=target_model,
+        draft_model=draft_model,
+    )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
         eagle3_model,
@@ -299,20 +269,11 @@ def main():
 
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
-            if args.is_vlm:
-                plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                    pixel_values=data["pixel_values"].cuda(),
-                    image_grid_thw=data["image_grid_thw"].cuda(),
-                )
-            else:
-                plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
+            plosses, _, acces = eagle3_model(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+            )
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
