@@ -54,6 +54,7 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--warmup-ratio", type=float, default=0.02)
+    parser.add_argument("--ttt-length", type=int, default=7)
 
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
@@ -190,6 +191,7 @@ def main():
     eagle3_model = OfflineEagle3Model(
         target_head=target_head,
         draft_model=draft_model,
+        length=args.ttt_length,
     )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
