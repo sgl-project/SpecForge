@@ -14,9 +14,6 @@ def validate_wandb_args(parser, args):
     if args.wandb_key is not None:
         return
 
-    if "WANDB_LOCAL" in os.environ:
-        args.wandb_key = "LOCAL"
-        return
     if "WANDB_API_KEY" in os.environ:
         args.wandb_key = os.environ["WANDB_API_KEY"]
         return
@@ -41,8 +38,7 @@ def validate_wandb_args(parser, args):
                 "When --wandb is enabled, you must provide a wandb API key via one of:\n"
                 "  1. --wandb-key argument\n"
                 "  2. WANDB_API_KEY environment variable\n"
-                "  3. WANDB_LOCAL environment variable (for local mode)\n"
-                "  4. wandb login api-key"
+                "  3. wandb login api-key"
             )
 
 
