@@ -32,7 +32,7 @@ def validate_wandb_args(parser, args):
     except (FileNotFoundError, netrc.NetrcParseError):
         pass
 
-    if args.wandb_key is None:
+    if args.wandb and args.wandb_key is None:
         if dist.get_rank() == 0:
             parser.error(
                 "When --wandb is enabled, you must provide a wandb API key via one of:\n"

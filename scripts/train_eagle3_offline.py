@@ -83,10 +83,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # Validate wandb arguments
-    validate_wandb_args(parser, args)
-
-    return args
+    return parser, args
 
 
 def init_wandb(args):
@@ -106,10 +103,13 @@ def print_on_rank0(message):
 
 def main():
     # initialize
-    args = parse_args()
+    parser, args = parse_args()
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank(f"Initialized distributed environment")
+
+    # Validate wandb arguments
+    validate_wandb_args(parser, args)
 
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
