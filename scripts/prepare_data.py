@@ -129,7 +129,7 @@ def process_sharegpt4v_row(row) -> Dict:
     }
     """
     conversations = row["conversations"]
-    image = f'/data1/nfs15/nfs/bigdata/zhanglei/ml/datasets/FreedomIntelligence/ALLaVA-4V/{row["image"]}'
+    image = f'FreedomIntelligence/ALLaVA-4V/{row["image"]}'
     if not os.path.exists(image):
         print(f"Image path {image} does not exist, skipping this sample.")
         return None, None
@@ -202,7 +202,7 @@ def main():
         ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "allava4v":
-        ds = load_dataset("/data1/nfs15/nfs/bigdata/zhanglei/ml/datasets/FreedomIntelligence/ALLaVA-4V",name="allava_laion")["instruct"]
+        ds = load_dataset("FreedomIntelligence/ALLaVA-4V",name="allava_laion")["instruct"]
         proc_fn = process_sharegpt4v_row
     else:
         raise ValueError(
