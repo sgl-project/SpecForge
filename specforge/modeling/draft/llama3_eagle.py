@@ -5,14 +5,285 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from einops import rearrange
 from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
+
+try:
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward, _flash_attn_varlen_backward
+    FLASH_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLASH_ATTENTION_AVAILABLE = False
 
 from ..utils import padding
 from .base import Eagle3DraftModel
 
 logger = logging.getLogger(__name__)
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    """
+    Flash Attention with KV Cache Support
+    """
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        kv_cache,
+        dropout_p,
+        causal,
+        softmax_scale,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        batch_size = q.shape[0]
+        
+        # Flash Attention only supports fp16 and bf16
+        original_dtype = q.dtype
+        if original_dtype not in [torch.float16, torch.bfloat16]:
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
+        
+        if 'k_cache' in kv_cache:
+            k_cache, v_cache = kv_cache['k_cache'], kv_cache['v_cache']
+            # Ensure cache tensors have the same dtype as current tensors
+            k_cache = k_cache.to(k.dtype)
+            v_cache = v_cache.to(v.dtype)
+            offset = k_cache.shape[1]
+            
+            k_whole = torch.cat([k_cache, k], dim=1).contiguous()
+            v_whole = torch.cat([v_cache, v], dim=1).contiguous()
+        else:
+            offset = 0
+            k_whole = k
+            v_whole = v
+        
+        kv_cache['k_cache'], kv_cache['v_cache'] = k_whole, v_whole 
+        
+        seqlen_k = k_whole.shape[1]
+        seqlen_q = q.shape[1]
+        ctx._seqlen_k = seqlen_k
+        ctx._seqlen_q = seqlen_q
+        ctx._offset = offset
+        
+        # Convert to Flash Attention format
+        q, k_whole, v_whole = [rearrange(x, 'b s ... -> (b s) ...').contiguous() for x in [q, k_whole, v_whole]]
+        
+        # Save tensors for backward pass BEFORE Flash Attention modifies them
+        # Flash Attention modifies input tensors in-place, so we need copies
+        # detach() prevents these tensors from participating in autograd (we handle gradients manually)
+        q_for_backward = q.detach().clone()
+        k_for_backward = k_whole.detach().clone() 
+        v_for_backward = v_whole.detach().clone()
+
+        # q_for_backward = q
+        # k_for_backward = k
+        # v_for_backward = v
+            
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device="cuda")
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device="cuda")
+
+        q = q.contiguous()
+        k_whole = k_whole.contiguous()
+        v_whole = v_whole.contiguous()
+        
+        # Flash attention API call
+        try:
+            # Try with newer API that includes window_size parameters
+            flash_result = _flash_attn_varlen_forward(
+                q,
+                k_whole,
+                v_whole,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqlen_q,
+                seqlen_k,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                alibi_slopes=None,
+                return_softmax=False,
+            )
+        except TypeError:
+            # Fallback to older API without window_size parameters
+            flash_result = _flash_attn_varlen_forward(
+                q,
+                k_whole,
+                v_whole,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqlen_q,
+                seqlen_k,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                return_softmax=False,
+            )
+        
+        # Handle different API versions
+        if len(flash_result) == 4:
+            out, softmax_lse, q_modified, k_modified = flash_result
+            out_padded = out
+            rng_state = None
+        elif len(flash_result) == 8:
+            out, q_modified, k_modified, v_modified, out_padded, softmax_lse, S_dmask, rng_state = flash_result
+        else:
+            raise ValueError(f"Unexpected number of return values from _flash_attn_varlen_forward: {len(flash_result)}")
+        
+        ctx._kv_cache = kv_cache
+        # Save the ORIGINAL tensors for backward pass, NOT the modified ones
+        saved_tensors = [q_for_backward, k_for_backward, v_for_backward, out_padded if out_padded is not None else out, softmax_lse, cu_seqlens_q, cu_seqlens_k]
+        if rng_state is not None:
+            saved_tensors.append(rng_state)
+        ctx.save_for_backward(*saved_tensors)
+        ctx._has_rng_state = rng_state is not None
+        ctx._batch_size = batch_size
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx._original_dtype = original_dtype
+        
+        # Convert output back to original dtype
+        if original_dtype != out.dtype:
+            out = out.to(original_dtype)
+        return out 
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        saved_tensors = ctx.saved_tensors
+        if ctx._has_rng_state:
+            q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = saved_tensors
+        else:
+            q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = saved_tensors
+            rng_state = None
+            
+        # Convert to fp16 for Flash Attention backward if needed
+        original_dtype = ctx._original_dtype
+        if original_dtype not in [torch.float16, torch.bfloat16]:
+            dout = dout.to(torch.float16)
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
+            out = out.to(torch.float16)
+            
+        k_whole = ctx._kv_cache['k_cache']
+        v_whole = ctx._kv_cache['v_cache']
+        
+        # Ensure cached tensors have correct dtype for backward
+        if original_dtype not in [torch.float16, torch.bfloat16]:
+            k_whole = k_whole.to(torch.float16)
+            v_whole = v_whole.to(torch.float16)
+        
+        # Calculate batch_size
+        if ctx._seqlen_q > 0:
+            batch_size = q.size(0) // ctx._seqlen_q
+        else:
+            batch_size = ctx._batch_size
+        
+        # Update KV cache: remove the current sequence
+        if ctx._seqlen_k > 0 and k_whole.shape[1] >= ctx._seqlen_k:
+            pk = k_whole[:, :ctx._seqlen_k]
+            pv = v_whole[:, :ctx._seqlen_k].contiguous()
+            
+            if ctx._seqlen_q > 0 and pk.shape[1] >= ctx._seqlen_q:
+                ctx._kv_cache['k_cache'] = pk[:, :-ctx._seqlen_q]
+                ctx._kv_cache['v_cache'] = pv[:, :-ctx._seqlen_q]
+            else:
+                ctx._kv_cache['k_cache'] = pk
+                ctx._kv_cache['v_cache'] = pv
+        else:
+            ctx._kv_cache['k_cache'] = k_whole
+            ctx._kv_cache['v_cache'] = v_whole
+        
+        # Extract relevant portions for gradient computation
+        pk = k.contiguous()
+        pv = v.contiguous()
+        
+        # Ensure all tensors are contiguous
+        q = q.contiguous()
+        dout = dout.contiguous()
+        out = out.contiguous()
+        
+        # Initialize gradient tensors
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(pk)  
+        dv = torch.empty_like(pv)
+        
+        # Call Flash Attention backward
+        _flash_attn_varlen_backward(
+            dout,
+            q,
+            pk,
+            pv,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ctx._seqlen_q,
+            ctx._seqlen_k,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            -1,  # window_size_left
+            -1,  # window_size_right
+            0.0,  # softcap
+            None,  # alibi_slopes
+            False,  # deterministic
+            rng_state,
+            False,  # zero_tensors
+        )
+        
+        # Ensure head dimension consistency
+        dq = dq[..., : dout.shape[-1]]
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        
+        # Only return gradients for the CURRENT INPUT, not the entire KV cache
+        # In varlen format, dk and dv have shape [batch_size * seqlen_k, num_heads, head_dim]
+        # But we need to return gradients only for the current input k,v with shape [batch_size * seqlen_q, num_heads, head_dim]
+        
+        current_input_len = ctx._seqlen_q  # Length of current input sequence
+        offset = ctx._offset  # Length of cached sequence
+        
+        # Extract gradients for current input from each batch sample
+        dk_current_list = []
+        dv_current_list = []
+        
+        for batch_idx in range(batch_size):
+            # For each batch sample, extract gradients for the current input portion
+            start_idx = batch_idx * ctx._seqlen_k + offset  # Start of current input in this batch
+            end_idx = start_idx + current_input_len  # End of current input in this batch
+            
+            dk_current_list.append(dk[start_idx:end_idx])
+            dv_current_list.append(dv[start_idx:end_idx])
+        
+        # Concatenate all batch samples
+        dk_current = torch.cat(dk_current_list, dim=0)
+        dv_current = torch.cat(dv_current_list, dim=0)
+        
+        # Convert back to original tensor format [batch, seq, heads, dim]
+        dq_final = rearrange(dq, '(b s) h d -> b s h d', b=batch_size, s=current_input_len).contiguous()
+        dk_final = rearrange(dk_current, '(b s) h d -> b s h d', b=batch_size, s=current_input_len).contiguous()
+        dv_final = rearrange(dv_current, '(b s) h d -> b s h d', b=batch_size, s=current_input_len).contiguous()
+        
+        # Convert gradients back to original dtype
+        if original_dtype not in [torch.float16, torch.bfloat16]:
+            dq_final = dq_final.to(original_dtype)
+            dk_final = dk_final.to(original_dtype)
+            dv_final = dv_final.to(original_dtype)
+        
+        return dq_final, dk_final, dv_final, None, None, None, None, None, None, None
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -244,6 +515,9 @@ class LlamaAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
         self._init_rope()
+        
+        # Initialize flash attention kv cache
+        self.flash_kv_cache = {}
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -326,60 +600,117 @@ class LlamaAttention(nn.Module):
             )
 
         else:
-            lck = len(cache_hidden[0])
-
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids + lck
+            # Check if Flash Attention should be used
+            use_flash_attention = (
+                FLASH_ATTENTION_AVAILABLE and 
+                q_len >= 128 and  # sequence length threshold
+                bsz * q_len >= 512  # total token count threshold
             )
+            
+            if use_flash_attention:
+                lck = len(cache_hidden[0]) if cache_hidden[0] else 0
+                
+                # Handle empty sequence case
+                if q_len == 0:
+                    attn_output = torch.zeros(
+                        bsz, self.num_heads, 0, self.head_dim,
+                        dtype=query_states.dtype,
+                        device=query_states.device
+                    )
+                else:
+                    cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+                    cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                    query_states, key_states = apply_rotary_pos_emb(
+                        query_states, key_states, cos, sin, position_ids + lck
+                    )
 
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+                    key_states = repeat_kv(key_states, self.num_key_value_groups)
+                    value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            cache_hidden[0] = cache_hidden[0] + [key_states]
-            cache_hidden[1] = cache_hidden[1] + [value_states]
+                    # Prepare Flash Attention input format
+                    # query_states: [bsz, num_heads, q_len, head_dim] -> [bsz, q_len, num_heads, head_dim]
+                    q = query_states.transpose(1, 2).contiguous()
+                    k = key_states.transpose(1, 2).contiguous()
+                    v = value_states.transpose(1, 2).contiguous()
 
-            cache_k = cache_hidden[0]
-            cache_v = cache_hidden[1]
+                    # Use Flash Attention
+                    attn_output = FlashAttnVarlenFunc.apply(
+                        q,
+                        k,
+                        v,
+                        self.flash_kv_cache,
+                        0.0,  # dropout_p
+                        True,  # causal
+                        None,  # softmax_scale (auto-computed)
+                    )
+                    
+                    # Convert output format [bsz * q_len, num_heads, head_dim] -> [bsz, num_heads, q_len, head_dim]
+                    attn_output = rearrange(attn_output, '(b s) h d -> b h s d', b=bsz).contiguous()
+                
+            else:
+                # Fallback to original implementation
+                lck = len(cache_hidden[0]) if cache_hidden[0] else 0
 
-            k0 = cache_k[0]
-            v0 = cache_v[0]
+                # Handle empty sequence case
+                if q_len == 0:
+                    attn_output = torch.zeros(
+                        bsz, self.num_heads, 0, self.head_dim,
+                        dtype=query_states.dtype,
+                        device=query_states.device
+                    )
+                else:
+                    cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+                    cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                    query_states, key_states = apply_rotary_pos_emb(
+                        query_states, key_states, cos, sin, position_ids + lck
+                    )
 
-            # causal
-            attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
-                self.head_dim
-            )
-            lck = len(cache_k)
+                    key_states = repeat_kv(key_states, self.num_key_value_groups)
+                    value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            attn_weights = attn_weights + attention_mask
+                    cache_hidden[0] = cache_hidden[0] + [key_states]
+                    cache_hidden[1] = cache_hidden[1] + [value_states]
 
-            for i in range(1, lck):
-                ki = cache_k[i]
-                qi = query_states
-                kiq = ki
+                    cache_k = cache_hidden[0]
+                    cache_v = cache_hidden[1]
 
-                attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
-                attn_weights = torch.cat(
-                    (attn_weights, attn_weightsi[..., None]), dim=-1
-                )
+                    k0 = cache_k[0]
+                    v0 = cache_v[0]
 
-            # upcast attention to fp32
-            attn_weights = nn.functional.softmax(
-                attn_weights, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype)
-            attn_weights0 = attn_weights[..., :q_len]
+                    # causal
+                    attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
+                        self.head_dim
+                    )
+                    lck = len(cache_k)
 
-            attn_output = torch.matmul(attn_weights0, v0)
+                    attn_weights = attn_weights + attention_mask
 
-            for i in range(1, lck):
-                vi = cache_v[i]
-                attn_weightsi = attn_weights[..., q_len + i - 1]
-                attn_outputi = attn_weightsi[..., None] * vi
-                attn_output = attn_output + attn_outputi
+                    for i in range(1, lck):
+                        ki = cache_k[i]
+                        qi = query_states
+                        kiq = ki
+
+                        attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
+                        attn_weights = torch.cat(
+                            (attn_weights, attn_weightsi[..., None]), dim=-1
+                        )
+
+                    # upcast attention to fp32
+                    attn_weights = nn.functional.softmax(
+                        attn_weights, dim=-1, dtype=torch.float32
+                    ).to(query_states.dtype)
+                    attn_weights0 = attn_weights[..., :q_len]
+
+                    attn_output = torch.matmul(attn_weights0, v0)
+
+                    for i in range(1, lck):
+                        vi = cache_v[i]
+                        attn_weightsi = attn_weights[..., q_len + i - 1]
+                        attn_outputi = attn_weightsi[..., None] * vi
+                        attn_output = attn_output + attn_outputi
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
 
