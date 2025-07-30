@@ -35,6 +35,6 @@
     "use_cache": true,
     "use_sliding_window": false,
     "vocab_size": 152064,
-    "draft_vocab_size": 32000
+    "draft_vocab_size": 2000
   }
   

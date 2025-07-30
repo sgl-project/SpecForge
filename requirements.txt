@@ -1,5 +1,5 @@
 pre-commit
-torch==2.6.0
+torch
 transformers==4.53.2
 datasets
 setuptools

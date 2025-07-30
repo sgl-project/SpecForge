@@ -173,6 +173,7 @@ def preprocess_vlm_conversations(
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": [], "pixel_values": [], "image_grid_thw": []}
 
+    # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         source = examples["conversations"][i]
         messages = [{"role": "system", "content": system_prompt}]
@@ -196,8 +197,6 @@ def preprocess_vlm_conversations(
                                         {
                                             "type": "image",
                                             "image": image,
-                                            "min_pixels": 50176,
-                                            "max_pixels": 802816,
                                         },
                                         {"type": "text", "text": sentence["content"]},
                                     ]

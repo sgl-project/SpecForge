@@ -473,6 +473,7 @@ class OnlineEagle3VlmModel(Eagle3Model):
             device = input_ids.device
 
         # get input embeding with image
+        inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
         image_embeds = self.target_model.model.get_image_features(pixel_values, image_grid_thw)
         image_embeds = torch.cat(image_embeds, dim=0)
         n_image_tokens = (input_ids == self.target_model.model.config.image_token_id).sum()
@@ -592,7 +593,7 @@ class OnlineEagle3VlmModel(Eagle3Model):
                 attention_mask_tensor = (1.0 - attention_mask_tensor).int()
 
 
-            position_ids, rope_deltas = self.target_model.get_rope_index(
+            position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 input_ids,
                 image_grid_thw,
                 None,
@@ -628,7 +629,7 @@ class OnlineEagle3VlmModel(Eagle3Model):
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            if pre_inputs_embeds:
+            if pre_inputs_embeds is not None:
                 inputs_embeds = pre_inputs_embeds
             else:
                 inputs_embeds = self.draft_model.embed_input_ids(input_ids)

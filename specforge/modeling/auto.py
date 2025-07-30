@@ -51,8 +51,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
         Llama4TextConfig: [Llama4ForCausalLM],
-        Qwen3MoeConfig: [Qwen3MoeForCausalLM],
-        Qwen2_5_VLConfig: [Qwen2_5_VLForConditionalGeneration]
+        Qwen3MoeConfig: [Qwen3MoeForCausalLM],    
     }
 
     @classmethod

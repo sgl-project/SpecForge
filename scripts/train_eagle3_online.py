@@ -81,12 +81,16 @@ def parse_args():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
 
+    # vlm related args
+    parser.add_argument("--min-pixels", type=int, default=50176) # 64*28*28 for qwen2.5-vl
+    parser.add_argument("--max-pixels", type=int, default=802816) # 1024*28*28 for qwen2.5-vl
+
     args = parser.parse_args()
     return args
 
 
 def init_wandb(args):
-    wandb.login(key=args.wandb_key)
+    # wandb.login(key=args.wandb_key)
     wandb.init(project=args.wandb_project, name=args.wandb_name)
 
 
@@ -167,14 +171,14 @@ def main():
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     if args.is_vlm:
-        processor = AutoProcessor.from_pretrained(args.target_model_path)
+        processor = AutoProcessor.from_pretrained(args.target_model_path,min_pixels=args.min_pixels, max_pixels=args.max_pixels)
     else:
         processor = None
 
     # convert to dataloader
     cache_key = hashlib.md5(args.train_data_path.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_dataset = train_dataset.shuffle(seed=args.seed).select(range(20000))
+    # train_dataset = train_dataset.shuffle(seed=args.seed).select(range(20000))
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -216,6 +220,7 @@ def main():
             args.max_length,
             is_vlm=args.is_vlm,
             processor=processor,
+            num_proc=16
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,

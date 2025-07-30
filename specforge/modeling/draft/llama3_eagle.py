@@ -307,11 +307,6 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings
                 )
-            elif scaling_type == "mrope":
-                self.config.rope_scaling["rope_type"] = "default"
-                self.rotary_emb = Qwen2_5_VLRotaryEmbedding(
-                    self.config
-                )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
