@@ -155,6 +155,7 @@ def main():
         )
         train_eagle3_dataset = build_offline_eagle3_dataset(
             args.train_hidden_states_path,
+            args.max_length,
         )
 
     train_dataloader = prepare_dp_dataloaders(
@@ -173,6 +174,7 @@ def main():
     if args.eval_data_path is not None:
         eval_eagle3_dataset = build_offline_eagle3_dataset(
             args.eval_hidden_states_path,
+            args.max_length,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
