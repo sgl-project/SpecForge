@@ -25,7 +25,12 @@ from specforge.data import (
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
-from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
+from specforge.utils import (
+    get_last_checkpoint,
+    print_with_rank,
+    rank_0_priority,
+    validate_wandb_args,
+)
 
 
 def parse_args():
@@ -80,6 +85,10 @@ def parse_args():
     parser.add_argument("--wandb-key", type=str, default=None)
 
     args = parser.parse_args()
+
+    # Validate wandb arguments
+    validate_wandb_args(parser, args)
+
     return args
 
 
