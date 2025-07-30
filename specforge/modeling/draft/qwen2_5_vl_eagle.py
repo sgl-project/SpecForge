@@ -438,6 +438,7 @@ class LlamaAttention(nn.Module):
             )
 
         else:
+            # TODO check cache_hidden is compatible with the qwen-vl model
             lck = len(cache_hidden[0])
             cos, sin = self.rotary_emb(query_states, position_ids)
             # cos, sin = self.rotary_emb(query_states, position_ids+lck)

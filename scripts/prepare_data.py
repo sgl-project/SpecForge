@@ -130,9 +130,9 @@ def process_sharegpt4v_row(row) -> Dict:
     """
     conversations = row["conversations"]
     image = f'/data1/nfs15/nfs/bigdata/zhanglei/ml/datasets/FreedomIntelligence/ALLaVA-4V/{row["image"]}'
-    # if not os.path.exists(image):
-    #     print(f"Image path {image} does not exist, skipping this sample.")
-    #     return None, None
+    if not os.path.exists(image):
+        print(f"Image path {image} does not exist, skipping this sample.")
+        return None, None
     formatted_conversations = []
     skipped_count = 0
     for message in conversations:

@@ -113,6 +113,8 @@ def main():
 
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
+    # load draft model config
+    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
@@ -130,7 +132,7 @@ def main():
             device="cuda",
         ).eval()
     else:
-        if args.is_vlm:
+        if args.is_vlm and draft_model_config.model_type == "qwen2_5_vl":
             from transformers import Qwen2_5_VLForConditionalGeneration
             target_model = (
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -151,7 +153,6 @@ def main():
             )
     print_with_rank(f"Initialized target model")
     # load model with resume
-    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint)
