@@ -328,7 +328,7 @@ def main():
 
     # args.dist_timeout is defined in sglang.srt.server_args.ServerArgs
     torch.distributed.init_process_group(backend="nccl",
-                                         timeout=timedelta(minutes=args.dist_timeout))
+                                         timeout=timedelta(seconds=args.dist_timeout))
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
