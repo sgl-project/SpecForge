@@ -14,6 +14,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from datasets import Dataset, load_dataset
+from datetime import timedelta
 from sglang.bench_one_batch import BenchArgs, load_model
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
@@ -324,7 +325,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    torch.distributed.init_process_group(backend="nccl")
+
+    # args.dist_timeout is defined in sglang.srt.server_args.ServerArgs
+    torch.distributed.init_process_group(backend="nccl",
+                                         timeout=timedelta(minutes=args.dist_timeout))
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
