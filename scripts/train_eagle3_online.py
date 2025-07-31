@@ -54,7 +54,12 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--warmup-ratio", type=float, default=0.02)
-    parser.add_argument("--ttt-length", type=int, default=7, help="The length for Test-Time Training (TTT).")
+    parser.add_argument(
+        "--ttt-length",
+        type=int,
+        default=7,
+        help="The length for Test-Time Training (TTT).",
+    )
 
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
