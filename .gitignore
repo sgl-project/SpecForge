@@ -194,5 +194,3 @@ cython_debug/
 cache/
 outputs/
 wandb/
-
-Miniconda3-latest-Linux-x86_64.sh

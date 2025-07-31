@@ -1,71 +1,35 @@
-FROM nvidia/cuda:12.6.0-devel-ubuntu24.04
+FROM lmsysorg/sglang:dev
 
-# Update package lists and install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    wget \
-    git \
-    clang-format \
-    clangd-19 \
-    vim \
-    zsh \
-    && rm -rf /var/lib/apt/lists/*
+# Create non-root user with specified UID and GID
+# NOTE: Replace with your own UID and GID. This is a workaround from https://github.com/microsoft/vscode-remote-release/issues/49#issuecomment-489060908.
+ARG HOST_UID=1003
+ARG HOST_GID=1003
+RUN groupadd -g $HOST_GID devuser && \
+    useradd -m -u $HOST_UID -g $HOST_GID -s /bin/zsh devuser
 
-# Install oh-my-zsh
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+# Give devuser sudo access
+RUN apt-get update && apt-get install -y sudo && \
+    echo "devuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devuser && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
 
-# Install zsh-autosuggestions
-RUN git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
+# Set up oh-my-zsh for devuser
+RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
+    cp /root/.zshrc /home/devuser/.zshrc && \
+    cp /root/.vimrc /home/devuser/.vimrc && \
+    cp /root/.tmux.conf /home/devuser/.tmux.conf && \
+    sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
+    chown -R devuser:devuser /home/devuser/
 
-# Configure zsh
-RUN sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="fino-time"/' ~/.zshrc && \
-    sed -i 's/plugins=(git)/plugins=(git zsh-autosuggestions)/' ~/.zshrc
+# Set workspace directory and ownership
+WORKDIR /sgl-workspace/sglang
+RUN chown -R devuser:devuser /sgl-workspace
 
-# Create a non-root user
-ARG USERNAME=devuser
-ARG USER_UID=1003
-ARG USER_GID=$USER_UID
+# Switch to devuser
+USER devuser
 
-# Create the user
-RUN groupadd --gid $USER_GID $USERNAME \
-    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
-    # [Optional] Add sudo support
-    && apt-get update \
-    && apt-get install -y sudo \
-    && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
-    && chmod 0440 /etc/sudoers.d/$USERNAME \
-    && rm -rf /var/lib/apt/lists/*
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Remove default 'ubuntu' user (UID 1000) to prevent devcontainer permission conflicts
-# Ref: https://github.com/rapidsai/devcontainers/pull/373
-RUN if grep ubuntu:x:1000:1000 /etc/passwd >/dev/null; then userdel -f -r ubuntu; fi
-
-# Copy zsh configuration to the new user's home
-RUN cp -r /root/.oh-my-zsh /home/$USERNAME/.oh-my-zsh && \
-    cp /root/.zshrc /home/$USERNAME/.zshrc && \
-    chown -R $USERNAME:$USERNAME /home/$USERNAME/.oh-my-zsh && \
-    chown $USERNAME:$USERNAME /home/$USERNAME/.zshrc
-
-# Switch to non-root user
-USER $USERNAME
-WORKDIR /home/$USERNAME
-
-# Install python
-COPY .devcontainer/install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh py312
-
-# clangd
-ENV PATH="/usr/lib/llvm-19/bin:$PATH"
-# conda
-ENV PATH="/home/devuser/conda/bin:$PATH"
-ENV PATH="/home/devuser/conda/envs/py312/bin:$PATH"
-
-# Install python packages
-COPY requirements.txt /install/requirements.txt
-COPY .devcontainer/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh
-RUN echo "source activate py312" >> /home/devuser/.zshrc
-
-# Set zsh as default shell
-ENV SHELL=/bin/zsh
-CMD [ "zsh" ]
+# Install rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
