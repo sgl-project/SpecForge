@@ -328,7 +328,9 @@ def main():
 
     # args.dist_timeout is defined in sglang.srt.server_args.ServerArgs and is in seconds.
     if args.dist_timeout <= 0:
-        raise ValueError(f"--dist-timeout must be a positive number of seconds, but got {args.dist_timeout}")
+        raise ValueError(
+            f"--dist-timeout must be a positive number of seconds, but got {args.dist_timeout}"
+        )
     torch.distributed.init_process_group(
         backend="nccl", timeout=timedelta(seconds=args.dist_timeout)
     )
