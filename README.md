@@ -158,6 +158,8 @@ bash ./examples/run_llama3_eagle3_online.sh
 bash ./examples/run_llama4_eagle3_online.sh
 
 # train Qwen3-30B-A3B
+# Qwen3-235B-A22B online training is also supported;
+# the relevant code is included in the script (currently commented out).
 bash ./examples/run_qwen3_moe_eagle3_online.sh
 
 # train Qwen3-8B

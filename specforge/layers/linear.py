@@ -7,7 +7,15 @@ from specforge.distributed import get_tp_group
 
 
 class RowParallelLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        device=None,
+        dtype=None,
+        kv_head_replicas=False,
+    ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.tp_group = get_tp_group()
@@ -16,7 +24,11 @@ class RowParallelLinear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        self.in_features_per_shard = in_features // self.tp_size
+
+        if kv_head_replicas:
+            self.in_features_per_shard = in_features
+        else:
+            self.in_features_per_shard = in_features // self.tp_size
         self.weight = nn.Parameter(
             torch.empty(self.out_features, self.in_features_per_shard, **factory_kwargs)
         )
@@ -54,7 +66,15 @@ class RowParallelLinear(nn.Module):
 
 
 class ColumnParallelLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        device=None,
+        dtype=None,
+        kv_head_replicas=False,
+    ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.tp_group = get_tp_group()
@@ -63,7 +83,10 @@ class ColumnParallelLinear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        self.out_features_per_shard = out_features // self.tp_size
+        if kv_head_replicas:
+            self.out_features_per_shard = out_features
+        else:
+            self.out_features_per_shard = out_features // self.tp_size
 
         self.weight = nn.Parameter(
             torch.empty(self.out_features_per_shard, self.in_features, **factory_kwargs)
