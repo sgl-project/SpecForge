@@ -419,7 +419,7 @@ class LlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         if cache_hidden is None:
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len)
+            cos, sin = self.rotary_emb(query_states, position_ids)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, position_ids
@@ -438,10 +438,8 @@ class LlamaAttention(nn.Module):
             )
 
         else:
-            # TODO check cache_hidden is compatible with the qwen-vl model
             lck = len(cache_hidden[0])
-            cos, sin = self.rotary_emb(query_states, position_ids)
-            # cos, sin = self.rotary_emb(query_states, position_ids+lck)
+            cos, sin = self.rotary_emb(query_states, position_ids+ lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             query_states, key_states = apply_multimodal_rotary_pos_emb(
                 query_states, key_states, cos, sin, self.config.rope_scaling["mrope_section"]
