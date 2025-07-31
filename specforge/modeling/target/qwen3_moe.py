@@ -138,16 +138,34 @@ class Qwen3MoeAttention(nn.Module):
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.total_num_kv_heads = config.num_key_value_heads
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        # Add TP support
+        # Add TP support and head calculations
         self.tp_group = get_tp_group()
+        self.tp_size = (
+            dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
+        )
+        self.tp_rank = dist.get_rank(self.tp_group) if self.tp_group is not None else 0
+
+        # Calculate head distribution for TP
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads
+        self.num_heads = self.total_num_heads // self.tp_size
+
+        # Handle KV head replication when tp_size > total_num_kv_heads
+        if self.tp_size > self.total_num_kv_heads:
+            # In replication mode, each rank gets 1 KV head (replicated across groups)
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = self.tp_size // self.total_num_kv_heads
+            self.num_key_value_groups = self.num_heads // self.num_kv_heads
+            self.kv_head_replicas = True
+        else:
+            self.num_kv_heads = self.total_num_kv_heads
+            self.num_kv_head_replicas = 1
+            self.num_key_value_groups = config.num_attention_heads // self.num_kv_heads
+            self.kv_head_replicas = False
 
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -156,13 +174,15 @@ class Qwen3MoeAttention(nn.Module):
         )
         self.k_proj = ColumnParallelLinear(
             config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
+            self.num_kv_heads * self.head_dim,
             bias=config.attention_bias,
+            kv_head_replicas=self.kv_head_replicas,
         )
         self.v_proj = ColumnParallelLinear(
             config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
+            self.num_kv_heads * self.head_dim,
             bias=config.attention_bias,
+            kv_head_replicas=self.kv_head_replicas,
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
@@ -941,6 +961,8 @@ class Qwen3MoeForCausalLM(
         tp_group = get_tp_group()
 
         updated_state_dict = {}
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         for key, value in state_dict.items():
             # Ensure that the state dict is a flat dict of keys and tensors
             if not isinstance(value, torch.Tensor):
@@ -965,6 +987,43 @@ class Qwen3MoeForCausalLM(
                 value = torch.cat((gate, up), dim=-1)
             elif "experts.down_proj" in key:
                 value = self._shard_tensor(value, tp_group, 1)
+            elif "self_attn" in key and key.endswith(".weight"):
+                # Get the attention layer to access head configuration
+                layer_match = key.split(".")
+                layer_idx = None
+                for i, part in enumerate(layer_match):
+                    if part.startswith("layers") and i + 1 < len(layer_match):
+                        try:
+                            layer_idx = int(layer_match[i + 1])
+                            break
+                        except (ValueError, IndexError):
+                            continue
+
+                if layer_idx is not None:
+                    attention_layer = self.model.layers[layer_idx].self_attn
+
+                    if "q_proj" in key:
+                        value = self._shard_tensor(value, tp_group, 0)
+                    elif "k_proj" in key or "v_proj" in key:
+                        # K/V projection: handle replication case
+                        head_dim = attention_layer.head_dim
+
+                        if tp_size > attention_layer.total_num_kv_heads:
+                            # Replication case: each rank gets one KV head, but replicated
+                            # All ranks within a replica group get the same KV head
+                            kv_shard_id = (
+                                tp_rank // attention_layer.num_kv_head_replicas
+                            )
+                            single_kv_head_size = head_dim
+                            start_idx = kv_shard_id * single_kv_head_size
+                            value = value.narrow(0, start_idx, single_kv_head_size)
+                        else:
+                            # Normal sharding case
+                            value = self._shard_tensor(value, tp_group, 0)
+                    elif "o_proj" in key:
+                        # O projection: row-wise sharding
+                        value = self._shard_tensor(value, tp_group, -1)
+
             elif isinstance(module, RowParallelLinear) and key.endswith(".weight"):
                 value = self._shard_tensor(value, tp_group, -1)
             elif isinstance(module, ColumnParallelLinear) and key.endswith(".weight"):
