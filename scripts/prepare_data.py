@@ -116,7 +116,7 @@ def main():
         proc_fn = process_ultrachat_row
     elif args.dataset == "sharegpt":
         if args.data_path is None:
-            ds = load_dataset("Aeala/ShareGPT_Vicuna_unfiltered")["train"]
+            ds = load_dataset("/root/models/ShareGPT_Vicuna_unfiltered")["train"]
         else:
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))

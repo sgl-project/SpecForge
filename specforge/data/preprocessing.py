@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from datasets import Dataset as HFDataset
 from tqdm import tqdm
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from specforge.utils import padding
 
@@ -44,7 +44,7 @@ Conversation = List[Dict[str, str]]
 # ==============================
 # Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
 def preprocess_conversations(
-    tokenizer: PreTrainedTokenizer,
+    tokenizer: PreTrainedTokenizerFast,
     conversations: List[Conversation],
     chat_template: ChatTemplate,
     max_length: int = 2048,
@@ -65,11 +65,20 @@ def preprocess_conversations(
             - attention_mask: List of attention masks.
     """
     system_prompt = chat_template.system_prompt
+    # This template is only suitable for other models. For kimi_k2, use the modified conversation template.
+ 
+    # user_message_separator = (
+    #     f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+    # )
+    # assistant_message_separator = (
+    #     f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+    # )
+
     user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+        chat_template.user_header
     )
     assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+        chat_template.assistant_header
     )
 
     # prepare result

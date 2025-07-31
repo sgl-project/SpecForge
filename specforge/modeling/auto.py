@@ -11,6 +11,7 @@ from transformers import (
     LlamaConfig,
     PretrainedConfig,
     Qwen3MoeConfig,
+    DeepseekV3Config,
 )
 
 from specforge.utils import default_torch_dtype
@@ -18,6 +19,7 @@ from specforge.utils import default_torch_dtype
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.llama4 import Llama4ForCausalLM
 from .target.qwen3_moe import Qwen3MoeForCausalLM
+from .target.kimi_k2 import DeepseekV3ForCausalLM
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
@@ -48,6 +50,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     _model_mapping = {
         Llama4TextConfig: [Llama4ForCausalLM],
         Qwen3MoeConfig: [Qwen3MoeForCausalLM],
+        DeepseekV3Config: [DeepseekV3ForCausalLM],
     }
 
     @classmethod
@@ -59,7 +62,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         **config_kwargs,
     ):
         config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path, **config_kwargs
+            pretrained_model_name_or_path, trust_remote_code=True, **config_kwargs
         )
 
         if isinstance(config, Llama4Config):

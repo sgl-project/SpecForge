@@ -32,7 +32,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
 )
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerFast
 
 from specforge.data import build_eagle3_dataset
 from specforge.utils import print_with_rank, rank_0_priority
@@ -73,7 +73,9 @@ class SglangHiddenStatesGenerator:
         self.server_args = ServerArgs.from_cli_args(args)
         self.server_args.enable_return_hidden_states = True
         self.server_args.context_length = args.max_length
-
+        
+        # 新增：添加trust_remote_code参数
+        self.server_args.trust_remote_code = True  # 关键修改
         self.server_args.cuda_graph_max_bs = max(self.bench_args.batch_size)
         self.server_args.cuda_graph_bs = list(self.bench_args.batch_size)
         _set_envs_and_config(self.server_args)
@@ -335,7 +337,7 @@ def main():
     dataset = load_dataset("json", data_files=args.data_path)["train"]
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(args.model_path, trust_remote_code=True, use_fast=True)
     cache_key = hashlib.md5(args.data_path.encode()).hexdigest()
     with rank_0_priority():
         eagle3_dataset = build_eagle3_dataset(

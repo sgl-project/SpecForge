@@ -1,6 +1,6 @@
 pre-commit
-torch==2.6.0
-transformers==4.53.2
+torch
+transformers
 datasets
 setuptools
 tqdm
