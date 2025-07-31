@@ -273,9 +273,11 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
 def build_offline_eagle3_dataset(
     hidden_states_path: str,
+    max_len: int = 2048,
 ) -> torch.utils.data.Dataset:
     return OfflineEagle3Dataset(
         list_local_files(hidden_states_path),
+        max_len=max_len,
     )
 
 
@@ -354,6 +356,14 @@ def process_token_dict_to_mappings(
             - d2t: A tensor mapping draft token ids to target token ids.
             - t2d: A tensor mapping target token ids to draft token ids.
     """
+    if len(token_dict) < draft_vocab_size:
+        existing_tokens = set(token_dict.keys())
+        missing_tokens = set(range(draft_vocab_size)) - existing_tokens
+        for token in missing_tokens:
+            token_dict[token] = 0
+            if len(token_dict) >= draft_vocab_size:
+                break
+
     total_frequency = sum(token_dict.values())
     top_N = token_dict.most_common(draft_vocab_size)
     top_N_frequency_sum = sum(freq for key, freq in top_N)

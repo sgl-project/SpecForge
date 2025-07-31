@@ -1,4 +1,5 @@
 import json
+import netrc
 import os
 import re
 from contextlib import contextmanager
@@ -7,6 +8,39 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 from transformers import PretrainedConfig
+
+
+def validate_wandb_args(parser, args):
+    if not args.wandb:
+        return
+    if args.wandb_key is not None:
+        return
+
+    if "WANDB_API_KEY" in os.environ:
+        args.wandb_key = os.environ["WANDB_API_KEY"]
+        return
+
+    # Check ~/.netrc file for wandb credentials
+    try:
+        netrc_path = os.path.expanduser("~/.netrc")
+        if os.path.exists(netrc_path):
+            netrc_file = netrc.netrc(netrc_path)
+            # Check for api.wandb.ai machine
+            if "api.wandb.ai" in netrc_file.hosts:
+                login, account, password = netrc_file.authenticators("api.wandb.ai")
+                if password:
+                    args.wandb_key = password
+                    return True
+    except (FileNotFoundError, netrc.NetrcParseError):
+        pass
+
+    if args.wandb_key is None:
+        parser.error(
+            "When --wandb is enabled, you must provide a wandb API key via one of:\n"
+            "  1. --wandb-key argument\n"
+            "  2. WANDB_API_KEY environment variable\n"
+            "  3. wandb login api-key"
+        )
 
 
 @contextmanager
