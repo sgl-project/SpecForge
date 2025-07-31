@@ -509,17 +509,34 @@ def main():
                     )
                     
                     if args.use_lora:
-                        # 只保存draft模型的LoRA适配器（target LoRA是冻结的不需要保存）
-                        draft_model.save_pretrained(
-                            os.path.join(epoch_output_dir, "draft_lora")
-                        )
-                        print_on_rank0(f"Saved draft LoRA adapter to {epoch_output_dir}/draft_lora")
+                        # 手动提取并保存draft模型的LoRA权重（从FSDP state_dict中）
+                        draft_lora_output_dir = os.path.join(epoch_output_dir, "draft_lora")
+                        os.makedirs(draft_lora_output_dir, exist_ok=True)
+                        
+                        # 提取LoRA相关的权重
+                        lora_state_dict = {}
+                        for key, value in model_state_dict.items():
+                            if "draft_model." in key and ("lora_" in key or "adapter" in key):
+                                # 移除 "draft_model." 前缀，因为我们要保存的是draft模型内部的LoRA权重
+                                lora_key = key.replace("draft_model.", "")
+                                lora_state_dict[lora_key] = value
+                        
+                        if lora_state_dict:
+                            # 保存LoRA权重
+                            import safetensors.torch as st
+                            st.save_file(lora_state_dict, os.path.join(draft_lora_output_dir, "adapter_model.safetensors"))
+                            print_on_rank0(f"Saved {len(lora_state_dict)} LoRA weights to {draft_lora_output_dir}/adapter_model.safetensors")
+                            
+                            # 保存LoRA配置文件
+                            import shutil
+                            shutil.copy2(args.lora_config, os.path.join(draft_lora_output_dir, "adapter_config.json"))
+                            print_on_rank0(f"Copied LoRA config to {draft_lora_output_dir}/adapter_config.json")
+                        else:
+                            print_on_rank0("Warning: No LoRA weights found in state_dict!")
                         
                         # 保存tokenizer到draft_lora目录
-                        tokenizer.save_pretrained(
-                            os.path.join(epoch_output_dir, "draft_lora")
-                        )
-                        print_on_rank0(f"Saved tokenizer to {epoch_output_dir}/draft_lora")
+                        tokenizer.save_pretrained(draft_lora_output_dir)
+                        print_on_rank0(f"Saved tokenizer to {draft_lora_output_dir}")
                     else:
                         # 原始逻辑：保存draft模型状态
                         draft_model_state_dict = {
