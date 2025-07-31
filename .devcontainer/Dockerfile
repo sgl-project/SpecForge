@@ -28,8 +28,5 @@ RUN chown -R devuser:devuser /sgl-workspace
 # Switch to devuser
 USER devuser
 
-# Install uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-
 # Install rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
