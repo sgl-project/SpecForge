@@ -372,6 +372,14 @@ def main():
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
                 )
+                                
+                eval_logdict = {}
+                for i in range(len(plosses)):
+                    eval_logdict[f"train/ploss_{i}"] = plosses[i].item()
+                for i in range(len(acces)):
+                    eval_logdict[f"train/acc_{i}"] = acces[i]
+                wandb_log_if_initialized(eval_logdict)
+                
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
