@@ -25,7 +25,12 @@ from specforge.data import (
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
-from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
+from specforge.utils import (
+    get_last_checkpoint,
+    print_with_rank,
+    rank_0_priority,
+    validate_wandb_args,
+)
 
 
 def parse_args():
@@ -49,6 +54,12 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--warmup-ratio", type=float, default=0.02)
+    parser.add_argument(
+        "--ttt-length",
+        type=int,
+        default=7,
+        help="The length for Test-Time Training (TTT).",
+    )
 
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
@@ -80,7 +91,8 @@ def parse_args():
     parser.add_argument("--wandb-key", type=str, default=None)
 
     args = parser.parse_args()
-    return args
+
+    return parser, args
 
 
 def init_wandb(args):
@@ -100,10 +112,13 @@ def print_on_rank0(message):
 
 def main():
     # initialize
-    args = parse_args()
+    parser, args = parse_args()
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank(f"Initialized distributed environment")
+
+    # Validate wandb arguments
+    validate_wandb_args(parser, args)
 
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
@@ -208,6 +223,7 @@ def main():
     eagle3_model = OnlineEagle3Model(
         target_model=target_model,
         draft_model=draft_model,
+        length=args.ttt_length,
     )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
