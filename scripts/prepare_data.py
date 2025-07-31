@@ -71,7 +71,7 @@ def process_ultrachat_row(row) -> Dict:
         assert role in ["user", "assistant"]
         formatted_conversations.append({"role": role, "content": content})
     row = {"id": row["prompt_id"], "conversations": formatted_conversations}
-    return row
+    return row, 0
 
 
 def process_sharegpt_row(row) -> Dict:
