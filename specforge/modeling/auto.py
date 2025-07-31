@@ -3,9 +3,7 @@ import os
 from typing import Union
 
 import torch
-from transformers import (
-    AutoConfig,
-)
+from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
     Llama4Config,
