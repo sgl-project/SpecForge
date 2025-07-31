@@ -367,12 +367,21 @@ def main():
             eval_plosses = [[] for _ in range(eagle3_model.length)]
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
-                                
+                if args.is_vlm:
+                    plosses, _, acces = eagle3_model(
+                        input_ids=data["input_ids"].cuda(),
+                        attention_mask=data["attention_mask"].cuda(),
+                        loss_mask=data["loss_mask"].cuda(),
+                        pixel_values=data["pixel_values"].cuda(),
+                        image_grid_thw=data["image_grid_thw"].cuda(),
+                    )
+                else:
+                    plosses, _, acces = eagle3_model(
+                        input_ids=data["input_ids"].cuda(),
+                        attention_mask=data["attention_mask"].cuda(),
+                        loss_mask=data["loss_mask"].cuda(),
+                    )
+
                 eval_logdict = {}
                 for i in range(len(plosses)):
                     eval_logdict[f"train/ploss_{i}"] = plosses[i].item()
