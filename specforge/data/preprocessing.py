@@ -150,7 +150,9 @@ def preprocess_vlm_conversations(
 
     Args:
         processor: The image processor to use for processing images.
-        conversations: A list of conversations, where each conversation is a list of messages.
+        examples: A list of examples, where each example is a dictionary containing:
+            - image: The image in the conversation.
+            - conversations: A list of conversations, where each conversation is a list of messages.
         chat_template: The chat template to use for formatting the conversations.
         max_length: The maximum length of the tokenized input.
 
@@ -159,7 +161,7 @@ def preprocess_vlm_conversations(
             - input_ids: List of tokenized input IDs.
             - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
             - attention_mask: List of attention masks.
-            - pixel_values: List of pixel values for images in the conversations.
+            - pixel_values: List of pixel values for images in the examples.
             - image_grid_thw: List of image grid tensors.
     """
     system_prompt = chat_template.system_prompt
@@ -285,6 +287,8 @@ def build_eagle3_dataset(
         num_proc: The number of processes to use for multiprocessing.
         cache_dir: The directory to use for caching the processed dataset.
         cache_key: The key to use for caching the processed dataset.
+        is_vlm: Whether the dataset is for VLM models.
+        processor: The image processor to use for processing images.
 
     Returns:
         The processed HF dataset.

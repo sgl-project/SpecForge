@@ -467,6 +467,7 @@ class OnlineEagle3VlmModel(Eagle3Model):
             target: (batch, seq_len, vocab_size)
             loss_mask: (batch, seq_len)
             input_ids: (batch, seq_len)
+            image_embeds: (batch, seq_len, hidden_size)
         """
 
         if device is None:
@@ -552,6 +553,8 @@ class OnlineEagle3VlmModel(Eagle3Model):
             loss_mask: (batch, seq_len)
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
+            pixel_values: batch image pixel values, used for VLM models
+            image_grid_thw: (batch, 3), image grid thw, used for VLM models
         """
         # Step 1: prepare data with the target model
         hidden_states, target, loss_mask, input_ids, pre_inputs_embeds = self._prepare_data(

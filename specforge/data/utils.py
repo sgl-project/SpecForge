@@ -161,6 +161,8 @@ class VlmDataCollatorWithPadding:
                 - input_ids: torch.Tensor of shape (n,)
                 - attention_mask: torch.Tensor of shape (n,)
                 - loss_mask: torch.Tensor of shape (n,)
+                - pixel_values: torch.Tensor of shape (grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size)
+                - image_grid_thw: torch.Tensor of shape (3,)
 
         Returns:
             A dictionary containing:
