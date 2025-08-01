@@ -402,9 +402,9 @@ def main():
 
                 eval_logdict = {}
                 for i in range(len(plosses)):
-                    eval_logdict[f"train/ploss_{i}"] = plosses[i].item()
+                    eval_logdict[f"eval/ploss_{i}"] = plosses[i].item()
                 for i in range(len(acces)):
-                    eval_logdict[f"train/acc_{i}"] = acces[i]
+                    eval_logdict[f"eval/acc_{i}"] = acces[i]
                 wandb_log_if_initialized(eval_logdict)
                 
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]

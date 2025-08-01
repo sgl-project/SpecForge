@@ -421,8 +421,8 @@ class LlamaAttention(nn.Module):
         if cache_hidden is None:
             cos, sin = self.rotary_emb(query_states, position_ids)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states, key_states, cos, sin, self.config.rope_scaling["mrope_section"]
             )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
