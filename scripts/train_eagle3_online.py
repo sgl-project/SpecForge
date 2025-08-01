@@ -147,7 +147,7 @@ def main():
             device="cuda",
         ).eval()
     else:
-        if args.is_vlm and draft_model_config.model_type == "qwen2_5_vl":
+        if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
             from transformers import Qwen2_5_VLForConditionalGeneration
             target_model = (
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -250,7 +250,7 @@ def main():
 
     # build Eagle3 model
     # broadcast draft model
-    if args.is_vlm and draft_model_config.model_type == "qwen2_5_vl":
+    if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
