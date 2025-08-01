@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
@@ -377,6 +378,96 @@ class LlamaAttention(nn.Module):
                 attn_weightsi = attn_weights[..., q_len + i - 1]
                 attn_outputi = attn_weightsi[..., None] * vi
                 attn_output = attn_output + attn_outputi
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
+
+class LlamaFlashAttention(LlamaAttention):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        lck = len(cache_hidden[0])
+
+        cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids + lck
+        )
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        cache_hidden[0] = cache_hidden[0] + [key_states]
+        cache_hidden[1] = cache_hidden[1] + [value_states]
+
+        cache_k = cache_hidden[0]
+        cache_v = cache_hidden[1]
+
+        k0 = cache_k[0]
+        v0 = cache_v[0]
+
+        # causal
+        attn_output, lse, _ = flash_attn_func(
+            query_states.transpose(1, 2),
+            k0.transpose(1, 2),
+            v0.transpose(1, 2),
+            causal=True,
+            return_attn_probs=True,
+        )
+        lck = len(cache_k)
+
+        attn_weights = lse[..., None]
+        attn_output = attn_output.transpose(1, 2)
+
+        for i in range(1, lck):
+            ki = cache_k[i]
+            qi = query_states
+            kiq = ki
+
+            attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
+            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attn_weights0 = attn_weights[..., 0]
+
+        attn_output = attn_weights0[..., None] * attn_output
+
+        for i in range(1, lck):
+            vi = cache_v[i]
+            attn_weightsi = attn_weights[..., i]
+            attn_outputi = attn_weightsi[..., None] * vi
+            attn_output = attn_output + attn_outputi
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
