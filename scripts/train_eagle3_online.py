@@ -32,6 +32,8 @@ from specforge.utils import (
     validate_wandb_args,
 )
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
@@ -145,7 +147,7 @@ def main():
                 torch_dtype=torch.bfloat16,
             )
             .eval()
-            .cuda()
+            .to(device)
         )
     print_with_rank(f"Initialized target model")
     # load model with resume
@@ -153,13 +155,13 @@ def main():
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint)
-            .cuda()
+            .to(device)
             .to(torch.bfloat16)
         )
     else:
         draft_model = (
             AutoEagle3DraftModel.from_config(draft_model_config)
-            .cuda()
+            .to(device)
             .to(torch.bfloat16)
         )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
@@ -286,13 +288,13 @@ def main():
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
+                input_ids=data["input_ids"].to(device),
+                attention_mask=data["attention_mask"].to(device),
+                loss_mask=data["loss_mask"].to(device),
             )
 
             # calculate weighted loss
-            ploss_weight = [0.8**i for i in range(len(plosses))]
+            ploss_weight = [0.8 ** i for i in range(len(plosses))]
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
             optimizer.step()
@@ -311,7 +313,7 @@ def main():
             ]
 
         for i in range(len(epoch_acces)):
-            acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+            acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
             dist.all_reduce(acc_i)
             acc_i = acc_i / dist.get_world_size()
             acc_i = acc_i.item()
@@ -321,7 +323,7 @@ def main():
             )
 
         for i in range(len(epoch_plosses)):
-            loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+            loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
             dist.all_reduce(loss_i)
             loss_i = loss_i / dist.get_world_size()
             loss_i = loss_i.item()
@@ -339,9 +341,9 @@ def main():
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                 plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                    input_ids=data["input_ids"].to(device),
+                    attention_mask=data["attention_mask"].to(device),
+                    loss_mask=data["loss_mask"].to(device),
                 )
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
@@ -349,7 +351,7 @@ def main():
                 ]
 
             for i in range(len(epoch_acces)):
-                acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+                acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
                 dist.all_reduce(acc_i)
                 acc_i = acc_i / dist.get_world_size()
                 acc_i = acc_i.item()
@@ -360,7 +362,7 @@ def main():
                 )
 
             for i in range(len(epoch_plosses)):
-                loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+                loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
                 dist.all_reduce(loss_i)
                 loss_i = loss_i / dist.get_world_size()
                 loss_i = loss_i.item()

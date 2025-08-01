@@ -1,3 +1,4 @@
+import sys
 from datetime import timedelta
 
 import torch
@@ -26,14 +27,26 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    print_with_rank(f"bind to device {local_rank}")
+    if sys.platform == 'darwin':
+        backend_name = 'gloo'  # macOS 不支持 nccl
+    elif torch.cuda.is_available():
+        backend_name = 'nccl'  # Linux + CUDA 支持
+    else:
+        backend_name = 'gloo'  # Linux 无 CUDA，退回 CPU 模式
+    dist.init_process_group(backend=backend_name, timeout=timedelta(minutes=timeout))
 
     # initialize sub groups
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+
+    # Set CUDA device only if CUDA is available
+    if torch.cuda.is_available():
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        print_with_rank(f"Bind to CUDA device {local_rank}")
+    else:
+        print_with_rank("CUDA not available, running on CPU")
+
     dp_size = world_size // tp_size
     assert world_size == tp_size * dp_size, "world size must be divisible by tp size"
     global _TP_GROUP, _DP_GROUP
