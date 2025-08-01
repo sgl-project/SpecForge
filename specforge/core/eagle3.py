@@ -467,30 +467,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             target: (batch, seq_len, vocab_size)
             loss_mask: (batch, seq_len)
             input_ids: (batch, seq_len)
-            image_embeds: (batch, seq_len, hidden_size)
         """
 
         if device is None:
             device = input_ids.device
-
-        # get input embeding with image
-        inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
-        image_embeds = self.target_model.model.get_image_features(pixel_values, image_grid_thw)
-        image_embeds = torch.cat(image_embeds, dim=0)
-        n_image_tokens = (input_ids == self.target_model.model.config.image_token_id).sum()
-        n_image_features = image_embeds.shape[0]
-        if n_image_tokens != n_image_features:
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-            )
-
-        mask = input_ids == self.target_model.model.config.image_token_id
-        mask_unsqueezed = mask.unsqueeze(-1)
-        mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-        image_mask = mask_expanded.to(inputs_embeds.device)
-
-        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         # run the target model to get the hidden states
         outputs = self.target_model(
@@ -532,7 +512,30 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             loss_mask = loss_mask[..., None]
             loss_mask = loss_mask.to(device)
 
-        return hidden_states, target, loss_mask, input_ids, inputs_embeds
+        return hidden_states, target, loss_mask, input_ids
+
+    @torch.no_grad()
+    def _get_input_embeds(self, input_ids: torch.Tensor, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        # get input embeding with image
+        # inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
+        inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+        image_embeds = self.target_model.model.get_image_features(pixel_values, image_grid_thw)
+        image_embeds = torch.cat(image_embeds, dim=0)
+        n_image_tokens = (input_ids == self.target_model.model.config.image_token_id).sum()
+        n_image_features = image_embeds.shape[0]
+        if n_image_tokens != n_image_features:
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            )
+
+        mask = input_ids == self.target_model.model.config.image_token_id
+        mask_unsqueezed = mask.unsqueeze(-1)
+        mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+        image_mask = mask_expanded.to(inputs_embeds.device)
+
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        return inputs_embeds
 
     def forward(
         self,
@@ -557,7 +560,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             image_grid_thw: (batch, 3), image grid thw, used for VLM models
         """
         # Step 1: prepare data with the target model
-        hidden_states, target, loss_mask, input_ids, pre_inputs_embeds = self._prepare_data(
+        hidden_states, target, loss_mask, input_ids = self._prepare_data(
             input_ids, attention_mask, loss_mask, pixel_values, image_grid_thw
         )
 
@@ -573,18 +576,6 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
-
-        # if position_ids is None:
-        #     device = hidden_states.device
-        #     position_ids = torch.arange(
-        #         past_key_values_length,
-        #         seq_length + past_key_values_length,
-        #         dtype=torch.long,
-        #         device=device,
-        #     )
-        #     position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        # else:
-        #     position_ids = position_ids.view(-1, seq_length).long()
 
         if position_ids is None:
             attention_mask_tensor = (
@@ -632,11 +623,8 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            if pre_inputs_embeds is not None:
-                inputs_embeds = pre_inputs_embeds
-            else:
-                inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-                inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+            inputs_embeds = self._get_input_embeds(input_ids, pixel_values, image_grid_thw)
+            inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
