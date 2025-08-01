@@ -1,9 +1,11 @@
 <div align="center" id="sglangtop">
 <img src="./assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
-[![HF-llama4-scout-eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Scout-yellow.svg?style=flat)](https://huggingface.co/lmsys/sglang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-v1)
-[![HF-llama4-maverick-eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-Llama4%20Maverick-yellow.svg?style=flat)](https://huggingface.co/lmsys/sglang-EAGLE3-Llama-4-Maverick-17B-128E-Instruct-v1)
+[![github badge](https://img.shields.io/badge/📃%20LMSYS-Blog-black.svg?style=flat)](https://lmsys.org/blog/2025-07-25-spec-forge/)
+[![slack badge](https://img.shields.io/badge/Slack-join-blueviolet?logo=slack&amp)](https://sgl-fru7574.slack.com/archives/C09784E3EN6)
+[![SGLang Eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-SGLang%20Eagle3-yellow.svg?style=flat)](https://huggingface.co/collections/lmsys/eagle-3-6886b2329f3998a8bc23f8ed)
 [![license](https://img.shields.io/badge/License-MIT%202.0-blue)](./LICENSE)
+
 </div>
 
 
@@ -156,6 +158,8 @@ bash ./examples/run_llama3_eagle3_online.sh
 bash ./examples/run_llama4_eagle3_online.sh
 
 # train Qwen3-30B-A3B
+# Qwen3-235B-A22B online training is also supported;
+# the relevant code is included in the script (currently commented out).
 bash ./examples/run_qwen3_moe_eagle3_online.sh
 
 # train Qwen3-8B

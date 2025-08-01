@@ -36,7 +36,6 @@ from transformers.models.llama4.configuration_llama4 import (
     Llama4TextConfig,
 )
 from transformers.models.llama4.modeling_llama4 import (
-    KwargsForCausalLM,
     Llama4TextL2Norm,
     Llama4TextRMSNorm,
     Llama4TextRotaryEmbedding,
@@ -617,7 +616,7 @@ class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin, DistributedTarge
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs,
     ) -> Union[tuple, CausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):

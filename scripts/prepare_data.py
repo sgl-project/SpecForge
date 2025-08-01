@@ -82,7 +82,7 @@ def process_ultrachat_row(row) -> Dict:
         assert role in ["user", "assistant"]
         formatted_conversations.append({"role": role, "content": content})
     row = {"id": row["prompt_id"], "conversations": formatted_conversations}
-    return row
+    return row, 0
 
 
 def process_sharegpt_row(row) -> Dict:
@@ -230,6 +230,7 @@ def main():
         output_path.mkdir(parents=True, exist_ok=True)
 
     process_and_save_ds(train_ds, test_ds, output_path, proc_fn, args.dataset)
+
 
 
 if __name__ == "__main__":
