@@ -164,6 +164,9 @@ bash ./examples/run_qwen3_moe_eagle3_online.sh
 
 # train Qwen3-8B
 bash ./examples/run_qwen3_dense_eagle3_online.sh
+
+# train Qwq-32B
+bash ./examples/run_qwq_dense_eagle3_online.sh
 ```
 
 ### 💨 Offline Training

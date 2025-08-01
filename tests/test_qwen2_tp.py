@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import Qwen2ForCausalLM, Qwen2Config
+from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from specforge.distributed import init_distributed
 
@@ -38,9 +38,7 @@ def test_qwen2_tp(rank, world_size, temp_dir):
     # create the single-gpu
     model = Qwen2ForCausalLM(config).cuda()
 
-    from specforge.modeling.target.qwen2 import (
-        Qwen2ForCausalLM as DistQwen2ForCausalLM,
-    )
+    from specforge.modeling.target.qwen2 import Qwen2ForCausalLM as DistQwen2ForCausalLM
 
     dist_model = DistQwen2ForCausalLM(config).cuda()
 

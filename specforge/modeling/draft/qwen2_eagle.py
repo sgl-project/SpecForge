@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GenerationMixin, Qwen2Config, PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel, Qwen2Config
 from transformers.activations import ACT2FN
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 

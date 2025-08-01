@@ -10,18 +10,17 @@ from transformers import (
     Llama4TextConfig,
     LlamaConfig,
     PretrainedConfig,
-    Qwen3MoeConfig,
     Qwen2Config,
+    Qwen3MoeConfig,
 )
 
 from specforge.utils import default_torch_dtype
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
-from .target.llama4 import Llama4ForCausalLM
-from .target.qwen3_moe import Qwen3MoeForCausalLM
-
 from .draft.qwen2_eagle import Qwen2ForCausalLMEagle3
+from .target.llama4 import Llama4ForCausalLM
 from .target.qwen2 import Qwen2ForCausalLM
+from .target.qwen3_moe import Qwen3MoeForCausalLM
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
