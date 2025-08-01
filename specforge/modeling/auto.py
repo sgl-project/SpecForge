@@ -12,7 +12,6 @@ from transformers import (
     PretrainedConfig,
     Qwen3MoeConfig,
     Qwen2_5_VLConfig,
-    Qwen2_5_VLForConditionalGeneration,
 )
 
 from specforge.utils import default_torch_dtype
