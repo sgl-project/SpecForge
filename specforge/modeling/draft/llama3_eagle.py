@@ -449,10 +449,7 @@ class LlamaFlashAttention(LlamaAttention):
 
         for i in range(1, lck):
             ki = cache_k[i]
-            qi = query_states
-            kiq = ki
-
-            attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
+            attn_weightsi = (query_states * ki).sum(-1) / math.sqrt(self.head_dim)
             attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
 
         # upcast attention to fp32
