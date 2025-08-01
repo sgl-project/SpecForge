@@ -4,6 +4,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -11,7 +12,6 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import wandb
 from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OfflineEagle3Model
 from specforge.data import (
     build_eagle3_dataset,
