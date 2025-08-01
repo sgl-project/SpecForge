@@ -229,6 +229,7 @@ def main():
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
+            is_vlm=args.is_vlm,
         )
         print_with_rank(f"Initialized eval dataloader")
 
