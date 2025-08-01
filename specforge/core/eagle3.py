@@ -415,7 +415,7 @@ class OfflineEagle3Model(Eagle3Model):
                 attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
         return plosses, vlosses, acces
 
-class OnlineEagle3VlmModel(Eagle3Model):
+class QwenVLOnlineEagle3Model(Eagle3Model):
     """
     In sgl-spec, we implement offline/online training.
     Online training means we have the target hidden_states available during training.
