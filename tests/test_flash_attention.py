@@ -113,16 +113,66 @@ class TestFlashAttentionIntegration(unittest.TestCase):
         # Check shapes are identical
         self.assertEqual(output_flash.shape, output_standard.shape)
         
-        # Calculate numerical differences
+        # Calculate comprehensive numerical differences
         abs_diff = torch.abs(output_flash - output_standard)
+        rel_diff = abs_diff / (torch.abs(output_standard) + 1e-8)
+        
+        # Detailed statistics
+        print(f"\n=== COMPREHENSIVE OUTPUT COMPARISON ===")
+        print(f"Flash Attention output stats:")
+        print(f"  Min: {torch.min(output_flash).item():.6f}, Max: {torch.max(output_flash).item():.6f}")
+        print(f"  Mean: {torch.mean(output_flash).item():.6f}, Std: {torch.std(output_flash).item():.6f}")
+        
+        print(f"Standard Attention output stats:")
+        print(f"  Min: {torch.min(output_standard).item():.6f}, Max: {torch.max(output_standard).item():.6f}")
+        print(f"  Mean: {torch.mean(output_standard).item():.6f}, Std: {torch.std(output_standard).item():.6f}")
+        
+        print(f"\nAbsolute Difference Stats:")
+        print(f"  Min: {torch.min(abs_diff).item():.6f}, Max: {torch.max(abs_diff).item():.6f}")
+        print(f"  Mean: {torch.mean(abs_diff).item():.6f}, Std: {torch.std(abs_diff).item():.6f}")
+        print(f"  Median: {torch.median(abs_diff).item():.6f}")
+        print(f"  95th percentile: {torch.quantile(abs_diff, 0.95).item():.6f}")
+        print(f"  99th percentile: {torch.quantile(abs_diff, 0.99).item():.6f}")
+        
+        print(f"\nRelative Difference Stats:")
+        print(f"  Min: {torch.min(rel_diff).item():.6f}, Max: {torch.max(rel_diff).item():.6f}")
+        print(f"  Mean: {torch.mean(rel_diff).item():.6f}, Std: {torch.std(rel_diff).item():.6f}")
+        print(f"  Median: {torch.median(rel_diff).item():.6f}")
+        
+        # Count differences by magnitude
+        total_elements = abs_diff.numel()
+        diff_1e6 = torch.sum(abs_diff > 1e-6).item()
+        diff_1e5 = torch.sum(abs_diff > 1e-5).item()
+        diff_1e4 = torch.sum(abs_diff > 1e-4).item()
+        diff_1e3 = torch.sum(abs_diff > 1e-3).item()
+        diff_1e2 = torch.sum(abs_diff > 1e-2).item()
+        
+        print(f"\nDifference Distribution (out of {total_elements} elements):")
+        print(f"  > 1e-6: {diff_1e6} ({100*diff_1e6/total_elements:.2f}%)")
+        print(f"  > 1e-5: {diff_1e5} ({100*diff_1e5/total_elements:.2f}%)")
+        print(f"  > 1e-4: {diff_1e4} ({100*diff_1e4/total_elements:.2f}%)")
+        print(f"  > 1e-3: {diff_1e3} ({100*diff_1e3/total_elements:.2f}%)")
+        print(f"  > 1e-2: {diff_1e2} ({100*diff_1e2/total_elements:.2f}%)")
+        
+        # Sample values from different regions
+        print(f"\n=== SAMPLE VALUES COMPARISON ===")
+        batch_samples = [0, min(1, self.batch_size-1)]
+        seq_samples = [0, self.seq_len//4, self.seq_len//2, -1]
+        hidden_samples = [0, self.hidden_size//4, self.hidden_size//2, -1]
+        
+        for b in batch_samples:
+            for s in seq_samples:
+                for h in hidden_samples:
+                    if s == -1: s = self.seq_len - 1
+                    if h == -1: h = self.hidden_size - 1
+                    flash_val = output_flash[b, s, h].item()
+                    std_val = output_standard[b, s, h].item()
+                    diff_val = abs(flash_val - std_val)
+                    print(f"  [{b},{s},{h}]: Flash={flash_val:.6f}, Std={std_val:.6f}, Diff={diff_val:.6f}")
+        
         max_abs_diff = torch.max(abs_diff).item()
         mean_abs_diff = torch.mean(abs_diff).item()
-        rel_diff = abs_diff / (torch.abs(output_standard) + 1e-8)
         max_rel_diff = torch.max(rel_diff).item()
-        
-        print(f"Max absolute difference: {max_abs_diff:.6f}")
-        print(f"Mean absolute difference: {mean_abs_diff:.6f}")
-        print(f"Max relative difference: {max_rel_diff:.6f}")
         
         # The outputs should be close (fp16 has lower precision than fp32)
         self.assertLess(max_abs_diff, 1e-2, "Flash Attention output differs too much from standard attention")
@@ -180,26 +230,99 @@ class TestFlashAttentionIntegration(unittest.TestCase):
         # Check gradient shapes
         self.assertEqual(grad_flash.shape, grad_standard.shape)
         
-        # Calculate gradient differences
+        # Calculate comprehensive gradient differences
         grad_abs_diff = torch.abs(grad_flash - grad_standard)
+        grad_rel_diff = grad_abs_diff / (torch.abs(grad_standard) + 1e-8)
+        
+        # Detailed gradient statistics
+        print(f"\n=== COMPREHENSIVE GRADIENT COMPARISON ===")
+        print(f"Flash Attention gradient stats:")
+        print(f"  Min: {torch.min(grad_flash).item():.6f}, Max: {torch.max(grad_flash).item():.6f}")
+        print(f"  Mean: {torch.mean(grad_flash).item():.6f}, Std: {torch.std(grad_flash).item():.6f}")
+        
+        print(f"Standard Attention gradient stats:")
+        print(f"  Min: {torch.min(grad_standard).item():.6f}, Max: {torch.max(grad_standard).item():.6f}")
+        print(f"  Mean: {torch.mean(grad_standard).item():.6f}, Std: {torch.std(grad_standard).item():.6f}")
+        
+        print(f"\nGradient Absolute Difference Stats:")
+        print(f"  Min: {torch.min(grad_abs_diff).item():.6f}, Max: {torch.max(grad_abs_diff).item():.6f}")
+        print(f"  Mean: {torch.mean(grad_abs_diff).item():.6f}, Std: {torch.std(grad_abs_diff).item():.6f}")
+        print(f"  Median: {torch.median(grad_abs_diff).item():.6f}")
+        print(f"  95th percentile: {torch.quantile(grad_abs_diff, 0.95).item():.6f}")
+        print(f"  99th percentile: {torch.quantile(grad_abs_diff, 0.99).item():.6f}")
+        
+        print(f"\nGradient Relative Difference Stats:")
+        print(f"  Min: {torch.min(grad_rel_diff).item():.6f}, Max: {torch.max(grad_rel_diff).item():.6f}")
+        print(f"  Mean: {torch.mean(grad_rel_diff).item():.6f}, Std: {torch.std(grad_rel_diff).item():.6f}")
+        print(f"  Median: {torch.median(grad_rel_diff).item():.6f}")
+        
+        # Count gradient differences by magnitude
+        total_grad_elements = grad_abs_diff.numel()
+        grad_diff_1e6 = torch.sum(grad_abs_diff > 1e-6).item()
+        grad_diff_1e5 = torch.sum(grad_abs_diff > 1e-5).item()
+        grad_diff_1e4 = torch.sum(grad_abs_diff > 1e-4).item()
+        grad_diff_1e3 = torch.sum(grad_abs_diff > 1e-3).item()
+        grad_diff_1e2 = torch.sum(grad_abs_diff > 1e-2).item()
+        
+        print(f"\nGradient Difference Distribution (out of {total_grad_elements} elements):")
+        print(f"  > 1e-6: {grad_diff_1e6} ({100*grad_diff_1e6/total_grad_elements:.2f}%)")
+        print(f"  > 1e-5: {grad_diff_1e5} ({100*grad_diff_1e5/total_grad_elements:.2f}%)")
+        print(f"  > 1e-4: {grad_diff_1e4} ({100*grad_diff_1e4/total_grad_elements:.2f}%)")
+        print(f"  > 1e-3: {grad_diff_1e3} ({100*grad_diff_1e3/total_grad_elements:.2f}%)")
+        print(f"  > 1e-2: {grad_diff_1e2} ({100*grad_diff_1e2/total_grad_elements:.2f}%)")
+        
+        # Sample gradient values from different regions  
+        print(f"\n=== GRADIENT SAMPLE VALUES COMPARISON ===")
+        batch_samples = [0, min(1, self.batch_size-1)]
+        seq_samples = [0, self.seq_len//4, self.seq_len//2, -1]
+        hidden_samples = [0, self.hidden_size//4, self.hidden_size//2, -1]
+        
+        for b in batch_samples:
+            for s in seq_samples:
+                for h in hidden_samples:
+                    if s == -1: s = self.seq_len - 1
+                    if h == -1: h = self.hidden_size*2 - 1  # Note: grad has hidden_size*2
+                    flash_grad_val = grad_flash[b, s, h].item()
+                    std_grad_val = grad_standard[b, s, h].item()
+                    diff_grad_val = abs(flash_grad_val - std_grad_val)
+                    print(f"  Grad[{b},{s},{h}]: Flash={flash_grad_val:.6f}, Std={std_grad_val:.6f}, Diff={diff_grad_val:.6f}")
+        
         grad_max_abs_diff = torch.max(grad_abs_diff).item()
         grad_mean_abs_diff = torch.mean(grad_abs_diff).item()
-        grad_rel_diff = grad_abs_diff / (torch.abs(grad_standard) + 1e-8)
         grad_max_rel_diff = torch.max(grad_rel_diff).item()
         
-        print(f"Gradient max absolute difference: {grad_max_abs_diff:.6f}")
-        print(f"Gradient mean absolute difference: {grad_mean_abs_diff:.6f}")
-        print(f"Gradient max relative difference: {grad_max_rel_diff:.6f}")
-        
-        # Compare parameter gradients
+        # Compare parameter gradients comprehensively
+        print(f"\n=== PARAMETER GRADIENTS COMPARISON ===")
         flash_param_grads = {name: param.grad for name, param in attn_flash.named_parameters() if param.grad is not None}
         standard_param_grads = {name: param.grad for name, param in attn_standard.named_parameters() if param.grad is not None}
         
         for name in flash_param_grads.keys():
             if name in standard_param_grads:
-                param_grad_diff = torch.abs(flash_param_grads[name] - standard_param_grads[name])
+                flash_grad = flash_param_grads[name]
+                std_grad = standard_param_grads[name]
+                param_grad_diff = torch.abs(flash_grad - std_grad)
+                param_rel_diff = param_grad_diff / (torch.abs(std_grad) + 1e-8)
+                
+                print(f"\nParameter '{name}' gradient comparison:")
+                print(f"  Shape: {flash_grad.shape}")
+                print(f"  Flash grad - Min: {torch.min(flash_grad).item():.6f}, Max: {torch.max(flash_grad).item():.6f}")
+                print(f"  Flash grad - Mean: {torch.mean(flash_grad).item():.6f}, Std: {torch.std(flash_grad).item():.6f}")
+                print(f"  Std grad   - Min: {torch.min(std_grad).item():.6f}, Max: {torch.max(std_grad).item():.6f}")
+                print(f"  Std grad   - Mean: {torch.mean(std_grad).item():.6f}, Std: {torch.std(std_grad).item():.6f}")
+                print(f"  Abs diff   - Min: {torch.min(param_grad_diff).item():.6f}, Max: {torch.max(param_grad_diff).item():.6f}")
+                print(f"  Abs diff   - Mean: {torch.mean(param_grad_diff).item():.6f}, Median: {torch.median(param_grad_diff).item():.6f}")
+                print(f"  Rel diff   - Mean: {torch.mean(param_rel_diff).item():.6f}, Max: {torch.max(param_rel_diff).item():.6f}")
+                
+                # Count significant differences
+                param_total = param_grad_diff.numel()
+                param_diff_1e4 = torch.sum(param_grad_diff > 1e-4).item()
+                param_diff_1e3 = torch.sum(param_grad_diff > 1e-3).item()
+                param_diff_1e2 = torch.sum(param_grad_diff > 1e-2).item()
+                print(f"  Differences > 1e-4: {param_diff_1e4}/{param_total} ({100*param_diff_1e4/param_total:.2f}%)")
+                print(f"  Differences > 1e-3: {param_diff_1e3}/{param_total} ({100*param_diff_1e3/param_total:.2f}%)")
+                print(f"  Differences > 1e-2: {param_diff_1e2}/{param_total} ({100*param_diff_1e2/param_total:.2f}%)")
+                
                 param_max_diff = torch.max(param_grad_diff).item()
-                print(f"Parameter {name} gradient max diff: {param_max_diff:.6f}")
                 self.assertLess(param_max_diff, 1e-1, f"Parameter {name} gradients differ too much")
         
         # The gradients should be close (fp16 has lower precision and different computation paths)
