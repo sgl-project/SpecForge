@@ -255,11 +255,13 @@ def main():
             target_model=target_model,
             draft_model=draft_model,
             processor=processor,
+            length=args.ttt_length,
         )
     else:
         eagle3_model = OnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
+            length=args.ttt_length,
         )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
