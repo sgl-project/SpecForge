@@ -1,8 +1,8 @@
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
-    --model-path moonshotai/Kimi-K2-Instruct \
+    --model-path /root/models/Kimi-K2-Instruct \
     --enable-aux-hidden-states \
-    --data-path cache/dataset/sharegpt.jsonl \
+    --data-path /root/script/SpecForge/cache/dataset/test.jsonl \
     --chat-template kimi_k2 \
     --max-length 2048 \
     --tp-size 8 \
