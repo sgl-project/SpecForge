@@ -11,6 +11,8 @@ from transformers import PretrainedConfig
 
 
 def validate_wandb_args(parser, args):
+    if not args.wandb:
+        return
     if args.wandb_key is not None:
         return
 
@@ -33,13 +35,12 @@ def validate_wandb_args(parser, args):
         pass
 
     if args.wandb_key is None:
-        if dist.get_rank() == 0:
-            parser.error(
-                "When --wandb is enabled, you must provide a wandb API key via one of:\n"
-                "  1. --wandb-key argument\n"
-                "  2. WANDB_API_KEY environment variable\n"
-                "  3. wandb login api-key"
-            )
+        parser.error(
+            "When --wandb is enabled, you must provide a wandb API key via one of:\n"
+            "  1. --wandb-key argument\n"
+            "  2. WANDB_API_KEY environment variable\n"
+            "  3. wandb login api-key"
+        )
 
 
 @contextmanager

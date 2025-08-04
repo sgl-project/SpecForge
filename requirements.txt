@@ -1,6 +1,8 @@
 pre-commit
-torch
-transformers
+torch==2.7.1
+torchaudio==2.7.1
+torchvision==0.22.1
+transformers==4.54.1
 datasets
 setuptools
 tqdm

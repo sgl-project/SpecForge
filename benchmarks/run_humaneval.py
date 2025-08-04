@@ -68,6 +68,7 @@ def main(args):
     states = get_humaneval_answer.run_batch(
         questions,
         temperature=0,
+        max_new_tokens=2048,
         num_threads=args.parallel,
         progress_bar=True,
     )
@@ -77,6 +78,7 @@ def main(args):
     num_output_tokens = sum(
         s.get_meta_info("answer")["completion_tokens"] for s in states
     )
+
     output_throughput = num_output_tokens / latency
 
     has_verify = "spec_verify_ct" in states[0].get_meta_info("answer")

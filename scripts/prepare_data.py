@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt"],
+        choices=["ultrachat", "sharegpt", "opc"],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -108,6 +108,20 @@ def load_dataset_from_path(data_path: Path):
     return ds
 
 
+import hashlib
+
+
+def process_opc_sft_stage1(row) -> Dict:
+    row_id = hashlib.md5((row["instruction"] + row["output"]).encode()).hexdigest()
+    return {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["instruction"]},
+            {"role": "assistant", "content": row["output"]},
+        ],
+    }
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -116,11 +130,16 @@ def main():
         proc_fn = process_ultrachat_row
     elif args.dataset == "sharegpt":
         if args.data_path is None:
-            ds = load_dataset("/root/models/ShareGPT_Vicuna_unfiltered")["train"]
+            ds = load_dataset("Aeala/ShareGPT_Vicuna_unfiltered")["train"]
         else:
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))
         proc_fn = process_sharegpt_row
+    elif args.dataset == "opc":
+        ds = load_dataset(
+            "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
+        )["train"]
+        proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
             f"This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."

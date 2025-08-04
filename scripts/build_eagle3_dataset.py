@@ -7,9 +7,9 @@ import hashlib
 import os
 from pathlib import Path
 from typing import Optional
-import torch.nn as nn
 
 import torch
+import torch.nn as nn
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
