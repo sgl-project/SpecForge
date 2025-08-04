@@ -569,8 +569,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
 
 
-
-
 @auto_docstring
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin, DistributedTargetModel):
     _tied_weights_keys = ["lm_head.weight"]
