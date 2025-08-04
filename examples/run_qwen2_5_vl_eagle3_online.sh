@@ -18,6 +18,7 @@ torchrun \
     --batch-size 1 \
     --learning-rate 1e-4 \
     --max-length 8192 \
+    --dist-timeout 360 \
     --chat-template qwen2-vl \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
