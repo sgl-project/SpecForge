@@ -3,7 +3,7 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 
-# support tp1 train eagle3 for Qwen3-8B
+# support tp1 train eagle3 for qwen2.5-vl-7b-instruct
 NUM_GPUS=${1:-1}
 
 torchrun \
@@ -12,7 +12,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3_online.py \
     --target-model-path Qwen/Qwen2.5-VL-7B-Instruct \
     --draft-model-config $ROOT_DIR/configs/qwen2-5-vl-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/allava4v.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/allava4v_train.jsonl \
     --output-dir $ROOT_DIR/outputs/Qwen2.5-VL-7B-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \
@@ -22,4 +22,6 @@ torchrun \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
     --tp-size 1 \
-    --is-vlm 
+    --is-vlm \
+    --min-pixels 50176 \
+    --max-pixels 802816
