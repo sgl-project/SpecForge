@@ -39,6 +39,7 @@ def main(args):
     states = get_humaneval_answer.run_batch(
         questions,
         temperature=0,
+        max_new_tokens=2048,
         num_threads=args.parallel,
         progress_bar=True,
     )
