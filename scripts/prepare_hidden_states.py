@@ -327,7 +327,7 @@ def main():
     args = parse_args()
 
     # args.dist_timeout is defined in sglang.srt.server_args.ServerArgs and is in seconds.
-    if args.dist_timeout:
+    if args.dist_timeout is not None:
         if args.dist_timeout <= 0:
             raise ValueError(
                 f"--dist-timeout must be a positive number of seconds, but got {args.dist_timeout}"
