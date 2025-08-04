@@ -65,21 +65,22 @@ def preprocess_conversations(
             - attention_mask: List of attention masks.
     """
     system_prompt = chat_template.system_prompt
-    # This template is only suitable for other models. For kimi_k2, use the modified conversation template.
+    # This template is only suitable for other models. 
  
-    # user_message_separator = (
-    #     f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    # )
-    # assistant_message_separator = (
-    #     f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    # )
-
     user_message_separator = (
-        chat_template.user_header
+        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
     )
     assistant_message_separator = (
-        chat_template.assistant_header
+        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
     )
+
+    # For kimi_k2, use the modified conversation template.
+    # user_message_separator = (
+    #     chat_template.user_header
+    # )
+    # assistant_message_separator = (
+    #     chat_template.assistant_header
+    # )
 
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
