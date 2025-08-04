@@ -37,7 +37,7 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import auto_docstring, can_return_tuple, logging
 
 from specforge.distributed import get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -570,7 +570,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
 
 
-class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
 @auto_docstring
@@ -625,7 +624,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin, DistributedTargetM
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
