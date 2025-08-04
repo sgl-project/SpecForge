@@ -29,10 +29,8 @@ from specforge.utils import (
     get_last_checkpoint,
     print_with_rank,
     rank_0_priority,
-    validate_wandb_args,
+    validate_wandb_args, detect_device,
 )
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def parse_args():
@@ -117,6 +115,7 @@ def main():
     parser, args = parse_args()
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    device = detect_device()
     print_with_rank(f"Initialized distributed environment")
 
     # Validate wandb arguments

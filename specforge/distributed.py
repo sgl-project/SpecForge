@@ -1,10 +1,10 @@
-import sys
+
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 
-from specforge.utils import print_with_rank
+from specforge.utils import print_with_rank,detect_communication_backend
 
 _TP_GROUP = None
 _DP_GROUP = None
@@ -27,12 +27,7 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    if sys.platform == 'darwin':
-        backend_name = 'gloo'  # macOS 不支持 nccl
-    elif torch.cuda.is_available():
-        backend_name = 'nccl'  # Linux + CUDA 支持
-    else:
-        backend_name = 'gloo'  # Linux 无 CUDA，退回 CPU 模式
+    backend_name=detect_communication_backend()
     dist.init_process_group(backend=backend_name, timeout=timedelta(minutes=timeout))
 
     # initialize sub groups
