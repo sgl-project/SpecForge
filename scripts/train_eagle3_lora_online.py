@@ -239,10 +239,9 @@ def main():
 
     # 根据策略冻结或添加LoRA
     if args.use_lora:
-        # 冻结draft模型的所有原始参数
-        # for param in draft_model.parameters():
-        #     param.requires_grad = False
-        # print_with_rank(f"Frozen all base draft model parameters")
+        for param in draft_model.parameters():
+            param.requires_grad = False
+        print_with_rank(f"Frozen all base draft model parameters")
         
         # 为draft模型添加LoRA
         draft_lora_config = load_lora_config(args.lora_config, is_trainable=True)
@@ -407,6 +406,17 @@ def main():
             ploss_weight = [0.8**i for i in range(len(plosses))]
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
+            if args.use_lora:
+                grad_log_dict = {}
+                for idx, param in enumerate(lora_params):
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        print_on_rank0(
+                            f"LoRA param {idx} grad norm: {grad_norm}"
+                        )
+                        grad_log_dict[f"train/lora_grad_norm_{idx}"] = grad_norm
+                if grad_log_dict:
+                    wandb_log_if_initialized(grad_log_dict)
             optimizer.step()
             scheduler.step()
 

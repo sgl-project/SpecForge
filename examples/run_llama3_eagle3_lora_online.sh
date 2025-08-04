@@ -4,8 +4,8 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 NUM_GPUS=${1:-8}
-DRAFT_LORA_CONFIG=${2:-/sgl-workspace/draft_cache/algoprog_fact-generation-llama-3.1-8b-instruct-lora/adapter_config.json}
-TARGET_LORA_PATH=${3:-/sgl-workspace/draft_cache/algoprog_fact-generation-llama-3.1-8b-instruct-lora}
+TARGET_LORA_PATH=${2:-/sgl-workspace/SpecForge/llama-duo_llama3.1-8b-summarize-gpt4o-128k}
+DRAFT_LORA_CONFIG=${3:-$ROOT_DIR/configs/draft_lora_trainable_config.json}
 BASE_DRAFT_MODEL_PATH=${4:-/sgl-workspace/draft_cache/jamesliu1_sglang-EAGLE3-Llama-3.1-Instruct-8B}
 
 torchrun \
@@ -13,10 +13,9 @@ torchrun \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3_lora_online.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
-    --base-draft-model-path $BASE_DRAFT_MODEL_PATH \
+    --draft-model-config /sgl-workspace/SpecForge/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
-    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-lora \
+    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-lora-fixed \
     --use-lora \
     --lora-config $DRAFT_LORA_CONFIG \
     --target-lora-path $TARGET_LORA_PATH \
@@ -26,4 +25,8 @@ torchrun \
     --max-length 2048 \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
-    --resume
+    --wandb \
+    --wandb-key "f3b46a484034ca1fe99fc5ae4d19402c94da12c1" \
+    --wandb-project "specforge-training" \
+    --wandb-name "llama3-8b-lora-online-fixed-run-1"
+    

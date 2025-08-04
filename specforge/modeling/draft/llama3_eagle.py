@@ -606,6 +606,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             logger.info(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
+        if not hasattr(self, "_lora_logged"):
+            print("self.midlayer.self_attn.q_proj type:", type(self.midlayer.self_attn.q_proj))
+            print("self.midlayer.self_attn.k_proj type:", type(self.midlayer.self_attn.k_proj))
+            print("self.midlayer.self_attn.v_proj type:", type(self.midlayer.self_attn.v_proj))
+            print("self.midlayer.self_attn.o_proj type:", type(self.midlayer.self_attn.o_proj))
+            self._lora_logged = True
+
         batch_size, seq_length, _ = hidden_states.size()
 
         # make position ids
