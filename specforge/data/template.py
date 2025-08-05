@@ -113,3 +113,68 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
     ),
 )
+
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3",
+    template=ChatTemplate(
+        # 角色头部标识
+        system_header="<|im_start|>system\n",
+        user_header="<|im_start|>user\n",
+        assistant_header="<|im_start|>assistant\n",
+        system_prompt="You are a helpful assistant.",
+        tool_header="<|im_start|>tool\n",
+        
+        # 工具相关标记
+        tools_declaration_prefix="# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+        tools_declaration_suffix="\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>",
+        
+        # 工具调用标记
+        tool_call_begin="<tool_call>\n",
+        tool_call_end="\n</tool_call>",
+        tool_response_wrapper="<tool_response>\n{content}\n</tool_response>",
+        
+        # 思考过程标记
+        reasoning_wrapper="<|FunctionCallBegin|>\n{reasoning}\n<|FunctionCallEnd|>\n\n",
+        
+        # 轮次结束标记
+        end_of_turn_token="<|im_end|>\n",
+        
+        # 生成提示
+        generation_prompt="<|im_start|>assistant\n",
+        default_thinking_prompt="<|FunctionCallBegin|>\n\n</think>\n\n"
+    ),
+)
+
+
+TEMPLATE_REGISTRY.register(
+    name="kimi_k2",
+    template=ChatTemplate(
+        # 系统提示相关配置
+        system_header="<|im_system|>system<|im_middle|>",
+        system_prompt="You are a helpful assistant.",
+        
+        # 角色前缀配置
+        user_header="<|im_user|>user<|im_middle|>",
+        assistant_header="<|im_assistant|>assistant<|im_middle|>",
+        tool_header="<|im_system|>tool<|im_middle|>",
+        
+        # 工具调用相关标记
+        tool_declare_prefix="<|im_system|>tool_declare<|im_middle|>",
+        tool_calls_section_begin="<|tool_calls_section_begin|>",
+        tool_calls_section_end="<|tool_calls_section_end|>",
+        tool_call_begin="<|tool_call_begin|>",
+        tool_call_argument_begin="<|tool_call_argument_begin|>",
+        tool_call_end="<|tool_call_end|>",
+        
+        # 媒体内容标记
+        media_start="<|media_start|>image<|media_content|><|media_pad|>",
+        media_end="<|media_end|>",
+        
+        # 轮次结束标记
+        end_of_turn_token="<|im_end|>\n",
+        
+        # 生成提示前缀
+        generation_prompt="<|im_assistant|>assistant<|im_middle|>"
+    ),
+)

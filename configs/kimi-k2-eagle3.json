@@ -1,0 +1,39 @@
+{
+  "architectures": [
+    "LlamaForCausalLMEagle3"
+  ],
+  "eagle_config": {
+    "eagle_aux_hidden_state_layer_ids": [
+      2,
+      30,
+      58
+    ],
+    "use_aux_hidden_state": true
+  },
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 163584,
+  "eos_token_id": 163585,
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 7168,
+  "initializer_range": 0.02,
+  "intermediate_size": 18432,
+  "max_position_embeddings": 131072,
+  "max_window_layers": 48,
+  "model_type": "kimi_k2",
+  "num_attention_heads": 64,
+  "num_hidden_layers": 1,
+  "num_key_value_heads":64,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": null,
+  "rope_theta": 1000000.0,
+  "sliding_window": null,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.53.2",
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 163840,
+  "draft_vocab_size": 32000
+}

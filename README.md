@@ -164,15 +164,26 @@ bash ./examples/run_qwen3_moe_eagle3_online.sh
 
 # train Qwen3-8B
 bash ./examples/run_qwen3_dense_eagle3_online.sh
+
+# train Kimi-K2
+bash ./examples/run_kimi_k2_eagle3_online.sh
 ```
 
 ### 💨 Offline Training
 
-We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct model in an offline manner. You can run the following command to start the training. Almost Everything is the same as the Online Training Step, except that you don't need to configure anything about target model. Instead, you need to pass `--train-hidden-states-path` to the file.
+We have provided a simple startup script to train the Eagle3 model for Llama-3.1-8B-Instruct and Kimi-K2-Instruct model in an offline manner. You can run the following command to start the training. Almost Everything is the same as the Online Training Step, except that you don't need to configure anything about target model. Instead, you need to pass `--train-hidden-states-path` to the file.
+
+Note: The tokenizer automatically obtained for the Kimi-K2-Instruct model is TikTokenTokenizer. This tokenizer is not a fast model supported by Rust and lacks the interfaces required during data processing. You need to first run the script to generate tokenizer.json in the root directory of the Kimi-K2-Instruct model, and then modify AutoTokenizer to PreTrainedTokenizerFast in scripts/prepare_hidden_states.py. After doing this, the framework can be called normally.
+```bash
+python scripts/convert_kimi_tokenizer.py
+```
+
 
 ```bash
 # make sure you have sharegpt data prepared
 bash ./examples/run_llama3_eagle3_offline.sh
+
+bash ./examples/run_kimi_k2_eagle3_offline.sh
 ```
 
 ### 📈 Wandb Integration

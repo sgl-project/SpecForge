@@ -10,7 +10,7 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OfflineEagle3Model
 from specforge.data import (
@@ -138,7 +138,7 @@ def main():
     print_with_rank(f"Initialized draft model")
 
     # build dataloaders
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(args.target_model_path)
 
     # convert to dataloader
     cache_key = hashlib.md5(args.train_data_path.encode()).hexdigest()
