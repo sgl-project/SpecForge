@@ -13,11 +13,11 @@ torchrun \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3_lora_online.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config /sgl-workspace/SpecForge/configs/llama3-8B-eagle3.json \
+    --draft-model-config /sgl-workspace/draft_cache/jamesliu1_sglang-EAGLE3-Llama-3.1-Instruct-8B/config.json \
+    --base-draft-model-path $BASE_DRAFT_MODEL_PATH \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-lora-fixed \
     --use-lora \
-    --lora-config $DRAFT_LORA_CONFIG \
     --target-lora-path $TARGET_LORA_PATH \
     --num-epochs 1 \
     --batch-size 1 \

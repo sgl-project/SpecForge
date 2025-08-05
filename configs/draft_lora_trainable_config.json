@@ -10,7 +10,7 @@
   "layers_pattern": null,
   "layers_to_transform": null,
   "loftq_config": {},
-  "lora_alpha": 16,
+  "lora_alpha": 128,
   "lora_dropout": 0.1,
   "megatron_config": null,
   "megatron_core": "megatron.core",

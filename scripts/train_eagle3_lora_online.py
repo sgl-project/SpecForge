@@ -181,7 +181,7 @@ def main():
             .cuda()
         )
     
-    # 为target模型加载已训练好的LoRA（用于推理）
+    # add target LoRA
     if args.use_lora:
         if args.target_lora_path and os.path.exists(args.target_lora_path):
             print_with_rank(f"Loading pre-trained target LoRA from: {args.target_lora_path}")
@@ -203,7 +203,6 @@ def main():
     
     print_with_rank(f"Initialized target model")
     
-    # --- MODIFICATION START ---
     # 修改draft model加载逻辑
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     
@@ -211,37 +210,19 @@ def main():
         # 优先从预训练的draft model路径加载
         print_with_rank(f"Loading base draft model from: {args.base_draft_model_path}")
         draft_model = (
-            AutoEagle3DraftModel.from_pretrained(args.base_draft_model_path, trust_remote_code=False)
+            AutoEagle3DraftModel.from_pretrained(args.base_draft_model_path)
             .cuda()
             .to(torch.bfloat16)
         )
-        print_with_rank(f"Loaded pre-trained base draft model.")
-    elif draft_model_last_checkpoint and not args.use_lora:
-        # 兼容旧的非LoRA模式的断点续训
-        print_with_rank(f"Resuming full draft model from checkpoint: {draft_model_last_checkpoint}")
-        draft_model = (
-            AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint)
-            .cuda()
-            .to(torch.bfloat16)
-        )
-    else:
-        # 如果没有提供预训练模型，则从config创建
-        print_with_rank("No base draft model path provided. Creating a new draft model from config.")
-        draft_model = (
-            AutoEagle3DraftModel.from_config(draft_model_config, trust_remote_code=True)
-            .cuda()
-            .to(torch.bfloat16)
-        )
-        # 只有从头创建时才需要加载embedding，预训练模型已经包含了
         draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
-        print_with_rank("Initialized new draft model and loaded embeddings.")
-    # --- MODIFICATION END ---
+        draft_model.freeze_embedding()
+        print_with_rank(f"Loaded pre-trained base draft model.")
 
     # 根据策略冻结或添加LoRA
-    if args.use_lora:
-        for param in draft_model.parameters():
-            param.requires_grad = False
-        print_with_rank(f"Frozen all base draft model parameters")
+    if args.use_lora and args.lora_config:
+        # for param in draft_model.parameters():
+        #     param.requires_grad = False
+        # print_with_rank(f"Frozen all base draft model parameters")
         
         # 为draft模型添加LoRA
         draft_lora_config = load_lora_config(args.lora_config, is_trainable=True)
@@ -249,16 +230,51 @@ def main():
         draft_model = draft_model.to(torch.bfloat16)
         print_with_rank(f"Added new LoRA to draft model for training")
         
-        # 从LoRA checkpoint恢复（只加载draft的LoRA）
-        if draft_model_last_checkpoint:
-            draft_lora_path = os.path.join(draft_model_last_checkpoint, "draft_lora")
+        # 详细记录所有模型参数的状态
+        def log_model_parameters(model, model_name):
+            """Log detailed parameter information for debugging"""
+            print_with_rank(f"\n=== {model_name} Parameter Details ===")
+            trainable_count = 0
+            frozen_count = 0
+            total_params = 0
             
-            if os.path.exists(draft_lora_path):
-                draft_model.load_adapter(draft_lora_path, "default")
-                print_with_rank(f"Loaded draft LoRA from checkpoint: {draft_lora_path}")
-    else:
-        # 原始逻辑：只冻结embedding
-        draft_model.freeze_embedding()
+            for name, param in model.named_parameters():
+                trainable = param.requires_grad
+                if trainable:
+                    trainable_count += param.numel()
+                else:
+                    frozen_count += param.numel()
+                total_params += param.numel()
+                
+                # 打印每个参数的详细信息
+                print_with_rank(
+                    f"  {name:60s} | "
+                    f"Trainable: {str(trainable):5s} | "
+                    f"Shape: {str(tuple(param.shape)):20s} | "
+                    f"Dtype: {str(param.dtype):10s} | "
+                    f"Device: {str(param.device):10s} | "
+                    f"Params: {param.numel():,}"
+                )
+            
+            print_with_rank(f"\n{model_name} Summary:")
+            print_with_rank(f"  Total parameters: {total_params:,}")
+            print_with_rank(f"  Trainable parameters: {trainable_count:,} ({100*trainable_count/total_params:.2f}%)")
+            print_with_rank(f"  Frozen parameters: {frozen_count:,} ({100*frozen_count/total_params:.2f}%)")
+            print_with_rank("=" * 80)
+        
+        # 记录target和draft模型的详细参数信息
+        log_model_parameters(target_model, "Target Model")
+        log_model_parameters(draft_model, "Draft Model")
+
+        # # 从LoRA checkpoint恢复（只加载draft的LoRA）
+        # if draft_model_last_checkpoint:
+        #     draft_lora_path = os.path.join(draft_model_last_checkpoint, "draft_lora")
+            
+        #     if os.path.exists(draft_lora_path):
+        #         draft_model.load_adapter(draft_lora_path, "default")
+        #         print_with_rank(f"Loaded draft LoRA from checkpoint: {draft_lora_path}")
+
+
     
     print_with_rank(f"Initialized draft model")
 
@@ -342,16 +358,17 @@ def main():
         print_trainable_parameters(eagle3_model, "Eagle3 Model (Overall)")
 
     # build other components
+    optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
+    
     if args.use_lora:
-        # 只优化draft模型的LoRA参数
-        lora_params = []
-        for name, param in eagle3_model.named_parameters():
-            if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name):
-                lora_params.append(param)
-        optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
-        print_with_rank(f"Optimizer configured for draft LoRA parameters only ({len(lora_params)} parameters)")
+        # 统计LoRA参数数量用于日志记录
+        lora_param_count = sum(1 for name, param in eagle3_model.named_parameters() 
+                              if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name))
+        print_with_rank(f"Optimizer will train {lora_param_count} LoRA parameters out of total parameters")
     else:
-        optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
+        trainable_param_count = sum(1 for param in eagle3_model.parameters() if param.requires_grad)
+        print_with_rank(f"Optimizer configured for {trainable_param_count} trainable parameters")
+    
     total_steps = args.num_epochs * len(train_dataloader)
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = CosineAnnealingWarmupLR(
@@ -408,13 +425,16 @@ def main():
             ploss.backward()
             if args.use_lora:
                 grad_log_dict = {}
-                for idx, param in enumerate(lora_params):
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                        print_on_rank0(
-                            f"LoRA param {idx} grad norm: {grad_norm}"
-                        )
-                        grad_log_dict[f"train/lora_grad_norm_{idx}"] = grad_norm
+                lora_param_idx = 0
+                for name, param in eagle3_model.named_parameters():
+                    if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name):
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            print_on_rank0(
+                                f"LoRA param {lora_param_idx} ({name}) grad norm: {grad_norm}"
+                            )
+                            grad_log_dict[f"train/lora_grad_norm_{lora_param_idx}"] = grad_norm
+                        lora_param_idx += 1
                 if grad_log_dict:
                     wandb_log_if_initialized(grad_log_dict)
             optimizer.step()

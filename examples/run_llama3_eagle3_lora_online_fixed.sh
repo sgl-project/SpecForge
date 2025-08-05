@@ -19,7 +19,7 @@ torchrun \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-lora-fixed \
     --use-lora \
     --lora-config $DRAFT_LORA_CONFIG \
-    --target-lora-path $TARGET_LORA_PATH \
+    # --target-lora-path $TARGET_LORA_PATH \
     --num-epochs 1 \
     --batch-size 1 \
     --learning-rate 1e-4 \
