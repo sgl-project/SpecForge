@@ -18,6 +18,7 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-lora-fixed \
     --use-lora \
+    --lora-config $DRAFT_LORA_CONFIG \
     --target-lora-path $TARGET_LORA_PATH \
     --num-epochs 1 \
     --batch-size 1 \
@@ -25,6 +26,7 @@ torchrun \
     --max-length 2048 \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
+    --skip-vocab-mapping \
     --wandb \
     --wandb-key "f3b46a484034ca1fe99fc5ae4d19402c94da12c1" \
     --wandb-project "specforge-training" \

@@ -83,6 +83,11 @@ def parse_args():
         default=20,
         help="Timeout for collective communication in minutes",
     )
+    parser.add_argument(
+        "--skip-vocab-mapping",
+        action="store_true",
+        help="Use pretrained vocab mapping without regeneration",
+    )
 
     # resume
     parser.add_argument("--resume", action="store_true")
@@ -284,6 +289,7 @@ def main():
     # convert to dataloader
     cache_key = hashlib.md5(args.train_data_path.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    vocab_mapping_path = None
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -293,13 +299,14 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
         )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
-        )
+        if not args.skip_vocab_mapping:
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+            )
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.batch_size,
@@ -310,8 +317,10 @@ def main():
     print_with_rank(f"Initialized train dataloader")
 
     # we load the vocab mapping then
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank(f"Loaded vocab mapping")
+    if not args.skip_vocab_mapping:
+        draft_model.load_vocab_mapping(vocab_mapping_path)
+        print_with_rank(f"Loaded vocab mapping")
+
 
     if args.eval_data_path is not None:
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
