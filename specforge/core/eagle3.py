@@ -623,7 +623,8 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            inputs_embeds = self._get_input_embeds(input_ids, pixel_values, image_grid_thw)
+            # inputs_embeds = self._get_input_embeds(input_ids, pixel_values, image_grid_thw)
+            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone

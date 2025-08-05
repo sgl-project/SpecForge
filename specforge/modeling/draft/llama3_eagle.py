@@ -416,7 +416,7 @@ class LlamaAttention(nn.Module):
                     query_states, key_states, cos, sin, self.config.rope_scaling["mrope_section"]
                 )
             else:
-                cos, sin = self.rotary_emb(query_states, position_ids+ lck)
+                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, position_ids
