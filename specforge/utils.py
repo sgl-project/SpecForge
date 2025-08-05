@@ -2,12 +2,53 @@ import json
 import netrc
 import os
 import re
+import sys
 from contextlib import contextmanager
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 from transformers import PretrainedConfig
+
+
+def detect_communication_backend() -> str:
+    """
+    Detect the best communication backend for distributed training,
+    based on the platform and hardware availability.
+
+    Returns:
+        backend_name (str): One of 'nccl', 'gloo', or 'mpi'
+    """
+    if sys.platform == 'darwin':
+        backend_name = 'gloo'  # macOS does not support NCCL
+    elif torch.cuda.is_available():
+        backend_name = 'nccl'  # Recommended for GPU-based training
+    else:
+        backend_name = 'gloo'  # CPU-only training (Linux/Windows)
+    print(f"[INFO] Selected backend: {backend_name} on platform {sys.platform} (CUDA: {torch.cuda.is_available()})")
+    return backend_name
+
+
+def detect_device() -> torch.device:
+    """
+    Detect the best available device (CUDA, MPS, or CPU) for PyTorch computation.
+
+    Returns:
+        torch.device: The selected device.
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        reason = "CUDA is available"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps:0")
+        reason = "MPS (Apple Silicon GPU) is available"
+    else:
+        device = torch.device("cpu")
+        reason = "falling back to CPU"
+
+    print(f"[INFO] Using device: {device} ({reason})")
+
+    return device
 
 
 def validate_wandb_args(parser, args):
@@ -94,7 +135,7 @@ def get_last_checkpoint(folder):
         path
         for path in content
         if _re_checkpoint.search(path) is not None
-        and os.path.isdir(os.path.join(folder, path))
+           and os.path.isdir(os.path.join(folder, path))
     ]
     if len(checkpoints) == 0:
         return
