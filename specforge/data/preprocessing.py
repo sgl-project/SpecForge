@@ -41,6 +41,7 @@ except ImportError:
 
 from specforge.utils import padding
 
+from .parse import GeneralParser, HarmonyParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -68,6 +69,7 @@ def _apply_loss_mask_from_chat_template(
     Returns:
         A tensor indicating which tokens should contribute to the loss (1) or not (0).
     """
+<<<<<<< HEAD
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
     user_message_separator = (
@@ -76,6 +78,8 @@ def _apply_loss_mask_from_chat_template(
     assistant_message_separator = (
         f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
     )
+=======
+>>>>>>> a35701e (fixed gptoss chat template)
 
     # Find spans of assistant responses using regex
     assistant_pattern = (
@@ -136,6 +140,13 @@ def preprocess_conversations(
 
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
+
+    if chat_template.parser_type == "general":
+        parser = GeneralParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "openai-harmony":
+        parser = HarmonyParser(tokenizer, chat_template)
+    else:
+        raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
 
     for source in conversations:
         if not source:
