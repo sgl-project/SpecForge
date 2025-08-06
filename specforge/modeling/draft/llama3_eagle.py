@@ -64,6 +64,34 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     )
 
 
+def prepare_decoder_attention_mask(
+    attention_mask, input_shape, inputs_embeds, past_key_values_length
+):
+    # create causal mask
+    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    combined_attention_mask = None
+    if input_shape[-1] > 1:
+        combined_attention_mask = _make_causal_mask(
+            input_shape,
+            inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            past_key_values_length=past_key_values_length,
+        )
+
+    if attention_mask is not None:
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        expanded_attn_mask = _expand_mask(
+            attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+        ).to(inputs_embeds.device)
+        combined_attention_mask = (
+            expanded_attn_mask
+            if combined_attention_mask is None
+            else expanded_attn_mask + combined_attention_mask
+        )
+
+    return combined_attention_mask
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -434,11 +462,16 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
+        q, k, v = (query_states.transpose(1, 2), k0.transpose(1, 2), v0.transpose(1, 2))
+        q, k, v = [
+            x.to(torch.float16) if x.dtype not in (torch.float16, torch.bfloat16) else x
+            for x in [q, k, v]
+        ]
         # causal
         attn_output, lse, _ = flash_attn_func(
-            query_states.transpose(1, 2),
-            k0.transpose(1, 2),
-            v0.transpose(1, 2),
+            q,
+            k,
+            v,
             causal=True,
             return_attn_probs=True,
         )
@@ -645,33 +678,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
-    def _prepare_decoder_attention_mask(
-        self, attention_mask, input_shape, inputs_embeds, past_key_values_length
-    ):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
-            combined_attention_mask = _make_causal_mask(
-                input_shape,
-                inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                past_key_values_length=past_key_values_length,
-            )
-
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(
-                attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
-            ).to(inputs_embeds.device)
-            combined_attention_mask = (
-                expanded_attn_mask
-                if combined_attention_mask is None
-                else expanded_attn_mask + combined_attention_mask
-            )
-
-        return combined_attention_mask
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -706,7 +712,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
             )
-        attention_mask = self._prepare_decoder_attention_mask(
+        attention_mask = prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
