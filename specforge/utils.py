@@ -25,7 +25,8 @@ except ImportError:
 
 def validate_report_to_args(parser, args):
     """
-    only judge for wandb now
+    Validate arguments for the chosen experiment tracking backend.
+    Currently supports validation for 'wandb' and 'swanlab'.
     """
     if args.report_to != "wandb":
         return
@@ -72,7 +73,7 @@ def validate_report_to_args(parser, args):
 
 class ExperimentTracker:
     """
-    ExperimentTracker，support 'wandb', 'tensorboard', 'swanlab', or 'none'。
+    An experiment tracker that supports 'wandb', 'tensorboard', 'swanlab', or 'none'.
     """
 
     def __init__(self, args, output_dir: str):

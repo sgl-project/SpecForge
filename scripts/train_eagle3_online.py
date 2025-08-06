@@ -89,7 +89,7 @@ def parse_args():
         "--report-to",
         type=str,
         default="none",
-        choices=["wandb", "tensorboard", "none"],
+        choices=["wandb", "tensorboard","swanlab", "none"],
         help="The integration to report results and logs to.",
     )
     # wandb-specific args
@@ -368,7 +368,7 @@ def main():
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
                 ]
 
-            # --- 使用新的 Tracker 记录评估日志 ---
+            # Log epoch-level evaluation metrics
             eval_logdict = {}
             for i in range(len(eval_acces)):
                 acc_i = torch.tensor(eval_acces[i]).cuda().mean()
@@ -427,7 +427,7 @@ def main():
                     print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
                 dist.barrier()
 
-    # --- 关闭 Tracker ---
+    # Close the tracker
     tracker.close()
     destroy_distributed()
 
