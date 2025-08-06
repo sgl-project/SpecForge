@@ -41,6 +41,7 @@ except ImportError:
 
 from specforge.utils import padding
 
+from .parse import GeneralParser, HarmonyParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -136,6 +137,13 @@ def preprocess_conversations(
 
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
+
+    if chat_template.parser_type == "general":
+        parser = GeneralParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "openai-harmony":
+        parser = HarmonyParser(tokenizer, chat_template)
+    else:
+        raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
 
     for source in conversations:
         if not source:

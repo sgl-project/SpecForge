@@ -111,9 +111,20 @@ class OnlineEagle3Model(Eagle3Model):
         num_layers = num_hidden_states - 1
 
         # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
-        low_aux_layer = 1 + offset
-        mid_aux_layer = num_layers // 2 - 1 + offset
-        last_aux_layer = num_layers - 4 + offset
+        eagle3_config_dict = self.draft_model.config.to_dict()
+        eagle_config = eagle3_config_dict.get("eagle_config", None)
+        if (
+            eagle_config is not None
+            and "eagle_aux_hidden_state_layer_ids" in eagle_config
+        ):
+            aux_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
+            assert len(aux_layer_ids) == 3, "EAGLE3 requires 3 aux layers"
+        else:
+            aux_layer_ids = [1, num_layers // 2, num_layers - 4]
+
+        low_aux_layer = aux_layer_ids[0] + offset
+        mid_aux_layer = aux_layer_ids[1] + offset
+        last_aux_layer = aux_layer_ids[2] + offset
 
         hidden_states0 = outputs.hidden_states[low_aux_layer]
         hidden_states1 = outputs.hidden_states[mid_aux_layer]

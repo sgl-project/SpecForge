@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt", "sharegpt4v", "allava4v", "opc"],
+        choices=["ultrachat", "sharegpt", "sharegpt4v", "allava4v", "opc", "perfect-blend-gptoss-20B"],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -205,6 +205,11 @@ def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
     return processed_row, 0
 
 
+def add_index(row, idx) -> Dict:
+    row["id"] = idx
+    return row
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -231,9 +236,17 @@ def main():
             "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
         )["train"]
         proc_fn = process_opc_sft_stage1
+    elif args.dataset == "perfect-blend-gptoss-20B":
+        ds = load_dataset("shuaills/perfect-blend-gptoss-20B")["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = process_sharegpt_row
     else:
         raise ValueError(
+<<<<<<< HEAD
             "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+=======
+            f"This script only supports sharegpt, ultrachat, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
+>>>>>>> a35701e (fixed gptoss chat template)
         )
 
     # filter and split dataset
