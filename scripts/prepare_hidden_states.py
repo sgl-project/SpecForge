@@ -327,13 +327,17 @@ def main():
     args = parse_args()
 
     # args.dist_timeout is defined in sglang.srt.server_args.ServerArgs and is in seconds.
-    if args.dist_timeout <= 0:
-        raise ValueError(
-            f"--dist-timeout must be a positive number of seconds, but got {args.dist_timeout}"
+    if args.dist_timeout is not None:
+        if args.dist_timeout <= 0:
+            raise ValueError(
+                f"--dist-timeout must be a positive number of seconds, but got {args.dist_timeout}"
+            )
+        torch.distributed.init_process_group(
+            backend="nccl", timeout=timedelta(seconds=args.dist_timeout)
         )
-    torch.distributed.init_process_group(
-        backend="nccl", timeout=timedelta(seconds=args.dist_timeout)
-    )
+    else:
+        torch.distributed.init_process_group(backend="nccl")
+
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
@@ -345,7 +349,13 @@ def main():
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    cache_key = hashlib.md5(args.data_path.encode()).hexdigest()
+    cache_params_string = (
+        f"{args.data_path}-"
+        f"{args.max_length}-"
+        f"{args.chat_template}-"
+        f"{args.model_path}"  # Tokenizer may also different
+    )
+    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     with rank_0_priority():
         eagle3_dataset = build_eagle3_dataset(
             dataset=dataset,

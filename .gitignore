@@ -194,3 +194,4 @@ cython_debug/
 cache/
 outputs/
 wandb/
+.idea
