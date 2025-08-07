@@ -349,7 +349,13 @@ def main():
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    cache_key = hashlib.md5(args.data_path.encode()).hexdigest()
+    cache_params_string = (
+        f"{args.data_path}-"
+        f"{args.max_length}-"
+        f"{args.chat_template}-"
+        f"{args.model_path}"  # Tokenizer may also different
+    )
+    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     with rank_0_priority():
         eagle3_dataset = build_eagle3_dataset(
             dataset=dataset,
