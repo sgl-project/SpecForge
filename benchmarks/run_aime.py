@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     select_sglang_backend,
 )
 
+
 def main(args):
     # Select backend
     set_default_backend(select_sglang_backend(args))

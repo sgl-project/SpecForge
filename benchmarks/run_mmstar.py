@@ -1,8 +1,8 @@
-import os
-import shutil
 import argparse
 import ast
+import os
 import re
+import shutil
 import time
 
 from datasets import load_dataset
@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
+
 
 def main(args):
     # Select backend
@@ -27,18 +28,18 @@ def main(args):
     questions = []
     for idx, q in enumerate(dataset):
         if idx >= args.num_questions:
-          break
+            break
         image = q["image"]
         image_path = os.path.join(cache_dir, q["meta_info"]["image_path"])
         image.convert("RGB").save(image_path, "JPEG")
         item = [
-          {
-            "image_path": image_path,
-            "question": q["question"].split("Options:", 1)[0].strip()
-          }
+            {
+                "image_path": image_path,
+                "question": q["question"].split("Options:", 1)[0].strip(),
+            }
         ]
         questions.append(item)
-    
+
     #####################################
     ######### SGL Program Begin #########
     #####################################
@@ -46,9 +47,8 @@ def main(args):
 
     @sgl.function
     def get_mmstar_answer(s, question):
-        s += sgl.user(sgl.image(question["image_path"])+ question["question"])
+        s += sgl.user(sgl.image(question["image_path"]) + question["question"])
         s += sgl.assistant(sgl.gen("answer"))
-
 
     #####################################
     ########## SGL Program End ##########
@@ -83,7 +83,7 @@ def main(args):
             accept_length = num_output_tokens / num_verify_tokens
     else:
         accept_length = 1.0
-    
+
     # Print results
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
@@ -92,6 +92,7 @@ def main(args):
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
         print(f"Deleted temporary directory: {cache_dir}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
