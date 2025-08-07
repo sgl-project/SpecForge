@@ -137,6 +137,7 @@ def main():
         target_model = AutoDistributedTargetModel.from_pretrained(
             pretrained_model_name_or_path=args.target_model_path,
             torch_dtype=torch.bfloat16,
+            cache_dir=args.cache_dir,
             device="cuda",
         ).eval()
     else:
@@ -144,6 +145,7 @@ def main():
             AutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
                 torch_dtype=torch.bfloat16,
+                cache_dir=args.cache_dir,
             )
             .eval()
             .to(device)

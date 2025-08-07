@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from transformers import AutoConfig
@@ -56,6 +56,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         pretrained_model_name_or_path: Union[str, os.PathLike[str]],
         torch_dtype: torch.dtype = None,
         device: str = None,
+        cache_dir: Optional[str] = None,
         **config_kwargs,
     ):
         config = AutoConfig.from_pretrained(
@@ -81,7 +82,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         # load model
         with default_torch_dtype(torch_dtype), torch.device(device):
             model = model_cls(config)
-        model.load_checkpoint(pretrained_model_name_or_path)
+        model.load_checkpoint(pretrained_model_name_or_path, cache_dir=cache_dir)
 
         # just ensure that all the parameters follow the same dtype and device
         # model = model.to(torch_dtype)
