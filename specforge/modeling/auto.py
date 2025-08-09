@@ -1,10 +1,9 @@
 import json
 import os
-from typing import Optional, Union
 import warnings
+from typing import Optional, Union
 
 import torch
-from transformers import modeling_utils
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
@@ -13,6 +12,7 @@ from transformers import (
     LlamaConfig,
     PretrainedConfig,
     Qwen3MoeConfig,
+    modeling_utils,
 )
 
 from specforge.utils import default_torch_dtype
@@ -43,32 +43,30 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         # get the model class from the
         _model_cls = cls._model_mapping[type(config)]
         return _model_cls(config)
-    
+
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path : Union[str, os.PathLike[str]],
+        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
         *model_args,
-        **kwargs
+        **kwargs,
     ):
         original_warn = modeling_utils.logger.warning
-        
+
         def filtered_warning(msg):
             if "embed_tokens.weight" in str(msg) and "initialized" in str(msg):
                 return
             original_warn(msg)
-        
+
         modeling_utils.logger.warning = filtered_warning
-        
+
         try:
             model = super().from_pretrained(
-                pretrained_model_name_or_path,
-                *model_args,
-                **kwargs
+                pretrained_model_name_or_path, *model_args, **kwargs
             )
         finally:
             modeling_utils.logger.warning = original_warn
-            
+
         return model
 
 
