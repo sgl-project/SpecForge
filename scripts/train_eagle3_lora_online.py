@@ -8,7 +8,12 @@ import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import (
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+    FullStateDictConfig,
+)
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 # 添加PEFT库导入
@@ -540,7 +545,12 @@ def main():
                 os.makedirs(epoch_output_dir, exist_ok=True)
             dist.barrier()
 
-            with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+            # Only gather a full state dict on rank 0 to reduce sync pressure
+            with FSDP.state_dict_type(
+                eagle3_model,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            ):
                 model_state_dict = eagle3_model.state_dict()
                 state_to_save = {
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -603,7 +613,7 @@ def main():
                         # 保存tokenizer
                         tokenizer.save_pretrained(epoch_output_dir)
                         print_on_rank0(f"Saved tokenizer to {epoch_output_dir}")
-                    dist.barrier()
+                    # Avoid a trailing barrier here to reduce chances of hanging on sync
 
     destroy_distributed()
 
