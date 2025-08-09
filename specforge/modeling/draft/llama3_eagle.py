@@ -556,6 +556,20 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+        
+        # Initialize the model completely before setting up PEFT compatibility
+        self.post_init()
+    
+    # Ensure this method is explicitly available for PEFT compatibility
+    def get_input_embeddings(self):
+        """Required for PEFT compatibility."""
+        return self.embed_tokens
+    
+    def set_input_embeddings(self, value):
+        """Required for PEFT compatibility."""
+        self.embed_tokens = value
+    
+
 
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length

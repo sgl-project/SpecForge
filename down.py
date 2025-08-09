@@ -22,7 +22,7 @@ def download_model(model_id, local_dir):
 
 if __name__ == "__main__":
     # 定义模型ID和本地存储目录
-    model_identifier = "llama-duo/llama3.1-8b-summarize-gpt4o-128k"
+    model_identifier = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
     save_directory = f"./{model_identifier.replace('/', '_')}" # 将'/'替换为'_'以创建有效的文件夹名
 
     # 创建目标文件夹（如果不存在）

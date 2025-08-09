@@ -231,6 +231,17 @@ def main():
         
         # 为draft模型添加LoRA
         draft_lora_config = load_lora_config(args.lora_config, is_trainable=True)
+        
+        # PEFT compatibility fix: ensure prepare_inputs_for_generation is accessible
+        if not hasattr(draft_model, 'prepare_inputs_for_generation'):
+            print_with_rank("Warning: draft_model doesn't have prepare_inputs_for_generation, adding compatibility method")
+            # Add a simple prepare_inputs_for_generation method from GenerationMixin
+            from transformers.generation.utils import GenerationMixin
+            if hasattr(GenerationMixin, 'prepare_inputs_for_generation'):
+                draft_model.prepare_inputs_for_generation = GenerationMixin.prepare_inputs_for_generation.__get__(draft_model, draft_model.__class__)
+        else:
+            print_with_rank("Draft model has prepare_inputs_for_generation method")
+        
         draft_model = get_peft_model(draft_model, draft_lora_config)
         draft_model = draft_model.to(torch.bfloat16)
         print_with_rank(f"Added new LoRA to draft model for training")
