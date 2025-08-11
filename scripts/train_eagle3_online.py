@@ -398,7 +398,7 @@ def main():
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
                     for k, v in model_state_dict.items()
-                    if "draft_model." in k
+                    if "draft_model." in k and "embed" not in k.lower()
                 }
 
                 if dist.get_rank() == 0:
