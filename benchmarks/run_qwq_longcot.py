@@ -4,20 +4,20 @@ import re
 import time
 
 import numpy as np
+from datasets import load_dataset
 from sglang import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
 
 INVALID = -9999999
 
 
 def get_one_example(lines, i, include_answer):
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
+    ret = "Problem: " + lines[i]["problem"] + "\nSolution:"
     if include_answer:
-        ret += " " + lines[i]["answer"]
+        ret += " " + lines[i]["qwq"]
     return ret
 
 
@@ -29,13 +29,29 @@ def get_few_shot_examples(lines, k):
 
 
 def get_answer_value(answer_str):
+    # For QwQ responses, look for final answer in boxed format or at the end
+    # Try to find boxed answer first
+    boxed_pattern = r"\\boxed\{([^}]+)\}"
+    boxed_matches = re.findall(boxed_pattern, answer_str)
+    if boxed_matches:
+        answer_candidate = boxed_matches[-1]
+        # Extract number from the boxed answer
+        answer_candidate = answer_candidate.replace(",", "")
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", answer_candidate)
+        if numbers:
+            try:
+                return float(numbers[-1])
+            except ValueError:
+                pass
+
+    # Fallback: look for numbers in the entire response
     answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
+    numbers = re.findall(r"-?\d+(?:\.\d+)?", answer_str)
     if len(numbers) < 1:
         return INVALID
     try:
-        return ast.literal_eval(numbers[-1])
-    except SyntaxError:
+        return float(numbers[-1])
+    except ValueError:
         return INVALID
 
 
@@ -44,10 +60,9 @@ def main(args):
     set_default_backend(select_sglang_backend(args))
 
     # Read data
-    data_path = "gsm8k.jsonl"
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
+    print("Loading QwQ-LongCoT-130K dataset...")
+    dataset = load_dataset("amphora/QwQ-LongCoT-130K", split="train")
+    lines = list(dataset)
 
     # Construct prompts
     num_questions = args.num_questions
@@ -58,8 +73,14 @@ def main(args):
     labels = []
     for i in range(len(lines[:num_questions])):
         questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
-    assert all(l != INVALID for l in labels)
+        labels.append(get_answer_value(lines[i]["qwq"]))
+
+    # Filter out invalid labels and corresponding questions
+    valid_indices = [i for i, l in enumerate(labels) if l != INVALID]
+    questions = [questions[i] for i in valid_indices]
+    labels = [labels[i] for i in valid_indices]
+
+    print(f"Found {len(questions)} valid questions out of {num_questions} requested")
     arguments = [{"question": q} for q in questions]
 
     #####################################
@@ -69,10 +90,12 @@ def main(args):
     import sglang as sgl
 
     @sgl.function
-    def few_shot_gsm8k(s, question):
+    def few_shot_qwq(s, question):
         s += few_shot_examples + question
         s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+            "answer",
+            max_tokens=2048,
+            stop=["Problem", "Assistant:", "<|separator|>", "\n\n---"],
         )
 
     #####################################
@@ -81,7 +104,7 @@ def main(args):
 
     # Run requests
     tic = time.perf_counter()
-    states = few_shot_gsm8k.run_batch(
+    states = few_shot_qwq.run_batch(
         arguments,
         temperature=0,
         max_new_tokens=2048,
