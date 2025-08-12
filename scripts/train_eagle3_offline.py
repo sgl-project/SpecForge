@@ -60,7 +60,7 @@ def parse_args():
         default=7,
         help="The length for Test-Time Training (TTT).",
     )
-
+    parser.add_argument("--attention-backend", type=str, default="flex_attention")
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
 
@@ -131,7 +131,12 @@ def main():
 
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     draft_model = (
-        AutoEagle3DraftModel.from_config(draft_model_config).cuda().to(torch.bfloat16)
+        AutoEagle3DraftModel.from_config(
+            draft_model_config,
+            attention_backend=args.attention_backend,
+        )
+        .cuda()
+        .to(torch.bfloat16)
     )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
@@ -203,6 +208,7 @@ def main():
         target_head=target_head,
         draft_model=draft_model,
         length=args.ttt_length,
+        attention_backend=args.attention_backend,
     )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
