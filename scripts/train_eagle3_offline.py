@@ -60,7 +60,7 @@ def parse_args():
         default=7,
         help="The length for Test-Time Training (TTT).",
     )
-
+    parser.add_argument("--attention-backend", type=str, default="flex_attention")
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
 
@@ -203,6 +203,7 @@ def main():
         target_head=target_head,
         draft_model=draft_model,
         length=args.ttt_length,
+        attention_backend=args.attention_backend,
     )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(

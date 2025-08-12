@@ -284,7 +284,9 @@ class OfflineEagle3Model(Eagle3Model):
     Offline training means we have the target hidden_states available before training.
     """
 
-    def __init__(self, target_head, draft_model, length: int = 7):
+    def __init__(
+        self, target_head, draft_model, length: int = 7, attention_backend="sdpa"
+    ):
         """
         Args:
             target_head: the target head to process the target hidden states.
@@ -295,6 +297,7 @@ class OfflineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.target_head = target_head
         self.length = length
+        self.attention_backend = attention_backend
 
     def forward(
         self,
