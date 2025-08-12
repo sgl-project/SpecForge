@@ -29,7 +29,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     }
 
     @classmethod
-    def from_config(cls, config: PretrainedConfig):
+    def from_config(cls, config: PretrainedConfig, **config_kwargs):
         """
         This class method takes a configuration object and create its model based on the
         _model_mapping class variable.
@@ -42,7 +42,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         """
         # get the model class from the
         _model_cls = cls._model_mapping[type(config)]
-        return _model_cls(config)
+        return _model_cls(config, **config_kwargs)
 
     @classmethod
     def from_pretrained(

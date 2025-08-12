@@ -5,11 +5,18 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask
 from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from ..utils import padding
+from specforge.modeling.draft.flex_attention import (
+    compile_friendly_create_block_mask,
+    compile_friendly_flex_attention,
+    generate_eagle3_mask,
+)
+
 from .base import Eagle3DraftModel
 
 logger = logging.getLogger(__name__)
@@ -93,6 +100,34 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def prepare_decoder_attention_mask(
+    attention_mask, input_shape, inputs_embeds, past_key_values_length
+):
+    # create causal mask
+    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    combined_attention_mask = None
+    if input_shape[-1] > 1:
+        combined_attention_mask = _make_causal_mask(
+            input_shape,
+            inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            past_key_values_length=past_key_values_length,
+        )
+
+    if attention_mask is not None:
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        expanded_attn_mask = _expand_mask(
+            attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+        ).to(inputs_embeds.device)
+        combined_attention_mask = (
+            expanded_attn_mask
+            if combined_attention_mask is None
+            else expanded_attn_mask + combined_attention_mask
+        )
+
+    return combined_attention_mask
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -286,7 +321,7 @@ class LlamaAttention(nn.Module):
         cache_hidden: Optional[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -386,6 +421,104 @@ class LlamaAttention(nn.Module):
         return attn_output
 
 
+class LlamaFlexAttention(LlamaAttention):
+    """
+    Attention layer implemented with flex attention. We keep the parameters consistent with LlamaAttention.
+    The used parameters are:
+        - hidden_states: input hidden states
+        - attention_mask: attention mask not expanded, straight from data loader.
+        - position_ids: position ids
+        - past_key_values: dynamic cache used for storing past key and value states.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        lck = past_seen_tokens // q_len
+        cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        # Keep positions ids aligned when padding so the KV cache is unaffected.
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids + lck
+        )
+
+        cache_position: torch.Tensor = torch.arange(
+            past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
+        )
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+
+        key_cache, value_cache = past_key_values.update(
+            key_states,
+            value_states,
+            layer_idx=0,  # TODO: support multiple layers
+            cache_kwargs=cache_kwargs,
+        )
+
+        seq_lengths = attention_mask.sum(dim=-1)
+        # Shrink the attention mask to align with the padding to the right.
+        # This is equivalent to the shrinking logic in eagle3.py
+        seq_lengths -= lck
+        # TODO: Remove the usage of uncompiled create_block_mask after
+        # https://github.com/pytorch/pytorch/issues/160018
+        if q_len > 128:
+            create_block_mask_func = compile_friendly_create_block_mask
+        else:
+            create_block_mask_func = create_block_mask
+
+        block_mask = create_block_mask_func(
+            mask_mod=generate_eagle3_mask(
+                seq_lengths=seq_lengths,
+                Q_LEN=q_len,
+                KV_LEN=key_cache.shape[-2],
+                shift_left=lck,
+            ),
+            B=bsz,
+            H=1,  # Rely on broadcast
+            Q_LEN=q_len,
+            KV_LEN=key_cache.shape[-2],
+            device=query_states.device,
+        )
+
+        attn_output = compile_friendly_flex_attention(
+            query=query_states,
+            key=key_cache.contiguous(),
+            value=value_cache.contiguous(),
+            block_mask=block_mask,
+            enable_gqa=True,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config, last=True):
         super().__init__()
@@ -452,10 +585,18 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, last=True):
+    def __init__(self, config, last=True, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+
+        if attention_backend == "sdpa":
+            self.self_attn = LlamaAttention(config=config)
+        elif attention_backend == "flex_attention":
+            logger.warning("Using flex attention on draft model training!")
+            self.self_attn = LlamaFlexAttention(config=config)
+        else:
+            raise ValueError(f"Unknown attention backend {attention_backend}")
+
         self.mlp = LlamaMLP(config, last=last)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -473,7 +614,7 @@ class LlamaDecoderLayer(nn.Module):
         cache_hidden: List[List[torch.Tensor]] = [],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[
@@ -490,7 +631,7 @@ class LlamaDecoderLayer(nn.Module):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
 
         residual = hidden_states
@@ -505,7 +646,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
@@ -525,7 +666,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
-    def __init__(self, config, quant_config=None) -> None:
+    def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
         self.config = config
         self.quant_config = quant_config
@@ -535,7 +676,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config)
+        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -556,33 +697,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
-
-    def _prepare_decoder_attention_mask(
-        self, attention_mask, input_shape, inputs_embeds, past_key_values_length
-    ):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
-            combined_attention_mask = _make_causal_mask(
-                input_shape,
-                inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                past_key_values_length=past_key_values_length,
-            )
-
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(
-                attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
-            ).to(inputs_embeds.device)
-            combined_attention_mask = (
-                expanded_attn_mask
-                if combined_attention_mask is None
-                else expanded_attn_mask + combined_attention_mask
-            )
-
-        return combined_attention_mask
 
     def forward(
         self,
@@ -618,7 +732,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
             )
-        attention_mask = self._prepare_decoder_attention_mask(
+        attention_mask = prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
@@ -630,7 +744,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=None,
+            past_key_values=None,
             output_attentions=False,
             use_cache=False,
         )
@@ -659,6 +773,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         cache_hidden: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         return self.midlayer(
@@ -667,7 +782,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=None,
+            past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
         )

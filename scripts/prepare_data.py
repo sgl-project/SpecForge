@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Dict
 
@@ -142,7 +141,7 @@ def main():
         proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
-            f"This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
 
     if args.output_path is None:

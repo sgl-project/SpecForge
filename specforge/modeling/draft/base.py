@@ -24,13 +24,14 @@ import glob
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PreTrainedModel
+from transformers.cache_utils import Cache
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
@@ -104,6 +105,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         cache_hidden: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         """

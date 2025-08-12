@@ -185,10 +185,10 @@ class SglangHiddenStatesGenerator:
                     )
                     assert not torch.any(
                         torch.isnan(data_point["hidden_state"])
-                    ), f"hidden_state is expected to be non-nan"
+                    ), "hidden_state is expected to be non-nan"
                     assert not torch.any(
                         torch.isnan(data_point["aux_hidden_state"])
-                    ), f"aux_hidden_state is expected to be non-nan"
+                    ), "aux_hidden_state is expected to be non-nan"
                     torch.save(data_point, output_file)
             else:
                 for hidden_state, (data_point, output_file) in zip(
@@ -197,7 +197,7 @@ class SglangHiddenStatesGenerator:
                     data_point["hidden_state"] = hidden_state.clone().unsqueeze(0).cpu()
                     assert not torch.any(
                         torch.isnan(data_point["hidden_state"])
-                    ), f"hidden_state is expected to be non-nan"
+                    ), "hidden_state is expected to be non-nan"
                     torch.save(data_point, output_file)
 
     def generate(self, dataset: Dataset):
@@ -365,7 +365,7 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
         )
-        print_with_rank(f"Built dataset")
+        print_with_rank("Built dataset")
 
     hidden_states_generator = SglangHiddenStatesGenerator(
         args, tp_rank=torch.distributed.get_rank()
