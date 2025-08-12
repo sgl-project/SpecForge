@@ -175,9 +175,9 @@ We have provided a simple startup script to train the Eagle3 model for Llama-3.1
 bash ./examples/run_llama3_eagle3_offline.sh
 ```
 
-### 📈 Wandb Integration
+### 📈 Experiment Tracking
 
-If you wish to log the training progress to Wandb, you can add `--wandb`, `--wandb-key`, `--wandb-project` and `--wandb-name` to the command line in the provided sh file.
+This project supports logging training progress to Wandb, TensorBoard, and SwanLab. You can enable tracking by adding the --report-to argument to the command line in your shell script.
 
 ## 💡 Customize Your Own Training
 
