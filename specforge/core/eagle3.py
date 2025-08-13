@@ -25,7 +25,6 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers.cache_utils import DynamicCache
 
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
@@ -47,13 +46,7 @@ class OnlineEagle3Model(Eagle3Model):
     5. finally, we run TTT to train the draft model. input size is (batch, seq_len, hidden_size * 2)
     """
 
-    def __init__(
-        self,
-        target_model,
-        draft_model: Eagle3DraftModel,
-        length: int = 7,
-        attention_backend="sdpa",
-    ):
+    def __init__(self, target_model, draft_model: Eagle3DraftModel, length: int = 7):
         """
         Args:
             target_model: the target model to extract hidden states.
@@ -64,7 +57,6 @@ class OnlineEagle3Model(Eagle3Model):
         self.target_model = target_model
         self.draft_model = draft_model
         self.length = length
-        self.attention_backend = attention_backend
 
     @torch.no_grad()
     def _prepare_data(
@@ -187,25 +179,19 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
-            attention_mask = self.draft_model.prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                hidden_states=hidden_states,
-                batch_size=batch_size,
-                seq_length=seq_length,
-                past_key_values_length=past_key_values_length,
-            )
+        attention_mask = self.draft_model.prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            past_key_values_length=past_key_values_length,
+        )
 
         # Step 5: run TTT
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
-            cache_hidden = [[], []]
-            past_key_values = None
-        elif self.attention_backend == "flex_attention":
-            cache_hidden = None
-            past_key_values = DynamicCache()
+        cache_hidden = [[], []]
 
         for idx in range(self.length):
             is_last = idx == self.length - 1
@@ -221,7 +207,6 @@ class OnlineEagle3Model(Eagle3Model):
                 cache_hidden=cache_hidden,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
                 use_cache=True,
             )
 
@@ -267,14 +252,10 @@ class OnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 target = padding(target, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                if self.attention_backend == "sdpa":
-                    ind = torch.arange(seq_length, device=attention_mask.device)
-                    ind0 = ind[idx:]
-                    ind1 = ind[: seq_length - idx]
-                    attention_mask[:, :, ind0, ind1] = torch.finfo(
-                        attention_mask.dtype
-                    ).min
-                # Flex attention mask shirnking is handled inside attention module
+                ind = torch.arange(seq_length, device=attention_mask.device)
+                ind0 = ind[idx:]
+                ind1 = ind[: seq_length - idx]
+                attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
         return plosses, vlosses, acces
 
 
@@ -284,9 +265,7 @@ class OfflineEagle3Model(Eagle3Model):
     Offline training means we have the target hidden_states available before training.
     """
 
-    def __init__(
-        self, target_head, draft_model, length: int = 7, attention_backend="sdpa"
-    ):
+    def __init__(self, target_head, draft_model, length: int = 7):
         """
         Args:
             target_head: the target head to process the target hidden states.
@@ -297,7 +276,6 @@ class OfflineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.target_head = target_head
         self.length = length
-        self.attention_backend = attention_backend
 
     def forward(
         self,
@@ -358,25 +336,19 @@ class OfflineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
-            attention_mask = self.draft_model.prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                hidden_states=hidden_states,
-                batch_size=batch_size,
-                seq_length=seq_length,
-                past_key_values_length=past_key_values_length,
-            )
+        attention_mask = self.draft_model.prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            past_key_values_length=past_key_values_length,
+        )
 
         # Step 5: run TTT
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
-            cache_hidden = [[], []]
-            past_key_values = None
-        elif self.attention_backend == "flex_attention":
-            cache_hidden = None
-            past_key_values = DynamicCache()
+        cache_hidden = [[], []]
 
         for idx in range(self.length):
             is_last = idx == self.length - 1
@@ -392,7 +364,6 @@ class OfflineEagle3Model(Eagle3Model):
                 cache_hidden=cache_hidden,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
                 use_cache=True,
             )
 
@@ -438,14 +409,10 @@ class OfflineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 target = padding(target, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                if self.attention_backend == "sdpa":
-                    ind = torch.arange(seq_length, device=attention_mask.device)
-                    ind0 = ind[idx:]
-                    ind1 = ind[: seq_length - idx]
-                    attention_mask[:, :, ind0, ind1] = torch.finfo(
-                        attention_mask.dtype
-                    ).min
-                # Flex attention mask shirnking is handled inside attention module
+                ind = torch.arange(seq_length, device=attention_mask.device)
+                ind0 = ind[idx:]
+                ind1 = ind[: seq_length - idx]
+                attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
         return plosses, vlosses, acces
 
 class QwenVLOnlineEagle3Model(Eagle3Model):

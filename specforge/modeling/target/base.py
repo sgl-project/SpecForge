@@ -3,7 +3,7 @@ import glob
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Generator, Optional
+from typing import Dict, Generator
 
 import safetensors.torch
 import torch
@@ -17,9 +17,7 @@ from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 class DistributedTargetModel(ABC):
 
-    def _load_ckpt_files(
-        self, model_path: str, cache_dir: Optional[str] = None
-    ) -> Generator[str, None, None]:
+    def _load_ckpt_files(self, model_path: str) -> Generator[str, None, None]:
         """
         Load the embedding of the draft model.
 
@@ -66,9 +64,7 @@ class DistributedTargetModel(ABC):
         else:
             # this is the case where model_path is a huggingface repository
             # we first need to locate its local cache
-            local_cache_path = snapshot_download(
-                repo_id=model_path, cache_dir=cache_dir
-            )
+            local_cache_path = snapshot_download(repo_id=model_path)
             yield from self._load_ckpt_files(local_cache_path)
 
     def _open_ckpt_file(self, ckpt_file: str) -> Dict[str, torch.Tensor]:
@@ -92,8 +88,8 @@ class DistributedTargetModel(ABC):
         gather_tensor = torch.cat(obj_list, dim=dim)
         return gather_tensor
 
-    def load_checkpoint(self, checkpoint_path: str, cache_dir: Optional[str] = None):
-        for ckpt_file in self._load_ckpt_files(checkpoint_path, cache_dir):
+    def load_checkpoint(self, checkpoint_path: str):
+        for ckpt_file in self._load_ckpt_files(checkpoint_path):
             state_dict = self._open_ckpt_file(ckpt_file)
             self.load_weights(state_dict)
 

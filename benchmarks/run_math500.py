@@ -2,7 +2,7 @@ import argparse
 import time
 
 from datasets import load_dataset
-from sglang import set_default_backend
+from sglang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -39,7 +39,6 @@ def main(args):
     states = get_humaneval_answer.run_batch(
         questions,
         temperature=0,
-        max_new_tokens=2048,
         num_threads=args.parallel,
         progress_bar=True,
     )
