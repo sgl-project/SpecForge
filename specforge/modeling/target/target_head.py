@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -16,11 +17,16 @@ class TargetHead(nn.Module):
         self.fc = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
     @torch.no_grad()
-    def load_weights(self, model_path, lm_head_key: str = "lm_head.weight"):
+    def load_weights(
+        self,
+        model_path,
+        lm_head_key: str = "lm_head.weight",
+        cache_dir: Optional[str] = None,
+    ):
         if os.path.exists(model_path):
             self.model_path = model_path
         else:
-            self.model_path = snapshot_download(repo_id=model_path)
+            self.model_path = snapshot_download(repo_id=model_path, cache_dir=cache_dir)
 
         # model_path is a local directory
         # check if there is file ending with index.json

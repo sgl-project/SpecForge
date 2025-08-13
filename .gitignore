@@ -194,6 +194,5 @@ cython_debug/
 cache/
 outputs/
 wandb/
-
-# vscode
+.idea
 .vscode/
