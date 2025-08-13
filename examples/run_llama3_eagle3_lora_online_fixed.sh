@@ -18,7 +18,6 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/synth_summarize.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-lora-fixed \
     --use-lora \
-    --lora-config $DRAFT_LORA_CONFIG \
     --target-lora-path $TARGET_LORA_PATH \
     --num-epochs 1 \
     --batch-size 1 \

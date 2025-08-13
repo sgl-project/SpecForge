@@ -9,3 +9,4 @@ psutil
 numpy
 accelerate
 pydantic
+peft

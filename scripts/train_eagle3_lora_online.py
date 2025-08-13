@@ -16,7 +16,7 @@ from torch.distributed.fsdp import (
 )
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-# 添加PEFT库导入
+# Import PEFT library
 from peft import LoraConfig, get_peft_model, TaskType, PeftConfig
 import json
 
@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument("--draft-model-config", type=str, required=True)
     
     # --- MODIFICATION START ---
-    # 新增参数，用于加载预训练的draft model
+    # Add new parameter for loading pre-trained draft model
     parser.add_argument("--base-draft-model-path", type=str, default=None, help="Path to a pre-trained base draft model")
     # --- MODIFICATION END ---
     
@@ -55,7 +55,7 @@ def parse_args():
         help="The key of the embedding weight to load from the target model",
     )
 
-    # LoRA配置
+    # LoRA configuration
     parser.add_argument("--use-lora", action="store_true", help="Enable LoRA training")
     parser.add_argument("--lora-config", type=str, default=None, help="Path to LoRA config file for draft model")
     parser.add_argument("--target-lora-path", type=str, default=None, help="Path to pre-trained target LoRA adapter")
@@ -123,7 +123,7 @@ def print_on_rank0(message):
 
 
 def print_trainable_parameters(model, model_name="Model"):
-    """打印模型的可训练参数统计"""
+    """Print model trainable parameter statistics"""
     trainable_params = 0
     all_param = 0
     for _, param in model.named_parameters():
@@ -138,13 +138,13 @@ def print_trainable_parameters(model, model_name="Model"):
 
 
 def load_lora_config(lora_config_path, is_trainable=False):
-    """从配置文件加载LoRA配置"""
+    """Load LoRA configuration from config file"""
     if not lora_config_path or not os.path.exists(lora_config_path):
         raise ValueError(f"LoRA config file not found: {lora_config_path}")
     
     print_with_rank(f"Loading LoRA config from: {lora_config_path}")
     
-    # 从配置文件创建LoraConfig
+    # Create LoraConfig from config file
     with open(lora_config_path, 'r') as f:
         config_dict = json.load(f)
 
@@ -195,7 +195,7 @@ def main():
     if args.use_lora:
         if args.target_lora_path and os.path.exists(args.target_lora_path):
             print_with_rank(f"Loading pre-trained target LoRA from: {args.target_lora_path}")
-            # 从target LoRA路径加载配置
+            # Load configuration from target LoRA path
             target_lora_config = load_lora_config(os.path.join(args.target_lora_path, "adapter_config.json"))
             target_model = get_peft_model(target_model, target_lora_config)
             target_model.load_adapter(args.target_lora_path, "default")
@@ -203,7 +203,7 @@ def main():
         else:
             print_with_rank(f"No pre-trained target LoRA specified, using base target model")
         
-        # 冻结target模型的所有参数（包括LoRA）
+        # Freeze all parameters of target model (including LoRA)
         for param in target_model.parameters():
             param.requires_grad = False
         target_model = target_model.eval()
@@ -213,11 +213,11 @@ def main():
     
     print_with_rank(f"Initialized target model")
     
-    # 修改draft model加载逻辑
+    # Modify draft model loading logic
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     
     if args.base_draft_model_path and os.path.exists(args.base_draft_model_path):
-        # 优先从预训练的draft model路径加载
+        # Load from pre-trained draft model path first
         print_with_rank(f"Loading base draft model from: {args.base_draft_model_path}")
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(args.base_draft_model_path)
@@ -228,13 +228,18 @@ def main():
         draft_model.freeze_embedding()
         print_with_rank(f"Loaded pre-trained base draft model.")
 
-    # 根据策略冻结或添加LoRA
+    if args.use_lora and not args.lora_config:
+        for param in draft_model.parameters():
+            param.requires_grad = False
+        print_with_rank(f"Frozen all base draft model parameters")
+
+    # Freeze or add LoRA based on strategy
     if args.use_lora and args.lora_config:
         # for param in draft_model.parameters():
         #     param.requires_grad = False
         # print_with_rank(f"Frozen all base draft model parameters")
         
-        # 为draft模型添加LoRA
+        # Add LoRA to draft model
         draft_lora_config = load_lora_config(args.lora_config, is_trainable=True)
         
         # PEFT compatibility fix: ensure prepare_inputs_for_generation is accessible
@@ -251,7 +256,7 @@ def main():
         draft_model = draft_model.to(torch.bfloat16)
         print_with_rank(f"Added new LoRA to draft model for training")
         
-        # 详细记录所有模型参数的状态
+        # Log detailed status of all model parameters
         def log_model_parameters(model, model_name):
             """Log detailed parameter information for debugging"""
             print_with_rank(f"\n=== {model_name} Parameter Details ===")
@@ -267,7 +272,7 @@ def main():
                     frozen_count += param.numel()
                 total_params += param.numel()
                 
-                # 打印每个参数的详细信息
+                # Print detailed information for each parameter
                 print_with_rank(
                     f"  {name:60s} | "
                     f"Trainable: {str(trainable):5s} | "
@@ -283,11 +288,11 @@ def main():
             print_with_rank(f"  Frozen parameters: {frozen_count:,} ({100*frozen_count/total_params:.2f}%)")
             print_with_rank("=" * 80)
         
-        # 记录target和draft模型的详细参数信息
+        # Log detailed parameter information for target and draft models
         log_model_parameters(target_model, "Target Model")
         log_model_parameters(draft_model, "Draft Model")
 
-        # # 从LoRA checkpoint恢复（只加载draft的LoRA）
+        # # Restore from LoRA checkpoint (only load draft LoRA)
         # if draft_model_last_checkpoint:
         #     draft_lora_path = os.path.join(draft_model_last_checkpoint, "draft_lora")
             
@@ -362,7 +367,7 @@ def main():
         draft_model=draft_model,
     )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
-    # target模型始终被忽略（无论是否使用LoRA，target都是冻结的）
+    # Target model is always ignored (target is frozen regardless of whether LoRA is used)
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -376,23 +381,31 @@ def main():
     )
     print_with_rank(f"Initialized Eagle3 FSDP model")
     
-    # 打印参数统计信息
+    # Print parameter statistics
     if args.use_lora:
         print_trainable_parameters(target_model, "Target Model (Frozen)")
         print_trainable_parameters(draft_model, "Draft Model (LoRA Only)") 
         print_trainable_parameters(eagle3_model, "Eagle3 Model (Overall)")
 
     # build other components
+    has_trainable_params = any(param.requires_grad for param in eagle3_model.parameters())
     optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
     
     if args.use_lora:
-        # 统计LoRA参数数量用于日志记录
-        lora_param_count = sum(1 for name, param in eagle3_model.named_parameters() 
-                              if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name))
-        print_with_rank(f"Optimizer will train {lora_param_count} LoRA parameters out of total parameters")
+        # Count LoRA parameters for logging
+        lora_param_count = sum(
+            1
+            for name, param in eagle3_model.named_parameters()
+            if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name)
+        )
+        print_with_rank(
+            f"Optimizer will train {lora_param_count} LoRA parameters out of total parameters"
+        )
     else:
         trainable_param_count = sum(1 for param in eagle3_model.parameters() if param.requires_grad)
-        print_with_rank(f"Optimizer configured for {trainable_param_count} trainable parameters")
+        print_with_rank(
+            f"Optimizer configured for {trainable_param_count} trainable parameters"
+        )
     
     total_steps = args.num_epochs * len(train_dataloader)
     warmup_steps = int(total_steps * args.warmup_ratio)
@@ -430,40 +443,48 @@ def main():
     # start running
     print_on_rank0(f"Starting training from epoch {start_epoch}")
     for epoch in range(start_epoch, args.num_epochs):
-        # Run training
+        # Run training / inference-only depending on whether any params are trainable
         train_dataloader.sampler.set_epoch(epoch + 1)
-        draft_model.train()
+        if has_trainable_params:
+            draft_model.train()
+            eagle3_model.train()
+        else:
+            draft_model.eval()
+            eagle3_model.eval()
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
-            plosses, _, acces = eagle3_model(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
-            )
+            with torch.set_grad_enabled(has_trainable_params):
+                plosses, _, acces = eagle3_model(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
 
-            # calculate weighted loss
-            ploss_weight = [0.8**i for i in range(len(plosses))]
-            ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-            ploss.backward()
-            if args.use_lora:
-                grad_log_dict = {}
-                lora_param_idx = 0
-                for name, param in eagle3_model.named_parameters():
-                    if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name):
-                        if param.grad is not None:
-                            grad_norm = param.grad.norm().item()
-                            print_on_rank0(
-                                f"LoRA param {lora_param_idx} ({name}) grad norm: {grad_norm}"
-                            )
-                            grad_log_dict[f"train/lora_grad_norm_{lora_param_idx}"] = grad_norm
-                        lora_param_idx += 1
-                if grad_log_dict:
-                    wandb_log_if_initialized(grad_log_dict)
-            optimizer.step()
-            scheduler.step()
+                # calculate weighted loss
+                ploss_weight = [0.8**i for i in range(len(plosses))]
+                ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+
+                if has_trainable_params:
+                    ploss.backward()
+                    if args.use_lora:
+                        grad_log_dict = {}
+                        lora_param_idx = 0
+                        for name, param in eagle3_model.named_parameters():
+                            if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name):
+                                if param.grad is not None:
+                                    grad_norm = param.grad.norm().item()
+                                    print_on_rank0(
+                                        f"LoRA param {lora_param_idx} ({name}) grad norm: {grad_norm}"
+                                    )
+                                    grad_log_dict[f"train/lora_grad_norm_{lora_param_idx}"] = grad_norm
+                                lora_param_idx += 1
+                        if grad_log_dict:
+                            wandb_log_if_initialized(grad_log_dict)
+                    optimizer.step()
+                    scheduler.step()
 
             logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
             for i in range(len(plosses)):
@@ -568,37 +589,37 @@ def main():
                         f"Saved full training state to {epoch_output_dir}/training_state.pt"
                     )
                     
-                    if args.use_lora:
-                        # 手动提取并保存draft模型的LoRA权重（从FSDP state_dict中）
+                    if args.use_lora and args.lora_config:
+                        # Manually extract and save draft model LoRA weights (from FSDP state_dict)
                         draft_lora_output_dir = os.path.join(epoch_output_dir, "draft_lora")
                         os.makedirs(draft_lora_output_dir, exist_ok=True)
                         
-                        # 提取LoRA相关的权重
+                        # Extract LoRA related weights
                         lora_state_dict = {}
                         for key, value in model_state_dict.items():
                             if "draft_model." in key and ("lora_" in key or "adapter" in key):
-                                # 移除 "draft_model." 前缀，因为我们要保存的是draft模型内部的LoRA权重
+                                # Remove "draft_model." prefix because we want to save the LoRA weights inside the draft model
                                 lora_key = key.replace("draft_model.", "")
                                 lora_state_dict[lora_key] = value
                         
                         if lora_state_dict:
-                            # 保存LoRA权重
+                            # Save LoRA weights
                             import safetensors.torch as st
                             st.save_file(lora_state_dict, os.path.join(draft_lora_output_dir, "adapter_model.safetensors"))
                             print_on_rank0(f"Saved {len(lora_state_dict)} LoRA weights to {draft_lora_output_dir}/adapter_model.safetensors")
                             
-                            # 保存LoRA配置文件
+                            # Save LoRA configuration file
                             import shutil
                             shutil.copy2(args.lora_config, os.path.join(draft_lora_output_dir, "adapter_config.json"))
                             print_on_rank0(f"Copied LoRA config to {draft_lora_output_dir}/adapter_config.json")
                         else:
                             print_on_rank0("Warning: No LoRA weights found in state_dict!")
                         
-                        # 保存tokenizer到draft_lora目录
+                        # Save tokenizer to draft_lora directory
                         tokenizer.save_pretrained(draft_lora_output_dir)
                         print_on_rank0(f"Saved tokenizer to {draft_lora_output_dir}")
                     else:
-                        # 原始逻辑：保存draft模型状态
+                        # Original logic: save draft model state
                         draft_model_state_dict = {
                             k.replace("draft_model.", ""): v
                             for k, v in model_state_dict.items()
@@ -610,7 +631,7 @@ def main():
                         )
                         print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
                         
-                        # 保存tokenizer
+                        # Save tokenizer
                         tokenizer.save_pretrained(epoch_output_dir)
                         print_on_rank0(f"Saved tokenizer to {epoch_output_dir}")
                     # Avoid a trailing barrier here to reduce chances of hanging on sync
