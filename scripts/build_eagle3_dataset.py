@@ -6,13 +6,10 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
-from typing import Optional
 
 import torch
-import torch.nn as nn
-from datasets import Dataset, load_dataset
-from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from datasets import load_dataset
+from transformers import AutoTokenizer
 
 from specforge.data import build_eagle3_dataset
 
@@ -24,10 +21,21 @@ def parse_args():
     parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--num-samples", type=int, default=None)
+    parser.add_argument("--chat-template", type=str, default="llama3")
+    parser.add_argument("--model-path", type=str, required=False)
     return parser.parse_args()
 
 
 def main():
+    """
+    Separated script to build eagle3 dataset from the training.
+
+    Usage:
+    python ./scripts/build_eagle3_dataset.py  \
+        --data-path "cache/dataset/sharegpt.jsonl" \
+        --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct \
+        --chat-template llama3
+    """
     args = parse_args()
     torch.distributed.init_process_group(backend="nccl")
     assert os.path.exists(
@@ -42,7 +50,13 @@ def main():
         print(f"Selecting {args.num_samples} samples from {len(dataset)}")
         dataset = dataset.select(range(args.num_samples))
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    cache_key = hashlib.md5(args.data_path.encode()).hexdigest()
+    cache_params_string = (
+        f"{args.data_path}-"
+        f"{args.max_length}-"
+        f"{args.chat_template}-"
+        f"{args.model_path}"  # Tokenizer may also different
+    )
+    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     eagle3_dataset = build_eagle3_dataset(
         dataset=dataset,
         tokenizer=tokenizer,
@@ -51,7 +65,7 @@ def main():
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
     )
-    print(f"Built dataset")
+    print("Built dataset")
 
 
 if __name__ == "__main__":

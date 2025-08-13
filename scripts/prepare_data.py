@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Dict
 
@@ -34,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt","sharegpt4v","allava4v"],
+        choices=["ultrachat", "sharegpt","sharegpt4v","allava4v", "opc"],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -185,6 +184,20 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
     if total_skipped_count > 0:
         print(f"Skipped {total_skipped_count}/{len(train_ds)+len(test_ds)} messages for {dataset_name}")
 
+import hashlib
+
+
+def process_opc_sft_stage1(row) -> Dict:
+    row_id = hashlib.md5((row["instruction"] + row["output"]).encode()).hexdigest()
+    return {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["instruction"]},
+            {"role": "assistant", "content": row["output"]},
+        ],
+    }
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -204,9 +217,14 @@ def main():
     elif args.dataset == "allava4v":
         ds = load_dataset("FreedomIntelligence/ALLaVA-4V",name="allava_laion")["instruct"]
         proc_fn = process_sharegpt4v_row
+    elif args.dataset == "opc":
+        ds = load_dataset(
+            "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
+        )["train"]
+        proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
-            f"This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
     
     # filter and split dataset
