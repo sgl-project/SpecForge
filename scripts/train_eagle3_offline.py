@@ -123,7 +123,9 @@ def main():
     # build target and draft model
     target_head = TargetHead(args.target_model_path)
     target_head.load_weights(
-        model_path=args.target_model_path, lm_head_key=args.lm_head_key
+        model_path=args.target_model_path,
+        lm_head_key=args.lm_head_key,
+        cache_dir=args.cache_dir,
     )
     target_head.freeze_weights()
     target_head = target_head.eval().cuda().to(torch.bfloat16)
