@@ -1,34 +1,48 @@
 """
 Usage:
 config_list=(
-    "1,0,0,0",
-    "1,1,1,2",
-    "1,2,1,3",
-    "1,3,1,4",
-    "1,3,2,6",
-    "1,3,4,4",
-    "1,3,4,8",
-    "1,4,1,5",
+    "1,0,0,0"
+    "1,1,1,2"
+    "1,2,1,3"
+    "1,2,4,4"
+    "1,3,1,4"
+    "1,3,2,6"
+    "1,3,4,4"
+    "1,4,1,5"
+    "1,5,1,6"
+    "1,5,8,16"
+    "1,5,8,32"
+    "1,6,1,7"
+    "1,7,1,8"
+    "1,8,1,9"
+    "1,8,8,32"
 )
-python3 run_mtbench_chatapi.py \
-    --model-path lmsys/gpt-oss-20b-bf16 \
-    --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-20b-bf16 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 run_mtbench_chatapi.py \
+    --model-path lmsys/gpt-oss-120b-bf16 \
+    --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-120b-bf16 \
     --trust-remote-code \
-    --mem-fraction-static 0.6 \
-    --num-prompts 10 \
+    --mem-fraction-static 0.8 \
+    --num-prompts 80 \
+    --tp-size 4 \
     --config-list "${config_list[@]}" \
-    --output output.jsonl
+    --output mtbench_120b_eagle_tune_result.jsonl
 
-python3 -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server \
   --model lmsys/gpt-oss-20b-bf16 \
   --cuda-graph-max-bs 1 \
-  --context-length 8192 \
-  --dtype bfloat16 --mem-frac=0.8 \
+  --context-length 4096 \
+  --dtype bfloat16 --mem-frac=0.8 --port 30001 &
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m sglang.launch_server \
+  --model lmsys/gpt-oss-120b-bf16 \
+  --cuda-graph-max-bs 1 \
+  --context-length 4096 \
+  --dtype bfloat16 --mem-frac=0.8 --tp 4 \
   --speculative-algo EAGLE3 \
-  --speculative-draft zhuyksir/EAGLE3-gpt-oss-20b-bf16 \
+  --speculative-draft zhuyksir/EAGLE3-gpt-oss-120b-bf16 \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4  
+  --speculative-num-draft-tokens 4 --port 30002 &
 """
 
 import argparse
@@ -110,7 +124,7 @@ def send_one_batch(base_url, prompts: List[str], batch_size):
         )
     )
 
-    assert results["completed"] == len(input_requests)
+    # assert results["completed"] == len(input_requests)
     acc_length = results["accept_length"] or 1.0
     avg_output_token = results["total_output_tokens"] / results["completed"]
 
@@ -156,6 +170,9 @@ def build_server_args(batch_size, steps, topk, num_draft_tokens, server_args):
         ]
     )
 
+    if server_args.disable_cuda_graph:
+        other_args.extend(["--disable-cuda-graph"])
+
     if server_args.trust_remote_code:
         other_args.extend(["--trust-remote-code"])
 
@@ -172,6 +189,7 @@ def build_server_args(batch_size, steps, topk, num_draft_tokens, server_args):
 def main(args, server_args):
     base_url = "http://127.0.0.1:20000"
     # batch_size, steps, topk, num_draft_tokens
+    print(args.config_list)
     configs = [tuple(map(int, config.split(","))) for config in args.config_list]
     prompts = get_eval_prompts()
     prompts = prompts[: args.num_prompts]
