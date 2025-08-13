@@ -165,7 +165,9 @@ def main():
         proc_fn = process_opc_sft_stage1
     elif args.dataset == "synth_summarize":
         if args.data_path is None:
-            ds = load_dataset("llama-duo/synth_summarize_dataset_dedup")["train_sft_claude3sonnet"]
+            ds = load_dataset("llama-duo/synth_summarize_dataset_dedup")[
+                "train_sft_claude3sonnet"
+            ]
         else:
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))

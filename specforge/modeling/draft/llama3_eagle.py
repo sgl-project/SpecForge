@@ -556,20 +556,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
-        
+
         # Initialize the model completely before setting up PEFT compatibility
         self.post_init()
-    
+
     # Ensure this method is explicitly available for PEFT compatibility
     def get_input_embeddings(self):
         """Required for PEFT compatibility."""
         return self.embed_tokens
-    
+
     def set_input_embeddings(self, value):
         """Required for PEFT compatibility."""
         self.embed_tokens = value
-    
-
 
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length
@@ -621,10 +619,22 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden = [[], []]
 
         if not hasattr(self, "_lora_logged"):
-            print("self.midlayer.self_attn.q_proj type:", type(self.midlayer.self_attn.q_proj))
-            print("self.midlayer.self_attn.k_proj type:", type(self.midlayer.self_attn.k_proj))
-            print("self.midlayer.self_attn.v_proj type:", type(self.midlayer.self_attn.v_proj))
-            print("self.midlayer.self_attn.o_proj type:", type(self.midlayer.self_attn.o_proj))
+            print(
+                "self.midlayer.self_attn.q_proj type:",
+                type(self.midlayer.self_attn.q_proj),
+            )
+            print(
+                "self.midlayer.self_attn.k_proj type:",
+                type(self.midlayer.self_attn.k_proj),
+            )
+            print(
+                "self.midlayer.self_attn.v_proj type:",
+                type(self.midlayer.self_attn.v_proj),
+            )
+            print(
+                "self.midlayer.self_attn.o_proj type:",
+                type(self.midlayer.self_attn.o_proj),
+            )
             self._lora_logged = True
 
         batch_size, seq_length, _ = hidden_states.size()
@@ -694,7 +704,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
     ):
         """
         Prepare inputs for generation. This method is required for PEFT compatibility.

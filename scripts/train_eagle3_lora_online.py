@@ -1,25 +1,22 @@
 import argparse
 import hashlib
+import json
 import os
 
 import torch
 import torch.distributed as dist
-import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
+
+# Import PEFT library
+from peft import LoraConfig, PeftConfig, TaskType, get_peft_model
+from torch.distributed.fsdp import FullStateDictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import (
-    MixedPrecision,
-    ShardingStrategy,
-    StateDictType,
-    FullStateDictConfig,
-)
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-# Import PEFT library
-from peft import LoraConfig, get_peft_model, TaskType, PeftConfig
-import json
 
+import wandb
 from specforge import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
@@ -42,12 +39,17 @@ def parse_args():
     # add model-related arguments
     parser.add_argument("--target-model-path", type=str, required=True)
     parser.add_argument("--draft-model-config", type=str, required=True)
-    
+
     # --- MODIFICATION START ---
     # Add new parameter for loading pre-trained draft model
-    parser.add_argument("--base-draft-model-path", type=str, default=None, help="Path to a pre-trained base draft model")
+    parser.add_argument(
+        "--base-draft-model-path",
+        type=str,
+        default=None,
+        help="Path to a pre-trained base draft model",
+    )
     # --- MODIFICATION END ---
-    
+
     parser.add_argument(
         "--embedding-key",
         type=str,
@@ -57,8 +59,18 @@ def parse_args():
 
     # LoRA configuration
     parser.add_argument("--use-lora", action="store_true", help="Enable LoRA training")
-    parser.add_argument("--lora-config", type=str, default=None, help="Path to LoRA config file for draft model")
-    parser.add_argument("--target-lora-path", type=str, default=None, help="Path to pre-trained target LoRA adapter")
+    parser.add_argument(
+        "--lora-config",
+        type=str,
+        default=None,
+        help="Path to LoRA config file for draft model",
+    )
+    parser.add_argument(
+        "--target-lora-path",
+        type=str,
+        default=None,
+        help="Path to pre-trained target LoRA adapter",
+    )
 
     # add training-related arguments
     parser.add_argument("--train-data-path", type=str, required=True)
@@ -130,7 +142,7 @@ def print_trainable_parameters(model, model_name="Model"):
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
-    
+
     print_with_rank(
         f"{model_name}: {trainable_params:,} trainable parameters out of {all_param:,} total parameters "
         f"({100 * trainable_params / all_param:.2f}% trainable)"
@@ -141,19 +153,21 @@ def load_lora_config(lora_config_path, is_trainable=False):
     """Load LoRA configuration from config file"""
     if not lora_config_path or not os.path.exists(lora_config_path):
         raise ValueError(f"LoRA config file not found: {lora_config_path}")
-    
+
     print_with_rank(f"Loading LoRA config from: {lora_config_path}")
-    
+
     # Create LoraConfig from config file
-    with open(lora_config_path, 'r') as f:
+    with open(lora_config_path, "r") as f:
         config_dict = json.load(f)
 
     if is_trainable:
         config_dict["inference_mode"] = False
-    
+
     lora_config = LoraConfig(**config_dict)
-    print_with_rank(f"Loaded LoRA config: r={lora_config.r}, alpha={lora_config.lora_alpha}, dropout={lora_config.lora_dropout}")
-    
+    print_with_rank(
+        f"Loaded LoRA config: r={lora_config.r}, alpha={lora_config.lora_alpha}, dropout={lora_config.lora_dropout}"
+    )
+
     return lora_config
 
 
@@ -183,26 +197,29 @@ def main():
             device="cuda",
         )
     else:
-        target_model = (
-            AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=torch.bfloat16,
-            )
-            .cuda()
-        )
-    
+        target_model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=args.target_model_path,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
+
     # add target LoRA
     if args.use_lora:
         if args.target_lora_path and os.path.exists(args.target_lora_path):
-            print_with_rank(f"Loading pre-trained target LoRA from: {args.target_lora_path}")
+            print_with_rank(
+                f"Loading pre-trained target LoRA from: {args.target_lora_path}"
+            )
             # Load configuration from target LoRA path
-            target_lora_config = load_lora_config(os.path.join(args.target_lora_path, "adapter_config.json"))
+            target_lora_config = load_lora_config(
+                os.path.join(args.target_lora_path, "adapter_config.json")
+            )
             target_model = get_peft_model(target_model, target_lora_config)
             target_model.load_adapter(args.target_lora_path, "default")
             print_with_rank(f"Loaded pre-trained target LoRA adapter")
         else:
-            print_with_rank(f"No pre-trained target LoRA specified, using base target model")
-        
+            print_with_rank(
+                f"No pre-trained target LoRA specified, using base target model"
+            )
+
         # Freeze all parameters of target model (including LoRA)
         for param in target_model.parameters():
             param.requires_grad = False
@@ -210,12 +227,12 @@ def main():
         print_with_rank(f"Target model frozen for inference")
     else:
         target_model = target_model.eval()
-    
+
     print_with_rank(f"Initialized target model")
-    
+
     # Modify draft model loading logic
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-    
+
     if args.base_draft_model_path and os.path.exists(args.base_draft_model_path):
         # Load from pre-trained draft model path first
         print_with_rank(f"Loading base draft model from: {args.base_draft_model_path}")
@@ -224,7 +241,9 @@ def main():
             .cuda()
             .to(torch.bfloat16)
         )
-        draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
+        draft_model.load_embedding(
+            args.target_model_path, embedding_key=args.embedding_key
+        )
         draft_model.freeze_embedding()
         print_with_rank(f"Loaded pre-trained base draft model.")
 
@@ -238,24 +257,31 @@ def main():
         # for param in draft_model.parameters():
         #     param.requires_grad = False
         # print_with_rank(f"Frozen all base draft model parameters")
-        
+
         # Add LoRA to draft model
         draft_lora_config = load_lora_config(args.lora_config, is_trainable=True)
-        
+
         # PEFT compatibility fix: ensure prepare_inputs_for_generation is accessible
-        if not hasattr(draft_model, 'prepare_inputs_for_generation'):
-            print_with_rank("Warning: draft_model doesn't have prepare_inputs_for_generation, adding compatibility method")
+        if not hasattr(draft_model, "prepare_inputs_for_generation"):
+            print_with_rank(
+                "Warning: draft_model doesn't have prepare_inputs_for_generation, adding compatibility method"
+            )
             # Add a simple prepare_inputs_for_generation method from GenerationMixin
             from transformers.generation.utils import GenerationMixin
-            if hasattr(GenerationMixin, 'prepare_inputs_for_generation'):
-                draft_model.prepare_inputs_for_generation = GenerationMixin.prepare_inputs_for_generation.__get__(draft_model, draft_model.__class__)
+
+            if hasattr(GenerationMixin, "prepare_inputs_for_generation"):
+                draft_model.prepare_inputs_for_generation = (
+                    GenerationMixin.prepare_inputs_for_generation.__get__(
+                        draft_model, draft_model.__class__
+                    )
+                )
         else:
             print_with_rank("Draft model has prepare_inputs_for_generation method")
-        
+
         draft_model = get_peft_model(draft_model, draft_lora_config)
         draft_model = draft_model.to(torch.bfloat16)
         print_with_rank(f"Added new LoRA to draft model for training")
-        
+
         # Log detailed status of all model parameters
         def log_model_parameters(model, model_name):
             """Log detailed parameter information for debugging"""
@@ -263,7 +289,7 @@ def main():
             trainable_count = 0
             frozen_count = 0
             total_params = 0
-            
+
             for name, param in model.named_parameters():
                 trainable = param.requires_grad
                 if trainable:
@@ -271,7 +297,7 @@ def main():
                 else:
                     frozen_count += param.numel()
                 total_params += param.numel()
-                
+
                 # Print detailed information for each parameter
                 print_with_rank(
                     f"  {name:60s} | "
@@ -281,13 +307,17 @@ def main():
                     f"Device: {str(param.device):10s} | "
                     f"Params: {param.numel():,}"
                 )
-            
+
             print_with_rank(f"\n{model_name} Summary:")
             print_with_rank(f"  Total parameters: {total_params:,}")
-            print_with_rank(f"  Trainable parameters: {trainable_count:,} ({100*trainable_count/total_params:.2f}%)")
-            print_with_rank(f"  Frozen parameters: {frozen_count:,} ({100*frozen_count/total_params:.2f}%)")
+            print_with_rank(
+                f"  Trainable parameters: {trainable_count:,} ({100*trainable_count/total_params:.2f}%)"
+            )
+            print_with_rank(
+                f"  Frozen parameters: {frozen_count:,} ({100*frozen_count/total_params:.2f}%)"
+            )
             print_with_rank("=" * 80)
-        
+
         # Log detailed parameter information for target and draft models
         log_model_parameters(target_model, "Target Model")
         log_model_parameters(draft_model, "Draft Model")
@@ -295,13 +325,11 @@ def main():
         # # Restore from LoRA checkpoint (only load draft LoRA)
         # if draft_model_last_checkpoint:
         #     draft_lora_path = os.path.join(draft_model_last_checkpoint, "draft_lora")
-            
+
         #     if os.path.exists(draft_lora_path):
         #         draft_model.load_adapter(draft_lora_path, "default")
         #         print_with_rank(f"Loaded draft LoRA from checkpoint: {draft_lora_path}")
 
-
-    
     print_with_rank(f"Initialized draft model")
 
     # build dataloaders
@@ -342,7 +370,6 @@ def main():
         draft_model.load_vocab_mapping(vocab_mapping_path)
         print_with_rank(f"Loaded vocab mapping")
 
-
     if args.eval_data_path is not None:
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
         eval_eagle3_dataset = build_eagle3_dataset(
@@ -380,33 +407,39 @@ def main():
         process_group=get_dp_group(),
     )
     print_with_rank(f"Initialized Eagle3 FSDP model")
-    
+
     # Print parameter statistics
     if args.use_lora:
         print_trainable_parameters(target_model, "Target Model (Frozen)")
-        print_trainable_parameters(draft_model, "Draft Model (LoRA Only)") 
+        print_trainable_parameters(draft_model, "Draft Model (LoRA Only)")
         print_trainable_parameters(eagle3_model, "Eagle3 Model (Overall)")
 
     # build other components
-    has_trainable_params = any(param.requires_grad for param in eagle3_model.parameters())
+    has_trainable_params = any(
+        param.requires_grad for param in eagle3_model.parameters()
+    )
     optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
-    
+
     if args.use_lora:
         # Count LoRA parameters for logging
         lora_param_count = sum(
             1
             for name, param in eagle3_model.named_parameters()
-            if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name)
+            if param.requires_grad
+            and "draft_model" in name
+            and ("lora_" in name or "adapter" in name)
         )
         print_with_rank(
             f"Optimizer will train {lora_param_count} LoRA parameters out of total parameters"
         )
     else:
-        trainable_param_count = sum(1 for param in eagle3_model.parameters() if param.requires_grad)
+        trainable_param_count = sum(
+            1 for param in eagle3_model.parameters() if param.requires_grad
+        )
         print_with_rank(
             f"Optimizer configured for {trainable_param_count} trainable parameters"
         )
-    
+
     total_steps = args.num_epochs * len(train_dataloader)
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = CosineAnnealingWarmupLR(
@@ -473,13 +506,19 @@ def main():
                         grad_log_dict = {}
                         lora_param_idx = 0
                         for name, param in eagle3_model.named_parameters():
-                            if param.requires_grad and 'draft_model' in name and ('lora_' in name or 'adapter' in name):
+                            if (
+                                param.requires_grad
+                                and "draft_model" in name
+                                and ("lora_" in name or "adapter" in name)
+                            ):
                                 if param.grad is not None:
                                     grad_norm = param.grad.norm().item()
                                     print_on_rank0(
                                         f"LoRA param {lora_param_idx} ({name}) grad norm: {grad_norm}"
                                     )
-                                    grad_log_dict[f"train/lora_grad_norm_{lora_param_idx}"] = grad_norm
+                                    grad_log_dict[
+                                        f"train/lora_grad_norm_{lora_param_idx}"
+                                    ] = grad_norm
                                 lora_param_idx += 1
                         if grad_log_dict:
                             wandb_log_if_initialized(grad_log_dict)
@@ -588,33 +627,55 @@ def main():
                     print_on_rank0(
                         f"Saved full training state to {epoch_output_dir}/training_state.pt"
                     )
-                    
+
                     if args.use_lora and args.lora_config:
                         # Manually extract and save draft model LoRA weights (from FSDP state_dict)
-                        draft_lora_output_dir = os.path.join(epoch_output_dir, "draft_lora")
+                        draft_lora_output_dir = os.path.join(
+                            epoch_output_dir, "draft_lora"
+                        )
                         os.makedirs(draft_lora_output_dir, exist_ok=True)
-                        
+
                         # Extract LoRA related weights
                         lora_state_dict = {}
                         for key, value in model_state_dict.items():
-                            if "draft_model." in key and ("lora_" in key or "adapter" in key):
+                            if "draft_model." in key and (
+                                "lora_" in key or "adapter" in key
+                            ):
                                 # Remove "draft_model." prefix because we want to save the LoRA weights inside the draft model
                                 lora_key = key.replace("draft_model.", "")
                                 lora_state_dict[lora_key] = value
-                        
+
                         if lora_state_dict:
                             # Save LoRA weights
                             import safetensors.torch as st
-                            st.save_file(lora_state_dict, os.path.join(draft_lora_output_dir, "adapter_model.safetensors"))
-                            print_on_rank0(f"Saved {len(lora_state_dict)} LoRA weights to {draft_lora_output_dir}/adapter_model.safetensors")
-                            
+
+                            st.save_file(
+                                lora_state_dict,
+                                os.path.join(
+                                    draft_lora_output_dir, "adapter_model.safetensors"
+                                ),
+                            )
+                            print_on_rank0(
+                                f"Saved {len(lora_state_dict)} LoRA weights to {draft_lora_output_dir}/adapter_model.safetensors"
+                            )
+
                             # Save LoRA configuration file
                             import shutil
-                            shutil.copy2(args.lora_config, os.path.join(draft_lora_output_dir, "adapter_config.json"))
-                            print_on_rank0(f"Copied LoRA config to {draft_lora_output_dir}/adapter_config.json")
+
+                            shutil.copy2(
+                                args.lora_config,
+                                os.path.join(
+                                    draft_lora_output_dir, "adapter_config.json"
+                                ),
+                            )
+                            print_on_rank0(
+                                f"Copied LoRA config to {draft_lora_output_dir}/adapter_config.json"
+                            )
                         else:
-                            print_on_rank0("Warning: No LoRA weights found in state_dict!")
-                        
+                            print_on_rank0(
+                                "Warning: No LoRA weights found in state_dict!"
+                            )
+
                         # Save tokenizer to draft_lora directory
                         tokenizer.save_pretrained(draft_lora_output_dir)
                         print_on_rank0(f"Saved tokenizer to {draft_lora_output_dir}")
@@ -629,8 +690,10 @@ def main():
                             epoch_output_dir,
                             state_dict=draft_model_state_dict,
                         )
-                        print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-                        
+                        print_on_rank0(
+                            f"Saved model configuration to {epoch_output_dir}"
+                        )
+
                         # Save tokenizer
                         tokenizer.save_pretrained(epoch_output_dir)
                         print_on_rank0(f"Saved tokenizer to {epoch_output_dir}")

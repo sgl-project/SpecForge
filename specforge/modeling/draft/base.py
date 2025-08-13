@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from transformers import PreTrainedModel, GenerationMixin
+from transformers import GenerationMixin, PreTrainedModel
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
