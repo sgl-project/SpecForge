@@ -145,11 +145,13 @@ def main():
                 pretrained_model_name_or_path=args.target_model_path,
                 torch_dtype=torch.bfloat16,
                 device="cuda",
+                local_files_only=True,
             ).eval()
         else:
             target_model = AutoModelForCausalLM.from_pretrained(
                 args.target_model_path,
                 tp_plan="auto",
+                tp_size=args.tp_size,
                 torch_dtype=torch.bfloat16,
                 device_mesh=get_tp_device_mesh(),
             ).eval()
@@ -291,6 +293,7 @@ def main():
 
     # start running
     print_on_rank0(f"Starting training from epoch {start_epoch}")
+    step = 0
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -324,6 +327,47 @@ def main():
             epoch_plosses = [
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
+            step += 1
+
+            if step % 2000 == 0:
+                # Save the model
+                epoch_output_dir = os.path.join(args.output_dir, f"step_{step}")
+
+                if dist.get_rank() == 0:
+                    os.makedirs(epoch_output_dir, exist_ok=True)
+                dist.barrier()
+
+                with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+                    model_state_dict = eagle3_model.state_dict()
+                    state_to_save = {
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "epoch": epoch,
+                        "args": args,
+                        "step": step,
+                    }
+                    draft_model_state_dict = {
+                        k.replace("draft_model.", ""): v
+                        for k, v in model_state_dict.items()
+                        if "draft_model." in k
+                    }
+
+                    if dist.get_rank() == 0:
+                        torch.save(
+                            state_to_save,
+                            os.path.join(epoch_output_dir, "training_state.pt"),
+                        )
+                        print_on_rank0(
+                            f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                        )
+                        draft_model.save_pretrained(
+                            epoch_output_dir,
+                            state_dict=draft_model_state_dict,
+                        )
+                        print_on_rank0(
+                            f"Saved model configuration to {epoch_output_dir}"
+                        )
+                    dist.barrier()
 
         for i in range(len(epoch_acces)):
             acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
