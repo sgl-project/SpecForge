@@ -141,6 +141,9 @@ class AutoDraftModelConfig:
         """
         with open(config_path, "r") as f:
             config = json.load(f)
+        
+        if "tie_word_embeddings" in config:
+            config["tie_word_embeddings"] = False
 
         # check for architectures
         architectures = config.get("architectures", None)
