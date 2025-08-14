@@ -21,7 +21,7 @@
   "rope_scaling": null,
   "rope_theta": 1000000,
   "sliding_window": null,
-  "tie_word_embeddings": true,
+  "tie_word_embeddings": false,
   "torch_dtype": "bfloat16",
   "transformers_version": "4.51.0",
   "use_cache": true,
