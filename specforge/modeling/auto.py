@@ -13,6 +13,7 @@ from transformers import (
     PretrainedConfig,
     Qwen3Config,
     Qwen3MoeConfig,
+    Qwen2_5_VLConfig,
     modeling_utils,
 )
 
@@ -76,7 +77,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
         Llama4TextConfig: [Llama4ForCausalLM],
-        Qwen3MoeConfig: [Qwen3MoeForCausalLM],
+        Qwen3MoeConfig: [Qwen3MoeForCausalLM],    
         Qwen3Config: [Qwen3ForCausalLM],
     }
 

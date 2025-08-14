@@ -10,13 +10,14 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
 
 from specforge import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
     OnlineEagle3Model,
+    QwenVLOnlineEagle3Model,
 )
 from specforge.data import (
     build_eagle3_dataset,
@@ -45,6 +46,7 @@ def parse_args():
         default="model.embed_tokens.weight",
         help="The key of the embedding weight to load from the target model",
     )
+    parser.add_argument("--is-vlm", action="store_true", help="Whether the target model is a VLM")
 
     # add training-related arguments
     parser.add_argument("--train-data-path", type=str, required=True)
@@ -91,13 +93,17 @@ def parse_args():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
 
+    # vlm related args
+    parser.add_argument("--min-pixels", type=int, default=50176) # 64*28*28 for qwen2.5-vl
+    parser.add_argument("--max-pixels", type=int, default=802816) # 1024*28*28 for qwen2.5-vl
+
     args = parser.parse_args()
 
     return parser, args
 
 
 def init_wandb(args):
-    wandb.login(key=args.wandb_key)
+    # wandb.login(key=args.wandb_key)
     wandb.init(project=args.wandb_project, name=args.wandb_name)
 
 
@@ -123,6 +129,8 @@ def main():
 
     if args.wandb and dist.get_rank() == 0:
         init_wandb(args)
+    # load draft model config
+    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
@@ -141,18 +149,28 @@ def main():
             device="cuda",
         ).eval()
     else:
-        target_model = (
-            AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=torch.bfloat16,
-                cache_dir=args.cache_dir,
+        if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            target_model = (
+                Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    torch_dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
             )
-            .eval()
-            .cuda()
-        )
+        else:
+            target_model = (
+                AutoModelForCausalLM.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    torch_dtype=torch.bfloat16,
+                    cache_dir=args.cache_dir,
+            )
+                .eval()
+                .cuda()
+            )
     print_with_rank("Initialized target model")
     # load model with resume
-    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(
@@ -175,6 +193,10 @@ def main():
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    if args.is_vlm:
+        processor = AutoProcessor.from_pretrained(args.target_model_path,min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+    else:
+        processor = None
 
     # convert to dataloader
     cache_params_string = (
@@ -185,6 +207,7 @@ def main():
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    # train_dataset = train_dataset.shuffle(seed=args.seed).select(range(20000))
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -193,6 +216,8 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
+            is_vlm=args.is_vlm,
+            processor=processor,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -207,6 +232,7 @@ def main():
         num_workers=4,
         shuffle=True,
         process_group=get_dp_group(),
+        is_vlm=args.is_vlm,
     )
     print_with_rank("Initialized train dataloader")
 
@@ -221,6 +247,9 @@ def main():
             tokenizer,
             args.chat_template,
             args.max_length,
+            is_vlm=args.is_vlm,
+            processor=processor,
+            num_proc=16
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -228,16 +257,25 @@ def main():
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
+            is_vlm=args.is_vlm,
         )
         print_with_rank("Initialized eval dataloader")
 
     # build Eagle3 model
     # broadcast draft model
-    eagle3_model = OnlineEagle3Model(
-        target_model=target_model,
-        draft_model=draft_model,
-        length=args.ttt_length,
-        attention_backend=args.attention_backend,
+    if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
+        eagle3_model = QwenVLOnlineEagle3Model(
+            target_model=target_model,
+            draft_model=draft_model,
+            processor=processor,
+            length=args.ttt_length,
+        )
+    else:
+        eagle3_model = OnlineEagle3Model(
+            target_model=target_model,
+            draft_model=draft_model,
+            length=args.ttt_length,
+            attention_backend=args.attention_backend,
     )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
@@ -299,11 +337,20 @@ def main():
 
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
-            plosses, _, acces = eagle3_model(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
-            )
+            if args.is_vlm:
+                plosses, _, acces = eagle3_model(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                    pixel_values=data["pixel_values"].cuda(),
+                    image_grid_thw=data["image_grid_thw"].cuda(),
+                )
+            else:
+                plosses, _, acces = eagle3_model(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -352,11 +399,28 @@ def main():
             eval_plosses = [[] for _ in range(eagle3_model.length)]
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
+                if args.is_vlm:
+                    plosses, _, acces = eagle3_model(
+                        input_ids=data["input_ids"].cuda(),
+                        attention_mask=data["attention_mask"].cuda(),
+                        loss_mask=data["loss_mask"].cuda(),
+                        pixel_values=data["pixel_values"].cuda(),
+                        image_grid_thw=data["image_grid_thw"].cuda(),
+                    )
+                else:
+                    plosses, _, acces = eagle3_model(
+                        input_ids=data["input_ids"].cuda(),
+                        attention_mask=data["attention_mask"].cuda(),
+                        loss_mask=data["loss_mask"].cuda(),
+                    )
+
+                eval_logdict = {}
+                for i in range(len(plosses)):
+                    eval_logdict[f"eval/ploss_{i}"] = plosses[i].item()
+                for i in range(len(acces)):
+                    eval_logdict[f"eval/acc_{i}"] = acces[i]
+                wandb_log_if_initialized(eval_logdict)
+                
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
