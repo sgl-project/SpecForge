@@ -17,6 +17,7 @@ import torch.nn as nn
 from datasets import Dataset, load_dataset
 from sglang.bench_one_batch import BenchArgs, load_model
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -25,7 +26,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
-    DeepEPMode,
     configure_logger,
     get_bool_env_var,
     require_mlp_sync,
@@ -120,15 +120,18 @@ class SglangHiddenStatesGenerator:
                 batch,
                 dp_size=model_runner.server_args.dp_size,
                 attn_tp_size=1,
-                tp_cpu_group=model_runner.tp_group.cpu_group,
+                tp_group=model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 speculative_num_draft_tokens=None,
-                require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
                 enable_two_batch_overlap=model_runner.server_args.enable_two_batch_overlap,
-                enable_deepep_moe=model_runner.server_args.enable_deepep_moe,
-                deepep_mode=DeepEPMode[model_runner.server_args.deepep_mode],
+                enable_deepep_moe=MoeA2ABackend(
+                    model_runner.server_args.moe_a2a_backend
+                ).is_deepep(),
+                deepep_mode=DeepEPMode(model_runner.server_args.deepep_mode),
+                require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+                disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
             )
 
     @torch.no_grad
