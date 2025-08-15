@@ -318,6 +318,8 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--enable-aux-hidden-states", action="store_true")
     parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
+    parser.add_argument("--build-dataset-num-proc", type=int, required=8)
+
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     return parser.parse_args()
@@ -364,6 +366,7 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
         )
         print_with_rank("Built dataset")
 
