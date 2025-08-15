@@ -91,6 +91,8 @@ def parse_args():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
 
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+
     args = parser.parse_args()
 
     return parser, args
@@ -193,6 +195,7 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -221,6 +224,7 @@ def main():
             tokenizer,
             args.chat_template,
             args.max_length,
+            num_proc=args.build_dataset_num_proc,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
