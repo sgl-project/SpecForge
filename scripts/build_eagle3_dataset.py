@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--chat-template", type=str, default="llama3")
     parser.add_argument("--model-path", type=str, required=False)
+    parser.add_argument("--build-dataset-num-proc", type=int, required=8)
     return parser.parse_args()
 
 
@@ -64,6 +65,7 @@ def main():
         max_length=args.max_length,
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
+        num_proc=args.build_dataset_num_proc,
     )
     print("Built dataset")
 
