@@ -318,7 +318,7 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--enable-aux-hidden-states", action="store_true")
     parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
-    parser.add_argument("--build-dataset-num-proc", type=int, required=8)
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
 
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)

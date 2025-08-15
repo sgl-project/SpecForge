@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
 
-    parser.add_argument("--build-dataset-num-proc", type=int, required=8)
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
 
     args = parser.parse_args()
 
