@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--chat-template", type=str, default="llama3")
     parser.add_argument("--model-path", type=str, required=False)
-    parser.add_argument("--build-dataset-num-proc", type=int, required=8)
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
     return parser.parse_args()
 
 
