@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -248,14 +249,17 @@ def main():
 
         for i, data in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
             if i == 30:
+                print("start profile")
                 torch_profiler = torch.profiler.profile(
                     activities=[
                         torch.profiler.ProfilerActivity.CPU,
                         torch.profiler.ProfilerActivity.CUDA,
                     ],
+                    with_stack=True,
                 )
                 torch_profiler.start()
             if i == 34:
+                print("end profile")
                 torch_profiler.stop()
                 torch_profiler.export_chrome_trace(f"/host_home/temp_sglang_server2local/SpecForge_{time.time()}.trace.json.gz")
 
