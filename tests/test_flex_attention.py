@@ -44,7 +44,7 @@ class TestFlexAttention(unittest.TestCase):
         }
         self.config = LlamaConfig(**self.config_dict)
 
-        self.seq_lengths = [128, 256, 300, 512, 800, 1024, 2048]
+        self.seq_lengths = [128, 200, 256, 300, 512, 800, 1024, 2048]
         self.dtype = torch.float32
 
     def test_forward_pass_comparison(self):

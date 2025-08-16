@@ -19,9 +19,4 @@ torchrun \
     --max-length 2048 \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
-    # --logger-backend mlflow \
-    # --mlflow-experiment $USER/llama3-8b-eagle3-specforge \
-    # --mlflow-run-name $USER/llama3-8b-eagle3-specforge-run-$(date +%Y%m%d-%H%M%S) \
-    # --mlflow-tracking-uri http://mlflow.grid1.ard.grid.linkedin.com:31812 \
-    # --eval-data-split 0.01 \
     --attention-backend flex_attention
