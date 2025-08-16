@@ -37,7 +37,7 @@ def parse_args():
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
-        "--output_path",
+        "--output-path",
         type=str,
         default=None,
         help="The path to save the processed dataset, if not specified, the dataset will be saved in the cache/dataset/dataset_name directory of the root path",
