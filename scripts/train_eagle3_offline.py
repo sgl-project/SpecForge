@@ -246,7 +246,19 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        for i, data in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
+            if i == 30:
+                torch_profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                )
+                torch_profiler.start()
+            if i == 34:
+                torch_profiler.stop()
+                torch_profiler.export_chrome_trace(f"/host_home/temp_sglang_server2local/SpecForge_{time.time()}.trace.json.gz")
+
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
                 input_ids=data["input_ids"].cuda(),  # [B, S]
