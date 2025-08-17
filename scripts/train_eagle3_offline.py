@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -87,6 +88,12 @@ def parse_args():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
 
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-start-step", type=int, default=30)
+    parser.add_argument("--profile-num-steps", type=int, default=4)
+
     args = parser.parse_args()
 
     return parser, args
@@ -164,6 +171,7 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset_tmp,
@@ -235,6 +243,8 @@ def main():
     )
     print_with_rank("Initialized optimizer and scheduler")
 
+    last_time = time.time()
+
     # start running
     for epoch in range(args.num_epochs):
         # Run training
@@ -243,7 +253,28 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        for batch_index, data in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
+            if args.profile and epoch == 0:
+                if batch_index == args.profile_start_step:
+                    print("Start profile")
+                    torch_profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=True,
+                    )
+                    torch_profiler.start()
+                if batch_index == args.profile_start_step + args.profile_num_steps:
+                    print("End profile")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(
+                        os.path.join(
+                            os.environ["SGLANG_TORCH_PROFILER_DIR"],
+                            f"debug_rank{torch.distributed.get_rank()}.trace.json.gz",
+                        )
+                    )
+
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
                 input_ids=data["input_ids"].cuda(),  # [B, S]
@@ -273,6 +304,10 @@ def main():
             epoch_plosses = [
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
+
+            if args.verbose:
+                print(f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}")
+                last_time = time.time()
 
         for i in range(len(epoch_acces)):
             acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
