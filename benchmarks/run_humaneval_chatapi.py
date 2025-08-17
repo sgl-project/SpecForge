@@ -17,32 +17,15 @@ config_list=(
     "1,8,1,9"
     "1,8,8,32"
 )
-CUDA_VISIBLE_DEVICES=0,1,2,3 python3 run_mtbench_chatapi.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 run_humaneval_chatapi.py \
     --model-path lmsys/gpt-oss-120b-bf16 \
     --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-120b-bf16 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \
-    --num-prompts 80 \
+    --num-prompts 200 \
     --tp-size 4 \
     --config-list "${config_list[@]}" \
-    --output mtbench_120b_eagle_tune_result.jsonl
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m sglang.launch_server \
-  --model lmsys/gpt-oss-120b-bf16 \
-  --cuda-graph-max-bs 1 \
-  --context-length 4096 \
-  --dtype bfloat16 --mem-frac=0.8 --tp 4 --attention-backend fa3 &
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m sglang.launch_server \
-  --model lmsys/gpt-oss-120b-bf16 \
-  --cuda-graph-max-bs 1 \
-  --context-length 8192 \
-  --dtype bfloat16 --mem-frac=0.8 --tp 4 \
-  --speculative-algo EAGLE3 \
-  --speculative-draft /workspace/model-performance/yikai-node1/EAGLE3-gpt-oss-120b-bf16 \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4
+    --output humaneval_120b_eagle_tune_result.jsonl
 """
 
 import argparse
@@ -62,13 +45,11 @@ from sglang.test.test_utils import (
     kill_process_tree,
     popen_launch_server,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from datasets import load_dataset
 
 def get_eval_prompts():
-    url = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
-    download_and_cache_file(url, filename="mtbench.jsonl")
-    questions = list(read_jsonl("mtbench.jsonl"))
-    prompts = [q["turns"][0] for q in questions]
+    dataset = load_dataset("openai/openai_humaneval")["test"]
+    prompts = [q["prompt"] for q in dataset]
     return prompts
 
 def parse_args():

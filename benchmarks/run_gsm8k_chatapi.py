@@ -1,48 +1,30 @@
 """
 Usage:
 config_list=(
-    "1,0,0,0"
-    "1,1,1,2"
-    "1,2,1,3"
-    "1,2,4,4"
-    "1,3,1,4"
-    "1,3,2,6"
-    "1,3,4,4"
-    "1,4,1,5"
-    "1,5,1,6"
-    "1,5,8,16"
-    "1,5,8,32"
-    "1,6,1,7"
-    "1,7,1,8"
-    "1,8,1,9"
-    "1,8,8,32"
+    "8,1,1,2"
+    "8,2,1,3"
+    "8,2,4,4"
+    "8,3,1,4"
+    "8,3,2,6"
+    "8,3,4,4"
+    "8,4,1,5"
+    "8,5,1,6"
+    "8,5,8,16"
+    "8,5,8,32"
+    "8,6,1,7"
+    "8,7,1,8"
+    "8,8,1,9"
+    "8,8,8,32"
 )
-CUDA_VISIBLE_DEVICES=0,1,2,3 python3 run_mtbench_chatapi.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 run_gsm8k_chatapi.py \
     --model-path lmsys/gpt-oss-120b-bf16 \
     --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-120b-bf16 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \
-    --num-prompts 80 \
+    --num-prompts 200 \
     --tp-size 4 \
     --config-list "${config_list[@]}" \
-    --output mtbench_120b_eagle_tune_result.jsonl
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m sglang.launch_server \
-  --model lmsys/gpt-oss-120b-bf16 \
-  --cuda-graph-max-bs 1 \
-  --context-length 4096 \
-  --dtype bfloat16 --mem-frac=0.8 --tp 4 --attention-backend fa3 &
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m sglang.launch_server \
-  --model lmsys/gpt-oss-120b-bf16 \
-  --cuda-graph-max-bs 1 \
-  --context-length 8192 \
-  --dtype bfloat16 --mem-frac=0.8 --tp 4 \
-  --speculative-algo EAGLE3 \
-  --speculative-draft /workspace/model-performance/yikai-node1/EAGLE3-gpt-oss-120b-bf16 \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4
+    --output gsm8k_120b_eagle_tune_result.jsonl
 """
 
 import argparse
@@ -64,17 +46,33 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-def get_eval_prompts():
-    url = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
-    download_and_cache_file(url, filename="mtbench.jsonl")
-    questions = list(read_jsonl("mtbench.jsonl"))
-    prompts = [q["turns"][0] for q in questions]
+def get_one_example(lines, i, include_answer):
+    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
+    if include_answer:
+        ret += " " + lines[i]["answer"]
+    return ret
+
+def get_few_shot_examples(lines, k):
+    ret = ""
+    for i in range(k):
+        ret += get_one_example(lines, i, True) + "\n\n"
+    return ret
+
+def get_eval_prompts(num_shots=5):
+    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+    data_path = download_and_cache_file(url)
+    lines = list(read_jsonl(data_path))
+    few_shot_examples = get_few_shot_examples(lines, num_shots)
+    prompts = []
+    for i in range(len(lines)):
+        prompts.append(few_shot_examples + get_one_example(lines, i, False))
     return prompts
 
 def parse_args():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     parser.add_argument("--num-prompts", type=int, default=80)
+    parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--output", type=str, default="output.jsonl")
     parser.add_argument("--config-list", type=str, nargs="+", default=["1,0,0,0", "1,3,1,4"])
     return parser.parse_args()
@@ -191,7 +189,7 @@ def main(args, server_args):
     # batch_size, steps, topk, num_draft_tokens
     print(args.config_list)
     configs = [tuple(map(int, config.split(","))) for config in args.config_list]
-    prompts = get_eval_prompts()
+    prompts = get_eval_prompts(args.num_shots)
     prompts = prompts[: args.num_prompts]
 
     for batch_size, steps, topk, num_draft_tokens in configs:
