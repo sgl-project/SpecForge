@@ -183,6 +183,7 @@ def main():
         num_workers=4,
         shuffle=True,
         process_group=get_dp_group(),
+        pin_memory=True,
     )
     print_with_rank("Initialized train dataloader")
 
@@ -201,6 +202,7 @@ def main():
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
+            pin_memory=True,
         )
         print_with_rank("Initialized eval dataloader")
 
