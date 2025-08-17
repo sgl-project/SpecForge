@@ -89,6 +89,7 @@ def parse_args():
     parser.add_argument("--wandb-key", type=str, default=None)
 
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-start-step", type=int, default=30)
     parser.add_argument("--profile-num-steps", type=int, default=4)
@@ -244,6 +245,8 @@ def main():
     )
     print_with_rank("Initialized optimizer and scheduler")
 
+    last_time = time.time()
+
     # start running
     for epoch in range(args.num_epochs):
         # Run training
@@ -303,6 +306,10 @@ def main():
             epoch_plosses = [
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
+
+            if args.verbose:
+                print(f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}")
+                last_time = time.time()
 
         for i in range(len(epoch_acces)):
             acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
