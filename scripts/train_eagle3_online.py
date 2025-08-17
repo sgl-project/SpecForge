@@ -428,10 +428,8 @@ def main():
             optimizer.step()
 
             global_step += 1
-
-            # Log only every log_steps steps
             if global_step % args.log_steps == 0:
-                logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
+                logdict = {"train/lr": optimizer.get_learning_rate()}
                 for i in range(len(plosses)):
                     logdict[f"train/ploss_{i}"] = plosses[i].item()
                 for i in range(len(acces)):
