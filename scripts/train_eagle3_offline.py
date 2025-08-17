@@ -89,6 +89,9 @@ def parse_args():
     parser.add_argument("--wandb-key", type=str, default=None)
 
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-start-step", type=int, default=30)
+    parser.add_argument("--profile-num-steps", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -249,21 +252,27 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for i, data in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
-            if i == 30:
-                print("start profile")
-                torch_profiler = torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    with_stack=True,
-                )
-                torch_profiler.start()
-            if i == 34:
-                print("end profile")
-                torch_profiler.stop()
-                torch_profiler.export_chrome_trace(f"/host_home/temp_sglang_server2local/SpecForge_{time.time()}.trace.json.gz")
+        for batch_index, data in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
+            if args.profile and epoch == 0:
+                if batch_index == args.profile_start_step:
+                    print("Start profile")
+                    torch_profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=True,
+                    )
+                    torch_profiler.start()
+                if batch_index == args.profile_start_step + args.profile_num_steps:
+                    print("End profile")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(
+                        os.path.join(
+                            os.environ["SGLANG_TORCH_PROFILER_DIR"],
+                            f"debug_rank{torch.distributed.get_rank()}.trace.json.gz",
+                        )
+                    )
 
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
