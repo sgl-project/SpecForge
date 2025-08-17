@@ -255,7 +255,9 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for batch_index, data in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
+        for batch_index, data in enumerate(
+            tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
+        ):
             if args.profile and epoch == 0:
                 if batch_index == args.profile_start_step:
                     print("Start profile")
@@ -308,7 +310,9 @@ def main():
             ]
 
             if args.verbose:
-                print(f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}")
+                print(
+                    f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
+                )
                 last_time = time.time()
 
         for i in range(len(epoch_acces)):
