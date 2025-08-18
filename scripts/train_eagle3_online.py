@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import os
 import platform
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -124,6 +125,35 @@ def safe_all_reduce(tensor, op=dist.ReduceOp.SUM):
         dist.all_reduce(tensor, op=op)
     # return tensor if single node world_size=1
     return tensor
+
+
+def is_distributed():
+    return (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+
+
+def fsdp_fullstate_ctx(model):
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+    except Exception:
+        FSDP = None
+        StateDictType = None
+        FullStateDictConfig = None
+
+    """仅当 model 是 FSDP 且 StateDictType 可用时，返回 FULL_STATE_DICT 上下文；否则返回空上下文。"""
+    if (
+        FSDP is not None
+        and isinstance(model, FSDP)
+        and StateDictType is not None
+        and FullStateDictConfig is not None
+    ):
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        return FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg)
+    return nullcontext()
 
 
 def main():
@@ -420,11 +450,12 @@ def main():
             # Save the model
             epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
 
-            if dist.get_rank() == 0:
+            if (not is_distributed()) or dist.get_rank() == 0:
                 os.makedirs(epoch_output_dir, exist_ok=True)
-            dist.barrier()
+            if is_distributed():
+                dist.barrier()
 
-            with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+            with fsdp_fullstate_ctx(eagle3_model):
                 model_state_dict = eagle3_model.state_dict()
                 state_to_save = {
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -438,7 +469,7 @@ def main():
                     if "draft_model." in k and "embed" not in k.lower()
                 }
 
-                if dist.get_rank() == 0:
+                if (not is_distributed()) or dist.get_rank() == 0:
                     torch.save(
                         state_to_save,
                         os.path.join(epoch_output_dir, "training_state.pt"),
@@ -451,7 +482,8 @@ def main():
                         state_dict=draft_model_state_dict,
                     )
                     print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-                dist.barrier()
+                if is_distributed():
+                    dist.barrier()
 
     destroy_distributed()
 
