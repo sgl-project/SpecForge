@@ -175,7 +175,9 @@ def main():
         )
     else:
         draft_model = (
-            AutoEagle3DraftModel.from_config(draft_model_config, attention_backend=attention_backend)
+            AutoEagle3DraftModel.from_config(
+                draft_model_config, attention_backend=attention_backend
+            )
             .to(device)
             .to(torch.bfloat16)
         )
@@ -253,8 +255,6 @@ def main():
     )
 
     # device and system detect
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    device = torch.device(device)
     eagle3_model.to(device)
 
     # use nn.Module or  DDP under macos or  cpu
