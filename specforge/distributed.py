@@ -1,4 +1,4 @@
-
+import os
 from datetime import timedelta
 
 import torch
@@ -28,7 +28,25 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
         tp_size(int): The degree of tensor parallelism
     """
     backend_name=detect_communication_backend()
-    dist.init_process_group(backend=backend_name, timeout=timedelta(minutes=timeout))
+    # single machine
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+
+        dist.init_process_group(
+            backend=backend_name,
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+            timeout=timedelta(minutes=timeout),
+        )
+    else:
+        dist.init_process_group(
+            backend=backend_name,
+            timeout=timedelta(minutes=timeout),
+        )
 
     # initialize sub groups
     rank = dist.get_rank()

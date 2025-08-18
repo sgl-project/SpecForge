@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import os
+import platform
 
 import torch
 import torch.distributed as dist
@@ -112,6 +113,11 @@ def print_on_rank0(message):
         print(message)
 
 
+def unwrap_model(model):
+    # return module if ddp or fsdp
+    return model.module if hasattr(model, "module") else model
+
+
 def main():
     # initialize
     parser, args = parse_args()
@@ -173,6 +179,12 @@ def main():
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    # if no  chat_template in tokenizer, use  args.chat_template
+    if not getattr(tokenizer, "chat_template", None):
+        if args.chat_template is not None:
+            tokenizer.chat_template = args.chat_template
+        else:
+            raise ValueError("No chat_template found in tokenizer and args.chat_template is None!")
 
     # convert to dataloader
     cache_params_string = (
@@ -238,19 +250,31 @@ def main():
         draft_model=draft_model,
         length=args.ttt_length,
     )
-    # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
-    eagle3_model = FSDP(
-        eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        ignored_modules=[target_model],
-        process_group=get_dp_group(),
-    )
-    print_with_rank(f"Initialized Eagle3 FSDP model")
+
+    # device and system detect
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    device = torch.device(device)
+    eagle3_model.to(device)
+
+    # use nn.Module or  DDP under macos or  cpu
+    if platform.system() == "Darwin" or device.type in ["mps", "cpu"]:
+        print("Running on macOS (MPS/CPU) -> fallback to plain model / DDP")
+        # multprocessing
+        # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
+        pass
+    else:
+        eagle3_model = FSDP(
+            eagle3_model,
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            ),
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            ignored_modules=[target_model],
+            process_group=get_dp_group(),
+        )
+        print_with_rank(f"Initialized Eagle3 FSDP model")
 
     # build other components
     optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
@@ -293,8 +317,9 @@ def main():
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
-        epoch_acces = [[] for _ in range(eagle3_model.module.length)]
-        epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
+        real_model = unwrap_model(eagle3_model)
+        epoch_acces = [[] for _ in range(real_model.length)]
+        epoch_plosses = [[] for _ in range(real_model.length)]
 
         for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
             optimizer.zero_grad()
