@@ -11,7 +11,6 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import wandb
 from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OfflineEagle3Model
 from specforge.data import (
     build_eagle3_dataset,
