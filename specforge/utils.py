@@ -176,7 +176,7 @@ def get_last_checkpoint(folder):
         path
         for path in content
         if _re_checkpoint.search(path) is not None
-           and os.path.isdir(os.path.join(folder, path))
+        and os.path.isdir(os.path.join(folder, path))
     ]
     if len(checkpoints) == 0:
         return
