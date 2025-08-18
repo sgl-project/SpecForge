@@ -24,6 +24,7 @@ from specforge.data import (
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
+from specforge.data.template import TEMPLATE_REGISTRY
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.utils import (
@@ -179,10 +180,10 @@ def main():
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    # if no  chat_template in tokenizer, use  args.chat_template
+    # if there  is no chat_template in tokenizer, use  args.chat_template
     if not getattr(tokenizer, "chat_template", None):
-        if args.chat_template is not None:
-            tokenizer.chat_template = args.chat_template
+        if args.chat_template is not None and args.chat_template in TEMPLATE_REGISTRY.templates:
+            tokenizer.chat_template = TEMPLATE_REGISTRY.get(args.chat_template)
         else:
             raise ValueError("No chat_template found in tokenizer and args.chat_template is None!")
 
