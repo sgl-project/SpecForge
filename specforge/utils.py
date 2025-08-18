@@ -29,6 +29,47 @@ def detect_communication_backend() -> str:
     return backend_name
 
 
+def detect_attention_impl(prefer="flex_attention") -> str:
+    """
+    Detect the best available attention implementation given the device.
+
+    Args:
+        prefer (str): preferred backend, one of ["flex_attention", "flash", "sdpa"].
+                      Will try to use it if supported, otherwise fallback.
+
+    Returns:
+        str: selected attention implementation ("flex_attention", "flash", "sdpa").
+    """
+    device = (
+        "cuda" if torch.cuda.is_available()
+        else "hpu" if getattr(torch.backends, "hpu", None) and torch.backends.hpu.is_available()
+        else "cpu" if torch.backends.mkldnn.is_available()
+        else "mps"
+    )
+
+    # FlexAttention
+    if prefer == "flex_attention":
+        if device in ["cuda", "cpu", "hpu"]:
+            print(f"[INFO] Using FlexAttention on {device}")
+            return "flex_attention"
+        else:
+            print(f"[WARN] FlexAttention not supported on {device}, falling back to SDPA")
+            return "sdpa"
+
+    # FlashAttention,only for cuda
+    if prefer == "flash":
+        if device == "cuda":
+            print(f"[INFO] Using FlashAttention on CUDA")
+            return "flash"
+        else:
+            print(f"[WARN] FlashAttention only works on CUDA, falling back to SDPA")
+            return "sdpa"
+
+    # default PyTorch SDPA
+    print(f"[INFO] Using PyTorch SDPA attention on {device}")
+    return "sdpa"
+
+
 def detect_device() -> torch.device:
     """
     Detect the best available device (CUDA, MPS, or CPU) for PyTorch computation.

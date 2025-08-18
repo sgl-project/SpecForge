@@ -30,7 +30,7 @@ from specforge.utils import (
     get_last_checkpoint,
     print_with_rank,
     rank_0_priority,
-    validate_wandb_args, detect_device,
+    validate_wandb_args, detect_device, detect_attention_impl,
 )
 
 
@@ -124,7 +124,10 @@ def main():
     parser, args = parse_args()
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    # target device check
     device = detect_device()
+    # attention backend check
+    attention_backend = detect_attention_impl(prefer=args.attention_backend)
     print_with_rank("Initialized distributed environment")
 
     # Validate wandb arguments
@@ -165,13 +168,13 @@ def main():
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint,
-                                                 attention_backend=args.attention_backend)
+                                                 attention_backend=attention_backend)
             .to(device)
             .to(torch.bfloat16)
         )
     else:
         draft_model = (
-            AutoEagle3DraftModel.from_config(draft_model_config, attention_backend=args.attention_backend)
+            AutoEagle3DraftModel.from_config(draft_model_config, attention_backend=attention_backend)
             .to(device)
             .to(torch.bfloat16)
         )
@@ -245,7 +248,7 @@ def main():
         target_model=target_model,
         draft_model=draft_model,
         length=args.ttt_length,
-        attention_backend=args.attention_backend,
+        attention_backend=attention_backend,
     )
 
     # device and system detect
