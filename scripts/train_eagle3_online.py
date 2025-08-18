@@ -119,6 +119,13 @@ def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+def safe_all_reduce(tensor, op=dist.ReduceOp.SUM):
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(tensor, op=op)
+    # return tensor if single node world_size=1
+    return tensor
+
+
 def main():
     # initialize
     parser, args = parse_args()
@@ -389,7 +396,7 @@ def main():
 
             for i in range(len(epoch_acces)):
                 acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
-                dist.all_reduce(acc_i)
+                acc_i = safe_all_reduce(acc_i)
                 acc_i = acc_i / dist.get_world_size()
                 acc_i = acc_i.item()
 
@@ -400,7 +407,7 @@ def main():
 
             for i in range(len(epoch_plosses)):
                 loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
-                dist.all_reduce(loss_i)
+                loss_i = safe_all_reduce(loss_i)
                 loss_i = loss_i / dist.get_world_size()
                 loss_i = loss_i.item()
 
