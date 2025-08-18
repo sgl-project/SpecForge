@@ -159,7 +159,7 @@ def main():
             .eval()
             .to(device)
         )
-    print_with_rank(f"Initialized target model")
+    print_with_rank("Initialized target model")
     # load model with resume
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     if draft_model_last_checkpoint:
@@ -177,7 +177,7 @@ def main():
         )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    print_with_rank(f"Initialized draft model")
+    print_with_rank("Initialized draft model")
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
