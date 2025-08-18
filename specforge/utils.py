@@ -56,14 +56,14 @@ def detect_attention_impl(prefer="flex_attention") -> str:
             print(f"[WARN] FlexAttention not supported on {device}, falling back to SDPA")
             return "sdpa"
 
-    # FlashAttention,only for cuda
-    if prefer == "flash":
-        if device == "cuda":
-            print(f"[INFO] Using FlashAttention on CUDA")
-            return "flash"
-        else:
-            print(f"[WARN] FlashAttention only works on CUDA, falling back to SDPA")
-            return "sdpa"
+    # FlashAttention, only for cuda, delayed
+    # if prefer == "flash":
+    #     if device == "cuda":
+    #         print(f"[INFO] Using FlashAttention on CUDA")
+    #         return "flash"
+    #     else:
+    #         print(f"[WARN] FlashAttention only works on CUDA, falling back to SDPA")
+    #         return "sdpa"
 
     # default PyTorch SDPA
     print(f"[INFO] Using PyTorch SDPA attention on {device}")
