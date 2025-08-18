@@ -196,7 +196,7 @@ class SwanlabTracker(Tracker):
             swanlab.log(log_dict, step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized and swanlab.is_running():
+        if self.rank == 0 and self.is_initialized:
             swanlab.finish()
             self.is_initialized = False
 
