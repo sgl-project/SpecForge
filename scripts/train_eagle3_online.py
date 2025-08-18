@@ -358,7 +358,7 @@ def main():
 
         for i in range(len(epoch_acces)):
             acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
-            dist.all_reduce(acc_i)
+            acc_i = safe_all_reduce(acc_i)
             acc_i = acc_i / dist.get_world_size()
             acc_i = acc_i.item()
             wandb_log_if_initialized({f"train/epochacc_{i}": acc_i})
@@ -368,7 +368,7 @@ def main():
 
         for i in range(len(epoch_plosses)):
             loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
-            dist.all_reduce(loss_i)
+            loss_i = safe_all_reduce(loss_i)
             loss_i = loss_i / dist.get_world_size()
             loss_i = loss_i.item()
             wandb_log_if_initialized({f"train/epochploss_{i}": loss_i})
