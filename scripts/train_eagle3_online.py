@@ -167,8 +167,9 @@ def main():
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
     if draft_model_last_checkpoint:
         draft_model = (
-            AutoEagle3DraftModel.from_pretrained(draft_model_last_checkpoint,
-                                                 attention_backend=attention_backend)
+            AutoEagle3DraftModel.from_pretrained(
+                draft_model_last_checkpoint,
+                attention_backend=attention_backend)
             .to(device)
             .to(torch.bfloat16)
         )
