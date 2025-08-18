@@ -195,4 +195,8 @@ cache/
 outputs/
 wandb/
 .idea
+
+# macOS
+.DS_Store
+
 .vscode/

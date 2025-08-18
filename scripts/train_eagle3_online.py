@@ -97,6 +97,8 @@ def parse_args():
     parser.add_argument("--min-pixels", type=int, default=50176) # 64*28*28 for qwen2.5-vl
     parser.add_argument("--max-pixels", type=int, default=802816) # 1024*28*28 for qwen2.5-vl
 
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+
     args = parser.parse_args()
 
     return parser, args
@@ -218,6 +220,7 @@ def main():
             cache_key=cache_key,
             is_vlm=args.is_vlm,
             processor=processor,
+            num_proc=args.build_dataset_num_proc,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -249,7 +252,7 @@ def main():
             args.max_length,
             is_vlm=args.is_vlm,
             processor=processor,
-            num_proc=16
+            num_proc=args.build_dataset_num_proc,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,

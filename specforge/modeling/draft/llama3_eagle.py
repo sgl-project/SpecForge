@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
@@ -575,10 +575,12 @@ class LlamaFlexAttention(LlamaAttention):
         seq_lengths -= lck
         # TODO: Remove the usage of uncompiled create_block_mask after
         # https://github.com/pytorch/pytorch/issues/160018
-        if q_len > 128:
-            create_block_mask_func = compile_friendly_create_block_mask
-        else:
+        if q_len <= 128:
             create_block_mask_func = create_block_mask
+            flex_attention_func = flex_attention
+        else:
+            create_block_mask_func = compile_friendly_create_block_mask
+            flex_attention_func = compile_friendly_flex_attention
 
         block_mask = create_block_mask_func(
             mask_mod=generate_eagle3_mask(
@@ -593,8 +595,7 @@ class LlamaFlexAttention(LlamaAttention):
             KV_LEN=key_cache.shape[-2],
             device=query_states.device,
         )
-
-        attn_output = compile_friendly_flex_attention(
+        attn_output = flex_attention_func(
             query=query_states,
             key=key_cache.contiguous(),
             value=value_cache.contiguous(),
