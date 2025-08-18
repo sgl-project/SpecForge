@@ -372,11 +372,10 @@ def main():
                     if "draft_model." in k and "embed" not in k.lower()
                 }
 
-                if dist.get_rank() == 0:
-                    draft_model.save_pretrained(
-                        os.path.join(args.output_dir, f"epoch_{epoch}"),
-                        state_dict=draft_model_state_dict,
-                    )
+                draft_model.save_pretrained(
+                    os.path.join(args.output_dir, f"epoch_{epoch}"),
+                    state_dict=draft_model_state_dict,
+                )
                 dist.barrier()
 
     # Close the tracker at the end of training

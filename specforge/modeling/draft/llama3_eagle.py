@@ -3,6 +3,7 @@ import math
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -10,10 +11,9 @@ from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
-import torch.distributed as dist
+
 from specforge.distributed import get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear, _AllReduce
-
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -260,7 +260,9 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.tp_group = get_tp_group()
-        self._tp_size = dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
+        self._tp_size = (
+            dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
+        )
         self._tp_rank = dist.get_rank(self.tp_group) if self.tp_group is not None else 0
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -433,7 +435,9 @@ class LlamaAttention(nn.Module):
 
         attn_output = self.o_proj(attn_output)
         if self._tp_size > 1:
-            attn_output = _AllReduce.apply(attn_output, dist.ReduceOp.SUM, self.tp_group)
+            attn_output = _AllReduce.apply(
+                attn_output, dist.ReduceOp.SUM, self.tp_group
+            )
         return attn_output
 
 
@@ -542,15 +546,22 @@ class LlamaMLP(nn.Module):
         self.config = config
 
         self.tp_group = get_tp_group()
-        self._tp_size = dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
+        self._tp_size = (
+            dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
+        )
 
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
-
-        self.gate_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = RowParallelLinear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = ColumnParallelLinear(
+            self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.up_proj = ColumnParallelLinear(
+            self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size, self.hidden_size, bias=False
+        )
 
         self.act_fn = ACT2FN[config.hidden_act]
 
@@ -565,6 +576,7 @@ class LlamaMLP(nn.Module):
         if self._tp_size > 1:
             down_proj = _AllReduce.apply(down_proj, dist.ReduceOp.SUM, self.tp_group)
         return down_proj
+
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):

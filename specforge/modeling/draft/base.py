@@ -27,12 +27,15 @@ from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache
 
+from specforge.distributed import get_tp_group
+from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
 
@@ -175,3 +178,71 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         vocab_mapping = torch.load(file_path)
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])
+
+    def save_pretrained(self, save_directory, state_dict=None, **kwargs):
+        """
+        Overrides save_pretrained to handle TP weight aggregation robustly.
+        This method gathers sharded weights from all TP ranks and saves a single,
+        complete checkpoint from the main process.
+        """
+        if not dist.is_initialized():
+            # Standard non-distributed save
+            super().save_pretrained(save_directory, state_dict=state_dict, **kwargs)
+            return
+
+        # Use the provided state_dict or get it from the model
+        if state_dict is None:
+            state_dict = self.state_dict()
+
+        # Get distributed process groups and ranks
+        global_rank = dist.get_rank()
+        tp_group = get_tp_group()
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+
+        # If not using TP, only rank 0 saves and others do nothing.
+        if tp_size <= 1:
+            if global_rank == 0:
+                super().save_pretrained(save_directory, state_dict=state_dict, **kwargs)
+            dist.barrier()
+            return
+
+        # --- Aggregation Logic for TP > 1 ---
+        # Step 1: Each TP rank's leader (tp_rank == 0) will reconstruct the full state dict.
+        reconstructed_state_dict = None
+        if tp_rank == 0:
+            reconstructed_state_dict = {}
+
+        # All ranks in a TP group participate in gathering shards for each parameter.
+        modules = dict(self.named_modules())
+        for name, param in state_dict.items():
+            # Gather shards from all TP ranks into a list
+            tensor_list = [torch.empty_like(param) for _ in range(tp_size)]
+            dist.all_gather(tensor_list, param.contiguous(), group=tp_group)
+
+            # Let the tp_rank 0 process handle the concatenation
+            if tp_rank == 0:
+                module_name = ".".join(name.split(".")[:-1])
+                module = modules.get(module_name)
+
+                if isinstance(module, ColumnParallelLinear) and name.endswith(
+                    ".weight"
+                ):
+                    # Concat along dimension 0 for ColumnParallel
+                    reconstructed_state_dict[name] = torch.cat(tensor_list, dim=0)
+                elif isinstance(module, RowParallelLinear) and name.endswith(".weight"):
+                    # Concat along dimension 1 for RowParallel
+                    reconstructed_state_dict[name] = torch.cat(tensor_list, dim=1)
+                else:
+                    # Non-parallel layers (biases, norms, etc.) are identical across ranks
+                    reconstructed_state_dict[name] = tensor_list[0]
+
+        # Step 2: Only the global rank 0 process saves the final model.
+        if global_rank == 0:
+            print(f"Rank {global_rank} saving aggregated model checkpoint...")
+            super().save_pretrained(
+                save_directory, state_dict=reconstructed_state_dict, **kwargs
+            )
+
+        # Step 3: Barrier to ensure all processes wait until saving is complete.
+        dist.barrier()
