@@ -180,12 +180,6 @@ def main():
 
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    # if there  is no chat_template in tokenizer, use  args.chat_template
-    if not getattr(tokenizer, "chat_template", None):
-        if args.chat_template is not None and args.chat_template in TEMPLATE_REGISTRY.templates:
-            tokenizer.chat_template = TEMPLATE_REGISTRY.get(args.chat_template)
-        else:
-            raise ValueError("No chat_template found in tokenizer and args.chat_template is None!")
 
     # convert to dataloader
     cache_params_string = (
