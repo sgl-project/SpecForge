@@ -125,7 +125,7 @@ def main():
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     device = detect_device()
-    print_with_rank(f"Initialized distributed environment")
+    print_with_rank("Initialized distributed environment")
 
     # Validate wandb arguments
     validate_wandb_args(parser, args)
