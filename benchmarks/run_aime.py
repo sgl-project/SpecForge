@@ -14,8 +14,8 @@ def main(args):
     set_default_backend(select_sglang_backend(args))
 
     # Read data
-    dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
-    questions = [{"question": q["problem"]} for q in dataset]
+    dataset = load_dataset("Maxwell-Jia/AIME_2024")["train"]
+    questions = [{"question": q["Problem"]} for q in dataset]
 
     # Construct prompts
     questions = questions[: args.num_questions]
@@ -26,9 +26,16 @@ def main(args):
     import sglang as sgl
 
     @sgl.function
-    def get_humaneval_answer(s, question):
-        s += sgl.user(question)
-        s += sgl.assistant(sgl.gen("answer"))
+    def reasoning_gen(s, question: str):
+        s += sgl.user(
+            question
+            + "\nPlease reason step by step, and put your final answer within \boxed{}."
+        )
+        s += sgl.assistant(
+            sgl.gen(
+                "answer",
+            )
+        )
 
     #####################################
     ########## SGL Program End ##########
@@ -36,10 +43,10 @@ def main(args):
 
     # Run requests
     tic = time.perf_counter()
-    states = get_humaneval_answer.run_batch(
+    states = reasoning_gen.run_batch(
         questions,
         temperature=0,
-        max_new_tokens=2048,
+        max_new_tokens=32768,
         num_threads=args.parallel,
         progress_bar=True,
     )
@@ -71,6 +78,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--num-questions", type=int, default=2)
     args = add_common_sglang_args_and_parse(parser)
     main(args)
