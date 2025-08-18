@@ -24,13 +24,8 @@ from specforge.data import (
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
-from specforge.utils import (
-    ExperimentTracker,
-    get_last_checkpoint,
-    print_with_rank,
-    rank_0_priority,
-    validate_report_to_args,
-)
+from specforge.tracker import create_tracker, get_tracker_class
+from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
 
 
 def parse_args():
@@ -89,7 +84,7 @@ def parse_args():
         "--report-to",
         type=str,
         default="none",
-        choices=["wandb", "tensorboard","swanlab", "none"],
+        choices=["wandb", "tensorboard", "swanlab", "none"],
         help="The integration to report results and logs to.",
     )
     # wandb-specific args
@@ -97,9 +92,24 @@ def parse_args():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
     # swanlab-specific args
-    parser.add_argument("--swanlab-project", type=str, default=None, help="The project name for swanlab.")
-    parser.add_argument("--swanlab-name", type=str, default=None, help="The experiment name for swanlab.")
-    parser.add_argument("--swanlab-key", type=str, default=None, help="The API key for swanlab non-interactive login.")
+    parser.add_argument(
+        "--swanlab-project",
+        type=str,
+        default=None,
+        help="The project name for swanlab.",
+    )
+    parser.add_argument(
+        "--swanlab-name",
+        type=str,
+        default=None,
+        help="The experiment name for swanlab.",
+    )
+    parser.add_argument(
+        "--swanlab-key",
+        type=str,
+        default=None,
+        help="The API key for swanlab non-interactive login.",
+    )
 
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
 
@@ -120,9 +130,13 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed environment")
 
-    validate_report_to_args(parser, args)
+    tracker_class = get_tracker_class(args.report_to)
+    if tracker_class:
+        tracker_class.validate_args(parser, args)
+    else:
+        parser.error(f"Unknown tracker: {args.report_to}")
 
-    tracker = ExperimentTracker(args, args.output_dir)
+    tracker = create_tracker(args, args.output_dir)
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None

@@ -4,7 +4,6 @@ import os
 
 import torch
 import torch.distributed as dist
-import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -12,6 +11,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+import wandb
 from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OfflineEagle3Model
 from specforge.data import (
     build_eagle3_dataset,
@@ -22,13 +22,8 @@ from specforge.data import (
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.modeling.target.target_head import TargetHead
-
-from specforge.utils import (
-    ExperimentTracker,
-    print_with_rank,
-    rank_0_priority,
-    validate_report_to_args,
-)
+from specforge.tracker import create_tracker, get_tracker_class
+from specforge.utils import print_with_rank, rank_0_priority
 
 
 def parse_args():
@@ -98,13 +93,32 @@ def parse_args():
         help="The integration to report results and logs to.",
     )
     # wandb-specific args
-    parser.add_argument("--wandb-project", type=str, default=None, help="The project name for W&B.")
-    parser.add_argument("--wandb-name", type=str, default=None, help="The run name for W&B.")
+    parser.add_argument(
+        "--wandb-project", type=str, default=None, help="The project name for W&B."
+    )
+    parser.add_argument(
+        "--wandb-name", type=str, default=None, help="The run name for W&B."
+    )
     parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
     # add swanlab-specific args ---
-    parser.add_argument("--swanlab-project", type=str, default=None, help="The project name for swanlab.")
-    parser.add_argument("--swanlab-name", type=str, default=None, help="The experiment name for swanlab.")
-    parser.add_argument("--swanlab-key", type=str, default=None, help="The API key for swanlab non-interactive login.")
+    parser.add_argument(
+        "--swanlab-project",
+        type=str,
+        default=None,
+        help="The project name for swanlab.",
+    )
+    parser.add_argument(
+        "--swanlab-name",
+        type=str,
+        default=None,
+        help="The experiment name for swanlab.",
+    )
+    parser.add_argument(
+        "--swanlab-key",
+        type=str,
+        default=None,
+        help="The API key for swanlab non-interactive login.",
+    )
 
     args = parser.parse_args()
 
@@ -124,9 +138,13 @@ def main():
     print_with_rank("Initialized distributed environment")
 
     # Validate report backend arguments
-    validate_report_to_args(parser, args)
+    tracker_class = get_tracker_class(args.report_to)
+    if tracker_class:
+        tracker_class.validate_args(parser, args)
+    else:
+        parser.error(f"Unknown tracker: {args.report_to}")
 
-    tracker = ExperimentTracker(args, args.output_dir)
+    tracker = create_tracker(args, args.output_dir)
 
     # build target and draft model
     target_head = TargetHead(args.target_model_path)
