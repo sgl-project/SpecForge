@@ -270,14 +270,13 @@ def main():
                     )
                     torch_profiler.start()
                 if batch_index == args.profile_start_step + args.profile_num_steps:
-                    print("End profile")
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(
-                        os.path.join(
-                            os.environ["SGLANG_TORCH_PROFILER_DIR"],
-                            f"debug_rank{torch.distributed.get_rank()}.trace.json.gz",
-                        )
+                    output_path = os.path.join(
+                        os.environ["SGLANG_TORCH_PROFILER_DIR"],
+                        f"debug_rank{torch.distributed.get_rank()}.trace.json.gz",
                     )
+                    print(f"End profile {output_path=}")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(output_path)
 
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
