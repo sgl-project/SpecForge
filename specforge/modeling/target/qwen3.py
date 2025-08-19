@@ -40,8 +40,7 @@ from transformers.utils import auto_docstring, can_return_tuple, logging
 
 from specforge.distributed import get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
-
-from .base import DistributedTargetModel
+from specforge.modeling.target.base import DistributedTargetModel
 
 logger = logging.get_logger(__name__)
 
@@ -679,7 +678,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin, DistributedTargetM
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         # Gather logits from all TP ranks
-        logits = self._gather_tensor(logits, get_tp_group())
+        # We don't shard embed_tokens, so when tie_word_embeddings is True
+        # lm_head is not sharded as well. Thus, we skip all_gather.
+        if not self.config.tie_word_embeddings:
+            logits = self._gather_tensor(logits, get_tp_group())
 
         loss = None
         if labels is not None:
