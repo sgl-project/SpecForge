@@ -332,6 +332,15 @@ class OfflineEagle3Model(Eagle3Model):
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
+        # Step 5.3: handle vocab size
+        with torch.no_grad():
+            target_p, position_mask = _compute_target_p(
+                target=target,
+                t2d=self.draft_model.t2d,
+                loss_mask=loss_mask,
+            )
+            del target
+
         # Step 1: project the concatenated hidden states to the target hidden size
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
@@ -396,14 +405,6 @@ class OfflineEagle3Model(Eagle3Model):
                 use_cache=True,
             )
 
-            # Step 5.3: handle vocab size
-            with torch.no_grad():
-                target_p, position_mask = _compute_target_p(
-                    target=target,
-                    t2d=self.draft_model.t2d,
-                    loss_mask=loss_mask,
-                )
-
             # update hidden states for next step
             hidden_states = hidden_states_out
 
@@ -426,7 +427,8 @@ class OfflineEagle3Model(Eagle3Model):
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
+                target_p = padding(target_p, left=False)
+                position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 if self.attention_backend == "sdpa":
                     ind = torch.arange(seq_length, device=attention_mask.device)
