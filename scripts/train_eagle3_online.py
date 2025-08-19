@@ -323,7 +323,9 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for batch_index, data in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
+        for batch_index, data in enumerate(
+            tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
+        ):
             # TODO extract logic
             if args.profile and epoch == 0:
                 if batch_index == args.profile_start_step:

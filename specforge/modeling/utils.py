@@ -10,4 +10,3 @@ def padding(tensor, left=True):
     else:
         tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
     return tensor
-

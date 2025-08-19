@@ -24,10 +24,10 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.cache_utils import DynamicCache
 
-import torch.nn.functional as F
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -342,7 +342,9 @@ class OfflineEagle3Model(Eagle3Model):
             )
 
             assert len(target_p.shape) == 3
-            target_p_padded = F.pad(target_p, pad=(0, 0, 0, self.length), mode="constant", value=0)
+            target_p_padded = F.pad(
+                target_p, pad=(0, 0, 0, self.length), mode="constant", value=0
+            )
 
             del target, target_p
 
@@ -393,7 +395,7 @@ class OfflineEagle3Model(Eagle3Model):
             past_key_values = DynamicCache()
 
         for idx in range(self.length):
-            target_p = target_p_padded[:, idx:idx + seq_length, :]
+            target_p = target_p_padded[:, idx : idx + seq_length, :]
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -418,17 +420,21 @@ class OfflineEagle3Model(Eagle3Model):
             logits = self.draft_model.compute_logits(hidden_states)
 
             # Step 5.5: calculate loss
-            loss = _compute_loss(logits=logits, target_p=target_p, position_mask=position_mask)
+            loss = _compute_loss(
+                logits=logits, target_p=target_p, position_mask=position_mask
+            )
 
             # Step 5.6: record metrics
             plosses.append(loss)
             with torch.no_grad():
-                acces.append(_compute_metric_acc(
-                    logits=logits,
-                    target_p=target_p,
-                    position_mask=position_mask,
-                    loss_mask=loss_mask,
-                ))
+                acces.append(
+                    _compute_metric_acc(
+                        logits=logits,
+                        target_p=target_p,
+                        position_mask=position_mask,
+                        loss_mask=loss_mask,
+                    )
+                )
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -468,14 +474,9 @@ def _compute_loss(logits, target_p, position_mask):
     loss = -torch.sum(position_mask * plogp, 2).mean()
     return loss
 
+
 @torch.compile(dynamic=None)
 def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
     return (
-        (
-            (logits.argmax(-1) == target_p.argmax(-1))
-            * position_mask.squeeze(-1)
-        )
-        .sum()
-        .item()
-        / (loss_mask.sum().item() + 1e-6)
-    )
+        (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
+    ).sum().item() / (loss_mask.sum().item() + 1e-6)
