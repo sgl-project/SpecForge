@@ -299,7 +299,6 @@ class OfflineEagle3Model(Eagle3Model):
         self.length = length
         self.attention_backend = attention_backend
 
-    @torch.compile(dynamic=None)
     def forward(
         self,
         input_ids,
