@@ -113,3 +113,13 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek",
+    template=ChatTemplate(
+        assistant_header="Assistant:",
+        user_header="User:",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="",
+    ),
+)
