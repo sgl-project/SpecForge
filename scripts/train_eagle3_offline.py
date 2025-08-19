@@ -259,6 +259,7 @@ def main():
         for batch_index, data in enumerate(
             tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
         ):
+            # TODO extract logic
             if args.profile and epoch == 0:
                 if batch_index == args.profile_start_step:
                     print("Start profile")
