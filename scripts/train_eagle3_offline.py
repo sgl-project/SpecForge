@@ -388,7 +388,7 @@ def main():
     destroy_distributed()
 
 
-@torch.compile(dynamic=None)
+@torch.compile(dynamic=True)
 def train_step(
     optimizer,
     eagle3_model,
