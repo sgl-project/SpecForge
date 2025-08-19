@@ -446,9 +446,7 @@ class OfflineEagle3Model(Eagle3Model):
 
 @torch.compile(dynamic=None)
 def _compute_target_p_padded(target, t2d, loss_mask, length):
-    target = F.pad(
-        target, pad=(0, 0, 0, length), mode="constant", value=0
-    )
+    target = F.pad(target, pad=(0, 0, 0, length), mode="constant", value=0)
     target_head = target
     target_max_token = target_head.argmax(-1)
     target_mask = t2d[target_max_token]
