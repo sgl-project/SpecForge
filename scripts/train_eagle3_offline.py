@@ -238,7 +238,7 @@ def main():
     print_with_rank("Initialized Eagle3 FSDP model")
 
     # build other components
-    optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=torch.tensor(args.learning_rate))
     total_steps = args.num_epochs * len(train_dataloader)
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = CosineAnnealingWarmupLR(
