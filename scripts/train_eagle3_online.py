@@ -412,8 +412,7 @@ def main():
         for i in range(len(epoch_acces)):
             acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
             acc_i = safe_all_reduce(acc_i)
-            acc_i = acc_i / dist.get_world_size()
-            acc_i = acc_i.item()
+            acc_i = (acc_i / dist.get_world_size()).item()
             epoch_logdict[f"train/epoch_acc_{i}"] = acc_i
             print_on_rank0(
                 f"Train Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
@@ -422,8 +421,7 @@ def main():
         for i in range(len(epoch_plosses)):
             loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
             loss_i = safe_all_reduce(loss_i)
-            loss_i = loss_i / dist.get_world_size()
-            loss_i = loss_i.item()
+            loss_i = (loss_i / dist.get_world_size()).item()
             epoch_logdict[f"train/epoch_ploss_{i}"] = loss_i
             print_on_rank0(
                 f"Train Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
