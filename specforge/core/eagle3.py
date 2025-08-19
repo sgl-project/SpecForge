@@ -228,39 +228,33 @@ class OnlineEagle3Model(Eagle3Model):
 
             # Step 5.3: handle vocab size
             with torch.no_grad():
-                target_head = target
-                target_max_token = target_head.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
-                position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.draft_model.t2d]
-                target_head = target_head.float()
-                target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
+                target_p, position_mask = _compute_target_p(
+                    target=target,
+                    t2d=self.draft_model.t2d,
+                    loss_mask=loss_mask,
+                )
 
             # update hidden states for next step
             hidden_states = hidden_states_out
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
-            logits = logits.float()
 
             # Step 5.5: calculate loss
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
+            loss = _compute_loss(
+                logits=logits, target_p=target_p, position_mask=position_mask
+            )
 
             # Step 5.6: record metrics
             plosses.append(loss)
             with torch.no_grad():
                 acces.append(
-                    (
-                        (logits.argmax(-1) == target_p.argmax(-1))
-                        * position_mask.squeeze(-1)
+                    _compute_metric_acc(
+                        logits=logits,
+                        target_p=target_p,
+                        position_mask=position_mask,
+                        loss_mask=loss_mask,
                     )
-                    .sum()
-                    .item()
-                    / (loss_mask.sum().item() + 1e-6)
                 )
 
             if not is_last:
