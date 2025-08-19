@@ -377,9 +377,6 @@ class OfflineEagle3Model(Eagle3Model):
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
-            for layer in past_key_values.layers:
-                torch._dynamo.mark_dynamic(layer.keys, 2)
-                torch._dynamo.mark_dynamic(layer.values, 2)
 
         for idx in range(self.length):
             is_last = idx == self.length - 1

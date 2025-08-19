@@ -431,6 +431,7 @@ class LlamaFlexAttention(LlamaAttention):
         - past_key_values: dynamic cache used for storing past key and value states.
     """
 
+    @torch._dynamo.disable(recursive=False)
     def forward(
         self,
         hidden_states: torch.Tensor,
