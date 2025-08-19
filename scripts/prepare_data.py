@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from datasets import load_dataset
 from tqdm import tqdm
@@ -51,7 +51,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def process_ultrachat_row(row) -> Dict:
+def process_ultrachat_row(row: Dict) -> Tuple[Dict, int]:
     """Process a row from the ultrachat dataset.
 
     The function expects a row with the following schema:
@@ -73,7 +73,7 @@ def process_ultrachat_row(row) -> Dict:
     return row, 0
 
 
-def process_sharegpt_row(row) -> Dict:
+def process_sharegpt_row(row: Dict) -> Tuple[Dict, int]:
     """
     sharegpt dataset schema:
     {
@@ -110,15 +110,16 @@ def load_dataset_from_path(data_path: Path):
 import hashlib
 
 
-def process_opc_sft_stage1(row) -> Dict:
+def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
     row_id = hashlib.md5((row["instruction"] + row["output"]).encode()).hexdigest()
-    return {
+    processed_row = {
         "id": row_id,
         "conversations": [
             {"role": "user", "content": row["instruction"]},
             {"role": "assistant", "content": row["output"]},
         ],
     }
+    return processed_row, 0
 
 
 def main():
