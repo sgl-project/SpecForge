@@ -19,7 +19,6 @@ from transformers import (
 from specforge.utils import default_torch_dtype
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
-
 # from .target.llama import LlamaForCausalLM
 from .target.llama4 import Llama4ForCausalLM
 from .target.qwen3 import Qwen3ForCausalLM
