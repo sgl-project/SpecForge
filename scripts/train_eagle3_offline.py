@@ -281,12 +281,23 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
-            plosses, acces = train_step(
-                optimizer=optimizer,
-                eagle3_model=eagle3_model,
-                data=data,
-                scheduler=scheduler,
+            optimizer.zero_grad()
+            plosses, _, acces = eagle3_model(
+                input_ids=data["input_ids"].cuda(),  # [B, S]
+                attention_mask=data["attention_mask"].cuda(),  # [B, S]
+                loss_mask=data["loss_mask"]
+                .unsqueeze(-1)
+                .cuda(),  # [B, S, 1] This is different from the online version
+                hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
+                target=data["target"].cuda(),  # [B, S, D*3]
             )
+
+            # calculate weighted loss
+            ploss_weight = [0.8**i for i in range(len(plosses))]
+            ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+            ploss.backward()
+            optimizer.step()
+            scheduler.step()
 
             logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
             for i in range(len(plosses)):
@@ -386,34 +397,6 @@ def main():
                 dist.barrier()
 
     destroy_distributed()
-
-
-# @torch.compile(dynamic=True)
-def train_step(
-    optimizer,
-    eagle3_model,
-    data,
-    scheduler,
-):
-    optimizer.zero_grad()
-    plosses, _, acces = eagle3_model(
-        input_ids=data["input_ids"].cuda(),  # [B, S]
-        attention_mask=data["attention_mask"].cuda(),  # [B, S]
-        loss_mask=data["loss_mask"]
-        .unsqueeze(-1)
-        .cuda(),  # [B, S, 1] This is different from the online version
-        hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
-        target=data["target"].cuda(),  # [B, S, D*3]
-    )
-
-    # calculate weighted loss
-    ploss_weight = [0.8**i for i in range(len(plosses))]
-    ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-    ploss.backward()
-    optimizer.step()
-    scheduler.step()
-
-    return plosses, acces
 
 
 if __name__ == "__main__":

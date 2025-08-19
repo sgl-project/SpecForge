@@ -19,13 +19,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from types import SimpleNamespace
+
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers.cache_utils import StaticCache
+from transformers.cache_utils import DynamicCache
 
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
@@ -205,7 +205,6 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
-            # TODO
             past_key_values = DynamicCache()
 
         for idx in range(self.length):
@@ -300,21 +299,6 @@ class OfflineEagle3Model(Eagle3Model):
         self.length = length
         self.attention_backend = attention_backend
 
-        print(f"hi {self.draft_model.config=} {self.target_head=}")
-        self.past_key_values_static = StaticCache(
-            config=self.draft_model.config,
-            # TODO temp hack
-            # TODO what is the real max_cache_len (max seq len)
-            max_cache_len=4096 * length,
-            # TODO temp hack
-            batch_size=4,
-            # TODO do not hardcode?
-            dtype=torch.bfloat16,
-            # TODO do not hardcode?
-            device="cuda",
-        )
-        print(f"hi {self.past_key_values_static=} {self.past_key_values_static.layers[0]=} {self.past_key_values_static.layers[0].keys=} {self.past_key_values_static.layers[0].keys.shape=}")
-
     def forward(
         self,
         input_ids,
@@ -392,10 +376,7 @@ class OfflineEagle3Model(Eagle3Model):
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
-            # NOTE must reset
-            self.past_key_values_static.reset()
-            past_key_values = self.past_key_values_static
-            print(f"hi forward {input_ids.shape=}")
+            past_key_values = DynamicCache()
 
         for idx in range(self.length):
             is_last = idx == self.length - 1
