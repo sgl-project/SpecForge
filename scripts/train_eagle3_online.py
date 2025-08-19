@@ -420,7 +420,7 @@ def main():
             )
 
         for i in range(len(epoch_plosses)):
-            loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+            loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
             loss_i = safe_all_reduce(loss_i)
             loss_i = loss_i / dist.get_world_size()
             loss_i = loss_i.item()
