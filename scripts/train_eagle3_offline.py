@@ -93,6 +93,7 @@ def parse_args():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-start-step", type=int, default=30)
     parser.add_argument("--profile-num-steps", type=int, default=4)
+    parser.add_argument("--profile-record-shapes", action="store_true")
 
     args = parser.parse_args()
 
@@ -267,6 +268,7 @@ def main():
                             torch.profiler.ProfilerActivity.CUDA,
                         ],
                         with_stack=True,
+                        record_shapes=args.profile_record_shapes,
                     )
                     torch_profiler.start()
                 if batch_index == args.profile_start_step + args.profile_num_steps:
