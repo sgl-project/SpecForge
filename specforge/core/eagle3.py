@@ -27,6 +27,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.cache_utils import DynamicCache
 
+import torch.nn.functional as F
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -339,7 +340,11 @@ class OfflineEagle3Model(Eagle3Model):
                 t2d=self.draft_model.t2d,
                 loss_mask=loss_mask,
             )
-            del target
+
+            assert len(target_p.shape) == 3
+            target_p_padded = F.pad(target_p, pad=(0, 0, 0, self.length), mode="constant", value=0)
+
+            del target, target_p
 
         # Step 1: project the concatenated hidden states to the target hidden size
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
@@ -388,6 +393,7 @@ class OfflineEagle3Model(Eagle3Model):
             past_key_values = DynamicCache()
 
         for idx in range(self.length):
+            target_p = target_p_padded[:, idx:idx + seq_length, :]
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -427,7 +433,6 @@ class OfflineEagle3Model(Eagle3Model):
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 input_ids = padding(input_ids, left=False)
-                target_p = padding(target_p, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 if self.attention_backend == "sdpa":
