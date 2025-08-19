@@ -158,14 +158,13 @@ class OnlineEagle3Model(Eagle3Model):
         )
 
         # Step 1: handle vocab size
-        with torch.no_grad():
-            target_p_padded, position_mask = _compute_target_p_padded(
-                target=target,
-                t2d=self.draft_model.t2d,
-                loss_mask=loss_mask,
-                length=self.length,
-            )
-            del target
+        target_p_padded, position_mask = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -331,14 +330,13 @@ class OfflineEagle3Model(Eagle3Model):
         past_key_values_length = 0
 
         # Step 0: handle vocab size
-        with torch.no_grad():
-            target_p_padded, position_mask = _compute_target_p_padded(
-                target=target,
-                t2d=self.draft_model.t2d,
-                loss_mask=loss_mask,
-                length=self.length,
-            )
-            del target
+        target_p_padded, position_mask = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
 
         # Step 1: project the concatenated hidden states to the target hidden size
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
@@ -444,11 +442,24 @@ class OfflineEagle3Model(Eagle3Model):
         return plosses, vlosses, acces
 
 
-@torch.compile(dynamic=None)
 def _compute_target_p_padded(target, t2d, loss_mask, length):
-    target = F.pad(
-        target, pad=(0, 0, 0, length), mode="constant", value=0
-    )
+    with torch.no_grad():
+        target_p, position_mask = _compute_target_p(
+            target=target,
+            t2d=t2d,
+            loss_mask=loss_mask,
+        )
+
+        assert len(target_p.shape) == 3
+        target_p_padded = F.pad(
+            target_p, pad=(0, 0, 0, length), mode="constant", value=0
+        )
+
+        return target_p_padded, position_mask
+
+
+@torch.compile(dynamic=None)
+def _compute_target_p(target, t2d, loss_mask):
     target_head = target
     target_max_token = target_head.argmax(-1)
     target_mask = t2d[target_max_token]
