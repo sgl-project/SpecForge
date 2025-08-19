@@ -452,7 +452,11 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
 
         assert len(target_p.shape) == 3
         target_p_padded = F.pad(
-            target_p, pad=(0, 0, 0, length), mode="constant", value=0
+            target_p,
+            pad=(0, 0, 0, length),
+            mode="constant",
+            # For bitwise equality with previous code
+            value=1 / target_p.shape[-1],
         )
 
         return target_p_padded, position_mask
