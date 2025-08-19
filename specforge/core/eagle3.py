@@ -457,6 +457,7 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
 
         return target_p_padded, position_mask
 
+
 @torch.compile(dynamic=None)
 def _compute_target_p(target, t2d, loss_mask):
     target_head = target
