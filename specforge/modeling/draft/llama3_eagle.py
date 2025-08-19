@@ -165,6 +165,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
+    @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
@@ -577,6 +578,7 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    @torch.compile(dynamic=True)
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
