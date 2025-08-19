@@ -165,7 +165,6 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
-    @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
@@ -475,6 +474,7 @@ class LlamaFlexAttention(LlamaAttention):
         )
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
+        print(f"hi past_key_values.update {key_states.shape=} {key_states.dtype=} {value_states.shape=} {value_states.dtype=}")
         key_cache, value_cache = past_key_values.update(
             key_states,
             value_states,
@@ -578,7 +578,6 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    @torch.compile(dynamic=True)
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
