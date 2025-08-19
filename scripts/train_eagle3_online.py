@@ -448,6 +448,8 @@ def main():
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
                 ]
 
+            # Log epoch-level evaluation metrics
+            eval_logdict = {}
             for i in range(len(eval_acces)):
                 acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
                 acc_i = safe_all_reduce(acc_i)
