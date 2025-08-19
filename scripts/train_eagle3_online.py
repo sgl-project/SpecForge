@@ -453,8 +453,7 @@ def main():
             for i in range(len(eval_acces)):
                 acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
                 acc_i = safe_all_reduce(acc_i)
-                acc_i = acc_i / dist.get_world_size()
-                acc_i = acc_i.item()
+                acc_i = (acc_i / dist.get_world_size()).item()
 
                 eval_logdict[f"eval/epoch_acc_{i}"] = acc_i
                 print_on_rank0(
@@ -464,8 +463,7 @@ def main():
             for i in range(len(eval_plosses)):
                 loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
                 loss_i = safe_all_reduce(loss_i)
-                loss_i = loss_i / dist.get_world_size()
-                loss_i = loss_i.item()
+                loss_i = (loss_i / dist.get_world_size()).item()
 
                 eval_logdict[f"eval/epoch_ploss_{i}"] = loss_i
                 print_on_rank0(
