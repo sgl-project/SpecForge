@@ -160,7 +160,7 @@ def fsdp_fullstate_ctx(model):
         StateDictType = None
         FullStateDictConfig = None
 
-    """仅当 model 是 FSDP 且 StateDictType 可用时，返回 FULL_STATE_DICT 上下文；否则返回空上下文。"""
+    """return FULL_STATE_DICT if model is fsdp and  StateDictType is available ,otherwise return nullcontext"""
     if (
         FSDP is not None
         and isinstance(model, FSDP)
