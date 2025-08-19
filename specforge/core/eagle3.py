@@ -86,7 +86,7 @@ class OnlineEagle3Model(Eagle3Model):
 
         Returns:
             hidden_states: (batch, seq_len, 3*hidden_size)
-            target: (batch, seq_len, hidden_size)
+            target: (batch, seq_len, vocab_size)
             loss_mask: (batch, seq_len)
             input_ids: (batch, seq_len)
         """
