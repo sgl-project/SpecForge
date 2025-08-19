@@ -770,6 +770,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         norm_hidden_states = self.norm(hidden_states)
         return self.lm_head(norm_hidden_states)
 
+    @torch._dynamo.disable(recursive=True)
     def backbone(
         self,
         input_embeds: torch.Tensor,
