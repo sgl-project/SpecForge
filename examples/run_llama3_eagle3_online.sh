@@ -1,10 +1,10 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
+export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # train eagle3 for llama3.1-8b
 NUM_GPUS=${1:-8}
 
-TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels \
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \

@@ -2,8 +2,9 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
+export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
-# support tp8 train eagle3 for Qwen3-4B/8B/32B
+# support tp8 train eagle3 for Qwen3-4B/8B/32B up to tp_size = 8
 NUM_GPUS=${1:-1}
 
 torchrun \
