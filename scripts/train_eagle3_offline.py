@@ -125,6 +125,7 @@ def parse_args():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-start-step", type=int, default=30)
     parser.add_argument("--profile-num-steps", type=int, default=4)
+    parser.add_argument("--profile-record-shapes", action="store_true")
 
     args = parser.parse_args()
 
@@ -290,17 +291,17 @@ def main():
                             torch.profiler.ProfilerActivity.CUDA,
                         ],
                         with_stack=True,
+                        record_shapes=args.profile_record_shapes,
                     )
                     torch_profiler.start()
                 if batch_index == args.profile_start_step + args.profile_num_steps:
-                    print("End profile")
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(
-                        os.path.join(
-                            os.environ["SGLANG_TORCH_PROFILER_DIR"],
-                            f"debug_rank{torch.distributed.get_rank()}.trace.json.gz",
-                        )
+                    output_path = os.path.join(
+                        os.environ["SGLANG_TORCH_PROFILER_DIR"],
+                        f"debug_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
                     )
+                    print(f"End profile {output_path=}")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(output_path)
 
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
