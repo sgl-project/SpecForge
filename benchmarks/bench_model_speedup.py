@@ -149,18 +149,18 @@ def launch_sglang_server(
     topk: int,
     num_draft_tokens: int,
 ):
-    sglang_args = []
+    sglang_args: List[str] = []
     if steps > 0:
         sglang_args.extend(
             [
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--speculative-num-steps",
-                steps,
+                str(steps),
                 "--speculative-eagle-topk",
-                topk,
+                str(topk),
                 "--speculative-num-draft-tokens",
-                num_draft_tokens,
+                str(num_draft_tokens),
                 "--speculative-draft-model-path",
                 server_args.speculative_draft_model_path,
             ]
@@ -169,13 +169,13 @@ def launch_sglang_server(
     sglang_args.extend(
         [
             "--cuda-graph-max-bs",
-            batch_size,
+            str(batch_size),
             "--mem-fraction-static",
-            server_args.mem_fraction_static,
+            str(server_args.mem_fraction_static),
             "--tp-size",
-            server_args.tp_size,
+            str(server_args.tp_size),
             "--max-running-requests",
-            batch_size,
+            str(batch_size),
         ]
     )
 
