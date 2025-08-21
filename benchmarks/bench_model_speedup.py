@@ -295,7 +295,11 @@ def send_flush_cache_request(base_url: str):
 
 
 def send_get_accept_length_request(base_url: str):
-    server_info = requests.get(base_url + "/get_server_info")
+    try:
+        server_info = requests.get(base_url + "/get_server_info")
+    except Exception as e:
+        print(f"Error sending get_server_info request: {e}")
+        return None
     accept_length = None
     if server_info.status_code == 200:
         server_info_json = server_info.json()
