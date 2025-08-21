@@ -2,7 +2,18 @@
 """
 Usage:
 config_list=(
+    "1,0,0,0"
+    "1,1,1,2"
+    "1,2,1,3"
+    "1,2,4,4"
     "1,3,1,4"
+    "1,3,2,6"
+    "1,4,1,5"
+    "1,5,1,6"
+    "1,5,8,16"
+    "1,6,1,7"
+    "1,7,1,8"
+    "1,8,1,9"
 )
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 bench_model_speedup.py \
     --model-path lmsys/gpt-oss-120b-bf16 \
@@ -108,10 +119,10 @@ def get_gsm8k_conversations(num_prompts: int, num_shots: int = 5):
 
 def get_humaneval_conversations(num_prompts: int):
     dataset = load_dataset("openai/openai_humaneval")["test"]
-    prompts = [q["prompt"] for q in dataset]
+    prompts = [q["prompt"] for q in dataset][:num_prompts]
     bench_name = "humaneval"
     bench_conversations = {bench_name: []}
-    for i in range(num_prompts):
+    for i in range(len(prompts)):
         bench_conversations[bench_name].append(
             [{"role": "user", "content": prompts[i]}]
         )
@@ -120,10 +131,10 @@ def get_humaneval_conversations(num_prompts: int):
 
 def get_math500_conversations(num_prompts: int):
     dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
-    prompts = [q["problem"] for q in dataset]
+    prompts = [q["problem"] for q in dataset][:num_prompts]
     bench_name = "math500"
     bench_conversations = {bench_name: []}
-    for i in range(num_prompts):
+    for i in range(len(prompts)):
         bench_conversations[bench_name].append(
             [{"role": "user", "content": prompts[i]}]
         )
@@ -350,7 +361,7 @@ def main():
                 "duration": float(f"{duration:.2f}"),
                 "throughput": float(f"{completion_tokens / duration:.2f}"),
                 "completion_tokens": completion_tokens,
-                "benchmark_name": bench_name,
+                "benchmark": bench_name,
             }
             send_flush_cache_request(base_url)
             with open(args.output, "a") as fout:
