@@ -12,7 +12,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3_online.py \
     --target-model-path Qwen/QwQ-32B \
     --draft-model-config $ROOT_DIR/configs/qwq-32B-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/ultrachat_100.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
     --output-dir $ROOT_DIR/outputs/QwQ-32B-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \
