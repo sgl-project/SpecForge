@@ -1,9 +1,10 @@
+import os
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 
-from specforge.utils import print_with_rank
+from specforge.utils import print_with_rank,detect_communication_backend
 
 _TP_GROUP = None
 _DP_GROUP = None
@@ -26,14 +27,39 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    print_with_rank(f"bind to device {local_rank}")
+    backend_name=detect_communication_backend()
+    # single machine
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+
+        dist.init_process_group(
+            backend=backend_name,
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+            timeout=timedelta(minutes=timeout),
+        )
+    else:
+        dist.init_process_group(
+            backend=backend_name,
+            timeout=timedelta(minutes=timeout),
+        )
 
     # initialize sub groups
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+
+    # Set CUDA device only if CUDA is available
+    if torch.cuda.is_available():
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        print_with_rank(f"Bind to CUDA device {local_rank}")
+    else:
+        print_with_rank("CUDA not available, running on CPU")
+
     dp_size = world_size // tp_size
     assert world_size == tp_size * dp_size, "world size must be divisible by tp size"
     global _TP_GROUP, _DP_GROUP

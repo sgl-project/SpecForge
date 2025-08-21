@@ -2,13 +2,15 @@ import argparse
 import hashlib
 import os
 import time
+import platform
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -26,7 +28,7 @@ from specforge.data import (
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
+from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority, detect_device, detect_attention_impl
 
 
 def parse_args():
@@ -129,11 +131,56 @@ def print_on_rank0(message):
         print(message)
 
 
+def unwrap_model(model):
+    # return module if ddp or fsdp
+    return model.module if hasattr(model, "module") else model
+
+
+def safe_all_reduce(tensor, op=dist.ReduceOp.SUM):
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(tensor, op=op)
+    # return tensor if single node world_size=1
+    return tensor
+
+
+def is_distributed():
+    return (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+
+
+def fsdp_fullstate_ctx(model):
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+    except Exception:
+        FSDP = None
+        StateDictType = None
+        FullStateDictConfig = None
+
+    """return FULL_STATE_DICT if model is fsdp and  StateDictType is available ,otherwise return nullcontext"""
+    if (
+        FSDP is not None
+        and isinstance(model, FSDP)
+        and StateDictType is not None
+        and FullStateDictConfig is not None
+    ):
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        return FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg)
+    return nullcontext()
+
+
 def main():
     # initialize
     parser, args = parse_args()
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    # target device check
+    device = detect_device()
+    # attention backend check
+    attention_backend = detect_attention_impl(prefer=args.attention_backend)
     print_with_rank("Initialized distributed environment")
 
     tracker_class = get_tracker_class(args.report_to)
@@ -168,7 +215,7 @@ def main():
                 cache_dir=args.cache_dir,
             )
             .eval()
-            .cuda()
+            .to(device)
         )
     print_with_rank("Initialized target model")
     # load model with resume
@@ -178,15 +225,15 @@ def main():
             AutoEagle3DraftModel.from_pretrained(
                 draft_model_last_checkpoint, attention_backend=args.attention_backend
             )
-            .cuda()
+            .to(device)
             .to(torch.bfloat16)
         )
     else:
         draft_model = (
             AutoEagle3DraftModel.from_config(
-                draft_model_config, attention_backend=args.attention_backend
+                draft_model_config, attention_backend=attention_backend
             )
-            .cuda()
+            .to(device)
             .to(torch.bfloat16)
         )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
@@ -259,21 +306,31 @@ def main():
         target_model=target_model,
         draft_model=draft_model,
         length=args.ttt_length,
-        attention_backend=args.attention_backend,
+        attention_backend=attention_backend,
     )
-    # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
-    eagle3_model = FSDP(
-        eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        ignored_modules=[target_model],
-        process_group=get_dp_group(),
-    )
-    print_with_rank("Initialized Eagle3 FSDP model")
+
+    # device and system detect
+    eagle3_model.to(device)
+
+    # use nn.Module or  DDP under macos or  cpu
+    if platform.system() == "Darwin" or device.type in ["mps", "cpu"]:
+        print("Running on macOS (MPS/CPU) -> fallback to plain model / DDP")
+        # multprocessing
+        # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
+        pass
+    else:
+        eagle3_model = FSDP(
+            eagle3_model,
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            ),
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            ignored_modules=[target_model],
+            process_group=get_dp_group(),
+        )
+        print_with_rank("Initialized Eagle3 FSDP model")
 
     # build other components
     optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
@@ -320,8 +377,9 @@ def main():
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
-        epoch_acces = [[] for _ in range(eagle3_model.module.length)]
-        epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
+        real_model = unwrap_model(eagle3_model)
+        epoch_acces = [[] for _ in range(real_model.length)]
+        epoch_plosses = [[] for _ in range(real_model.length)]
 
         for batch_index, data in enumerate(
             tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
@@ -349,9 +407,9 @@ def main():
 
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
+                input_ids=data["input_ids"].to(device),
+                attention_mask=data["attention_mask"].to(device),
+                loss_mask=data["loss_mask"].to(device),
             )
 
             # calculate weighted loss
@@ -383,8 +441,8 @@ def main():
 
         epoch_logdict = {}
         for i in range(len(epoch_acces)):
-            acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-            dist.all_reduce(acc_i)
+            acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
+            acc_i = safe_all_reduce(acc_i)
             acc_i = (acc_i / dist.get_world_size()).item()
             epoch_logdict[f"train/epoch_acc_{i}"] = acc_i
             print_on_rank0(
@@ -392,8 +450,8 @@ def main():
             )
 
         for i in range(len(epoch_plosses)):
-            loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-            dist.all_reduce(loss_i)
+            loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
+            loss_i = safe_all_reduce(loss_i)
             loss_i = (loss_i / dist.get_world_size()).item()
             epoch_logdict[f"train/epoch_ploss_{i}"] = loss_i
             print_on_rank0(
@@ -410,9 +468,9 @@ def main():
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                 plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                    input_ids=data["input_ids"].to(device),
+                    attention_mask=data["attention_mask"].to(device),
+                    loss_mask=data["loss_mask"].to(device),
                 )
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
@@ -422,8 +480,8 @@ def main():
             # Log epoch-level evaluation metrics
             eval_logdict = {}
             for i in range(len(eval_acces)):
-                acc_i = torch.tensor(eval_acces[i]).cuda().mean()
-                dist.all_reduce(acc_i)
+                acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
+                acc_i = safe_all_reduce(acc_i)
                 acc_i = (acc_i / dist.get_world_size()).item()
                 eval_logdict[f"eval/epoch_acc_{i}"] = acc_i
                 print_on_rank0(
@@ -431,8 +489,8 @@ def main():
                 )
 
             for i in range(len(eval_plosses)):
-                loss_i = torch.tensor(eval_plosses[i]).cuda().mean()
-                dist.all_reduce(loss_i)
+                loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
+                loss_i = safe_all_reduce(loss_i)
                 loss_i = (loss_i / dist.get_world_size()).item()
                 eval_logdict[f"eval/epoch_ploss_{i}"] = loss_i
                 print_on_rank0(
@@ -444,11 +502,12 @@ def main():
             # Save the model
             epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
 
-            if dist.get_rank() == 0:
+            if (not is_distributed()) or dist.get_rank() == 0:
                 os.makedirs(epoch_output_dir, exist_ok=True)
-            dist.barrier()
+            if is_distributed():
+                dist.barrier()
 
-            with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+            with fsdp_fullstate_ctx(eagle3_model):
                 model_state_dict = eagle3_model.state_dict()
                 state_to_save = {
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -463,7 +522,7 @@ def main():
                     if "draft_model." in k and "embed" not in k.lower()
                 }
 
-                if dist.get_rank() == 0:
+                if (not is_distributed()) or dist.get_rank() == 0:
                     torch.save(
                         state_to_save,
                         os.path.join(epoch_output_dir, "training_state.pt"),
@@ -476,7 +535,8 @@ def main():
                         state_dict=draft_model_state_dict,
                     )
                     print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-                dist.barrier()
+                if is_distributed():
+                    dist.barrier()
 
     # Close the tracker
     tracker.close()
