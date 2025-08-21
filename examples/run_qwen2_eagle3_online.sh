@@ -3,7 +3,7 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 
-# support tp4 train eagle3 for Qwen3-8B
+# support tp4 train eagle3 for Qwen2.5-math-7B
 NUM_GPUS=${1:-1}
 
 torchrun \
