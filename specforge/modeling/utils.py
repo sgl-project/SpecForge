@@ -1,7 +1,6 @@
 import torch
 
 
-# TODO maybe rename e.g. shift_padding, and input dim e.g. dim=1
 @torch.no_grad()
 def padding(tensor, left=True):
     zeropadding = torch.zeros_like(tensor[:, -1:])
