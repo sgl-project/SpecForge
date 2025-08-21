@@ -1,8 +1,7 @@
 import argparse
 import json
-import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from datasets import load_dataset
 from tqdm import tqdm
@@ -34,11 +33,11 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt"],
+        choices=["ultrachat", "sharegpt", "opc"],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
-        "--output_path",
+        "--output-path",
         type=str,
         default=None,
         help="The path to save the processed dataset, if not specified, the dataset will be saved in the cache/dataset/dataset_name directory of the root path",
@@ -52,7 +51,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def process_ultrachat_row(row) -> Dict:
+def process_ultrachat_row(row: Dict) -> Tuple[Dict, int]:
     """Process a row from the ultrachat dataset.
 
     The function expects a row with the following schema:
@@ -71,10 +70,10 @@ def process_ultrachat_row(row) -> Dict:
         assert role in ["user", "assistant"]
         formatted_conversations.append({"role": role, "content": content})
     row = {"id": row["prompt_id"], "conversations": formatted_conversations}
-    return row
+    return row, 0
 
 
-def process_sharegpt_row(row) -> Dict:
+def process_sharegpt_row(row: Dict) -> Tuple[Dict, int]:
     """
     sharegpt dataset schema:
     {
@@ -108,6 +107,21 @@ def load_dataset_from_path(data_path: Path):
     return ds
 
 
+import hashlib
+
+
+def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
+    row_id = hashlib.md5((row["instruction"] + row["output"]).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["instruction"]},
+            {"role": "assistant", "content": row["output"]},
+        ],
+    }
+    return processed_row, 0
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -121,9 +135,14 @@ def main():
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))
         proc_fn = process_sharegpt_row
+    elif args.dataset == "opc":
+        ds = load_dataset(
+            "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
+        )["train"]
+        proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
-            f"This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
 
     if args.output_path is None:

@@ -8,6 +8,7 @@ By generating hidden states in advance, we can avoid:
 import argparse
 import hashlib
 import os
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,7 @@ from datasets import Dataset, load_dataset
 from sglang.bench_one_batch import BenchArgs, load_model
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -24,7 +26,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
-    DeepEPMode,
     configure_logger,
     get_bool_env_var,
     require_mlp_sync,
@@ -119,15 +120,18 @@ class SglangHiddenStatesGenerator:
                 batch,
                 dp_size=model_runner.server_args.dp_size,
                 attn_tp_size=1,
-                tp_cpu_group=model_runner.tp_group.cpu_group,
+                tp_group=model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 speculative_num_draft_tokens=None,
-                require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
                 enable_two_batch_overlap=model_runner.server_args.enable_two_batch_overlap,
-                enable_deepep_moe=model_runner.server_args.enable_deepep_moe,
-                deepep_mode=DeepEPMode[model_runner.server_args.deepep_mode],
+                enable_deepep_moe=MoeA2ABackend(
+                    model_runner.server_args.moe_a2a_backend
+                ).is_deepep(),
+                deepep_mode=DeepEPMode(model_runner.server_args.deepep_mode),
+                require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+                disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
             )
 
     @torch.no_grad
@@ -140,7 +144,6 @@ class SglangHiddenStatesGenerator:
             model_config=model_runner.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            enable_custom_logit_processor=False,
         )
         batch.prepare_for_extend()
         self._maybe_prepare_mlp_sync_batch(batch, model_runner)
@@ -184,10 +187,10 @@ class SglangHiddenStatesGenerator:
                     )
                     assert not torch.any(
                         torch.isnan(data_point["hidden_state"])
-                    ), f"hidden_state is expected to be non-nan"
+                    ), "hidden_state is expected to be non-nan"
                     assert not torch.any(
                         torch.isnan(data_point["aux_hidden_state"])
-                    ), f"aux_hidden_state is expected to be non-nan"
+                    ), "aux_hidden_state is expected to be non-nan"
                     torch.save(data_point, output_file)
             else:
                 for hidden_state, (data_point, output_file) in zip(
@@ -196,7 +199,7 @@ class SglangHiddenStatesGenerator:
                     data_point["hidden_state"] = hidden_state.clone().unsqueeze(0).cpu()
                     assert not torch.any(
                         torch.isnan(data_point["hidden_state"])
-                    ), f"hidden_state is expected to be non-nan"
+                    ), "hidden_state is expected to be non-nan"
                     torch.save(data_point, output_file)
 
     def generate(self, dataset: Dataset):
@@ -317,6 +320,8 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--enable-aux-hidden-states", action="store_true")
     parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     return parser.parse_args()
@@ -324,7 +329,19 @@ def parse_args():
 
 def main():
     args = parse_args()
-    torch.distributed.init_process_group(backend="nccl")
+
+    # args.dist_timeout is defined in sglang.srt.server_args.ServerArgs and is in seconds.
+    if args.dist_timeout is not None:
+        if args.dist_timeout <= 0:
+            raise ValueError(
+                f"--dist-timeout must be a positive number of seconds, but got {args.dist_timeout}"
+            )
+        torch.distributed.init_process_group(
+            backend="nccl", timeout=timedelta(seconds=args.dist_timeout)
+        )
+    else:
+        torch.distributed.init_process_group(backend="nccl")
+
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
@@ -336,7 +353,13 @@ def main():
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    cache_key = hashlib.md5(args.data_path.encode()).hexdigest()
+    cache_params_string = (
+        f"{args.data_path}-"
+        f"{args.max_length}-"
+        f"{args.chat_template}-"
+        f"{args.model_path}"  # Tokenizer may also different
+    )
+    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     with rank_0_priority():
         eagle3_dataset = build_eagle3_dataset(
             dataset=dataset,
@@ -345,8 +368,9 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
         )
-        print_with_rank(f"Built dataset")
+        print_with_rank("Built dataset")
 
     hidden_states_generator = SglangHiddenStatesGenerator(
         args, tp_rank=torch.distributed.get_rank()

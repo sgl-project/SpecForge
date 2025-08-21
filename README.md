@@ -57,7 +57,7 @@ We provide two orthogonal paths so everyone can start training in minutes, regar
 > **Why does disk matter?**
 > During Eagle3 training, the frozen target model will first generate the hidden states for each token given the data sample. The hidden states are fed to the draft model for training.
 > Offline mode stores these hidden states to the local disk, so a small disk can be filled up fast.
-> Online mode only generates these hidden states on the fly without storing them to the disk, but needs to keep the draft model alive during training, trading GPU RAM for almost-zero disk footprint.
+> Online mode only generates these hidden states on the fly without storing them to the disk, but needs to keep the target model resident in memory during training, trading GPU RAM for almost-zero disk footprint.
 
 ### ⚡️ SGLang-ready
 
@@ -178,9 +178,9 @@ We have provided a simple startup script to train the Eagle3 model for Llama-3.1
 bash ./examples/run_llama3_eagle3_offline.sh
 ```
 
-### 📈 Wandb Integration
+### 📈 Experiment Tracking
 
-If you wish to log the training progress to Wandb, you can add `--wandb`, `--wandb-key`, `--wandb-project` and `--wandb-name` to the command line in the provided sh file.
+This project supports logging training progress to Wandb, TensorBoard, and SwanLab. You can enable tracking by adding the --report-to argument to the command line in your shell script.
 
 ## 💡 Customize Your Own Training
 
@@ -205,7 +205,7 @@ torchrun \
 
 If you wish to understand what each argument does, you can run `python scripts/train_eagle3_online.py --help` to see the full list of arguments. Particularly, we will discuss some important arguments below.
 - `--chat-template`: This should be the chat template to use for the model, so please make sure you set it to the correct value.
-- `--cache-dir`: This directory contains the dataset cache including the `input_ids`, `loss_mask`, `attention_mask` and `vocab_mapping`. These caches can make your data loading much faster once a cache is generated. The cache file has a name which is obtained by hashing the dataset path to avoid cache collision. **However, if you use the same cache for different models, that might cause problems because configs like vocab size is not consistent for different models. Thus please delete the old cache before you start training with a new model.**
+- `--cache-dir`: This directory contains the dataset cache including the `input_ids`, `loss_mask`, `attention_mask` and `vocab_mapping`. These caches can make your data loading much faster once a cache is generated. The cache file has a name which is obtained by hashing the dataset path to avoid cache collision.
 
 ### 💬 Customize Chat Template
 
