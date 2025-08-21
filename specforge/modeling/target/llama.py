@@ -37,7 +37,12 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import (
+    TransformersKwargs,
+    auto_docstring,
+    can_return_tuple,
+    logging,
+)
 
 from specforge.distributed import get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -543,7 +548,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
 
-class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+class KwargsForCausalLM(FlashAttentionKwargs, TransformersKwargs): ...
 
 
 @auto_docstring

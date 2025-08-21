@@ -1,6 +1,6 @@
 {
   "architectures": [
-    "Qwen2ForCausalLMEagle3"
+    "LlamaForCausalLMEagle3"
   ],
   "attention_dropout": 0.0,
   "bos_token_id": 151643,

@@ -39,7 +39,6 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
-    KwargsForCausalLM,
     Qwen2RMSNorm,
     Qwen2RotaryEmbedding,
     apply_rotary_pos_emb,
@@ -48,7 +47,12 @@ from transformers.models.qwen2.modeling_qwen2 import (
     rotate_half,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import (
+    TransformersKwargs,
+    auto_docstring,
+    can_return_tuple,
+    logging,
+)
 
 # [MODIFIED] Import from distributed library
 from specforge.distributed import get_tp_group
@@ -484,7 +488,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin, DistributedTargetM
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
