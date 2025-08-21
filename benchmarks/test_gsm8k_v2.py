@@ -4,15 +4,15 @@ import re
 import time
 
 import numpy as np
+import openai
+
 # from sglang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
 from sglang.utils import download_and_cache_file, read_jsonl
-import openai
 from tqdm import tqdm
-
 
 INVALID = -9999999
 
@@ -48,14 +48,14 @@ def main(args):
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)
     lines = list(read_jsonl(data_path))
-    lines = lines[:args.num_questions]
+    lines = lines[: args.num_questions]
     client = openai.Client(base_url=f"http://127.0.0.1:30000/v1", api_key="None")
 
     # Run requests
     tic = time.perf_counter()
     total_completion_tokens = 0
     for line in tqdm(lines):
-        question = line['question']
+        question = line["question"]
         assert isinstance(question, str)
         print(question)
         response = client.chat.completions.create(
@@ -73,7 +73,6 @@ def main(args):
 
     # Compute speed
     output_throughput = total_completion_tokens / latency
-
 
     # Print results
     print(f"Latency: {latency:.3f} s")
