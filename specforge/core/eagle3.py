@@ -315,7 +315,7 @@ class OfflineEagle3Model(Eagle3Model):
             input_ids: (batch, seq_len)
             attention_mask: (batch, seq_len)
             loss_mask: (batch, seq_len, 1)
-            target: (batch, seq_len, vocab_size)
+            target: (batch, seq_len, hidden_size)
             hidden_states: (batch, seq_len, 3*hidden_size)
             past_key_values: We dont use this past_key_values in eagle3, but keep it
                 for compatibility. We control kvcache by cache_hidden.

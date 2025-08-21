@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import os
+import time
 import platform
 from contextlib import nullcontext
 
@@ -26,14 +27,8 @@ from specforge.data import (
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
-from specforge.utils import (
-    get_last_checkpoint,
-    print_with_rank,
-    rank_0_priority,
-    validate_wandb_args, detect_device, detect_attention_impl,
-)
 from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
+from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_prioritydetect_device, detect_attention_impl,
 
 
 def parse_args():
@@ -120,6 +115,11 @@ def parse_args():
     )
 
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-start-step", type=int, default=30)
+    parser.add_argument("--profile-num-steps", type=int, default=4)
+    parser.add_argument("--profile-record-shapes", action="store_true")
 
     args = parser.parse_args()
 
@@ -223,8 +223,8 @@ def main():
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(
-                draft_model_last_checkpoint,
-                attention_backend=attention_backend)
+                draft_model_last_checkpoint, attention_backend=args.attention_backend
+            )
             .to(device)
             .to(torch.bfloat16)
         )
@@ -330,7 +330,7 @@ def main():
             ignored_modules=[target_model],
             process_group=get_dp_group(),
         )
-        print_with_rank(f"Initialized Eagle3 FSDP model")
+        print_with_rank("Initialized Eagle3 FSDP model")
 
     # build other components
     optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
@@ -369,6 +369,8 @@ def main():
 
     dist.barrier()
 
+    last_time = time.time()
+
     # start running
     print_on_rank0(f"Starting training from epoch {start_epoch}")
     for epoch in range(start_epoch, args.num_epochs):
@@ -379,7 +381,30 @@ def main():
         epoch_acces = [[] for _ in range(real_model.length)]
         epoch_plosses = [[] for _ in range(real_model.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        for batch_index, data in enumerate(
+            tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
+        ):
+            if args.profile and epoch == 0:
+                if batch_index == args.profile_start_step:
+                    print("Start profile")
+                    torch_profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=True,
+                        record_shapes=args.profile_record_shapes,
+                    )
+                    torch_profiler.start()
+                if batch_index == args.profile_start_step + args.profile_num_steps:
+                    output_path = os.path.join(
+                        os.environ["SGLANG_TORCH_PROFILER_DIR"],
+                        f"debug_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
+                    )
+                    print(f"End profile {output_path=}")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(output_path)
+
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
                 input_ids=data["input_ids"].to(device),
@@ -388,7 +413,7 @@ def main():
             )
 
             # calculate weighted loss
-            ploss_weight = [0.8 ** i for i in range(len(plosses))]
+            ploss_weight = [0.8**i for i in range(len(plosses))]
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
             optimizer.step()
@@ -407,6 +432,12 @@ def main():
             epoch_plosses = [
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
+
+            if args.verbose:
+                print(
+                    f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
+                )
+                last_time = time.time()
 
         epoch_logdict = {}
         for i in range(len(epoch_acces)):
@@ -452,7 +483,6 @@ def main():
                 acc_i = torch.tensor(epoch_acces[i]).to(device).mean()
                 acc_i = safe_all_reduce(acc_i)
                 acc_i = (acc_i / dist.get_world_size()).item()
-
                 eval_logdict[f"eval/epoch_acc_{i}"] = acc_i
                 print_on_rank0(
                     f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
@@ -462,7 +492,6 @@ def main():
                 loss_i = torch.tensor(epoch_plosses[i]).to(device).mean()
                 loss_i = safe_all_reduce(loss_i)
                 loss_i = (loss_i / dist.get_world_size()).item()
-
                 eval_logdict[f"eval/epoch_ploss_{i}"] = loss_i
                 print_on_rank0(
                     f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
