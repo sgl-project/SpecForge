@@ -355,13 +355,19 @@ def main():
             duration = time.perf_counter() - start_timestamp
             completion_tokens = sum(req_obj.output_tokens for req_obj in outputs)
             time.sleep(3)
-            acc_length = send_get_accept_length_request(base_url)
+            if steps > 0:
+                acc_length = send_get_accept_length_request(base_url)
+            else:
+                # steps == 0 means no speculative algorithm is used
+                acc_length = 1.0
             record = {
                 "batch_size": batch_size,
                 "steps": steps,
                 "topk": topk,
                 "num_draft_tokens": num_draft_tokens,
-                "acc_length": float(f"{acc_length:.2f}"),
+                "acc_length": (
+                    float(f"{acc_length:.2f}") if acc_length is not None else None
+                ),
                 "duration": float(f"{duration:.2f}"),
                 "throughput": float(f"{completion_tokens / duration:.2f}"),
                 "completion_tokens": completion_tokens,
