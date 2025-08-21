@@ -10,7 +10,7 @@ import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
