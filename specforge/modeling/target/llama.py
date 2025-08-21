@@ -40,14 +40,7 @@ from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
 )
 from transformers.processing_utils import Unpack
-
-from transformers.utils import (
-    TransformersKwargs,
-    auto_docstring,
-    can_return_tuple,
-    logging,
-)
-
+from transformers.utils import can_return_tuple, logging
 
 from specforge.distributed import get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -448,9 +441,6 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
 
-
-
-@auto_docstring
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin, DistributedTargetModel):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
