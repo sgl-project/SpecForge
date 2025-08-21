@@ -6,39 +6,41 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from specforge.distributed import init_distributed
 
 
-def test_llama3_tp(rank, world_size, temp_dir):
+def test_qwen2_tp(rank, world_size, temp_dir):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29501"
+    os.environ["MASTER_PORT"] = "29500"
 
     init_distributed(tp_size=2)
     set_seed(42)
-    config = LlamaConfig(
+    config = Qwen2Config(
         vocab_size=1000,
         hidden_size=384,
         intermediate_size=512,
+        intermediate_size_mlp=512,
         num_hidden_layers=2,
         max_position_embeddings=1024,
         num_attention_heads=10,
         num_key_value_heads=2,
-        tie_word_embeddings=False,
+        head_dim=64,
+        num_local_experts=4,
+        tie_word_embedding=False,
         initializer_range=0.02,
         hidden_act="silu",
-        rms_norm_eps=1e-6,
     )
 
     # create the single-gpu
-    model = LlamaForCausalLM(config).cuda()
+    model = Qwen2ForCausalLM(config).cuda()
 
-    from specforge.modeling.target.llama import LlamaForCausalLM as DistLlamaForCausalLM
+    from specforge.modeling.target.qwen2 import Qwen2ForCausalLM as DistQwen2ForCausalLM
 
-    dist_model = DistLlamaForCausalLM(config).cuda()
+    dist_model = DistQwen2ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -66,7 +68,7 @@ def test_llama3_tp(rank, world_size, temp_dir):
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
 
-class TestLlama3TP(unittest.TestCase):
+class TestQwen2TP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -74,12 +76,12 @@ class TestLlama3TP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_llama3_tp(self):
-        mp.spawn(test_llama3_tp, nprocs=2, args=(2, self.temp_dir.name))
+    def test_qwen2_tp(self):
+        mp.spawn(test_qwen2_tp, nprocs=2, args=(2, self.temp_dir.name))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(TestLlama3TP))
+    suite.addTest(unittest.makeSuite(TestQwen2TP))
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)
