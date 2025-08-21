@@ -28,7 +28,7 @@ from specforge.data import (
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_prioritydetect_device, detect_attention_impl,
+from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority, detect_device, detect_attention_impl
 
 
 def parse_args():
