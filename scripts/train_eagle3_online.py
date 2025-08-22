@@ -10,7 +10,7 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from specforge import (
     AutoDistributedTargetModel,
@@ -42,7 +42,9 @@ def parse_args():
         default="model.embed_tokens.weight",
         help="The key of the embedding weight to load from the target model",
     )
-    parser.add_argument("--is-vlm", action="store_true", help="Whether the target model is a VLM")
+    parser.add_argument(
+        "--is-vlm", action="store_true", help="Whether the target model is a VLM"
+    )
 
     # add training-related arguments
     parser.add_argument("--train-data-path", type=str, required=True)
@@ -115,8 +117,12 @@ def parse_args():
     )
 
     # vlm related args
-    parser.add_argument("--min-pixels", type=int, default=50176) # 64*28*28 for qwen2.5-vl
-    parser.add_argument("--max-pixels", type=int, default=802816) # 1024*28*28 for qwen2.5-vl
+    parser.add_argument(
+        "--min-pixels", type=int, default=50176
+    )  # 64*28*28 for qwen2.5-vl
+    parser.add_argument(
+        "--max-pixels", type=int, default=802816
+    )  # 1024*28*28 for qwen2.5-vl
 
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
     parser.add_argument("--verbose", action="store_true")
@@ -129,9 +135,11 @@ def parse_args():
 
     return parser, args
 
+
 def print_on_rank0(message):
     if dist.get_rank() == 0:
         print(message)
+
 
 def main():
     # initialize
@@ -169,6 +177,7 @@ def main():
     else:
         if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
             from transformers import Qwen2_5_VLForConditionalGeneration
+
             target_model = (
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     pretrained_model_name_or_path=args.target_model_path,
@@ -183,7 +192,7 @@ def main():
                     pretrained_model_name_or_path=args.target_model_path,
                     torch_dtype=torch.bfloat16,
                     cache_dir=args.cache_dir,
-            )
+                )
                 .eval()
                 .cuda()
             )
@@ -212,7 +221,11 @@ def main():
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     if args.is_vlm:
-        processor = AutoProcessor.from_pretrained(args.target_model_path,min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+        processor = AutoProcessor.from_pretrained(
+            args.target_model_path,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+        )
     else:
         processor = None
 
@@ -294,7 +307,7 @@ def main():
             draft_model=draft_model,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
-    )
+        )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
         eagle3_model,

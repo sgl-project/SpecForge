@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt","sharegpt4v","allava4v", "opc"],
+        choices=["ultrachat", "sharegpt", "sharegpt4v", "allava4v", "opc"],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -146,13 +146,15 @@ def process_sharegpt4v_row(row) -> Dict:
             content = message["value"]
         formatted_conversations.append({"role": new_role, "content": content})
 
-    row = {"id": row["id"], "image":image, "conversations": formatted_conversations}
+    row = {"id": row["id"], "image": image, "conversations": formatted_conversations}
     return row, skipped_count
+
 
 def load_dataset_from_path(data_path: Path):
     suffix = data_path.suffix.split(".")[1]
     ds = load_dataset(suffix, data_files=str(data_path), split="train")
     return ds
+
 
 def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
     train_output_jsonl_path = output_path.joinpath(f"{dataset_name}_train.jsonl")
@@ -161,7 +163,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
             f"The dataset {dataset_name} has already been processed and saved in {train_output_jsonl_path}, skipping..."
         )
         return
-    
+
     total_skipped_count = 0
     with open(train_output_jsonl_path, "w") as f:
         for item in tqdm(train_ds, desc=f"Processing {dataset_name} dataset"):
@@ -170,7 +172,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
                 continue
             total_skipped_count += skipped_count
             f.write(json.dumps(row) + "\n")
-    
+
     if test_ds is not None:
         test_output_jsonl_path = output_path.joinpath(f"{dataset_name}_test.jsonl")
         with open(test_output_jsonl_path, "w") as f:
@@ -182,7 +184,10 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
                 f.write(json.dumps(row) + "\n")
 
     if total_skipped_count > 0:
-        print(f"Skipped {total_skipped_count}/{len(train_ds)+len(test_ds)} messages for {dataset_name}")
+        print(
+            f"Skipped {total_skipped_count}/{len(train_ds)+len(test_ds)} messages for {dataset_name}"
+        )
+
 
 import hashlib
 
@@ -216,7 +221,9 @@ def main():
         ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "allava4v":
-        ds = load_dataset("FreedomIntelligence/ALLaVA-4V",name="allava_laion")["instruct"]
+        ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
+            "instruct"
+        ]
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "opc":
         ds = load_dataset(
@@ -227,7 +234,7 @@ def main():
         raise ValueError(
             "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
-    
+
     # filter and split dataset
     if args.sample_size is not None and args.sample_size < len(ds):
         ds = ds.select(range(args.sample_size))
@@ -249,7 +256,6 @@ def main():
         output_path.mkdir(parents=True, exist_ok=True)
 
     process_and_save_ds(train_ds, test_ds, output_path, proc_fn, args.dataset)
-
 
 
 if __name__ == "__main__":

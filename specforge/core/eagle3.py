@@ -441,6 +441,7 @@ class OfflineEagle3Model(Eagle3Model):
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
+
 class QwenVLOnlineEagle3Model(Eagle3Model):
     """
     In sgl-spec, we implement offline/online training.
@@ -453,7 +454,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
     5. finally, we run TTT to train the draft model. input size is (batch, seq_len, hidden_size * 2)
     """
 
-    def __init__(self, target_model, draft_model: Eagle3DraftModel, processor, length: int = 7):
+    def __init__(
+        self, target_model, draft_model: Eagle3DraftModel, processor, length: int = 7
+    ):
         """
         Args:
             target_model: the target model to extract hidden states.
@@ -474,7 +477,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         loss_mask: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L692
@@ -541,13 +544,22 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         return hidden_states, target, loss_mask, input_ids
 
     @torch.no_grad()
-    def _get_input_embeds(self, input_ids: torch.Tensor, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+    def _get_input_embeds(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
         # get input embeding with image
         # inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
         inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-        image_embeds = self.target_model.model.get_image_features(pixel_values, image_grid_thw)
+        image_embeds = self.target_model.model.get_image_features(
+            pixel_values, image_grid_thw
+        )
         image_embeds = torch.cat(image_embeds, dim=0)
-        n_image_tokens = (input_ids == self.target_model.model.config.image_token_id).sum()
+        n_image_tokens = (
+            input_ids == self.target_model.model.config.image_token_id
+        ).sum()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
             raise ValueError(
@@ -605,13 +617,18 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
         if position_ids is None:
             attention_mask_tensor = (
-                attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
+                attention_mask
+                if not isinstance(attention_mask, dict)
+                else attention_mask["full_attention"]
             )
             if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
-                attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
-                attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+                attention_mask_tensor = torch.diagonal(
+                    attention_mask_tensor[:, 0], dim1=1, dim2=2
+                )
+                attention_mask_tensor = (
+                    attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+                )
                 attention_mask_tensor = (1.0 - attention_mask_tensor).int()
-
 
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 input_ids,

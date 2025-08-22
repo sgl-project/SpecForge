@@ -136,12 +136,12 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
     mrope_section = mrope_section * 2
-    cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-        unsqueeze_dim
-    )
-    sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-        unsqueeze_dim
-    )
+    cos = torch.cat(
+        [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
+    sin = torch.cat(
+        [m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
@@ -296,31 +296,47 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
+
 class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
-    def __init__(self, 
-                 dim, 
-                 max_position_embeddings=2048, 
-                 base=10000, 
-                 device=None,
-                 scaling_factor=1.0):
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+    ):
         super().__init__(dim, max_position_embeddings, base, device)
         self.scaling_factor = scaling_factor
 
     def forward(self, x, position_ids):
         # In contrast to other models, Qwen2_5_VL has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
-        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+        )
+        position_ids_expanded = position_ids[
+            :, :, None, :
+        ].float()  # shape (3, bs, 1, positions)
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(2, 3)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.scaling_factor
             sin = emb.sin() * self.scaling_factor
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-    
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -379,8 +395,7 @@ class LlamaAttention(nn.Module):
                 )
             elif scaling_type == "mrope":
                 self.rotary_emb = LlamaMutiRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -423,7 +438,11 @@ class LlamaAttention(nn.Module):
                 cos, sin = self.rotary_emb(query_states, position_ids)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states, key_states, cos, sin, self.config.rope_scaling["mrope_section"]
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    self.config.rope_scaling["mrope_section"],
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len)
@@ -447,10 +466,14 @@ class LlamaAttention(nn.Module):
         else:
             lck = len(cache_hidden[0])
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                cos, sin = self.rotary_emb(query_states, position_ids+ lck)
+                cos, sin = self.rotary_emb(query_states, position_ids + lck)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states, key_states, cos, sin, self.config.rope_scaling["mrope_section"]
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    self.config.rope_scaling["mrope_section"],
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)

@@ -115,6 +115,7 @@ class DataCollatorWithPadding:
             )
         return batch
 
+
 class VlmDataCollatorWithPadding:
     """
     Datacollator that will dynamically pad the inputs for batching.
@@ -212,6 +213,7 @@ class VlmDataCollatorWithPadding:
                 [self.paddingtensor(item["target"], max_length) for item in features]
             )
         return batch
+
 
 def prepare_dp_dataloaders(
     dataset: Dataset,

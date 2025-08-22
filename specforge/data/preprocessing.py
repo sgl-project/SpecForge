@@ -28,9 +28,9 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from datasets import Dataset as HFDataset
-from tqdm import tqdm
-from transformers import PreTrainedTokenizer,ImageProcessingMixin
 from qwen_vl_utils import process_vision_info
+from tqdm import tqdm
+from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
 from specforge.utils import padding
 
@@ -139,6 +139,7 @@ def preprocess_conversations(
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
     return results
 
+
 def preprocess_vlm_conversations(
     processor: ImageProcessingMixin,
     examples: List[Conversation],
@@ -173,7 +174,13 @@ def preprocess_vlm_conversations(
     )
 
     # prepare result
-    results = {"input_ids": [], "loss_mask": [], "attention_mask": [], "pixel_values": [], "image_grid_thw": []}
+    results = {
+        "input_ids": [],
+        "loss_mask": [],
+        "attention_mask": [],
+        "pixel_values": [],
+        "image_grid_thw": [],
+    }
 
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
@@ -193,16 +200,18 @@ def preprocess_vlm_conversations(
             assert role == convroles[j % 2], f"unexpected role {role}"
             if role == "user":
                 # if the message is from user and has image, process the image
-                messages.append({
-                                    "role": role, 
-                                    "content": [
-                                        {
-                                            "type": "image",
-                                            "image": image,
-                                        },
-                                        {"type": "text", "text": sentence["content"]},
-                                    ]
-                                 })
+                messages.append(
+                    {
+                        "role": role,
+                        "content": [
+                            {
+                                "type": "image",
+                                "image": image,
+                            },
+                            {"type": "text", "text": sentence["content"]},
+                        ],
+                    }
+                )
             else:
                 messages.append({"role": role, "content": sentence["content"]})
 
@@ -223,7 +232,7 @@ def preprocess_vlm_conversations(
             truncation=True,
             return_tensors="pt",
             return_offsets_mapping=True,
-            add_special_tokens=False
+            add_special_tokens=False,
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
@@ -240,7 +249,9 @@ def preprocess_vlm_conversations(
         )
 
         # get conversation with image info
-        decoded_conversation = processor.tokenizer.decode(encoding.input_ids[0], skip_special_tokens=False)
+        decoded_conversation = processor.tokenizer.decode(
+            encoding.input_ids[0], skip_special_tokens=False
+        )
 
         for match in re.finditer(assistant_pattern, decoded_conversation, re.DOTALL):
             # Assistant response text span (excluding assistant_header itself)
@@ -262,6 +273,7 @@ def preprocess_vlm_conversations(
         results["pixel_values"].append(pixel_values)
         results["image_grid_thw"].append(image_grid_thw[None, :])
     return results
+
 
 def build_eagle3_dataset(
     dataset: HFDataset,
@@ -294,9 +306,7 @@ def build_eagle3_dataset(
         The processed HF dataset.
     """
     if is_vlm:
-        assert (
-            processor is not None
-        ), "processor must be provided when is_vlm is True"
+        assert processor is not None, "processor must be provided when is_vlm is True"
     # Get chat template
     assert (
         chat_template in TEMPLATE_REGISTRY.get_all_template_names()
@@ -341,9 +351,9 @@ def build_eagle3_dataset(
 
     # reduce batch size for VLM datasets to avoid PyArrow offset overflow
     if is_vlm:
-        batch_size=200
+        batch_size = 200
     else:
-        batch_size=1000
+        batch_size = 1000
     dataset = dataset.map(
         preprocess_function,
         batched=True,
