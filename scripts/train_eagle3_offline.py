@@ -1,10 +1,10 @@
 import argparse
 import hashlib
 import os
+import time
 
 import torch
 import torch.distributed as dist
-import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -22,7 +22,8 @@ from specforge.data import (
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.modeling.target.target_head import TargetHead
-from specforge.utils import print_with_rank, rank_0_priority, validate_wandb_args
+from specforge.tracker import create_tracker, get_tracker_class
+from specforge.utils import print_with_rank, rank_0_priority
 
 
 def parse_args():
@@ -80,26 +81,55 @@ def parse_args():
         default=20,
         help="Timeout for collective communication in minutes",
     )
+    # resume
+    parser.add_argument("--resume", action="store_true")
 
-    # wandb wandb args
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--wandb-name", type=str, default=None)
-    parser.add_argument("--wandb-key", type=str, default=None)
+    # report backend
+    parser.add_argument(
+        "--report-to",
+        type=str,
+        default="none",
+        choices=["wandb", "tensorboard", "swanlab", "none"],
+        help="The integration to report results and logs to.",
+    )
+    # wandb-specific args
+    parser.add_argument(
+        "--wandb-project", type=str, default=None, help="The project name for W&B."
+    )
+    parser.add_argument(
+        "--wandb-name", type=str, default=None, help="The run name for W&B."
+    )
+    parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
+    # add swanlab-specific args ---
+    parser.add_argument(
+        "--swanlab-project",
+        type=str,
+        default=None,
+        help="The project name for swanlab.",
+    )
+    parser.add_argument(
+        "--swanlab-name",
+        type=str,
+        default=None,
+        help="The experiment name for swanlab.",
+    )
+    parser.add_argument(
+        "--swanlab-key",
+        type=str,
+        default=None,
+        help="The API key for swanlab non-interactive login.",
+    )
+
+    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-start-step", type=int, default=30)
+    parser.add_argument("--profile-num-steps", type=int, default=4)
+    parser.add_argument("--profile-record-shapes", action="store_true")
 
     args = parser.parse_args()
 
     return parser, args
-
-
-def init_wandb(args):
-    wandb.login(key=args.wandb_key)
-    wandb.init(project=args.wandb_project, name=args.wandb_name)
-
-
-def wandb_log_if_initialized(log_dict):
-    if dist.get_rank() == 0 and wandb.run is not None:
-        wandb.log(log_dict)
 
 
 def print_on_rank0(message):
@@ -114,11 +144,14 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed environment")
 
-    # Validate wandb arguments
-    validate_wandb_args(parser, args)
+    # Validate report backend arguments
+    tracker_class = get_tracker_class(args.report_to)
+    if tracker_class:
+        tracker_class.validate_args(parser, args)
+    else:
+        parser.error(f"Unknown tracker: {args.report_to}")
 
-    if args.wandb and dist.get_rank() == 0:
-        init_wandb(args)
+    tracker = create_tracker(args, args.output_dir)
 
     # build target and draft model
     target_head = TargetHead(args.target_model_path)
@@ -164,6 +197,7 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset_tmp,
@@ -207,14 +241,12 @@ def main():
         print_with_rank("Initialized eval dataloader")
 
     # build Eagle3 model
-    # broadcast draft model
     eagle3_model = OfflineEagle3Model(
         target_head=target_head,
         draft_model=draft_model,
         length=args.ttt_length,
         attention_backend=args.attention_backend,
     )
-    # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -226,8 +258,8 @@ def main():
         ignored_modules=[],
         process_group=get_dp_group(),
     )
-    print_with_rank("Initialized Eagle3 FSDP model")
-
+    print_with_rank(f"Initialized Eagle3 FSDP model")
+    global_step = 0
     # build other components
     optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
     total_steps = args.num_epochs * len(train_dataloader)
@@ -237,6 +269,8 @@ def main():
     )
     print_with_rank("Initialized optimizer and scheduler")
 
+    last_time = time.time()
+
     # start running
     for epoch in range(args.num_epochs):
         # Run training
@@ -245,7 +279,30 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        for batch_index, data in enumerate(
+            tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
+        ):
+            if args.profile and epoch == 0:
+                if batch_index == args.profile_start_step:
+                    print("Start profile")
+                    torch_profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=True,
+                        record_shapes=args.profile_record_shapes,
+                    )
+                    torch_profiler.start()
+                if batch_index == args.profile_start_step + args.profile_num_steps:
+                    output_path = os.path.join(
+                        os.environ["SGLANG_TORCH_PROFILER_DIR"],
+                        f"debug_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
+                    )
+                    print(f"End profile {output_path=}")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(output_path)
+
             optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
                 input_ids=data["input_ids"].cuda(),  # [B, S]
@@ -263,38 +320,46 @@ def main():
             ploss.backward()
             optimizer.step()
             scheduler.step()
+            global_step += 1
 
             logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
             for i in range(len(plosses)):
                 logdict[f"train/ploss_{i}"] = plosses[i].item()
             for i in range(len(acces)):
                 logdict[f"train/acc_{i}"] = acces[i]
-            wandb_log_if_initialized(logdict)
+            # Pass global_step to the tracker
+            tracker.log(logdict, step=global_step)
 
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
 
+            if args.verbose:
+                print(
+                    f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
+                )
+                last_time = time.time()
+
+        # Log epoch-level training metrics
+        train_epoch_logdict = {}
         for i in range(len(epoch_acces)):
             acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
             dist.all_reduce(acc_i)
-            acc_i = acc_i / dist.get_world_size()
-            acc_i = acc_i.item()
-            wandb_log_if_initialized({f"train/epochacc_{i}": acc_i})
+            acc_i = (acc_i / dist.get_world_size()).item()
+            train_epoch_logdict[f"train/epoch_acc_{i}"] = acc_i
             print_on_rank0(
                 f"Train Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
             )
-
         for i in range(len(epoch_plosses)):
             loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
             dist.all_reduce(loss_i)
-            loss_i = loss_i / dist.get_world_size()
-            loss_i = loss_i.item()
-            wandb_log_if_initialized({f"train/epochploss_{i}": loss_i})
+            loss_i = (loss_i / dist.get_world_size()).item()
+            train_epoch_logdict[f"train/epoch_ploss_{i}"] = loss_i
             print_on_rank0(
                 f"Train Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
             )
+        tracker.log(train_epoch_logdict, step=global_step)
 
         # run evaluation
         if args.eval_data_path is not None and epoch % args.eval_interval == 0:
@@ -316,13 +381,13 @@ def main():
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
                 ]
 
-            for i in range(len(epoch_acces)):
-                acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+            # Log epoch-level evaluation metrics
+            eval_epoch_logdict = {}
+            for i in range(len(eval_acces)):
+                acc_i = torch.tensor(eval_acces[i]).cuda().mean()
                 dist.all_reduce(acc_i)
-                acc_i = acc_i / dist.get_world_size()
-                acc_i = acc_i.item()
-
-                wandb_log_if_initialized({f"eval/epochacc_{i}": acc_i})
+                acc_i = (acc_i / dist.get_world_size()).item()
+                eval_epoch_logdict[f"eval/epoch_acc_{i}"] = acc_i
                 print_on_rank0(
                     f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
                 )
@@ -330,13 +395,12 @@ def main():
             for i in range(len(epoch_plosses)):
                 loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
                 dist.all_reduce(loss_i)
-                loss_i = loss_i / dist.get_world_size()
-                loss_i = loss_i.item()
-
-                wandb_log_if_initialized({f"eval/epochploss_{i}": loss_i})
+                loss_i = (loss_i / dist.get_world_size()).item()
+                eval_epoch_logdict[f"eval/epoch_ploss_{i}"] = loss_i
                 print_on_rank0(
                     f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
                 )
+            tracker.log(eval_epoch_logdict, step=global_step)
 
         if epoch % args.save_interval == 0:
             # Save the model
@@ -355,6 +419,8 @@ def main():
                     )
                 dist.barrier()
 
+    # Close the tracker at the end of training
+    tracker.close()
     destroy_distributed()
 
 

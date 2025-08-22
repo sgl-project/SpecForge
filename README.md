@@ -159,11 +159,13 @@ bash ./examples/run_llama4_eagle3_online.sh
 
 # train Qwen3-30B-A3B
 # Qwen3-235B-A22B online training is also supported;
-# the relevant code is included in the script (currently commented out).
 bash ./examples/run_qwen3_moe_eagle3_online.sh
 
 # train Qwen3-8B
 bash ./examples/run_qwen3_dense_eagle3_online.sh
+
+# train Qwq-32B
+bash ./examples/run_qwq_eagle3_online.sh
 ```
 
 ### 💨 Offline Training
@@ -175,9 +177,9 @@ We have provided a simple startup script to train the Eagle3 model for Llama-3.1
 bash ./examples/run_llama3_eagle3_offline.sh
 ```
 
-### 📈 Wandb Integration
+### 📈 Experiment Tracking
 
-If you wish to log the training progress to Wandb, you can add `--wandb`, `--wandb-key`, `--wandb-project` and `--wandb-name` to the command line in the provided sh file.
+This project supports logging training progress to Wandb, TensorBoard, and SwanLab. You can enable tracking by adding the --report-to argument to the command line in your shell script.
 
 ## 💡 Customize Your Own Training
 

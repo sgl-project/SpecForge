@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.cache_utils import DynamicCache
 
@@ -151,10 +152,19 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
         """
-        # Step 1: prepare data with the target model
+        # Step 0: prepare data with the target model
         hidden_states, target, loss_mask, input_ids = self._prepare_data(
             input_ids, attention_mask, loss_mask
         )
+
+        # Step 1: handle vocab size
+        target_p_padded, position_mask = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -208,6 +218,7 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values = DynamicCache()
 
         for idx in range(self.length):
+            target_p = target_p_padded[:, idx : idx + seq_length, :]
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -225,47 +236,33 @@ class OnlineEagle3Model(Eagle3Model):
                 use_cache=True,
             )
 
-            # Step 5.3: handle vocab size
-            with torch.no_grad():
-                target_head = target
-                target_max_token = target_head.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
-                position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.draft_model.t2d]
-                target_head = target_head.float()
-                target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
-
             # update hidden states for next step
             hidden_states = hidden_states_out
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
-            logits = logits.float()
 
             # Step 5.5: calculate loss
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
+            loss = _compute_loss(
+                logits=logits, target_p=target_p, position_mask=position_mask
+            )
 
             # Step 5.6: record metrics
             plosses.append(loss)
             with torch.no_grad():
                 acces.append(
-                    (
-                        (logits.argmax(-1) == target_p.argmax(-1))
-                        * position_mask.squeeze(-1)
+                    _compute_metric_acc(
+                        logits=logits,
+                        target_p=target_p,
+                        position_mask=position_mask,
+                        loss_mask=loss_mask,
                     )
-                    .sum()
-                    .item()
-                    / (loss_mask.sum().item() + 1e-6)
                 )
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
+                position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 if self.attention_backend == "sdpa":
                     ind = torch.arange(seq_length, device=attention_mask.device)
@@ -315,7 +312,7 @@ class OfflineEagle3Model(Eagle3Model):
             input_ids: (batch, seq_len)
             attention_mask: (batch, seq_len)
             loss_mask: (batch, seq_len, 1)
-            target: (batch, seq_len, vocab_size)
+            target: (batch, seq_len, hidden_size)
             hidden_states: (batch, seq_len, 3*hidden_size)
             past_key_values: We dont use this past_key_values in eagle3, but keep it
                 for compatibility. We control kvcache by cache_hidden.
@@ -331,6 +328,15 @@ class OfflineEagle3Model(Eagle3Model):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
+
+        # Step 0: handle vocab size
+        target_p_padded, position_mask = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
 
         # Step 1: project the concatenated hidden states to the target hidden size
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
@@ -379,6 +385,7 @@ class OfflineEagle3Model(Eagle3Model):
             past_key_values = DynamicCache()
 
         for idx in range(self.length):
+            target_p = target_p_padded[:, idx : idx + seq_length, :]
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -396,47 +403,33 @@ class OfflineEagle3Model(Eagle3Model):
                 use_cache=True,
             )
 
-            # Step 5.3: handle vocab size
-            with torch.no_grad():
-                target_head = target
-                target_max_token = target_head.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
-                position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.draft_model.t2d]
-                target_head = target_head.float()
-                target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
-
             # update hidden states for next step
             hidden_states = hidden_states_out
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
-            logits = logits.float()
 
             # Step 5.5: calculate loss
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
+            loss = _compute_loss(
+                logits=logits, target_p=target_p, position_mask=position_mask
+            )
 
             # Step 5.6: record metrics
             plosses.append(loss)
             with torch.no_grad():
                 acces.append(
-                    (
-                        (logits.argmax(-1) == target_p.argmax(-1))
-                        * position_mask.squeeze(-1)
+                    _compute_metric_acc(
+                        logits=logits,
+                        target_p=target_p,
+                        position_mask=position_mask,
+                        loss_mask=loss_mask,
                     )
-                    .sum()
-                    .item()
-                    / (loss_mask.sum().item() + 1e-6)
                 )
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
+                position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 if self.attention_backend == "sdpa":
                     ind = torch.arange(seq_length, device=attention_mask.device)
@@ -717,3 +710,53 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 ind1 = ind[: seq_length - idx]
                 attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
         return plosses, vlosses, acces
+
+
+def _compute_target_p_padded(target, t2d, loss_mask, length):
+    with torch.no_grad():
+        target_p, position_mask = _compute_target_p(
+            target=target,
+            t2d=t2d,
+            loss_mask=loss_mask,
+        )
+
+        assert len(target_p.shape) == 3
+        target_p_padded = F.pad(
+            target_p,
+            pad=(0, 0, 0, length),
+            mode="constant",
+            # For bitwise equality with previous code
+            value=1 / target_p.shape[-1],
+        )
+
+        return target_p_padded, position_mask
+
+
+@torch.compile(dynamic=None)
+def _compute_target_p(target, t2d, loss_mask):
+    target_head = target
+    target_max_token = target_head.argmax(-1)
+    target_mask = t2d[target_max_token]
+    target_mask = target_mask[..., None].int()
+    position_mask = target_mask * loss_mask
+    target_head = target_head[..., t2d]
+    target_head = target_head.float()
+    target_p = nn.Softmax(dim=2)(target_head)
+    target_p = target_p.detach()
+    return target_p, position_mask
+
+
+@torch.compile(dynamic=None)
+def _compute_loss(logits, target_p, position_mask):
+    logits = logits.float()
+    out_logp = nn.LogSoftmax(dim=2)(logits)
+    plogp = target_p * out_logp
+    loss = -torch.sum(position_mask * plogp, 2).mean()
+    return loss
+
+
+@torch.compile(dynamic=None)
+def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
+    return (
+        (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
+    ).sum().item() / (loss_mask.sum().item() + 1e-6)
