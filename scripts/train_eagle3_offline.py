@@ -23,7 +23,11 @@ from specforge.distributed import destroy_distributed, get_dp_group, init_distri
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.modeling.target.target_head import TargetHead
 from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import print_with_rank, rank_0_priority
+from specforge.utils import (
+    create_draft_config_from_target,
+    print_with_rank,
+    rank_0_priority,
+)
 
 
 def parse_args():
@@ -31,7 +35,12 @@ def parse_args():
 
     # add model-related arguments
     parser.add_argument("--target-model-path", type=str, required=True)
-    parser.add_argument("--draft-model-config", type=str, required=True)
+    parser.add_argument(
+        "--draft-model-config",
+        type=str,
+        required=False,
+        help="Draft model config path. If not provided, will auto-generate from target model.",
+    )
     parser.add_argument(
         "--embedding-key",
         type=str,
@@ -164,7 +173,23 @@ def main():
     target_head = target_head.eval().cuda().to(torch.bfloat16)
     print_with_rank("Initialized target head")
 
-    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+    # Handle draft model config
+    if args.draft_model_config is None:
+        print_with_rank(
+            "No draft model config provided, auto-generating from target model..."
+        )
+        # Auto-generate and save config file
+        auto_config_path = create_draft_config_from_target(
+            target_model_path=args.target_model_path, cache_dir=args.cache_dir
+        )
+        draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
+        print_with_rank(
+            f"Auto-generated draft model config saved to: {auto_config_path}"
+        )
+    else:
+        # Use provided config file
+        draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+        print_with_rank(f"Using provided draft model config: {args.draft_model_config}")
     draft_model = (
         AutoEagle3DraftModel.from_config(
             draft_model_config,
