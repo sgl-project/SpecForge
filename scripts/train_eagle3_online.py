@@ -129,21 +129,9 @@ def parse_args():
 
     return parser, args
 
-
-def init_wandb(args):
-    # wandb.login(key=args.wandb_key)
-    wandb.init(project=args.wandb_project, name=args.wandb_name)
-
-
-def wandb_log_if_initialized(log_dict):
-    if dist.get_rank() == 0 and wandb.run is not None:
-        wandb.log(log_dict)
-
-
 def print_on_rank0(message):
     if dist.get_rank() == 0:
         print(message)
-
 
 def main():
     # initialize
@@ -237,7 +225,6 @@ def main():
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    # train_dataset = train_dataset.shuffle(seed=args.seed).select(range(20000))
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -480,13 +467,6 @@ def main():
                         loss_mask=data["loss_mask"].cuda(),
                     )
 
-                eval_logdict = {}
-                for i in range(len(plosses)):
-                    eval_logdict[f"eval/ploss_{i}"] = plosses[i].item()
-                for i in range(len(acces)):
-                    eval_logdict[f"eval/acc_{i}"] = acces[i]
-                wandb_log_if_initialized(eval_logdict)
-                
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
