@@ -90,9 +90,11 @@ def generate_draft_model_config(
 
     # If no template specified, use default llama3-8B-eagle3.json
     if template_config_path is None:
-        # Get current file directory
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_dir)
+        # Use the script execution directory as base
+        import sys
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        project_root = os.path.dirname(script_dir)  # Go up one level from scripts/
         template_config_path = os.path.join(
             project_root, "configs", "llama3-8B-eagle3.json"
         )
@@ -115,7 +117,6 @@ def generate_draft_model_config(
         "intermediate_size": "intermediate_size",
         "max_position_embeddings": "max_position_embeddings",
         "rms_norm_eps": "rms_norm_eps",
-        "rope_theta": "rope_theta",
         "hidden_act": "hidden_act",
         "bos_token_id": "bos_token_id",
         "eos_token_id": "eos_token_id",
@@ -126,35 +127,21 @@ def generate_draft_model_config(
     for target_param, draft_param in param_mappings.items():
         if hasattr(target_config, target_param):
             value = getattr(target_config, target_param)
+            # Special handling for torch_dtype to make it JSON serializable
+            if target_param == "torch_dtype":
+                if hasattr(value, "__name__") or "torch" in str(type(value)):
+                    value_str = str(value)
+                    if "torch." in value_str:
+                        value = value_str.split("torch.")[
+                            -1
+                        ]  # Convert torch.float16 to 'float16'
+                    else:
+                        value = value_str.split(".")[-1]
             draft_config[draft_param] = value
 
     # Special handling for some parameters
     # Ensure num_hidden_layers is always 1 (EAGLE3 feature)
     draft_config["num_hidden_layers"] = 1
-
-    # Copy attention_dropout if target model has it
-    if hasattr(target_config, "attention_dropout"):
-        draft_config["attention_dropout"] = target_config.attention_dropout
-
-    # Copy head_dim if target model has it
-    if hasattr(target_config, "head_dim"):
-        draft_config["head_dim"] = target_config.head_dim
-
-    # Copy attention_bias if target model has it
-    if hasattr(target_config, "attention_bias"):
-        draft_config["attention_bias"] = target_config.attention_bias
-
-    # Copy rope_scaling if target model has it
-    if hasattr(target_config, "rope_scaling"):
-        draft_config["rope_scaling"] = target_config.rope_scaling
-
-    # Copy sliding_window related configs if target model has them
-    if hasattr(target_config, "sliding_window"):
-        draft_config["sliding_window"] = target_config.sliding_window
-    if hasattr(target_config, "use_sliding_window"):
-        draft_config["use_sliding_window"] = target_config.use_sliding_window
-    if hasattr(target_config, "max_window_layers"):
-        draft_config["max_window_layers"] = target_config.max_window_layers
 
     # Keep some fixed draft model specific parameters
     draft_config["tie_word_embeddings"] = False
@@ -208,8 +195,11 @@ def create_draft_config_from_target(
 
     # Determine output path
     if output_dir is None:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_dir)
+        # Use the script execution directory as base
+        import sys
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        project_root = os.path.dirname(script_dir)  # Go up one level from scripts/
         output_dir = os.path.join(project_root, "configs")
 
     # Extract model name from model path
