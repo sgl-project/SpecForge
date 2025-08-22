@@ -11,6 +11,7 @@ from transformers import (
     Llama4TextConfig,
     LlamaConfig,
     PretrainedConfig,
+    Qwen2_5_VLConfig,
     Qwen2Config,
     Qwen3Config,
     Qwen3MoeConfig,

@@ -7,4 +7,5 @@ __all__ = [
     "AutoEagle3DraftModel",
     "AutoDistributedTargetModel",
     "AutoDraftModelConfig",
+    "QwenVLOnlineEagle3Model",
 ]

@@ -28,8 +28,9 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from datasets import Dataset as HFDataset
+from qwen_vl_utils import process_vision_info
 from tqdm import tqdm
-from transformers import PreTrainedTokenizer
+from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
 from specforge.utils import padding
 
@@ -139,6 +140,141 @@ def preprocess_conversations(
     return results
 
 
+def preprocess_vlm_conversations(
+    processor: ImageProcessingMixin,
+    examples: List[Conversation],
+    chat_template: ChatTemplate,
+    max_length: int = 2048,
+) -> Dict[str, List[torch.Tensor]]:
+    """
+    Preprocess a batch of ShareGPT style conversations.
+
+    Args:
+        processor: The image processor to use for processing images.
+        examples: A list of examples, where each example is a dictionary containing:
+            - image: The image in the conversation.
+            - conversations: A list of conversations, where each conversation is a list of messages.
+        chat_template: The chat template to use for formatting the conversations.
+        max_length: The maximum length of the tokenized input.
+
+    Returns:
+        A dictionary containing:
+            - input_ids: List of tokenized input IDs.
+            - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
+            - attention_mask: List of attention masks.
+            - pixel_values: List of pixel values for images in the examples.
+            - image_grid_thw: List of image grid tensors.
+    """
+    system_prompt = chat_template.system_prompt
+    user_message_separator = (
+        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+    )
+    assistant_message_separator = (
+        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+    )
+
+    # prepare result
+    results = {
+        "input_ids": [],
+        "loss_mask": [],
+        "attention_mask": [],
+        "pixel_values": [],
+        "image_grid_thw": [],
+    }
+
+    # Note: currently, we assume that each example has only one image
+    for i, image in enumerate(examples["image"]):
+        source = examples["conversations"][i]
+        messages = [{"role": "system", "content": system_prompt}]
+        if not source:
+            # if the source is None, skip it
+            continue
+
+        if source[0]["role"] != "user":
+            # if the first message is not from user, skip it
+            source = source[1:]
+
+        convroles = ["user", "assistant"]
+        for j, sentence in enumerate(source):
+            role = sentence["role"]
+            assert role == convroles[j % 2], f"unexpected role {role}"
+            if role == "user":
+                # if the message is from user and has image, process the image
+                messages.append(
+                    {
+                        "role": role,
+                        "content": [
+                            {
+                                "type": "image",
+                                "image": image,
+                            },
+                            {"type": "text", "text": sentence["content"]},
+                        ],
+                    }
+                )
+            else:
+                messages.append({"role": role, "content": sentence["content"]})
+
+        conversation = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        # get vision infor use qwen_vl_utils
+        image_inputs, video_inputs = process_vision_info(messages)
+        assert image_inputs is not None, "image_inputs must not be None"
+
+        encoding = processor(
+            text=[conversation],
+            images=image_inputs,
+            videos=video_inputs,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            add_special_tokens=False,
+        )
+        input_ids = encoding.input_ids[0]
+        offsets = encoding.offset_mapping[0]
+        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+        pixel_values = encoding.pixel_values
+        image_grid_thw = encoding.image_grid_thw[0]
+
+        # Find spans of assistant responses using regex
+        assistant_pattern = (
+            re.escape(assistant_message_separator)
+            + r"(.*?)(?="
+            + re.escape(user_message_separator)
+            + "|$)"
+        )
+
+        # get conversation with image info
+        decoded_conversation = processor.tokenizer.decode(
+            encoding.input_ids[0], skip_special_tokens=False
+        )
+
+        for match in re.finditer(assistant_pattern, decoded_conversation, re.DOTALL):
+            # Assistant response text span (excluding assistant_header itself)
+            assistant_start_char = match.start(1)
+            assistant_end_char = match.end(1)
+
+            # Mark tokens overlapping with assistant response
+            for idx, (token_start, token_end) in enumerate(offsets):
+                # Token is part of the assistant response span
+                if token_end <= assistant_start_char:
+                    continue  # token before assistant text
+                if token_start > assistant_end_char:
+                    continue  # token after assistant text
+                loss_mask[idx] = 1
+
+        results["input_ids"].append(input_ids[None, :])
+        results["loss_mask"].append(loss_mask[None, :])
+        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        results["pixel_values"].append(pixel_values)
+        results["image_grid_thw"].append(image_grid_thw[None, :])
+    return results
+
+
 def build_eagle3_dataset(
     dataset: HFDataset,
     tokenizer: PreTrainedTokenizer,
@@ -148,6 +284,8 @@ def build_eagle3_dataset(
     num_proc: Optional[int] = 8,
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
+    is_vlm: Optional[bool] = False,
+    processor: Optional[ImageProcessingMixin] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -161,10 +299,14 @@ def build_eagle3_dataset(
         num_proc: The number of processes to use for multiprocessing.
         cache_dir: The directory to use for caching the processed dataset.
         cache_key: The key to use for caching the processed dataset.
+        is_vlm: Whether the dataset is for VLM models.
+        processor: The image processor to use for processing images.
 
     Returns:
         The processed HF dataset.
     """
+    if is_vlm:
+        assert processor is not None, "processor must be provided when is_vlm is True"
     # Get chat template
     assert (
         chat_template in TEMPLATE_REGISTRY.get_all_template_names()
@@ -176,12 +318,20 @@ def build_eagle3_dataset(
 
     def preprocess_function(examples):
         # Always do preprocessing
-        processed = preprocess_conversations(
-            tokenizer,
-            examples["conversations"],
-            template,
-            max_length,
-        )
+        if is_vlm:
+            processed = preprocess_vlm_conversations(
+                processor,
+                examples,
+                template,
+                max_length,
+            )
+        else:
+            processed = preprocess_conversations(
+                tokenizer,
+                examples["conversations"],
+                template,
+                max_length,
+            )
         return processed
 
     # Process dataset only once
@@ -199,11 +349,18 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
+    # reduce batch size for VLM datasets to avoid PyArrow offset overflow
+    if is_vlm:
+        batch_size = 200
+    else:
+        batch_size = 1000
     dataset = dataset.map(
         preprocess_function,
         batched=True,
         num_proc=num_proc,
+        batch_size=batch_size,
         remove_columns=original_cols,
+        # keep_in_memory=True,
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
