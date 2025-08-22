@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt", "opc"],
+        choices=["ultrachat", "sharegpt", "opc", "synth_summarize", "opc"],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -122,6 +122,43 @@ def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
     return processed_row, 0
 
 
+def process_synth_summarize_row(row) -> Dict:
+    """Process a row from the synth_summarize dataset.
+
+    The function expects a row with the following schema:
+    "messages": [
+        {
+            "role": "user" | "assistant",
+            "content": str
+        }
+    ],
+    "prompt_id": str
+    """
+    conversations = row["messages"]
+    formatted_conversations = []
+    for message in conversations:
+        role = message["role"]
+        content = message["content"]
+        assert role in ["user", "assistant"]
+        formatted_conversations.append({"role": role, "content": content})
+    row = {"id": row["prompt_id"], "conversations": formatted_conversations}
+    return row, 0
+
+
+import hashlib
+
+
+def process_opc_sft_stage1(row) -> Dict:
+    row_id = hashlib.md5((row["instruction"] + row["output"]).encode()).hexdigest()
+    return {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["instruction"]},
+            {"role": "assistant", "content": row["output"]},
+        ],
+    }
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -140,9 +177,23 @@ def main():
             "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
         )["train"]
         proc_fn = process_opc_sft_stage1
+    elif args.dataset == "synth_summarize":
+        if args.data_path is None:
+            ds = load_dataset("llama-duo/synth_summarize_dataset_dedup")[
+                "train_sft_claude3sonnet"
+            ]
+        else:
+            print("Loading dataset from custom data path: ", args.data_path)
+            ds = load_dataset_from_path(Path(args.data_path))
+        proc_fn = process_synth_summarize_row
+    elif args.dataset == "opc":
+        ds = load_dataset(
+            "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
+        )["train"]
+        proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
-            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            "This script only supports ultrachat_200k, sharegpt, opc, and synth_summarize datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
 
     if args.output_path is None:

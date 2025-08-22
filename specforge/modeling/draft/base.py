@@ -30,13 +30,13 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from transformers import PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.cache_utils import Cache
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
 
-class Eagle3DraftModel(PreTrainedModel, ABC):
+class Eagle3DraftModel(PreTrainedModel, GenerationMixin, ABC):
     """
     This is the base class for the Eagle3 draft model implementation. The child class needs to implement
     the abstract methods to support training with TTT.

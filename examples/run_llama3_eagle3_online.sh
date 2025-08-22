@@ -20,3 +20,8 @@ torchrun \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend flex_attention
+    --cache-dir $ROOT_DIR/cache \
+    --wandb \
+    --wandb-key "f3b46a484034ca1fe99fc5ae4d19402c94da12c1" \
+    --wandb-project "specforge-training" \
+    --wandb-name "llama3-8b-online-fixed-run-1"

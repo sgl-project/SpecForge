@@ -702,6 +702,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
+        # Initialize the model completely before setting up PEFT compatibility
+        self.post_init()
+
+    # Ensure this method is explicitly available for PEFT compatibility
+    def get_input_embeddings(self):
+        """Required for PEFT compatibility."""
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        """Required for PEFT compatibility."""
+        self.embed_tokens = value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -723,6 +735,25 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         else:
             logger.info(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
+
+        if not hasattr(self, "_lora_logged"):
+            print(
+                "self.midlayer.self_attn.q_proj type:",
+                type(self.midlayer.self_attn.q_proj),
+            )
+            print(
+                "self.midlayer.self_attn.k_proj type:",
+                type(self.midlayer.self_attn.k_proj),
+            )
+            print(
+                "self.midlayer.self_attn.v_proj type:",
+                type(self.midlayer.self_attn.v_proj),
+            )
+            print(
+                "self.midlayer.self_attn.o_proj type:",
+                type(self.midlayer.self_attn.o_proj),
+            )
+            self._lora_logged = True
 
         batch_size, seq_length, _ = hidden_states.size()
 
@@ -790,3 +821,50 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=False,
             use_cache=False,
         )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        """
+        Prepare inputs for generation. This method is required for PEFT compatibility.
+        """
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs

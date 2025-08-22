@@ -12,6 +12,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import wandb
 from specforge import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
