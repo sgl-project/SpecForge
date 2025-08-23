@@ -414,8 +414,6 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
-            if batch_index % args.draft_accumulation_steps == 0:
-                optimizer.zero_grad()
             if args.is_vlm:
                 plosses, _, acces = eagle3_model(
                     input_ids=data["input_ids"].cuda(),
