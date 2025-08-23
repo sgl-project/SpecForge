@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import os
 import time
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -56,10 +57,13 @@ def parse_args():
     parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--eval-hidden-states-path", type=str, default=None)
     parser.add_argument("--num-epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--draft-global-batch-size", type=int, default=16)
+    parser.add_argument("--draft-micro-batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--warmup-ratio", type=float, default=0.02)
+    parser.add_argument("--warmup-ratio", type=float, default=0.015)
+    parser.add_argument("--total-steps", type=int, default=800000)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument(
         "--log-steps", type=int, default=50, help="Log training metrics every N steps"
     )
@@ -69,7 +73,7 @@ def parse_args():
         default=7,
         help="The length for Test-Time Training (TTT).",
     )
-    parser.add_argument("--attention-backend", type=str, default="flex_attention")
+    parser.add_argument("--draft-attention-backend", type=str, default="flex_attention")
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
 
@@ -165,6 +169,16 @@ def main():
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed environment")
+    args.draft_accumulation_steps = (
+        args.draft_global_batch_size // args.tp_size // args.draft_micro_batch_size
+    )
+    assert (
+        args.draft_accumulation_steps * args.draft_micro_batch_size * args.tp_size
+        == args.draft_global_batch_size
+    ), f"draft_global_batch_size={args.draft_global_batch_size} must be divisible by tp_size={args.tp_size} and micro_batch_size={args.draft_micro_batch_size}"
+    print_with_rank(
+        f"draft_accumulation_steps={args.draft_global_batch_size} // {args.tp_size} // {args.draft_micro_batch_size}={args.draft_accumulation_steps}"
+    )
 
     # Validate report backend arguments
     tracker_class = get_tracker_class(args.report_to)
@@ -197,7 +211,8 @@ def main():
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(
-                draft_model_last_checkpoint, attention_backend=args.attention_backend
+                draft_model_last_checkpoint,
+                attention_backend=args.draft_attention_backend,
             )
             .cuda()
             .to(torch.bfloat16)
@@ -205,7 +220,7 @@ def main():
     else:
         draft_model = (
             AutoEagle3DraftModel.from_config(
-                draft_model_config, attention_backend=args.attention_backend
+                draft_model_config, attention_backend=args.draft_attention_backend
             )
             .cuda()
             .to(torch.bfloat16)
@@ -250,7 +265,7 @@ def main():
 
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
-        args.batch_size,
+        args.draft_micro_batch_size,
         num_workers=4,
         shuffle=True,
         process_group=get_dp_group(),
@@ -269,7 +284,7 @@ def main():
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
-            args.batch_size,
+            args.draft_micro_batch_size,
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
@@ -282,7 +297,7 @@ def main():
         target_head=target_head,
         draft_model=draft_model,
         length=args.ttt_length,
-        attention_backend=args.attention_backend,
+        attention_backend=args.draft_attention_backend,
     )
     eagle3_model = FSDP(
         eagle3_model,
@@ -290,15 +305,24 @@ def main():
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            keep_low_precision_grads=False,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         ignored_modules=[],
         process_group=get_dp_group(),
     )
     print_with_rank(f"Initialized Eagle3 FSDP model")
-    global_step = 0
+    global_step, batch_index = 0, 0
+    log_dict = defaultdict(float)
     # build other components
-    optimizer = BF16Optimizer(eagle3_model, lr=args.learning_rate)
+    optimizer = BF16Optimizer(
+        eagle3_model,
+        lr=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
+        warmup_ratio=args.warmup_ratio,
+        total_steps=args.total_steps,
+    )
     print_with_rank("Initialized optimizer and scheduler")
 
     last_time = time.time()
@@ -311,10 +335,9 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for batch_index, data in enumerate(
-            tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
-        ):
-            if args.profile and epoch == 0:
+        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+            batch_index += 1
+            if args.profile:
                 if batch_index == args.profile_start_step:
                     print("Start profile")
                     torch_profiler = torch.profiler.profile(
@@ -335,7 +358,8 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
-            optimizer.zero_grad()
+            if batch_index % args.draft_accumulation_steps == 0:
+                optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
                 input_ids=data["input_ids"].cuda(),  # [B, S]
                 attention_mask=data["attention_mask"].cuda(),  # [B, S]
@@ -348,19 +372,25 @@ def main():
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
-            ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+            ploss = (
+                sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+                / args.draft_accumulation_steps
+            )
             ploss.backward()
-            optimizer.step()
-            global_step += 1
-
-            if global_step % args.log_steps == 0:
-                logdict = {"train/lr": optimizer.get_learning_rate()}
-                for i in range(len(plosses)):
-                    logdict[f"train/ploss_{i}"] = plosses[i].item()
-                for i in range(len(acces)):
-                    logdict[f"train/acc_{i}"] = acces[i]
+            log_dict["train/lr"] = optimizer.get_learning_rate()
+            for i in range(len(plosses)):
+                log_dict[f"train/ploss_{i}"] += (
+                    plosses[i].item() / args.draft_accumulation_steps
+                )
+            for i in range(len(acces)):
+                log_dict[f"train/acc_{i}"] += acces[i] / args.draft_accumulation_steps
+            if batch_index % args.draft_accumulation_steps == 0:
+                optimizer.step()
+                global_step += 1
                 # Pass global_step to the tracker
-                tracker.log(logdict, step=global_step)
+                if global_step % args.log_steps == 0:
+                    tracker.log(log_dict, step=global_step)
+                log_dict = defaultdict(float)
 
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [

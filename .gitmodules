@@ -1,0 +1,4 @@
+[submodule "third_party/sglang"]
+	path = third_party/sglang
+	url = https://github.com/sgl-project/sglang.git
+	branch = v0.4.10.post2
