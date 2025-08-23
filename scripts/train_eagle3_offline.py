@@ -308,7 +308,7 @@ def main():
             reduce_dtype=torch.float32,
             keep_low_precision_grads=False,
         ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        sharding_strategy=ShardingStrategy.NO_SHARD,
         ignored_modules=[],
         process_group=get_dp_group(),
     )
@@ -358,8 +358,8 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
-            if batch_index % args.draft_accumulation_steps == 0:
-                optimizer.zero_grad()
+            # if batch_index % args.draft_accumulation_steps == 0:
+            #     optimizer.zero_grad()
             plosses, _, acces = eagle3_model(
                 input_ids=data["input_ids"].cuda(),  # [B, S]
                 attention_mask=data["attention_mask"].cuda(),  # [B, S]
