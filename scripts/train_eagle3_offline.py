@@ -2,7 +2,6 @@ import argparse
 import hashlib
 import os
 import time
-from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -11,7 +10,7 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoTokenizer, Trainer
+from transformers import AutoTokenizer
 
 from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OfflineEagle3Model
 from specforge.data import (
@@ -21,7 +20,6 @@ from specforge.data import (
     prepare_dp_dataloaders,
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.modeling.target.target_head import TargetHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
@@ -31,95 +29,6 @@ from specforge.utils import (
     print_with_rank,
     rank_0_priority,
 )
-
-
-class Eagle3OfflineTrainer(Trainer):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.log_state_dict = defaultdict(float)
-        self.skip_eval = False
-
-    def create_scheduler(self, num_training_steps, optimizer=None):
-        if optimizer is None:
-            optimizer = self.optimizer
-        num_warmup_steps = self.args.get_warmup_steps(num_training_steps)
-        self.lr_scheduler = CosineAnnealingWarmupLR(
-            optimizer, total_steps=num_training_steps, warmup_steps=num_warmup_steps
-        )
-        print_on_rank0(
-            f"Created custom LR scheduler with num_warmup_steps={num_warmup_steps}"
-        )
-        return self.lr_scheduler
-
-    def compute_loss(
-        self, model, inputs, return_outputs=False, num_items_in_batch=None
-    ):
-        plosses, _, acces = model(
-            input_ids=inputs["input_ids"].cuda(),  # [B, S]
-            attention_mask=inputs["attention_mask"].cuda(),  # [B, S]
-            loss_mask=inputs["loss_mask"]
-            .unsqueeze(-1)
-            .cuda(),  # [B, S, 1] This is different from the online version
-            hidden_states=inputs["hidden_state"].cuda(),  # [B, S, D]
-            target=inputs["target"].cuda(),  # [B, S, D*3]
-        )
-        ploss_weight = [0.8**i for i in range(len(plosses))]
-        ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-        for i in range(len(plosses)):
-            self.log_state_dict[f"train/ploss_{i}"] += (
-                plosses[i].item() / self.args.gradient_accumulation_steps
-            )
-        for i in range(len(acces)):
-            self.log_state_dict[f"train/acc_{i}"] += (
-                acces[i] / self.args.gradient_accumulation_steps
-            )
-        return ploss
-
-    def log(self, logs):
-        logs = dict(logs)
-        for k, v in self.log_state_dict.items():
-            logs[k] = v / self.args.logging_steps
-        self.log_state_dict.clear()
-        super().log(logs)
-
-    def evaluate(self, eval_dataset=None, ignore_keys=False):
-        eval_dataset = eval_dataset or self.eval_dataset
-        eval_dataloader = self.get_eval_dataloader(eval_dataset)
-        self.model.eval()
-        if self.skip_eval:
-            return
-        self.model.eval()
-        eval_acces = [[] for _ in range(self.model.module.length)]
-        eval_plosses = [[] for _ in range(self.model.module.length)]
-
-        for data in tqdm(eval_dataloader, desc=f"Evaluating"):
-            plosses, _, acces = self.model(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
-                hidden_states=data["hidden_state"].cuda(),
-                target=data["target"].cuda(),
-            )
-            eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
-            eval_plosses = [
-                eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
-            ]
-
-        log_state_dict = {}
-        for i in range(len(eval_acces)):
-            acc_i = torch.tensor(eval_acces[i]).cuda().mean()
-            dist.all_reduce(acc_i, op=dist.ReduceOp.AVG)
-            log_state_dict[f"eval/epochacc_{i}"] = acc_i.item()
-        for i in range(len(eval_plosses)):
-            loss_i = torch.tensor(eval_plosses[i]).cuda().mean()
-            dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
-            log_state_dict[f"eval/epochploss_{i}"] = loss_i.item()
-
-        super().log(log_state_dict)
-        self.control = self.callback_handler.on_evaluate(
-            self.args, self.state, self.control, log_state_dict
-        )
-        return log_state_dict
 
 
 def parse_args():
