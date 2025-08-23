@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import os
 import time
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -58,7 +59,9 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--warmup-ratio", type=float, default=0.02)
+    parser.add_argument("--warmup-ratio", type=float, default=0.015)
+    parser.add_argument("--total-steps", type=int, default=800000)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument(
         "--log-steps", type=int, default=50, help="Log training metrics every N steps"
     )
@@ -345,7 +348,13 @@ def main():
     print_with_rank("Initialized Eagle3 FSDP model")
 
     # build other components
-    optimizer = BF16Optimizer(eagle3_model, lr=args.learning_rate)
+    optimizer = BF16Optimizer(
+        eagle3_model,
+        lr=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
+        warmup_ratio=args.warmup_ratio,
+        total_steps=args.total_steps,
+    )
     print_with_rank("Initialized optimizer and scheduler")
 
     # global_step
@@ -374,6 +383,7 @@ def main():
 
     # start running
     print_on_rank0(f"Starting training from epoch {start_epoch}")
+    batch_index, log_dict = 0, defaultdict(float)
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -381,10 +391,9 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for batch_index, data in enumerate(
-            tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
-        ):
-            if args.profile and epoch == 0:
+        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+            batch_index += 1
+            if args.profile:
                 if batch_index == args.profile_start_step:
                     print("Start profile")
                     torch_profiler = torch.profiler.profile(
@@ -405,7 +414,8 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
-            optimizer.zero_grad()
+            if batch_index % args.draft_accumulation_steps == 0:
+                optimizer.zero_grad()
             if args.is_vlm:
                 plosses, _, acces = eagle3_model(
                     input_ids=data["input_ids"].cuda(),
@@ -423,18 +433,24 @@ def main():
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
-            ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+            ploss = (
+                sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+                / args.draft_accumulation_steps
+            )
             ploss.backward()
-            optimizer.step()
-
-            global_step += 1
-            if global_step % args.log_steps == 0:
-                logdict = {"train/lr": optimizer.get_learning_rate()}
-                for i in range(len(plosses)):
-                    logdict[f"train/ploss_{i}"] = plosses[i].item()
-                for i in range(len(acces)):
-                    logdict[f"train/acc_{i}"] = acces[i]
-                tracker.log(logdict, step=global_step)
+            log_dict["train/lr"] = optimizer.get_learning_rate()
+            for i in range(len(plosses)):
+                log_dict[f"train/ploss_{i}"] += (
+                    plosses[i].item() / args.draft_accumulation_steps
+                )
+            for i in range(len(acces)):
+                log_dict[f"train/acc_{i}"] += acces[i] / args.draft_accumulation_steps
+            if batch_index % args.draft_accumulation_steps == 0:
+                optimizer.step()
+                global_step += 1
+                if global_step % args.log_steps == 0:
+                    tracker.log(log_dict, step=global_step)
+                log_dict = defaultdict(float)
 
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [
