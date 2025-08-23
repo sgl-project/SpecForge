@@ -20,10 +20,15 @@ from specforge.data import (
     prepare_dp_dataloaders,
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.modeling.target.target_head import TargetHead
+from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import print_with_rank, rank_0_priority
+from specforge.utils import (
+    get_last_checkpoint,
+    print_on_rank0,
+    print_with_rank,
+    rank_0_priority,
+)
 
 
 def parse_args():
@@ -154,11 +159,6 @@ def parse_args():
     return parser, args
 
 
-def print_on_rank0(message):
-    if dist.get_rank() == 0:
-        print(message)
-
-
 def main():
     # initialize
     parser, args = parse_args()
@@ -175,6 +175,13 @@ def main():
 
     tracker = create_tracker(args, args.output_dir)
 
+    # detecting last ckpt for draft model
+    draft_model_last_checkpoint = None
+    if args.resume and os.path.isdir(args.output_dir):
+        print_on_rank0(args.output_dir)
+        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
+        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
     # build target and draft model
     target_head = TargetHead(args.target_model_path)
     target_head.load_weights(
@@ -187,14 +194,22 @@ def main():
     print_with_rank("Initialized target head")
 
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-    draft_model = (
-        AutoEagle3DraftModel.from_config(
-            draft_model_config,
-            attention_backend=args.attention_backend,
+    if draft_model_last_checkpoint:
+        draft_model = (
+            AutoEagle3DraftModel.from_pretrained(
+                draft_model_last_checkpoint, attention_backend=args.attention_backend
+            )
+            .cuda()
+            .to(torch.bfloat16)
         )
-        .cuda()
-        .to(torch.bfloat16)
-    )
+    else:
+        draft_model = (
+            AutoEagle3DraftModel.from_config(
+                draft_model_config, attention_backend=args.attention_backend
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank("Initialized draft model")
@@ -283,12 +298,7 @@ def main():
     print_with_rank(f"Initialized Eagle3 FSDP model")
     global_step = 0
     # build other components
-    optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
-    total_steps = args.num_epochs * len(train_dataloader)
-    warmup_steps = int(total_steps * args.warmup_ratio)
-    scheduler = CosineAnnealingWarmupLR(
-        optimizer, total_steps=total_steps, warmup_steps=warmup_steps
-    )
+    optimizer = BF16Optimizer(eagle3_model, lr=args.learning_rate)
     print_with_rank("Initialized optimizer and scheduler")
 
     last_time = time.time()
@@ -341,7 +351,6 @@ def main():
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
             optimizer.step()
-            scheduler.step()
             global_step += 1
 
             # Log only every log_steps steps
@@ -428,8 +437,19 @@ def main():
 
         if epoch % args.save_interval == 0:
             # Save the model
+            epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
+
+            if dist.get_rank() == 0:
+                os.makedirs(epoch_output_dir, exist_ok=True)
+            dist.barrier()
+
             with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
                 model_state_dict = eagle3_model.state_dict()
+                state_to_save = {
+                    "epoch": epoch,
+                    "args": args,
+                }
+                state_to_save.update(optimizer.state_dict())
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
                     for k, v in model_state_dict.items()
@@ -437,10 +457,18 @@ def main():
                 }
 
                 if dist.get_rank() == 0:
+                    torch.save(
+                        state_to_save,
+                        os.path.join(epoch_output_dir, "training_state.pt"),
+                    )
+                    print_on_rank0(
+                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                    )
                     draft_model.save_pretrained(
-                        os.path.join(args.output_dir, f"epoch_{epoch}"),
+                        epoch_output_dir,
                         state_dict=draft_model_state_dict,
                     )
+                    print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
                 dist.barrier()
 
     # Close the tracker at the end of training

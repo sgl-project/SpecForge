@@ -51,6 +51,11 @@ def print_with_rank(message):
     print(f"rank {dist.get_rank()}: {message}")
 
 
+def print_on_rank0(message):
+    if dist.get_rank() == 0:
+        print(message)
+
+
 PREFIX_CHECKPOINT_DIR = "epoch"
 _re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"_(\d+)$")
 

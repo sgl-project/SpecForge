@@ -25,9 +25,14 @@ from specforge.data import (
     prepare_dp_dataloaders,
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.lr_scheduler import CosineAnnealingWarmupLR
+from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
+from specforge.utils import (
+    get_last_checkpoint,
+    print_on_rank0,
+    print_with_rank,
+    rank_0_priority,
+)
 
 
 def parse_args():
@@ -156,11 +161,6 @@ def parse_args():
     args = parser.parse_args()
 
     return parser, args
-
-
-def print_on_rank0(message):
-    if dist.get_rank() == 0:
-        print(message)
 
 
 def main():
@@ -345,12 +345,7 @@ def main():
     print_with_rank("Initialized Eagle3 FSDP model")
 
     # build other components
-    optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
-    total_steps = args.num_epochs * len(train_dataloader)
-    warmup_steps = int(total_steps * args.warmup_ratio)
-    scheduler = CosineAnnealingWarmupLR(
-        optimizer, total_steps=total_steps, warmup_steps=warmup_steps
-    )
+    optimizer = BF16Optimizer(eagle3_model, lr=args.learning_rate)
     print_with_rank("Initialized optimizer and scheduler")
 
     # global_step
@@ -364,13 +359,7 @@ def main():
 
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location="cpu", weights_only=False)
-
-            optimizer.load_state_dict(state["optimizer_state_dict"])
-            print_on_rank0("Successfully loaded optimizer state_dict.")
-
-            scheduler.load_state_dict(state["scheduler_state_dict"])
-            print_on_rank0("Successfully loaded scheduler state_dict.")
-
+            optimizer.load_state_dict(state)
             start_epoch = state["epoch"] + 1
             global_step = state.get("global_step", 0)
             print_on_rank0(f"Resuming from epoch {start_epoch}")
@@ -437,7 +426,6 @@ def main():
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
             optimizer.step()
-            scheduler.step()
 
             global_step += 1
 
@@ -541,12 +529,11 @@ def main():
             with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
                 model_state_dict = eagle3_model.state_dict()
                 state_to_save = {
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
                     "epoch": epoch,
                     "global_step": global_step,
                     "args": args,
                 }
+                state_to_save.update(optimizer.state_dict())
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
                     for k, v in model_state_dict.items()
