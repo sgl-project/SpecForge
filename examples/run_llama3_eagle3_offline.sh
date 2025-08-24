@@ -50,8 +50,8 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun --nproc_per_node=4 \
 # python scripts/view_data.py --data-path $HIDDEN_STATES_DIR/all_test/rows_0-5000/data_100.ckpt --tokenizer $MODEL_PATH
 # python scripts/view_data.py --data-path $HIDDEN_STATES_DIR/all_train/rows_0-5000/data_100.ckpt --tokenizer $MODEL_PATH
 
-export NUM_GPUS=2
-CUDA_VISIBLE_DEVICES=2,3 torchrun \
+export NUM_GPUS=4
+CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     scripts/train_eagle3_offline.py \
@@ -71,6 +71,7 @@ CUDA_VISIBLE_DEVICES=2,3 torchrun \
     --chat-template $CHAT_TEMPLATE \
     --cache-dir $CACHE_DIR \
     --dist-timeout=10 \
+    --log-steps 1 \
     --report-to wandb \
     --wandb-project llama3-8b-eagle3 \
-    --wandb-name offline-100k
+    --wandb-name offline-100k-4gpus
