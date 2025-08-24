@@ -12,3 +12,4 @@ psutil
 numpy
 accelerate
 pydantic
+sglang==v0.5.1
