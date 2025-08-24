@@ -172,6 +172,17 @@ def main():
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed environment")
+    args.dp_size = dist.get_world_size() // args.tp_size
+    args.draft_accumulation_steps = (
+        args.draft_global_batch_size // args.dp_size // args.draft_micro_batch_size
+    )
+    assert (
+        args.draft_accumulation_steps * args.draft_micro_batch_size * args.dp_size
+        == args.draft_global_batch_size
+    ), f"draft_global_batch_size={args.draft_global_batch_size} must be divisible by dp_size={args.dp_size} and micro_batch_size={args.draft_micro_batch_size}"
+    print_with_rank(
+        f"draft_accumulation_steps={args.draft_global_batch_size} // {args.dp_size} // {args.draft_micro_batch_size}={args.draft_accumulation_steps}"
+    )
 
     tracker_class = get_tracker_class(args.report_to)
     if tracker_class:
