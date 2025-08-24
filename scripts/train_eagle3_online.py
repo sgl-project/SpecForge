@@ -2,13 +2,13 @@ import argparse
 import hashlib
 import os
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -16,14 +16,21 @@ from specforge import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
-    OnlineEagle3Model,
+    Eagle3Model,
+    generate_eagle3_targets,
 )
+from specforge.checkpoint.fsdp2 import load_checkpoint, save_checkpoint
 from specforge.data import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import (
+    destroy_distributed,
+    get_device_mesh,
+    get_dp_group,
+    init_distributed,
+)
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority
@@ -48,6 +55,8 @@ def parse_args():
     parser.add_argument("--num-epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--clip-grad-value", type=float, default=0.5)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--warmup-ratio", type=float, default=0.02)
     parser.add_argument(
@@ -68,7 +77,7 @@ def parse_args():
     parser.add_argument("--cache-dir", type=str, default="./cache")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--eval-interval", type=int, default=1)
-    parser.add_argument("--save-interval", type=int, default=1)
+    parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--dist-timeout",
@@ -127,6 +136,14 @@ def parse_args():
 def print_on_rank0(message):
     if dist.get_rank() == 0:
         print(message)
+
+
+def parse_ckpt_info(checkpoint_path):
+    # parse the global step from the checkpoint path
+    path = Path(checkpoint_path)
+    global_step = int(path.name.split("_global_step_")[-1])
+    epoch = int(path.name.split("epoch_")[-1].split("_global_step_")[0])
+    return global_step, epoch
 
 
 def main():
@@ -255,28 +272,28 @@ def main():
 
     # build Eagle3 model
     # broadcast draft model
-    eagle3_model = OnlineEagle3Model(
-        target_model=target_model,
+    eagle3_model = Eagle3Model(
         draft_model=draft_model,
         length=args.ttt_length,
         attention_backend=args.attention_backend,
     )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
-    eagle3_model = FSDP(
+    eagle3_model = fully_shard(
         eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
+        mesh=get_device_mesh(),
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
         ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        ignored_modules=[target_model],
-        process_group=get_dp_group(),
     )
     print_with_rank("Initialized Eagle3 FSDP model")
 
     # build other components
-    optimizer = torch.optim.AdamW(eagle3_model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(
+        eagle3_model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.95),
+    )
     total_steps = args.num_epochs * len(train_dataloader)
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = CosineAnnealingWarmupLR(
@@ -291,24 +308,9 @@ def main():
         print_on_rank0(
             f"Resuming draft model training from checkpoint: {draft_model_last_checkpoint}"
         )
-        state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
-
-        if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu", weights_only=False)
-
-            optimizer.load_state_dict(state["optimizer_state_dict"])
-            print_on_rank0("Successfully loaded optimizer state_dict.")
-
-            scheduler.load_state_dict(state["scheduler_state_dict"])
-            print_on_rank0("Successfully loaded scheduler state_dict.")
-
-            start_epoch = state["epoch"] + 1
-            global_step = state.get("global_step", 0)
-            print_on_rank0(f"Resuming from epoch {start_epoch}")
-        else:
-            print_on_rank0(
-                f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch."
-            )
+        load_checkpoint(eagle3_model, optimizer, scheduler, draft_model_last_checkpoint)
+        global_step, start_epoch = parse_ckpt_info(draft_model_last_checkpoint)
+        print_on_rank0(f"Resuming from epoch {start_epoch}")
 
     dist.barrier()
 
@@ -320,8 +322,8 @@ def main():
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
-        epoch_acces = [[] for _ in range(eagle3_model.module.length)]
-        epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
+        epoch_acces = [[] for _ in range(eagle3_model.length)]
+        epoch_plosses = [[] for _ in range(eagle3_model.length)]
 
         for batch_index, data in enumerate(
             tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
@@ -348,16 +350,34 @@ def main():
                     torch_profiler.export_chrome_trace(output_path)
 
             optimizer.zero_grad()
-            plosses, _, acces = eagle3_model(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
+
+            input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
+            loss_mask = data["loss_mask"].unsqueeze(-1).cuda()
+
+            hidden_states, target, loss_mask, input_ids = generate_eagle3_targets(
+                target_model=target_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
             )
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                plosses, _, acces = eagle3_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    loss_mask=loss_mask,
+                    hidden_states=hidden_states,
+                    target=target,
+                )
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
+            torch.nn.utils.clip_grad_value_(
+                eagle3_model.parameters(), args.clip_grad_value
+            )
             optimizer.step()
             scheduler.step()
 
@@ -380,6 +400,16 @@ def main():
                     f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
                 )
                 last_time = time.time()
+
+            if global_step % args.save_interval == 0:
+                # Save the model
+                epoch_output_dir = os.path.join(
+                    args.output_dir, f"epoch_{epoch}_global_step_{global_step}"
+                )
+                if dist.get_rank() == 0:
+                    os.makedirs(epoch_output_dir, exist_ok=True)
+                dist.barrier()
+                save_checkpoint(eagle3_model, optimizer, scheduler, epoch_output_dir)
 
         epoch_logdict = {}
         for i in range(len(epoch_acces)):
@@ -409,11 +439,26 @@ def main():
             eval_plosses = [[] for _ in range(eagle3_model.length)]
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                input_ids = data["input_ids"].cuda()
+                attention_mask = data["attention_mask"].cuda()
+                loss_mask = data["loss_mask"].unsqueeze(-1).cuda()
+
+                hidden_states, target, loss_mask, input_ids = generate_eagle3_targets(
+                    target_model=target_model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    loss_mask=loss_mask,
                 )
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    plosses, _, acces = eagle3_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        loss_mask=loss_mask,
+                        hidden_states=hidden_states,
+                        target=target,
+                    )
+
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
@@ -439,44 +484,6 @@ def main():
                     f"Eval Epoch [{epoch + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
                 )
             tracker.log(eval_logdict, step=global_step)
-
-        if epoch % args.save_interval == 0:
-            # Save the model
-            epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
-
-            if dist.get_rank() == 0:
-                os.makedirs(epoch_output_dir, exist_ok=True)
-            dist.barrier()
-
-            with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
-                model_state_dict = eagle3_model.state_dict()
-                state_to_save = {
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "args": args,
-                }
-                draft_model_state_dict = {
-                    k.replace("draft_model.", ""): v
-                    for k, v in model_state_dict.items()
-                    if "draft_model." in k and "embed" not in k.lower()
-                }
-
-                if dist.get_rank() == 0:
-                    torch.save(
-                        state_to_save,
-                        os.path.join(epoch_output_dir, "training_state.pt"),
-                    )
-                    print_on_rank0(
-                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
-                    )
-                    draft_model.save_pretrained(
-                        epoch_output_dir,
-                        state_dict=draft_model_state_dict,
-                    )
-                    print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-                dist.barrier()
 
     # Close the tracker
     tracker.close()

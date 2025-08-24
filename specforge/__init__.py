@@ -2,8 +2,8 @@ from .core import *
 from .modeling import *
 
 __all__ = [
-    "OnlineEagle3Model",
-    "OfflineEagle3Model",
+    "Eagle3Model",
+    "generate_eagle3_targets",
     "AutoEagle3DraftModel",
     "AutoDistributedTargetModel",
     "AutoDraftModelConfig",

@@ -1,3 +1,3 @@
-from .eagle3 import OfflineEagle3Model, OnlineEagle3Model
+from .eagle3 import Eagle3Model, generate_eagle3_targets
 
-__all__ = ["OnlineEagle3Model", "OfflineEagle3Model"]
+__all__ = ["Eagle3Model", "generate_eagle3_targets"]
