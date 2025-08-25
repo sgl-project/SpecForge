@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -56,7 +57,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--clip-grad-value", type=float, default=0.5)
+    parser.add_argument("--clip-grad-norm", type=float, default=0.5)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--warmup-ratio", type=float, default=0.02)
     parser.add_argument(
@@ -144,6 +146,32 @@ def parse_ckpt_info(checkpoint_path):
     global_step = int(path.name.split("_global_step_")[-1])
     epoch = int(path.name.split("epoch_")[-1].split("_global_step_")[0])
     return global_step, epoch
+
+
+@contextmanager
+def accumulate_gradients(eagle3_model, gradient_accumulation_steps, global_step):
+    """
+    This context manager is used to accumulate gradients.
+
+    Args:
+        eagle3_model: The Eagle3 model.
+        gradient_accumulation_steps: The number of steps to accumulate gradients.
+        global_step: The current global step.
+
+    Yields:
+        None
+    """
+    global_step = global_step + 1
+    if global_step % gradient_accumulation_steps == 0:
+        eagle3_model.set_requires_gradient_sync(True)
+    elif global_step % gradient_accumulation_steps == 1:
+        eagle3_model.set_requires_gradient_sync(False)
+    yield
+
+
+def should_sync_gradients(global_step, gradient_accumulation_steps):
+    global_step = global_step + 1
+    return global_step % gradient_accumulation_steps == 0
 
 
 def main():
@@ -371,35 +399,40 @@ def main():
                     target=target,
                 )
 
-            # calculate weighted loss
-            ploss_weight = [0.8**i for i in range(len(plosses))]
-            ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-            ploss.backward()
-            torch.nn.utils.clip_grad_value_(
-                eagle3_model.parameters(), args.clip_grad_value
-            )
-            optimizer.step()
-            scheduler.step()
+            with accumulate_gradients(
+                eagle3_model, args.gradient_accumulation_steps, global_step
+            ):
+                # calculate weighted loss
+                ploss_weight = [0.8**i for i in range(len(plosses))]
+                ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+                ploss.backward()
 
             global_step += 1
 
-            logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
-            for i in range(len(plosses)):
-                logdict[f"train/ploss_{i}"] = plosses[i].item()
-            for i in range(len(acces)):
-                logdict[f"train/acc_{i}"] = acces[i]
-            tracker.log(logdict, step=global_step)
-
-            epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-            epoch_plosses = [
-                epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
-            ]
-
-            if args.verbose:
-                print(
-                    f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
+            if should_sync_gradients(global_step, args.gradient_accumulation_steps):
+                torch.nn.utils.clip_grad_norm_(
+                    eagle3_model.parameters(), args.clip_grad_norm
                 )
-                last_time = time.time()
+                optimizer.step()
+                scheduler.step()
+
+                logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
+                for i in range(len(plosses)):
+                    logdict[f"train/ploss_{i}"] = plosses[i].item()
+                for i in range(len(acces)):
+                    logdict[f"train/acc_{i}"] = acces[i]
+                tracker.log(logdict, step=global_step)
+
+                epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
+                epoch_plosses = [
+                    epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
+                ]
+
+                if args.verbose:
+                    print(
+                        f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
+                    )
+                    last_time = time.time()
 
             if global_step % args.save_interval == 0:
                 # Save the model
