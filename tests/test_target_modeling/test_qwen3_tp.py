@@ -79,7 +79,8 @@ class TestQwen3MoeTP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_qwen3_moe_tp(self):
-        mp.spawn(test_qwen3_moe_tp, nprocs=4, args=(4, self.temp_dir.name))
+        # Set to 2 as only 2 GPU avaialble in CI
+        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name))
 
 
 if __name__ == "__main__":
