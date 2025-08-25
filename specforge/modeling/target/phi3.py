@@ -164,6 +164,11 @@ class Phi3Attention(nn.Module):
 
         # Add TP support
         self.tp_group = get_tp_group()
+        tp_size = dist.get_world_size(self.tp_group)
+        
+        # Adjust head counts for TP
+        self.num_attention_heads_per_rank = config.num_attention_heads // tp_size
+        self.num_key_value_heads_per_rank = config.num_key_value_heads // tp_size
 
         op_size = config.num_attention_heads * self.head_dim + 2 * (config.num_key_value_heads * self.head_dim)
         self.o_proj = RowParallelLinear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
@@ -183,10 +188,10 @@ class Phi3Attention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         qkv = self.qkv_proj(hidden_states)
-        query_pos = self.config.num_attention_heads * self.head_dim
+        query_pos = self.num_attention_heads_per_rank * self.head_dim
         query_states = qkv[..., :query_pos]
-        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
-        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
+        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads_per_rank * self.head_dim]
+        value_states = qkv[..., query_pos + self.num_key_value_heads_per_rank * self.head_dim :]
 
         query_states = query_states.view(hidden_shape).transpose(1, 2)
         key_states = key_states.view(hidden_shape).transpose(1, 2)
