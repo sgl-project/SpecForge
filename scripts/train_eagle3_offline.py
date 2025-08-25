@@ -76,6 +76,11 @@ def parse_args():
     parser.add_argument("--draft-attention-backend", type=str, default="flex_attention")
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
+    parser.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
+    )
 
     # distributed training
     parser.add_argument("--tp-size", type=int, default=1)
@@ -247,6 +252,7 @@ def main():
             dataset=train_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
+            is_preformatted=args.is_preformatted,
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,

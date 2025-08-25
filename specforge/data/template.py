@@ -133,3 +133,23 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="phi3",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>\n",
+        user_header="<|user|>\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="phi4",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant<|im_sep|>",
+        user_header="<|im_start|>user<|im_sep|>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>",
+    ),
+)
