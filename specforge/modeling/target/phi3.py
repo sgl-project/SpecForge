@@ -170,6 +170,7 @@ class Phi3Attention(nn.Module):
         self.num_attention_heads_per_rank = config.num_attention_heads // tp_size
         self.num_key_value_heads_per_rank = config.num_key_value_heads // tp_size
 
+        # ColumnParallel splits the full QKV output across ranks
         op_size = config.num_attention_heads * self.head_dim + 2 * (config.num_key_value_heads * self.head_dim)
         self.o_proj = RowParallelLinear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         self.qkv_proj = ColumnParallelLinear(config.hidden_size, op_size, bias=False)
@@ -576,11 +577,39 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin, DistributedTargetMod
                 up_key = key.replace("gate_up_proj.weight", "up_proj.weight")
                 
                 # Handle TP sharding for both
-                gate_weight = self._shard_tensor(gate_weight, tp_group, 0)
-                up_weight = self._shard_tensor(up_weight, tp_group, 0)
+                gate_weight_sharded = self._shard_tensor(gate_weight, tp_group, 0)
+                up_weight_sharded = self._shard_tensor(up_weight, tp_group, 0)
                 
-                updated_state_dict[gate_key] = gate_weight
-                updated_state_dict[up_key] = up_weight
+                updated_state_dict[gate_key] = gate_weight_sharded
+                updated_state_dict[up_key] = up_weight_sharded
+                continue
+            
+            # Handle the special case of qkv_proj weight splitting for TP
+            if "qkv_proj.weight" in key:
+                # For QKV, we need to split Q, K, V separately and then concatenate per rank
+                total_heads = self.config.num_attention_heads
+                total_kv_heads = self.config.num_key_value_heads
+                head_dim = self.config.hidden_size // total_heads
+                
+                # Calculate sizes
+                q_size = total_heads * head_dim
+                k_size = total_kv_heads * head_dim  
+                v_size = total_kv_heads * head_dim
+                
+                # Split the QKV weight into Q, K, V
+                q_weight = value[:q_size, :]  # [q_size, hidden_size]
+                k_weight = value[q_size:q_size + k_size, :]  # [k_size, hidden_size]
+                v_weight = value[q_size + k_size:q_size + k_size + v_size, :]  # [v_size, hidden_size]
+                
+                # Split each Q, K, V across TP ranks
+                q_weight_sharded = self._shard_tensor(q_weight, tp_group, 0)
+                k_weight_sharded = self._shard_tensor(k_weight, tp_group, 0)
+                v_weight_sharded = self._shard_tensor(v_weight, tp_group, 0)
+                
+                # Concatenate Q, K, V for this rank
+                qkv_weight_sharded = torch.cat([q_weight_sharded, k_weight_sharded, v_weight_sharded], dim=0)
+                
+                updated_state_dict[key] = qkv_weight_sharded
                 continue
 
             module_key = ".".join(key.split(".")[:-1])

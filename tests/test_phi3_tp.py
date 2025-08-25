@@ -55,7 +55,7 @@ def test_phi3_tp(rank, world_size, temp_dir):
     dist.barrier()
 
     # create data
-    input_ids = torch.randint(0, 1000, (1, 32)).cuda()  # Smaller sequence length
+    input_ids = torch.randint(0, 1000, (1, 256)).cuda()
     attention_mask = torch.ones_like(input_ids).cuda()
 
     try:
@@ -73,17 +73,23 @@ def test_phi3_tp(rank, world_size, temp_dir):
             print(f"Distributed logits sample: {dist_logits[0, 0, :5]}")
             
             # More lenient comparison due to potential numerical differences in TP
-            if torch.allclose(expected_logits, dist_logits, rtol=1e-3, atol=1e-3):
+            if torch.allclose(expected_logits, dist_logits, rtol=1e-2, atol=1e-1):
                 print(f"[Rank {rank}] ✓ Logits match within tolerance")
             else:
                 print(f"[Rank {rank}] ✗ Logits do not match within tolerance")
                 max_diff = torch.max(torch.abs(expected_logits - dist_logits))
+                relative_error = max_diff / torch.max(torch.abs(expected_logits))
                 print(f"[Rank {rank}] Max difference: {max_diff}")
+                print(f"[Rank {rank}] Relative error: {relative_error * 100:.6f}%")
+                
+                # Only fail if the relative error is > 1%
+                if relative_error > 0.01:
+                    raise AssertionError(f"Logits do not match within tolerance. Max difference: {max_diff}, Relative error: {relative_error * 100:.2f}%")
     except Exception as e:
         print(f"[Rank {rank}] Inference failed: {e}")
         import traceback
         traceback.print_exc()
-        return
+        raise  # Re-raise the exception to fail the test
 
 
 class TestPhi3TP(unittest.TestCase):
