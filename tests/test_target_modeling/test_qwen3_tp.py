@@ -18,7 +18,7 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
 
-    init_distributed(tp_size=4)
+    init_distributed(tp_size=2)
     set_seed(42)
     config = Qwen3MoeConfig(
         vocab_size=1000,
