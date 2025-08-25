@@ -11,6 +11,23 @@ import torch.distributed as dist
 from transformers import PretrainedConfig
 
 
+def get_profiler_activities():
+    activities = [torch.profiler.ProfilerActivity.CPU]
+
+    #  CUDA if possible
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    # MPS (Apple Silicon)
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        try:
+            activities.append(torch.profiler.ProfilerActivity.MPS)
+        except AttributeError:
+            print("MPS available but profiler does not support it in this PyTorch version.")
+
+    return activities
+
+
 def detect_communication_backend() -> str:
     """
     Detect the best communication backend for distributed training,
@@ -176,7 +193,7 @@ def get_last_checkpoint(folder):
         path
         for path in content
         if _re_checkpoint.search(path) is not None
-        and os.path.isdir(os.path.join(folder, path))
+           and os.path.isdir(os.path.join(folder, path))
     ]
     if len(checkpoints) == 0:
         return

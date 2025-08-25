@@ -28,7 +28,8 @@ from specforge.data import (
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.tracker import create_tracker, get_tracker_class
-from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority, detect_device, detect_attention_impl
+from specforge.utils import get_last_checkpoint, print_with_rank, rank_0_priority, detect_device, detect_attention_impl, \
+    get_profiler_activities
 
 
 def parse_args():
@@ -388,10 +389,7 @@ def main():
                 if batch_index == args.profile_start_step:
                     print("Start profile")
                     torch_profiler = torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA,
-                        ],
+                        activities=get_profiler_activities(),
                         with_stack=True,
                         record_shapes=args.profile_record_shapes,
                     )
@@ -413,7 +411,7 @@ def main():
             )
 
             # calculate weighted loss
-            ploss_weight = [0.8**i for i in range(len(plosses))]
+            ploss_weight = [0.8 ** i for i in range(len(plosses))]
             ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             ploss.backward()
             optimizer.step()
