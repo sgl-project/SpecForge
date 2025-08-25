@@ -33,7 +33,7 @@ from specforge.utils import padding
 
 @torch.no_grad()
 def generate_eagle3_targets(
-    target_model,
+    target_model: nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -129,10 +129,10 @@ class Eagle3Model(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         target: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
@@ -146,6 +146,15 @@ class Eagle3Model(nn.Module):
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
         """
+        # Step 1: handle vocab size
+        target_p_padded, position_mask = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
+
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
@@ -198,6 +207,7 @@ class Eagle3Model(nn.Module):
             past_key_values = DynamicCache()
 
         for idx in range(self.length):
+            target_p = target_p_padded[:, idx : idx + seq_length, :]
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -214,14 +224,6 @@ class Eagle3Model(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=True,
             )
-
-            # Step 5.3: handle vocab size
-            with torch.no_grad():
-                target_p, position_mask = _compute_target_p(
-                    target=target,
-                    t2d=self.draft_model.t2d,
-                    loss_mask=loss_mask,
-                )
 
             # update hidden states for next step
             hidden_states = hidden_states_out
@@ -249,7 +251,7 @@ class Eagle3Model(nn.Module):
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
+                position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 if self.attention_backend == "sdpa":
                     ind = torch.arange(seq_length, device=attention_mask.device)
@@ -262,7 +264,27 @@ class Eagle3Model(nn.Module):
         return plosses, vlosses, acces
 
 
-@torch.compile(dynamic=None)
+def _compute_target_p_padded(target, t2d, loss_mask, length):
+    with torch.no_grad():
+        target_p, position_mask = _compute_target_p(
+            target=target,
+            t2d=t2d,
+            loss_mask=loss_mask,
+        )
+
+        assert len(target_p.shape) == 3
+        target_p_padded = F.pad(
+            target_p,
+            pad=(0, 0, 0, length),
+            mode="constant",
+            # For bitwise equality with previous code
+            value=1 / target_p.shape[-1],
+        )
+
+        return target_p_padded, position_mask
+
+
+# @torch.compile(dynamic=None)
 def _compute_target_p(target, t2d, loss_mask):
     target_head = target
     target_max_token = target_head.argmax(-1)
@@ -276,7 +298,7 @@ def _compute_target_p(target, t2d, loss_mask):
     return target_p, position_mask
 
 
-@torch.compile(dynamic=None)
+# @torch.compile(dynamic=None)
 def _compute_loss(logits, target_p, position_mask):
     logits = logits.float()
     out_logp = nn.LogSoftmax(dim=2)(logits)
@@ -285,7 +307,7 @@ def _compute_loss(logits, target_p, position_mask):
     return loss
 
 
-@torch.compile(dynamic=None)
+# @torch.compile(dynamic=None)
 def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
     return (
         (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
