@@ -634,17 +634,14 @@ class LlamaFlexAttention(LlamaAttention):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config, last=True):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        # if last:
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        # else:
-        #     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size * 2, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -700,7 +697,7 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, last=True, attention_backend: str = "sdpa"):
+    def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -712,7 +709,7 @@ class LlamaDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
-        self.mlp = LlamaMLP(config, last=last)
+        self.mlp = LlamaMLP(config)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
