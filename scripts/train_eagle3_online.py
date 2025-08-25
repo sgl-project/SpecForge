@@ -79,7 +79,12 @@ def parse_args():
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--draft-global-batch-size", type=int, default=8)
-    parser.add_argument("--draft-micro-batch-size", type=int, default=1, help="Micro batch size for draft model")
+    parser.add_argument(
+        "--draft-micro-batch-size",
+        type=int,
+        default=1,
+        help="Micro batch size for draft model",
+    )
     parser.add_argument("--draft-accumulation-steps", type=int, default=1)
 
     # other args
