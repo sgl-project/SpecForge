@@ -342,6 +342,11 @@ def main():
     else:
         torch.distributed.init_process_group(backend="nccl")
 
+    if args.aux_hidden_states_layers is not None:
+        args.aux_hidden_states_layers = [
+            int(layer) for layer in args.aux_hidden_states_layers.split(",")
+        ]
+
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
