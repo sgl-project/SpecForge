@@ -381,7 +381,7 @@ def main():
 
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].unsqueeze(-1).cuda()
+            loss_mask = data["loss_mask"].cuda()
 
             hidden_states, target, loss_mask, input_ids = generate_eagle3_targets(
                 target_model=target_model,
@@ -474,7 +474,7 @@ def main():
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                 input_ids = data["input_ids"].cuda()
                 attention_mask = data["attention_mask"].cuda()
-                loss_mask = data["loss_mask"].unsqueeze(-1).cuda()
+                loss_mask = data["loss_mask"].cuda()
 
                 hidden_states, target, loss_mask, input_ids = generate_eagle3_targets(
                     target_model=target_model,
