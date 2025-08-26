@@ -72,7 +72,9 @@ def _apply_loss_mask_from_chat_template(
     """
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
-    user_message_separator = f"{chat_template.end_of_turn_token}"
+    user_message_separator = (
+        f"{chat_template.end_of_turn_token}"
+    )
     if is_think_mode:
         assistant_message_separator = (
             f"{chat_template.end_of_turn_token}{chat_template.assistant_think_header}"
