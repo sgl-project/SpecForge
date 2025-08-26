@@ -74,6 +74,11 @@ def parse_args():
 
     # data processing type
     parser.add_argument("--chat-template", type=str, default="llama3")
+    parser.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
+    )
 
     # distributed training
     parser.add_argument("--tp-size", type=int, default=1)
@@ -292,6 +297,7 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
             is_vlm=args.is_vlm,
+            is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
@@ -326,6 +332,7 @@ def main():
             is_vlm=args.is_vlm,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
+            is_preformatted=args.is_preformatted,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -334,6 +341,7 @@ def main():
             shuffle=False,
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
+            is_preformatted=args.is_preformatted,
         )
         print_with_rank("Initialized eval dataloader")
 
