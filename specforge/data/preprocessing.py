@@ -146,10 +146,11 @@ def preprocess_conversations(
             # source is already a formatted text string with chat template applied
             conversation = source
         else:
-            if source[0]["role"] != "system":
-                system_prompt = chat_template.system_prompt
-            else:
-                system_prompt = source[0]["content"]
+            system_prompt = (
+                source[0]["content"]
+                if source[0]["role"] == "system"
+                else chat_template.system_prompt
+            )
 
             # source is a list of conversation messages, need to format
             messages = [{"role": "system", "content": system_prompt}]
