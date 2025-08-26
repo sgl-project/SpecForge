@@ -153,3 +153,13 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="phi4-mini",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|end|>",
+    ),
+)

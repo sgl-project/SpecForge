@@ -302,12 +302,12 @@ class TestPreprocessing(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    suite = unittest.TestSuite()
+    # suite = unittest.TestSuite()
 
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPreprocessing))
+    # suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPreprocessing))
 
-    runner = unittest.TextTestRunner(verbosity=2)
-    runner.run(suite)
+    # runner = unittest.TextTestRunner(verbosity=2)
+    # runner.run(suite)
 
     # Commented-out example for using visualize_loss_mask function directly
     """
@@ -353,3 +353,21 @@ if __name__ == "__main__":
     for i in range(len(results["input_ids"])):
         visualize_loss_mask(tokenizer, results["input_ids"][i], results["loss_mask"][i])
     """
+
+    import json
+    model_path = "/shared/public/elr-models/microsoft/Phi-4-mini-instruct/c0fb9e74abda11b496b7907a9c6c9009a7a0488f"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    chat_template = TEMPLATE_REGISTRY.get("phi4-mini")
+
+    # Load from /shared/public/data/specforge/sharegpt_10k.jsonl and get first 2 conversation entries, where conversations is a key on the object
+    with open("/shared/public/data/specforge/sharegpt_10k.jsonl", "r") as f:
+        conversations = [json.loads(line)["conversations"] for line in f.readlines()[:2]]
+    
+    results = preprocess_conversations(
+        tokenizer=tokenizer,
+        conversations=conversations,
+        chat_template=chat_template,
+        max_length=2048,
+    )
+    for i in range(len(results["input_ids"])):
+        visualize_loss_mask(tokenizer, results["input_ids"][i], results["loss_mask"][i])
