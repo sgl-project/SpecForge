@@ -35,8 +35,7 @@ class TemplateRegistry:
         TEMPLATE_REGISTRY.register(
             name="custom",
             template=ChatTemplate(
-                assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
-                assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
+                assistant_think_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
                 user_header="<|start_header_id|>user<|end_header_id|>",
                 system_prompt="You are a helpful assistant.",
                 end_of_turn_token="<|eot_id|>"
