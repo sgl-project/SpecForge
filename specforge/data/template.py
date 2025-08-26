@@ -10,12 +10,14 @@ class ChatTemplate(BaseModel):
 
     Args:
         assistant_header(str): The header for the assistant.
+        assistant_think_header(str): The header for the assistant in the think mode.
         user_header(str): The header for the user.
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
     """
 
     assistant_header: str | None
+    assistant_think_header: str | None
     user_header: str | None
     system_prompt: str | None
     end_of_turn_token: str | None
@@ -33,6 +35,7 @@ class TemplateRegistry:
         TEMPLATE_REGISTRY.register(
             name="custom",
             template=ChatTemplate(
+                assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
                 assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
                 user_header="<|start_header_id|>user<|end_header_id|>",
                 system_prompt="You are a helpful assistant.",
@@ -89,6 +92,7 @@ TEMPLATE_REGISTRY.register(
     name="llama3",
     template=ChatTemplate(
         assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
+        assistant_think_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
         user_header="<|start_header_id|>user<|end_header_id|>",
         system_prompt="You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.",
         end_of_turn_token="<|eot_id|>",
@@ -99,6 +103,7 @@ TEMPLATE_REGISTRY.register(
     name="llama4",
     template=ChatTemplate(
         assistant_header="<|header_start|>assistant<|header_end|>\n\n",
+        assistant_think_header="<|header_start|>assistant<|header_end|>\n\n",
         user_header="<|header_start|>user<|header_end|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|eot|>",
@@ -109,6 +114,7 @@ TEMPLATE_REGISTRY.register(
     name="qwen",
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant\n",
+        assistant_think_header="<|im_start|>assistant\n",
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
@@ -116,9 +122,33 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="qwen3",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        assistant_think_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwq",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n<think>\n",
+        assistant_think_header="<|im_start|>assistant\n<think>\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+
+TEMPLATE_REGISTRY.register(
     name="qwen2-vl",
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant\n",
+        assistant_think_header="<|im_start|>assistant\n",
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
@@ -129,6 +159,7 @@ TEMPLATE_REGISTRY.register(
     name="deepseek",
     template=ChatTemplate(
         assistant_header="Assistant:",
+        assistant_think_header="Assistant:",
         user_header="User:",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="",
@@ -139,6 +170,7 @@ TEMPLATE_REGISTRY.register(
     name="phi3",
     template=ChatTemplate(
         assistant_header="<|assistant|>\n",
+        assistant_think_header="<|assistant|>\n",
         user_header="<|user|>\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|end|>\n",
@@ -149,6 +181,7 @@ TEMPLATE_REGISTRY.register(
     name="phi4",
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant<|im_sep|>",
+        assistant_think_header="<|im_start|>assistant<|im_sep|>",
         user_header="<|im_start|>user<|im_sep|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>",
@@ -159,6 +192,7 @@ TEMPLATE_REGISTRY.register(
     name="phi4-mini",
     template=ChatTemplate(
         assistant_header="<|assistant|>",
+        assistant_think_header="<|assistant|>",
         user_header="<|user|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|end|>",
@@ -170,6 +204,7 @@ TEMPLATE_REGISTRY.register(
     name="gpt-oss",
     template=ChatTemplate(
         assistant_header=None,  # the headers are not applicable to openai-harmony's channel tags
+        assistant_think_header=None,
         user_header=None,
         system_prompt=None,
         end_of_turn_token=None,
