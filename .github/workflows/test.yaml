@@ -30,4 +30,4 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          python -m unittest discover ./tests
+          python -m unittest discover -s ./tests -p "test_*.py"
