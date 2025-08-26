@@ -56,6 +56,7 @@ def _apply_loss_mask_from_chat_template(
     text: str,
     offsets: torch.Tensor,
     chat_template: ChatTemplate,
+    is_think_mode: bool = False,
 ) -> torch.Tensor:
     """
     Apply loss mask to identify assistant response spans using chat template.
@@ -71,11 +72,16 @@ def _apply_loss_mask_from_chat_template(
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
     user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+        f"{chat_template.end_of_turn_token}"
     )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    )
+    if is_think_mode:
+        assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_think_header}"
+        )
+    else:
+        assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+        )
 
     # Find spans of assistant responses using regex
     assistant_pattern = (
@@ -115,6 +121,7 @@ def preprocess_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
     is_preformatted: bool = False,
+    is_think_mode: bool = False,
 ) -> Dict[str, List[torch.Tensor]]:
     """
     Preprocess a batch of ShareGPT style conversations or pre-formatted text.
@@ -154,9 +161,9 @@ def preprocess_conversations(
             if source[0]["role"] != "user":
                 # if the first message is not from user, skip it
                 source = source[1:]
-
+            assert len(source) % 2 == 0, "conversation have question without answer"
             convroles = ["user", "assistant"]
-            for j, sentence in enumerate(source):
+            for j, sentence in enumerate(source[:-1]):
                 role = sentence["role"]
                 assert role == convroles[j % 2], f"unexpected role {role}"
                 messages.append({"role": role, "content": sentence["content"]})
@@ -164,8 +171,10 @@ def preprocess_conversations(
             conversation = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
-                add_generation_prompt=False,
+                add_generation_prompt=True,
+                enable_thinking=is_think_mode,
             )
+            conversation += source[-1]["content"] + chat_template.end_of_turn_token
 
         if not tokenizer.pad_token_id:
             tokenizer.pad_token_id = tokenizer.unk_token_id
@@ -183,7 +192,7 @@ def preprocess_conversations(
 
         # Apply loss mask
         loss_mask = _apply_loss_mask_from_chat_template(
-            conversation, offsets, chat_template
+            conversation, offsets, chat_template, is_think_mode
         )
 
         results["input_ids"].append(input_ids[None, :])
@@ -320,6 +329,7 @@ def build_eagle3_dataset(
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
+    is_think_mode: Optional[bool] = False,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -345,6 +355,7 @@ def build_eagle3_dataset(
                         the assistant spans for loss mask generation.
                         If True, expects "text" column with ready-to-train text.
                         If False, expects "conversations" column with ShareGPT format.
+        is_think_mode: Whether to enable think mode in the chat template processing.
 
     Returns:
         The processed HF dataset.
@@ -386,6 +397,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=True,
+                is_think_mode=is_think_mode,
             )
         else:
             # Handle ShareGPT conversations
@@ -399,6 +411,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=False,
+                is_think_mode=is_think_mode,
             )
 
         return processed
