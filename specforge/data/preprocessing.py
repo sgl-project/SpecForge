@@ -57,6 +57,7 @@ def _apply_loss_mask_from_chat_template(
     text: str,
     offsets: torch.Tensor,
     chat_template: ChatTemplate,
+    is_think_mode: bool = False,
 ) -> torch.Tensor:
     """
     Apply loss mask to identify assistant response spans using chat template.
@@ -71,12 +72,15 @@ def _apply_loss_mask_from_chat_template(
     """
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
-    user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    )
+    user_message_separator = f"{chat_template.end_of_turn_token}"
+    if is_think_mode:
+        assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_think_header}"
+        )
+    else:
+        assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+        )
 
     # Find spans of assistant responses using regex
     assistant_pattern = (
@@ -116,6 +120,7 @@ def preprocess_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
     is_preformatted: bool = False,
+    is_think_mode: bool = False,
 ) -> Dict[str, List[torch.Tensor]]:
     """
     Preprocess a batch of ShareGPT style conversations or pre-formatted text.
@@ -139,14 +144,14 @@ def preprocess_conversations(
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
 
     if chat_template.parser_type == "general":
-        parser = GeneralParser(tokenizer, chat_template)
+        parser = GeneralParser(tokenizer, chat_template, is_think_mode)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
 
     for source in conversations:
-        if not source:
+        if not source or len(source) % 2 != 0:
             # if the source is None, skip it
             continue
         input_ids, loss_mask = parser.parse(
@@ -286,6 +291,7 @@ def build_eagle3_dataset(
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
+    is_think_mode: Optional[bool] = False,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -311,6 +317,7 @@ def build_eagle3_dataset(
                         the assistant spans for loss mask generation.
                         If True, expects "text" column with ready-to-train text.
                         If False, expects "conversations" column with ShareGPT format.
+        is_think_mode: Whether to enable think mode in the chat template processing.
 
     Returns:
         The processed HF dataset.
@@ -352,6 +359,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=True,
+                is_think_mode=is_think_mode,
             )
         else:
             # Handle ShareGPT conversations
@@ -365,6 +373,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=False,
+                is_think_mode=is_think_mode,
             )
 
         return processed

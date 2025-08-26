@@ -38,15 +38,25 @@ _harmony_encoding = None
 
 class GeneralParser(Parser):
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chat_template: ChatTemplate,
+        is_think_mode: bool = False,
+    ):
         super().__init__(tokenizer, chat_template)
         self.system_prompt = chat_template.system_prompt
+        self.is_think_mode = is_think_mode
+        self.chat_template = chat_template
         self.user_message_separator = (
             f"{chat_template.end_of_turn_token}{chat_template.user_header}"
         )
-        self.assistant_message_separator = (
-            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-        )
+        if is_think_mode:
+            self.assistant_message_separator = f"{chat_template.end_of_turn_token}{chat_template.assistant_think_header}"
+        else:
+            self.assistant_message_separator = (
+                f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+            )
 
     def parse(
         self, conversation: "Conversation", max_length: int, preformatted: bool = False
@@ -66,7 +76,7 @@ class GeneralParser(Parser):
                 messages.append({"role": "system", "content": self.system_prompt})
 
             convroles = ["user", "assistant"]
-            for j, sentence in enumerate(conversation):
+            for j, sentence in enumerate(conversation[:-1]):
                 role = sentence["role"]
                 if role != convroles[j % 2]:
                     warnings.warn(
@@ -78,7 +88,11 @@ class GeneralParser(Parser):
             conversation = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
-                add_generation_prompt=False,
+                add_generation_prompt=True,
+                enable_thinking=self.is_think_mode,
+            )
+            conversation += (
+                conversation[-1]["content"] + self.chat_template.end_of_turn_token
             )
 
         if not self.tokenizer.pad_token_id:
