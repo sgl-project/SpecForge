@@ -259,8 +259,14 @@ def main():
             .cuda()
             .to(torch.bfloat16)
         )
-    draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
-    draft_model.freeze_embedding()
+    if (
+        not hasattr(draft_model_config, "target_hidden_size")
+        or draft_model_config.target_hidden_size == draft_model_config.hidden_size
+    ):
+        draft_model.load_embedding(
+            args.target_model_path, embedding_key=args.embedding_key
+        )
+        draft_model.freeze_embedding()
     print_with_rank("Initialized draft model")
 
     # build dataloaders
