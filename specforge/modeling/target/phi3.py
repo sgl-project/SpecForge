@@ -14,32 +14,36 @@
 # limitations under the License.
 
 
-from typing import Callable, Optional, Union, Dict
+from typing import Callable, Dict, Optional, Union
 
 import torch
-from torch import nn
 import torch.distributed as dist
-
-from transformers.utils.generic import check_model_inputs
-
+from torch import nn
+from transformers import Phi3Config
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
     GenericForSequenceClassification,
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers import Phi3Config
+from transformers.utils.generic import check_model_inputs
 
 from specforge.distributed import get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -51,13 +55,19 @@ class Phi3MLP(nn.Module):
         super().__init__()
 
         self.config = config
-        
+
         # Add TP support
         self.tp_group = get_tp_group()
-        
-        self.gate_proj = ColumnParallelLinear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = ColumnParallelLinear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size, bias=False)
+
+        self.gate_proj = ColumnParallelLinear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = ColumnParallelLinear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
         self.activation_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states: torch.FloatTensor) -> torch.FloatTensor:
@@ -86,7 +96,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -108,8 +120,12 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
+    attn_weights = nn.functional.dropout(
+        attn_weights, p=dropout, training=module.training
+    )
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -155,8 +171,12 @@ class Phi3Attention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
@@ -165,14 +185,18 @@ class Phi3Attention(nn.Module):
         # Add TP support
         self.tp_group = get_tp_group()
         tp_size = dist.get_world_size(self.tp_group)
-        
+
         # Adjust head counts for TP
         self.num_attention_heads_per_rank = config.num_attention_heads // tp_size
         self.num_key_value_heads_per_rank = config.num_key_value_heads // tp_size
 
         # ColumnParallel splits the full QKV output across ranks
-        op_size = config.num_attention_heads * self.head_dim + 2 * (config.num_key_value_heads * self.head_dim)
-        self.o_proj = RowParallelLinear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        op_size = config.num_attention_heads * self.head_dim + 2 * (
+            config.num_key_value_heads * self.head_dim
+        )
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
+        )
         self.qkv_proj = ColumnParallelLinear(config.hidden_size, op_size, bias=False)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -191,24 +215,35 @@ class Phi3Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         query_pos = self.num_attention_heads_per_rank * self.head_dim
         query_states = qkv[..., :query_pos]
-        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads_per_rank * self.head_dim]
-        value_states = qkv[..., query_pos + self.num_key_value_heads_per_rank * self.head_dim :]
+        key_states = qkv[
+            ...,
+            query_pos : query_pos + self.num_key_value_heads_per_rank * self.head_dim,
+        ]
+        value_states = qkv[
+            ..., query_pos + self.num_key_value_heads_per_rank * self.head_dim :
+        ]
 
         query_states = query_states.view(hidden_shape).transpose(1, 2)
         key_states = key_states.view(hidden_shape).transpose(1, 2)
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[
+                self.config._attn_implementation
+            ]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -257,7 +292,9 @@ class Phi3DecoderLayer(GradientCheckpointingLayer):
         self.self_attn = Phi3Attention(config=config, layer_idx=layer_idx)
         self.mlp = Phi3MLP(config)
         self.input_layernorm = Phi3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Phi3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Phi3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.config = config
         self.resid_attn_dropout = nn.Dropout(config.resid_pdrop)
         self.resid_mlp_dropout = nn.Dropout(config.resid_pdrop)
@@ -271,9 +308,13 @@ class Phi3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[
+            tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> tuple[
+        torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
+    ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -287,12 +328,16 @@ class Phi3DecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + self.resid_attn_dropout(hidden_states)  # main diff with Llama
+        hidden_states = residual + self.resid_attn_dropout(
+            hidden_states
+        )  # main diff with Llama
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + self.resid_mlp_dropout(hidden_states)  # main diff with Llama
+        hidden_states = residual + self.resid_mlp_dropout(
+            hidden_states
+        )  # main diff with Llama
         return hidden_states
 
 
@@ -323,7 +368,9 @@ class Phi3RotaryEmbedding(nn.Module):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -339,12 +386,23 @@ class Phi3RotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
         position_ids_expanded = position_ids[:, None, :].float()
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -359,9 +417,14 @@ class Phi3Model(Phi3PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
         self.layers = nn.ModuleList(
-            [Phi3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                Phi3DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = Phi3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Phi3RotaryEmbedding(config=config)
@@ -384,7 +447,9 @@ class Phi3Model(Phi3PreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -393,15 +458,23 @@ class Phi3Model(Phi3PreTrainedModel):
             past_key_values = DynamicCache()
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
             )
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+        mask_function = (
+            create_causal_mask
+            if self.config.sliding_window is None
+            else create_sliding_window_causal_mask
+        )
         causal_mask = mask_function(
             config=self.config,
             input_embeds=inputs_embeds,
@@ -442,9 +515,11 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin, DistributedTargetMod
         super().__init__(config)
         self.model = Phi3Model(config)
         self.vocab_size = config.vocab_size
-        
+
         # Use ColumnParallelLinear for lm_head
-        self.lm_head = ColumnParallelLinear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -494,7 +569,11 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin, DistributedTargetMod
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         # Gather logits from all TP ranks
@@ -505,7 +584,12 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin, DistributedTargetMod
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -571,44 +655,48 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin, DistributedTargetMod
             if "gate_up_proj.weight" in key:
                 # Split the gate_up_proj weight into gate_proj and up_proj
                 gate_weight, up_weight = value.chunk(2, dim=0)
-                
+
                 # Create new keys for gate_proj and up_proj
                 gate_key = key.replace("gate_up_proj.weight", "gate_proj.weight")
                 up_key = key.replace("gate_up_proj.weight", "up_proj.weight")
-                
+
                 # Handle TP sharding for both
                 gate_weight_sharded = self._shard_tensor(gate_weight, tp_group, 0)
                 up_weight_sharded = self._shard_tensor(up_weight, tp_group, 0)
-                
+
                 updated_state_dict[gate_key] = gate_weight_sharded
                 updated_state_dict[up_key] = up_weight_sharded
                 continue
-            
+
             # Handle the special case of qkv_proj weight splitting for TP
             if "qkv_proj.weight" in key:
                 # For QKV, we need to split Q, K, V separately and then concatenate per rank
                 total_heads = self.config.num_attention_heads
                 total_kv_heads = self.config.num_key_value_heads
                 head_dim = self.config.hidden_size // total_heads
-                
+
                 # Calculate sizes
                 q_size = total_heads * head_dim
-                k_size = total_kv_heads * head_dim  
+                k_size = total_kv_heads * head_dim
                 v_size = total_kv_heads * head_dim
-                
+
                 # Split the QKV weight into Q, K, V
                 q_weight = value[:q_size, :]  # [q_size, hidden_size]
-                k_weight = value[q_size:q_size + k_size, :]  # [k_size, hidden_size]
-                v_weight = value[q_size + k_size:q_size + k_size + v_size, :]  # [v_size, hidden_size]
-                
+                k_weight = value[q_size : q_size + k_size, :]  # [k_size, hidden_size]
+                v_weight = value[
+                    q_size + k_size : q_size + k_size + v_size, :
+                ]  # [v_size, hidden_size]
+
                 # Split each Q, K, V across TP ranks
                 q_weight_sharded = self._shard_tensor(q_weight, tp_group, 0)
                 k_weight_sharded = self._shard_tensor(k_weight, tp_group, 0)
                 v_weight_sharded = self._shard_tensor(v_weight, tp_group, 0)
-                
+
                 # Concatenate Q, K, V for this rank
-                qkv_weight_sharded = torch.cat([q_weight_sharded, k_weight_sharded, v_weight_sharded], dim=0)
-                
+                qkv_weight_sharded = torch.cat(
+                    [q_weight_sharded, k_weight_sharded, v_weight_sharded], dim=0
+                )
+
                 updated_state_dict[key] = qkv_weight_sharded
                 continue
 

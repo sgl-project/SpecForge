@@ -37,9 +37,7 @@ def test_phi3_tp(rank, world_size, temp_dir):
     # create a simple single-gpu model
     model = Phi3ForCausalLM(config).cuda()
 
-    from specforge.modeling.target.phi3 import (
-        Phi3ForCausalLM as DistPhi3ForCausalLM,
-    )
+    from specforge.modeling.target.phi3 import Phi3ForCausalLM as DistPhi3ForCausalLM
 
     dist_model = DistPhi3ForCausalLM(config).cuda()
 
