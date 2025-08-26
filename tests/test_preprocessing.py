@@ -353,24 +353,3 @@ if __name__ == "__main__":
     for i in range(len(results["input_ids"])):
         visualize_loss_mask(tokenizer, results["input_ids"][i], results["loss_mask"][i])
     """
-
-    import json
-    # model_path = "/shared/public/elr-models/microsoft/Phi-4-mini-instruct/c0fb9e74abda11b496b7907a9c6c9009a7a0488f"
-    # model_path = "/shared/public/elr-models/microsoft/phi-4/f957856cd926f9d681b14153374d755dd97e45ed"
-    # model_path = "/shared/public/elr-models/microsoft/Phi-3.5-mini-instruct/cd6881a82d62252f5a84593c61acf290f15d89e3"
-    # model_path = "/shared/public/models/microsoft/Phi-3-mini-128k-instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    chat_template = TEMPLATE_REGISTRY.get("phi3")
-
-    # Load from /shared/public/data/specforge/sharegpt_10k.jsonl and get first 2 conversation entries, where conversations is a key on the object
-    with open("/shared/public/data/specforge/sharegpt_10k.jsonl", "r") as f:
-        conversations = [json.loads(line)["conversations"] for line in f.readlines()[:2]]
-    
-    results = preprocess_conversations(
-        tokenizer=tokenizer,
-        conversations=conversations,
-        chat_template=chat_template,
-        max_length=2048,
-    )
-    for i in range(len(results["input_ids"])):
-        visualize_loss_mask(tokenizer, results["input_ids"][i], results["loss_mask"][i])
