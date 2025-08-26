@@ -341,7 +341,6 @@ def main():
             shuffle=False,
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
-            is_preformatted=args.is_preformatted,
         )
         print_with_rank("Initialized eval dataloader")
 
