@@ -215,9 +215,7 @@ def create_draft_config_from_target(
     # Save config
     if rank == 0:
         save_draft_model_config(config_dict, output_path)
-        print_with_rank(
-            f"Auto-generated draft model config saved to: {output_path}"
-        )
+        print_with_rank(f"Auto-generated draft model config saved to: {output_path}")
     dist.barrier()  # 所有人在这里同步
 
     return output_path
