@@ -131,7 +131,7 @@ You should prepare the dataset in jsonl format and the schema should look like t
     "id": "xxxx",
     "conversations": [
         {
-            "role": "user | assistant",
+            "role": "system | user | assistant",
             "content": "The message content"
         }
     ],
