@@ -214,21 +214,14 @@ def main():
 
     # Handle draft model config
     if args.draft_model_config is None:
-        print_with_rank(
-            "No draft model config provided, auto-generating from target model..."
-        )
         # Auto-generate and save config file
         auto_config_path = create_draft_config_from_target(
             target_model_path=args.target_model_path, cache_dir=args.cache_dir
         )
         draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
-        print_with_rank(
-            f"Auto-generated draft model config saved to: {auto_config_path}"
-        )
     else:
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-        print_with_rank(f"Using provided draft model config: {args.draft_model_config}")
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None

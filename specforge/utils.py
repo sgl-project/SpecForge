@@ -133,15 +133,8 @@ def generate_draft_model_config(
         if hasattr(target_config, target_param):
             value = getattr(target_config, target_param)
             # Special handling for torch_dtype to make it JSON serializable
-            if target_param == "torch_dtype":
-                if hasattr(value, "__name__") or "torch" in str(type(value)):
-                    value_str = str(value)
-                    if "torch." in value_str:
-                        value = value_str.split("torch.")[
-                            -1
-                        ]  # Convert torch.float16 to 'float16'
-                    else:
-                        value = value_str.split(".")[-1]
+            if target_param == "torch_dtype" and isinstance(value, torch.dtype):
+                value = str(value).replace("torch.", "")
             draft_config[draft_param] = value
 
     # Special handling for some parameters
@@ -194,9 +187,16 @@ def create_draft_config_from_target(
         str: Generated config file path
     """
     # Generate config
-    config_dict = generate_draft_model_config(
-        target_model_path, template_config_path, cache_dir
-    )
+    rank = dist.get_rank()
+
+    if rank == 0:
+        print_with_rank(
+            "No draft model config provided, auto-generating from target model..."
+        )
+        config_dict = generate_draft_model_config(
+            target_model_path, template_config_path, cache_dir
+        )
+    dist.barrier()  # 所有人在这里同步
 
     # Determine output path
     if output_dir is None:
@@ -213,6 +213,11 @@ def create_draft_config_from_target(
     output_path = os.path.join(output_dir, output_filename)
 
     # Save config
-    save_draft_model_config(config_dict, output_path)
+    if rank == 0:
+        save_draft_model_config(config_dict, output_path)
+        print_with_rank(
+            f"Auto-generated draft model config saved to: {output_path}"
+        )
+    dist.barrier()  # 所有人在这里同步
 
     return output_path
