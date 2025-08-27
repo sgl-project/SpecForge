@@ -196,7 +196,7 @@ def create_draft_config_from_target(
         config_dict = generate_draft_model_config(
             target_model_path, template_config_path, cache_dir
         )
-    dist.barrier()  # 所有人在这里同步
+    dist.barrier()
 
     # Determine output path
     if output_dir is None:
@@ -216,6 +216,6 @@ def create_draft_config_from_target(
     if rank == 0:
         save_draft_model_config(config_dict, output_path)
         print_with_rank(f"Auto-generated draft model config saved to: {output_path}")
-    dist.barrier()  # 所有人在这里同步
+    dist.barrier()
 
     return output_path
