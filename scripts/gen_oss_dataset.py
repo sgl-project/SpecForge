@@ -4,7 +4,7 @@ Simple script to generate responses using local SGLang API from JSONL file.
 
 Data: https://huggingface.co/datasets/mlabonne/open-perfectblend
 Environment variables:
-     # optional, default: http://localhost:8418
+     # optional, default: http://localhost:30000
 Usage:
     step 1: data splitting
         ```
@@ -50,7 +50,7 @@ from openai_harmony import (
 from tqdm.auto import tqdm
 
 # Configuration
-BASE_URL = os.getenv("SGLANG_BASE_URL", "http://localhost:8418/v1/completions")
+BASE_URL = os.getenv("SGLANG_BASE_URL", "http://localhost:30000/v1/completions")
 HEADERS = {"Content-Type": "application/json"}
 
 MODEL = "openai/gpt-oss-20b"
