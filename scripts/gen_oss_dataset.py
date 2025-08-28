@@ -225,13 +225,20 @@ def main():
     parser.add_argument(
         "--output-dir", default="/data/", help="Output directory path (default: /data/)"
     )
+    parser.add_argument(
+        "--shard-step",
+        type=int,
+        default=5,
+        help="Process every Nth shard; step size (default: 5)",
+    )
+
     args = parser.parse_args()
 
     start_shared = args.shared
     max_shared = 72  # Based on the filename pattern shard_X_of_72
+    shard_step = max(1, args.shard_step)
 
-    # Process every 5th shard starting from start_shared
-    for shared in range(start_shared, max_shared + 1, 1):
+    for shared in range(start_shared, max_shared + 1, shard_step):
         input_file = os.path.join(args.input_dir, f"shard_{shared}_of_72.json")
         output_file = os.path.join(args.output_dir, f"shard_{shared}_of_72.json")
 
@@ -349,7 +356,9 @@ def main():
             continue
 
     print(f"\n{'='*60}")
-    print(f"Completed processing shards starting from {start_shared} (every 5th shard)")
+    print(
+        f"Completed processing shards starting from {start_shared} (every {shard_step}th shard)"
+    )
     print(f"{'='*60}")
 
 
