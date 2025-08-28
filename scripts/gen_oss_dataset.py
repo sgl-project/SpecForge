@@ -22,10 +22,11 @@ Usage:
             i=$((i+1))
         done
         ```
-    step 2: launch sglang
+    step 2: python3 -m sglang.launch_server --model-path openai/gpt-oss-120b --tp 8
     step 3: python gen_data.py <shared>
     Example: python gen_data.py 9
 """
+import argparse
 import json
 import os
 import random
@@ -213,19 +214,29 @@ def parse_channel_output(output: str) -> Dict[str, Optional[str]]:
 
 
 def main():
-    # Check arguments
-    if len(sys.argv) != 2:
-        print("Usage: python gen_data.py <shared>")
-        print("Example: python gen_data.py 9")
-        sys.exit(1)
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Generate GPT-OSS data from JSONL files"
+    )
+    parser.add_argument("shared", type=int, help="Starting shard number")
+    parser.add_argument(
+        "--input-dir", default="/data/", help="Input directory path (default: /data/)"
+    )
+    parser.add_argument(
+        "--output-dir", default="/data/", help="Output directory path (default: /data/)"
+    )
+    args = parser.parse_args()
 
-    start_shared = int(sys.argv[1])
+    start_shared = args.shared
     max_shared = 72  # Based on the filename pattern shard_X_of_72
 
     # Process every 5th shard starting from start_shared
     for shared in range(start_shared, max_shared + 1, 1):
-        input_file = f"/data/shenggui/data/perfect-blend/shard_{shared}_of_72.json"
-        output_file = f"/data/gen_oss/shard_{shared}_of_72.json"
+        input_file = os.path.join(args.input_dir, f"shard_{shared}_of_72.json")
+        output_file = os.path.join(args.output_dir, f"shard_{shared}_of_72.json")
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
         # Check if input file exists
         if not os.path.exists(input_file):
