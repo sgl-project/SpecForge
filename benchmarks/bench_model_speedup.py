@@ -65,10 +65,19 @@ def parse_args():
         nargs="+",
         default=["mtbench:80", "gsm8k:200", "humaneval:200", "math500:200"],
     )
+    parser.add_argument(
+        "--enable-multi-turn-conversation",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args()
 
 
-def get_mtbench_conversations(num_prompts: int, split_category: bool = True):
+def get_mtbench_conversations(
+    num_prompts: int,
+    split_category: bool = True,
+    use_multi_turn_conversation: bool = False,
+):
     url = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
     download_and_cache_file(url, filename="mtbench.jsonl")
     questions = list(read_jsonl("mtbench.jsonl"))[:num_prompts]
@@ -76,7 +85,8 @@ def get_mtbench_conversations(num_prompts: int, split_category: bool = True):
     for q in questions:
         conversation = []
         conversation.append({"role": "user", "content": q["turns"][0]})
-        conversation.append({"role": "user", "content": q["turns"][1]})
+        if use_multi_turn_conversation:
+            conversation.append({"role": "user", "content": q["turns"][1]})
         sub_bench_name = (
             f"{bench_name}-{q['category']}" if split_category else bench_name
         )
@@ -323,7 +333,11 @@ def main():
     for bench_name, num_prompts in benchmark_list:
         num_prompts = int(num_prompts)
         if bench_name == "mtbench":
-            bench_conversations.update(get_mtbench_conversations(num_prompts))
+            bench_conversations.update(
+                get_mtbench_conversations(
+                    num_prompts, args.enable_multi_turn_conversation
+                )
+            )
         elif bench_name == "gsm8k":
             bench_conversations.update(get_gsm8k_conversations(num_prompts))
         elif bench_name == "humaneval":
