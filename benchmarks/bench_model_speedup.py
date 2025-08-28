@@ -66,6 +66,11 @@ def parse_args():
         default=["mtbench:80", "gsm8k:200", "humaneval:200", "math500:200"],
     )
     parser.add_argument(
+        "--split-category",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--enable-multi-turn-conversation",
         action="store_true",
         default=False,
@@ -335,7 +340,9 @@ def main():
         if bench_name == "mtbench":
             bench_conversations.update(
                 get_mtbench_conversations(
-                    num_prompts, args.enable_multi_turn_conversation
+                    num_prompts=num_prompts,
+                    split_category=args.split_category,
+                    use_multi_turn_conversation=args.enable_multi_turn_conversation,
                 )
             )
         elif bench_name == "gsm8k":
