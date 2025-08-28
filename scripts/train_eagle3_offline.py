@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import math
 import os
 import time
 from collections import defaultdict
@@ -303,7 +304,9 @@ def main():
 
     # Calculate total steps if not provided
     if args.total_steps is None:
-        steps_per_epoch = len(train_dataloader) // args.draft_accumulation_steps
+        steps_per_epoch = math.ceil(
+            len(train_dataloader) / args.draft_accumulation_steps
+        )
         args.total_steps = args.num_epochs * steps_per_epoch
         print_with_rank(
             f"Auto-calculated total_steps: {args.total_steps} (num_epochs={args.num_epochs} * steps_per_epoch={steps_per_epoch})"
