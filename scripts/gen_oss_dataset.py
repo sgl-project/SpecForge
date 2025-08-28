@@ -22,7 +22,7 @@ Usage:
             i=$((i+1))
         done
         ```
-    step 2: python3 -m sglang.launch_server --model-path openai/gpt-oss-120b --tp 8
+    step 2: python3 -m sglang.launch_server --model-path openai/gpt-oss-20b --tp 8
     step 3: python gen_data.py <shared>
     Example: python gen_data.py 9
 """
