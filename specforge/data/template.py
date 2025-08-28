@@ -163,3 +163,34 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|end|>",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="kimi_k2",
+    template=ChatTemplate(
+        system_prompt="You are a helpful assistant.",
+        user_header="<|im_user|>user<|im_middle|>",
+        assistant_header="<|im_assistant|>assistant<|im_middle|>",
+        end_of_turn_token="<|im_end|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek_v3",
+    template=ChatTemplate(
+        system_prompt="You are a helpful assistant.",
+        user_header="<｜User｜>",
+        assistant_header="<｜Assistant｜>",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
+
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek_r1",
+    template=ChatTemplate(
+        system_prompt="You are a helpful assistant.",
+        user_header="<｜User｜>",
+        assistant_header="<｜Assistant｜>",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
