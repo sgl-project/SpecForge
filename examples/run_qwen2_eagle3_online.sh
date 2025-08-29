@@ -15,10 +15,10 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
     --output-dir $ROOT_DIR/outputs/Qwen3-8B-eagle3 \
     --num-epochs 10 \
-    --batch-size 1 \
+    --batch-size 8 \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template qwen \
     --cache-dir $ROOT_DIR/cache \
     --report-to wandb \
-    --tp-size $NUM_GPUS
+    --attention-backend flex_attention

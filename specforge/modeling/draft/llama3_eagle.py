@@ -23,6 +23,48 @@ from .base import Eagle3DraftModel
 logger = logging.getLogger(__name__)
 
 
+def expand_weight_low_rank(source_weight, target_in_dim, rank=None):
+    original_dtype = source_weight.dtype
+    original_device = source_weight.device
+    original_out, original_in = source_weight.shape
+
+    assert target_in_dim % original_in == 0
+    in_scale = target_in_dim // original_in
+
+    if rank is None:
+        rank = min(original_out, original_in) // 4
+    rank = min(rank, original_out, original_in)
+
+    # Perform SVD in float32 for numerical stability and wider device support
+    svd_input = source_weight.to(dtype=torch.float32)
+    U, S, Vh = torch.linalg.svd(svd_input, full_matrices=False)
+    U = U[:, :rank]  # [original_out, rank]
+    S = S[:rank]  # [rank]
+    Vh = Vh[:rank, :]  # [rank, original_in]
+
+    sqrt_S = torch.sqrt(S)
+    A = U * sqrt_S  # [original_out, rank]
+    B = sqrt_S.unsqueeze(1) * Vh  # [rank, original_in]
+
+    # Keep output rows the same; only expand columns (input dim)
+    A_extended = A  # [original_out, rank]
+
+    B_extended = []
+    for i in range(in_scale):
+        if i == 0:
+            B_extended.append(B)
+        else:
+            noise = torch.randn_like(B) * 0.01 * (B.std() + 1e-6)
+            B_extended.append(B + noise)
+    B_extended = torch.cat(B_extended, dim=1)  # [rank, target_in_dim]
+
+    expanded_weight = (A_extended @ B_extended).to(
+        dtype=original_dtype, device=original_device
+    )  # [original_out, target_in_dim]
+
+    return expanded_weight
+
+
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
     input_ids_shape: torch.Size,
@@ -1041,8 +1083,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
                         )
 
                         if source_shape[1] * 2 == target_shape[1]:
-                            weight_part1 = source_weight
 
+                            """
+                            weight_part1 = source_weight
                             noise_scale = 0.01
                             weight_part2 = (
                                 source_weight
@@ -1051,7 +1094,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
                             expanded_weight = torch.cat(
                                 [weight_part1, weight_part2], dim=1
                             )
-
+                            """
+                            expanded_weight = expand_weight_low_rank(
+                                source_weight, target_shape[1]
+                            )
                             target_param.copy_(expanded_weight)
                         else:
                             target_param.copy_(source_weight)
