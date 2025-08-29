@@ -57,6 +57,17 @@ def parse_args():
     parser.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
+    parser.add_argument(
+        "--init-from-target-layer",
+        action="store_true",
+        help="Initialize draft model parameters from target model's last layer",
+    )
+    parser.add_argument(
+        "--target-layer-idx",
+        type=int,
+        default=-1,
+        help="Target layer index to load parameters from (-1 means last layer)",
+    )
 
     # add training-related arguments
     parser.add_argument("--train-data-path", type=str, required=True)
@@ -282,6 +293,20 @@ def main():
         )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+
+    # Load parameters from target model's last layer for better initialization
+    if (
+        not draft_model_last_checkpoint and args.init_from_target_layer
+    ):  # Only load from target if not resuming from checkpoint and flag is set
+        draft_model.load_from_target_last_layer(
+            model_path=args.target_model_path,
+            layer_idx=args.target_layer_idx,  # Use specified layer
+            attention_backend=args.attention_backend,
+        )
+        print_with_rank(
+            f"Loaded parameters from target model layer {args.target_layer_idx}"
+        )
+
     print_with_rank("Initialized draft model")
 
     # build dataloaders

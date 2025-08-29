@@ -16,6 +16,7 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.utils import print_with_rank, rank_0_priority
 
 from .base import Eagle3DraftModel
 
@@ -778,7 +779,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
-    def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
+    def __init__(
+        self, config, quant_config=None, attention_backend="flex_attention"
+    ) -> None:
         super().__init__(config)
         self.config = config
         self.quant_config = quant_config
@@ -803,7 +806,11 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
-
+        self.load_from_target_last_layer(
+            model_path="Qwen/Qwen2.5-Math-7B",
+            layer_idx=27,
+            attention_backend=attention_backend,
+        )
         # create vocab buffers
         t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
@@ -826,10 +833,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            logger.info("using ttt_length 1, no need to cache hidden states")
+            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            logger.info(f"using ttt_length {ttt_length}, caching hidden states")
+            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()
@@ -897,4 +904,185 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
+        )
+
+    @torch.no_grad()
+    def load_from_target_last_layer(
+        self, model_path: str, layer_idx: int = -1, attention_backend: str = "sdpa"
+    ) -> None:
+        """
+        Load parameters from target model's specified layer to initialize draft model.
+
+        Args:
+            model_path (str): Path to the target model
+            layer_idx (int): Layer index to load from (-1 means last layer)
+            attention_backend (str): Attention backend used in draft model
+        """
+        import glob
+        import json
+        import os
+
+        from huggingface_hub import snapshot_download
+        from safetensors import safe_open
+        from transformers import AutoConfig
+
+        print_with_rank(f"loading from target model layer {layer_idx}")
+        # Handle model path (local or HF hub)
+        if os.path.exists(model_path):
+            local_cache_path = model_path
+        else:
+            print_with_rank(f"Downloading model from {model_path}...")
+            local_cache_path = snapshot_download(repo_id=model_path)
+            self.load_from_target_last_layer(
+                local_cache_path, layer_idx, attention_backend
+            )
+            return
+
+        # Get target model config to determine number of layers
+        target_config = AutoConfig.from_pretrained(model_path)
+        num_layers = target_config.num_hidden_layers
+
+        # Determine which layer to load from
+        if layer_idx < 0:
+            layer_idx = num_layers + layer_idx  # Convert negative index to positive
+
+        if layer_idx >= num_layers:
+            raise ValueError(
+                f"Layer index {layer_idx} is out of range for model with {num_layers} layers"
+            )
+
+        print_with_rank(
+            f"Loading parameters from target model layer {layer_idx} (0-indexed)"
+        )
+
+        # Define parameter prefixes
+        attention_prefix = f"model.layers.{layer_idx}.self_attn"
+        mlp_prefix = f"model.layers.{layer_idx}.mlp"
+        input_norm_prefix = f"model.layers.{layer_idx}.input_layernorm"
+        post_attn_norm_prefix = f"model.layers.{layer_idx}.post_attention_layernorm"
+
+        # Find checkpoint files
+        glob_path = os.path.join(local_cache_path, "*.index.json")
+        index_json_path = glob.glob(glob_path)
+
+        if len(index_json_path) == 0:
+            raise FileNotFoundError(f"No index.json file found in {local_cache_path}")
+        if len(index_json_path) > 1:
+            raise FileNotFoundError(
+                f"Multiple index.json files found in {local_cache_path}"
+            )
+
+        index_json_path = index_json_path[0]
+        with open(index_json_path, "r") as f:
+            index_json = json.load(f)
+
+        def load_tensor_from_checkpoint(tensor_key):
+            if tensor_key not in index_json["weight_map"]:
+                return None
+
+            ckpt_file = index_json["weight_map"][tensor_key]
+            if ckpt_file.endswith(".safetensors"):
+                with safe_open(
+                    os.path.join(local_cache_path, ckpt_file), framework="pt"
+                ) as f:
+                    return f.get_tensor(tensor_key)
+            else:
+                state_dict = torch.load(os.path.join(local_cache_path, ckpt_file))
+                return state_dict[tensor_key]
+
+        param_keys = {
+            "attention": [
+                f"{attention_prefix}.q_proj.weight",
+                f"{attention_prefix}.k_proj.weight",
+                f"{attention_prefix}.v_proj.weight",
+                f"{attention_prefix}.o_proj.weight",
+            ],
+            "mlp": [
+                f"{mlp_prefix}.gate_proj.weight",
+                f"{mlp_prefix}.up_proj.weight",
+                f"{mlp_prefix}.down_proj.weight",
+            ],
+            "norm": [
+                f"{input_norm_prefix}.weight",
+                f"{post_attn_norm_prefix}.weight",
+            ],
+        }
+
+        # Load all parameters
+        loaded_params = {}
+        for param_type, keys in param_keys.items():
+            loaded_params[param_type] = {}
+            for key in keys:
+                tensor = load_tensor_from_checkpoint(key)
+                if tensor is not None:
+                    loaded_params[param_type][key] = tensor
+                    print_with_rank(f"Loaded {key}")
+                else:
+                    print_with_rank(f"Parameter {key} not found in checkpoint")
+
+        if loaded_params["attention"]:
+            attention_mapping = {
+                f"{attention_prefix}.q_proj.weight": self.midlayer.self_attn.q_proj.weight,
+                f"{attention_prefix}.k_proj.weight": self.midlayer.self_attn.k_proj.weight,
+                f"{attention_prefix}.v_proj.weight": self.midlayer.self_attn.v_proj.weight,
+                f"{attention_prefix}.o_proj.weight": self.midlayer.self_attn.o_proj.weight,
+            }
+
+            for key, target_param in attention_mapping.items():
+                if key in loaded_params["attention"]:
+                    source_weight = loaded_params["attention"][key]
+
+                    if "q_proj" in key or "k_proj" in key or "v_proj" in key:
+                        source_shape = source_weight.shape
+                        target_shape = target_param.shape
+
+                        print_with_rank(
+                            f"Expanding {key} from {source_shape} to {target_shape}"
+                        )
+
+                        if source_shape[1] * 2 == target_shape[1]:
+                            weight_part1 = source_weight
+
+                            noise_scale = 0.01
+                            weight_part2 = (
+                                source_weight
+                                + torch.randn_like(source_weight) * noise_scale
+                            )
+                            expanded_weight = torch.cat(
+                                [weight_part1, weight_part2], dim=1
+                            )
+
+                            target_param.copy_(expanded_weight)
+                        else:
+                            target_param.copy_(source_weight)
+                    else:
+                        target_param.copy_(source_weight)
+
+        # Copy MLP parameters
+        print_with_rank("Copying MLP parameters...")
+        if loaded_params["mlp"]:
+            mlp_mapping = {
+                f"{mlp_prefix}.gate_proj.weight": self.midlayer.mlp.gate_proj.weight,
+                f"{mlp_prefix}.up_proj.weight": self.midlayer.mlp.up_proj.weight,
+                f"{mlp_prefix}.down_proj.weight": self.midlayer.mlp.down_proj.weight,
+            }
+
+            for key, target_param in mlp_mapping.items():
+                if key in loaded_params["mlp"]:
+                    target_param.copy_(loaded_params["mlp"][key])
+
+        # Copy layer norm parameters
+        print_with_rank("Copying layer norm parameters...")
+        if loaded_params["norm"]:
+            norm_mapping = {
+                f"{input_norm_prefix}.weight": self.midlayer.input_layernorm.weight,
+                f"{post_attn_norm_prefix}.weight": self.midlayer.post_attention_layernorm.weight,
+            }
+
+            for key, target_param in norm_mapping.items():
+                if key in loaded_params["norm"]:
+                    target_param.copy_(loaded_params["norm"][key])
+
+        print_with_rank(
+            f"Successfully loaded parameters from target model layer {layer_idx}"
         )
