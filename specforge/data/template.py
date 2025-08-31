@@ -1,5 +1,5 @@
 # Adapted from: https://github.com/sgl-project/sglang/blob/main/python/sglang/lang/chat_template.py#L13
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -11,14 +11,19 @@ class ChatTemplate(BaseModel):
     Args:
         assistant_header(str): The header for the assistant.
         user_header(str): The header for the user.
-        system_prompt(str): The system prompt.
-        end_of_turn_token(str): The end token of a turn of conversation.
+        system_prompt (Optional[str]): The system prompt.
+        end_of_turn_token (Optional[str]): The end token of a turn of conversation.
+                                           If present, end_of_assistant_token and end_of_user_token are ignored.
+        end_of_assistant_token (Optional[str]): The end token of an assistant turn of conversation.
+        end_of_user_token (Optional[str]): The end token of a user turn of conversation.
     """
 
     assistant_header: str
     user_header: str
-    system_prompt: str
-    end_of_turn_token: str
+    system_prompt: Optional[str] = None
+    end_of_turn_token: Optional[str] = None
+    end_of_assistant_token: Optional[str] = None
+    end_of_user_token: Optional[str] = None
 
 
 class TemplateRegistry:
@@ -101,6 +106,24 @@ TEMPLATE_REGISTRY.register(
         user_header="<|header_start|>user<|header_end|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|eot|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="mistral-v0.1",
+    template=ChatTemplate(
+        assistant_header=" [/INST] ",
+        user_header=" [INST] ",
+        end_of_assistant_token="</s>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="mistral-v0.3",
+    template=ChatTemplate(
+        assistant_header="[/INST] ",
+        user_header="[INST] ",
+        end_of_assistant_token="</s>",
     ),
 )
 

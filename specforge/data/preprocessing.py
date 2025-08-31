@@ -70,12 +70,20 @@ def _apply_loss_mask_from_chat_template(
     """
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
-    user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    )
+    if chat_template.end_of_turn_token is None:
+        user_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+        )
+        assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+        )
+    else:
+        user_message_separator = (
+            f"{chat_template.end_of_assistant_token or ''}{chat_template.user_header}"
+        )
+        assistant_message_separator = (
+            f"{chat_template.end_of_user_token or ''}{chat_template.assistant_header}"
+        )
 
     # Find spans of assistant responses using regex
     assistant_pattern = (
@@ -149,7 +157,7 @@ def preprocess_conversations(
             system_prompt = chat_template.system_prompt
 
             # source is a list of conversation messages, need to format
-            messages = [{"role": "system", "content": system_prompt}]
+            messages = [{"role": "system", "content": system_prompt}] if system_prompt is None else []
 
             if source[0]["role"] != "user":
                 # if the first message is not from user, skip it
