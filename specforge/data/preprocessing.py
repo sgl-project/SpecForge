@@ -157,7 +157,7 @@ def preprocess_conversations(
             system_prompt = chat_template.system_prompt
 
             # source is a list of conversation messages, need to format
-            messages = [{"role": "system", "content": system_prompt}] if system_prompt is None else []
+            messages = [{"role": "system", "content": system_prompt}]
 
             if source[0]["role"] != "user":
                 # if the first message is not from user, skip it
