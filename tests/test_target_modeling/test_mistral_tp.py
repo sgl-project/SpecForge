@@ -27,6 +27,7 @@ def test_mistral_tp(rank, world_size, temp_dir):
         max_position_embeddings=1024,
         num_attention_heads=10,
         num_key_value_heads=2,
+        head_dim=64,
         tie_word_embeddings=False,
         initializer_range=0.02,
         hidden_act="silu",
