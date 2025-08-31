@@ -65,10 +65,10 @@ class TestPreprocessing(unittest.TestCase):
     """Test suite for conversation preprocessing and loss mask generation."""
 
     def setUp(self):
-        """Set up test fixtures with Qwen3-8B tokenizer and template."""
-        self.model_path = "Qwen/Qwen3-8B"
+        """Set up test fixtures with mistralai/Mistral-Small-24B-Instruct-2501 tokenizer and template."""
+        self.model_path = "mistralai/Mistral-Small-24B-Instruct-2501"
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        self.chat_template = TEMPLATE_REGISTRY.get("qwen")
+        self.chat_template = TEMPLATE_REGISTRY.get("mistral-small-24B")
         self.max_length = 512
 
     def test_conversation_preprocessing_basic(self):
@@ -122,7 +122,7 @@ class TestPreprocessing(unittest.TestCase):
                 assistant_tokens, skip_special_tokens=False
             )
             expected_assistant_text = (
-                "<think>\n\n</think>\n\nThe answer is 4.<|im_end|>\n"
+                "The answer is 4.</s>"
             )
             self.assertEqual(
                 assistant_text,
@@ -165,7 +165,7 @@ class TestPreprocessing(unittest.TestCase):
         )
 
         # Exact match for the complete assistant text from both turns
-        expected_assistant_text = "The answer is 4.<|im_end|><think>\n\n</think>\n\nYes, I'm certain.<|im_end|>\n"
+        expected_assistant_text = "The answer is 4.</s>Yes, I'm certain.</s>"
         self.assertEqual(
             assistant_text,
             expected_assistant_text,
@@ -175,7 +175,14 @@ class TestPreprocessing(unittest.TestCase):
     def test_preformatted_conversation(self):
         """Test preprocessing of pre-formatted conversation strings."""
         preformatted_conversations = [
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is Python?<|im_end|>\n<|im_start|>assistant\nPython is a programming language.<|im_end|>\n"
+            "<s>[SYSTEM_PROMPT]You are Mistral Small 3, a Large Language Model (LLM) created by Mistral AI, a French "
+            "startup headquartered in Paris. Your knowledge base was last updated on 2023-10-01. The current date is "
+            "2025-08-31. When you're not sure about some information, you say that you don't have the information and "
+            "don't make up anything. If the user's question is not clear, ambiguous, or does not provide enough context "
+            "for you to accurately answer the question, you do not try to answer it right away and you rather ask the "
+            "user to clarify their request (e.g. \"What are some good restaurants around me?\" => \"Where are you?\" "
+            "or \"When is the next flight to Tokyo\" => \"Where do you travel from?\")[/SYSTEM_PROMPT]"
+            "[INST]What is Python?[/INST]Python is a programming language.</s>"
         ]
 
         results = preprocess_conversations(
@@ -206,7 +213,7 @@ class TestPreprocessing(unittest.TestCase):
         )
 
         # Check for exact match of the expected assistant response
-        expected_assistant_text = "Python is a programming language.<|im_end|>\n"
+        expected_assistant_text = "Python is a programming language.</s>"
         self.assertEqual(
             assistant_text,
             expected_assistant_text,
@@ -222,7 +229,7 @@ class TestPreprocessing(unittest.TestCase):
                     {"role": "user", "content": "Hi"},
                     {"role": "assistant", "content": "Hello!"},
                 ],
-                "expected_assistant_text": "<think>\n\n</think>\n\nHello!<|im_end|>\n",
+                "expected_assistant_text": "Hello!</s>",
             },
             {
                 "name": "Response with punctuation",
@@ -230,7 +237,7 @@ class TestPreprocessing(unittest.TestCase):
                     {"role": "user", "content": "What's your name?"},
                     {"role": "assistant", "content": "I'm Claude, an AI assistant."},
                 ],
-                "expected_assistant_text": "<think>\n\n</think>\n\nI'm Claude, an AI assistant.<|im_end|>\n",
+                "expected_assistant_text": "I'm Claude, an AI assistant.</s>",
             },
             {
                 "name": "Multi-sentence response",
@@ -241,7 +248,7 @@ class TestPreprocessing(unittest.TestCase):
                         "content": "Python is a programming language. It's very popular for AI.",
                     },
                 ],
-                "expected_assistant_text": "<think>\n\n</think>\n\nPython is a programming language. It's very popular for AI.<|im_end|>\n",
+                "expected_assistant_text": "Python is a programming language. It's very popular for AI.</s>",
             },
             {
                 "name": "Response with special characters",
@@ -252,7 +259,7 @@ class TestPreprocessing(unittest.TestCase):
                         "content": "Sure! Here's an example: 2 + 2 = 4, and π ≈ 3.14159.",
                     },
                 ],
-                "expected_assistant_text": "<think>\n\n</think>\n\nSure! Here's an example: 2 + 2 = 4, and π ≈ 3.14159.<|im_end|>\n",
+                "expected_assistant_text": "Sure! Here's an example: 2 + 2 = 4, and π ≈ 3.14159.</s>",
             },
         ]
 
