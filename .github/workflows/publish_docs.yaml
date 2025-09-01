@@ -43,4 +43,3 @@ jobs:
         with:
           personal_token: ${{ secrets.PERSONAL_TOKEN }}
           publish_dir: ./docs/_build/html
-          cname: docs.sglang.ai/SpecForge
