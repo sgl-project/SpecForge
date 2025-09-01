@@ -40,3 +40,14 @@ This project has also been inspired by many outstanding open-source projects fro
 ## 💡 Special Thanks to Voltage Park
 
 We would like to extend our sincere thanks to [Voltage Park](https://www.voltagepark.com/), our official infrastructure partner. As part of a formal collaboration with the SGLang team, Voltage Park provided critical GPU resources that empowered us to train and evaluate large-scale speculative decoding models efficiently and reliably. This partnership was instrumental in making SpecForge possible. We deeply appreciate Voltage Park’s mission to make cutting-edge AI infrastructure more accessible, and we look forward to continued collaboration as we push the boundaries of open-source LLM serving and optimization.
+
+## 📃 Citation
+
+```bibtex
+@misc{specforge2025,
+  title={SpecForge: Train speculative decoding models effortlessly},
+  author={Shenggui Li, Yikai Zhu, Chao Wang, Fan Yin, Shuai Shi, Yubo Wang, Yi Zhang, Yingyi Huang, Haoshuai Zheng, Yineng Zhang},
+  year={2025},
+  publisher={GitHub},
+  howpublished={\url{https://github.com/sgl-project/specforge}},
+}
