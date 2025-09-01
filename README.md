@@ -1,7 +1,7 @@
 <div align="center" id="sglangtop">
 <img src="./assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
-[![documentation](https://img.shields.io/badge/📖-Documentation-red.svg?style=flat)](https://sglang-project.github.io/specforgfe)
+[![documentation](https://img.shields.io/badge/📖-Documentation-red.svg?style=flat)](https://docs.sglang.ai/SpecForge/)
 [![github badge](https://img.shields.io/badge/📃%20LMSYS-Blog-black.svg?style=flat)](https://lmsys.org/blog/2025-07-25-spec-forge/)
 [![slack badge](https://img.shields.io/badge/Slack-join-blueviolet?logo=slack&amp)](https://sgl-fru7574.slack.com/archives/C09784E3EN6)
 [![SGLang Eagle3](https://img.shields.io/badge/🤗%20Hugging%20Face-SGLang%20Eagle3-yellow.svg?style=flat)](https://huggingface.co/collections/lmsys/eagle-3-6886b2329f3998a8bc23f8ed)
@@ -19,7 +19,7 @@ We have seen many open-source projects for speculative decoding, but most of the
 - provide performant training capabilities: we provided online/offline/tensor-parallel/FSDP to suit your needs
 
 
-Check out [**our documentation**](https://sglang-project.github.io/specforge) to get started.
+Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get started.
 
 ## 🎉 News
 
