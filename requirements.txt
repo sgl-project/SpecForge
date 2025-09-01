@@ -13,3 +13,4 @@ numpy
 accelerate
 pydantic
 sglang[all]==0.5.1
+openai-harmony

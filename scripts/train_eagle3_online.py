@@ -12,7 +12,7 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from specforge import (
     AutoDistributedTargetModel,
@@ -26,7 +26,12 @@ from specforge.data import (
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_group,
+    get_tp_device_mesh,
+    init_distributed,
+)
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import (
@@ -238,13 +243,24 @@ def main():
 
     # build target and draft model
     if args.tp_size > 1:
-        # to avoid CPU RAM OOM, we directly init the model on CUDA
-        target_model = AutoDistributedTargetModel.from_pretrained(
-            pretrained_model_name_or_path=args.target_model_path,
-            torch_dtype=torch.bfloat16,
-            cache_dir=args.cache_dir,
-            device="cuda",
-        ).eval()
+        # check if the target model has tp_plan
+        config = AutoConfig.from_pretrained(args.target_model_path)
+
+        if type(config) in AutoDistributedTargetModel._model_mapping:
+            target_model = AutoDistributedTargetModel.from_pretrained(
+                pretrained_model_name_or_path=args.target_model_path,
+                torch_dtype=torch.bfloat16,
+                device="cuda",
+                local_files_only=True,
+            ).eval()
+        else:
+            target_model = AutoModelForCausalLM.from_pretrained(
+                args.target_model_path,
+                tp_plan="auto",
+                tp_size=args.tp_size,
+                torch_dtype=torch.bfloat16,
+                device_mesh=get_tp_device_mesh(),
+            ).eval()
     else:
         if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
             from transformers import Qwen2_5_VLForConditionalGeneration
@@ -445,6 +461,7 @@ def main():
     # start running
     print_on_rank0(f"Starting training from epoch {start_epoch}")
     batch_index, log_dict = 0, defaultdict(float)
+
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)

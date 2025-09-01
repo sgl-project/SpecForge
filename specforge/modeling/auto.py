@@ -7,6 +7,7 @@ import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
+    GptOssConfig,
     Llama4Config,
     Llama4TextConfig,
     LlamaConfig,
@@ -23,6 +24,7 @@ from transformers import (
 from specforge.utils import default_torch_dtype
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .target.gpt_oss import GptOssForCausalLM
 from .target.llama import LlamaForCausalLM
 from .target.llama4 import Llama4ForCausalLM
 from .target.mistral import MistralForCausalLM
@@ -90,6 +92,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         Qwen3Config: [Qwen3ForCausalLM],
         Phi3Config: [Phi3ForCausalLM],
         MistralConfig: [MistralForCausalLM],
+        GptOssConfig: [GptOssForCausalLM],
     }
 
     @classmethod
