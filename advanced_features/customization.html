@@ -1,0 +1,636 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>💡 Customize Your Own Training &#8212; SGLang</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="../_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="../_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=eba8b062" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="../_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="../_static/documentation_options.js?v=a1637f0b"></script>
+    <script src="../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'advanced_features/customization';</script>
+    <link rel="icon" href="../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="prev" title="&lt;no title&gt;" href="../basic_usage/llama3.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2025"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
+    <script>document.write(`<img src="../_static/logo.png" class="logo__image only-dark" alt="SGLang - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get_started/install.html">📦 Installation</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">🚀 Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/benchmarking.html">🤖 Benchmarking On SGLang</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">💡 Customize Your Own Training</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/blob/main/advanced_features/customization.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/edit/main/advanced_features/customization.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/issues/new?title=Issue%20on%20page%20%2Fadvanced_features/customization.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/advanced_features/customization.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm pst-navbar-icon search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>💡 Customize Your Own Training</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-training-args">🔧 Customize Training Args</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-chat-template">💬 Customize Chat Template</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-model">🪅 Customize Model</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-target-model">Customize Target Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-draft-model">Customize Draft Model</a></li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="customize-your-own-training">
+<h1>💡 Customize Your Own Training<a class="headerlink" href="#customize-your-own-training" title="Link to this heading">#</a></h1>
+<section id="customize-training-args">
+<h2>🔧 Customize Training Args<a class="headerlink" href="#customize-training-args" title="Link to this heading">#</a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--standalone<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>./scripts/train_eagle3_online.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--target-model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--draft-model-config<span class="w"> </span>./configs/llama3-8B-eagle3.json<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--train-data-path<span class="w"> </span>./cache/dataset/sharegpt.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-dir<span class="w"> </span>./outputs/llama3-8b-eagle3<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-epochs<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--learning-rate<span class="w"> </span>1e-4<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-length<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--chat-template<span class="w"> </span>llama3<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--cache-dir<span class="w"> </span>./cache
+</pre></div>
+</div>
+<p>If you wish to understand what each argument does, you can run <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">scripts/train_eagle3_online.py</span> <span class="pre">--help</span></code> to see the full list of arguments. Particularly, we will discuss some important arguments below.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--chat-template</span></code>: This should be the chat template to use for the model, so please make sure you set it to the correct value.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code>: This directory contains the dataset cache including the <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">attention_mask</span></code> and <code class="docutils literal notranslate"><span class="pre">vocab_mapping</span></code>. These caches can make your data loading much faster once a cache is generated. The cache file has a name which is obtained by hashing the dataset path to avoid cache collision.</p></li>
+</ul>
+</section>
+<section id="customize-chat-template">
+<h2>💬 Customize Chat Template<a class="headerlink" href="#customize-chat-template" title="Link to this heading">#</a></h2>
+<p>You can register a new chat template for your model by adding a new entry to the <code class="docutils literal notranslate"><span class="pre">TEMPLATE_REGISTRY</span></code> in the <code class="docutils literal notranslate"><span class="pre">specforge.data.template.py</span></code> file.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">TEMPLATE_REGISTRY</span><span class="o">.</span><span class="n">register</span><span class="p">(</span>
+    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;your-template-name&quot;</span><span class="p">,</span>
+    <span class="n">template</span><span class="o">=</span><span class="n">ChatTemplate</span><span class="p">(</span>
+        <span class="n">assistant_header</span><span class="o">=</span><span class="s2">&quot;xxx&quot;</span><span class="p">,</span>
+        <span class="n">user_header</span><span class="o">=</span><span class="s2">&quot;xxx&quot;</span><span class="p">,</span>
+        <span class="n">system_prompt</span><span class="o">=</span><span class="s2">&quot;xxx&quot;</span><span class="p">,</span>
+        <span class="n">end_of_turn_token</span><span class="o">=</span><span class="s2">&quot;xxx&quot;</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="customize-model">
+<h2>🪅 Customize Model<a class="headerlink" href="#customize-model" title="Link to this heading">#</a></h2>
+<section id="customize-target-model">
+<h3>Customize Target Model<a class="headerlink" href="#customize-target-model" title="Link to this heading">#</a></h3>
+<p>If you wish to train Eagle3 for other models, you need to modify the <code class="docutils literal notranslate"><span class="pre">--target-model-path</span></code> value. We support loading these models directly from HuggingFace.</p>
+<p>However, if your model is too large and requires tensor parallelism, you can implement its tensor parallel version on your own in the <code class="docutils literal notranslate"><span class="pre">specforge.modeling.target</span></code> directory. The CausalLM model should inherit the <code class="docutils literal notranslate"><span class="pre">DistributedTargetModel</span></code> class in the <code class="docutils literal notranslate"><span class="pre">specforge.modeling.target.base.py</span></code> file and apply <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code> and <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code> to its submodules.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedTargetModel</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">specforge.layers.linear</span><span class="w"> </span><span class="kn">import</span> <span class="n">ColumnParallelLinear</span><span class="p">,</span> <span class="n">RowParallelLinear</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MyModelForCausalLM</span><span class="p">(</span><span class="n">MyModelPreTrainedModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">,</span> <span class="n">DistributedTargetModel</span><span class="p">):</span>
+    <span class="o">...</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">state_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
+        <span class="o">...</span>
+</pre></div>
+</div>
+<p>Afterwards, you need to register this model to the <code class="docutils literal notranslate"><span class="pre">AutoEagle3TargetModel</span></code> class in the <code class="docutils literal notranslate"><span class="pre">specforge.modeling.auto.py</span></code> file.</p>
+<div class="highlight-diff notranslate"><div class="highlight"><pre><span></span>class AutoDistributedTargetModel(AutoModelForCausalLMBase):
+<span class="w"> </span>   _model_mapping = {
+<span class="w"> </span>       Llama4TextConfig: [Llama4ForCausalLM],
+<span class="gi">+       MyModelConfig: [MyModelForCausalLM],</span>
+<span class="w"> </span>   }
+</pre></div>
+</div>
+<p>When <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> is greater than 1, the script will automatically load the distributed version of the model for tensor parallelism.</p>
+</section>
+<section id="customize-draft-model">
+<h3>Customize Draft Model<a class="headerlink" href="#customize-draft-model" title="Link to this heading">#</a></h3>
+<p>If you want to change the draft model configuration, you can write your own configuration file and pass its path to the <code class="docutils literal notranslate"><span class="pre">--draft-model-config</span></code> argument. Or, if you do not provide the <code class="docutils literal notranslate"><span class="pre">--draft-model-config</span></code> argument, the script will automatically generate the draft model configuration based on the target model configuration. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the <code class="docutils literal notranslate"><span class="pre">Eagle3DraftModel</span></code> class in the <code class="docutils literal notranslate"><span class="pre">specforge.modeling.draft.base.py</span></code> file.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Eagle3DraftModel</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PretrainedConfig</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MyModelConfig</span><span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="n">model_type</span> <span class="o">=</span> <span class="s2">&quot;mymodel&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="o">...</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MyModelEagle3</span><span class="p">(</span><span class="n">Eagle3DraftModel</span><span class="p">):</span>
+
+    <span class="n">config_class</span> <span class="o">=</span> <span class="n">MyModelConfig</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">quant_config</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="o">...</span>
+</pre></div>
+</div>
+<p>You can then register these models to the <code class="docutils literal notranslate"><span class="pre">AutoEagle3TargetModel</span></code> and <code class="docutils literal notranslate"><span class="pre">AutoDraftModelConfig</span></code> classes in the <code class="docutils literal notranslate"><span class="pre">specforge.modeling.auto.py</span></code> file for the automatic model loading.</p>
+<div class="highlight-diff notranslate"><div class="highlight"><pre><span></span>class AutoEagle3DraftModel(AutoModelForCausalLMBase):
+<span class="w"> </span>   # the model mapping is currently hardcoded, we should support lazy model mapping via registry
+<span class="w"> </span>   _model_mapping = {
+<span class="w"> </span>       LlamaConfig: [LlamaForCausalLMEagle3],
+<span class="gi">+       MyModelConfig: MyModelEagle3,</span>
+<span class="w"> </span>   }
+
+
+class AutoDraftModelConfig:
+
+<span class="w"> </span>   _config_mapping = {
+<span class="w"> </span>       &quot;LlamaForCausalLMEagle3&quot;: LlamaConfig,
+<span class="gi">+       &quot;MyModelEagle3&quot;: MyModelConfig,</span>
+<span class="w"> </span>   }
+</pre></div>
+</div>
+<p>In this way, as long as your <code class="docutils literal notranslate"><span class="pre">config.json</span></code> specifies the correct architecture name, the script will automatically load the correct draft model for you.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../basic_usage/llama3.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">&lt;no title&gt;</p>
+      </div>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-training-args">🔧 Customize Training Args</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-chat-template">💬 Customize Chat Template</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-model">🪅 Customize Model</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-target-model">Customize Target Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-draft-model">Customize Draft Model</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SpecForge Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2025, SpecForge.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Sep 01, 2025.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="../_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="../_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
