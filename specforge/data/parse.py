@@ -49,29 +49,30 @@ class GeneralParser(Parser):
         )
 
     def parse(
-        self, conversation: "Conversation", max_length: int
+        self, conversation: "Conversation", max_length: int, preformatted: bool = False
     ) -> Dict[str, List[torch.Tensor]]:
-        messages = []
-        if source[0]["role"] == "system":
-            warnings.warn(
-                f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+        if not preformatted:
+            messages = []
+            if source[0]["role"] == "system":
+                warnings.warn(
+                    f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+                )
+                messages.append({"role": "system", "content": source[0]["content"]})
+                source = source[1:]
+            else:
+                messages.append({"role": "system", "content": self.system_prompt})
+
+            convroles = ["user", "assistant"]
+            for j, sentence in enumerate(source):
+                role = sentence["role"]
+                assert role == convroles[j % 2], f"unexpected role {role}"
+                messages.append({"role": role, "content": sentence["content"]})
+
+            conversation = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
             )
-            messages.append({"role": "system", "content": source[0]["content"]})
-            source = source[1:]
-        else:
-            messages.append({"role": "system", "content": self.system_prompt})
-
-        convroles = ["user", "assistant"]
-        for j, sentence in enumerate(source):
-            role = sentence["role"]
-            assert role == convroles[j % 2], f"unexpected role {role}"
-            messages.append({"role": role, "content": sentence["content"]})
-
-        conversation = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
@@ -136,33 +137,35 @@ class HarmonyParser(Parser):
         return prompt_text
 
     def parse(
-        self, conversation: "Conversation", max_length: int
+        self, conversation: "Conversation", max_length: int, preformatted: bool = False
     ) -> List[torch.Tensor]:
-        user_message = None
-        analysis_message = None
-        commentary_message = None
-        final_message = None
-        reasoning_level = "Low"
+        if not preformatted:
+            user_message = None
+            analysis_message = None
+            commentary_message = None
+            final_message = None
+            reasoning_level = "Low"
 
-        for j, message in enumerate(conversation):
-            if message["from"] == "human":
-                user_message = message["value"]
-            if message["from"] == "assistant_analysis":
-                analysis_message = message["value"]
-            elif message["from"] == "assistant_commentary":
-                commentary_message = message["value"]
-            elif message["from"] == "assistant_final":
-                final_message = message["value"]
-            elif message["from"] == "assistant_reasoning_effort":
-                reasoning_level = message["value"]
+            for j, message in enumerate(conversation):
+                if message["from"] == "human":
+                    user_message = message["value"]
+                if message["from"] == "assistant_analysis":
+                    analysis_message = message["value"]
+                elif message["from"] == "assistant_commentary":
+                    commentary_message = message["value"]
+                elif message["from"] == "assistant_final":
+                    final_message = message["value"]
+                elif message["from"] == "assistant_reasoning_effort":
+                    reasoning_level = message["value"]
 
-        conversation = self.build_single_turn_prompt(
-            user_message,
-            analysis_message,
-            commentary_message,
-            final_message,
-            reasoning_level,
-        )
+            conversation = self.build_single_turn_prompt(
+                user_message,
+                analysis_message,
+                commentary_message,
+                final_message,
+                reasoning_level,
+            )
+
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 

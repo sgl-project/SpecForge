@@ -149,51 +149,9 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-
-        if is_preformatted:
-            # source is already a formatted text string with chat template applied
-            conversation = source
-        else:
-            system_prompt = chat_template.system_prompt
-
-            # source is a list of conversation messages, need to format
-            messages = [{"role": "system", "content": system_prompt}]
-
-            if source[0]["role"] != "user":
-                # if the first message is not from user, skip it
-                source = source[1:]
-
-            convroles = ["user", "assistant"]
-            for j, sentence in enumerate(source):
-                role = sentence["role"]
-                assert role == convroles[j % 2], f"unexpected role {role}"
-                messages.append({"role": role, "content": sentence["content"]})
-
-            conversation = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-        if not tokenizer.pad_token_id:
-            tokenizer.pad_token_id = tokenizer.unk_token_id
-
-        encoding = tokenizer(
-            conversation,
-            return_offsets_mapping=True,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=False,
+        input_ids, loss_mask = parser.parse(
+            source, max_length, preformatted=is_preformatted
         )
-        input_ids = encoding.input_ids[0]
-        offsets = encoding.offset_mapping[0]
-
-        # Apply loss mask
-        loss_mask = _apply_loss_mask_from_chat_template(
-            conversation, offsets, chat_template
-        )
-
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
