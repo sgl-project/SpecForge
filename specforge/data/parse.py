@@ -53,17 +53,20 @@ class GeneralParser(Parser):
     ) -> Dict[str, List[torch.Tensor]]:
         if not preformatted:
             messages = []
-            if source[0]["role"] == "system":
+
+            if conversation[0]["role"] == "system":
                 warnings.warn(
                     f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
                 )
-                messages.append({"role": "system", "content": source[0]["content"]})
-                source = source[1:]
+                messages.append(
+                    {"role": "system", "content": conversation[0]["content"]}
+                )
+                conversation = conversation[1:]
             else:
                 messages.append({"role": "system", "content": self.system_prompt})
 
             convroles = ["user", "assistant"]
-            for j, sentence in enumerate(source):
+            for j, sentence in enumerate(conversation):
                 role = sentence["role"]
                 assert role == convroles[j % 2], f"unexpected role {role}"
                 messages.append({"role": role, "content": sentence["content"]})
