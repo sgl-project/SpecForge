@@ -28,6 +28,7 @@ from .target.phi3 import Phi3ForCausalLM
 from .target.qwen2 import Qwen2ForCausalLM
 from .target.qwen3 import Qwen3ForCausalLM
 from .target.qwen3_moe import Qwen3MoeForCausalLM
+from .target.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
@@ -87,6 +88,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         LlamaConfig: [LlamaForCausalLM],
         Qwen3Config: [Qwen3ForCausalLM],
         Phi3Config: [Phi3ForCausalLM],
+        Qwen2_5_VLConfig: [Qwen2_5_VLForConditionalGeneration],
     }
 
     @classmethod

@@ -4,7 +4,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 # support tp1 train eagle3 for qwen2.5-vl-7b-instruct
-NUM_GPUS=${1:-1}
+NUM_GPUS=${1:-4}
 
 torchrun \
     --standalone \
@@ -22,7 +22,7 @@ torchrun \
     --chat-template qwen2-vl \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
-    --tp-size 1 \
+    --tp-size 4 \
     --is-vlm \
     --min-pixels 50176 \
     --max-pixels 802816
