@@ -34,7 +34,14 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt", "sharegpt4v", "allava4v", "opc", "perfect-blend-gptoss-20B"],
+        choices=[
+            "ultrachat",
+            "sharegpt",
+            "sharegpt4v",
+            "allava4v",
+            "opc",
+            "perfect-blend-gptoss-20B",
+        ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -242,11 +249,7 @@ def main():
         proc_fn = process_sharegpt_row
     else:
         raise ValueError(
-<<<<<<< HEAD
-            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
-=======
-            f"This script only supports sharegpt, ultrachat, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
->>>>>>> a35701e (fixed gptoss chat template)
+            f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
 
     # filter and split dataset
