@@ -29,8 +29,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r docs/requirements.txt
           apt-get update && apt-get install -y pandoc parallel retry
+          pip install -r docs/requirements.txt
 
       - name: Build documentation
         run: |
