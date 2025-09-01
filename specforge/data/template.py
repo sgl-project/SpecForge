@@ -13,7 +13,7 @@ class ChatTemplate(BaseModel):
         user_header(str): The header for the user.
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
-                                          If present, end_of_assistant_token and end_of_user_token are ignored.
+                                If present, end_of_assistant_token and end_of_user_token are ignored.
         end_of_assistant_token(str): The end token of an assistant turn of conversation.
         end_of_user_token(str): The end token of a user turn of conversation.
     """
