@@ -534,45 +534,6 @@ def main():
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
 
-            if global_step % 2000 == 0:
-                # Save the model
-                epoch_output_dir = os.path.join(args.output_dir, f"step_{global_step}")
-
-                if dist.get_rank() == 0:
-                    os.makedirs(epoch_output_dir, exist_ok=True)
-                dist.barrier()
-
-                with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
-                    model_state_dict = eagle3_model.state_dict()
-                    state_to_save = {
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "epoch": epoch,
-                        "args": args,
-                        "step": global_step,
-                    }
-                    draft_model_state_dict = {
-                        k.replace("draft_model.", ""): v
-                        for k, v in model_state_dict.items()
-                        if "draft_model." in k
-                    }
-
-                    if dist.get_rank() == 0:
-                        torch.save(
-                            state_to_save,
-                            os.path.join(epoch_output_dir, "training_state.pt"),
-                        )
-                        print_on_rank0(
-                            f"Saved full training state to {epoch_output_dir}/training_state.pt"
-                        )
-                        draft_model.save_pretrained(
-                            epoch_output_dir,
-                            state_dict=draft_model_state_dict,
-                        )
-                        print_on_rank0(
-                            f"Saved model configuration to {epoch_output_dir}"
-                        )
-                    dist.barrier()
-
             if args.verbose:
                 print(
                     f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
