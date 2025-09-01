@@ -75,6 +75,7 @@ class OnlineEagle3Model(Eagle3Model):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         device: Optional[torch.device] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L692
@@ -153,6 +154,7 @@ class OnlineEagle3Model(Eagle3Model):
         loss_mask: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
         Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
@@ -166,7 +168,7 @@ class OnlineEagle3Model(Eagle3Model):
         """
         # Step 0: prepare data with the target model
         hidden_states, target, loss_mask, input_ids = self._prepare_data(
-            input_ids, attention_mask, loss_mask
+            input_ids, attention_mask, loss_mask, **kwargs
         )
 
         # Step 1: handle vocab size
@@ -285,14 +287,19 @@ class OnlineEagle3Model(Eagle3Model):
         return plosses, vlosses, acces
 
 
-class OfflineEagle3Model(Eagle3Model):
+class OfflineEagle3Model(OnlineEagle3Model):
     """
     In sgl-spec, we implement offline/online training.
     Offline training means we have the target hidden_states available before training.
     """
 
     def __init__(
-        self, target_head, draft_model, length: int = 7, attention_backend="sdpa"
+        self,
+        target_head,
+        draft_model,
+        length: int = 7,
+        attention_backend="sdpa",
+        target_model=None,
     ):
         """
         Args:
@@ -300,21 +307,36 @@ class OfflineEagle3Model(Eagle3Model):
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
         """
-        super().__init__()
-        self.draft_model = draft_model
+        super().__init__(
+            target_model=target_model,
+            draft_model=draft_model,
+            length=length,
+            attention_backend=attention_backend,
+        )
         self.target_head = target_head
-        self.length = length
-        self.attention_backend = attention_backend
+
+    @torch.no_grad()
+    def _prepare_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        device: Optional[torch.device] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states = kwargs["hidden_states"]
+        target = kwargs["target"]
+        target = self.target_head(target)
+        return hidden_states, target, loss_mask, input_ids
 
     def forward(
         self,
-        input_ids,
-        attention_mask,
-        loss_mask,
-        target,
-        hidden_states,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
         Forward pass for the offline Eagle3 model.
@@ -333,121 +355,20 @@ class OfflineEagle3Model(Eagle3Model):
             vlosses: List of validation losses (not used in this implementation).
             acces: List of accuracies for each TTT step.
         """
-        # basic info
-        target = self.target_head(target)
-        batch_size, seq_length, _ = hidden_states.shape
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
-        # Step 0: handle vocab size
-        target_p_padded, position_mask = _compute_target_p_padded(
-            target=target,
-            t2d=self.draft_model.t2d,
-            loss_mask=loss_mask,
-            length=self.length,
+        assert (
+            "hidden_states" in kwargs
+        ), "hidden_states must be provided for OfflineEagle3Model forward"
+        assert (
+            "target" in kwargs
+        ), "target must be provided for OfflineEagle3Model forward"
+        return super().forward(
+            input_ids,
+            attention_mask,
+            loss_mask,
+            past_key_values,
+            position_ids,
+            **kwargs,
         )
-        del target
-
-        # Step 1: project the concatenated hidden states to the target hidden size
-        hidden_states = self.draft_model.project_hidden_states(hidden_states)
-
-        # Step 3: process kv cache, position ids and position ids
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-        if position_ids is None:
-            device = hidden_states.device
-            position_ids = torch.arange(
-                past_key_values_length,
-                seq_length + past_key_values_length,
-                dtype=torch.long,
-                device=device,
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
-
-        # Step 4: handle attention mask
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        if self.attention_backend == "sdpa":
-            attention_mask = self.draft_model.prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                hidden_states=hidden_states,
-                batch_size=batch_size,
-                seq_length=seq_length,
-                past_key_values_length=past_key_values_length,
-            )
-
-        # Step 5: run TTT
-        plosses = []
-        vlosses = []
-        acces = []
-        if self.attention_backend == "sdpa":
-            cache_hidden = [[], []]
-            past_key_values = None
-        elif self.attention_backend == "flex_attention":
-            cache_hidden = None
-            past_key_values = DynamicCache()
-
-        for idx in range(self.length):
-            target_p = target_p_padded[:, idx : idx + seq_length, :]
-            is_last = idx == self.length - 1
-
-            # Step 5.1: embed the input ids
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-            inputs_embeds = inputs_embeds.to(hidden_states.dtype)
-
-            # Step 5.2: run the draft model backbone
-            hidden_states_out = self.draft_model.backbone(
-                input_embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-
-            # update hidden states for next step
-            hidden_states = hidden_states_out
-
-            # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
-
-            # Step 5.5: record metrics
-            with torch.no_grad():
-                acces.append(
-                    _compute_metric_acc(
-                        logits=logits,
-                        target_p=target_p,
-                        position_mask=position_mask,
-                        loss_mask=loss_mask,
-                    )
-                )
-
-            # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-            plosses.append(loss)
-
-            if not is_last:
-                # Step 5.7: we need to update the loss mask
-                input_ids = padding(input_ids, left=False)
-                position_mask = padding(position_mask, left=False)
-                loss_mask = padding(loss_mask, left=False)
-                if self.attention_backend == "sdpa":
-                    ind = torch.arange(seq_length, device=attention_mask.device)
-                    ind0 = ind[idx:]
-                    ind1 = ind[: seq_length - idx]
-                    attention_mask[:, :, ind0, ind1] = torch.finfo(
-                        attention_mask.dtype
-                    ).min
-                # Flex attention mask shirnking is handled inside attention module
-        return plosses, vlosses, acces
 
 
 class QwenVLOnlineEagle3Model(Eagle3Model):

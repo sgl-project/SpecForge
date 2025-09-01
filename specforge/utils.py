@@ -56,12 +56,9 @@ def print_on_rank0(message):
         print(message)
 
 
-PREFIX_CHECKPOINT_DIR = "epoch"
-_re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"_(\d+)$")
-
-
-def get_last_checkpoint(folder):
+def get_last_checkpoint(folder, prefix="epoch"):
     content = os.listdir(folder)
+    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
     checkpoints = [
         path
         for path in content

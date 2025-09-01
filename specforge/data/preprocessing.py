@@ -428,6 +428,26 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         self._epoch = 0
         self.max_len = max_len
 
+    @staticmethod
+    def process_data(data, max_len, transform=None):
+        new_data = {}
+        # Squeeze due to our data generation script adding a batch dimension
+        hidden_state = data["aux_hidden_state"].squeeze(0)[:max_len][None, :]
+        target = data["hidden_state"].squeeze(0)[:max_len][None, :]
+
+        input_ids = data["input_ids"][:max_len][None, :]
+        loss_mask = data["loss_mask"][:max_len][None, :]
+        loss_mask[0, -1] = 0
+
+        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
+        new_data["loss_mask"] = loss_mask
+        new_data["target"] = padding(target, left=False)
+        new_data["hidden_state"] = hidden_state
+        new_data["input_ids"] = padding(input_ids, left=False)
+        if transform:
+            new_data = transform(new_data)
+        return new_data
+
     def __len__(self):
         return len(self.datapaths)
 
@@ -440,26 +460,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
             data = self._open_file(0)
-            # raise e
-        new_data = {}
-
-        # Squeeze due to our data generation script adding a batch dimension
-        hidden_state = data["aux_hidden_state"].squeeze(0)[: self.max_len][None, :]
-        target = data["hidden_state"].squeeze(0)[: self.max_len][None, :]
-
-        input_ids = data["input_ids"][: self.max_len][None, :]
-        loss_mask = data["loss_mask"][: self.max_len][None, :]
-        loss_mask[0, -1] = 0
-
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["target"] = padding(target, left=False)
-        new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = padding(input_ids, left=False)
-        if self.transform:
-            new_data = self.transform(new_data)
-
-        return new_data
+        return self.process_data(data, self.max_len, self.transform)
 
     def set_epoch(self, epoch):
         self._epoch = epoch

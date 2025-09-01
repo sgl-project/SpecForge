@@ -191,3 +191,4 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         vocab_mapping = torch.load(file_path)
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])
+        self.vocab_mapping_loaded = True

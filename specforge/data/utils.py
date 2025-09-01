@@ -44,7 +44,9 @@ class DataCollatorWithPadding:
             outtensors: (B, N, S)
         """
         B, n, S = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
+        padding_tensor = torch.zeros(
+            B, N - n, S, dtype=intensors.dtype, device=intensors.device
+        )
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
@@ -60,7 +62,9 @@ class DataCollatorWithPadding:
             outtensors: (B, N)
         """
         B, n = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
+        padding_tensor = torch.zeros(
+            B, N - n, dtype=intensors.dtype, device=intensors.device
+        )
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
