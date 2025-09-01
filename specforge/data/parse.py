@@ -1,7 +1,7 @@
 import re
 import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 from transformers import PreTrainedTokenizer
@@ -20,7 +20,7 @@ class Parser(ABC):
     @abstractmethod
     def parse(
         self, conversation: "Conversation", max_length: int
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Parse the conversation into a list of tensors.
 
