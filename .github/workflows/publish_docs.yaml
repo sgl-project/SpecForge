@@ -1,7 +1,7 @@
 name: Release Documentation
 
 on:
-  push:
+  pull_request:
     branches:
       - main
     paths:
@@ -41,6 +41,6 @@ jobs:
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4
         with:
-          github_token: ${{ secrets.GH_TOKEN_FOR_CI }}
+          github_token: ${{ secrets.PERSONAL_TOKEN }}
           publish_dir: ./docs/_build/html
           cname: docs.sglang.ai/SpecForge
