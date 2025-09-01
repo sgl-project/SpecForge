@@ -30,7 +30,6 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from transformers import PreTrainedModel
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
