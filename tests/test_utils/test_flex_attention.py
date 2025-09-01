@@ -20,15 +20,11 @@ from specforge.modeling.draft.llama3_eagle import (
 )
 from specforge.utils import padding
 
+from .utils import norm_tensor
+
 dynamo.config.recompile_limit = 64
 TTT_LENGTH = 7
 torch.manual_seed(0)
-
-
-def norm_tensor(shape, device, dtype, std=0.02):
-    t = torch.empty(shape, device=device, dtype=dtype)
-    torch.nn.init.trunc_normal_(t, mean=0.0, std=std)
-    return t
 
 
 class TestFlexAttention(unittest.TestCase):

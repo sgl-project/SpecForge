@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import math
 import os
 import time
 from collections import defaultdict
@@ -29,6 +30,7 @@ from specforge.distributed import destroy_distributed, get_dp_group, init_distri
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import (
+    create_draft_config_from_target,
     get_last_checkpoint,
     print_on_rank0,
     print_with_rank,
@@ -41,7 +43,12 @@ def parse_args():
 
     # add model-related arguments
     parser.add_argument("--target-model-path", type=str, required=True)
-    parser.add_argument("--draft-model-config", type=str, required=True)
+    parser.add_argument(
+        "--draft-model-config",
+        type=str,
+        required=False,
+        help="Draft model config path. If not provided, will auto-generate from target model.",
+    )
     parser.add_argument(
         "--embedding-key",
         type=str,
@@ -60,7 +67,12 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--warmup-ratio", type=float, default=0.015)
-    parser.add_argument("--total-steps", type=int, default=800000)
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=None,
+        help="Total training steps. If not provided, will be calculated as num_epochs * steps_per_epoch",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument(
         "--log-steps", type=int, default=50, help="Log training metrics every N steps"
@@ -205,8 +217,17 @@ def main():
         parser.error(f"Unknown tracker: {args.report_to}")
 
     tracker = create_tracker(args, args.output_dir)
-    # load draft model config
-    draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+
+    # Handle draft model config
+    if args.draft_model_config is None:
+        # Auto-generate and save config file
+        auto_config_path = create_draft_config_from_target(
+            target_model_path=args.target_model_path, cache_dir=args.cache_dir
+        )
+        draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
+    else:
+        # Use provided config file
+        draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
@@ -247,6 +268,7 @@ def main():
                 .cuda()
             )
     print_with_rank("Initialized target model")
+
     # load model with resume
     if draft_model_last_checkpoint:
         draft_model = (
@@ -318,6 +340,18 @@ def main():
     )
     print_with_rank("Initialized train dataloader")
 
+    # Calculate total steps if not provided
+    if args.total_steps is None:
+        steps_per_epoch = math.ceil(
+            len(train_dataloader) / args.draft_accumulation_steps
+        )
+        args.total_steps = args.num_epochs * steps_per_epoch
+        print_with_rank(
+            f"Auto-calculated total_steps: {args.total_steps} (num_epochs={args.num_epochs} * steps_per_epoch={steps_per_epoch})"
+        )
+    else:
+        print_with_rank(f"Using provided total_steps: {args.total_steps}")
+
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
@@ -341,7 +375,6 @@ def main():
             shuffle=False,
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
-            is_preformatted=args.is_preformatted,
         )
         print_with_rank("Initialized eval dataloader")
 

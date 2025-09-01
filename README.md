@@ -284,7 +284,7 @@ When `tp_size` is greater than 1, the script will automatically load the distrib
 
 #### Customize Draft Model
 
-If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `specforge.modeling.draft.base.py` file.
+If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. Or, if you do not provide the `--draft-model-config` argument, the script will automatically generate the draft model configuration based on the target model configuration. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `specforge.modeling.draft.base.py` file.
 
 
 ```python

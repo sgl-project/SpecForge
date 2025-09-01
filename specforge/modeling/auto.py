@@ -10,6 +10,7 @@ from transformers import (
     Llama4Config,
     Llama4TextConfig,
     LlamaConfig,
+    Phi3Config,
     PretrainedConfig,
     Qwen2_5_VLConfig,
     Qwen2Config,
@@ -23,6 +24,7 @@ from specforge.utils import default_torch_dtype
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.llama import LlamaForCausalLM
 from .target.llama4 import Llama4ForCausalLM
+from .target.phi3 import Phi3ForCausalLM
 from .target.qwen2 import Qwen2ForCausalLM
 from .target.qwen3 import Qwen3ForCausalLM
 from .target.qwen3_moe import Qwen3MoeForCausalLM
@@ -84,6 +86,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         Qwen2Config: [Qwen2ForCausalLM],
         LlamaConfig: [LlamaForCausalLM],
         Qwen3Config: [Qwen3ForCausalLM],
+        Phi3Config: [Phi3ForCausalLM],
     }
 
     @classmethod

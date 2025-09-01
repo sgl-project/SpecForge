@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.cache_utils import DynamicCache
 
+from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -242,13 +243,7 @@ class OnlineEagle3Model(Eagle3Model):
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
 
-            # Step 5.5: calculate loss
-            loss = _compute_loss(
-                logits=logits, target_p=target_p, position_mask=position_mask
-            )
-
-            # Step 5.6: record metrics
-            plosses.append(loss)
+            # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
                 acces.append(
                     _compute_metric_acc(
@@ -258,6 +253,10 @@ class OnlineEagle3Model(Eagle3Model):
                         loss_mask=loss_mask,
                     )
                 )
+
+            # Step 5.6: calculate loss, in-place modifies logits!
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            plosses.append(loss)
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -409,13 +408,7 @@ class OfflineEagle3Model(Eagle3Model):
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
 
-            # Step 5.5: calculate loss
-            loss = _compute_loss(
-                logits=logits, target_p=target_p, position_mask=position_mask
-            )
-
-            # Step 5.6: record metrics
-            plosses.append(loss)
+            # Step 5.5: record metrics
             with torch.no_grad():
                 acces.append(
                     _compute_metric_acc(
@@ -425,6 +418,10 @@ class OfflineEagle3Model(Eagle3Model):
                         loss_mask=loss_mask,
                     )
                 )
+
+            # Step 5.6: calculate loss, in-place modifies logits!
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            plosses.append(loss)
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -761,15 +758,6 @@ def _compute_target_p(target, t2d, loss_mask):
     target_p = nn.Softmax(dim=2)(target_head)
     target_p = target_p.detach()
     return target_p, position_mask
-
-
-@torch.compile(dynamic=None)
-def _compute_loss(logits, target_p, position_mask):
-    logits = logits.float()
-    out_logp = nn.LogSoftmax(dim=2)(logits)
-    plogp = target_p * out_logp
-    loss = -torch.sum(position_mask * plogp, 2).mean()
-    return loss
 
 
 @torch.compile(dynamic=None)

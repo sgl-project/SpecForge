@@ -723,7 +723,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: List[List[torch.Tensor]] = [],
+        cache_hidden: List[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
