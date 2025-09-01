@@ -147,16 +147,17 @@ class HarmonyParser(Parser):
             reasoning_level = "Low"
 
             for j, message in enumerate(conversation):
-                if message["from"] == "human":
-                    user_message = message["value"]
-                if message["from"] == "assistant_analysis":
-                    analysis_message = message["value"]
-                elif message["from"] == "assistant_commentary":
-                    commentary_message = message["value"]
-                elif message["from"] == "assistant_final":
-                    final_message = message["value"]
-                elif message["from"] == "assistant_reasoning_effort":
-                    reasoning_level = message["value"]
+                print(message)
+                if message["role"] == "user":
+                    user_message = message["content"]
+                if message["role"] == "assistant_analysis":
+                    analysis_message = message["content"]
+                elif message["role"] == "assistant_commentary":
+                    commentary_message = message["content"]
+                elif message["role"] == "assistant_final":
+                    final_message = message["content"]
+                elif message["role"] == "assistant_reasoning_effort":
+                    reasoning_level = message["content"]
 
             conversation = self.build_single_turn_prompt(
                 user_message,

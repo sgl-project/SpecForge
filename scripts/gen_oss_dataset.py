@@ -316,19 +316,19 @@ def main():
 
                                 row = {
                                     "conversations": [
-                                        {"from": "human", "value": human_msg},
-                                        {"from": "assistant", "value": output},
+                                        {"role": "human", "content": human_msg},
+                                        {"role": "assistant", "content": output},
                                         {
-                                            "from": "assistant_analysis",
-                                            "value": parsed_output["analysis"],
+                                            "role": "assistant_analysis",
+                                            "content": parsed_output["analysis"],
                                         },
                                         {
-                                            "from": "assistant_final",
-                                            "value": parsed_output["final"],
+                                            "role": "assistant_final",
+                                            "content": parsed_output["final"],
                                         },
                                         {
-                                            "from": "assistant_reasoning_effort",
-                                            "value": reasoning_effort.value,
+                                            "role": "assistant_reasoning_effort",
+                                            "content": reasoning_effort.value,
                                         },
                                     ],
                                 }

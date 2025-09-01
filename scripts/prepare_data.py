@@ -40,7 +40,6 @@ def parse_args():
             "sharegpt4v",
             "allava4v",
             "opc",
-            "perfect-blend-gptoss-20B",
         ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
@@ -243,10 +242,6 @@ def main():
             "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
         )["train"]
         proc_fn = process_opc_sft_stage1
-    elif args.dataset == "perfect-blend-gptoss-20B":
-        ds = load_dataset("shuaills/perfect-blend-gptoss-20B")["train"]
-        ds = ds.map(add_index, with_indices=True)
-        proc_fn = process_sharegpt_row
     else:
         raise ValueError(
             f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
