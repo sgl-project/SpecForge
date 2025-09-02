@@ -280,7 +280,7 @@ def build_eagle3_dataset(
     chat_template: Optional[str] = None,
     max_length: Optional[int] = 2048,
     shuffle_seed: Optional[int] = 42,
-    num_proc: Optional[int] = 8,
+    num_proc: Optional[int] = 32,
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
     is_vlm: Optional[bool] = False,

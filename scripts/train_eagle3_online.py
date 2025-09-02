@@ -32,6 +32,7 @@ from specforge.distributed import (
     get_tp_device_mesh,
     init_distributed,
 )
+from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import (
@@ -418,21 +419,25 @@ def main():
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
         ignored_modules=[target_model],
         process_group=get_dp_group(),
     )
-    print_with_rank("Initialized Eagle3 FSDP model")
+    print_with_rank("Initialized Eagle3 FSDP model with optimizer state sharding")
 
-    # build other components
-    optimizer = BF16Optimizer(
-        eagle3_model,
+    optimizer = torch.optim.AdamW(
+        eagle3_model.parameters(),
         lr=args.learning_rate,
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
-        total_steps=args.total_steps,
+        weight_decay=0.0,
     )
-    print_with_rank("Initialized optimizer and scheduler")
+
+    scheduler = CosineAnnealingWarmupLR(
+        optimizer,
+        total_steps=args.total_steps,
+        warmup_steps=int(args.warmup_ratio * args.total_steps),
+    )
+
+    print_with_rank("Initialized optimizer and scheduler with FSDP state sharding")
 
     # global_step
     global_step = 0
@@ -445,7 +450,13 @@ def main():
 
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location="cpu", weights_only=False)
-            optimizer.load_state_dict(state)
+            # 加载优化器和调度器状态
+            if "optimizer_state_dict" in state:
+                optimizer.load_state_dict(state["optimizer_state_dict"])
+                print_on_rank0("Successfully loaded optimizer state_dict.")
+            if "scheduler_state_dict" in state:
+                scheduler.load_state_dict(state["scheduler_state_dict"])
+                print_on_rank0("Successfully loaded scheduler state_dict.")
             start_epoch = state["epoch"] + 1
             global_step = state.get("global_step", 0)
             print_on_rank0(f"Resuming from epoch {start_epoch}")
@@ -514,7 +525,7 @@ def main():
                 / args.draft_accumulation_steps
             )
             ploss.backward()
-            log_dict["train/lr"] = optimizer.get_learning_rate()
+            log_dict["train/lr"] = optimizer.param_groups[0]["lr"]  # 获取学习率
             for i in range(len(plosses)):
                 log_dict[f"train/ploss_{i}"] += (
                     plosses[i].item() / args.draft_accumulation_steps
@@ -522,7 +533,13 @@ def main():
             for i in range(len(acces)):
                 log_dict[f"train/acc_{i}"] += acces[i] / args.draft_accumulation_steps
             if batch_index % args.draft_accumulation_steps == 0:
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(
+                    eagle3_model.parameters(), args.max_grad_norm
+                )
                 optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
                 global_step += 1
                 if global_step % args.log_steps == 0:
                     tracker.log(log_dict, step=global_step)
@@ -622,8 +639,9 @@ def main():
                     "epoch": epoch,
                     "global_step": global_step,
                     "args": args,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                 }
-                state_to_save.update(optimizer.state_dict())
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
                     for k, v in model_state_dict.items()

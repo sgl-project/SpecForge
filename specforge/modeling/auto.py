@@ -22,6 +22,7 @@ from transformers import (
 
 from specforge.utils import default_torch_dtype
 
+from .draft.gpt_oss_eagle import GptOssForCausalLMEagle3
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.gpt_oss import GptOssForCausalLM
 from .target.llama import LlamaForCausalLM
@@ -36,6 +37,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
+        GptOssConfig: GptOssForCausalLMEagle3,
     }
 
     @classmethod
@@ -137,6 +139,7 @@ class AutoDraftModelConfig:
 
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
+        "GptOssForCausalLMEagle3": GptOssConfig,
     }
 
     @classmethod
