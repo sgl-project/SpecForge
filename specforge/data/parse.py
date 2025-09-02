@@ -150,7 +150,6 @@ class HarmonyParser(Parser):
             reasoning_level = "Low"
 
             for j, message in enumerate(conversation):
-                print(message)
                 if message["role"] == "user":
                     user_message = message["content"]
                 if message["role"] == "assistant_analysis":
