@@ -248,9 +248,9 @@ class SglOnlineEagle3Trainer:
         assert (
             args.draft_accumulation_steps * args.draft_micro_batch_size * args.dp_size
             == args.draft_global_batch_size
-        ), f"draft_global_batch_size={args.draft_global_batch_size} must be divisible by dp_size={args.dp_size} and micro_batch_size={args.draft_micro_batch_size}"
+        ), f"{args.draft_global_batch_size=} must be divisible by {args.dp_size=} and {args.draft_micro_batch_size=}"
         print_with_rank(
-            f"draft_accumulation_steps={args.draft_global_batch_size} // {args.dp_size} // {args.draft_micro_batch_size}={args.draft_accumulation_steps}"
+            f"{args.draft_accumulation_steps=} {args.draft_global_batch_size=} // {args.dp_size=} // {args.draft_micro_batch_size=}"
         )
         assert (
             args.draft_micro_batch_size == 1
@@ -283,7 +283,7 @@ class SglOnlineEagle3Trainer:
             )
             args.total_steps = args.num_epochs * steps_per_epoch
             print_on_rank0(
-                f"Auto-Calculated {args.total_steps=}={args.num_epochs=} * {steps_per_epoch=}"
+                f"Auto-Calculated {args.total_steps=} {args.num_epochs=} * {steps_per_epoch=}"
             )
         else:
             print_on_rank0(f"Using provided {args.total_steps=}")
@@ -647,7 +647,7 @@ class SglOnlineEagle3Trainer:
         for _, data in tqdm(
             enumerate(self.train_dataloader),
             total=len(self.train_dataloader),
-            desc=f"Training[{dist.get_world_size()}x]",
+            desc=f"Training",
         ):
             data_for_target.append(data)
             if (

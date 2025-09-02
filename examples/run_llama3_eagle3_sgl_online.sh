@@ -67,6 +67,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --cache-dir $CACHE_DIR \
     --mem-frac=0.4 \
     --total-steps=800000 \
+    --warmup-ratio=0.015 \
     --dist-timeout=10 \
     --wandb-project llama3-8b-eagle3 \
     --wandb-name sgl-online \
