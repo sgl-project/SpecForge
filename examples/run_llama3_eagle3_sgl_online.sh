@@ -66,9 +66,8 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --chat-template $CHAT_TEMPLATE \
     --cache-dir $CACHE_DIR \
     --mem-frac=0.4 \
+    --total-steps=800000 \
     --dist-timeout=10 \
-    --eval-interval -1 \
-    --save-interval -1 \
     --wandb-project llama3-8b-eagle3 \
     --wandb-name sgl-online \
     --report-to wandb

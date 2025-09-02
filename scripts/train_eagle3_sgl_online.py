@@ -234,7 +234,9 @@ class SglOnlineEagle3Trainer:
     def __init__(self, args):
         # using sglang server args and renaming is needed
         args.tp_size = args.tensor_parallel_size
-        args.target_batch_size = args.tp_size * 8
+        args.target_tp_size = args.tp_size
+        args.target_micro_batch_size = args.target_tp_size
+        args.target_batch_size = args.target_micro_batch_size * 8
         set_seed(args.seed)
         self.args = args
         if not dist.is_initialized():
@@ -408,7 +410,7 @@ class SglOnlineEagle3Trainer:
             )
         train_dataloader = prepare_dp_dataloaders(
             train_eagle3_dataset,
-            1,
+            self.args.target_tp_size,
             num_workers=4,
             shuffle=True,
             process_group=get_dp_group(),
@@ -441,7 +443,7 @@ class SglOnlineEagle3Trainer:
             )
             eval_dataloader = prepare_dp_dataloaders(
                 eval_eagle3_dataset,
-                1,
+                self.args.target_tp_size,
                 num_workers=4,
                 shuffle=False,
                 process_group=get_dp_group(),
@@ -449,18 +451,10 @@ class SglOnlineEagle3Trainer:
             print_with_rank(f"Initialized eval dataloader")
 
         if self.args.eval_interval == -1:
-            self.args.eval_interval = (
-                len(train_dataloader)
-                // self.args.target_batch_size
-                * self.args.target_batch_size
-            )
+            self.args.eval_interval = len(train_dataloader)
             print_on_rank0(f"Auto-set eval_interval to {self.args.eval_interval}")
         if self.args.save_interval == -1:
-            self.args.save_interval = (
-                len(train_dataloader)
-                // self.args.target_batch_size
-                * self.args.target_batch_size
-            )
+            self.args.save_interval = len(train_dataloader)
             print_on_rank0(f"Auto-set save_interval to {self.args.save_interval}")
         return (
             TrainDataLoaderWrapper(train_dataloader, self.args.num_epochs),
@@ -581,10 +575,15 @@ class SglOnlineEagle3Trainer:
         data_for_target = []
         for data in tqdm(self.eval_dataloader, desc=f"Evaluating Step {self.step_idx}"):
             data_for_target.append(data)
-            if len(data_for_target) >= self.args.target_batch_size:
+            if (
+                len(data_for_target)
+                >= self.args.target_batch_size // self.args.target_tp_size
+            ):
                 torch.cuda.empty_cache()
                 data_for_draft = self.target_model.forward(
-                    data_for_target, draft_data_collator=draft_data_collator
+                    data_for_target,
+                    draft_data_collator=draft_data_collator,
+                    draft_dp_rank=dist.get_rank(),
                 )
                 torch.cuda.empty_cache()
                 data_for_target = []
@@ -605,7 +604,9 @@ class SglOnlineEagle3Trainer:
 
         torch.cuda.empty_cache()
         data_for_draft = self.target_model.forward(
-            data_for_target, draft_data_collator=draft_data_collator
+            data_for_target,
+            draft_data_collator=draft_data_collator,
+            draft_dp_rank=dist.get_rank(),
         )
         torch.cuda.empty_cache()
         for data in data_for_draft:
@@ -646,13 +647,18 @@ class SglOnlineEagle3Trainer:
         for _, data in tqdm(
             enumerate(self.train_dataloader),
             total=len(self.train_dataloader),
-            desc=f"Training",
+            desc=f"Training[{dist.get_world_size()}x]",
         ):
             data_for_target.append(data)
-            if len(data_for_target) >= self.args.target_batch_size:
+            if (
+                len(data_for_target)
+                >= self.args.target_batch_size // self.args.target_tp_size
+            ):
                 torch.cuda.empty_cache()
                 data_for_draft = self.target_model.forward(
-                    data_for_target, draft_data_collator=draft_data_collator
+                    data_for_target,
+                    draft_data_collator=draft_data_collator,
+                    draft_dp_rank=dist.get_rank(),
                 )
                 data_for_target = []
                 for data_ in data_for_draft:
@@ -680,22 +686,22 @@ class SglOnlineEagle3Trainer:
                             step=self.step_idx // self.args.draft_accumulation_steps,
                         )
                         self.train_logdict = defaultdict(float)
-                if self.step_idx % self.args.eval_interval == 0:
-                    train_logdict = {}
-                    for i in range(len(train_acces)):
-                        acc_i = torch.tensor(train_acces[i]).cuda().mean()
-                        dist.all_reduce(acc_i, op=dist.ReduceOp.AVG)
-                        train_logdict[f"train/epochacc_{i}"] = acc_i.item()
+                    if self.step_idx % self.args.eval_interval == 0:
+                        train_logdict = {}
+                        for i in range(len(train_acces)):
+                            acc_i = torch.tensor(train_acces[i]).cuda().mean()
+                            dist.all_reduce(acc_i, op=dist.ReduceOp.AVG)
+                            train_logdict[f"train/epochacc_{i}"] = acc_i.item()
 
-                    for i in range(len(train_plosses)):
-                        loss_i = torch.tensor(train_plosses[i]).cuda().mean()
-                        dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
-                        train_logdict[f"train/epochploss_{i}"] = loss_i.item()
-                    self.tracker.log(train_logdict, step=self.step_idx)
-                    self.eval()
+                        for i in range(len(train_plosses)):
+                            loss_i = torch.tensor(train_plosses[i]).cuda().mean()
+                            dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
+                            train_logdict[f"train/epochploss_{i}"] = loss_i.item()
+                        self.tracker.log(train_logdict, step=self.step_idx)
+                        self.eval()
 
-                if self.step_idx % self.args.save_interval == 0:
-                    self.save_checkpoint(self.step_idx)
+                    if self.step_idx % self.args.save_interval == 0:
+                        self.save_checkpoint(self.step_idx)
 
         destroy_distributed()
         return

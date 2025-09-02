@@ -93,18 +93,20 @@ python scripts/build_eagle3_dataset_cache.py \
 
 Use the following script to train.
 
+- set `total-steps=800000, learning-rate=5e-5` to align with [EAGLE official repo config](https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json). Feel Free to change this settings to do your own experiments. `total-steps` and `warmup-ratio` decide the increasement curve of learning rate.
+
 ```shell
 export NUM_GPUS=4
 export OUTPUT_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/dev_outputs/
-CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun \
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     scripts/train_eagle3_sgl_online.py \
     --target-model-path $MODEL_PATH \
     --model-path $MODEL_PATH \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path $DATASET_PATH/sharegpt_train.jsonl \
-    --eval-data-path $DATASET_PATH/sharegpt_test.jsonl \
+    --train-data-path $DATASET_PATH/sharegpt_ultrachat_train.jsonl \
+    --eval-data-path $DATASET_PATH/sharegpt_ultrachat_test.jsonl \
     --tp-size $NUM_GPUS \
     --output-dir $OUTPUT_DIR \
     --num-epochs 10 \
@@ -115,8 +117,28 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun \
     --chat-template $CHAT_TEMPLATE \
     --cache-dir $CACHE_DIR \
     --mem-frac=0.4 \
+    --total-steps=800000 \
     --dist-timeout=10 \
     --wandb-project llama3-8b-eagle3 \
-    --wandb-name dev-300k-new-2kSeqLen-5e-5 \
-    --wandb
+    --wandb-name sgl-online \
+    --report-to wandb
+```
+
+## Step3. benchmark
+
+```shell
+config_list=(
+    "4,3,1,4"
+    "4,7,10,60"
+)
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 bench_model_speedup.py \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-120b-bf16 \
+    --port 20001 \
+    --trust-remote-code \
+    --mem-fraction-static 0.8 \
+    --tp-size 4 \
+    --config-list "${config_list[@]}" \
+    --benchmark-list mtbench:80 gsm8k:200 humaneval:200 math500:200 \
+    --output output.jsonl
 ```

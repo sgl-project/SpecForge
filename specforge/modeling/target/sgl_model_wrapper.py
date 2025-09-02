@@ -119,6 +119,7 @@ class SglangTargetModel(nn.Module):
         tp_rank = dist.get_rank(group=tp_group)
         self.tp_group = tp_group
         self.tp_rank = tp_rank
+        self.target_tp_size = args.target_tp_size
         self.target_micro_batch_size = target_micro_batch_size
         self.draft_micro_batch_size = draft_micro_batch_size
         assert draft_micro_batch_size == 1, "draft_micro_batch_size must be 1 for now"
@@ -204,21 +205,24 @@ class SglangTargetModel(nn.Module):
         )
 
     def forward(
-        self, data_for_target: List[Dict[str, torch.Tensor]], draft_data_collator
+        self,
+        data_for_target: List[Dict[str, torch.Tensor]],
+        draft_data_collator,
+        draft_dp_rank: int,
     ) -> List[Dict[str, torch.Tensor]]:
         """
         arguments:
             data_for_target: List[Dict[str, torch.Tensor]] of target_batch_size
-                - input_ids: (batch_size, seq_len)
-                - attention_mask: (batch_size, seq_len)
-                - loss_mask: (batch_size, seq_len)
+                - input_ids: (tp_size, seq_len)
+                - attention_mask: (tp_size, seq_len)
+                - loss_mask: (tp_size, seq_len)
         return:
-            data_for_draft: List[Dict[str, torch.Tensor]] of draft_batch_size, draft_micro_batch_size = target_batch_size // tp_size
-                - input_ids: (batch_size, seq_len)
-                - attention_mask: (batch_size, seq_len)
-                - loss_mask: (batch_size, seq_len)
-                - target: (batch_size, seq_len, vocab_size) or (batch_size, seq_len, hidden_size)
-                - hidden_states: (batch_size, seq_len, hidden_size)
+            data_for_draft: List[Dict[str, torch.Tensor]] of draft_batch_size, draft_micro_batch_size = 1
+                - input_ids: (1, seq_len)
+                - attention_mask: (1, seq_len)
+                - loss_mask: (1, seq_len)
+                - target: (1, seq_len, vocab_size) or (1, seq_len, hidden_size)
+                - hidden_states: (1, seq_len, hidden_size)
         """
         num_items = len(data_for_target)
         target_total = (
@@ -231,44 +235,45 @@ class SglangTargetModel(nn.Module):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
         data_for_draft = []
-        for idx, data in enumerate(data_for_target):
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=data["input_ids"].view(-1).tolist(),
-                sampling_params=sampling_params,
-            )
-            req.prefix_indices = []
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-            data_cache.append(data)
-            reqs.append(req)
-            if len(reqs) == self.target_micro_batch_size:
-                # here let me assume return aux_hidden_states is True
-                hidden_states_list, aux_hidden_states_list = self.extend(reqs)
-                for idx, (data, hidden_states, aux_hidden_states) in enumerate(
-                    zip(data_cache, hidden_states_list, aux_hidden_states_list)
-                ):
-                    if (
-                        idx % torch.distributed.get_world_size()
-                        != torch.distributed.get_rank()
+        for idx_data, data in enumerate(data_for_target):
+            assert (
+                data["input_ids"].shape[0] == self.target_tp_size
+            ), "input_ids.shape[0] must be equal to target_tp_size"
+            for idx_row in range(data["input_ids"].shape[0]):
+                req = Req(
+                    rid=str(idx_row + idx_data * self.target_tp_size),
+                    origin_input_text="",
+                    origin_input_ids=data["input_ids"][idx_row].view(-1).tolist(),
+                    sampling_params=sampling_params,
+                )
+                req.prefix_indices = []
+                req.fill_ids = req.origin_input_ids
+                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+                data_cache.append(data)
+                reqs.append(req)
+                if len(reqs) == self.target_micro_batch_size:
+                    # here let me assume return aux_hidden_states is True
+                    hidden_states_list, aux_hidden_states_list = self.extend(reqs)
+                    for idx, (data, hidden_states, aux_hidden_states) in enumerate(
+                        zip(data_cache, hidden_states_list, aux_hidden_states_list)
                     ):
-                        continue
-                    # the input shape is aligned with "prepare_hidden_states.py"
-                    # the output shape is aligned with OfflineEagle3Dataset
-                    data_for_draft.append(
-                        OfflineEagle3Dataset.process_data(
-                            {
-                                "input_ids": data["input_ids"].view(-1),
-                                "loss_mask": data["loss_mask"].view(-1),
-                                "hidden_state": hidden_states.unsqueeze(0),
-                                "aux_hidden_state": aux_hidden_states.unsqueeze(0),
-                            },
-                            transform=None,
-                            max_len=self.args.max_length,
+                        if idx % dist.get_world_size() != draft_dp_rank:
+                            continue
+                        # the input shape is aligned with "prepare_hidden_states.py"
+                        # the output shape is aligned with OfflineEagle3Dataset
+                        data_for_draft.append(
+                            OfflineEagle3Dataset.process_data(
+                                {
+                                    "input_ids": data["input_ids"].view(-1),
+                                    "loss_mask": data["loss_mask"].view(-1),
+                                    "hidden_state": hidden_states.unsqueeze(0),
+                                    "aux_hidden_state": aux_hidden_states.unsqueeze(0),
+                                },
+                                transform=None,
+                                max_len=self.args.max_length,
+                            )
                         )
-                    )
-                reqs, data_cache = [], []
+                    reqs, data_cache = [], []
         # for now, let us assume draft_micro_batch_size = 1
         return [draft_data_collator([data]) for data in data_for_draft]
