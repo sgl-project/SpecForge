@@ -463,10 +463,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
     """
 
     def __init__(
-        self, 
-        target_model, 
-        draft_model: Eagle3DraftModel, 
-        processor, 
+        self,
+        target_model,
+        draft_model: Eagle3DraftModel,
+        processor,
         length: int = 7,
         attention_backend: str = "sdpa",
     ):
@@ -679,7 +679,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 seq_length=seq_length,
                 past_key_values_length=past_key_values_length,
             )
-            
+
         # Step 5: run TTT
         plosses = []
         vlosses = []
