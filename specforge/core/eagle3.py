@@ -32,6 +32,8 @@ from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
+torch._dynamo.config.capture_scalar_outputs = True
+
 
 class Eagle3Model(nn.Module):
     pass

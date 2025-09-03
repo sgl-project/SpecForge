@@ -236,9 +236,27 @@ class SglangTargetModel(nn.Module):
         reqs, data_cache = [], []
         data_for_draft = []
         for idx_data, data in enumerate(data_for_target):
-            assert (
-                data["input_ids"].shape[0] == self.target_tp_size
-            ), "input_ids.shape[0] must be equal to target_tp_size"
+            if data["input_ids"].shape[0] < self.target_tp_size:
+                print_with_rank(
+                    f"Zero padding {data['input_ids'].shape=}, {data['attention_mask'].shape=}, {data['loss_mask'].shape=} to {self.target_tp_size=}"
+                )
+                zero_padding = torch.zeros(
+                    (
+                        self.target_tp_size - data["input_ids"].shape[0],
+                        data["input_ids"].shape[1],
+                    ),
+                    dtype=data["input_ids"].dtype,
+                    device=data["input_ids"].device,
+                )
+                data["input_ids"] = torch.cat([data["input_ids"], zero_padding], dim=0)
+                data["attention_mask"] = torch.cat(
+                    [data["attention_mask"], zero_padding], dim=0
+                )
+                data["loss_mask"] = torch.cat([data["loss_mask"], zero_padding], dim=0)
+            elif data["input_ids"].shape[0] > self.target_tp_size:
+                raise ValueError(
+                    f"{data['input_ids'].shape[0]=} must be less or equal to {self.target_tp_size=}"
+                )
             for idx_row in range(data["input_ids"].shape[0]):
                 req = Req(
                     rid=str(idx_row + idx_data * self.target_tp_size),

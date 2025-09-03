@@ -686,6 +686,10 @@ class SglOnlineEagle3Trainer:
                             step=self.step_idx // self.args.draft_accumulation_steps,
                         )
                         self.train_logdict = defaultdict(float)
+
+                    if self.step_idx % self.args.save_interval == 0:
+                        self.save_checkpoint(self.step_idx)
+
                     if self.step_idx % self.args.eval_interval == 0:
                         train_logdict = {}
                         for i in range(len(train_acces)):
@@ -699,9 +703,6 @@ class SglOnlineEagle3Trainer:
                             train_logdict[f"train/epochploss_{i}"] = loss_i.item()
                         self.tracker.log(train_logdict, step=self.step_idx)
                         self.eval()
-
-                    if self.step_idx % self.args.save_interval == 0:
-                        self.save_checkpoint(self.step_idx)
 
         destroy_distributed()
         return

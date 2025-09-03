@@ -4,6 +4,8 @@ This documents shows how to reproduce the training process of EAGLE3 paper. The 
 
 ## Step0. Prepare environment
 
+We suggest to use virtual environment to make sure all the dependency can be correctly installed. If you want to use `python>=3.12`, please set `export SETUPTOOLS_USE_DISTUTILS=local`.
+
 ```
 uv venv --python 3.11
 source .venv/bin/activate
@@ -133,7 +135,7 @@ config_list=(
 )
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 bench_model_speedup.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-120b-bf16 \
+    --speculative-draft-model-path ~/.cache/huggingface/Llama-3.1-8B-Instruct/dev_outputs/epoch_0 \
     --port 20001 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \
