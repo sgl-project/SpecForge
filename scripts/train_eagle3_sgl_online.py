@@ -250,7 +250,7 @@ class SglOnlineEagle3Trainer:
             == args.draft_global_batch_size
         ), f"{args.draft_global_batch_size=} must be divisible by {args.dp_size=} and {args.draft_micro_batch_size=}"
         print_with_rank(
-            f"{args.draft_accumulation_steps=} {args.draft_global_batch_size=} // {args.dp_size=} // {args.draft_micro_batch_size=}"
+            f"({args.draft_accumulation_steps=}) = ({args.draft_global_batch_size=}) // ({args.dp_size=}) // ({args.draft_micro_batch_size=})"
         )
         assert (
             args.draft_micro_batch_size == 1
@@ -310,7 +310,8 @@ class SglOnlineEagle3Trainer:
                 )
 
         dist.barrier()
-        self.step_idx = 0
+        self.micro_batch_idx = 0
+        self.global_batch_idx = 0
 
     def _create_target_model(self):
         target_model = SglangTargetModel(
@@ -451,10 +452,14 @@ class SglOnlineEagle3Trainer:
             print_with_rank(f"Initialized eval dataloader")
 
         if self.args.eval_interval == -1:
-            self.args.eval_interval = len(train_dataloader)
+            self.args.eval_interval = (
+                len(train_dataloader) // self.args.draft_accumulation_steps
+            )
             print_on_rank0(f"Auto-set eval_interval to {self.args.eval_interval}")
         if self.args.save_interval == -1:
-            self.args.save_interval = len(train_dataloader)
+            self.args.save_interval = (
+                len(train_dataloader) // self.args.draft_accumulation_steps
+            )
             print_on_rank0(f"Auto-set save_interval to {self.args.save_interval}")
         return (
             TrainDataLoaderWrapper(train_dataloader, self.args.num_epochs),
@@ -540,8 +545,8 @@ class SglOnlineEagle3Trainer:
             dist.barrier()
 
     def train_step(self, data):
-        self.step_idx += 1
-        plosses, _, acces = self.eagle3_model(
+        self.micro_batch_idx += 1
+        plosses, vlosses, acces = self.eagle3_model(
             input_ids=data["input_ids"].cuda(),  # [B, S]
             attention_mask=data["attention_mask"].cuda(),  # [B, S]
             loss_mask=data["loss_mask"]
@@ -557,10 +562,13 @@ class SglOnlineEagle3Trainer:
             sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             / self.args.draft_accumulation_steps
         )
+        # vloss = sum(vlosses) / self.args.draft_accumulation_steps
+        # ploss += vloss
         ploss.backward()
-        if self.step_idx % self.args.draft_accumulation_steps == 0:
+        if self.micro_batch_idx % self.args.draft_accumulation_steps == 0:
+            self.global_batch_idx += 1
             self.optimizer.step()
-        return plosses, acces
+        return plosses, vlosses, acces
 
     @torch.no_grad()
     def eval(self):
@@ -571,9 +579,12 @@ class SglOnlineEagle3Trainer:
         # Run evaluation
         eval_acces = [[] for _ in range(self.eagle3_model.module.length)]
         eval_plosses = [[] for _ in range(self.eagle3_model.module.length)]
+        # eval_vlosses = [[] for _ in range(self.eagle3_model.module.length)]
 
         data_for_target = []
-        for data in tqdm(self.eval_dataloader, desc=f"Evaluating Step {self.step_idx}"):
+        for data in tqdm(
+            self.eval_dataloader, desc=f"Evaluating Step {self.global_batch_idx}"
+        ):
             data_for_target.append(data)
             if (
                 len(data_for_target)
@@ -588,7 +599,7 @@ class SglOnlineEagle3Trainer:
                 torch.cuda.empty_cache()
                 data_for_target = []
                 for data in data_for_draft:
-                    step_plosses, _, step_acces = self.eagle3_model(
+                    step_plosses, step_vlosses, step_acces = self.eagle3_model(
                         input_ids=data["input_ids"].cuda(),  # [B, S]
                         attention_mask=data["attention_mask"].cuda(),  # [B, S]
                         loss_mask=data["loss_mask"]
@@ -599,6 +610,8 @@ class SglOnlineEagle3Trainer:
                     )
                     for i in range(len(eval_plosses)):
                         eval_plosses[i].append(step_plosses[i].item())
+                    # for i in range(len(eval_vlosses)):
+                    #     eval_vlosses[i].append(step_vlosses[i].item())
                     for i in range(len(eval_acces)):
                         eval_acces[i].append(step_acces[i])
 
@@ -610,7 +623,7 @@ class SglOnlineEagle3Trainer:
         )
         torch.cuda.empty_cache()
         for data in data_for_draft:
-            step_plosses, _, step_acces = self.eagle3_model(
+            step_plosses, step_vlosses, step_acces = self.eagle3_model(
                 input_ids=data["input_ids"].cuda(),  # [B, S]
                 attention_mask=data["attention_mask"].cuda(),  # [B, S]
                 loss_mask=data["loss_mask"]
@@ -621,25 +634,31 @@ class SglOnlineEagle3Trainer:
             )
             for i in range(len(eval_plosses)):
                 eval_plosses[i].append(step_plosses[i].item())
+            # for i in range(len(eval_vlosses)):
+            #     eval_vlosses[i].append(step_vlosses[i].item())
             for i in range(len(eval_acces)):
                 eval_acces[i].append(step_acces[i])
 
         eval_logdict = {}
-        for i in range(len(eval_acces)):
-            acc_i = torch.tensor(eval_acces[i]).cuda().mean()
-            dist.all_reduce(acc_i, op=dist.ReduceOp.AVG)
-            eval_logdict[f"eval/epochacc_{i}"] = acc_i.item()
-
         for i in range(len(eval_plosses)):
             loss_i = torch.tensor(eval_plosses[i]).cuda().mean()
             dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
             eval_logdict[f"eval/epochploss_{i}"] = loss_i.item()
-        self.tracker.log(eval_logdict, step=self.step_idx)
+            # for i in range(len(eval_vlosses)):
+            #     loss_i = torch.tensor(eval_vlosses[i]).cuda().mean()
+            dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
+            eval_logdict[f"eval/epochvloss_{i}"] = loss_i.item()
+        for i in range(len(eval_acces)):
+            acc_i = torch.tensor(eval_acces[i]).cuda().mean()
+            dist.all_reduce(acc_i, op=dist.ReduceOp.AVG)
+            eval_logdict[f"eval/epochacc_{i}"] = acc_i.item()
+        self.tracker.log(eval_logdict, step=self.global_batch_idx)
 
     def train(self):
         draft_data_collator = DataCollatorWithPadding()
-        train_acces = [[] for _ in range(self.eagle3_model.module.length)]
         train_plosses = [[] for _ in range(self.eagle3_model.module.length)]
+        # train_vlosses = [[] for _ in range(self.eagle3_model.module.length)]
+        train_acces = [[] for _ in range(self.eagle3_model.module.length)]
         self.train_logdict = defaultdict(float)
 
         data_for_target = []
@@ -662,35 +681,36 @@ class SglOnlineEagle3Trainer:
                 )
                 data_for_target = []
                 for data_ in data_for_draft:
-                    step_plosses, step_acces = self.train_step(data_)
-                    for i in range(len(train_acces)):
-                        train_acces[i].append(step_acces[i])
-                        self.train_logdict[f"train/acc_{i}"] += (
-                            step_acces[i] / self.args.draft_accumulation_steps
-                        )
+                    step_plosses, step_vlosses, step_acces = self.train_step(data_)
                     for i in range(len(train_plosses)):
                         train_plosses[i].append(step_plosses[i].item())
                         self.train_logdict[f"train/ploss_{i}"] += (
                             step_plosses[i].item() / self.args.draft_accumulation_steps
                         )
-                    if (self.step_idx % self.args.draft_accumulation_steps == 0) and (
-                        (self.step_idx // self.args.draft_accumulation_steps)
-                        % self.args.log_interval
-                        == 0
-                    ):
+                    # for i in range(len(train_vlosses)):
+                    #     train_vlosses[i].append(step_vlosses[i].item())
+                    #     self.train_logdict[f"train/vloss_{i}"] += (
+                    #         step_vlosses[i].item() / self.args.draft_accumulation_steps
+                    #     )
+                    for i in range(len(train_acces)):
+                        train_acces[i].append(step_acces[i])
+                        self.train_logdict[f"train/acc_{i}"] += (
+                            step_acces[i] / self.args.draft_accumulation_steps
+                        )
+                    if self.global_batch_idx % self.args.log_interval == 0:
                         self.train_logdict["train/lr"] = (
                             self.optimizer.get_learning_rate()
                         )
                         self.tracker.log(
                             self.train_logdict,
-                            step=self.step_idx // self.args.draft_accumulation_steps,
+                            step=self.global_batch_idx,
                         )
                         self.train_logdict = defaultdict(float)
 
-                    if self.step_idx % self.args.save_interval == 0:
-                        self.save_checkpoint(self.step_idx)
+                    if self.global_batch_idx % self.args.save_interval == 0:
+                        self.save_checkpoint(self.global_batch_idx)
 
-                    if self.step_idx % self.args.eval_interval == 0:
+                    if self.global_batch_idx % self.args.eval_interval == 0:
                         train_logdict = {}
                         for i in range(len(train_acces)):
                             acc_i = torch.tensor(train_acces[i]).cuda().mean()
@@ -701,7 +721,12 @@ class SglOnlineEagle3Trainer:
                             loss_i = torch.tensor(train_plosses[i]).cuda().mean()
                             dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
                             train_logdict[f"train/epochploss_{i}"] = loss_i.item()
-                        self.tracker.log(train_logdict, step=self.step_idx)
+
+                        # for i in range(len(train_vlosses)):
+                        #     loss_i = torch.tensor(train_vlosses[i]).cuda().mean()
+                        #     dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
+                        #     train_logdict[f"train/epochvloss_{i}"] = loss_i.item()
+                        self.tracker.log(train_logdict, step=self.global_batch_idx)
                         self.eval()
 
         destroy_distributed()
