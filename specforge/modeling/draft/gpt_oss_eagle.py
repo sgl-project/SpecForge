@@ -18,7 +18,7 @@ class GptOssForCausalLMEagle3(LlamaForCausalLMEagle3):
     config_class = GptOssConfig
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
-        super().__init__(config)
+        super().__init__(config, attention_backend=attention_backend)
         self.midlayer.mlp = GptOssMLP(config)
 
 

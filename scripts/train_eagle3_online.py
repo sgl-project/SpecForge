@@ -81,7 +81,7 @@ def parse_args():
     )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument(
-        "--log-steps", type=int, default=50, help="Log training metrics every N steps"
+        "--log-steps", type=int, default=10, help="Log training metrics every N steps"
     )
     parser.add_argument(
         "--ttt-length",
