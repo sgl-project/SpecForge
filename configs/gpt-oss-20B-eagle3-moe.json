@@ -26,6 +26,7 @@
   "torch_dtype": "bfloat16",
   "transformers_version": "4.52.3",
   "use_cache": true,
+  "rope_theta": 150000,
   "vocab_size": 201088,
   "experts_per_token": 4,
   "draft_vocab_size": 32000

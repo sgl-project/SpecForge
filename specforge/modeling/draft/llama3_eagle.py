@@ -260,8 +260,11 @@ class LlamaAttention(nn.Module):
         self._init_rope(config)
 
     def _init_rope(self, config):
+        base = getattr(config, "rope_theta", 10000)
         self.rotary_emb = LlamaRotaryEmbedding(
-            self.head_dim, max_position_embeddings=self.max_position_embeddings
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=base,
         )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):

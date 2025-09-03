@@ -13,7 +13,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3_online.py \
     --target-model-path openai/gpt-oss-20b \
     --draft-model-config $ROOT_DIR/configs/gpt-oss-20B-eagle3-moe.json \
-    --train-data-path /data/gen_oss/shard_20_of_220k.json \
+    --train-data-path /data/gen_oss/shard_20_of_20k.json \
     --output-dir $ROOT_DIR/outputs/perfect-blend-gptoss-20b-eagle3 \
     --num-epochs 1 \
     --batch-size 1 \
