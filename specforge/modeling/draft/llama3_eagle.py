@@ -590,7 +590,7 @@ class LlamaFlexAttention(LlamaAttention):
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             # Keep positions ids aligned when padding so the KV cache is unaffected.
             query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids
+                query_states, key_states, cos, sin, position_ids + lck
             )
 
         cache_position: torch.Tensor = torch.arange(
