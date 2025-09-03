@@ -12,7 +12,7 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer,AutoProcessor
 
 from specforge import (
     AutoDistributedTargetModel,
@@ -402,6 +402,7 @@ def main():
             draft_model=draft_model,
             processor=processor,
             length=args.ttt_length,
+            attention_backend=args.attention_backend,
         )
     else:
         eagle3_model = OnlineEagle3Model(
