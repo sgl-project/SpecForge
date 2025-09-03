@@ -469,7 +469,14 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        if dist.get_rank() == 0:
+            progress_bar = tqdm(
+                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+            )
+        else:
+            progress_bar = train_dataloader
+
+        for data in progress_bar:
             batch_index += 1
             if args.profile:
                 if batch_index == args.profile_start_step:
@@ -538,6 +545,13 @@ def main():
                     f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
                 )
                 last_time = time.time()
+
+            if dist.get_rank() == 0:
+                avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
+                avg_acc = sum(acces) / len(acces)
+                progress_bar.set_postfix(
+                    {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}"}
+                )
 
         epoch_logdict = {}
         for i in range(len(epoch_acces)):
