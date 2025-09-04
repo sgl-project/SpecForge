@@ -23,14 +23,18 @@ If the import succeeds without errors, Step 0 is complete.
 ## Step1. Prepare Model & Dataset
 
 First, use these command to download the model and the dataset.
-```
+```shell
 hf download meta-llama/Llama-3.1-8B-Instruct
 hf download Aeala/ShareGPT_Vicuna_unfiltered --repo-type dataset
 hf download HuggingFaceH4/ultrachat_200k --repo-type dataset
 
 python scripts/prepare_data.py --dataset ultrachat --output_path /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/dataset
 python scripts/prepare_data.py --dataset sharegpt --output_path /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/dataset
+```
 
+Then, launch the SGLang server and run `generate_data_by_target.py` to generate responses from the base model across different datasets. Make sure to update the `SYSTEM_PROMPT` value in `generate_data_by_target.py` to suit your requirements.
+
+```shell
 for i in {1..4}; do
     CUDA_VISIBLE_DEVICES=$i python3 -m sglang.launch_server \
         --model meta-llama/Llama-3.1-8B-Instruct \
@@ -127,6 +131,12 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
 ```
 
 ## Step3. benchmark
+
+For `Llama3.1-8B`, we add a system prompt to all training data, following the approach used in the official repository. Consequently, when benchmarking, we should also include this system prompt to obtain the full accept length. Please uncomment the corresponding line and add the system prompt.
+
+The four numbers in the config represent: `batch_size, num_steps, topk, num_verify_tokens`.  You can adjust the values in the config list to experiment with different test cases.
+
+I have upload my trained eagle model in [zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct). You are welcome to download and check its accept length.
 
 ```shell
 config_list=(

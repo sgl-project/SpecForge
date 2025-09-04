@@ -277,16 +277,26 @@ class SglOnlineEagle3Trainer:
             self.eagle3_model.draft_model, "vocab_mapping_loaded", False
         ), "Vocab mapping is not loaded"
         self.shard_model()
+        steps_per_epoch = math.ceil(
+            len(self.train_dataloader)
+            / args.num_epochs
+            / args.target_tp_size
+            / args.draft_accumulation_steps
+        )
         if args.total_steps is None:
-            steps_per_epoch = math.ceil(
-                len(self.train_dataloader) / args.draft_accumulation_steps
-            )
             args.total_steps = args.num_epochs * steps_per_epoch
             print_on_rank0(
                 f"Auto-Calculated {args.total_steps=} {args.num_epochs=} * {steps_per_epoch=}"
             )
         else:
             print_on_rank0(f"Using provided {args.total_steps=}")
+
+        if self.args.eval_interval == -1:
+            self.args.eval_interval = steps_per_epoch
+            print_on_rank0(f"Auto-set eval_interval to {self.args.eval_interval}")
+        if self.args.save_interval == -1:
+            self.args.save_interval = steps_per_epoch
+            print_on_rank0(f"Auto-set save_interval to {self.args.save_interval}")
         self.optimizer = self.create_optimizer()
 
         self.tracker = NoOpTracker(self.args, self.args.output_dir)
@@ -316,7 +326,7 @@ class SglOnlineEagle3Trainer:
     def _create_target_model(self):
         target_model = SglangTargetModel(
             args=self.args,
-            target_micro_batch_size=self.args.tp_size,
+            target_micro_batch_size=self.args.target_micro_batch_size,
             draft_micro_batch_size=self.args.draft_micro_batch_size,
             tp_group=dist.group.WORLD,
             enable_aux_hidden_states=True,
@@ -411,7 +421,7 @@ class SglOnlineEagle3Trainer:
             )
         train_dataloader = prepare_dp_dataloaders(
             train_eagle3_dataset,
-            self.args.target_tp_size,
+            1,
             num_workers=4,
             shuffle=True,
             process_group=get_dp_group(),
@@ -444,23 +454,13 @@ class SglOnlineEagle3Trainer:
             )
             eval_dataloader = prepare_dp_dataloaders(
                 eval_eagle3_dataset,
-                self.args.target_tp_size,
+                1,
                 num_workers=4,
                 shuffle=False,
                 process_group=get_dp_group(),
             )
             print_with_rank(f"Initialized eval dataloader")
 
-        if self.args.eval_interval == -1:
-            self.args.eval_interval = (
-                len(train_dataloader) // self.args.draft_accumulation_steps
-            )
-            print_on_rank0(f"Auto-set eval_interval to {self.args.eval_interval}")
-        if self.args.save_interval == -1:
-            self.args.save_interval = (
-                len(train_dataloader) // self.args.draft_accumulation_steps
-            )
-            print_on_rank0(f"Auto-set save_interval to {self.args.save_interval}")
         return (
             TrainDataLoaderWrapper(train_dataloader, self.args.num_epochs),
             eval_dataloader,
@@ -562,13 +562,14 @@ class SglOnlineEagle3Trainer:
             sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             / self.args.draft_accumulation_steps
         )
-        # vloss = sum(vlosses) / self.args.draft_accumulation_steps
-        # ploss += vloss
         ploss.backward()
-        if self.micro_batch_idx % self.args.draft_accumulation_steps == 0:
+        do_optimizer_step = (
+            self.micro_batch_idx % self.args.draft_accumulation_steps == 0
+        )
+        if do_optimizer_step:
             self.global_batch_idx += 1
             self.optimizer.step()
-        return plosses, vlosses, acces
+        return plosses, vlosses, acces, do_optimizer_step
 
     @torch.no_grad()
     def eval(self):
@@ -669,10 +670,7 @@ class SglOnlineEagle3Trainer:
             desc=f"Training",
         ):
             data_for_target.append(data)
-            if (
-                len(data_for_target)
-                >= self.args.target_batch_size // self.args.target_tp_size
-            ):
+            if len(data_for_target) >= self.args.target_batch_size:
                 torch.cuda.empty_cache()
                 data_for_draft = self.target_model.forward(
                     data_for_target,
@@ -681,23 +679,23 @@ class SglOnlineEagle3Trainer:
                 )
                 data_for_target = []
                 for data_ in data_for_draft:
-                    step_plosses, step_vlosses, step_acces = self.train_step(data_)
+                    step_plosses, _, step_acces, do_optimizer_step = self.train_step(
+                        data_
+                    )
                     for i in range(len(train_plosses)):
                         train_plosses[i].append(step_plosses[i].item())
                         self.train_logdict[f"train/ploss_{i}"] += (
                             step_plosses[i].item() / self.args.draft_accumulation_steps
                         )
-                    # for i in range(len(train_vlosses)):
-                    #     train_vlosses[i].append(step_vlosses[i].item())
-                    #     self.train_logdict[f"train/vloss_{i}"] += (
-                    #         step_vlosses[i].item() / self.args.draft_accumulation_steps
-                    #     )
                     for i in range(len(train_acces)):
                         train_acces[i].append(step_acces[i])
                         self.train_logdict[f"train/acc_{i}"] += (
                             step_acces[i] / self.args.draft_accumulation_steps
                         )
-                    if self.global_batch_idx % self.args.log_interval == 0:
+                    if (
+                        do_optimizer_step
+                        and self.global_batch_idx % self.args.log_interval == 0
+                    ):
                         self.train_logdict["train/lr"] = (
                             self.optimizer.get_learning_rate()
                         )
@@ -707,10 +705,16 @@ class SglOnlineEagle3Trainer:
                         )
                         self.train_logdict = defaultdict(float)
 
-                    if self.global_batch_idx % self.args.save_interval == 0:
+                    if (
+                        do_optimizer_step
+                        and self.global_batch_idx % self.args.save_interval == 0
+                    ):
                         self.save_checkpoint(self.global_batch_idx)
 
-                    if self.global_batch_idx % self.args.eval_interval == 0:
+                    if (
+                        do_optimizer_step
+                        and self.global_batch_idx % self.args.eval_interval == 0
+                    ):
                         train_logdict = {}
                         for i in range(len(train_acces)):
                             acc_i = torch.tensor(train_acces[i]).cuda().mean()
@@ -722,10 +726,6 @@ class SglOnlineEagle3Trainer:
                             dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
                             train_logdict[f"train/epochploss_{i}"] = loss_i.item()
 
-                        # for i in range(len(train_vlosses)):
-                        #     loss_i = torch.tensor(train_vlosses[i]).cuda().mean()
-                        #     dist.all_reduce(loss_i, op=dist.ReduceOp.AVG)
-                        #     train_logdict[f"train/epochvloss_{i}"] = loss_i.item()
                         self.tracker.log(train_logdict, step=self.global_batch_idx)
                         self.eval()
 

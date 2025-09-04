@@ -211,26 +211,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-# from openai import OpenAIError, AsyncOpenAI, OpenAI
-# client = OpenAI(base_url=f"http://127.0.0.1:30001/v1", api_key="None")
-# messages = []
-# def ask(user_text: str, messages, client):
-#     messages.append({"role": "user", "content": user_text})
-#     resp = client.chat.completions.create(
-#         model=MODEL,
-#         messages=messages,
-#         extra_body={"reasoning_effort": "low"},
-#         temperature=0.3,
-#         max_tokens=512,
-#     )
-#     assistant_text = resp.choices[0].message.content
-#     reasoning_content = resp.choices[0].message.reasoning_content
-#     messages.append({"role": "assistant", "content": assistant_text, "thinking": reasoning_content})
-#     return assistant_text
-
-# # --- Multi-turn conversation ---
-# print(ask("Give me a two-sentence overview of diffusion models.", messages, client))
-# print(ask("Great—now compare them to autoregressive LLMs in 3 bullets.", messages, client))
-# print(ask("Suggest one practical use case for each, max 20 words per item.", messages, client))

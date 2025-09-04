@@ -235,63 +235,41 @@ class SglangTargetModel(nn.Module):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
         data_for_draft = []
-        for idx_data, data in enumerate(data_for_target):
-            if data["input_ids"].shape[0] < self.target_tp_size:
-                print_with_rank(
-                    f"Zero padding {data['input_ids'].shape=}, {data['attention_mask'].shape=}, {data['loss_mask'].shape=} to {self.target_tp_size=}"
-                )
-                zero_padding = torch.zeros(
-                    (
-                        self.target_tp_size - data["input_ids"].shape[0],
-                        data["input_ids"].shape[1],
-                    ),
-                    dtype=data["input_ids"].dtype,
-                    device=data["input_ids"].device,
-                )
-                data["input_ids"] = torch.cat([data["input_ids"], zero_padding], dim=0)
-                data["attention_mask"] = torch.cat(
-                    [data["attention_mask"], zero_padding], dim=0
-                )
-                data["loss_mask"] = torch.cat([data["loss_mask"], zero_padding], dim=0)
-            elif data["input_ids"].shape[0] > self.target_tp_size:
-                raise ValueError(
-                    f"{data['input_ids'].shape[0]=} must be less or equal to {self.target_tp_size=}"
-                )
-            for idx_row in range(data["input_ids"].shape[0]):
-                req = Req(
-                    rid=str(idx_row + idx_data * self.target_tp_size),
-                    origin_input_text="",
-                    origin_input_ids=data["input_ids"][idx_row].view(-1).tolist(),
-                    sampling_params=sampling_params,
-                )
-                req.prefix_indices = []
-                req.fill_ids = req.origin_input_ids
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                req.logprob_start_len = len(req.origin_input_ids) - 1
-                data_cache.append(data)
-                reqs.append(req)
-                if len(reqs) == self.target_micro_batch_size:
-                    # here let me assume return aux_hidden_states is True
-                    hidden_states_list, aux_hidden_states_list = self.extend(reqs)
-                    for idx, (data, hidden_states, aux_hidden_states) in enumerate(
-                        zip(data_cache, hidden_states_list, aux_hidden_states_list)
-                    ):
-                        if idx % dist.get_world_size() != draft_dp_rank:
-                            continue
-                        # the input shape is aligned with "prepare_hidden_states.py"
-                        # the output shape is aligned with OfflineEagle3Dataset
-                        data_for_draft.append(
-                            OfflineEagle3Dataset.process_data(
-                                {
-                                    "input_ids": data["input_ids"].view(-1),
-                                    "loss_mask": data["loss_mask"].view(-1),
-                                    "hidden_state": hidden_states.unsqueeze(0),
-                                    "aux_hidden_state": aux_hidden_states.unsqueeze(0),
-                                },
-                                transform=None,
-                                max_len=self.args.max_length,
-                            )
+        for idx, data in enumerate(data_for_target):
+            req = Req(
+                rid=str(idx),
+                origin_input_text="",
+                origin_input_ids=data["input_ids"].view(-1).tolist(),
+                sampling_params=sampling_params,
+            )
+            req.prefix_indices = []
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+            data_cache.append(data)
+            reqs.append(req)
+            if len(reqs) == self.target_micro_batch_size:
+                # here let me assume return aux_hidden_states is True
+                hidden_states_list, aux_hidden_states_list = self.extend(reqs)
+                for idx, (data, hidden_states, aux_hidden_states) in enumerate(
+                    zip(data_cache, hidden_states_list, aux_hidden_states_list)
+                ):
+                    if idx % torch.distributed.get_world_size() != draft_dp_rank:
+                        continue
+                    # the input shape is aligned with "prepare_hidden_states.py"
+                    # the output shape is aligned with OfflineEagle3Dataset
+                    data_for_draft.append(
+                        OfflineEagle3Dataset.process_data(
+                            {
+                                "input_ids": data["input_ids"].view(-1),
+                                "loss_mask": data["loss_mask"].view(-1),
+                                "hidden_state": hidden_states.unsqueeze(0),
+                                "aux_hidden_state": aux_hidden_states.unsqueeze(0),
+                            },
+                            transform=None,
+                            max_len=self.args.max_length,
                         )
-                    reqs, data_cache = [], []
+                    )
+                reqs, data_cache = [], []
         # for now, let us assume draft_micro_batch_size = 1
         return [draft_data_collator([data]) for data in data_for_draft]

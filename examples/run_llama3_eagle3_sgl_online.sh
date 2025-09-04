@@ -30,16 +30,11 @@ python scripts/prepare_data.py --dataset ultrachat --output_path $DATASET_PATH -
 #     --num-per-shard 10000 \
 #     --server-address-port 127.0.0.1:30001 127.0.0.1:30002 127.0.0.1:30003 127.0.0.1:30004
 
-shuf sharegpt_ultrachat.jsonl > shuffled_sharegpt_ultrachat.jsonl
-N=$(wc -l < shuffled_sharegpt_ultrachat.jsonl)
-train_count=$(( N * 95 / 100 ))
-head -n "$train_count" shuffled_sharegpt_ultrachat.jsonl > sharegpt_ultrachat_train.jsonl
-tail -n +"$((train_count + 1))" shuffled_sharegpt_ultrachat.jsonl > sharegpt_ultrachat_test.jsonl
+hf download zhuyksir/Ultrachat-Sharegpt-Llama3.1-8B --repo-type dataset --local-dir $DATASET_PATH
 python scripts/build_eagle3_dataset_cache.py \
     --target-model-path $MODEL_PATH \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path $DATASET_PATH/sharegpt_ultrachat_train.jsonl \
-    --eval-data-path $DATASET_PATH/sharegpt_ultrachat_test.jsonl \
+    --train-data-path $DATASET_PATH/sharegpt_ultrachat.jsonl \
     --cache-dir $CACHE_DIR \
     --chat-template $CHAT_TEMPLATE \
     --max-length $MAX_LENGTH \
@@ -54,8 +49,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --target-model-path $MODEL_PATH \
     --model-path $MODEL_PATH \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path $DATASET_PATH/sharegpt_ultrachat_train.jsonl \
-    --eval-data-path $DATASET_PATH/sharegpt_ultrachat_test.jsonl \
+    --train-data-path $DATASET_PATH/sharegpt_ultrachat.jsonl \
     --tp-size $NUM_GPUS \
     --output-dir $OUTPUT_DIR \
     --num-epochs 10 \
@@ -69,6 +63,20 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --total-steps=800000 \
     --warmup-ratio=0.015 \
     --dist-timeout=10 \
-    --wandb-project llama3-8b-eagle3 \
+    --wandb-project llama3-8b-eagle3-offline \
     --wandb-name sgl-online \
     --report-to wandb
+
+config_list=(
+    "8,7,10,60"
+    "8,3,1,4"
+)
+CUDA_VISIBLE_DEVICES=1,2 python3 benchmarks/bench_model_speedup.py \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --speculative-draft-model-path ~/.cache/huggingface/Llama-3.1-8B-Instruct/dev_outputs/step_20533/ \
+    --port 20001 \
+    --trust-remote-code \
+    --mem-fraction-static 0.8 \
+    --config-list "${config_list[@]}" \
+    --benchmark-list mtbench:80 \
+    --output Llama-3.1-8B-Instruct_Eagle3-300k_result.jsonl --enable-multi-turn-conversation
