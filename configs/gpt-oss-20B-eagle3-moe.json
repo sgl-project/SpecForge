@@ -9,13 +9,21 @@
       21
     ]
   },
+  "rope_scaling": {
+    "beta_fast": 32.0,
+    "beta_slow": 1.0,
+    "factor": 32.0,
+    "original_max_position_embeddings": 4096,
+    "rope_type": "yarn",
+    "truncate": false
+  },
   "head_dim": 64,
   "hidden_act": "silu",
   "hidden_size": 2880,
   "initializer_range": 0.02,
   "intermediate_size": 17280,
   "num_local_experts": 16,
-  "max_position_embeddings": 4096,
+  "max_position_embeddings": 131072,
   "model_type": "gpt_oss",
   "num_attention_heads": 64,
   "num_key_value_heads": 8,
