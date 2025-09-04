@@ -37,7 +37,9 @@ def test_mistral_tp(rank, world_size, temp_dir):
     # create the single-gpu
     model = MistralForCausalLM(config).cuda()
 
-    from specforge.modeling.target.mistral import MistralForCausalLM as DistMistralForCausalLM
+    from specforge.modeling.target.mistral import (
+        MistralForCausalLM as DistMistralForCausalLM,
+    )
 
     dist_model = DistMistralForCausalLM(config).cuda()
 

@@ -92,7 +92,7 @@ class MistralAttention(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         self.num_key_value_groups = (
-                config.num_attention_heads // config.num_key_value_heads
+            config.num_attention_heads // config.num_key_value_heads
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
@@ -122,13 +122,13 @@ class MistralAttention(nn.Module):
         )
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            position_embeddings: tuple[torch.Tensor, torch.Tensor],
-            attention_mask: Optional[torch.Tensor],
-            past_key_value: Optional[Cache] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            **kwargs: Unpack[FlashAttentionKwargs],
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -163,7 +163,9 @@ class MistralAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=getattr(self.config, "sliding_window", None),  # main diff with Llama
+            sliding_window=getattr(
+                self.config, "sliding_window", None
+            ),  # main diff with Llama
             **kwargs,
         )
 
@@ -181,24 +183,26 @@ class MistralDecoderLayer(GradientCheckpointingLayer):
         self.self_attn = MistralAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = MistralMLP(config)
-        self.input_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = MistralRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.post_attention_layernorm = MistralRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_value: Optional[Cache] = None,
-            output_attentions: Optional[bool] = False,
-            use_cache: Optional[bool] = False,
-            cache_position: Optional[torch.LongTensor] = None,
-            position_embeddings: Optional[
-                tuple[torch.Tensor, torch.Tensor]
-            ] = None,  # necessary, but kept here for BC
-            **kwargs: Unpack[FlashAttentionKwargs],
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[
+            tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # necessary, but kept here for BC
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -347,14 +351,16 @@ class MistralModel(MistralPreTrainedModel):
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device
+                device=inputs_embeds.device,
             )
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
         mask_function = (
-            create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+            create_causal_mask
+            if self.config.sliding_window is None
+            else create_sliding_window_causal_mask
         )
         causal_mask = mask_function(
             config=self.config,
@@ -409,7 +415,9 @@ class MistralModel(MistralPreTrainedModel):
 
 
 @auto_docstring
-class MistralForCausalLM(MistralPreTrainedModel, GenerationMixin, DistributedTargetModel):
+class MistralForCausalLM(
+    MistralPreTrainedModel, GenerationMixin, DistributedTargetModel
+):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -518,7 +526,7 @@ class MistralForCausalLM(MistralPreTrainedModel, GenerationMixin, DistributedTar
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
-                **kwargs
+                **kwargs,
             )
 
         return CausalLMOutputWithPast(
