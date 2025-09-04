@@ -283,6 +283,10 @@ def main():
                 .eval()
                 .cuda()
             )
+
+    for p in target_model.parameters():
+        p.requires_grad = False
+
     print_with_rank("Initialized target model")
 
     # load model with resume
