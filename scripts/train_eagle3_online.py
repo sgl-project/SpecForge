@@ -283,10 +283,6 @@ def main():
                 .eval()
                 .cuda()
             )
-
-    for p in target_model.parameters():
-        p.requires_grad = False
-
     print_with_rank("Initialized target model")
 
     # load model with resume
@@ -431,7 +427,7 @@ def main():
 
     # build other components
     optimizer = BF16Optimizer(
-        eagle3_model,
+        draft_model,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
