@@ -100,7 +100,7 @@ def launch_sglang_server(
     print(" ".join(cmd))
 
     # Start the server process
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(cmd)
     return process
 
 
