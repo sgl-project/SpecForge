@@ -68,7 +68,8 @@ class GeneralParser(Parser):
             convroles = ["user", "assistant"]
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
-                assert role == convroles[j % 2], f"unexpected role {role}"
+                if role != convroles[j % 2]:
+                    break
                 messages.append({"role": role, "content": sentence["content"]})
 
             conversation = self.tokenizer.apply_chat_template(
