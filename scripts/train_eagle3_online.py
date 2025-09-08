@@ -518,7 +518,7 @@ def main():
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
                 )
-            acces = [x.item() for x in acces]
+            acces = torch.stack(acces).cpu().tolist()
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -601,7 +601,7 @@ def main():
                         attention_mask=data["attention_mask"].cuda(),
                         loss_mask=data["loss_mask"].cuda(),
                     )
-                acces = [x.item() for x in acces]
+                acces = torch.stack(acces).cpu().tolist()
 
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
