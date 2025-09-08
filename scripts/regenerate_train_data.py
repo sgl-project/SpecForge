@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+﻿"""
+This script will re-generate the dataset from target model,
+which better aligns the draft model with the target model’s output distribution.
+"""
+
 import argparse
 import json
 import signal
