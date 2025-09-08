@@ -417,6 +417,7 @@ def main():
                 hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
                 target=data["target"].cuda(),  # [B, S, D*3]
             )
+            acces = [x.item() for x in acces]
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -493,6 +494,7 @@ def main():
                     hidden_states=data["hidden_state"].cuda(),
                     target=data["target"].cuda(),
                 )
+                acces = [x.item() for x in acces]
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))

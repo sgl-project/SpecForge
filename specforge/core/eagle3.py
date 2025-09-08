@@ -786,4 +786,4 @@ def _compute_target_p(target, t2d, loss_mask):
 def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
     return (
         (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
-    ).sum().item() / (loss_mask.sum().item() + 1e-6)
+    ).sum() / loss_mask.sum().clamp_min(1e-6)
