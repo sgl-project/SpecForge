@@ -260,9 +260,7 @@ def main():
             output_file_path, "w"
         ) as output_file_handle:
 
-            for line_number, line in enumerate(input_file, start=0):
-                if line_number == total_lines:
-                    break
+            for _, line in zip(range(total_lines), input_file):
                 data = json.loads(line)
                 messages = data["conversations"]
 
