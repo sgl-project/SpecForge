@@ -69,6 +69,9 @@ class GeneralParser(Parser):
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
                 if role != convroles[j % 2]:
+                    warnings.warn(
+                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
+                    )
                     break
                 messages.append({"role": role, "content": sentence["content"]})
 
