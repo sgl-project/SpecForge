@@ -13,7 +13,7 @@ python3 \
     scripts/regenerate_data.py \
     --model <target-model-path> \
     --input-file-path <jsonl-file-path> \
-    --output-file-path <jsonl-file-path> \
+    --output-file-path <regenerated-jsonl-file-path> \
     --batch-size 128 \
     --tp-size 8 \
     --num-samples 1000 \
