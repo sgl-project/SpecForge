@@ -24,7 +24,7 @@ def main(args):
     print(f"Created temporary image directory: {cache_dir}")
 
     # Read data
-    dataset = load_dataset("Lin-Chen/MMStar")["validation"]
+    dataset = load_dataset("Lin-Chen/MMStar")["val"]
     questions = []
     for idx, q in enumerate(dataset):
         if idx >= args.num_questions:
