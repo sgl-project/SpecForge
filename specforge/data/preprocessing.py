@@ -71,12 +71,20 @@ def _apply_loss_mask_from_chat_template(
     """
     loss_mask = torch.zeros(len(offsets), dtype=torch.long)
 
-    user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    )
+    if chat_template.end_of_turn_token is not None:
+        user_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+        )
+        assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+        )
+    else:
+        user_message_separator = (
+            f"{chat_template.end_of_assistant_token or ''}{chat_template.user_header}"
+        )
+        assistant_message_separator = (
+            f"{chat_template.end_of_user_token or ''}{chat_template.assistant_header}"
+        )
 
     # Find spans of assistant responses using regex
     assistant_pattern = (
