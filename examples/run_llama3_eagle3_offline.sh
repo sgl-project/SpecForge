@@ -10,7 +10,7 @@ export CHAT_TEMPLATE=llama3
 hf download $MODEL_PATH
 hf download Aeala/ShareGPT_Vicuna_unfiltered --repo-type dataset
 
-python scripts/prepare_data.py --dataset sharegpt --output-path $DATASET_PATH
+python scripts/prepare_data.py --dataset sharegpt --output-path $DATASET_PATH --split-eval
 python scripts/build_eagle3_dataset_cache.py \
     --target-model-path $MODEL_PATH \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
