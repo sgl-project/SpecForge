@@ -24,6 +24,10 @@ def parse_args():
     parser.add_argument("--chat-template", type=str, default="llama3")
     parser.add_argument("--model-path", type=str, required=False)
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+    parser.add_argument("--num-gpu", type=int, default=1)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--master-addr", type=str, default="localhost")
+    parser.add_argument("--master-port", type=str, default="12355")
     return parser.parse_args()
 
 
@@ -38,7 +42,7 @@ def main():
         --chat-template llama3
     """
     args = parse_args()
-    torch.distributed.init_process_group(backend="nccl")
+    torch.distributed.init_process_group(backend="nccl", world_size=args.num_gpu, rank=args.rank, init_method=f"tcp://{args.master_addr}:{args.master_port}")
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
