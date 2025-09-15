@@ -336,6 +336,7 @@ class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
+
 # Inverse dim formula to find dim based on number of rotations
 def yarn_find_correction_dim(
     num_rotations, dim, base=10000, max_position_embeddings=2048
@@ -367,7 +368,9 @@ def yarn_get_mscale(scale=1, mscale=1):
 def yarn_linear_ramp_mask(min_val, max_val, dim):
     if min_val == max_val:
         max_val += 0.001  # Prevent singularity
-    linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (
+        max_val - min_val
+    )
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
@@ -433,10 +436,14 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
 
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer(
-            "cos_cached", (emb.cos() * _mscale)[None, None, :, :].to(dtype), persistent=False
+            "cos_cached",
+            (emb.cos() * _mscale)[None, None, :, :].to(dtype),
+            persistent=False,
         )
         self.register_buffer(
-            "sin_cached", (emb.sin() * _mscale)[None, None, :, :].to(dtype), persistent=False
+            "sin_cached",
+            (emb.sin() * _mscale)[None, None, :, :].to(dtype),
+            persistent=False,
         )
 
 
@@ -504,7 +511,9 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    original_max_position_embeddings=self.config.rope_scaling["original_max_position_embeddings"],
+                    original_max_position_embeddings=self.config.rope_scaling[
+                        "original_max_position_embeddings"
+                    ],
                     scaling_factor=self.config.rope_scaling["factor"],
                     beta_fast=self.config.rope_scaling["beta_fast"],
                     beta_slow=self.config.rope_scaling["beta_slow"],
