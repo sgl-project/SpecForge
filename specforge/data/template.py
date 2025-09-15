@@ -16,20 +16,12 @@ class ChatTemplate(BaseModel):
         end_of_turn_token(str): The end token of a turn of conversation.
     """
 
-<<<<<<< HEAD
     assistant_header: str | None
     assistant_think_header: str | None
     user_header: str | None
     system_prompt: str | None
     end_of_turn_token: str | None
     parser_type: str = "general"
-=======
-    assistant_header: str
-    assistant_think_header: str
-    user_header: str
-    system_prompt: str
-    end_of_turn_token: str
->>>>>>> 8b91281 (suppoerted think mode)
 
 
 class TemplateRegistry:
@@ -43,12 +35,8 @@ class TemplateRegistry:
         TEMPLATE_REGISTRY.register(
             name="custom",
             template=ChatTemplate(
-<<<<<<< HEAD
-                assistant_think_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
-=======
                 assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
                 assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
->>>>>>> 8b91281 (suppoerted think mode)
                 user_header="<|start_header_id|>user<|end_header_id|>",
                 system_prompt="You are a helpful assistant.",
                 end_of_turn_token="<|eot_id|>"
