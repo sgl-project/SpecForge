@@ -170,9 +170,9 @@ class LogSoftmaxLoss(torch.autograd.Function):
     def forward(ctx, logits, target, position_mask):
         B, T, V = logits.shape
         loss = torch.zeros((B * T, 1), device=logits.device)
-        logits_flat = logits.view(B * T, V).contiguous()
-        target_flat = target.view(B * T, V).contiguous()
-        position_mask_flat = position_mask.view(B * T, 1).contiguous().bool()
+        logits_flat = logits.contiguous().view(B * T, V)
+        target_flat = target.contiguous().view(B * T, V)
+        position_mask_flat = position_mask.contiguous().view(B * T, 1).bool()
         grid = (B * T,)
         m = torch.zeros((B * T,), device=logits.device, dtype=torch.float32)
         d = torch.zeros((B * T,), device=logits.device, dtype=torch.float32)
@@ -200,9 +200,9 @@ class LogSoftmaxLoss(torch.autograd.Function):
         logits, target, position_mask, m, d = ctx.saved_tensors
         B, T, V = logits.shape
         scaling_factor = 1.0 / (B * T)
-        logits = logits.view(B * T, V).contiguous()
-        target = target.view(B * T, V).contiguous()
-        position_mask = position_mask.view(B * T, 1).contiguous().bool()
+        logits = logits.contiguous().view(B * T, V)
+        target = target.contiguous().view(B * T, V)
+        position_mask = position_mask.contiguous().view(B * T, 1).bool()
         grid = (B * T,)
         BLOCK_SIZE, num_warps = _calculate_settings(V)
         log_softmax_backward_kernel[grid](

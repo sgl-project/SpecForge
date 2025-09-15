@@ -68,7 +68,11 @@ class GeneralParser(Parser):
             convroles = ["user", "assistant"]
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
-                assert role == convroles[j % 2], f"unexpected role {role}"
+                if role != convroles[j % 2]:
+                    warnings.warn(
+                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
+                    )
+                    break
                 messages.append({"role": role, "content": sentence["content"]})
 
             conversation = self.tokenizer.apply_chat_template(
@@ -150,7 +154,6 @@ class HarmonyParser(Parser):
             reasoning_level = "Low"
 
             for j, message in enumerate(conversation):
-                print(message)
                 if message["role"] == "user":
                     user_message = message["content"]
                 if message["role"] == "assistant_analysis":

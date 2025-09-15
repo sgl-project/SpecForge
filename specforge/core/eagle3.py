@@ -463,7 +463,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
     """
 
     def __init__(
-        self, target_model, draft_model: Eagle3DraftModel, processor, length: int = 7
+        self,
+        target_model,
+        draft_model: Eagle3DraftModel,
+        processor,
+        length: int = 7,
+        attention_backend: str = "sdpa",
     ):
         """
         Args:
@@ -476,6 +481,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.processor = processor
         self.length = length
+        self.attention_backend = attention_backend
 
     @torch.no_grad()
     def _prepare_data(
@@ -605,10 +611,19 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             pixel_values: batch image pixel values, used for VLM models
             image_grid_thw: (batch, 3), image grid thw, used for VLM models
         """
-        # Step 1: prepare data with the target model
+        # Step 0: prepare data with the target model
         hidden_states, target, loss_mask, input_ids = self._prepare_data(
             input_ids, attention_mask, loss_mask, pixel_values, image_grid_thw
         )
+
+        # Step 1: handle vocab size
+        target_p_padded, position_mask = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -656,21 +671,28 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        attention_mask = self.draft_model.prepare_decoder_attention_mask(
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-            batch_size=batch_size,
-            seq_length=seq_length,
-            past_key_values_length=past_key_values_length,
-        )
+        if self.attention_backend == "sdpa":
+            attention_mask = self.draft_model.prepare_decoder_attention_mask(
+                attention_mask=attention_mask,
+                hidden_states=hidden_states,
+                batch_size=batch_size,
+                seq_length=seq_length,
+                past_key_values_length=past_key_values_length,
+            )
 
         # Step 5: run TTT
         plosses = []
         vlosses = []
         acces = []
-        cache_hidden = [[], []]
+        if self.attention_backend == "sdpa":
+            cache_hidden = [[], []]
+            past_key_values = None
+        elif self.attention_backend == "flex_attention":
+            cache_hidden = None
+            past_key_values = DynamicCache()
 
         for idx in range(self.length):
+            target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -685,55 +707,44 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 cache_hidden=cache_hidden,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                past_key_values=past_key_values,
                 use_cache=True,
             )
-
-            # Step 5.3: handle vocab size
-            with torch.no_grad():
-                target_head = target
-                target_max_token = target_head.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
-                position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.draft_model.t2d]
-                target_head = target_head.float()
-                target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
 
             # update hidden states for next step
             hidden_states = hidden_states_out
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
-            logits = logits.float()
 
-            # Step 5.5: calculate loss
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
-
-            # Step 5.6: record metrics
-            plosses.append(loss)
+            # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
                 acces.append(
-                    (
-                        (logits.argmax(-1) == target_p.argmax(-1))
-                        * position_mask.squeeze(-1)
+                    _compute_metric_acc(
+                        logits=logits,
+                        target_p=target_p,
+                        position_mask=position_mask,
+                        loss_mask=loss_mask,
                     )
-                    .sum()
-                    .item()
-                    / (loss_mask.sum().item() + 1e-6)
                 )
+
+            # Step 5.6: calculate loss, in-place modifies logits!
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            plosses.append(loss)
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
+                position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                ind = torch.arange(seq_length, device=attention_mask.device)
-                ind0 = ind[idx:]
-                ind1 = ind[: seq_length - idx]
-                attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
+                if self.attention_backend == "sdpa":
+                    ind = torch.arange(seq_length, device=attention_mask.device)
+                    ind0 = ind[idx:]
+                    ind1 = ind[: seq_length - idx]
+                    attention_mask[:, :, ind0, ind1] = torch.finfo(
+                        attention_mask.dtype
+                    ).min
+                # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
 
@@ -775,4 +786,4 @@ def _compute_target_p(target, t2d, loss_mask):
 def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
     return (
         (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
-    ).sum().item() / (loss_mask.sum().item() + 1e-6)
+    ).sum() / loss_mask.sum().clamp_min(1e-6)

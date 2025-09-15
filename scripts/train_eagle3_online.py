@@ -12,7 +12,7 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from specforge import (
     AutoDistributedTargetModel,
@@ -283,6 +283,10 @@ def main():
                 .eval()
                 .cuda()
             )
+
+    for p in target_model.parameters():
+        p.requires_grad = False
+
     print_with_rank("Initialized target model")
 
     # load model with resume
@@ -402,6 +406,7 @@ def main():
             draft_model=draft_model,
             processor=processor,
             length=args.ttt_length,
+            attention_backend=args.attention_backend,
         )
     else:
         eagle3_model = OnlineEagle3Model(
@@ -426,7 +431,7 @@ def main():
 
     # build other components
     optimizer = BF16Optimizer(
-        eagle3_model,
+        draft_model,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
@@ -469,7 +474,14 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        if dist.get_rank() == 0:
+            progress_bar = tqdm(
+                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+            )
+        else:
+            progress_bar = train_dataloader
+
+        for data in progress_bar:
             batch_index += 1
             if args.profile:
                 if batch_index == args.profile_start_step:
@@ -506,6 +518,7 @@ def main():
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
                 )
+            acces = torch.stack(acces).cpu().tolist()
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -538,6 +551,13 @@ def main():
                     f"[{dist.get_rank()}] time={(time.time() - last_time):.3}s shape={data['input_ids'].shape}"
                 )
                 last_time = time.time()
+
+            if dist.get_rank() == 0:
+                avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
+                avg_acc = sum(acces) / len(acces)
+                progress_bar.set_postfix(
+                    {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}"}
+                )
 
         epoch_logdict = {}
         for i in range(len(epoch_acces)):
@@ -581,6 +601,7 @@ def main():
                         attention_mask=data["attention_mask"].cuda(),
                         loss_mask=data["loss_mask"].cuda(),
                     )
+                acces = torch.stack(acces).cpu().tolist()
 
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [

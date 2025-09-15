@@ -575,12 +575,23 @@ class LlamaFlexAttention(LlamaAttention):
         ).transpose(1, 2)
 
         lck = past_seen_tokens // q_len
-        cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-        # Keep positions ids aligned when padding so the KV cache is unaffected.
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids + lck
-        )
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            # Keep positions ids aligned when padding so the KV cache is unaffected.
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids + lck
+            )
 
         cache_position: torch.Tensor = torch.arange(
             past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
