@@ -85,15 +85,13 @@ class GeneralParser(Parser):
                     break
                 messages.append({"role": role, "content": sentence["content"]})
 
-            conversation = self.tokenizer.apply_chat_template(
+            conversation_ = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=self.is_think_mode,
             )
-            conversation += (
-                conversation[-1]["content"] + self.chat_template.end_of_turn_token
-            )
+            conversation = conversation_ + conversation[-1]["content"] + self.chat_template.end_of_turn_token
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
