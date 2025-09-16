@@ -91,7 +91,11 @@ class GeneralParser(Parser):
                 add_generation_prompt=True,
                 enable_thinking=self.is_think_mode,
             )
-            conversation = conversation_ + conversation[-1]["content"] + self.chat_template.end_of_turn_token
+            conversation = (
+                conversation_
+                + conversation[-1]["content"]
+                + self.chat_template.end_of_turn_token
+            )
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
