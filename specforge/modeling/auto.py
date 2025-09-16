@@ -39,7 +39,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     }
 
     @classmethod
-    def from_config(cls, config: PretrainedConfig,torch_dtype=None, **config_kwargs):
+    def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
         This class method takes a configuration object and create its model based on the
         _model_mapping class variable.
@@ -54,7 +54,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         _model_cls = cls._model_mapping[type(config)]
         model = _model_cls(config, **config_kwargs)
 
-        #If a dtype is passed, convert it
+        # Convert model to specified dtype if provided
         if torch_dtype is not None:
             model = model.to(dtype=torch_dtype)
         return model
