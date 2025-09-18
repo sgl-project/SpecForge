@@ -605,9 +605,7 @@ def main():
                         )
                 acces = torch.stack(acces).cpu().tolist()
 
-                eval_acces = [
-                    eval_acces[i] + [acces[i].item()] for i in range(len(acces))
-                ]
+                eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
                 ]
