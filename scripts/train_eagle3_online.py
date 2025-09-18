@@ -588,22 +588,26 @@ def main():
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                 if args.is_vlm:
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].cuda(),
-                        pixel_values=data["pixel_values"].cuda(),
-                        image_grid_thw=data["image_grid_thw"].cuda(),
-                    )
+                    with torch.no_grad():
+                        plosses, _, acces = eagle3_model(
+                            input_ids=data["input_ids"].cuda(),
+                            attention_mask=data["attention_mask"].cuda(),
+                            loss_mask=data["loss_mask"].cuda(),
+                            pixel_values=data["pixel_values"].cuda(),
+                            image_grid_thw=data["image_grid_thw"].cuda(),
+                        )
                 else:
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].cuda(),
-                    )
+                    with torch.no_grad():
+                        plosses, _, acces = eagle3_model(
+                            input_ids=data["input_ids"].cuda(),
+                            attention_mask=data["attention_mask"].cuda(),
+                            loss_mask=data["loss_mask"].cuda(),
+                        )
                 acces = torch.stack(acces).cpu().tolist()
 
-                eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
+                eval_acces = [
+                    eval_acces[i] + [acces[i].item()] for i in range(len(acces))
+                ]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
                 ]
