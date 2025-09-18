@@ -191,8 +191,9 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
                 f.write(json.dumps(row) + "\n")
 
     if total_skipped_count > 0:
+        total_messages = len(train_ds) + (len(test_ds) if test_ds is not None else 0)
         print(
-            f"Skipped {total_skipped_count}/{len(train_ds)+len(test_ds)} messages for {dataset_name}"
+            f"Skipped {total_skipped_count}/{total_messages} messages for {dataset_name}"
         )
 
 
