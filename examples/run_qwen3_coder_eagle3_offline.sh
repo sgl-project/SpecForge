@@ -15,7 +15,8 @@ torchrun \
     --train-hidden-states-path $ROOT_DIR/cache/hidden_states \
     --output-dir $ROOT_DIR/outputs/Qwen3-Coder-480B-A35B-Instruct \
     --num-epochs 10 \
-    --batch-size 1 \
+    --draft-micro-batch-size 1 \
+    --draft-global-batch-size $NUM_GPUS\
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template qwen \
