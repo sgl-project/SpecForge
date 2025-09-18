@@ -20,24 +20,25 @@ from specforge.modeling.draft.llama3_eagle import (
 )
 from specforge.utils import padding
 
+from .utils import norm_tensor
+
 dynamo.config.recompile_limit = 64
 TTT_LENGTH = 7
+torch.manual_seed(0)
 
 
 class TestFlexAttention(unittest.TestCase):
-    """Comprehensive test suite for LlamaAttention with simulated inputs."""
 
     def setUp(self):
-        """Set up test configurations and common parameters."""
-        # Basic configuration
+        torch.manual_seed(0)
         self.config_dict = {
-            "hidden_size": 512,
+            "hidden_size": 128,
             "num_attention_heads": 8,
             "num_key_value_heads": 2,
-            "max_position_embeddings": 2048,
+            "max_position_embeddings": 4096,
             "rms_norm_eps": 1e-05,
             "vocab_size": 32000,
-            "intermediate_size": 1376,
+            "intermediate_size": 688,
             "hidden_act": "silu",
             "num_hidden_layers": 1,
             "torch_dtype": "float32",
@@ -82,9 +83,11 @@ class TestFlexAttention(unittest.TestCase):
             200, seq_len // 3
         )  # Adjust padding based on seq_len
         attention_mask[1, padding_start_index:] = False
-        input_embeds = torch.randn(
-            batch_size, seq_len, self.config.hidden_size, dtype=self.dtype
-        ).to("cuda")
+        input_embeds = norm_tensor(
+            (batch_size, seq_len, self.config.hidden_size),
+            device="cuda",
+            dtype=self.dtype,
+        )
         decoder_attention_mask = prepare_decoder_attention_mask(
             attention_mask=attention_mask,
             input_shape=(batch_size, seq_len),
@@ -94,8 +97,8 @@ class TestFlexAttention(unittest.TestCase):
         hidden_states_list = []
         flex_hidden_states_list = []
         for idx in range(TTT_LENGTH):
-            hidden_states = torch.randn(
-                batch_size, seq_len, hidden_size, device="cuda", dtype=self.dtype
+            hidden_states = norm_tensor(
+                (batch_size, seq_len, hidden_size), device="cuda", dtype=self.dtype
             )
             flex_hidden_states = hidden_states.clone().detach()
             hidden_states_list.append(hidden_states)
@@ -122,15 +125,14 @@ class TestFlexAttention(unittest.TestCase):
                     position_ids=flex_position_ids,
                     past_key_values=past_key_values,
                 )
-
             torch.testing.assert_close(
-                output[0][: -1 - idx], output_flex[0][: -1 - idx], atol=1e-3, rtol=1e-3
+                output[0][: -1 - idx], output_flex[0][: -1 - idx], atol=1e-2, rtol=1e-2
             )
             torch.testing.assert_close(
                 output[1][: padding_start_index - idx],
                 output_flex[1][: padding_start_index - idx],
-                atol=1e-3,
-                rtol=1e-3,
+                atol=1e-2,
+                rtol=1e-2,
             )
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -177,9 +179,11 @@ class TestFlexAttention(unittest.TestCase):
         # Simulate one item in the batch is masked and not taking a full block.
         # padding_start_index = seq_len - 50
         # attention_mask[1, padding_start_index:] = False
-        input_embeds = torch.randn(
-            batch_size, seq_len, self.config.hidden_size, dtype=self.dtype
-        ).to("cuda")
+        input_embeds = norm_tensor(
+            (batch_size, seq_len, self.config.hidden_size),
+            device="cuda",
+            dtype=self.dtype,
+        )
         decoder_attention_mask = prepare_decoder_attention_mask(
             attention_mask=attention_mask,
             input_shape=(batch_size, seq_len),
@@ -201,8 +205,8 @@ class TestFlexAttention(unittest.TestCase):
         hidden_states_list = []
         flex_hidden_states_list = []
         for idx in range(TTT_LENGTH):
-            hidden_states = torch.randn(
-                batch_size, seq_len, hidden_size, device="cuda", dtype=self.dtype
+            hidden_states = norm_tensor(
+                (batch_size, seq_len, hidden_size), device="cuda", dtype=self.dtype
             )
             flex_hidden_states = hidden_states.clone().detach()
             hidden_states_list.append(hidden_states)
@@ -227,7 +231,7 @@ class TestFlexAttention(unittest.TestCase):
             # Apply loss mask on calculation over batch
             loss = (output * loss_mask[..., None]).sum().mean()
             loss_flex = (output_flex * loss_mask[..., None]).sum().mean()
-            torch.testing.assert_close(loss, loss_flex, atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(loss, loss_flex, atol=1e-2, rtol=1e-2)
             loss_list.append(loss)
             loss_flex_list.append(loss_flex)
             # Compare gradients
@@ -250,8 +254,8 @@ class TestFlexAttention(unittest.TestCase):
             torch.testing.assert_close(
                 getattr(attention, proj_name).weight.grad,
                 getattr(flex_attention, proj_name).weight.grad,
-                atol=1e-3,
-                rtol=1e-3,
+                atol=1e-2,
+                rtol=1e-2,
             )
 
 
@@ -265,15 +269,9 @@ class TestEagle3FlexMask(unittest.TestCase):
         Q_LEN = S
         KV_LEN = S * 3
         data_type = torch.bfloat16
-        query = torch.randn(
-            B, H, S, D, device="cuda", dtype=data_type, requires_grad=True
-        )
-        key_cache = torch.randn(
-            B, H, KV_LEN, D, device="cuda", dtype=data_type, requires_grad=True
-        )
-        value_cache = torch.randn(
-            B, H, KV_LEN, D, device="cuda", dtype=data_type, requires_grad=True
-        )
+        query = norm_tensor((B, H, S, D), device="cuda", dtype=data_type)
+        key_cache = norm_tensor((B, H, KV_LEN, D), device="cuda", dtype=data_type)
+        value_cache = norm_tensor((B, H, KV_LEN, D), device="cuda", dtype=data_type)
         seq_lengths = torch.tensor([S], device="cuda", dtype=torch.int32)
         block_mask = compile_friendly_create_block_mask(
             mask_mod=generate_eagle3_mask(

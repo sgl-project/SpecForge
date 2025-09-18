@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -33,7 +34,13 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt", "opc"],
+        choices=[
+            "ultrachat",
+            "sharegpt",
+            "sharegpt4v",
+            "allava4v",
+            "opc",
+        ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -47,6 +54,17 @@ def parse_args():
         type=str,
         default=None,
         help="The path to the custom dataset, if not specified, the default dataset will be loaded",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="The number of samples to process from the dataset, if not specified, all samples will be processed",
+    )
+    parser.add_argument(
+        "--split-eval",
+        action="store_true",
+        help="Whether to split the dataset into train and eval sets, default is False",
     )
     return parser.parse_args()
 
@@ -101,10 +119,81 @@ def process_sharegpt_row(row: Dict) -> Tuple[Dict, int]:
     return row, skipped_count
 
 
+def process_sharegpt4v_row(row) -> Dict:
+    """
+    sharegpt4v dataset schema:
+    {
+        "id": str,
+        "image": str,  # path to the image
+        "conversations": [
+            {
+                "from": <human|gpt>,
+                "value": <message>,
+            },
+            ...
+        ]
+    }
+    """
+    conversations = row["conversations"]
+    image = f'FreedomIntelligence/ALLaVA-4V/{row["image"]}'
+    if not os.path.exists(image):
+        print(f"Image path {image} does not exist, skipping this sample.")
+        return None, None
+    formatted_conversations = []
+    skipped_count = 0
+    for message in conversations:
+        if message["from"] not in ROLE_MAPPING:
+            skipped_count += 1
+            continue
+        new_role = ROLE_MAPPING[message["from"]]
+        if new_role == "user":
+            text_content = message["value"].replace("<image>\n", "")
+            content = text_content
+        else:
+            content = message["value"]
+        formatted_conversations.append({"role": new_role, "content": content})
+
+    row = {"id": row["id"], "image": image, "conversations": formatted_conversations}
+    return row, skipped_count
+
+
 def load_dataset_from_path(data_path: Path):
     suffix = data_path.suffix.split(".")[1]
     ds = load_dataset(suffix, data_files=str(data_path), split="train")
     return ds
+
+
+def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
+    train_output_jsonl_path = output_path.joinpath(f"{dataset_name}_train.jsonl")
+    if train_output_jsonl_path.exists():
+        print(
+            f"The dataset {dataset_name} has already been processed and saved in {train_output_jsonl_path}, skipping..."
+        )
+        return
+
+    total_skipped_count = 0
+    with open(train_output_jsonl_path, "w") as f:
+        for item in tqdm(train_ds, desc=f"Processing {dataset_name} dataset"):
+            row, skipped_count = proc_fn(item)
+            if row is None:
+                continue
+            total_skipped_count += skipped_count
+            f.write(json.dumps(row) + "\n")
+
+    if test_ds is not None:
+        test_output_jsonl_path = output_path.joinpath(f"{dataset_name}_test.jsonl")
+        with open(test_output_jsonl_path, "w") as f:
+            for item in tqdm(test_ds, desc=f"Processing {dataset_name} test dataset"):
+                row, skipped_count = proc_fn(item)
+                if row is None:
+                    continue
+                total_skipped_count += skipped_count
+                f.write(json.dumps(row) + "\n")
+
+    if total_skipped_count > 0:
+        print(
+            f"Skipped {total_skipped_count}/{len(train_ds)+len(test_ds)} messages for {dataset_name}"
+        )
 
 
 import hashlib
@@ -122,6 +211,11 @@ def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
     return processed_row, 0
 
 
+def add_index(row, idx) -> Dict:
+    row["id"] = idx
+    return row
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -135,6 +229,14 @@ def main():
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))
         proc_fn = process_sharegpt_row
+    elif args.dataset == "sharegpt4v":
+        ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
+        proc_fn = process_sharegpt4v_row
+    elif args.dataset == "allava4v":
+        ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
+            "instruct"
+        ]
+        proc_fn = process_sharegpt4v_row
     elif args.dataset == "opc":
         ds = load_dataset(
             "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
@@ -142,8 +244,20 @@ def main():
         proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
-            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
+
+    # filter and split dataset
+    if args.sample_size is not None and args.sample_size < len(ds):
+        ds = ds.select(range(args.sample_size))
+        print(f"Processing {args.sample_size} samples from the dataset {args.dataset}")
+    if args.split_eval:
+        ds = ds.train_test_split(test_size=0.05)
+        train_ds = ds["train"]
+        test_ds = ds["test"]
+    else:
+        train_ds = ds
+        test_ds = None
 
     if args.output_path is None:
         root_path = Path(__file__).parent.parent
@@ -151,24 +265,9 @@ def main():
         output_path.mkdir(parents=True, exist_ok=True)
     else:
         output_path = Path(args.output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
 
-    output_jsonl_path = output_path.joinpath(f"{args.dataset}.jsonl")
-
-    if output_jsonl_path.exists():
-        print(
-            f"The dataset {args.dataset} has already been processed and saved in {output_jsonl_path}, skipping..."
-        )
-        return
-
-    total_skipped_count = 0
-    with open(output_jsonl_path, "w") as f:
-        for item in tqdm(ds, desc=f"Processing {args.dataset} dataset"):
-            row, skipped_count = proc_fn(item)
-            total_skipped_count += skipped_count
-            f.write(json.dumps(row) + "\n")
-
-    if total_skipped_count > 0:
-        print(f"Skipped {total_skipped_count}/{len(ds)} messages for {args.dataset}")
+    process_and_save_ds(train_ds, test_ds, output_path, proc_fn, args.dataset)
 
 
 if __name__ == "__main__":

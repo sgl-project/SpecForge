@@ -168,12 +168,10 @@ def benchmark_function(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
-
         # Record initial memory
         initial_memory = 0
         if torch.cuda.is_available():
             initial_memory = torch.cuda.memory_allocated()
-
         hidden_states = [
             torch.randn(
                 BATCH_SIZE,
@@ -202,7 +200,6 @@ def benchmark_function(
         if torch.cuda.is_available():
             peak_memory = torch.cuda.max_memory_allocated()
             current_memory = torch.cuda.memory_allocated()
-
         results_per_seq_len.append(
             {
                 "seq_len": seq_len,
@@ -214,6 +211,9 @@ def benchmark_function(
 
         print(f"  Time: {end_time - start_time:.3f}s")
         print(f"  Peak memory: {peak_memory / 1024**3:.3f} GB")
+        print(
+            f"  Memory increase: {(current_memory - initial_memory) / 1024**3:.3f} GB"
+        )
 
     return results_per_seq_len
 

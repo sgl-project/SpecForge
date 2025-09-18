@@ -6,41 +6,43 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
 from specforge.distributed import init_distributed
 
 
-def test_llama3_tp(rank, world_size, temp_dir):
+def test_qwen3_moe_tp(rank, world_size, temp_dir):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29501"
+    os.environ["MASTER_PORT"] = "29500"
 
     init_distributed(tp_size=2)
     set_seed(42)
-    config = LlamaConfig(
+    config = Qwen3MoeConfig(
         vocab_size=1000,
         hidden_size=384,
         intermediate_size=512,
+        moe_intermediate_size=512,
         num_hidden_layers=2,
         max_position_embeddings=1024,
-        num_attention_heads=10,
-        num_key_value_heads=2,
-        tie_word_embeddings=False,
-        initializer_range=0.02,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        num_experts=64,
+        num_experts_per_tok=8,
         hidden_act="silu",
         rms_norm_eps=1e-6,
     )
 
-    # create the single-gpu
-    model = LlamaForCausalLM(config).cuda()
+    # create a simple single-gpu model
+    model = Qwen3MoeForCausalLM(config).cuda()
 
-    from SpecForge.specforge.modeling.target.llama import (
-        LlamaForCausalLM as DistLlamaForCausalLM,
+    from specforge.modeling.target.qwen3_moe import (
+        Qwen3MoeForCausalLM as DistQwen3MoeForCausalLM,
     )
 
-    dist_model = DistLlamaForCausalLM(config).cuda()
+    dist_model = DistQwen3MoeForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -68,7 +70,7 @@ def test_llama3_tp(rank, world_size, temp_dir):
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
 
-class TestLlama3TP(unittest.TestCase):
+class TestQwen3MoeTP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -76,12 +78,15 @@ class TestLlama3TP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_llama3_tp(self):
-        mp.spawn(test_llama3_tp, nprocs=2, args=(2, self.temp_dir.name))
+    def test_qwen3_moe_tp(self):
+        # Set to 2 as only 2 GPU avaialble in CI
+        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(TestLlama3TP))
+
+    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestQwen3MoeTP))
+
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

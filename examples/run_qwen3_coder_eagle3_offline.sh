@@ -1,5 +1,6 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
+export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # train eagle3 for qwen3-coder
 NUM_GPUS=${1:-8}
@@ -14,7 +15,8 @@ torchrun \
     --train-hidden-states-path $ROOT_DIR/cache/hidden_states \
     --output-dir $ROOT_DIR/outputs/Qwen3-Coder-480B-A35B-Instruct \
     --num-epochs 10 \
-    --batch-size 1 \
+    --draft-micro-batch-size 1 \
+    --draft-global-batch-size $NUM_GPUS \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template qwen \
