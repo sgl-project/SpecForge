@@ -11,8 +11,8 @@ hf download $MODEL_PATH
 hf download Aeala/ShareGPT_Vicuna_unfiltered --repo-type dataset
 hf download HuggingFaceH4/ultrachat_200k --repo-type dataset
 
-python scripts/prepare_data.py --dataset sharegpt --output_path $DATASET_PATH --test-size 0.0
-python scripts/prepare_data.py --dataset ultrachat --output_path $DATASET_PATH --test-size 0.0
+python scripts/prepare_data.py --dataset sharegpt --output-path $DATASET_PATH
+python scripts/prepare_data.py --dataset ultrachat --output-path $DATASET_PATH
 
 # for i in {1..4}; do
 #     CUDA_VISIBLE_DEVICES=$i python3 -m sglang.launch_server \

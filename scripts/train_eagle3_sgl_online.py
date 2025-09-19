@@ -203,8 +203,13 @@ class TrainDataLoaderWrapper:
             self.dataloader.sampler.set_epoch(epoch)
             dataloader = iter(self.dataloader)
             # skip some steps if needed
-            for _ in range(self.steps_consumed_in_current_epoch):
-                next(dataloader)
+            if self.steps_consumed_in_current_epoch > 0:
+                print_on_rank0(
+                    f"Skipping {self.steps_consumed_in_current_epoch} steps in current epoch"
+                )
+                # it takes 5 minutes to run 279310 steps
+                for _ in tqdm(range(self.steps_consumed_in_current_epoch), desc="Skipping steps"):
+                    next(dataloader)
             for data in dataloader:
                 self.steps_consumed_in_current_epoch += 1
                 self.steps_consumed += 1
@@ -278,8 +283,7 @@ class SglOnlineEagle3Trainer:
         ), "Vocab mapping is not loaded"
         self.shard_model()
         steps_per_epoch = math.ceil(
-            len(self.train_dataloader)
-            / args.num_epochs
+            len(self.train_dataloader.dataloader)
             / args.target_tp_size
             / args.draft_accumulation_steps
         )
@@ -300,6 +304,8 @@ class SglOnlineEagle3Trainer:
         self.optimizer = self.create_optimizer()
 
         self.tracker = NoOpTracker(self.args, self.args.output_dir)
+        self.micro_batch_idx = 0
+        self.global_batch_idx = 0
         if self.draft_model_last_checkpoint is not None:
             print_on_rank0(
                 f"Resuming draft model from {self.draft_model_last_checkpoint}"
@@ -309,10 +315,12 @@ class SglOnlineEagle3Trainer:
             )
             if os.path.exists(state_path):
                 state = torch.load(state_path, map_location="cpu", weights_only=False)
+                self.global_batch_idx = state.get("global_batch_idx", 0)
+                self.micro_batch_idx = state.get("micro_batch_idx", 0)
                 self.optimizer.load_state_dict(state)
                 self.train_dataloader.load_state_dict(state)
                 print_on_rank0(
-                    f"Resuming from step {self.train_dataloader.steps_consumed}"
+                    f"Resuming from step {self.train_dataloader.steps_consumed} with {self.global_batch_idx=} and {self.micro_batch_idx=}"
                 )
             else:
                 print_on_rank0(
@@ -320,8 +328,6 @@ class SglOnlineEagle3Trainer:
                 )
 
         dist.barrier()
-        self.micro_batch_idx = 0
-        self.global_batch_idx = 0
 
     def _create_target_model(self):
         target_model = SglangTargetModel(
@@ -411,6 +417,7 @@ class SglOnlineEagle3Trainer:
                 max_length=self.args.max_length,
                 cache_dir=os.path.join(self.args.cache_dir, "processed_dataset"),
                 cache_key=cache_key,
+                num_proc=self.args.build_dataset_num_proc,
             )
             vocab_mapping_path = generate_vocab_mapping_file(
                 dataset=train_eagle3_dataset,
@@ -424,6 +431,7 @@ class SglOnlineEagle3Trainer:
             1,
             num_workers=4,
             shuffle=True,
+            prefetch_factor=8,
             process_group=get_dp_group(),
         )
         print_with_rank(f"Initialized train dataloader")
@@ -451,12 +459,14 @@ class SglOnlineEagle3Trainer:
                 self.args.max_length,
                 cache_dir=os.path.join(self.args.cache_dir, "processed_dataset"),
                 cache_key=test_cache_key,
+                num_proc=self.args.build_dataset_num_proc,
             )
             eval_dataloader = prepare_dp_dataloaders(
                 eval_eagle3_dataset,
                 1,
                 num_workers=4,
                 shuffle=False,
+                prefetch_factor=8,
                 process_group=get_dp_group(),
             )
             print_with_rank(f"Initialized eval dataloader")
@@ -506,6 +516,8 @@ class SglOnlineEagle3Trainer:
             model_state_dict = self.eagle3_model.state_dict()
             state_to_save = {
                 "args": self.args,
+                "global_batch_idx": self.global_batch_idx,
+                "micro_batch_idx": self.micro_batch_idx,
             }
             state_to_save.update(self.train_dataloader.state_dict())
             state_to_save.update(self.optimizer.state_dict())

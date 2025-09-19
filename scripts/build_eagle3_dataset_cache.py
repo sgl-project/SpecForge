@@ -34,8 +34,42 @@ def parse_args():
     parser.add_argument("--cache-dir", type=str, default="./cache")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--view-train-data", type=int, nargs="+", default=[])
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--build-dataset-num-proc", type=int, default=16)
     args = parser.parse_args()
     return args
+
+def view_data(dataset, tokenizer, idx_list):
+    RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"
+    for idx in idx_list:
+        input_ids = dataset["input_ids"][idx].view(-1)
+        loss_mask = dataset["loss_mask"][idx].view(-1).tolist()
+        print(f"Loss mask sum: {sum(loss_mask)}")
+        current_mask = input_ids[0]
+        current_ids = []
+        for i in range(len(input_ids)):
+            if current_mask == loss_mask[i]:
+                current_ids.append(input_ids[i])
+            else:
+                decoded_text = tokenizer.decode(
+                    current_ids, skip_special_tokens=False
+                )
+                if current_mask == 0:
+                    print(f"{RED}{decoded_text}{RESET}", end="")
+                else:
+                    print(f"{GREEN}{decoded_text}{RESET}", end="")
+                current_ids = [input_ids[i]]
+                current_mask = loss_mask[i]
+        
+        if sum(loss_mask) == 0:
+            print(f"{RED}No loss mask{RESET}")
+            print(
+                f"{RED}{tokenizer.decode(current_ids, skip_special_tokens=False)}{RESET}"
+            )
+            return
+        print(
+            f"{GREEN}{tokenizer.decode(current_ids, skip_special_tokens=False)}{RESET}"
+        )
 
 
 def main():
@@ -49,6 +83,20 @@ def main():
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+    if args.debug:
+        train_ds = load_dataset("json", data_files=args.train_data_path)["train"]
+        train_ds = train_ds.select(range(10))
+        train_eagle3_dataset = build_eagle3_dataset(
+            dataset=train_ds,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            num_proc=args.build_dataset_num_proc,
+        )
+        if args.view_train_data:
+            view_data(train_eagle3_dataset, tokenizer, args.view_train_data)
+        exit()
+
     if args.eval_data_path is not None:
         test_ds = load_dataset("json", data_files=args.eval_data_path)["train"]
         test_cache_params_string = (
@@ -68,30 +116,10 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=test_cache_key,
+            num_proc=args.build_dataset_num_proc,
         )
-        RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"
-        for idx in args.view_train_data:
-            input_ids = test_eagle3_dataset["input_ids"][idx].view(-1)
-            loss_mask = test_eagle3_dataset["loss_mask"][idx].view(-1).tolist()
-            print(f"Loss mask sum: {sum(loss_mask)}")
-            current_mask = input_ids[0]
-            current_ids = []
-            for i in range(len(input_ids)):
-                if current_mask == loss_mask[i]:
-                    current_ids.append(input_ids[i])
-                else:
-                    decoded_text = tokenizer.decode(
-                        current_ids, skip_special_tokens=False
-                    )
-                    if current_mask == 0:
-                        print(f"{RED}{decoded_text}{RESET}", end="")
-                    else:
-                        print(f"{GREEN}{decoded_text}{RESET}", end="")
-                    current_ids = [input_ids[i]]
-                    current_mask = loss_mask[i]
-            print(
-                f"{GREEN}{tokenizer.decode(current_ids, skip_special_tokens=False)}{RESET}"
-            )
+        if args.view_train_data:
+            view_data(test_eagle3_dataset, tokenizer, args.view_train_data)
     train_ds = load_dataset("json", data_files=args.train_data_path)["train"]
     train_cache_params_string = (
         f"{args.train_data_path}-"
@@ -110,28 +138,10 @@ def main():
         max_length=args.max_length,
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=train_cache_key,
+        num_proc=args.build_dataset_num_proc,
     )
-    RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"
-    for idx in args.view_train_data:
-        input_ids = train_eagle3_dataset["input_ids"][idx].view(-1)
-        loss_mask = train_eagle3_dataset["loss_mask"][idx].view(-1).tolist()
-        print(f"Loss mask sum: {sum(loss_mask)}")
-        current_mask = input_ids[0]
-        current_ids = []
-        for i in range(len(input_ids)):
-            if current_mask == loss_mask[i]:
-                current_ids.append(input_ids[i])
-            else:
-                decoded_text = tokenizer.decode(current_ids, skip_special_tokens=False)
-                if current_mask == 0:
-                    print(f"{RED}{decoded_text}{RESET}", end="")
-                else:
-                    print(f"{GREEN}{decoded_text}{RESET}", end="")
-                current_ids = [input_ids[i]]
-                current_mask = loss_mask[i]
-        print(
-            f"{GREEN}{tokenizer.decode(current_ids, skip_special_tokens=False)}{RESET}"
-        )
+    if args.view_train_data:
+        view_data(train_eagle3_dataset, tokenizer, args.view_train_data)
 
     vocab_mapping_path = generate_vocab_mapping_file(
         dataset=train_eagle3_dataset,
