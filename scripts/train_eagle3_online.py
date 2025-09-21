@@ -96,7 +96,11 @@ def parse_args():
         action="store_true",
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
     )
-
+    parser.add_argument(
+        "--is-think-mode",
+        action="store_true",
+        help="Whether the input data need to handle special think token format.",
+    )
     # distributed training
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
@@ -291,22 +295,17 @@ def main():
 
     # load model with resume
     if draft_model_last_checkpoint:
-        draft_model = (
-            AutoEagle3DraftModel.from_pretrained(
-                draft_model_last_checkpoint, attention_backend=args.attention_backend,
-                torch_dtype=torch.bfloat16
-            )
-            .cuda()
-            
-        )
+        draft_model = AutoEagle3DraftModel.from_pretrained(
+            draft_model_last_checkpoint,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     else:
-        draft_model = (
-            AutoEagle3DraftModel.from_config(
-                draft_model_config, attention_backend=args.attention_backend,
-                torch_dtype=torch.bfloat16
-            )
-            .cuda()
-        )
+        draft_model = AutoEagle3DraftModel.from_config(
+            draft_model_config,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank("Initialized draft model")
@@ -341,6 +340,7 @@ def main():
             cache_key=cache_key,
             is_vlm=args.is_vlm,
             is_preformatted=args.is_preformatted,
+            is_think_mode=args.is_think_mode,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
@@ -388,6 +388,7 @@ def main():
             processor=processor,
             num_proc=args.build_dataset_num_proc,
             is_preformatted=args.is_preformatted,
+            is_think_mode=args.is_think_mode,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
