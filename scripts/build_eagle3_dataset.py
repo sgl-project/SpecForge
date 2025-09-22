@@ -7,7 +7,6 @@ import hashlib
 import os
 from pathlib import Path
 
-import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -32,13 +31,12 @@ def main():
     Separated script to build eagle3 dataset from the training.
 
     Usage:
-    python ./scripts/build_eagle3_dataset.py  \
+        python ./scripts/build_eagle3_dataset.py  \
         --data-path "cache/dataset/sharegpt.jsonl" \
         --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct \
         --chat-template llama3
     """
     args = parse_args()
-    torch.distributed.init_process_group(backend="nccl")
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"

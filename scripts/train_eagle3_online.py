@@ -293,18 +293,19 @@ def main():
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(
-                draft_model_last_checkpoint, attention_backend=args.attention_backend
+                draft_model_last_checkpoint, attention_backend=args.attention_backend,
+                torch_dtype=torch.bfloat16
             )
             .cuda()
-            .to(torch.bfloat16)
+            
         )
     else:
         draft_model = (
             AutoEagle3DraftModel.from_config(
-                draft_model_config, attention_backend=args.attention_backend
+                draft_model_config, attention_backend=args.attention_backend,
+                torch_dtype=torch.bfloat16
             )
             .cuda()
-            .to(torch.bfloat16)
         )
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
@@ -588,19 +589,21 @@ def main():
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                 if args.is_vlm:
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].cuda(),
-                        pixel_values=data["pixel_values"].cuda(),
-                        image_grid_thw=data["image_grid_thw"].cuda(),
-                    )
+                    with torch.no_grad():
+                        plosses, _, acces = eagle3_model(
+                            input_ids=data["input_ids"].cuda(),
+                            attention_mask=data["attention_mask"].cuda(),
+                            loss_mask=data["loss_mask"].cuda(),
+                            pixel_values=data["pixel_values"].cuda(),
+                            image_grid_thw=data["image_grid_thw"].cuda(),
+                        )
                 else:
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].cuda(),
-                    )
+                    with torch.no_grad():
+                        plosses, _, acces = eagle3_model(
+                            input_ids=data["input_ids"].cuda(),
+                            attention_mask=data["attention_mask"].cuda(),
+                            loss_mask=data["loss_mask"].cuda(),
+                        )
                 acces = torch.stack(acces).cpu().tolist()
 
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
