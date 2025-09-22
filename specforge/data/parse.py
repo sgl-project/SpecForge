@@ -41,12 +41,12 @@ class GeneralParser(Parser):
     def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
         super().__init__(tokenizer, chat_template)
         self.system_prompt = chat_template.system_prompt
-        self.user_message_separator = (
-            f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-        )
-        self.assistant_message_separator = (
-            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-        )
+        if chat_template.end_of_turn_token:
+            self.user_message_separator = f"{chat_template.end_of_turn_token or ''}{chat_template.user_header or ''}"
+            self.assistant_message_separator = f"{chat_template.end_of_turn_token or ''}{chat_template.assistant_header or ''}"
+        else:
+            self.user_message_separator = f"{chat_template.end_of_assistant_token or ''}{chat_template.user_header or ''}"
+            self.assistant_message_separator = f"{chat_template.end_of_user_token or ''}{chat_template.assistant_header or ''}"
 
     def parse(
         self, conversation: "Conversation", max_length: int, preformatted: bool = False
