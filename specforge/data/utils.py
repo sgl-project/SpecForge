@@ -44,7 +44,9 @@ class DataCollatorWithPadding:
             outtensors: (B, N, S)
         """
         B, n, S = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
+        padding_tensor = torch.zeros(
+            B, N - n, S, dtype=intensors.dtype, device=intensors.device
+        )
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
@@ -60,7 +62,9 @@ class DataCollatorWithPadding:
             outtensors: (B, N)
         """
         B, n = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
+        padding_tensor = torch.zeros(
+            B, N - n, dtype=intensors.dtype, device=intensors.device
+        )
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
@@ -223,6 +227,7 @@ def prepare_dp_dataloaders(
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
+    prefetch_factor: Optional[int] = 2,
     **dataloader_kwargs
 ) -> DataLoader:
     """
@@ -256,6 +261,7 @@ def prepare_dp_dataloaders(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
         collate_fn=datacollator_cls(),
         **dataloader_kwargs
     )

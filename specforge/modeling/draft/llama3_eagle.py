@@ -1,4 +1,3 @@
-import logging
 import math
 from typing import List, Optional, Tuple
 
@@ -16,10 +15,9 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
-
-logger = logging.getLogger(__name__)
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -715,7 +713,7 @@ class LlamaDecoderLayer(nn.Module):
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
         elif attention_backend == "flex_attention":
-            logger.warning("Using flex attention on draft model training!")
+            print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
@@ -837,10 +835,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            logger.info("using ttt_length 1, no need to cache hidden states")
+            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            logger.info(f"using ttt_length {ttt_length}, caching hidden states")
+            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()

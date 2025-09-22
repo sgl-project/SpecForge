@@ -165,6 +165,16 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+TEMPLATE_REGISTRY.register(
+    name="gpt-oss-naive",
+    template=ChatTemplate(
+        assistant_header="<|start|>assistant<|channel|>analysis<|message|>",
+        user_header="<|start|>user<|message|>",
+        system_prompt=None,
+        end_of_turn_token="<|end|>",
+    ),
+)
+
 
 TEMPLATE_REGISTRY.register(
     name="gpt-oss",

@@ -291,22 +291,17 @@ def main():
 
     # load model with resume
     if draft_model_last_checkpoint:
-        draft_model = (
-            AutoEagle3DraftModel.from_pretrained(
-                draft_model_last_checkpoint, attention_backend=args.attention_backend,
-                torch_dtype=torch.bfloat16
-            )
-            .cuda()
-            
-        )
+        draft_model = AutoEagle3DraftModel.from_pretrained(
+            draft_model_last_checkpoint,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     else:
-        draft_model = (
-            AutoEagle3DraftModel.from_config(
-                draft_model_config, attention_backend=args.attention_backend,
-                torch_dtype=torch.bfloat16
-            )
-            .cuda()
-        )
+        draft_model = AutoEagle3DraftModel.from_config(
+            draft_model_config,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank("Initialized draft model")
