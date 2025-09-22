@@ -15,6 +15,7 @@ torchrun \
     --output-dir $ROOT_DIR/outputs/mistral-Small-24B-eagle3 \
     --num-epochs 2 \
     --batch-size 1 \
+    --tp 2 \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template mistral-small-24B \
