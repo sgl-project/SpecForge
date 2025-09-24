@@ -120,7 +120,7 @@ class OnlineEagle3Model(Eagle3Model):
             aux_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
             assert len(aux_layer_ids) == 3, "EAGLE3 requires 3 aux layers"
         else:
-            aux_layer_ids = [1, num_layers // 2, num_layers - 4]
+            aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
 
         low_aux_layer = aux_layer_ids[0] + offset
         mid_aux_layer = aux_layer_ids[1] + offset
