@@ -219,3 +219,27 @@ def create_draft_config_from_target(
     dist.barrier()
 
     return output_path
+
+def get_full_optimizer_state(optimizer_state_dict: dict):
+    """
+    Convert optimizer state dict with DTensor to full tensors for saving
+
+    Args:
+        optimizer_state_dict (dict): Optimizer state dict possibly containing DTensors
+    Returns:
+        dict: Optimizer state dict with full tensors
+    """
+    full_optimizer_state_dict = {}
+    for k, v in optimizer_state_dict.items():
+        if k == "state":
+            full_optimizer_state_dict[k] = {}
+            for param_id, param_state in v.items():
+                full_optimizer_state_dict[k][param_id] = {}
+                for state_key, state_tensor in param_state.items():
+                    if isinstance(state_tensor, torch.distributed.tensor.DTensor):
+                        full_optimizer_state_dict[k][param_id][state_key] = state_tensor.full_tensor()
+                    else:
+                        full_optimizer_state_dict[k][param_id][state_key] = state_tensor
+        else:
+            full_optimizer_state_dict[k] = v
+    return full_optimizer_state_dict
