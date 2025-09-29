@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import math
 import os
+import re
 import time
 from collections import defaultdict
 
@@ -209,10 +210,48 @@ def main():
 
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
+    resume_training_state = None
+    start_epoch = 0
     if args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        if draft_model_last_checkpoint:
+            epoch_dir_name = os.path.basename(
+                draft_model_last_checkpoint.rstrip(os.sep)
+            )
+            match = re.search(r"epoch_(\d+)", epoch_dir_name)
+            if match:
+                start_epoch = int(match.group(1)) + 1
+                print_on_rank0(f"Resuming training from epoch {start_epoch}")
+            else:
+                print_on_rank0(
+                    "Failed to parse epoch index from checkpoint directory; starting from epoch 0"
+                )
+            training_state_path = os.path.join(
+                draft_model_last_checkpoint, "training_state.pt"
+            )
+            if os.path.isfile(training_state_path):
+                try:
+                    resume_training_state = torch.load(
+                        training_state_path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                    saved_epoch = resume_training_state.get("epoch")
+                    if saved_epoch is not None:
+                        start_epoch = saved_epoch + 1
+                    print_on_rank0(
+                        f"Loaded training state from {training_state_path}"
+                    )
+                except Exception as exc:  # pragma: no cover - informational
+                    print_on_rank0(
+                        f"Failed to load training state from {training_state_path}: {exc}"
+                    )
+            else:
+                print_on_rank0(
+                    f"No training_state.pt found in {draft_model_last_checkpoint}; starting from epoch {start_epoch}"
+                )
 
     # build target and draft model
     target_head = TargetHead(args.target_model_path)
@@ -366,10 +405,31 @@ def main():
     )
     print_with_rank("Initialized optimizer and scheduler")
 
+    if resume_training_state:
+        optimizer.load_state_dict(resume_training_state)
+        global_step = resume_training_state.get("global_step")
+        if global_step is None:
+            global_step = start_epoch * math.ceil(
+                len(train_dataloader) / args.draft_accumulation_steps
+            )
+            if global_step is None or global_step < 0:
+                global_step = 0
+        print_on_rank0(
+            f"Resumed optimizer and scheduler state (global_step={global_step})"
+        )
+
     last_time = time.time()
 
     # start running
-    for epoch in range(args.num_epochs):
+    if start_epoch >= args.num_epochs:
+        print_on_rank0(
+            f"Start epoch {start_epoch} is >= total epochs {args.num_epochs}; nothing to resume."
+        )
+        tracker.close()
+        destroy_distributed()
+        return
+
+    for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
@@ -487,14 +547,13 @@ def main():
             eval_plosses = [[] for _ in range(eagle3_model.length)]
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                with torch.no_grad():
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
-                        hidden_states=data["hidden_state"].cuda(),
-                        target=data["target"].cuda(),
-                    )
+                plosses, _, acces = eagle3_model(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
+                    hidden_states=data["hidden_state"].cuda(),
+                    target=data["target"].cuda(),
+                )
                 acces = torch.stack(acces).cpu().tolist()
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
@@ -535,6 +594,7 @@ def main():
                 state_to_save = {
                     "epoch": epoch,
                     "args": args,
+                    "global_step": global_step,
                 }
                 state_to_save.update(optimizer.state_dict())
                 draft_model_state_dict = {
