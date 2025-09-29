@@ -534,13 +534,14 @@ def main():
             state_to_save.update(optimizer_state_dict)
 
             draft_model_state_dict = {
-                k.replace("draft_model.", ""): v
+                k.replace("draft_model.", ""): (
+                    v.full_tensor()
+                    if isinstance(v, torch.distributed.tensor.DTensor)
+                    else v
+                )
                 for k, v in model_state_dict.items()
                 if "draft_model." in k and "embed" not in k.lower()
             }
-            for k, v in draft_model_state_dict.items():
-                if isinstance(v, torch.distributed.tensor.DTensor):
-                    draft_model_state_dict[k] = v.full_tensor()
 
             if dist.get_rank() == 0:
                 torch.save(
