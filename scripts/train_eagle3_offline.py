@@ -409,11 +409,10 @@ def main():
         optimizer.load_state_dict(resume_training_state)
         global_step = resume_training_state.get("global_step")
         if global_step is None:
-            global_step = start_epoch * math.ceil(
+            steps_per_epoch = math.ceil(
                 len(train_dataloader) / args.draft_accumulation_steps
             )
-            if global_step is None or global_step < 0:
-                global_step = 0
+            global_step = int(start_epoch * steps_per_epoch)
         print_on_rank0(
             f"Resumed optimizer and scheduler state (global_step={global_step})"
         )
