@@ -291,22 +291,17 @@ def main():
 
     # load model with resume
     if draft_model_last_checkpoint:
-        draft_model = (
-            AutoEagle3DraftModel.from_pretrained(
-                draft_model_last_checkpoint, attention_backend=args.attention_backend,
-                torch_dtype=torch.bfloat16
-            )
-            .cuda()
-            
-        )
+        draft_model = AutoEagle3DraftModel.from_pretrained(
+            draft_model_last_checkpoint,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     else:
-        draft_model = (
-            AutoEagle3DraftModel.from_config(
-                draft_model_config, attention_backend=args.attention_backend,
-                torch_dtype=torch.bfloat16
-            )
-            .cuda()
-        )
+        draft_model = AutoEagle3DraftModel.from_config(
+            draft_model_config,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank("Initialized draft model")
@@ -654,6 +649,12 @@ def main():
                     if "draft_model." in k and "embed" not in k.lower()
                 }
 
+                # The new save_pretrained method handles all TP logic internally.
+                # It ensures only global rank 0 writes to disk.
+                draft_model.save_pretrained(
+                    epoch_output_dir,
+                    state_dict=draft_model_state_dict,
+                )
                 if dist.get_rank() == 0:
                     torch.save(
                         state_to_save,
@@ -661,10 +662,6 @@ def main():
                     )
                     print_on_rank0(
                         f"Saved full training state to {epoch_output_dir}/training_state.pt"
-                    )
-                    draft_model.save_pretrained(
-                        epoch_output_dir,
-                        state_dict=draft_model_state_dict,
                     )
                     print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
                 dist.barrier()
