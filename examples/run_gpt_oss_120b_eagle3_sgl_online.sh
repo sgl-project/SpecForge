@@ -1,5 +1,5 @@
 #!/bin/bash
-export PERSIST_DIR=/root/.cache/user_artifacts
+export PERSIST_DIR=/tmp # Please Change this to your own directory
 export MODEL_PATH="openai/gpt-oss-120b"
 export DATASET_PATH=$PERSIST_DIR/dataset/
 export CACHE_DIR=$PERSIST_DIR/gpt-oss-120b/cache/
@@ -38,10 +38,10 @@ python scripts/generate_data_by_target.py \
 pkill -9 sglang
 
 export DATASET_PATH=$PERSIST_DIR/gpt-oss-120b/dataset/
-hf download baseten-admin/gpt-oss120b-generated-perfectblend --repo-type dataset
-hf download baseten-admin/gpt-oss120b-generated-magpie-1m-v0.1 --repo-type dataset
-python scripts/prepare_data.py --dataset baseten-admin/gpt-oss120b-generated-perfectblend --output-path $DATASET_PATH --split-eval
-python scripts/prepare_data.py --dataset baseten-admin/gpt-oss120b-generated-magpie-1m-v0.1 --output-path $DATASET_PATH --split-eval
+# hf download YOUR_REPO/gpt-oss120b-generated-perfectblend --repo-type dataset
+# hf download YOUR_REPO/gpt-oss120b-generated-magpie-1m-v0.1 --repo-type dataset
+# python scripts/prepare_data.py --dataset YOUR_REPO/gpt-oss120b-generated-perfectblend --output-path $DATASET_PATH --split-eval
+# python scripts/prepare_data.py --dataset YOUR_REPO/gpt-oss120b-generated-magpie-1m-v0.1 --output-path $DATASET_PATH --split-eval
 cat $DATASET_PATH/perfectblend_train.jsonl $DATASET_PATH/magpie-1m-v0.1_train.jsonl > $DATASET_PATH/all_train.jsonl
 cat  $DATASET_PATH/perfectblend_test.jsonl $DATASET_PATH/magpie-1m-v0.1_test.jsonl > $DATASET_PATH/all_test.jsonl
 

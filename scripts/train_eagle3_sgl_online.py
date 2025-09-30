@@ -1,3 +1,15 @@
+"""
+This script is used to train a eagle3 model with sglang server.
+
+This script has two TODOS. This TODOs won't affect the correctness of the training,
+but will make the code more easy to implement and understand.
+I will fix them in the future.
+
+1. --draft-micro-batch-size must be 1; This won't stop you from using larger `--draft-global-batch-size`;
+2. --target-tp-size must be equal to NUM_GPUS;
+
+"""
+
 import argparse
 import hashlib
 import math

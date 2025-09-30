@@ -28,8 +28,8 @@ hf download meta-llama/Llama-3.1-8B-Instruct
 hf download Aeala/ShareGPT_Vicuna_unfiltered --repo-type dataset
 hf download HuggingFaceH4/ultrachat_200k --repo-type dataset
 
-python scripts/prepare_data.py --dataset ultrachat --output_path /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/dataset
-python scripts/prepare_data.py --dataset sharegpt --output_path /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/dataset
+python scripts/prepare_data.py --dataset ultrachat --output_path /YOUR/PATH/Llama-3.1-8B-Instruct/dataset
+python scripts/prepare_data.py --dataset sharegpt --output_path /YOUR/PATH/Llama-3.1-8B-Instruct/dataset
 ```
 
 Then, launch the SGLang server and run `generate_data_by_target.py` to generate responses from the base model across different datasets. Make sure to update the `SYSTEM_PROMPT` value in `generate_data_by_target.py` to suit your requirements.
@@ -44,16 +44,16 @@ done
 
 python scripts/generate_data_by_target.py \
     --model-name meta-llama/Llama-3.1-8B-Instruct \
-    --raw-data-file /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/dataset/sharegpt.jsonl \
-    --output-dir /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/generated-dataset/sharegpt-llama-3.1-8b-instruct \
+    --raw-data-file /YOUR/PATH/Llama-3.1-8B-Instruct/dataset/sharegpt.jsonl \
+    --output-dir /YOUR/PATH/Llama-3.1-8B-Instruct/generated-dataset/sharegpt-llama-3.1-8b-instruct \
     --max-concurrency 512 \
     --num-per-shard 50000 \
     --server-address-port 127.0.0.1:30001 127.0.0.1:30002 127.0.0.1:30003 127.0.0.1:30004
 
 python scripts/generate_data_by_target.py \
     --model-name meta-llama/Llama-3.1-8B-Instruct \
-    --raw-data-file /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/dataset/ultrachat.jsonl \
-    --output-dir /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/generated-dataset/ultrachat-llama-3.1-8b-instruct \
+    --raw-data-file /YOUR/PATH/Llama-3.1-8B-Instruct/dataset/ultrachat.jsonl \
+    --output-dir /YOUR/PATH/Llama-3.1-8B-Instruct/generated-dataset/ultrachat-llama-3.1-8b-instruct \
     --max-concurrency 512 \
     --num-per-shard 50000 \
     --server-address-port 127.0.0.1:30001 127.0.0.1:30002 127.0.0.1:30003 127.0.0.1:30004
@@ -62,7 +62,7 @@ python scripts/generate_data_by_target.py \
 After completing these steps, you can review the error entries in `error.jsonl`. Most of them will likely be `request timeout`. You can then decide whether you want to regenerate those samples. In my case, I chose not to, so I simply deleted error.jsonl before uploading to Hugging Face. The following command is used:
 ```shell
 hf repo create zhuyksir/Ultrachat-Sharegpt-Llama3.1-8B --type dataset
-hf upload /root/.cache/user_artifacts/Llama-3.1-8B-Instruct/generated-dataset/ultrachat-llama-3.1-8b-instruct --commit-message "generated dataset by Llama3.1-8B"
+hf upload /YOUR/PATH/Llama-3.1-8B-Instruct/generated-dataset/ultrachat-llama-3.1-8b-instruct --commit-message "generated dataset by Llama3.1-8B"
 ```
 
 ```python
@@ -119,7 +119,7 @@ Use the following script to train.
 
 ```shell
 export NUM_GPUS=4
-export OUTPUT_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/dev_outputs/
+export OUTPUT_DIR=/YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/
 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
@@ -161,7 +161,7 @@ config_list=(
 )
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 bench_model_speedup.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path ~/.cache/huggingface/Llama-3.1-8B-Instruct/dev_outputs/epoch_0 \
+    --speculative-draft-model-path /YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/epoch_0 \
     --port 20001 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \

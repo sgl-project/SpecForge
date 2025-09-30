@@ -147,7 +147,7 @@ async def main():
     for start in range(0, len(total_ds), args.num_per_shard):
         end = min(start + args.num_per_shard, len(total_ds))
         output_file = os.path.join(args.output_dir, f"shard_{start}-{end}.jsonl")
-        output_file_error = os.path.join(args.output_dir, f"error.jsonl")
+        output_file_error = os.path.join(args.output_dir, f"error_{start}-{end}.jsonl")
         if os.path.exists(output_file):
             print(f"Skipping generate data {output_file} because it already exists")
             continue
@@ -164,7 +164,23 @@ async def main():
                 if args.max_concurrency
                 else None
             )
+            # send a dummy request to the server to warm up
+            try:
+                resp = await client.chat.completions.create(
+                    model=args.model_name,
+                    messages=[{"role": "user", "content": "Hello, how are you?"}],
+                    max_tokens=args.max_tokens,
+                    temperature=get_random_temperature(),
+                )
+                assert resp.choices[0].message.content is not None
+                print(
+                    f"Dummy request successful for {server_address_port}: {resp.choices[0].message.content}"
+                )
+            except Exception as e:
+                print(f"Warning: Dummy request failed for {server_address_port}: {e}")
+                continue
             client_semaphore_list.append((client, semaphore))
+        assert len(client_semaphore_list) > 0, "No server address port is available"
 
         tasks = []
         for i, row in enumerate(ds):
