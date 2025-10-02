@@ -54,6 +54,7 @@ SYSTEM_PROMPT = None
 def parse_args():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
+    parser.add_argument("--skip-launch-server", action="store_true", default=False)
     parser.add_argument("--num-prompts", type=int, default=80)
     parser.add_argument("--output", type=str, default="output.jsonl")
     parser.add_argument(
@@ -362,6 +363,23 @@ def main():
         exit()
     base_url = f"http://localhost:{args.port}"
     client = AsyncOpenAI(base_url=f"{base_url}/v1", api_key="None")
+    if args.skip_launch_server:
+        batch_size = configs[0][0] if len(configs) > 0 else 8
+        for bench_name, conversation_list in bench_conversations.items():
+            semaphore = asyncio.Semaphore(batch_size)
+            start_timestamp = time.perf_counter()
+            outputs = asyncio.run(
+                run_benchmark(conversation_list, server_args, client, semaphore)
+            )
+            duration = time.perf_counter() - start_timestamp
+            completion_tokens = sum(req_obj.output_tokens for req_obj in outputs)
+            acc_length = send_get_accept_length_request(base_url)
+            send_flush_cache_request(base_url)
+            throughput = completion_tokens / duration
+            print(
+                f"bs=8:{bench_name=} {completion_tokens=} {acc_length=} {duration=}s {throughput=} token/s"
+            )
+        exit()
 
     for batch_size, steps, topk, num_draft_tokens in configs:
         process = launch_sglang_server(

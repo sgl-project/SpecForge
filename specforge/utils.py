@@ -1,5 +1,5 @@
 import json
-import netrc
+import logging
 import os
 import re
 from contextlib import contextmanager
@@ -8,6 +8,8 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig, PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -48,20 +50,17 @@ def load_config_from_file(config_path: str):
 
 
 def print_with_rank(message):
-    print(f"rank {dist.get_rank()}: {message}")
+    logger.info(f"rank {dist.get_rank()}: {message}")
 
 
 def print_on_rank0(message):
     if dist.get_rank() == 0:
-        print(message)
+        logger.info(message)
 
 
-PREFIX_CHECKPOINT_DIR = "epoch"
-_re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"_(\d+)$")
-
-
-def get_last_checkpoint(folder):
+def get_last_checkpoint(folder, prefix="epoch"):
     content = os.listdir(folder)
+    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
     checkpoints = [
         path
         for path in content
