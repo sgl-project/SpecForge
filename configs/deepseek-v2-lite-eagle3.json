@@ -25,7 +25,7 @@
     "mscale": 0.707,
     "mscale_all_dim": 0.707,
     "original_max_position_embeddings": 4096,
-    "type": "yarn"
+    "rope_type": "yarn"
   },
   "rope_theta": 10000,
   "sliding_window": null,
