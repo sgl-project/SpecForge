@@ -13,12 +13,17 @@ class ChatTemplate(BaseModel):
         user_header(str): The header for the user.
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
+                                If present, end_of_assistant_token and end_of_user_token are ignored.
+        end_of_assistant_token(str): The end token of an assistant turn of conversation.
+        end_of_user_token(str): The end token of a user turn of conversation.
     """
 
     assistant_header: str | None
     user_header: str | None
     system_prompt: str | None
-    end_of_turn_token: str | None
+    end_of_turn_token: str | None = None
+    end_of_assistant_token: str | None = None
+    end_of_user_token: str | None = None
     parser_type: str = "general"
 
 
@@ -102,6 +107,23 @@ TEMPLATE_REGISTRY.register(
         user_header="<|header_start|>user<|header_end|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|eot|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="mistral-small-24B",
+    template=ChatTemplate(
+        assistant_header="[/INST]",
+        user_header="[INST]",
+        system_prompt="You are Mistral Small 3, a Large Language Model (LLM) created by Mistral AI, a French startup "
+        "headquartered in Paris. Your knowledge base was last updated on 2023-10-01. The current date"
+        "is 2025-08-31. When you're not sure about some information, you say that you don't have the "
+        "information and don't make up anything. If the user's question is not clear, ambiguous, or "
+        "does not provide enough context for you to accurately answer the question, you do not try to "
+        'answer it right away and you rather ask the user to clarify their request (e.g. "What are '
+        'some good restaurants around me?" => "Where are you?" or "When is the next flight to '
+        'Tokyo" => "Where do you travel from?")',
+        end_of_assistant_token="</s>",
     ),
 )
 
