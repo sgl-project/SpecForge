@@ -275,7 +275,7 @@ class TestEagle3FlexMask(unittest.TestCase):
         seq_lengths = torch.tensor([S], device="cuda", dtype=torch.int32)
         block_mask = compile_friendly_create_block_mask(
             mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths, Q_LEN=Q_LEN, KV_LEN=KV_LEN, shift_left=128 * 2
+                seq_lengths=seq_lengths, Q_LEN=Q_LEN, KV_LEN=KV_LEN, lck=128 * 2
             ),
             B=1,
             H=1,
