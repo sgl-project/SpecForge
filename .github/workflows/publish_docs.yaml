@@ -14,9 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  execute-and-deploy:
+  deploy-github-pages:
     runs-on: ubuntu-latest
     if: github.repository == 'sgl-project/specforge'
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -41,6 +43,5 @@ jobs:
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4
         with:
-          personal_token: ${{ secrets.PERSONAL_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs/_build/html
-          cname: docs.sglang.ai/SpecForge
