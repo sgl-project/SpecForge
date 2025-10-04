@@ -621,7 +621,7 @@ class LlamaFlexAttention(LlamaAttention):
                 seq_lengths=seq_lengths,
                 Q_LEN=q_len,
                 KV_LEN=key_cache.shape[-2],
-                shift_left=lck,
+                lck=lck,
             ),
             B=bsz,
             H=1,  # Rely on broadcast
