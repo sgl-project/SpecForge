@@ -276,7 +276,6 @@ class OnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                position_ids += 1
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
@@ -652,7 +651,6 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                position_ids += 1
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
