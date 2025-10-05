@@ -198,8 +198,11 @@ def launch_sglang_server(
     if server_args.trust_remote_code:
         sglang_args.extend(["--trust-remote-code"])
 
-    if server_args.enable_ep_moe:
-        sglang_args.extend(["--enable-ep-moe"])
+    if server_args.disable_radix_cache:
+        sglang_args.extend(["--disable-radix-cache"])
+
+    if server_args.ep_size:
+        sglang_args.extend(["--ep-size", server_args.ep_size])
 
     if server_args.attention_backend:
         sglang_args.extend(["--attention-backend", server_args.attention_backend])
