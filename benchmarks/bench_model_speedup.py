@@ -202,7 +202,7 @@ def launch_sglang_server(
         sglang_args.extend(["--disable-radix-cache"])
 
     if server_args.ep_size:
-        sglang_args.extend(["--ep-size", server_args.ep_size])
+        sglang_args.extend(["--ep-size", str(server_args.ep_size)])
 
     if server_args.attention_backend:
         sglang_args.extend(["--attention-backend", server_args.attention_backend])
