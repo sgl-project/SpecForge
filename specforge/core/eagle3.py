@@ -488,9 +488,13 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         # get input embeding with image
         # inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
         inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-        image_embeds = self.target_model.model.get_image_features(
+        image_features = self.target_model.model.get_image_features(
             pixel_values, image_grid_thw
         )
+        if isinstance(image_features, tuple):
+            image_embeds, _ = image_features
+        else:
+            image_embeds = image_features
         image_embeds = torch.cat(image_embeds, dim=0)
         n_image_tokens = (
             input_ids == self.target_model.model.config.image_token_id
