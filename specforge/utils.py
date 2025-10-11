@@ -50,7 +50,10 @@ def load_config_from_file(config_path: str):
 
 
 def print_with_rank(message):
-    logger.info(f"rank {dist.get_rank()}: {message}")
+    if dist.is_available() and dist.is_initialized():
+        logger.info(f"rank {dist.get_rank()}: {message}")
+    else:
+        logger.info(f"non-distributed: {message}")
 
 
 def print_on_rank0(message):
