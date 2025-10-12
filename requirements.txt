@@ -12,5 +12,6 @@ psutil
 numpy
 accelerate
 pydantic
+deepspeed==0.17.5
 sglang[all]==0.5.1
 openai-harmony
