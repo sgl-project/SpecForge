@@ -255,7 +255,7 @@ class TestEagle3FlexMask(unittest.TestCase):
         D = 128
         Q_LEN = S
         KV_LEN = S * 3
-        lck=128 * 2
+        lck = 128 * 2
         data_type = torch.bfloat16
         query = norm_tensor((B, H, S, D), device="cuda", dtype=data_type)
         key_cache = norm_tensor((B, H, KV_LEN, D), device="cuda", dtype=data_type)
