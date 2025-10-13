@@ -17,8 +17,6 @@ jobs:
     container:
       image: lmsysorg/sglang:dev
       options: --gpus all --shm-size=2g --rm -v /dev/shm
-    env:
-      CUDA_VISIBLE_DEVICES: 6,7
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -30,4 +28,4 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          python -m unittest discover -s ./tests -p "test_*.py"
+          python tests/ci/gpu_lock_exec.py --devices 6,7 python -m unittest discover -s ./tests -p "test_*.py"

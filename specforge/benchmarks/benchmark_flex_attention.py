@@ -111,15 +111,6 @@ def run_attention(
         loss = output[0].sum()
         loss_list.append(loss)
 
-        if attention_backend == "sdpa" and not is_last:
-            # Step 5.7: we need to update the loss mask
-            ind = torch.arange(seq_len, device=decoder_attention_mask.device)
-            ind0 = ind[idx:]
-            ind1 = ind[: seq_len - idx]
-            decoder_attention_mask[:, :, ind0, ind1] = torch.finfo(
-                decoder_attention_mask.dtype
-            ).min
-
     # Compute mean loss and backward pass
     if loss_list:
         mean_loss = sum(loss_list) / len(loss_list)
