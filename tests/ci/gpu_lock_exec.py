@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import fcntl
 import os
@@ -38,12 +37,29 @@ def _os_execvp(args):
 
 def _parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--count", type=int, default=None, help="Acquire this many GPUs (any free ones)")
-    p.add_argument("--devices", type=str, default=None, help="Comma separated explicit devices to acquire (e.g. 0,1)")
-    p.add_argument("--total-gpus", type=int, default=8, help="Total GPUs on the machine")
-    p.add_argument("--timeout", type=int, default=3600, help="Seconds to wait for locks before failing")
     p.add_argument(
-        "--target-env-name", type=str, default="CUDA_VISIBLE_DEVICES", help="Which env var to set for devices"
+        "--count", type=int, default=None, help="Acquire this many GPUs (any free ones)"
+    )
+    p.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help="Comma separated explicit devices to acquire (e.g. 0,1)",
+    )
+    p.add_argument(
+        "--total-gpus", type=int, default=8, help="Total GPUs on the machine"
+    )
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=3600,
+        help="Seconds to wait for locks before failing",
+    )
+    p.add_argument(
+        "--target-env-name",
+        type=str,
+        default="CUDA_VISIBLE_DEVICES",
+        help="Which env var to set for devices",
     )
     p.add_argument(
         "--lock-path-pattern",
@@ -51,8 +67,16 @@ def _parse_args():
         default="/dev/shm/custom_gpu_lock_{gpu_id}.lock",
         help='Filename pattern with "{gpu_id}" placeholder',
     )
-    p.add_argument("--print-only", action="store_true", help="Probe free devices and print them (does NOT hold locks)")
-    p.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to exec after '--' (required unless --print-only)")
+    p.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Probe free devices and print them (does NOT hold locks)",
+    )
+    p.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        help="Command to exec after '--' (required unless --print-only)",
+    )
     args = p.parse_args()
 
     if "{gpu_id}" not in args.lock_path_pattern:
@@ -79,7 +103,9 @@ def _execute_print_only(args):
                 pass
             fd_lock.close()
         except Exception as e:
-            print(f"Warning: Error while probing lock: {e}", file=sys.stderr, flush=True)
+            print(
+                f"Warning: Error while probing lock: {e}", file=sys.stderr, flush=True
+            )
 
     print("Free GPUs:", ",".join(str(x) for x in free), flush=True)
 
@@ -89,7 +115,9 @@ def _try_acquire(args):
         devs = _parse_devices(args.devices)
         return _try_acquire_specific(devs, args.lock_path_pattern, args.timeout)
     else:
-        return _try_acquire_count(args.count, args.total_gpus, args.lock_path_pattern, args.timeout)
+        return _try_acquire_count(
+            args.count, args.total_gpus, args.lock_path_pattern, args.timeout
+        )
 
 
 def _try_acquire_specific(devs: List[int], path_pattern: str, timeout: int):
@@ -111,7 +139,9 @@ def _try_acquire_specific(devs: List[int], path_pattern: str, timeout: int):
             fd_locks.append(fd_lock)
         return fd_locks
     except Exception as e:
-        print(f"Error during specific GPU acquisition: {e}", file=sys.stderr, flush=True)
+        print(
+            f"Error during specific GPU acquisition: {e}", file=sys.stderr, flush=True
+        )
         for fd_lock in fd_locks:
             fd_lock.close()
         raise
@@ -143,7 +173,10 @@ def _try_acquire_count(count: int, total_gpus: int, path_pattern: str, timeout: 
         if time.time() - start > timeout:
             raise TimeoutError(f"Timeout acquiring {count} GPUs (out of {total_gpus})")
 
-        print(f"[gpu_lock_exec] try_acquire_count failed, sleep and retry (only got: {gotten_gpu_ids})", flush=True)
+        print(
+            f"[gpu_lock_exec] try_acquire_count failed, sleep and retry (only got: {gotten_gpu_ids})",
+            flush=True,
+        )
         time.sleep(SLEEP_BACKOFF * random.random())
 
 
@@ -168,7 +201,11 @@ class FdLock:
         try:
             self.fd.close()
         except Exception as e:
-            print(f"Warning: Failed to close file descriptor: {e}", file=sys.stderr, flush=True)
+            print(
+                f"Warning: Failed to close file descriptor: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
         self.fd = None
 
 
@@ -181,7 +218,11 @@ def _ensure_lock_files(path_pattern: str, total_gpus: int):
         try:
             open(p, "a").close()
         except Exception as e:
-            print(f"Warning: Could not create lock file {p}: {e}", file=sys.stderr, flush=True)
+            print(
+                f"Warning: Could not create lock file {p}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def _get_lock_path(path_pattern: str, gpu_id: int) -> str:

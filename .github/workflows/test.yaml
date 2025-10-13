@@ -17,8 +17,6 @@ jobs:
     container:
       image: lmsysorg/sglang:dev
       options: --gpus all --shm-size=2g --rm -v /dev/shm
-    env:
-      CUDA_VISIBLE_DEVICES: 6,7
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
