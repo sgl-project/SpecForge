@@ -136,6 +136,16 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="deepseekv3",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt="",
+        end_of_turn_token="",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="phi3",
     template=ChatTemplate(
         assistant_header="<|assistant|>\n",
