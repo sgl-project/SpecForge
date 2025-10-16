@@ -241,7 +241,7 @@ def main():
         ds = ds.rename_column("uuid", "id")
         proc_fn = process_sharegpt_row
     elif args.dataset == "sharegpt4v":
-        ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
+        ds = load_dataset("Lin-Chen/ShareGPT4V", name="ShareGPT4V")["train"]
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "allava4v":
         ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[

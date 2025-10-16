@@ -234,6 +234,17 @@ def main():
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
+    # safeguard for qwen3_vl_moe because embedding key is different
+    if draft_model_config.target_model_type in ["qwen2_5_vl", "qwen3_vl_moe"]:
+        args.is_vlm = True
+        if draft_model_config.target_model_type == "qwen3_vl_moe":
+            expected_key = "model.language_model.embed_tokens.weight"
+            if args.embedding_key != expected_key:
+                print_on_rank0(
+                    f"WARNING: overriding embedding key from {args.embedding_key} to {expected_key} for qwen3_vl_moe target."
+                )
+                args.embedding_key = expected_key
+
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
     if args.resume and os.path.isdir(args.output_dir):
@@ -262,17 +273,32 @@ def main():
                 device_mesh=get_tp_device_mesh(),
             ).eval()
     else:
-        if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
-            from transformers import Qwen2_5_VLForConditionalGeneration
+        if args.is_vlm and draft_model_config.target_model_type in [
+            "qwen2_5_vl",
+            "qwen3_vl_moe",
+        ]:
+            if draft_model_config.target_model_type == "qwen2_5_vl":
+                from transformers import Qwen2_5_VLForConditionalGeneration
 
-            target_model = (
-                Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    torch_dtype=torch.bfloat16,
+                target_model = (
+                    Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        pretrained_model_name_or_path=args.target_model_path,
+                        torch_dtype=torch.bfloat16,
+                    )
+                    .eval()
+                    .cuda()
                 )
-                .eval()
-                .cuda()
-            )
+            elif draft_model_config.target_model_type == "qwen3_vl_moe":
+                from transformers import Qwen3VLMoeForConditionalGeneration
+
+                target_model = (
+                    Qwen3VLMoeForConditionalGeneration.from_pretrained(
+                        pretrained_model_name_or_path=args.target_model_path,
+                        torch_dtype=torch.bfloat16,
+                    )
+                    .eval()
+                    .cuda()
+                )
         else:
             target_model = (
                 AutoModelForCausalLM.from_pretrained(
@@ -314,6 +340,10 @@ def main():
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
         )
+        if args.build_dataset_num_proc > 0:
+            print_on_rank0(
+                "WARNING: VLM dataset preprocessing may hang with --build-dataset-num-proc > 0"
+            )
     else:
         processor = None
 
