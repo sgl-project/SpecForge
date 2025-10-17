@@ -270,7 +270,7 @@ def main():
 
                 # Remove original last assistant message
                 if messages[-1]["role"] == "assistant":
-                    messages = messages[:-1]
+                    messages.pop()
                 prompt = tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
