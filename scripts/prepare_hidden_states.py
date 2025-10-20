@@ -157,7 +157,7 @@ class SglangHiddenStatesGenerator:
             assert (
                 hasattr(logits_output, "last_hidden_states")
                 and logits_output.last_hidden_states is not None
-            ), "please use https://github.com/zyksir/sglang/tree/eagle3-offline"
+            ), "the sglang version is outdated, please upgrade sglang"
             hidden_states_list = torch.split(
                 logits_output.last_hidden_states, input_lens, dim=0
             )

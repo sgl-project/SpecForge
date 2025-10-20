@@ -37,6 +37,8 @@ def parse_args():
         choices=[
             "ultrachat",
             "sharegpt",
+            "perfectblend",
+            "magpie-qwen2.5-pro-1m-v0.1",
             "sharegpt4v",
             "allava4v",
             "opc",
@@ -229,6 +231,14 @@ def main():
         else:
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))
+        proc_fn = process_sharegpt_row
+    elif args.dataset == "perfectblend":
+        ds = load_dataset("mlabonne/open-perfectblend")["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = process_sharegpt_row
+    elif args.dataset == "magpie-qwen2.5-pro-1m-v0.1":
+        ds = load_dataset("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")["train"]
+        ds = ds.rename_column("uuid", "id")
         proc_fn = process_sharegpt_row
     elif args.dataset == "sharegpt4v":
         ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
