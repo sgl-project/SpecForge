@@ -7,6 +7,7 @@ import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
+    GptOssConfig,
     Llama4Config,
     Llama4TextConfig,
     LlamaConfig,
@@ -22,6 +23,7 @@ from transformers import (
 from specforge.utils import default_torch_dtype
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .target.gpt_oss import GptOssForCausalLM
 from .target.llama import LlamaForCausalLM
 from .target.llama4 import Llama4ForCausalLM
 from .target.phi3 import Phi3ForCausalLM
@@ -38,7 +40,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     }
 
     @classmethod
-    def from_config(cls, config: PretrainedConfig, **config_kwargs):
+    def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
         This class method takes a configuration object and create its model based on the
         _model_mapping class variable.
@@ -51,7 +53,12 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         """
         # get the model class from the
         _model_cls = cls._model_mapping[type(config)]
-        return _model_cls(config, **config_kwargs)
+        model = _model_cls(config, **config_kwargs)
+
+        # Convert model to specified dtype if provided
+        if torch_dtype is not None:
+            model = model.to(dtype=torch_dtype)
+        return model
 
     @classmethod
     def from_pretrained(
@@ -89,6 +96,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         Qwen3Config: [Qwen3ForCausalLM],
         Phi3Config: [Phi3ForCausalLM],
         Qwen2_5_VLConfig: [Qwen2_5_VLForConditionalGeneration],
+        GptOssConfig: [GptOssForCausalLM],
     }
 
     @classmethod

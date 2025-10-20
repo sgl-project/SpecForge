@@ -1,32 +1,30 @@
 #!/bin/bash
+export PERSIST_DIR=/tmp # Please Change this to your own directory
 export MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
-export DATASET_PATH=~/.cache/huggingface/Llama-3.1-8B-Instruct/dataset/
-export CACHE_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/cache/
-export OUTPUT_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/outputs/
-export HIDDEN_STATES_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/hidden_states/
+export DATASET_PATH=$PERSIST_DIR/dataset/
+export CACHE_DIR=$PERSIST_DIR/cache/
+export OUTPUT_DIR=$PERSIST_DIR/outputs/
+export HIDDEN_STATES_DIR=$PERSIST_DIR/hidden_states/
 export MAX_LENGTH=2048
 export CHAT_TEMPLATE=llama3
 
 hf download $MODEL_PATH
 hf download Aeala/ShareGPT_Vicuna_unfiltered --repo-type dataset
 
-python scripts/prepare_data.py --dataset sharegpt --output_path $DATASET_PATH --test-size 0.01
-python scripts/build_eagle3_dataset_cache.py \
-    --target-model-path $MODEL_PATH \
-    --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path $DATASET_PATH/sharegpt_train.jsonl \
-    --eval-data-path $DATASET_PATH/sharegpt_test.jsonl \
+python scripts/prepare_data.py --dataset sharegpt --output-path $DATASET_PATH --split-eval
+python scripts/build_eagle3_dataset.py \
+    --model-path $MODEL_PATH \
+    --data-path $DATASET_PATH \
     --cache-dir $CACHE_DIR \
     --chat-template $CHAT_TEMPLATE \
     --max-length $MAX_LENGTH \
-    --view-train-data 1
 
 CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun --nproc_per_node=4 \
     scripts/prepare_hidden_states.py \
     --data-path $DATASET_PATH/sharegpt_test.jsonl \
     --model-path $MODEL_PATH \
     --cache-dir $CACHE_DIR \
-    --output-dir $HIDDEN_STATES_DIR/sharegpt_test \
+    --output-path $HIDDEN_STATES_DIR/sharegpt_test \
     --chat-template $CHAT_TEMPLATE \
     --max-length $MAX_LENGTH \
     --enable-aux-hidden-states \
@@ -39,7 +37,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun --nproc_per_node=4 \
     --data-path $DATASET_PATH/sharegpt_train.jsonl \
     --model-path $MODEL_PATH \
     --cache-dir $CACHE_DIR \
-    --output-dir $HIDDEN_STATES_DIR/sharegpt_train \
+    --output-path $HIDDEN_STATES_DIR/sharegpt_train \
     --chat-template $CHAT_TEMPLATE \
     --max-length $MAX_LENGTH \
     --enable-aux-hidden-states \

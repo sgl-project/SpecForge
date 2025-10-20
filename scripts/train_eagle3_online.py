@@ -12,7 +12,7 @@ from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from specforge import (
     AutoDistributedTargetModel,
@@ -26,7 +26,12 @@ from specforge.data import (
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_group,
+    get_tp_device_mesh,
+    init_distributed,
+)
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import (
@@ -238,13 +243,24 @@ def main():
 
     # build target and draft model
     if args.tp_size > 1:
-        # to avoid CPU RAM OOM, we directly init the model on CUDA
-        target_model = AutoDistributedTargetModel.from_pretrained(
-            pretrained_model_name_or_path=args.target_model_path,
-            torch_dtype=torch.bfloat16,
-            cache_dir=args.cache_dir,
-            device="cuda",
-        ).eval()
+        # check if the target model has tp_plan
+        config = AutoConfig.from_pretrained(args.target_model_path)
+
+        if type(config) in AutoDistributedTargetModel._model_mapping:
+            target_model = AutoDistributedTargetModel.from_pretrained(
+                pretrained_model_name_or_path=args.target_model_path,
+                torch_dtype=torch.bfloat16,
+                device="cuda",
+                local_files_only=True,
+            ).eval()
+        else:
+            target_model = AutoModelForCausalLM.from_pretrained(
+                args.target_model_path,
+                tp_plan="auto",
+                tp_size=args.tp_size,
+                torch_dtype=torch.bfloat16,
+                device_mesh=get_tp_device_mesh(),
+            ).eval()
     else:
         if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
             from transformers import Qwen2_5_VLForConditionalGeneration
@@ -267,25 +283,25 @@ def main():
                 .eval()
                 .cuda()
             )
+
+    for p in target_model.parameters():
+        p.requires_grad = False
+
     print_with_rank("Initialized target model")
 
     # load model with resume
     if draft_model_last_checkpoint:
-        draft_model = (
-            AutoEagle3DraftModel.from_pretrained(
-                draft_model_last_checkpoint, attention_backend=args.attention_backend
-            )
-            .cuda()
-            .to(torch.bfloat16)
-        )
+        draft_model = AutoEagle3DraftModel.from_pretrained(
+            draft_model_last_checkpoint,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     else:
-        draft_model = (
-            AutoEagle3DraftModel.from_config(
-                draft_model_config, attention_backend=args.attention_backend
-            )
-            .cuda()
-            .to(torch.bfloat16)
-        )
+        draft_model = AutoEagle3DraftModel.from_config(
+            draft_model_config,
+            attention_backend=args.attention_backend,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
     print_with_rank("Initialized draft model")
@@ -386,6 +402,7 @@ def main():
             draft_model=draft_model,
             processor=processor,
             length=args.ttt_length,
+            attention_backend=args.attention_backend,
         )
     else:
         eagle3_model = OnlineEagle3Model(
@@ -410,7 +427,7 @@ def main():
 
     # build other components
     optimizer = BF16Optimizer(
-        eagle3_model,
+        draft_model,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
@@ -445,6 +462,7 @@ def main():
     # start running
     print_on_rank0(f"Starting training from epoch {start_epoch}")
     batch_index, log_dict = 0, defaultdict(float)
+
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -452,7 +470,14 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        if dist.get_rank() == 0:
+            progress_bar = tqdm(
+                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+            )
+        else:
+            progress_bar = train_dataloader
+
+        for data in progress_bar:
             batch_index += 1
             if args.profile:
                 if batch_index == args.profile_start_step:
@@ -489,6 +514,7 @@ def main():
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
                 )
+            acces = torch.stack(acces).cpu().tolist()
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -522,6 +548,13 @@ def main():
                 )
                 last_time = time.time()
 
+            if dist.get_rank() == 0:
+                avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
+                avg_acc = sum(acces) / len(acces)
+                progress_bar.set_postfix(
+                    {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}"}
+                )
+
         epoch_logdict = {}
         for i in range(len(epoch_acces)):
             acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
@@ -551,19 +584,22 @@ def main():
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                 if args.is_vlm:
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].cuda(),
-                        pixel_values=data["pixel_values"].cuda(),
-                        image_grid_thw=data["image_grid_thw"].cuda(),
-                    )
+                    with torch.no_grad():
+                        plosses, _, acces = eagle3_model(
+                            input_ids=data["input_ids"].cuda(),
+                            attention_mask=data["attention_mask"].cuda(),
+                            loss_mask=data["loss_mask"].cuda(),
+                            pixel_values=data["pixel_values"].cuda(),
+                            image_grid_thw=data["image_grid_thw"].cuda(),
+                        )
                 else:
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].cuda(),
-                    )
+                    with torch.no_grad():
+                        plosses, _, acces = eagle3_model(
+                            input_ids=data["input_ids"].cuda(),
+                            attention_mask=data["attention_mask"].cuda(),
+                            loss_mask=data["loss_mask"].cuda(),
+                        )
+                acces = torch.stack(acces).cpu().tolist()
 
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [

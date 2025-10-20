@@ -34,7 +34,15 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt", "sharegpt4v", "allava4v", "opc"],
+        choices=[
+            "ultrachat",
+            "sharegpt",
+            "perfectblend",
+            "magpie-qwen2.5-pro-1m-v0.1",
+            "sharegpt4v",
+            "allava4v",
+            "opc",
+        ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -185,8 +193,9 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
                 f.write(json.dumps(row) + "\n")
 
     if total_skipped_count > 0:
+        total_messages = len(train_ds) + (len(test_ds) if test_ds is not None else 0)
         print(
-            f"Skipped {total_skipped_count}/{len(train_ds)+len(test_ds)} messages for {dataset_name}"
+            f"Skipped {total_skipped_count}/{total_messages} messages for {dataset_name}"
         )
 
 
@@ -205,6 +214,11 @@ def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
     return processed_row, 0
 
 
+def add_index(row, idx) -> Dict:
+    row["id"] = idx
+    return row
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -217,6 +231,14 @@ def main():
         else:
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))
+        proc_fn = process_sharegpt_row
+    elif args.dataset == "perfectblend":
+        ds = load_dataset("mlabonne/open-perfectblend")["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = process_sharegpt_row
+    elif args.dataset == "magpie-qwen2.5-pro-1m-v0.1":
+        ds = load_dataset("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")["train"]
+        ds = ds.rename_column("uuid", "id")
         proc_fn = process_sharegpt_row
     elif args.dataset == "sharegpt4v":
         ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
@@ -233,7 +255,7 @@ def main():
         proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
-            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
 
     # filter and split dataset

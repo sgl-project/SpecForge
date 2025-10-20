@@ -376,7 +376,14 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        for data in tqdm(train_dataloader, desc=f"Training Epoch {epoch}"):
+        if dist.get_rank() == 0:
+            progress_bar = tqdm(
+                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+            )
+        else:
+            progress_bar = train_dataloader
+
+        for data in progress_bar:
             batch_index += 1
             if args.profile:
                 if batch_index == args.profile_start_step:
@@ -410,6 +417,7 @@ def main():
                 hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
                 target=data["target"].cuda(),  # [B, S, D*3]
             )
+            acces = torch.stack(acces).cpu().tolist()
 
             # calculate weighted loss
             ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -444,6 +452,13 @@ def main():
                 )
                 last_time = time.time()
 
+            if dist.get_rank() == 0:
+                avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
+                avg_acc = sum(acces) / len(acces)
+                progress_bar.set_postfix(
+                    {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}"}
+                )
+
         # Log epoch-level training metrics
         train_epoch_logdict = {}
         for i in range(len(epoch_acces)):
@@ -472,13 +487,15 @@ def main():
             eval_plosses = [[] for _ in range(eagle3_model.length)]
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                plosses, _, acces = eagle3_model(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
-                    hidden_states=data["hidden_state"].cuda(),
-                    target=data["target"].cuda(),
-                )
+                with torch.no_grad():
+                    plosses, _, acces = eagle3_model(
+                        input_ids=data["input_ids"].cuda(),
+                        attention_mask=data["attention_mask"].cuda(),
+                        loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
+                        hidden_states=data["hidden_state"].cuda(),
+                        target=data["target"].cuda(),
+                    )
+                acces = torch.stack(acces).cpu().tolist()
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))

@@ -1,4 +1,3 @@
-import logging
 import math
 from typing import List, Optional, Tuple
 
@@ -16,10 +15,9 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
-
-logger = logging.getLogger(__name__)
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -575,12 +573,23 @@ class LlamaFlexAttention(LlamaAttention):
         ).transpose(1, 2)
 
         lck = past_seen_tokens // q_len
-        cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-        # Keep positions ids aligned when padding so the KV cache is unaffected.
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids + lck
-        )
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            # Keep positions ids aligned when padding so the KV cache is unaffected.
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids + lck
+            )
 
         cache_position: torch.Tensor = torch.arange(
             past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
@@ -612,7 +621,7 @@ class LlamaFlexAttention(LlamaAttention):
                 seq_lengths=seq_lengths,
                 Q_LEN=q_len,
                 KV_LEN=key_cache.shape[-2],
-                shift_left=lck,
+                lck=lck,
             ),
             B=bsz,
             H=1,  # Rely on broadcast
@@ -704,7 +713,7 @@ class LlamaDecoderLayer(nn.Module):
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
         elif attention_backend == "flex_attention":
-            logger.warning("Using flex attention on draft model training!")
+            print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
@@ -826,10 +835,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            logger.info("using ttt_length 1, no need to cache hidden states")
+            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            logger.info(f"using ttt_length {ttt_length}, caching hidden states")
+            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()
