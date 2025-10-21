@@ -366,7 +366,8 @@ def build_eagle3_dataset(
                 max_length,
                 is_preformatted=False,
             )
-
+        if "request_id" in examples:
+            processed["request_id"] = examples["request_id"]
         return processed
 
     # Process dataset only once
@@ -509,8 +510,8 @@ def generate_vocab_mapping_file(
     # we first count the frequency of effectiev tokens in the dataset
     token_dict = Counter()
     for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
-        input_ids = item["input_ids"]
-        loss_mask = item["loss_mask"]
+        input_ids = item["input_ids"].unsqueeze(0)
+        loss_mask = item["loss_mask"].unsqueeze(0)
         masked_ids = input_ids[loss_mask == 1]
         unique_ids, counts = masked_ids.unique(return_counts=True)
         batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))

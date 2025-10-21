@@ -60,9 +60,9 @@ def parse_args():
     )
 
     # add training-related arguments
-    parser.add_argument("--train-data-path", type=str, required=True)
+    # parser.add_argument("--train-data-path", type=str, required=True)
+    # parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--train-hidden-states-path", type=str, required=True)
-    parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--eval-hidden-states-path", type=str, default=None)
     parser.add_argument("--num-epochs", type=int, default=10)
     parser.add_argument("--draft-global-batch-size", type=int, default=16)
@@ -113,6 +113,10 @@ def parse_args():
     )
     # resume
     parser.add_argument("--resume", action="store_true")
+
+    # finetune
+    parser.add_argument("--finetune", action="store_true")
+    parser.add_argument("--baseline-dir", type=str, default=None)
 
     # report backend
     parser.add_argument(
@@ -212,6 +216,12 @@ def main():
     draft_model_last_checkpoint = None
     resume_training_state = None
     start_epoch = 0
+    if args.finetune and args.baseline_dir is not None:
+        if os.path.isdir(args.baseline_dir):
+            draft_model_last_checkpoint = args.baseline_dir
+            print_on_rank0(f"Finetuning from baseline model: {draft_model_last_checkpoint}")
+        else:
+            raise ValueError(f"Provided baseline-dir {args.baseline_dir} is not a valid directory.")
     if args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
@@ -222,7 +232,7 @@ def main():
             )
             match = re.search(r"epoch_(\d+)", epoch_dir_name)
             if match:
-                start_epoch = int(match.group(1)) + 1
+                start_epoch = int(match.group(1))
                 print_on_rank0(f"Resuming training from epoch {start_epoch}")
             else:
                 print_on_rank0(
@@ -301,24 +311,18 @@ def main():
 
     # convert to dataloader
     cache_params_string = (
-        f"{args.train_data_path}-"
+        f"{args.train_hidden_states_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
     with rank_0_priority():
-        train_eagle3_dataset_tmp = build_eagle3_dataset(
-            dataset=train_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            is_preformatted=args.is_preformatted,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            num_proc=args.build_dataset_num_proc,
+        train_eagle3_dataset = build_offline_eagle3_dataset(
+            args.train_hidden_states_path,
+            args.max_length,
         )
+        train_eagle3_dataset_tmp = train_eagle3_dataset
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset_tmp,
             target_vocab_size=draft_model_config.vocab_size,
@@ -326,10 +330,7 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
         )
-        train_eagle3_dataset = build_offline_eagle3_dataset(
-            args.train_hidden_states_path,
-            args.max_length,
-        )
+        
 
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
@@ -357,7 +358,7 @@ def main():
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
 
-    if args.eval_data_path is not None:
+    if args.eval_hidden_states_path is not None:
         eval_eagle3_dataset = build_offline_eagle3_dataset(
             args.eval_hidden_states_path,
             args.max_length,
@@ -409,10 +410,11 @@ def main():
         optimizer.load_state_dict(resume_training_state)
         global_step = resume_training_state.get("global_step")
         if global_step is None:
-            steps_per_epoch = math.ceil(
+            global_step = start_epoch * math.ceil(
                 len(train_dataloader) / args.draft_accumulation_steps
             )
-            global_step = int(start_epoch * steps_per_epoch)
+            if global_step is None or global_step < 0:
+                global_step = 0
         print_on_rank0(
             f"Resumed optimizer and scheduler state (global_step={global_step})"
         )
@@ -539,21 +541,20 @@ def main():
         tracker.log(train_epoch_logdict, step=global_step)
 
         # run evaluation
-        if args.eval_data_path is not None and epoch % args.eval_interval == 0:
+        if args.eval_hidden_states_path is not None and epoch % args.eval_interval == 0:
             # Run evaluation
             draft_model.eval()
             eval_acces = [[] for _ in range(eagle3_model.length)]
             eval_plosses = [[] for _ in range(eagle3_model.length)]
 
             for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                with torch.no_grad():
-                    plosses, _, acces = eagle3_model(
-                        input_ids=data["input_ids"].cuda(),
-                        attention_mask=data["attention_mask"].cuda(),
-                        loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
-                        hidden_states=data["hidden_state"].cuda(),
-                        target=data["target"].cuda(),
-                    )
+                plosses, _, acces = eagle3_model(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].unsqueeze(-1).cuda(),
+                    hidden_states=data["hidden_state"].cuda(),
+                    target=data["target"].cuda(),
+                )
                 acces = torch.stack(acces).cpu().tolist()
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
