@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -20,17 +20,22 @@ from specforge.data import (
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed, get_dp_device_mesh
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_device_mesh,
+    get_dp_group,
+    init_distributed,
+)
 from specforge.modeling.target.target_head import TargetHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
+    get_full_optimizer_state,
     get_last_checkpoint,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
-    get_full_optimizer_state,
 )
 
 
@@ -340,7 +345,9 @@ def main():
         length=args.ttt_length,
         attention_backend=args.draft_attention_backend,
     )
-    mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
     fsdp_config = {"mesh": get_dp_device_mesh(), "mp_policy": mp_policy}
     fully_shard(eagle3_model, **fsdp_config)
 
@@ -527,10 +534,12 @@ def main():
                 "epoch": epoch,
                 "args": args,
             }
-            
+
             optimizer_state_dict = optimizer.state_dict()
-            optimizer_state_dict["optimizer_state_dict"] = get_full_optimizer_state(optimizer_state_dict["optimizer_state_dict"])
-            
+            optimizer_state_dict["optimizer_state_dict"] = get_full_optimizer_state(
+                optimizer_state_dict["optimizer_state_dict"]
+            )
+
             state_to_save.update(optimizer_state_dict)
 
             draft_model_state_dict = {

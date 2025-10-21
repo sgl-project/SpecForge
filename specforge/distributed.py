@@ -11,6 +11,7 @@ _TP_GROUP = None
 _DP_DEVICE_MESH = None
 _DP_GROUP = None
 
+
 def get_tp_group():
     global _TP_GROUP
     return _TP_GROUP
@@ -29,6 +30,7 @@ def get_device_mesh():
 def get_tp_device_mesh():
     global _TP_DEVICE_MESH
     return _TP_DEVICE_MESH
+
 
 def get_dp_device_mesh():
     global _DP_DEVICE_MESH

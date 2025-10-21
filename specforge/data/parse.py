@@ -85,7 +85,9 @@ class GeneralParser(Parser):
             )
 
             if self.chat_template.ignored_token:
-                conversation = conversation.replace(self.chat_template.ignored_token, "")
+                conversation = conversation.replace(
+                    self.chat_template.ignored_token, ""
+                )
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
@@ -128,7 +130,7 @@ class GeneralParser(Parser):
 class Qwen3ThinkingParser(GeneralParser):
     def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
         super().__init__(tokenizer, chat_template)
-    
+
     def parse(
         self,
         conversation: "Conversation",
@@ -137,9 +139,7 @@ class Qwen3ThinkingParser(GeneralParser):
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if kwargs.get("enable_thinking", False):
-            self.assistant_message_separator = (
-                f"{self.chat_template.end_of_turn_token}<|im_start|>assistant\n<think>\n"
-            )
+            self.assistant_message_separator = f"{self.chat_template.end_of_turn_token}<|im_start|>assistant\n<think>\n"
             self.chat_template.ignored_token = None
         else:
             self.assistant_message_separator = (
@@ -147,6 +147,7 @@ class Qwen3ThinkingParser(GeneralParser):
             )
             self.chat_template.ignored_token = "<think>\n\n</think>\n\n"
         return super().parse(conversation, max_length, preformatted, **kwargs)
+
 
 class HarmonyParser(Parser):
 
