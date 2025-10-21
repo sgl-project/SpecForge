@@ -20,6 +20,7 @@ class ChatTemplate(BaseModel):
     system_prompt: str | None
     end_of_turn_token: str | None
     parser_type: str = "general"
+    ignored_token: str | None = None
 
 
 class TemplateRegistry:
@@ -112,6 +113,18 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3-thinking",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="qwen3-thinking",
+        ignored_token="<think>\n\n</think>\n\n",
     ),
 )
 
