@@ -1,9 +1,10 @@
 #!/bin/bash
+export PERSIST_DIR=/tmp # Please Change this to your own directory
 export MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
-export DATASET_PATH=~/.cache/huggingface/Llama-3.1-8B-Instruct/dataset/
-export CACHE_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/cache/
-export OUTPUT_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/outputs/
-export HIDDEN_STATES_DIR=~/.cache/huggingface/Llama-3.1-8B-Instruct/hidden_states/
+export DATASET_PATH=$PERSIST_DIR/dataset/
+export CACHE_DIR=$PERSIST_DIR/cache/
+export OUTPUT_DIR=$PERSIST_DIR/outputs/
+export HIDDEN_STATES_DIR=$PERSIST_DIR/hidden_states/
 export MAX_LENGTH=2048
 export CHAT_TEMPLATE=llama3
 

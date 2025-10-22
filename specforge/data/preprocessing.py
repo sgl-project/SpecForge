@@ -116,6 +116,7 @@ def preprocess_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
     is_preformatted: bool = False,
+    **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
     Preprocess a batch of ShareGPT style conversations or pre-formatted text.
@@ -145,12 +146,16 @@ def preprocess_conversations(
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
 
-    for source in conversations:
+    kwargs_list = [{} for _ in range(len(conversations))]
+    for key, value_list in kwargs.items():
+        for i, value in enumerate(value_list):
+            kwargs_list[i][key] = value
+    for source, kwargs_item in zip(conversations, kwargs_list):
         if not source:
             # if the source is None, skip it
             continue
         input_ids, loss_mask = parser.parse(
-            source, max_length, preformatted=is_preformatted
+            source, max_length, preformatted=is_preformatted, **kwargs_item
         )
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
@@ -359,12 +364,16 @@ def build_eagle3_dataset(
                 raise ValueError(
                     f"Expected 'conversations' column for is_preformatted=False, but found columns: {list(examples.keys())}"
                 )
+            conversations = examples.pop("conversations")
+            if "id" in examples:
+                examples.pop("id")
             processed = preprocess_conversations(
                 tokenizer,
-                examples["conversations"],
+                conversations,
                 template,
                 max_length,
                 is_preformatted=False,
+                **examples,
             )
         if "request_id" in examples:
             processed["request_id"] = examples["request_id"]
@@ -429,6 +438,26 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         self._epoch = 0
         self.max_len = max_len
 
+    @staticmethod
+    def process_data(data, max_len, transform=None):
+        new_data = {}
+        # Squeeze due to our data generation script adding a batch dimension
+        hidden_state = data["aux_hidden_state"].squeeze(0)[:max_len][None, :]
+        target = data["hidden_state"].squeeze(0)[:max_len][None, :]
+
+        input_ids = data["input_ids"][:max_len][None, :]
+        loss_mask = data["loss_mask"][:max_len][None, :]
+        loss_mask[0, -1] = 0
+
+        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
+        new_data["loss_mask"] = loss_mask
+        new_data["target"] = padding(target, left=False)
+        new_data["hidden_state"] = hidden_state
+        new_data["input_ids"] = padding(input_ids, left=False)
+        if transform:
+            new_data = transform(new_data)
+        return new_data
+
     def __len__(self):
         return len(self.datapaths)
 
@@ -441,26 +470,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
             data = self._open_file(0)
-            # raise e
-        new_data = {}
-
-        # Squeeze due to our data generation script adding a batch dimension
-        hidden_state = data["aux_hidden_state"].squeeze(0)[: self.max_len][None, :]
-        target = data["hidden_state"].squeeze(0)[: self.max_len][None, :]
-
-        input_ids = data["input_ids"][: self.max_len][None, :]
-        loss_mask = data["loss_mask"][: self.max_len][None, :]
-        loss_mask[0, -1] = 0
-
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["target"] = padding(target, left=False)
-        new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = padding(input_ids, left=False)
-        if self.transform:
-            new_data = self.transform(new_data)
-
-        return new_data
+        return self.process_data(data, self.max_len, self.transform)
 
     def set_epoch(self, epoch):
         self._epoch = epoch

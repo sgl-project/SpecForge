@@ -1,5 +1,5 @@
 import json
-import netrc
+import logging
 import os
 import re
 from contextlib import contextmanager
@@ -8,6 +8,8 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig, PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -48,20 +50,20 @@ def load_config_from_file(config_path: str):
 
 
 def print_with_rank(message):
-    print(f"rank {dist.get_rank()}: {message}")
+    if dist.is_available() and dist.is_initialized():
+        logger.info(f"rank {dist.get_rank()}: {message}")
+    else:
+        logger.info(f"non-distributed: {message}")
 
 
 def print_on_rank0(message):
     if dist.get_rank() == 0:
-        print(message)
+        logger.info(message)
 
 
-PREFIX_CHECKPOINT_DIR = "epoch"
-_re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"_(\d+)$")
-
-
-def get_last_checkpoint(folder):
+def get_last_checkpoint(folder, prefix="epoch"):
     content = os.listdir(folder)
+    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
     checkpoints = [
         path
         for path in content
@@ -219,3 +221,29 @@ def create_draft_config_from_target(
     dist.barrier()
 
     return output_path
+
+def get_full_optimizer_state(optimizer_state_dict: dict):
+    """
+    Convert optimizer state dict with DTensor to full tensors for saving
+
+    Args:
+        optimizer_state_dict (dict): Optimizer state dict possibly containing DTensors
+    Returns:
+        dict: Optimizer state dict with full tensors
+    """
+    full_optimizer_state_dict = {
+        k: v for k, v in optimizer_state_dict.items() if k != "state"
+    }
+    if "state" in optimizer_state_dict:
+        full_optimizer_state_dict["state"] = {
+            param_id: {
+                state_key: (
+                    state_tensor.full_tensor()
+                    if isinstance(state_tensor, torch.distributed.tensor.DTensor)
+                    else state_tensor
+                )
+                for state_key, state_tensor in param_state.items()
+            }
+            for param_id, param_state in optimizer_state_dict["state"].items()
+        }
+    return full_optimizer_state_dict
