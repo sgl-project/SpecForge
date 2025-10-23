@@ -603,7 +603,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         acces = []
         if self.attention_backend == "sdpa":
             num_hidden_layers = getattr(
-                self.draft_model.config.to_dict(), "num_hidden_layers", 1
+                self.draft_model.config, "num_hidden_layers", 1
             )
             cache_hidden = [[[], []] for _ in range(num_hidden_layers)]
             past_key_values = None
