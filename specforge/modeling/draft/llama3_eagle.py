@@ -911,7 +911,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             hidden_states = layer(
                 input_emb=input_embeds,
                 hidden_states=hidden_states,
-                cache_hidden=cache_hidden[layer] if cache_hidden else None,
+                cache_hidden=cache_hidden[layer.layer_idx] if cache_hidden else None,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
