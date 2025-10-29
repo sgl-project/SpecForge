@@ -115,7 +115,6 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
 
     # finetune
-    parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--baseline-dir", type=str, default=None)
 
     # report backend
@@ -216,7 +215,7 @@ def main():
     draft_model_last_checkpoint = None
     resume_training_state = None
     start_epoch = 0
-    if args.finetune and args.baseline_dir is not None:
+    if args.baseline_dir is not None:
         if os.path.isdir(args.baseline_dir):
             draft_model_last_checkpoint = args.baseline_dir
             print_on_rank0(f"Finetuning from baseline model: {draft_model_last_checkpoint}")
@@ -330,7 +329,7 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
         )
-        
+
 
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
@@ -587,10 +586,10 @@ def main():
                 "epoch": epoch,
                 "args": args,
             }
-            
+
             optimizer_state_dict = optimizer.state_dict()
             optimizer_state_dict["optimizer_state_dict"] = get_full_optimizer_state(optimizer_state_dict["optimizer_state_dict"])
-            
+
             state_to_save.update(optimizer_state_dict)
 
             draft_model_state_dict = {
