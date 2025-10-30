@@ -522,19 +522,12 @@ def record_metrcs(
         dist.all_reduce(acc_i, op=dist.ReduceOp.AVG)
         logdict[f"{mode}/acc_{i}"] = acc_i.item()
         print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
         )
 
     for i in range(len(plosses)):
         loss_i = torch.tensor(plosses[i]).cuda().mean()
         dist.all_reduce(loss_i, op=dist.ReduceOp.AVG, group=get_dp_group())
         logdict[f"{mode}/ploss_{i}"] = loss_i
-        print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
-        )
-    tracker.log(logdict, step=global_step)
-
-
 def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     """
     Get the data shard from the tensor.
@@ -554,7 +547,6 @@ def main():
     sanity_check(args)
     print_with_rank("Initialized distributed environment")
 
-    # ================================================
     # 2. Build models
     # ================================================
     draft_model_config, draft_model = build_draft_model(args)
@@ -564,8 +556,6 @@ def main():
     # 3. Build dataloader
     # ================================================
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
-        args, draft_model_config, processor
-    )
 
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
@@ -678,11 +668,7 @@ def main():
                 last_time = time.time()
                 avg_loss = sum(pl for pl in plosses) / len(plosses)
                 avg_acc = sum(acces) / len(acces)
-                progress_bar.set_postfix(
                     {
-                        "loss": f"{avg_loss:.2f}",
-                        "acc": f"{avg_acc:.2f}",
-                        "time": f"{time_per_step:.2f}s",
                     }
                 )
 
