@@ -6,7 +6,6 @@ but will make the code more easy to implement and understand.
 I will fix them in the future.
 
 1. --draft-micro-batch-size must be 1; This won't stop you from using larger `--draft-global-batch-size`;
-2. --target-tp-size must be equal to NUM_GPUS;
 
 """
 
@@ -36,9 +35,15 @@ from specforge.data import (
     prepare_dp_dataloaders,
 )
 from specforge.data.utils import DataCollatorWithPadding
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.target.sgl_model_wrapper import SglangTargetModel
+from specforge.distributed import (
+    destroy_distributed,
+    get_device_mesh,
+    get_dp_group,
+    get_tp_group,
+    init_distributed,
+)
 from specforge.modeling.target.target_head import TargetHead
+from specforge.modeling.target.target_model import TargetModelFactory
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import NoOpTracker, create_tracker, get_tracker_class
 from specforge.utils import (
@@ -178,6 +183,12 @@ def parse_args():
     parser.add_argument("--profile-start-step", type=int, default=30)
     parser.add_argument("--profile-num-steps", type=int, default=4)
 
+    parser.add_argument(
+        "--target-model-backend",
+        type=str,
+        default="sglang",
+        help="The inference backend used for target model.",
+    )
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
 
@@ -255,12 +266,11 @@ class SglOnlineEagle3Trainer:
         args.tp_size = args.tensor_parallel_size
         args.target_tp_size = args.tp_size
         args.target_micro_batch_size = args.target_tp_size
-        args.target_batch_size = args.target_micro_batch_size * 8
         set_seed(args.seed)
         self.args = args
         if not dist.is_initialized():
             init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-        args.dp_size = dist.get_world_size()  #  // args.tp_size
+        args.dp_size = dist.get_world_size()  # draft model use only dp
         args.draft_accumulation_steps = (
             args.draft_global_batch_size // args.dp_size // args.draft_micro_batch_size
         )
@@ -268,15 +278,17 @@ class SglOnlineEagle3Trainer:
             args.draft_accumulation_steps * args.draft_micro_batch_size * args.dp_size
             == args.draft_global_batch_size
         ), f"{args.draft_global_batch_size=} must be divisible by {args.dp_size=} and {args.draft_micro_batch_size=}"
+        # Ensure that the loops and steps in train_step are aligned, i.e., the number of data_for_drafts must equal tp_size * cumulative steps, because each rank needs to be calculated and steps are counted to form a step.
+        args.target_batch_size = dist.get_world_size() * args.draft_accumulation_steps
         print_with_rank(
+            f"({args.draft_accumulation_steps=}) = ({args.draft_global_batch_size=}) // ({args.dp_size=}) // ({args.draft_micro_batch_size=})"
+        )
+        print_on_rank0(
             f"({args.draft_accumulation_steps=}) = ({args.draft_global_batch_size=}) // ({args.dp_size=}) // ({args.draft_micro_batch_size=})"
         )
         assert (
             args.draft_micro_batch_size == 1
         ), "draft_micro_batch_size must be 1 for SglOnlineEagle3Trainer"
-        assert (
-            args.tp_size == dist.get_world_size()
-        ), "tp_size must be equal to world_size for SglOnlineEagle3Trainer"
         self.draft_model_config = AutoDraftModelConfig.from_file(
             self.args.draft_model_config
         )
@@ -289,7 +301,6 @@ class SglOnlineEagle3Trainer:
             print_on_rank0(
                 f"Last checkpoint detected: {self.draft_model_last_checkpoint}"
             )
-
         self.create_eagle3_model()
         self.train_dataloader, self.eval_dataloader = self.create_dataloaders()
         assert getattr(
@@ -344,11 +355,10 @@ class SglOnlineEagle3Trainer:
         dist.barrier()
 
     def _create_target_model(self):
-        target_model = SglangTargetModel(
+        target_model = TargetModelFactory.create(
             args=self.args,
             target_micro_batch_size=self.args.target_micro_batch_size,
             draft_micro_batch_size=self.args.draft_micro_batch_size,
-            tp_group=dist.group.WORLD,
             enable_aux_hidden_states=True,
             return_full_logits=False,
         )
@@ -388,7 +398,7 @@ class SglOnlineEagle3Trainer:
         param_dtype = torch.bfloat16
         args = self.args
 
-        target_head = TargetHead(args.target_model_path)
+        target_head = TargetHead(args.target_model_path)  # lm_head
         target_head.load_weights(
             model_path=args.target_model_path, lm_head_key=args.lm_head_key
         )
@@ -434,6 +444,7 @@ class SglOnlineEagle3Trainer:
                 cache_dir=os.path.join(self.args.cache_dir, "vocab_mapping"),
                 cache_key=cache_key,
             )
+        # split data by dp rank
         train_dataloader = prepare_dp_dataloaders(
             train_eagle3_dataset,
             1,
@@ -478,14 +489,12 @@ class SglOnlineEagle3Trainer:
                 process_group=get_dp_group(),
             )
             print_with_rank(f"Initialized eval dataloader")
-
         return (
             TrainDataLoaderWrapper(train_dataloader, self.args.num_epochs),
             eval_dataloader,
         )
 
     def shard_model(self):
-        # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
         self.eagle3_model = FSDP(
             self.eagle3_model,
             use_orig_params=True,
@@ -495,8 +504,10 @@ class SglOnlineEagle3Trainer:
                 reduce_dtype=torch.float32,
             ),
             sharding_strategy=ShardingStrategy.NO_SHARD,
-            ignored_modules=[],
-            process_group=dist.group.WORLD,  # get_dp_group(),
+            ignored_modules=(
+                [] if self.args.target_model_backend != "hf" else [self.target_model]
+            ),
+            process_group=dist.group.WORLD,
         )
 
     def create_optimizer(self):
@@ -579,7 +590,6 @@ class SglOnlineEagle3Trainer:
             hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
             target=data["target"].cuda(),  # [B, S, D*3]
         )
-
         # calculate weighted loss
         ploss_weight = [0.8**i for i in range(len(plosses))]
         ploss = (
@@ -688,24 +698,25 @@ class SglOnlineEagle3Trainer:
 
         data_for_target = []
         self.draft_model.train()
-        for _, data in tqdm(
-            enumerate(self.train_dataloader),
-            total=len(self.train_dataloader),
-            desc=f"Training",
-        ):
+        progress_bar = tqdm(self.train_dataloader, desc=f"Training", leave=True)
+        for data in progress_bar:
             data_for_target.append(data)
-            if len(data_for_target) >= self.args.target_batch_size:
+            # target model forward to get hidden states
+            if len(data_for_target) >= self.args.target_batch_size:  # tp size * 8
                 torch.cuda.empty_cache()
                 data_for_draft = self.target_model.forward(
                     data_for_target,
                     draft_data_collator=draft_data_collator,
-                    draft_dp_rank=dist.get_rank(),
+                    draft_dp_rank=dist.get_rank(group=get_tp_group()),
                 )
                 data_for_target = []
                 for data_ in data_for_draft:
                     step_plosses, _, step_acces, do_optimizer_step = self.train_step(
                         data_
                     )
+                    if step_plosses:
+                        current_loss = step_plosses[0].item()
+                        progress_bar.set_postfix({"loss": f"{current_loss:.4f}"})
                     for i in range(len(train_plosses)):
                         train_plosses[i].append(step_plosses[i].item())
                         self.train_logdict[f"train/ploss_{i}"] += (

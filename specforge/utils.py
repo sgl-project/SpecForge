@@ -2,11 +2,13 @@ import json
 import logging
 import os
 import re
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+from safetensors import safe_open
 from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
