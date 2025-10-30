@@ -363,7 +363,6 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         **kwargs,
     ) -> "CustomEagle3TargetModel":
         from specforge.modeling.auto import AutoDistributedTargetModel
-
         target_model = AutoDistributedTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
