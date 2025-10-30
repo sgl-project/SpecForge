@@ -67,8 +67,11 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir, port):
         atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+<<<<<<< HEAD
     dist.destroy_process_group()
 
+=======
+>>>>>>> 179b426 (added abstraction for target model backend)
 
 class TestQwen3MoeTP(unittest.TestCase):
 
@@ -80,8 +83,12 @@ class TestQwen3MoeTP(unittest.TestCase):
 
     def test_qwen3_moe_tp(self):
         # Set to 2 as only 2 GPU avaialble in CI
+<<<<<<< HEAD
         port = get_available_port()
         mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+=======
+        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name))
+>>>>>>> 179b426 (added abstraction for target model backend)
 
 
 if __name__ == "__main__":

@@ -8,10 +8,10 @@ NUM_GPUS=${1:-8}
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    $ROOT_DIR/scripts/train_eagle3_online.py \
+    $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3 \
     --num-epochs 2 \
     --batch-size 2 \
@@ -19,4 +19,7 @@ torchrun \
     --max-length 2048 \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
-    --attention-backend flex_attention
+    --attention-backend flex_attention \
+    --target-model-backend sglang \
+    --report-to wandb \
+    --log-steps 10
