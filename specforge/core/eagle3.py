@@ -51,7 +51,6 @@ class OnlineEagle3Model(Eagle3Model):
 
     def __init__(
         self,
-        target_model,
         draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
@@ -63,95 +62,17 @@ class OnlineEagle3Model(Eagle3Model):
             length: TTT length, it means how many turns to unroll during TTT.
         """
         super().__init__()
-        self.target_model = target_model
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
-
-    @torch.no_grad()
-    def _prepare_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        device: Optional[torch.device] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L692
-        Extract the hidden states from the target model outputs.
-
-        Args:
-            input_ids: (batch, seq_len)
-            attention_mask: (batch, seq_len)
-            loss_mask: (batch, seq_len)
-            device: the device to run the target model, if None, use the input_ids device
-
-        Returns:
-            hidden_states: (batch, seq_len, 3*hidden_size)
-            target: (batch, seq_len, vocab_size)
-            loss_mask: (batch, seq_len)
-            input_ids: (batch, seq_len)
-        """
-
-        if device is None:
-            device = input_ids.device
-
-        outputs = self.target_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-
-        # extract the aux hidden states
-        # output_hidden_states = True will return the embedding output as well
-        # so we have an offset of 1
-        num_hidden_states = len(outputs.hidden_states)
-        offset = 1
-        num_layers = num_hidden_states - 1
-
-        # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
-        eagle3_config_dict = self.draft_model.config.to_dict()
-        eagle_config = eagle3_config_dict.get("eagle_config", None)
-        if (
-            eagle_config is not None
-            and "eagle_aux_hidden_state_layer_ids" in eagle_config
-        ):
-            aux_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
-            assert len(aux_layer_ids) == 3, "EAGLE3 requires 3 aux layers"
-        else:
-            aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
-
-        low_aux_layer = aux_layer_ids[0] + offset
-        mid_aux_layer = aux_layer_ids[1] + offset
-        last_aux_layer = aux_layer_ids[2] + offset
-
-        hidden_states0 = outputs.hidden_states[low_aux_layer]
-        hidden_states1 = outputs.hidden_states[mid_aux_layer]
-        hidden_states2 = outputs.hidden_states[last_aux_layer]
-
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
-
-        # apply pading
-        target = outputs.logits
-        target = padding(target, left=False)
-        input_ids = padding(input_ids, left=False)
-
-        if target is not None:
-            target = target.to(device)
-            loss_mask = loss_mask[..., None]
-            loss_mask = loss_mask.to(device)
-
-        return hidden_states, target, loss_mask, input_ids
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        target: torch.Tensor,
         loss_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
         **kwargs,
@@ -166,11 +87,6 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
         """
-        # Step 0: prepare data with the target model
-        hidden_states, target, loss_mask, input_ids = self._prepare_data(
-            input_ids, attention_mask, loss_mask, **kwargs
-        )
-
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,

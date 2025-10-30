@@ -7,7 +7,9 @@ from accelerate.utils import set_seed
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.llama import LlamaForCausalLM as SFLlamaForCausalLM
+from specforge.modeling.target.custom_backend.llama import (
+    LlamaForCausalLM as SFLlamaForCausalLM,
+)
 from tests.utils import get_available_port
 
 
