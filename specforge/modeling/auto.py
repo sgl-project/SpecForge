@@ -15,6 +15,8 @@ from transformers import (
     Qwen2Config,
     Qwen3Config,
     Qwen3MoeConfig,
+    Qwen3VLConfig,
+    Qwen3VLMoeConfig,
     modeling_utils,
 )
 

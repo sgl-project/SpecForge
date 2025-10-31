@@ -114,6 +114,31 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def apply_interleaved_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
     """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
 
@@ -508,6 +533,67 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
         )
 
 
+class LlamaInterleavedMultiRotaryEmbedding(LlamaRotaryEmbedding):
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 2048,
+        base: int = 10000,
+        device: str = None,
+        scaling_factor: float = 1.0,
+        mrope_section: List[int] = [24, 20, 20],
+    ):
+        """
+        Initializes the LlamaInterleavedMultiRotaryEmbedding.
+
+        Args:
+            dim (int): The feature dimension for RoPE.
+            max_position_embeddings (int): The maximum sequence length.
+            base (int): The base for the rotary frequencies.
+            device (str): The device to initialize tensors on.
+            scaling_factor (float): A factor to scale the rotary embeddings.
+            mrope_section (List[int]): The channel dimension sections for temporal,
+                                       height, and width in the m-RoPE calculation.
+        """
+        # The super().__init__ call initializes self.inv_freq from the base class
+        super().__init__(dim, max_position_embeddings, base, device)
+        self.scaling_factor = scaling_factor
+        self.mrope_section = mrope_section
+
+    def _apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
+        freqs_t = freqs[0]
+        for dim_idx, offset in enumerate((1, 2), start=1):
+            length = self.mrope_section[dim_idx] * 3
+            idx_slice = slice(offset, length, 3)
+            freqs_t[..., idx_slice] = freqs[dim_idx, ..., idx_slice]
+        return freqs_t
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        # In contrast to other models, Qwen3VL has different position ids for the grids
+        # So we expand the inv_freq to shape (3, ...)
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        # can optionally be rewritten as:
+        # if position_ids.ndim == 2:
+        #     position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32 for precision
+            # Calculate base frequencies: (3, bs, seq_len, head_dim/2)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+            interleaved_freqs = self._apply_interleaved_mrope(freqs)
+            emb = torch.cat((interleaved_freqs, interleaved_freqs), dim=-1)
+            cos = emb.cos() * self.scaling_factor
+            sin = emb.sin() * self.scaling_factor
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -589,10 +675,20 @@ class LlamaAttention(nn.Module):
                     high_freq_factor=rope_get("high_freq_factor"),
                     orig_max_position=rope_get("original_max_position_embeddings"),
                 )
-            elif scaling_type == "mrope":
-                self.rotary_emb = LlamaMutiRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings
-                )
+            elif scaling_type in ["mrope", "default"]:
+                is_interleaved = getattr(self.config.rope_scaling, "mrope_interleaved", False)
+                rope_theta = getattr(self.config, "rope_theta", 10000)
+
+                if is_interleaved:
+                    self.rotary_emb = LlamaInterleavedMultiRotaryEmbedding(
+                        self.head_dim,
+                        max_position_embeddings=self.max_position_embeddings,
+                        base=rope_theta
+                    )
+                else:
+                    self.rotary_emb = LlamaMutiRotaryEmbedding(
+                        self.head_dim, max_position_embeddings=self.max_position_embeddings
+                    )
             elif scaling_type == "yarn":
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
@@ -653,6 +749,12 @@ class LlamaAttention(nn.Module):
                     sin,
                     self.config.rope_scaling["mrope_section"],
                 )
+            elif isinstance(self.rotary_emb, LlamaInterleavedMultiRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_interleaved_rotary_pos_emb(
+                    query_states, key_states, cos, sin
+                )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
@@ -683,6 +785,12 @@ class LlamaAttention(nn.Module):
                     cos,
                     sin,
                     self.config.rope_scaling["mrope_section"],
+                )
+            elif isinstance(self.rotary_emb, LlamaInterleavedMultiRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_interleaved_rotary_pos_emb(
+                    query_states, key_states, cos, sin
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)

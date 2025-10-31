@@ -274,6 +274,36 @@ def build_target_model(
                 .eval()
                 .cuda()
             )
+        elif (
+            args.is_vlm
+            and draft_model_config.target_model_type == "qwen3_vl"
+            and args.tp_size == 1
+        ):
+            from transformers import Qwen3VLForConditionalGeneration
+
+            target_model = (
+                Qwen3VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
+            )
+        elif (
+            args.is_vlm
+            and draft_model_config.target_model_type == "qwen3_vl_moe"
+            and args.tp_size == 1
+        ):
+            from transformers import Qwen3VLMoeForConditionalGeneration
+
+            target_model = (
+                Qwen3VLMoeForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
+            )
         else:
             if args.target_model_backend == "sglang":
                 target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -738,7 +768,12 @@ def main():
     # ================================================
     if (
         args.is_vlm
-        and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
+        and getattr(draft_model_config, "target_model_type", None)
+        in {
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        }
     ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
@@ -746,6 +781,7 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            target_model_type=getattr(draft_model_config, "target_model_type", None),
         )
     else:
         eagle3_model = OnlineEagle3Model(
