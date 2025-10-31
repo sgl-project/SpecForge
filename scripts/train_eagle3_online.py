@@ -262,17 +262,44 @@ def main():
                 device_mesh=get_tp_device_mesh(),
             ).eval()
     else:
-        if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
-            from transformers import Qwen2_5_VLForConditionalGeneration
+        if args.is_vlm and draft_model_config.target_model_type in {
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        }:
+            if draft_model_config.target_model_type == "qwen2_5_vl":
+                from transformers import Qwen2_5_VLForConditionalGeneration
 
-            target_model = (
-                Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    torch_dtype=torch.bfloat16,
+                target_model = (
+                    Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        pretrained_model_name_or_path=args.target_model_path,
+                        torch_dtype=torch.bfloat16,
+                    )
+                    .eval()
+                    .cuda()
                 )
-                .eval()
-                .cuda()
-            )
+            elif draft_model_config.target_model_type == "qwen3_vl":
+                from transformers import Qwen3VLForConditionalGeneration
+
+                target_model = (
+                    Qwen3VLForConditionalGeneration.from_pretrained(
+                        pretrained_model_name_or_path=args.target_model_path,
+                        dtype=torch.bfloat16,
+                    )
+                    .eval()
+                    .cuda()
+                )
+            elif draft_model_config.target_model_type == "qwen3_vl_moe":
+                from transformers import Qwen3VLMoeForConditionalGeneration
+
+                target_model = (
+                    Qwen3VLMoeForConditionalGeneration.from_pretrained(
+                        pretrained_model_name_or_path=args.target_model_path,
+                        dtype=torch.bfloat16,
+                    )
+                    .eval()
+                    .cuda()
+                )
         else:
             target_model = (
                 AutoModelForCausalLM.from_pretrained(
@@ -314,6 +341,10 @@ def main():
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
         )
+        if args.build_dataset_num_proc > 0:
+            print_on_rank0(
+                "WARNING: VLM dataset preprocessing may hang with --build-dataset-num-proc > 0"
+            )
     else:
         processor = None
 
@@ -396,13 +427,18 @@ def main():
 
     # build Eagle3 model
     # broadcast draft model
-    if args.is_vlm and draft_model_config.target_model_type == "qwen2_5_vl":
+    if args.is_vlm and draft_model_config.target_model_type in {
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    }:
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            target_model_type=draft_model_config.target_model_type,
         )
     else:
         eagle3_model = OnlineEagle3Model(
