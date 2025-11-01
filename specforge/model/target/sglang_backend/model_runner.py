@@ -2,6 +2,7 @@ import logging
 import os
 
 import torch
+import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_pp_group,
@@ -41,7 +42,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
-from specforge.distributed import get_tp_group as get_specforge_tp_group
+from specforge.distributed import get_target_tp_group as get_specforge_tp_group
 
 from .patch import (
     init_distributed_environment,
@@ -62,161 +63,14 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 logger = logging.getLogger(__name__)
 
 
+import sglang.srt.distributed.parallel_state as parallel_state
+from sglang.srt.distributed import init_model_parallel_group
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+
 class SGLangRunner(ModelRunner):
-
-    def initialize(self, min_per_gpu_memory: float):
-        server_args = self.server_args
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
-        )
-
-        if not self.is_draft_worker:
-            set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(server_args, self.model_config)
-            )
-            if self.tp_rank == 0 and get_bool_env_var(
-                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
-            ):
-                logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
-                )
-
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.tp_rank,
-                )
-            )
-
-        # Expert parallelism
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
-        self.expert_location_updater = ExpertLocationUpdater()
-
-        (
-            ElasticEPStateManager.init(self.server_args)
-            if self.server_args.elastic_ep_backend
-            else None
-        )
-        # Load the model
-        self.sampler = Sampler()
-        self.load_model()
-
-        # Check if the model is using hybrid SWA
-        if (
-            not self.server_args.disable_hybrid_swa_memory
-            and self.sliding_window_size is not None
-            and self.sliding_window_size > 0
-        ):
-            architectures = self.model_config.hf_config.architectures
-            if architectures and not any("Llama4" in arch for arch in architectures):
-                self.is_hybrid = self.model_config.is_hybrid = True
-
-        if config := self.mamba2_config:
-            class_name = config.__class__.__name__
-            logger.warning(f"{class_name} model detected, disable radix cache")
-            self.server_args.disable_radix_cache = True
-
-        # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
-        # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
-        # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
-                self.model_config.num_hidden_layers,
-                self.model_config.num_attention_layers,
-            )
-        )
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
-        self.num_effective_layers = self.end_layer - self.start_layer
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
-            )
-        ), "PP is not compatible with MTP models."
-
-        # Apply torchao quantization
-        torchao_applied = getattr(self.model, "torchao_applied", False)
-        # In layered loading, torchao may have been applied
-        if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, get_global_server_args().torchao_config
-            )
-
-        # Apply torch TP if the model supports it
-        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
-            self.apply_torch_tp()
-
-        # Init lora
-        if server_args.enable_lora:
-            self.init_lora_manager()
-
-        # Init Double Sparsity
-        if server_args.enable_double_sparsity:
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
-                )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
-
-        # Enable batch invariant mode
-        if server_args.enable_deterministic_inference:
-            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
-
-            enable_batch_invariant_mode()
-
-        # Init memory pool and attention backends
-        self.init_memory_pool(
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
-        )
-        if self.device == "cuda":
-            self.init_cublas()
-            self.init_attention_backend()
-            self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
-            self.init_attention_backend()
-            self.init_device_graphs()
-        else:
-            self.graph_runner = None
-            self.graph_mem_usage = 0
-            self.init_attention_backend()
-
-        # auxiliary hidden capture mode. TODO: expose this to server args?
-        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
-            # load draft config
-            draft_model_config = ModelConfig.from_server_args(
-                server_args,
-                model_path=(server_args.speculative_draft_model_path),
-                is_draft_model=True,
-            )
-
-            try:
-                # get the aux layer from draft model config
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
-                )
-                eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                eagle_aux_hidden_state_layer_ids = None
-
-            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+    def model_specific_adjustment(self):
+        pass
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")

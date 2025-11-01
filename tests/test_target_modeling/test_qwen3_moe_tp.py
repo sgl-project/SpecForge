@@ -69,6 +69,7 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir, port):
 
     dist.destroy_process_group()
 
+
 class TestQwen3MoeTP(unittest.TestCase):
 
     def setUp(self):

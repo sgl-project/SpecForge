@@ -1,8 +1,8 @@
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
+
+from .lr_scheduler import CosineAnnealingWarmupLR
 
 
 class BF16Optimizer:

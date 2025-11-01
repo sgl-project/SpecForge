@@ -1,13 +1,9 @@
 import argparse
-import gc
-import os
-import sys
 import time
 
-import numpy as np
 import torch
 
-from specforge.core.loss import LogSoftmaxLoss, _compute_loss
+from specforge.model.loss import LogSoftmaxLoss, _compute_loss
 
 TTT_LENGTH = 7
 

@@ -25,12 +25,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.cache_utils import DynamicCache
 
-from specforge.core.loss import LogSoftmaxLoss
-from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
+
+from .draft import Eagle3DraftModel
+from .loss import LogSoftmaxLoss
 
 
 class Eagle3Model(nn.Module):
@@ -208,7 +208,6 @@ class OfflineEagle3Model(OnlineEagle3Model):
         draft_model,
         length: int = 7,
         attention_backend="sdpa",
-        target_model=None,
     ):
         """
         Args:
@@ -217,7 +216,6 @@ class OfflineEagle3Model(OnlineEagle3Model):
             length: TTT length, it means how many turns to unroll during TTT.
         """
         super().__init__(
-            target_model=target_model,
             draft_model=draft_model,
             length=length,
             attention_backend=attention_backend,
@@ -273,7 +271,7 @@ class OfflineEagle3Model(OnlineEagle3Model):
         return super().forward(
             input_ids,
             attention_mask,
-            loss_mask,
+            loss_mask.unsqueeze(-1),
             past_key_values,
             position_ids,
             **kwargs,

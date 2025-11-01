@@ -1,5 +1,4 @@
 import argparse
-import gc
 import time
 
 import matplotlib.pyplot as plt
@@ -9,12 +8,11 @@ import torch._dynamo as dynamo
 from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
-from specforge.modeling.draft.llama3_eagle import (
+from specforge.model.draft.llama3_eagle import (
     LlamaAttention,
     LlamaFlexAttention,
     prepare_decoder_attention_mask,
 )
-from specforge.utils import padding
 
 dynamo.config.recompile_limit = 64
 

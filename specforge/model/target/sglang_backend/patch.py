@@ -17,7 +17,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
-from specforge.distributed import get_tp_group as get_specforge_tp_group
+from specforge.distributed import get_target_tp_group as get_specforge_tp_group
 
 logger = logging.getLogger(__name__)
 

@@ -5,19 +5,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
+from transformers import LlamaConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from specforge.modeling.draft.flex_attention import (
+from specforge.utils import print_with_rank
+
+from .base import Eagle3DraftModel
+from .flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.utils import print_with_rank
-
-from .base import Eagle3DraftModel
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -960,10 +960,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()

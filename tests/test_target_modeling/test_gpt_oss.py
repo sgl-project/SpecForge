@@ -9,7 +9,9 @@ from accelerate.utils import set_seed
 from transformers import GptOssConfig, GptOssForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.custom_backend.gpt_oss import GptOssForCausalLM as DistGptOssForCausalLM
+from specforge.modeling.target.custom_backend.gpt_oss import (
+    GptOssForCausalLM as DistGptOssForCausalLM,
+)
 from tests.utils import get_available_port
 
 
