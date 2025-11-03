@@ -10,9 +10,7 @@ from transformers.models.qwen3 import Qwen3Config
 from transformers.models.qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.qwen3 import (
-    Qwen3ForCausalLM as SFLQwen3ForCausalLM,
-)
+from specforge.modeling.target.qwen3 import Qwen3ForCausalLM as SFLQwen3ForCausalLM
 
 
 def test_qwen3_moe_tp(rank, world_size, temp_dir):

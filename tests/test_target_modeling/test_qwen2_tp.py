@@ -10,9 +10,7 @@ from transformers import Qwen2Config
 from transformers import Qwen2ForCausalLM as HFWen2ForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.qwen2 import (
-    Qwen2ForCausalLM as SFLQwen2ForCausalLM,
-)
+from specforge.modeling.target.qwen2 import Qwen2ForCausalLM as SFLQwen2ForCausalLM
 
 
 def test_qwen2_tp(rank, world_size, temp_dir):

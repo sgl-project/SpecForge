@@ -10,9 +10,7 @@ from transformers import Llama4ForCausalLM as HFLlama4ForCausalLM
 from transformers import Llama4TextConfig
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.llama4 import (
-    Llama4ForCausalLM as SFLlama4ForCausalLM,
-)
+from specforge.modeling.target.llama4 import Llama4ForCausalLM as SFLlama4ForCausalLM
 
 
 def test_llama4_tp(rank, world_size, temp_dir):
