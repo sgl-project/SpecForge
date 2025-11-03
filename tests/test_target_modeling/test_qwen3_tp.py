@@ -14,7 +14,7 @@ from specforge.modeling.target.qwen3 import Qwen3ForCausalLM as SFLQwen3ForCausa
 from tests.utils import get_available_port
 
 
-def test_qwen3_moe_tp(rank, world_size, temp_dir, port):
+def test_qwen3_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -66,7 +66,7 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir, port):
     dist.destroy_process_group()
 
 
-class TestQwen3MoeTP(unittest.TestCase):
+class TestQwen3TP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -74,16 +74,16 @@ class TestQwen3MoeTP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_qwen3_moe_tp(self):
+    def test_qwen3_tp(self):
         # Set to 2 as only 2 GPU avaialble in CI
         port = get_available_port()
-        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(test_qwen3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
 
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestQwen3MoeTP))
+    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestQwen3TP))
 
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

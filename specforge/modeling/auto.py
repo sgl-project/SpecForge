@@ -122,7 +122,12 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
             torch_dtype=torch_dtype,
             cache_dir=cache_dir,
             **config_kwargs,
-        ).cuda()
+        )
+
+        if device is not None:
+            model = model.to(device)
+        else:
+            model = model.cuda()
         return model
 
 

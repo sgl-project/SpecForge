@@ -147,21 +147,30 @@ class ColumnParallelLinear(nn.Module):
             up = shard_tensor(up, self.tp_group, 0)
             state_dict["weight"] = torch.cat((gate, up), dim=0)
 
-        assert "bias" not in state_dict, "Bias is not supported for merged QKV layout"
+        if "bias" in state_dict and state_dict["bias"] is not None:
+            gate, up = state_dict["bias"].chunk(2, dim=0)
+            gate = shard_tensor(gate, self.tp_group, 0)
+            up = shard_tensor(up, self.tp_group, 0)
+            state_dict["bias"] = torch.cat((gate, up), dim=0)
 
     def handle_merged_qkv(self, state_dict, *args):
         """
         This handles the merged QKV layout where the q, k, v weights are concatenated along the column dimension.
         """
         if "weight" in state_dict:
-            # need to re-order qkv
+            # need to split into qkv and take the correct chunk for the rank
             q, k, v = state_dict["weight"].chunk(3, dim=0)
             q = shard_tensor(q, self.tp_group, 0)
             k = shard_tensor(k, self.tp_group, 0)
             v = shard_tensor(v, self.tp_group, 0)
             state_dict["weight"] = torch.cat((q, k, v), dim=0)
 
-        assert "bias" not in state_dict, "Bias is not supported for merged QKV layout"
+        if "bias" in state_dict and state_dict["bias"] is not None:
+            q, k, v = state_dict["bias"].chunk(3, dim=0)
+            q = shard_tensor(q, self.tp_group, 0)
+            k = shard_tensor(k, self.tp_group, 0)
+            v = shard_tensor(v, self.tp_group, 0)
+            state_dict["bias"] = torch.cat((q, k, v), dim=0)
 
     def forward(self, x):
         return F.linear(x, self.weight, self.bias)
