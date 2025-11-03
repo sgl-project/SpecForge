@@ -11,13 +11,14 @@ from transformers.models.phi3 import Phi3ForCausalLM as HFPhi3ForCausalLM
 
 from specforge.distributed import init_distributed
 from specforge.modeling.target.phi3 import Phi3ForCausalLM as SFLPhi3ForCausalLM
+from tests.utils import get_available_port
 
 
-def test_phi3_tp(rank, world_size, temp_dir):
+def test_phi3_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29501"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=2)
     set_seed(42)
@@ -75,7 +76,8 @@ class TestPhi3TP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_phi3_tp(self):
-        mp.spawn(test_phi3_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_phi3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":

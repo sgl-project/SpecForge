@@ -10,13 +10,14 @@ from transformers import GptOssConfig, GptOssForCausalLM
 
 from specforge.distributed import init_distributed
 from specforge.modeling.target.gpt_oss import GptOssForCausalLM as DistGptOssForCausalLM
+from tests.utils import get_available_port
 
 
-def test_gpt_oss_tp(rank, world_size, temp_dir):
+def test_gpt_oss_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=2)
     set_seed(42)
@@ -79,7 +80,8 @@ class TestGptOssTP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_gpt_oss_tp(self):
-        mp.spawn(test_gpt_oss_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_gpt_oss_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":

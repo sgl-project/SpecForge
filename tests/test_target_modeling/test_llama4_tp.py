@@ -11,13 +11,14 @@ from transformers import Llama4TextConfig
 
 from specforge.distributed import init_distributed
 from specforge.modeling.target.llama4 import Llama4ForCausalLM as SFLlama4ForCausalLM
+from tests.utils import get_available_port
 
 
-def test_llama4_tp(rank, world_size, temp_dir):
+def test_llama4_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=world_size)
     set_seed(42)
@@ -76,7 +77,8 @@ class TestLlama4TP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_llama4_tp(self):
-        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":

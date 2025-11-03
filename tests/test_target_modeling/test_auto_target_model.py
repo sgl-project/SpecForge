@@ -8,15 +8,17 @@ from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from specforge.distributed import init_distributed
 from specforge.modeling.target.llama import LlamaForCausalLM as SFLlamaForCausalLM
+from tests.utils import get_available_port
 
 
 class TestAutoTargetModel(unittest.TestCase):
 
     def test_auto_target_model(self):
+        port = get_available_port()
         os.environ["RANK"] = str(0)
         os.environ["WORLD_SIZE"] = str(1)
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "29500"
+        os.environ["MASTER_PORT"] = str(port)
 
         init_distributed(tp_size=1)
 
