@@ -2,6 +2,7 @@ import os
 import unittest
 
 import torch
+import torch.distributed as dist
 from accelerate.utils import set_seed
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
@@ -44,6 +45,8 @@ class TestAutoTargetModel(unittest.TestCase):
             rtol=1e-5,
             atol=1e-5,
         ), f"Logits are not close, {expected_logits} vs {dist_logits}"
+
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

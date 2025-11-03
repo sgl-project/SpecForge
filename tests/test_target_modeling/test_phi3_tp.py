@@ -63,6 +63,8 @@ def test_phi3_tp(rank, world_size, temp_dir):
         atol=1e-4,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+    dist.destroy_process_group()
+
 
 class TestPhi3TP(unittest.TestCase):
 

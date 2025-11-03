@@ -65,6 +65,8 @@ def test_qwen2_tp(rank, world_size, temp_dir):
         atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+    dist.destroy_process_group()
+
 
 class TestQwen2TP(unittest.TestCase):
 

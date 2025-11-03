@@ -67,6 +67,8 @@ def test_gpt_oss_tp(rank, world_size, temp_dir):
         atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+    dist.destroy_process_group()
+
 
 class TestGptOssTP(unittest.TestCase):
 
