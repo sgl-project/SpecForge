@@ -2,7 +2,8 @@ pre-commit
 torch==2.8.0
 torchaudio==2.8.0
 torchvision==0.23.0
-transformers==4.55.2
+sglang[all]==0.5.1
+transformers==4.57.1
 qwen-vl-utils==0.0.11
 datasets
 setuptools
@@ -12,5 +13,5 @@ psutil
 numpy
 accelerate
 pydantic
-sglang[all]==0.5.1
+
 openai-harmony

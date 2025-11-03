@@ -29,3 +29,5 @@ jobs:
         timeout-minutes: 10
         run: |
           python tests/ci/gpu_lock_exec.py --devices 6,7 python -m unittest discover -s ./tests -p "test_*.py"
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
