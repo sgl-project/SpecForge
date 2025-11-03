@@ -27,6 +27,9 @@ def main():
     for env_var in args.env:
         name, value = env_var.split("=")
         os.environ[name] = value
+        print(
+            f"[gpu_lock_exec] Setting environment variable: {name}={value}", flush=True
+        )
     print(f"[gpu_lock_exec] Acquired GPUs: {dev_list}", flush=True)
 
     _os_execvp(args)
