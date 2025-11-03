@@ -125,6 +125,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         ).cuda()
         return model
 
+
 class AutoDraftModelConfig:
 
     _config_mapping = {

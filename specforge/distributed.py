@@ -68,6 +68,7 @@ def destroy_distributed():
     dist.destroy_process_group(_DP_GROUP)
     dist.destroy_process_group()
 
+
 def shard_tensor(
     tensor: torch.Tensor, process_group: dist.ProcessGroup = None, dim: int = -1
 ) -> torch.Tensor:

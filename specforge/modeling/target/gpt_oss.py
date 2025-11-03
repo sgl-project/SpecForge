@@ -38,9 +38,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import OutputRecorder, check_model_inputs
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import get_tp_group, shard_tensor
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
-from specforge.distributed import shard_tensor
 
 
 class GptOssExperts(nn.Module):
@@ -80,7 +79,7 @@ class GptOssExperts(nn.Module):
             # columnwise splitting
             value = state_dict["down_proj"]
             state_dict["down_proj"] = shard_tensor(value, self.tp_group, 1)
-        
+
         if "down_proj_bias" in state_dict:
             value = state_dict["down_proj_bias"]
             if dist.get_rank(self.tp_group) != 0:
