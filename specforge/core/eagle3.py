@@ -121,7 +121,7 @@ class OnlineEagle3Model(Eagle3Model):
             aux_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
             assert len(aux_layer_ids) == 3, "EAGLE3 requires 3 aux layers"
         else:
-            aux_layer_ids = [1, num_layers // 2, num_layers - 4]
+            aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
 
         low_aux_layer = aux_layer_ids[0] + offset
         mid_aux_layer = aux_layer_ids[1] + offset
@@ -276,6 +276,7 @@ class OnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
 
@@ -650,6 +651,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 
 

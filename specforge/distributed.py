@@ -8,6 +8,7 @@ from specforge.utils import print_with_rank
 _DEVICE_MESH = None
 _TP_DEVICE_MESH = None
 _TP_GROUP = None
+_DP_DEVICE_MESH = None
 _DP_GROUP = None
 
 
@@ -29,6 +30,11 @@ def get_device_mesh():
 def get_tp_device_mesh():
     global _TP_DEVICE_MESH
     return _TP_DEVICE_MESH
+
+
+def get_dp_device_mesh():
+    global _DP_DEVICE_MESH
+    return _DP_DEVICE_MESH
 
 
 def init_distributed(timeout: int = 10, tp_size: int = 1):
@@ -55,11 +61,12 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
 
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
     _TP_DEVICE_MESH = tp_device_mesh
     _DP_GROUP = dp_group
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
 
 
 def destroy_distributed():

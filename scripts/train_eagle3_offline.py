@@ -9,8 +9,7 @@ import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -21,12 +20,18 @@ from specforge.data import (
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_device_mesh,
+    get_dp_group,
+    init_distributed,
+)
 from specforge.modeling.target.target_head import TargetHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
+    get_full_optimizer_state,
     get_last_checkpoint,
     print_on_rank0,
     print_with_rank,
@@ -340,19 +345,12 @@ def main():
         length=args.ttt_length,
         attention_backend=args.draft_attention_backend,
     )
-    eagle3_model = FSDP(
-        eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            keep_low_precision_grads=False,
-        ),
-        sharding_strategy=ShardingStrategy.NO_SHARD,
-        ignored_modules=[],
-        process_group=get_dp_group(),
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
+    fsdp_config = {"mesh": get_dp_device_mesh(), "mp_policy": mp_policy}
+    fully_shard(eagle3_model, **fsdp_config)
+
     print_with_rank(f"Initialized Eagle3 FSDP model")
     global_step, batch_index = 0, 0
     log_dict = defaultdict(float)
@@ -373,8 +371,8 @@ def main():
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
-        epoch_acces = [[] for _ in range(eagle3_model.module.length)]
-        epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
+        epoch_acces = [[] for _ in range(eagle3_model.length)]
+        epoch_plosses = [[] for _ in range(eagle3_model.length)]
 
         if dist.get_rank() == 0:
             progress_bar = tqdm(
@@ -530,33 +528,44 @@ def main():
                 os.makedirs(epoch_output_dir, exist_ok=True)
             dist.barrier()
 
-            with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
-                model_state_dict = eagle3_model.state_dict()
-                state_to_save = {
-                    "epoch": epoch,
-                    "args": args,
-                }
-                state_to_save.update(optimizer.state_dict())
-                draft_model_state_dict = {
-                    k.replace("draft_model.", ""): v
-                    for k, v in model_state_dict.items()
-                    if "draft_model." in k and "embed" not in k.lower()
-                }
+            model_state_dict = eagle3_model.state_dict()
 
-                if dist.get_rank() == 0:
-                    torch.save(
-                        state_to_save,
-                        os.path.join(epoch_output_dir, "training_state.pt"),
-                    )
-                    print_on_rank0(
-                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
-                    )
-                    draft_model.save_pretrained(
-                        epoch_output_dir,
-                        state_dict=draft_model_state_dict,
-                    )
-                    print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-                dist.barrier()
+            state_to_save = {
+                "epoch": epoch,
+                "args": args,
+            }
+
+            optimizer_state_dict = optimizer.state_dict()
+            optimizer_state_dict["optimizer_state_dict"] = get_full_optimizer_state(
+                optimizer_state_dict["optimizer_state_dict"]
+            )
+
+            state_to_save.update(optimizer_state_dict)
+
+            draft_model_state_dict = {
+                k.replace("draft_model.", ""): (
+                    v.full_tensor()
+                    if isinstance(v, torch.distributed.tensor.DTensor)
+                    else v
+                )
+                for k, v in model_state_dict.items()
+                if "draft_model." in k and "embed" not in k.lower()
+            }
+
+            if dist.get_rank() == 0:
+                torch.save(
+                    state_to_save,
+                    os.path.join(epoch_output_dir, "training_state.pt"),
+                )
+                print_on_rank0(
+                    f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                )
+                draft_model.save_pretrained(
+                    epoch_output_dir,
+                    state_dict=draft_model_state_dict,
+                )
+                print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+            dist.barrier()
 
     # Close the tracker at the end of training
     tracker.close()
