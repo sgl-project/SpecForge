@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -e .
+          pip install -e . --no-deps
 
       - name: Run test
         timeout-minutes: 10
