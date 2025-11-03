@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -32,100 +31,22 @@ from transformers.masking_utils import (
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
     MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    apply_rotary_pos_emb,
+    eager_attention_forward,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import gather_tensor, get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
-from .base import DistributedTargetModel
-
 logger = logging.get_logger(__name__)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query.dtype
-    )
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -802,9 +723,7 @@ def load_balancing_loss_func(
 
 
 @auto_docstring
-class Qwen3MoeForCausalLM(
-    Qwen3MoePreTrainedModel, GenerationMixin, DistributedTargetModel
-):
+class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -927,7 +846,7 @@ class Qwen3MoeForCausalLM(
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         # Gather logits from all TP ranks
-        logits = self._gather_tensor(logits, get_tp_group())
+        logits = gather_tensor(logits, get_tp_group())
 
         loss = None
         if labels is not None:
@@ -955,83 +874,3 @@ class Qwen3MoeForCausalLM(
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
         )
-
-    def load_weights(self, state_dict: Dict[str, torch.Tensor]):
-        """Load weights with TP sharding support"""
-        tp_group = get_tp_group()
-
-        updated_state_dict = {}
-        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
-        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
-        for key, value in state_dict.items():
-            # Ensure that the state dict is a flat dict of keys and tensors
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(
-                    f"Expected all values in the state dict to be torch.Tensor. "
-                    f"Found {type(value)} instead."
-                )
-
-            module_key = ".".join(key.split(".")[:-1])
-            try:
-                module = self.get_submodule(module_key)
-            except AttributeError:
-                # Skip keys that don't correspond to existing modules
-                continue
-
-            # Handle expert weights specially
-            if "experts.gate_up_proj" in key:
-                gate, up = value.chunk(2, dim=-1)
-                # Shard the gate and up based on tp
-                gate = self._shard_tensor(gate, tp_group, -1)
-                up = self._shard_tensor(up, tp_group, -1)
-                value = torch.cat((gate, up), dim=-1)
-            elif "experts.down_proj" in key:
-                value = self._shard_tensor(value, tp_group, 1)
-            elif "self_attn" in key and key.endswith(".weight"):
-                # Get the attention layer to access head configuration
-                layer_match = key.split(".")
-                layer_idx = None
-                for i, part in enumerate(layer_match):
-                    if part.startswith("layers") and i + 1 < len(layer_match):
-                        try:
-                            layer_idx = int(layer_match[i + 1])
-                            break
-                        except (ValueError, IndexError):
-                            continue
-
-                if layer_idx is not None:
-                    attention_layer = self.model.layers[layer_idx].self_attn
-
-                    if "q_proj" in key:
-                        value = self._shard_tensor(value, tp_group, 0)
-                    elif "k_proj" in key or "v_proj" in key:
-                        # K/V projection: handle replication case
-                        head_dim = attention_layer.head_dim
-
-                        if tp_size > attention_layer.total_num_kv_heads:
-                            # Replication case: each rank gets one KV head, but replicated
-                            # All ranks within a replica group get the same KV head
-                            kv_shard_id = (
-                                tp_rank // attention_layer.num_kv_head_replicas
-                            )
-                            single_kv_head_size = head_dim
-                            start_idx = kv_shard_id * single_kv_head_size
-                            value = value.narrow(0, start_idx, single_kv_head_size)
-                        else:
-                            # Normal sharding case
-                            value = self._shard_tensor(value, tp_group, 0)
-                    elif "o_proj" in key:
-                        # O projection: row-wise sharding
-                        value = self._shard_tensor(value, tp_group, -1)
-
-            elif isinstance(module, RowParallelLinear) and key.endswith(".weight"):
-                value = self._shard_tensor(value, tp_group, -1)
-            elif isinstance(module, ColumnParallelLinear) and key.endswith(".weight"):
-                value = self._shard_tensor(value, tp_group, 0)
-            elif isinstance(module, ColumnParallelLinear) and key.endswith(".bias"):
-                value = self._shard_tensor(value, tp_group, 0)
-
-            updated_state_dict[key] = value
-
-        # Load state dict
-        self.load_state_dict(updated_state_dict, strict=False)

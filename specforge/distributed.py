@@ -67,3 +67,20 @@ def destroy_distributed():
     dist.destroy_process_group(_TP_GROUP)
     dist.destroy_process_group(_DP_GROUP)
     dist.destroy_process_group()
+
+def shard_tensor(
+    tensor: torch.Tensor, process_group: dist.ProcessGroup = None, dim: int = -1
+) -> torch.Tensor:
+    rank = dist.get_rank(process_group)
+    size = dist.get_world_size(process_group)
+    return tensor.chunk(size, dim=dim)[rank].contiguous()
+
+
+def gather_tensor(
+    tensor: torch.Tensor, process_group: dist.ProcessGroup = None, dim: int = -1
+) -> torch.Tensor:
+    size = dist.get_world_size(process_group)
+    obj_list = [torch.empty_like(tensor) for _ in range(size)]
+    dist.all_gather(obj_list, tensor, group=process_group)
+    gather_tensor = torch.cat(obj_list, dim=dim)
+    return gather_tensor

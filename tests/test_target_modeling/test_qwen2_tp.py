@@ -6,9 +6,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen2Config
+from transformers import Qwen2ForCausalLM as HFWen2ForCausalLM
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.qwen2 import (
+    Qwen2ForCausalLM as SFLQwen2ForCausalLM,
+)
 
 
 def test_qwen2_tp(rank, world_size, temp_dir):
@@ -36,11 +40,7 @@ def test_qwen2_tp(rank, world_size, temp_dir):
     )
 
     # create the single-gpu
-    model = Qwen2ForCausalLM(config).cuda()
-
-    from specforge.modeling.target.qwen2 import Qwen2ForCausalLM as DistQwen2ForCausalLM
-
-    dist_model = DistQwen2ForCausalLM(config).cuda()
+    model = HFWen2ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -50,7 +50,7 @@ def test_qwen2_tp(rank, world_size, temp_dir):
 
     # load the model weights to the distributed model
     print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = SFLQwen2ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data

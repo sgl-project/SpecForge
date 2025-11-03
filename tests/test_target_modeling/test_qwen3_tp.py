@@ -6,10 +6,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+from transformers.models.qwen3 import Qwen3Config
+from transformers.models.qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.qwen3 import (
+    Qwen3ForCausalLM as SFLQwen3ForCausalLM,
+)
 
 
 def test_qwen3_moe_tp(rank, world_size, temp_dir):
@@ -20,7 +23,7 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
 
     init_distributed(tp_size=2)
     set_seed(42)
-    config = Qwen3MoeConfig(
+    config = Qwen3Config(
         vocab_size=1000,
         hidden_size=384,
         intermediate_size=512,
@@ -29,20 +32,12 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
         max_position_embeddings=1024,
         num_attention_heads=8,
         num_key_value_heads=4,
-        num_experts=64,
-        num_experts_per_tok=8,
         hidden_act="silu",
         rms_norm_eps=1e-6,
     )
 
     # create a simple single-gpu model
-    model = Qwen3MoeForCausalLM(config).cuda()
-
-    from specforge.modeling.target.qwen3_moe import (
-        Qwen3MoeForCausalLM as DistQwen3MoeForCausalLM,
-    )
-
-    dist_model = DistQwen3MoeForCausalLM(config).cuda()
+    model = HFQwen3ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -52,7 +47,7 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
 
     # load the model weights to the distributed model
     print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = SFLQwen3ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data

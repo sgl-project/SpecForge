@@ -9,6 +9,7 @@ from accelerate.utils import set_seed
 from transformers import GptOssConfig, GptOssForCausalLM
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.gpt_oss import GptOssForCausalLM as DistGptOssForCausalLM
 
 
 def test_gpt_oss_tp(rank, world_size, temp_dir):
@@ -42,13 +43,6 @@ def test_gpt_oss_tp(rank, world_size, temp_dir):
     # create the single-gpu
     model = GptOssForCausalLM(config).cuda().eval()
 
-    from specforge.modeling.target.gpt_oss import (
-        GptOssForCausalLM as DistGptOssForCausalLM,
-    )
-
-    dist_model = DistGptOssForCausalLM(config).cuda().eval()
-
-    # save the model weights to a temp directory
     if dist.get_rank() == 0:
         model.save_pretrained(temp_dir)
         print(f"Saved model to {temp_dir}")
@@ -56,7 +50,7 @@ def test_gpt_oss_tp(rank, world_size, temp_dir):
 
     # # load the model weights to the distributed model
     print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = DistGptOssForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # # create data

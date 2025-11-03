@@ -6,9 +6,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import Llama4ForCausalLM, Llama4TextConfig
+from transformers import Llama4ForCausalLM as HFLlama4ForCausalLM
+from transformers import Llama4TextConfig
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.llama4 import (
+    Llama4ForCausalLM as SFLlama4ForCausalLM,
+)
 
 
 def test_llama4_tp(rank, world_size, temp_dir):
@@ -17,7 +21,7 @@ def test_llama4_tp(rank, world_size, temp_dir):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
 
-    init_distributed(tp_size=2)
+    init_distributed(tp_size=world_size)
     set_seed(42)
     config = Llama4TextConfig(
         vocab_size=1000,
@@ -36,13 +40,7 @@ def test_llama4_tp(rank, world_size, temp_dir):
     )
 
     # create the single-gpu
-    model = Llama4ForCausalLM(config).cuda()
-
-    from specforge.modeling.target.llama4 import (
-        Llama4ForCausalLM as DistLlama4ForCausalLM,
-    )
-
-    dist_model = DistLlama4ForCausalLM(config).cuda()
+    model = HFLlama4ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -51,8 +49,7 @@ def test_llama4_tp(rank, world_size, temp_dir):
     dist.barrier()
 
     # load the model weights to the distributed model
-    print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = SFLlama4ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
