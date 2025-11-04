@@ -902,6 +902,12 @@ class LlamaFlexAttention(LlamaAttention):
                 sin,
                 self.config.rope_scaling["mrope_section"],
             )
+        elif isinstance(self.rotary_emb, LlamaInterleavedMultiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_interleaved_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
         else:
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
