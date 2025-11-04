@@ -38,6 +38,11 @@ def _calculate_settings(n):
         num_warps = 16
     elif BLOCK_SIZE >= 2048:
         num_warps = 8
+
+    # AMD GPU (ROCm)
+    if hasattr(torch.version, "hip") and torch.version.hip is not None:
+        num_warps //= 2
+
     return BLOCK_SIZE, num_warps
 
 

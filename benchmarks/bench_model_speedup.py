@@ -24,7 +24,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 bench_model_speedup.py \
     --tp-size 4 \
     --attention-backend fa3 \
     --config-list "${config_list[@]}" \
-    --benchmark-list mtbench:80 gsm8k:200 humaneval:200 math500:200 \
+    --benchmark-list mtbench:80 gsm8k:200 humaneval:200 math500:200 ceval:200 cmmlu:200 \
     --output lmsys_gpt-oss-120b_Eagle3_result.jsonl
 """
 import argparse
@@ -64,7 +64,14 @@ def parse_args():
         "--benchmark-list",
         type=str,
         nargs="+",
-        default=["mtbench:80", "gsm8k:200", "humaneval:200", "math500:200"],
+        default=[
+            "mtbench:80",
+            "gsm8k:200",
+            "humaneval:200",
+            "math500:200",
+            "ceval:200",
+            "cmmlu:200",
+        ],
     )
     parser.add_argument(
         "--split-category",
@@ -149,6 +156,30 @@ def get_math500_conversations(num_prompts: int):
     dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
     prompts = [q["problem"] for q in dataset][:num_prompts]
     bench_name = "math500"
+    bench_conversations = {bench_name: []}
+    for i in range(len(prompts)):
+        bench_conversations[bench_name].append(
+            [{"role": "user", "content": prompts[i]}]
+        )
+    return bench_conversations
+
+
+def get_ceval_conversations(num_prompts: int):
+    dataset = load_dataset("zhaode/ceval")["train"]
+    prompts = [q["instruction"] for q in dataset][:num_prompts]
+    bench_name = "ceval"
+    bench_conversations = {bench_name: []}
+    for i in range(len(prompts)):
+        bench_conversations[bench_name].append(
+            [{"role": "user", "content": prompts[i]}]
+        )
+    return bench_conversations
+
+
+def get_cmmlu_conversations(num_prompts: int):
+    dataset = load_dataset("zhaode/cmmlu")["train"]
+    prompts = [q["instruction"] for q in dataset][:num_prompts]
+    bench_name = "ceval"
     bench_conversations = {bench_name: []}
     for i in range(len(prompts)):
         bench_conversations[bench_name].append(
@@ -355,6 +386,10 @@ def main():
             bench_conversations.update(get_humaneval_conversations(num_prompts))
         elif bench_name == "math500":
             bench_conversations.update(get_math500_conversations(num_prompts))
+        elif bench_name == "ceval":
+            bench_conversations.update(get_ceval_conversations(num_prompts))
+        elif bench_name == "cmmlu":
+            bench_conversations.update(get_cmmlu_conversations(num_prompts))
         else:
             print(f"{bench_name} is not supported yet, skip ... ")
             continue

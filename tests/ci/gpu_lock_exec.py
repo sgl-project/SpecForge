@@ -22,7 +22,16 @@ def main():
     fd_locks = _try_acquire(args)
 
     dev_list = ",".join(str(x.gpu_id) for x in fd_locks)
-    os.environ[args.target_env_name] = dev_list
+    os.environ["CUDA_VISIBLE_DEVICES"] = dev_list
+
+    if args.env:
+        for env_var in args.env:
+            name, value = env_var.split("=")
+            os.environ[name] = value
+            print(
+                f"[gpu_lock_exec] Setting environment variable: {name}={value}",
+                flush=True,
+            )
     print(f"[gpu_lock_exec] Acquired GPUs: {dev_list}", flush=True)
 
     _os_execvp(args)
@@ -32,6 +41,8 @@ def _os_execvp(args):
     cmd = args.cmd
     if cmd[0] == "--":
         cmd = cmd[1:]
+
+    # propagate the environment variables
     os.execvp(cmd[0], cmd)
 
 
@@ -56,10 +67,11 @@ def _parse_args():
         help="Seconds to wait for locks before failing",
     )
     p.add_argument(
-        "--target-env-name",
+        "--env",
         type=str,
-        default="CUDA_VISIBLE_DEVICES",
-        help="Which env var to set for devices",
+        default=None,
+        nargs="*",
+        help="Environment variables to set (e.g. HF_TOKEN=1234567890)",
     )
     p.add_argument(
         "--lock-path-pattern",

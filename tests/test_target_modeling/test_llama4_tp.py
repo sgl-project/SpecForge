@@ -6,18 +6,21 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import Llama4ForCausalLM, Llama4TextConfig
+from transformers import Llama4ForCausalLM as HFLlama4ForCausalLM
+from transformers import Llama4TextConfig
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.llama4 import Llama4ForCausalLM as SFLlama4ForCausalLM
+from tests.utils import get_available_port
 
 
-def test_llama4_tp(rank, world_size, temp_dir):
+def test_llama4_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = str(port)
 
-    init_distributed(tp_size=2)
+    init_distributed(tp_size=world_size)
     set_seed(42)
     config = Llama4TextConfig(
         vocab_size=1000,
@@ -36,13 +39,7 @@ def test_llama4_tp(rank, world_size, temp_dir):
     )
 
     # create the single-gpu
-    model = Llama4ForCausalLM(config).cuda()
-
-    from specforge.modeling.target.llama4 import (
-        Llama4ForCausalLM as DistLlama4ForCausalLM,
-    )
-
-    dist_model = DistLlama4ForCausalLM(config).cuda()
+    model = HFLlama4ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -51,8 +48,7 @@ def test_llama4_tp(rank, world_size, temp_dir):
     dist.barrier()
 
     # load the model weights to the distributed model
-    print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = SFLlama4ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
@@ -69,6 +65,8 @@ def test_llama4_tp(rank, world_size, temp_dir):
         atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+    dist.destroy_process_group()
+
 
 class TestLlama4TP(unittest.TestCase):
 
@@ -79,7 +77,8 @@ class TestLlama4TP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_llama4_tp(self):
-        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":

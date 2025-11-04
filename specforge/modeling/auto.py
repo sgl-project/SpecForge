@@ -107,7 +107,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         **config_kwargs,
     ):
         config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path, **config_kwargs
+            pretrained_model_name_or_path,
         )
 
         if isinstance(config, Llama4Config):
@@ -117,24 +117,17 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
             type(config) in cls._model_mapping
         ), f"Unsupported config type: {type(config)}"
         model_cls = cls._model_mapping[type(config)][0]
+        model = model_cls.from_pretrained(
+            pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            cache_dir=cache_dir,
+            **config_kwargs,
+        )
 
-        if device is None:
-            device = torch.device("cpu")
+        if device is not None:
+            model = model.to(device)
         else:
-            device = torch.device(device)
-
-        if torch_dtype is None:
-            torch_dtype = torch.get_default_dtype()
-
-        # load model
-        with default_torch_dtype(torch_dtype), torch.device(device):
-            model = model_cls(config)
-        model.load_checkpoint(pretrained_model_name_or_path, cache_dir=cache_dir)
-
-        # just ensure that all the parameters follow the same dtype and device
-        # model = model.to(torch_dtype)
-        # model = model.to(device)
-
+            model = model.cuda()
         return model
 
 

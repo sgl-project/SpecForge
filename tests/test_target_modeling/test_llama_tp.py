@@ -6,16 +6,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import LlamaConfig
+from transformers import LlamaForCausalLM as HFLLamaForCausalLM
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.llama import LlamaForCausalLM as SFLlamaForCausalLM
+from tests.utils import get_available_port
 
 
-def test_llama3_tp(rank, world_size, temp_dir):
+def test_llama3_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29501"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=2)
     set_seed(42)
@@ -34,21 +37,14 @@ def test_llama3_tp(rank, world_size, temp_dir):
     )
 
     # create the single-gpu
-    model = LlamaForCausalLM(config).cuda()
-
-    from specforge.modeling.target.llama import LlamaForCausalLM as DistLlamaForCausalLM
-
-    dist_model = DistLlamaForCausalLM(config).cuda()
+    model = HFLLamaForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
         model.save_pretrained(temp_dir)
         print(f"Saved model to {temp_dir}")
     dist.barrier()
-
-    # load the model weights to the distributed model
-    print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = SFLlamaForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
@@ -65,6 +61,8 @@ def test_llama3_tp(rank, world_size, temp_dir):
         atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+    dist.destroy_process_group()
+
 
 class TestLlama3TP(unittest.TestCase):
 
@@ -75,7 +73,8 @@ class TestLlama3TP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_llama3_tp(self):
-        mp.spawn(test_llama3_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_llama3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":

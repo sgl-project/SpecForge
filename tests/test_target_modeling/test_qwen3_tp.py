@@ -6,21 +6,23 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+from transformers.models.qwen3 import Qwen3Config
+from transformers.models.qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.qwen3 import Qwen3ForCausalLM as SFLQwen3ForCausalLM
+from tests.utils import get_available_port
 
 
-def test_qwen3_moe_tp(rank, world_size, temp_dir):
+def test_qwen3_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=2)
     set_seed(42)
-    config = Qwen3MoeConfig(
+    config = Qwen3Config(
         vocab_size=1000,
         hidden_size=384,
         intermediate_size=512,
@@ -29,20 +31,12 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
         max_position_embeddings=1024,
         num_attention_heads=8,
         num_key_value_heads=4,
-        num_experts=64,
-        num_experts_per_tok=8,
         hidden_act="silu",
         rms_norm_eps=1e-6,
     )
 
     # create a simple single-gpu model
-    model = Qwen3MoeForCausalLM(config).cuda()
-
-    from specforge.modeling.target.qwen3_moe import (
-        Qwen3MoeForCausalLM as DistQwen3MoeForCausalLM,
-    )
-
-    dist_model = DistQwen3MoeForCausalLM(config).cuda()
+    model = HFQwen3ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -52,7 +46,7 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
 
     # load the model weights to the distributed model
     print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = SFLQwen3ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
@@ -69,8 +63,10 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir):
         atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+    dist.destroy_process_group()
 
-class TestQwen3MoeTP(unittest.TestCase):
+
+class TestQwen3TP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -78,15 +74,16 @@ class TestQwen3MoeTP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_qwen3_moe_tp(self):
+    def test_qwen3_tp(self):
         # Set to 2 as only 2 GPU avaialble in CI
-        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_qwen3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
 
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestQwen3MoeTP))
+    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestQwen3TP))
 
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

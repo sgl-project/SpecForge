@@ -21,7 +21,6 @@ import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import (
     create_causal_mask,
     create_sliding_window_causal_mask,
@@ -35,7 +34,6 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
@@ -43,8 +41,6 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2RotaryEmbedding,
     apply_rotary_pos_emb,
     eager_attention_forward,
-    repeat_kv,
-    rotate_half,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import (
@@ -55,10 +51,8 @@ from transformers.utils import (
 )
 
 # [MODIFIED] Import from distributed library
-from specforge.distributed import get_tp_group
+from specforge.distributed import gather_tensor, get_tp_group
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
-
-from .base import DistributedTargetModel
 
 logger = logging.get_logger(__name__)
 
@@ -437,7 +431,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
 
 @auto_docstring
-class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin, DistributedTargetModel):
+class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -545,7 +539,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin, DistributedTargetM
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = self._gather_tensor(logits, get_tp_group())
+        logits = gather_tensor(logits, get_tp_group())
 
         loss = None
         if labels is not None:
@@ -563,35 +557,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin, DistributedTargetM
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-    def load_weights(self, state_dict: Dict[str, torch.Tensor]):
-        tp_group = get_tp_group()
-
-        updated_state_dict = {}
-        for key, value in state_dict.items():
-            # Ensure that the state dict is a flat dict of keys and tensors. Breaking this assumption
-            # will break recipe code
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(
-                    f"Expected all values in the state dict to be torch.Tensor. "
-                    f"Found {type(value)} instead."
-                )
-
-            module_key = ".".join(key.split(".")[:-1])
-            module = self.get_submodule(module_key)
-
-            # get the module type based on key and shard accordingly
-            if isinstance(module, RowParallelLinear) and key.endswith(".weight"):
-                value = self._shard_tensor(value, tp_group, -1)
-            elif isinstance(module, ColumnParallelLinear) and key.endswith(".weight"):
-                value = self._shard_tensor(value, tp_group, 0)
-            elif isinstance(module, ColumnParallelLinear) and key.endswith(".bias"):
-                value = self._shard_tensor(value, tp_group, 0)
-
-            updated_state_dict[key] = value
-
-        # load state dict
-        self.load_state_dict(updated_state_dict, strict=False)
 
 
 @auto_docstring(

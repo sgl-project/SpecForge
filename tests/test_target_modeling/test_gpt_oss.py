@@ -9,13 +9,15 @@ from accelerate.utils import set_seed
 from transformers import GptOssConfig, GptOssForCausalLM
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.gpt_oss import GptOssForCausalLM as DistGptOssForCausalLM
+from tests.utils import get_available_port
 
 
-def test_gpt_oss_tp(rank, world_size, temp_dir):
+def test_gpt_oss_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=2)
     set_seed(42)
@@ -42,13 +44,6 @@ def test_gpt_oss_tp(rank, world_size, temp_dir):
     # create the single-gpu
     model = GptOssForCausalLM(config).cuda().eval()
 
-    from specforge.modeling.target.gpt_oss import (
-        GptOssForCausalLM as DistGptOssForCausalLM,
-    )
-
-    dist_model = DistGptOssForCausalLM(config).cuda().eval()
-
-    # save the model weights to a temp directory
     if dist.get_rank() == 0:
         model.save_pretrained(temp_dir)
         print(f"Saved model to {temp_dir}")
@@ -56,7 +51,7 @@ def test_gpt_oss_tp(rank, world_size, temp_dir):
 
     # # load the model weights to the distributed model
     print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = DistGptOssForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # # create data
@@ -73,6 +68,8 @@ def test_gpt_oss_tp(rank, world_size, temp_dir):
         atol=1e-5,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
+    dist.destroy_process_group()
+
 
 class TestGptOssTP(unittest.TestCase):
 
@@ -83,7 +80,8 @@ class TestGptOssTP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_gpt_oss_tp(self):
-        mp.spawn(test_gpt_oss_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_gpt_oss_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":

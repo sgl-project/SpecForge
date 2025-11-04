@@ -9,6 +9,9 @@ concurrency:
   group: pr-test-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   unit-test:
     if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&

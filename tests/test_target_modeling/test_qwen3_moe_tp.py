@@ -6,15 +6,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import Qwen2Config
-from transformers import Qwen2ForCausalLM as HFWen2ForCausalLM
+from transformers.models.qwen3_moe import Qwen3MoeConfig
+from transformers.models.qwen3_moe import Qwen3MoeForCausalLM as HFWen3MoeForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.qwen2 import Qwen2ForCausalLM as SFLQwen2ForCausalLM
+from specforge.modeling.target.qwen3_moe import (
+    Qwen3MoeForCausalLM as SFLQwen3MoeForCausalLM,
+)
 from tests.utils import get_available_port
 
 
-def test_qwen2_tp(rank, world_size, temp_dir, port):
+def test_qwen3_moe_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -22,24 +24,23 @@ def test_qwen2_tp(rank, world_size, temp_dir, port):
 
     init_distributed(tp_size=2)
     set_seed(42)
-    config = Qwen2Config(
+    config = Qwen3MoeConfig(
         vocab_size=1000,
         hidden_size=384,
         intermediate_size=512,
-        intermediate_size_mlp=512,
+        moe_intermediate_size=512,
         num_hidden_layers=2,
         max_position_embeddings=1024,
-        num_attention_heads=10,
-        num_key_value_heads=2,
-        head_dim=64,
-        num_local_experts=4,
-        tie_word_embedding=False,
-        initializer_range=0.02,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        num_experts=64,
+        num_experts_per_tok=8,
         hidden_act="silu",
+        rms_norm_eps=1e-6,
     )
 
-    # create the single-gpu
-    model = HFWen2ForCausalLM(config).cuda()
+    # create a simple single-gpu model
+    model = HFWen3MoeForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -49,7 +50,7 @@ def test_qwen2_tp(rank, world_size, temp_dir, port):
 
     # load the model weights to the distributed model
     print(f"Loading model from {temp_dir}")
-    dist_model = SFLQwen2ForCausalLM.from_pretrained(temp_dir).cuda()
+    dist_model = SFLQwen3MoeForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
@@ -69,7 +70,7 @@ def test_qwen2_tp(rank, world_size, temp_dir, port):
     dist.destroy_process_group()
 
 
-class TestQwen2TP(unittest.TestCase):
+class TestQwen3MoeTP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -77,13 +78,16 @@ class TestQwen2TP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_qwen2_tp(self):
+    def test_qwen3_moe_tp(self):
+        # Set to 2 as only 2 GPU avaialble in CI
         port = get_available_port()
-        mp.spawn(test_qwen2_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(TestQwen2TP))
+
+    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestQwen3MoeTP))
+
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

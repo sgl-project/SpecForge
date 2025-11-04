@@ -6,17 +6,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers.models.phi3.configuration_phi3 import Phi3Config
-from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
+from transformers.models.phi3 import Phi3Config
+from transformers.models.phi3 import Phi3ForCausalLM as HFPhi3ForCausalLM
 
 from specforge.distributed import init_distributed
+from specforge.modeling.target.phi3 import Phi3ForCausalLM as SFLPhi3ForCausalLM
+from tests.utils import get_available_port
 
 
-def test_phi3_tp(rank, world_size, temp_dir):
+def test_phi3_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29501"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=2)
     set_seed(42)
@@ -35,11 +37,7 @@ def test_phi3_tp(rank, world_size, temp_dir):
     )
 
     # create a simple single-gpu model
-    model = Phi3ForCausalLM(config).cuda()
-
-    from specforge.modeling.target.phi3 import Phi3ForCausalLM as DistPhi3ForCausalLM
-
-    dist_model = DistPhi3ForCausalLM(config).cuda()
+    model = HFPhi3ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -48,8 +46,7 @@ def test_phi3_tp(rank, world_size, temp_dir):
     dist.barrier()
 
     # load the model weights to the distributed model
-    print(f"Loading model from {temp_dir}")
-    dist_model.load_checkpoint(temp_dir)
+    dist_model = SFLPhi3ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
@@ -60,13 +57,14 @@ def test_phi3_tp(rank, world_size, temp_dir):
     expected_logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     dist_logits = dist_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
-    print(expected_logits, dist_logits)
     assert torch.allclose(
         expected_logits,
         dist_logits,
         rtol=1e-4,
         atol=1e-4,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
+
+    dist.destroy_process_group()
 
 
 class TestPhi3TP(unittest.TestCase):
@@ -78,7 +76,8 @@ class TestPhi3TP(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_phi3_tp(self):
-        mp.spawn(test_phi3_tp, nprocs=2, args=(2, self.temp_dir.name))
+        port = get_available_port()
+        mp.spawn(test_phi3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":
