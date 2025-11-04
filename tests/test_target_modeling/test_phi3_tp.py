@@ -10,7 +10,7 @@ from transformers.models.phi3 import Phi3Config
 from transformers.models.phi3 import Phi3ForCausalLM as HFPhi3ForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.phi3 import Phi3ForCausalLM as SFLPhi3ForCausalLM
+from specforge.modeling.target.custom_backend.phi3 import Phi3ForCausalLM as SFLPhi3ForCausalLM
 from tests.utils import get_available_port
 
 
