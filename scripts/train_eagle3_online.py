@@ -29,7 +29,7 @@ from specforge.data import (
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import destroy_distributed, get_dp_group, get_tp_group, init_distributed
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
@@ -102,13 +102,6 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     # distributed training
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
-    parser.add_argument("--draft-global-batch-size", type=int, default=8)
-    parser.add_argument(
-        "--draft-micro-batch-size",
-        type=int,
-        default=1,
-        help="Micro batch size for draft model",
-    )
     parser.add_argument("--draft-accumulation-steps", type=int, default=1)
 
     # other args
@@ -297,13 +290,7 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
-    args.draft_accumulation_steps = args.draft_global_batch_size // args.dp_size
-    assert (
-        args.draft_accumulation_steps * args.dp_size == args.draft_global_batch_size
-    ), f"draft_global_batch_size={args.draft_global_batch_size} must be divisible by dp_size={args.dp_size}"
-    print_with_rank(
-        f"draft_accumulation_steps={args.draft_global_batch_size} // {args.dp_size}={args.draft_accumulation_steps}"
-    )
+    args.target_batch_size = args.tp_size * args.batch_size
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -382,7 +369,7 @@ def build_dataloaders(
         )
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
-        args.draft_micro_batch_size,
+        args.target_batch_size,
         num_workers=4,
         shuffle=True,
         process_group=get_dp_group(),
@@ -403,7 +390,7 @@ def build_dataloaders(
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
-            args.batch_size,
+            args.target_batch_size,
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
@@ -466,7 +453,6 @@ def run_forward(
     eagle3_model: nn.Module,
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
-    target_head: Optional[nn.Module] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if args.is_vlm:
         plosses, _, acces = eagle3_model(
@@ -477,14 +463,17 @@ def run_forward(
             image_grid_thw=data["image_grid_thw"].cuda(),
         )
     else:
-        if target_model:
-            eagle3_data = target_model.generate_eagle3_data(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
-            )
-        else:
-            target = target_head(data["hidden_states"].cuda())
+        eagle3_data = target_model.generate_eagle3_data(
+            input_ids=data["input_ids"].cuda(),
+            attention_mask=data["attention_mask"].cuda(),
+            loss_mask=data["loss_mask"].cuda(),
+        )
+
+        eagle3_data.input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+        eagle3_data.attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
+        eagle3_data.loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+        eagle3_data.target = get_dp_data_shard_from_tp(eagle3_data.target)
+        eagle3_data.hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
 
         plosses, _, acces = eagle3_model(
             input_ids=eagle3_data.input_ids,
@@ -525,10 +514,12 @@ def record_metrcs(
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
 
+    print(accuracies)
+
     # TODO: just use one all reduce
     for i in range(len(accuracies)):
         acc_i = torch.tensor(accuracies[i]).cuda().mean()
-        dist.all_reduce(acc_i, op=dist.ReduceOp.AVG, group=get_dp_group())
+        dist.all_reduce(acc_i, op=dist.ReduceOp.AVG)
         logdict[f"{mode}/acc_{i}"] = acc_i.item()
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {acc_i:.2f}"
@@ -542,6 +533,15 @@ def record_metrcs(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {loss_i:.2f}"
         )
     tracker.log(logdict, step=global_step)
+
+
+def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Get the data shard from the tensor.
+    """
+    tp_size = dist.get_world_size(get_tp_group())
+    tp_rank = dist.get_rank(get_tp_group())
+    return tensor.chunk(tp_size, dim=0)[tp_rank]
 
 
 def main():
@@ -612,7 +612,7 @@ def main():
             buffer_dtype=torch.bfloat16,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        process_group=get_dp_group(),
+        process_group=dist.group.WORLD, # the draft model should run dp for all processes
     )
     print_with_rank("Initialized Eagle3 FSDP model")
 
@@ -661,7 +661,7 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(args, eagle3_model, target_model, data)
+            plosses, acces = run_forward(args, eagle3_model, data, target_model)
             run_backward_and_update(args, plosses, optimizer, global_step)
 
             # log training metrics
@@ -676,7 +676,7 @@ def main():
             if dist.get_rank() == 0:
                 time_per_step = time.time() - last_time
                 last_time = time.time()
-                avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
+                avg_loss = sum(pl for pl in plosses) / len(plosses)
                 avg_acc = sum(acces) / len(acces)
                 progress_bar.set_postfix(
                     {
@@ -699,7 +699,7 @@ def main():
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
                         plosses, _, acces = run_forward(
-                            args, eagle3_model, target_model, data
+                            args, eagle3_model, data, target_model
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))
