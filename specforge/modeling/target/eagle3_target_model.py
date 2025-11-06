@@ -254,6 +254,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             aux_hidden_states_list = None
 
+        # TODO: can we not clear?
+        self.model_runner.req_to_token_pool.clear()
+        self.model_runner.token_to_kv_pool_allocator.clear()
         return logits, aux_hidden_states_list
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
