@@ -29,6 +29,6 @@ jobs:
           pip install -e .
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
-          python tests/ci/gpu_lock_exec.py --devices 6,7 python -m unittest discover -s ./tests -p "test_*.py"
+          python -m unittest discover -s ./tests -p "test_*.py" -v

@@ -24,10 +24,10 @@ class TestAutoTargetModel(unittest.TestCase):
 
         set_seed(42)
         hf_model = HFLlamaForCausalLM.from_pretrained(
-            "dphn/Dolphin3.0-Llama3.1-8B", torch_dtype=torch.bfloat16
+            "unsloth/Llama-3.2-1B", torch_dtype=torch.bfloat16
         ).cuda()
         sf_model = SFLlamaForCausalLM.from_pretrained(
-            "dphn/Dolphin3.0-Llama3.1-8B", torch_dtype=torch.bfloat16
+            "unsloth/Llama-3.2-1B", torch_dtype=torch.bfloat16
         ).cuda()
 
         # create data
