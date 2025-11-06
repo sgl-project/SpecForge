@@ -19,7 +19,7 @@ jobs:
     runs-on: [self-hosted]
     container:
       image: lmsysorg/sglang:dev
-      options: --gpus all --shm-size=2g --rm -v /dev/shm
+      options: --gpus all --shm-size=2g --rm -v /dev/shm --network=host
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,4 +31,6 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          python tests/ci/gpu_lock_exec.py --devices 6,7 python -m unittest discover -s ./tests -p "test_*.py"
+          echo $HTTP_PROXY
+          echo $HTTPS_PROXY
+          python -m unittest discover -s ./tests -p "test_*.py"
