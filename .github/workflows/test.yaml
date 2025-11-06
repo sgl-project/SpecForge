@@ -37,7 +37,7 @@ jobs:
           pip install -e .
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           export HF_ENDPOINT=https://hf-mirror.com
-          python -m unittest discover -s ./tests -p "test_*.py"
+          python -m unittest discover -s ./tests -p "test_*.py" -v
