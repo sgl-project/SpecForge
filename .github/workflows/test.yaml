@@ -24,14 +24,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/
-          key: ${{ runner.os }}-specforge
-          restore-keys: |
-            ${{ runner.os }}-specforge
-
       - name: Install dependencies
         run: |
           pip install -e .
