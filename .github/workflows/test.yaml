@@ -24,13 +24,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/
+          key: ${{ runner.os }}-specforge
+          restore-keys: |
+            ${{ runner.os }}-specforge
+
       - name: Install dependencies
         run: |
-          pip install -e .
+          pip install -e . --prerelease=allow
 
       - name: Run test
         timeout-minutes: 10
         run: |
-          echo $HTTP_PROXY
-          echo $HTTPS_PROXY
+          wget www.google.com
+          export HF_ENDPOINT=https://hf-mirror.com
           python -m unittest discover -s ./tests -p "test_*.py"
