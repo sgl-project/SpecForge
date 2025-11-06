@@ -34,7 +34,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -e . --prerelease=allow
+          pip install -e .
 
       - name: Run test
         timeout-minutes: 10
