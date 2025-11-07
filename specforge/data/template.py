@@ -186,3 +186,13 @@ TEMPLATE_REGISTRY.register(
         parser_type="openai-harmony",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-r1-distill",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        end_of_turn_token=None,
+        system_prompt=None,
+    ),
+)
