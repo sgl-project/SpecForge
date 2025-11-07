@@ -92,3 +92,11 @@ def gather_tensor(
     dist.all_gather(obj_list, tensor, group=process_group)
     gather_tensor = torch.cat(obj_list, dim=dim)
     return gather_tensor
+
+
+def is_tp_rank_0():
+    """Return True if current process is rank 0 in its TP group."""
+    tp_group = get_tp_group()
+    if tp_group is None:
+        return True
+    return dist.get_rank(group=tp_group) == 0
