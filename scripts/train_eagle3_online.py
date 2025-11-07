@@ -14,16 +14,18 @@ import argparse
 import dataclasses
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
 from collections import defaultdict
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
+from rich.logging import RichHandler
 
 # from sglang.bench_one_batch import BenchArgs
 from sglang.srt.server_args import ServerArgs
@@ -41,6 +43,7 @@ from specforge.data import (
 from specforge.distributed import (
     destroy_distributed,
     get_draft_dp_group,
+    get_draft_tp_group,
     get_target_dp_group,
     init_distributed,
 )
@@ -50,7 +53,11 @@ from specforge.model.eagle3 import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
-from specforge.model.target import SGLangEagle3TargetModel, get_eagle3_target_model
+from specforge.model.target import (
+    Eagle3TargetOutput,
+    SGLangEagle3TargetModel,
+    get_eagle3_target_model,
+)
 from specforge.trainer_helper import BF16Optimizer, build_tracker
 from specforge.utils import (
     create_draft_config_from_target,
@@ -114,6 +121,7 @@ class Eagle3TrainerArgs:
     max_length: int = 2048
     warmup_ratio: float = 0.015
     eagle3_chat_template: str = "llama3"
+    enable_zero2: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -203,7 +211,11 @@ class Eagle3TrainerArgs:
             type=str,
             default=Eagle3TrainerArgs.eagle3_chat_template,
         )
-
+        parser.add_argument(
+            "--enable-zero2",
+            action="store_true",
+            help="enabled to shard the optimizer state; if enabled we cannot change number of GPUs for resume training",
+        )
         # other args
         parser.add_argument(
             "--cache-dir", type=str, default=Eagle3TrainerArgs.cache_dir
@@ -348,9 +360,10 @@ class Eagle3TrainerArgs:
             == 0
         ), f"{args.target_global_batch_size=} must be divisible by {args.target_dp_size=} * {args.target_micro_batch_size=}"
 
+        args.save_per_epoch = args.save_interval == -1
         if args.resume and os.path.isdir(args.output_dir):
             args.draft_model_last_checkpoint = get_last_checkpoint(
-                args.output_dir, prefix="step"
+                args.output_dir, prefix="epoch" if args.save_per_epoch else "step"
             )
             print_on_rank0(
                 f"Last checkpoint detected: {args.draft_model_last_checkpoint}"
@@ -358,8 +371,6 @@ class Eagle3TrainerArgs:
         else:
             args.draft_model_last_checkpoint = None
             print_on_rank0(f"Training from scratch")
-
-        args.save_per_epoch = args.save_interval == -1
 
         args.context_length = args.max_length
         args.cuda_graph_max_bs = args.target_micro_batch_size
@@ -389,7 +400,6 @@ class TrainDataLoaderWrapper:
         start_epoch: int = 0,
         steps_consumed_in_current_epoch: int = 0,
         steps_consumed: int = 0,
-        max_global_steps: int = None,
     ):
         self.dataloader = dataloader
         self.num_epochs = num_epochs
@@ -398,8 +408,6 @@ class TrainDataLoaderWrapper:
         self.steps_consumed = steps_consumed
 
         self.max_global_steps = len(dataloader) * num_epochs
-        if max_global_steps is not None:
-            self.max_global_steps = min(self.max_global_steps, max_global_steps)
         self.epoch = start_epoch
 
     def __iter__(self):
@@ -409,6 +417,9 @@ class TrainDataLoaderWrapper:
             dataloader = iter(self.dataloader)
             # skip some steps if needed
             if self.steps_consumed_in_current_epoch > 0:
+                if self.steps_consumed_in_current_epoch >= len(dataloader):
+                    self.steps_consumed_in_current_epoch = 0
+                    continue
                 print_on_rank0(
                     f"Skipping {self.steps_consumed_in_current_epoch} steps in current epoch"
                 )
@@ -465,9 +476,19 @@ class Eagle3Trainer:
         self.micro_batch_idx = 0
         self.global_batch_idx = 0
         if self.trainer_args.draft_model_last_checkpoint is not None:
-            state_path = os.path.join(
-                self.trainer_args.draft_model_last_checkpoint, "training_state.pt"
-            )
+            if self.trainer_args.enable_zero2:
+                draft_tp_group = get_draft_tp_group()
+                draft_tp_rank = dist.get_rank(draft_tp_group)
+                draft_dp_group = get_draft_dp_group()
+                draft_dp_rank = dist.get_rank(draft_dp_group)
+                state_path = os.path.join(
+                    self.trainer_args.draft_model_last_checkpoint,
+                    f"training_state_draft_tp{draft_tp_rank}_dp{draft_dp_rank}.pt",
+                )
+            else:
+                state_path = os.path.join(
+                    self.trainer_args.draft_model_last_checkpoint, "training_state.pt"
+                )
             if os.path.exists(state_path):
                 state = torch.load(state_path, map_location="cpu", weights_only=False)
                 self.global_batch_idx = state.get("global_batch_idx", 0)
@@ -488,15 +509,21 @@ class Eagle3Trainer:
         args = self.trainer_args
         if args.target_tp_size <= args.draft_tp_size:
             # all data generate this target instance will contribute to one draft instance
-            steps_per_epoch = (
-                len(self.train_dataloader.dataloader) // args.draft_accumulation_steps
+            steps_per_epoch = math.ceil(
+                len(self.train_dataloader.dataloader) / args.draft_accumulation_steps
+            )
+            print_on_rank0(
+                f"Auto-Calculated {steps_per_epoch=} = ceil({len(self.train_dataloader.dataloader)=} / {args.draft_accumulation_steps})"
             )
         else:
             # data generate this target instance will contribute to multiple draft instances
-            steps_per_epoch = (
+            steps_per_epoch = math.ceil(
                 len(self.train_dataloader.dataloader)
-                // (args.target_tp_size // args.draft_tp_size)
-                // args.draft_accumulation_steps
+                / (args.target_tp_size // args.draft_tp_size)
+                / args.draft_accumulation_steps
+            )
+            print_on_rank0(
+                f"Auto-Calculated {steps_per_epoch=} = ceil({len(self.train_dataloader.dataloader)=} / ({args.target_tp_size // args.draft_tp_size=}) / {args.draft_accumulation_steps=})"
             )
         if args.total_steps is None:
             args.total_steps = args.num_epochs * steps_per_epoch
@@ -638,7 +665,11 @@ class Eagle3Trainer:
                 buffer_dtype=torch.float32,
                 reduce_dtype=torch.float32,
             ),
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=(
+                ShardingStrategy.SHARD_GRAD_OP
+                if args.enable_zero2
+                else ShardingStrategy.NO_SHARD
+            ),
             process_group=get_draft_dp_group(),
         )
         print_with_rank("Initialized Eagle3 FSDP model")
@@ -736,6 +767,7 @@ class Eagle3Trainer:
             max_grad_norm=args.max_grad_norm,
             warmup_ratio=args.warmup_ratio,
             total_steps=args.total_steps,
+            enable_zero2=args.enable_zero2,
         )
         return optimizer
 
@@ -744,6 +776,7 @@ class Eagle3Trainer:
 
     def save_checkpoint(self, step: int):
         # Save the model
+        print_on_rank0(f"save_checkpoint on {step=}")
         args = self.trainer_args
         if args.save_per_epoch:
             epoch_output_dir = os.path.join(
@@ -771,19 +804,37 @@ class Eagle3Trainer:
                 if "draft_model." in k and "embed" not in k.lower()
             }
 
-            if dist.get_rank() == 0:
+            if not args.enable_zero2:
+                if dist.get_rank() == 0:
+                    torch.save(
+                        state_to_save,
+                        os.path.join(epoch_output_dir, "training_state.pt"),
+                    )
+                    print_with_rank(
+                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                    )
+            else:
+                draft_dp_droup = get_draft_dp_group()
+                draft_dp_rank = dist.get_rank(draft_dp_droup)
+                draft_tp_group = get_draft_tp_group()
+                draft_tp_rank = dist.get_rank(draft_tp_group)
                 torch.save(
                     state_to_save,
-                    os.path.join(epoch_output_dir, "training_state.pt"),
+                    os.path.join(
+                        epoch_output_dir,
+                        f"training_state_draft_tp{draft_tp_rank}_dp{draft_dp_rank}.pt",
+                    ),
                 )
-                print_on_rank0(
-                    f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                print_with_rank(
+                    f"Saved full training state to {epoch_output_dir}/training_state_draft_tp{draft_tp_rank}_dp{draft_dp_rank}.pt"
                 )
+
+            if dist.get_rank() == 0:
                 self.draft_model.save_pretrained(
                     epoch_output_dir,
                     state_dict=draft_model_state_dict,
                 )
-                print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+                print_with_rank(f"Saved model configuration to {epoch_output_dir}")
                 if args.max_num_saved_checkpoints > 1:
                     if args.save_per_epoch:
                         step_re = re.compile(r"^epoch_(\d+)$")
@@ -798,11 +849,13 @@ class Eagle3Trainer:
                         if match:
                             dirs.append((match.group(1), full_path))
                         else:
-                            print(f"Warning: {name} is not a valid step directory")
+                            print_with_rank(
+                                f"Warning: {name} is not a valid step directory"
+                            )
                     dirs.sort(key=lambda x: int(x[0]), reverse=True)
                     for i, (_, path) in enumerate(dirs):
                         if i >= args.max_num_saved_checkpoints:
-                            print(f"Removing {path}")
+                            print_with_rank(f"Removing {path}")
                             shutil.rmtree(path)
 
             dist.barrier()
@@ -814,8 +867,7 @@ class Eagle3Trainer:
                 logdict[key] = value.item()
         self.tracker.log(logdict, step=self.global_batch_idx)
 
-    def train_step(self, data):
-        self.micro_batch_idx += 1
+    def _forward_step(self, data: Eagle3TargetOutput):
         args = self.trainer_args
         if args.is_vlm:
             plosses, _, acces = self.eagle3_model(
@@ -841,8 +893,11 @@ class Eagle3Trainer:
                 target=eagle3_data.target,
                 hidden_states=eagle3_data.hidden_states,
             )
+        return plosses, acces
 
-        # calculate weighted loss
+    def _backward_step(self, plosses: List[torch.Tensor], acces: List[float]):
+        args = self.trainer_args
+        self.micro_batch_idx += 1
         ploss_weight = [0.8**i for i in range(len(plosses))]
         ploss = (
             sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
@@ -853,7 +908,7 @@ class Eagle3Trainer:
         if do_optimizer_step:
             self.global_batch_idx += 1
             self.optimizer.step()
-        return plosses, acces, do_optimizer_step
+        return do_optimizer_step
 
     @torch.no_grad()
     def eval(self, logdict: Optional[Dict[str, Union[torch.Tensor, float]]] = None):
@@ -880,14 +935,7 @@ class Eagle3Trainer:
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
                 )
-
-                plosses, _, acces = self.eagle3_model(
-                    input_ids=eagle3_data.input_ids,
-                    attention_mask=eagle3_data.attention_mask,
-                    loss_mask=eagle3_data.loss_mask,
-                    target=eagle3_data.target,
-                    hidden_states=eagle3_data.hidden_states,
-                )
+                plosses, acces = self._forward_step(eagle3_data)
                 for i in range(len(eval_plosses)):
                     eval_plosses[i].append(plosses[i].item())
                 for i in range(len(eval_acces)):
@@ -912,14 +960,15 @@ class Eagle3Trainer:
         if dist.get_rank() == 0:
             progress_bar = tqdm(
                 self.train_dataloader,
-                total=args.total_steps,
+                total=len(self.train_dataloader),
                 desc=f"Training...",
                 leave=True,
             )
         else:
             progress_bar = self.train_dataloader
         for data in progress_bar:
-            plosses, acces, do_optimizer_step = self.train_step(data)
+            plosses, acces = self._forward_step(data)
+            do_optimizer_step = self._backward_step(plosses, acces)
             for i in range(len(train_plosses)):
                 train_plosses[i].append(plosses[i].item())
                 self.train_logdict[f"train/ploss_{i}"] += (
@@ -931,27 +980,31 @@ class Eagle3Trainer:
                     acces[i] / args.draft_accumulation_steps
                 )
 
-            if do_optimizer_step and self.global_batch_idx % args.log_interval == 0:
-                self.train_logdict["train/lr"] = self.optimizer.get_learning_rate()
-                self.record_metrics(self.train_logdict, mode="train")
-                self.train_logdict = defaultdict(float)
+            if do_optimizer_step:
+                if self.global_batch_idx % args.log_interval == 0:
+                    self.train_logdict["train/lr"] = self.optimizer.get_learning_rate()
+                    self.record_metrics(self.train_logdict, mode="train")
+                    self.train_logdict = defaultdict(float)
 
-            if do_optimizer_step and self.global_batch_idx % args.save_interval == 0:
-                self.save_checkpoint(self.global_batch_idx)
+                if self.global_batch_idx % args.save_interval == 0:
+                    self.save_checkpoint(self.global_batch_idx)
 
-            if do_optimizer_step and self.global_batch_idx % args.eval_interval == 0:
-                logdict = {}
-                for i in range(len(train_acces)):
-                    logdict[f"train/epochacc_{i}"] = (
-                        torch.tensor(train_acces[i]).cuda().mean()
-                    )
-                for i in range(len(train_plosses)):
-                    logdict[f"train/epochploss_{i}"] = (
-                        torch.tensor(train_plosses[i]).cuda().mean()
-                    )
-                self.eval(logdict)
-                train_plosses = [[] for _ in range(args.ttt_length)]
-                train_acces = [[] for _ in range(args.ttt_length)]
+                if self.global_batch_idx % args.eval_interval == 0:
+                    logdict = {}
+                    for i in range(len(train_acces)):
+                        logdict[f"train/epochacc_{i}"] = (
+                            torch.tensor(train_acces[i]).cuda().mean()
+                        )
+                    for i in range(len(train_plosses)):
+                        logdict[f"train/epochploss_{i}"] = (
+                            torch.tensor(train_plosses[i]).cuda().mean()
+                        )
+                    self.eval(logdict)
+                    train_plosses = [[] for _ in range(args.ttt_length)]
+                    train_acces = [[] for _ in range(args.ttt_length)]
+
+                if self.global_batch_idx >= args.total_steps:
+                    break
         destroy_distributed()
         return
 
@@ -998,17 +1051,11 @@ class SglOnlineEagle3Trainer(Eagle3Trainer):
                 torch.cuda.empty_cache()
                 data_for_target = [[], [], []]
                 for data in data_for_draft:
-                    step_plosses, _, step_acces = self.eagle3_model(
-                        input_ids=data["input_ids"].cuda(),  # [B, S]
-                        attention_mask=data["attention_mask"].cuda(),  # [B, S]
-                        loss_mask=data["loss_mask"].cuda(),  # [B, S]
-                        hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
-                        target=data["target"].cuda(),  # [B, S, D*3]
-                    )
+                    plosses, acces = self._forward_step(data)
                     for i in range(len(eval_plosses)):
-                        eval_plosses[i].append(step_plosses[i].item())
+                        eval_plosses[i].append(plosses[i].item())
                     for i in range(len(eval_acces)):
-                        eval_acces[i].append(step_acces[i])
+                        eval_acces[i].append(acces[i])
 
         torch.cuda.empty_cache()
         data_for_draft = self.target_model.generate_eagle3_data(
@@ -1018,19 +1065,11 @@ class SglOnlineEagle3Trainer(Eagle3Trainer):
         )
         torch.cuda.empty_cache()
         for data in data_for_draft:
-            step_plosses, _, step_acces = self.eagle3_model(
-                input_ids=data["input_ids"].cuda(),  # [B, S]
-                attention_mask=data["attention_mask"].cuda(),  # [B, S]
-                loss_mask=data[
-                    "loss_mask"
-                ].cuda(),  # [B, S] This is different from the online version
-                hidden_states=data["hidden_state"].cuda(),  # [B, S, D]
-                target=data["target"].cuda(),  # [B, S, D*3]
-            )
+            plosses, acces = self._forward_step(data)
             for i in range(len(eval_plosses)):
-                eval_plosses[i].append(step_plosses[i].item())
+                eval_plosses[i].append(plosses[i].item())
             for i in range(len(eval_acces)):
-                eval_acces[i].append(step_acces[i])
+                eval_acces[i].append(acces[i])
 
         if logdict is None:
             logdict = {}
@@ -1042,7 +1081,18 @@ class SglOnlineEagle3Trainer(Eagle3Trainer):
             logdict[f"eval/epochacc_{i}"] = torch.tensor(eval_acces[i]).cuda().mean()
         self.record_metrics(logdict, mode="eval")
 
+    def _forward_step(self, data: Eagle3TargetOutput):
+        plosses, _, acces = self.eagle3_model(
+            input_ids=data.input_ids,
+            attention_mask=data.attention_mask,
+            loss_mask=data.loss_mask,
+            target=data.target,
+            hidden_states=data.hidden_states,
+        )
+        return plosses, acces
+
     def train(self):
+        print_with_rank("SglOnlineEagle3Trainer training...")
         args = self.trainer_args
         train_plosses = [[] for _ in range(args.ttt_length)]
         train_acces = [[] for _ in range(args.ttt_length)]
@@ -1053,7 +1103,7 @@ class SglOnlineEagle3Trainer(Eagle3Trainer):
         if dist.get_rank() == 0:
             progress_bar = tqdm(
                 self.train_dataloader,
-                total=args.total_steps,
+                total=len(self.train_dataloader),
                 desc=f"Training",
                 leave=True,
             )
@@ -1074,61 +1124,47 @@ class SglOnlineEagle3Trainer(Eagle3Trainer):
                 )
                 data_for_target = [[], [], []]
                 for data_ in data_for_draft:
-                    print_on_rank0(
-                        data_.input_ids.shape,
-                        data_.attention_mask.shape,
-                        data_.loss_mask.shape,
-                        data_.hidden_states.shape,
-                        data_.target.shape,
-                    )
-                    step_plosses, _, step_acces, do_optimizer_step = self.train_step(
-                        data_
-                    )
+                    plosses, acces = self._forward_step(data_)
+                    do_optimizer_step = self._backward_step(plosses, acces)
+                    # print_with_rank(f"{self.global_batch_idx=}, {self.micro_batch_idx=}, {data_.input_ids.shape=}, {data_.attention_mask.shape=}, {data_.loss_mask.shape=}, {data_.target.shape=}, {data_.hidden_states.shape=}")
                     for i in range(len(train_plosses)):
-                        train_plosses[i].append(step_plosses[i].item())
+                        train_plosses[i].append(plosses[i].item())
                         self.train_logdict[f"train/ploss_{i}"] += (
-                            step_plosses[i].item() / args.draft_accumulation_steps
+                            plosses[i].item() / args.draft_accumulation_steps
                         )
                     for i in range(len(train_acces)):
-                        train_acces[i].append(step_acces[i])
+                        train_acces[i].append(acces[i])
                         self.train_logdict[f"train/acc_{i}"] += (
-                            step_acces[i] / args.draft_accumulation_steps
+                            acces[i] / args.draft_accumulation_steps
                         )
-                    if (
-                        do_optimizer_step
-                        and self.global_batch_idx % args.log_interval == 0
-                    ):
-                        self.train_logdict["train/lr"] = (
-                            self.optimizer.get_learning_rate()
-                        )
-                        self.tracker.log(
-                            self.train_logdict,
-                            step=self.global_batch_idx,
-                        )
-                        self.train_logdict = defaultdict(float)
 
-                    if (
-                        do_optimizer_step
-                        and self.global_batch_idx % args.save_interval == 0
-                    ):
-                        self.save_checkpoint(self.global_batch_idx)
+                    if do_optimizer_step:
+                        if self.global_batch_idx % args.log_interval == 0:
+                            self.train_logdict["train/lr"] = (
+                                self.optimizer.get_learning_rate()
+                            )
+                            self.tracker.log(
+                                self.train_logdict,
+                                step=self.global_batch_idx,
+                            )
+                            self.train_logdict = defaultdict(float)
 
-                    if (
-                        do_optimizer_step
-                        and self.global_batch_idx % args.eval_interval == 0
-                    ):
-                        logdict = {}
-                        for i in range(len(train_acces)):
-                            logdict[f"train/epochacc_{i}"] = (
-                                torch.tensor(train_acces[i]).cuda().mean()
-                            )
-                        for i in range(len(train_plosses)):
-                            logdict[f"train/epochploss_{i}"] = (
-                                torch.tensor(train_plosses[i]).cuda().mean()
-                            )
-                        self.eval(logdict)
-                        train_plosses = [[] for _ in range(args.ttt_length)]
-                        train_acces = [[] for _ in range(args.ttt_length)]
+                        if self.global_batch_idx % args.save_interval == 0:
+                            self.save_checkpoint(self.global_batch_idx)
+
+                        if self.global_batch_idx % args.eval_interval == 0:
+                            logdict = {}
+                            for i in range(len(train_acces)):
+                                logdict[f"train/epochacc_{i}"] = (
+                                    torch.tensor(train_acces[i]).cuda().mean()
+                                )
+                            for i in range(len(train_plosses)):
+                                logdict[f"train/epochploss_{i}"] = (
+                                    torch.tensor(train_plosses[i]).cuda().mean()
+                                )
+                            self.eval(logdict)
+                            train_plosses = [[] for _ in range(args.ttt_length)]
+                            train_acces = [[] for _ in range(args.ttt_length)]
 
         destroy_distributed()
         return
@@ -1137,7 +1173,10 @@ class SglOnlineEagle3Trainer(Eagle3Trainer):
 def main():
     # initialize
     logging.basicConfig(
-        level=logging.WARNING, format="%(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[RichHandler()],
     )
     args = parse_args()
     if args.target_model_backend == "sglang":

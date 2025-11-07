@@ -240,7 +240,9 @@ class OfflineEagle3Model(OnlineEagle3Model):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        target: torch.Tensor,
         loss_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
         **kwargs,
@@ -250,7 +252,7 @@ class OfflineEagle3Model(OnlineEagle3Model):
         Args:
             input_ids: (batch, seq_len)
             attention_mask: (batch, seq_len)
-            loss_mask: (batch, seq_len, 1)
+            loss_mask: (batch, seq_len)
             target: (batch, seq_len, hidden_size)
             hidden_states: (batch, seq_len, 3*hidden_size)
             past_key_values: We dont use this past_key_values in eagle3, but keep it
@@ -262,18 +264,15 @@ class OfflineEagle3Model(OnlineEagle3Model):
             vlosses: List of validation losses (not used in this implementation).
             acces: List of accuracies for each TTT step.
         """
-        assert (
-            "hidden_states" in kwargs
-        ), "hidden_states must be provided for OfflineEagle3Model forward"
-        assert (
-            "target" in kwargs
-        ), "target must be provided for OfflineEagle3Model forward"
+        target = self.target_head(target)  # [B, S, H] -> [B, S, V]
         return super().forward(
-            input_ids,
-            attention_mask,
-            loss_mask.unsqueeze(-1),
-            past_key_values,
-            position_ids,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            target=target,
+            loss_mask=loss_mask.unsqueeze(-1),  # [B, S, 1]
+            hidden_states=hidden_states,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
             **kwargs,
         )
 

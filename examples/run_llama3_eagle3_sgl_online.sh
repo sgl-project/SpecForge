@@ -69,10 +69,10 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
     --train-data-path $GENERATED_DATASET_PATH/train_data.jsonl \
     --eval-data-path $GENERATED_DATASET_PATH/eval_data.jsonl \
-    --target-tp-size $NUM_GPUS \
+    --target-tp-size 1 \
     --draft-tp-size 1 \
     --target-global-batch-size 64 \
-    --target-micro-batch-size 8 \
+    --target-micro-batch-size $NUM_GPUS \
     --draft-global-batch-size 16 \
     --draft-micro-batch-size 1 \
     --target-model-backend sglang \
@@ -88,6 +88,8 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --total-steps=800000 \
     --warmup-ratio=0.015 \
     --dist-timeout=10 \
+    --enable-zero2 \
+    --resume \
     --wandb-project llama3-8b-eagle3 \
     --wandb-name dev \
     --report-to wandb
@@ -98,10 +100,10 @@ config_list=(
 )
 CUDA_VISIBLE_DEVICES=1,2 python3 benchmarks/bench_model_speedup.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path $PERSIST_DIR/Llama-3.1-8B-Instruct/dev_outputs/step_20533/ \
+    --speculative-draft-model-path $OUTPUT_DIR/epoch_1/ \
     --port 20001 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \
     --config-list "${config_list[@]}" \
     --benchmark-list mtbench:80 \
-    --output Llama-3.1-8B-Instruct_Eagle3-300k_result.jsonl --enable-multi-turn-conversation
+    --output dev_result.jsonl --enable-multi-turn-conversation

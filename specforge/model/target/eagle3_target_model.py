@@ -41,11 +41,11 @@ def get_dp_data_shard_from_tp(
 
 @dataclass
 class Eagle3TargetOutput:
-    hidden_states: torch.Tensor
-    target: torch.Tensor
-    loss_mask: torch.Tensor
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
+    hidden_states: torch.Tensor  # [B, S, H*3]
+    target: torch.Tensor  # [B, S, H]
+    loss_mask: torch.Tensor  # [B, S]
+    input_ids: torch.Tensor  # [B, S]
+    attention_mask: torch.Tensor  # [B, S]
 
 
 class Eagle3TargetModel(ABC):
@@ -221,9 +221,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             server_args=server_args,
             nccl_port=None,
         )
-        wrap_eagle3_logits_processors_in_module(
-            model_runner.model, return_full_logits=False
-        )
+        wrap_eagle3_logits_processors_in_module(model_runner.model)
         return cls(model_runner, args.target_micro_batch_size)
 
     def set_aux_hidden_states_layers(
@@ -258,7 +256,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         aux_hidden_states_list = None
         input_lens = [len(req.origin_input_ids) for req in reqs]
-        logits = torch.split(logits_output.logits, input_lens, dim=0)
+        hidden_states = torch.split(logits_output.hidden_states, input_lens, dim=0)
         if capture_aux_hidden_states:
             aux_hidden_states_list = torch.split(
                 logits_output.aux_hidden_states, input_lens, dim=0
@@ -268,7 +266,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
-        return logits, aux_hidden_states_list
+        return hidden_states, aux_hidden_states_list
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
         if require_mlp_sync(self.model_runner.server_args):
@@ -307,6 +305,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
         data_for_draft = []
+        # if dist.get_rank() == 0:
+        #     print(f"generate eagle3 data: {input_ids[0].shape=}, {attention_mask[0].shape=}, {loss_mask[0].shape=}, {len(input_ids)=}, {len(attention_mask)=}, {len(loss_mask)=}, {self.target_micro_batch_size=}")
         for idx, (input_id_, attention_mask_, loss_mask_) in enumerate(
             zip(input_ids, attention_mask, loss_mask)
         ):
@@ -322,27 +322,27 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
             if len(reqs) == self.target_micro_batch_size:
-                logits_list, aux_hidden_states_list = self.extend(
+                hidden_states_list, aux_hidden_states_list = self.extend(
                     reqs, capture_aux_hidden_states=True
                 )
-                logits_list = get_dp_data_shard_from_tp(list(logits_list))
+                hidden_states_list = get_dp_data_shard_from_tp(list(hidden_states_list))
                 aux_hidden_states_list = get_dp_data_shard_from_tp(
                     list(aux_hidden_states_list)
                 )
                 data_cache = get_dp_data_shard_from_tp(list(data_cache))
-                reqs, data_cache = [], []
-                for data, logits, aux_hidden_states in zip(
-                    data_cache, logits_list, aux_hidden_states_list
+                for data, hidden_states, aux_hidden_states in zip(
+                    data_cache, hidden_states_list, aux_hidden_states_list
                 ):
                     data_for_draft.append(
                         Eagle3TargetOutput(
                             hidden_states=aux_hidden_states.unsqueeze(0),
-                            target=padding(logits.unsqueeze(0), left=False),
+                            target=padding(hidden_states.unsqueeze(0), left=False),
                             loss_mask=data[2],
                             input_ids=padding(data[0], left=False),
                             attention_mask=data[1],
                         )
                     )
+                reqs, data_cache = [], []
         return data_for_draft
 
         # aux_hidden_states_out = []
