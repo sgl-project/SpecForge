@@ -96,7 +96,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Eagle3TargetOutput:
+    ) -> List[Eagle3TargetOutput]:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -127,13 +127,15 @@ class Eagle3TargetModel(ABC):
         loss_mask = loss_mask[..., None]
         loss_mask = loss_mask.to(target.device)
 
-        return Eagle3TargetOutput(
-            hidden_states=get_dp_data_shard_from_tp(hidden_states),
-            target=get_dp_data_shard_from_tp(target),
-            loss_mask=get_dp_data_shard_from_tp(loss_mask),
-            input_ids=get_dp_data_shard_from_tp(input_ids),
-            attention_mask=get_dp_data_shard_from_tp(attention_mask),
-        )
+        return [
+            Eagle3TargetOutput(
+                hidden_states=get_dp_data_shard_from_tp(hidden_states),
+                target=get_dp_data_shard_from_tp(target),
+                loss_mask=get_dp_data_shard_from_tp(loss_mask),
+                input_ids=get_dp_data_shard_from_tp(input_ids),
+                attention_mask=get_dp_data_shard_from_tp(attention_mask),
+            )
+        ]
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -304,11 +306,15 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     @torch.no_grad()
     def generate_eagle3_data(
         self,
-        input_ids: List[torch.Tensor],
-        attention_mask: List[torch.Tensor],
-        loss_mask: List[torch.Tensor],
-    ) -> Eagle3TargetOutput:
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> List[Eagle3TargetOutput]:
         """
+        args:
+            input_ids: (batch_size, seq_len)
+            attention_mask: (batch_size, seq_len)
+            loss_mask: (batch_size, seq_len)
         return:
             data_for_draft: List[Dict[str, torch.Tensor]] of draft_batch_size, draft_micro_batch_size = 1
                 - input_ids: (1, seq_len)
@@ -320,18 +326,49 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
         data_for_draft = []
-        if len(input_ids) % self.target_micro_batch_size != 0:
-            num_padding_items = (
-                self.target_micro_batch_size
-                - len(input_ids) % self.target_micro_batch_size
+        padding_len = (
+            input_ids.shape[0]
+            - input_ids.shape[0]
+            // self.target_micro_batch_size
+            * self.target_micro_batch_size
+        )
+        if padding_len > 0:
+            input_ids = torch.cat(
+                [
+                    input_ids,
+                    torch.zeros(
+                        (padding_len, *input_ids.shape[1:]),
+                        device=input_ids.device,
+                        dtype=input_ids.dtype,
+                    ),
+                ]
             )
-            input_ids = input_ids + [input_ids[-1]] * num_padding_items
-            attention_mask = attention_mask + [attention_mask[-1]] * num_padding_items
-            loss_mask = (
-                loss_mask + [torch.zeros_like(loss_mask[-1])] * num_padding_items
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.zeros(
+                        (padding_len, *attention_mask.shape[1:]),
+                        device=attention_mask.device,
+                        dtype=attention_mask.dtype,
+                    ),
+                ]
+            )
+            loss_mask = torch.cat(
+                [
+                    loss_mask,
+                    torch.zeros(
+                        (padding_len, *loss_mask.shape[1:]),
+                        device=loss_mask.device,
+                        dtype=loss_mask.dtype,
+                    ),
+                ]
             )
         for idx, (input_id_, attention_mask_, loss_mask_) in enumerate(
-            zip(input_ids, attention_mask, loss_mask)
+            zip(
+                input_ids.unsqueeze(1),
+                attention_mask.unsqueeze(1),
+                loss_mask.unsqueeze(1),
+            )
         ):
             req = Req(
                 rid=str(idx),

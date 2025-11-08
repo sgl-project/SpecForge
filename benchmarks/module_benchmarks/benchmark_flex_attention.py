@@ -290,7 +290,7 @@ def plot_results(eagle_results, flex_results, seq_lengths):
 
 
 if __name__ == "__main__":
-    init_distributed(timeout=10, target_tp_size=1, draft_tp_size=1)
+    # init_distributed(timeout=10, target_tp_size=1, draft_tp_size=1)
     parser = argparse.ArgumentParser(description="Benchmark attention mechanisms")
     parser.add_argument(
         "--enable-profile", action="store_true", help="Enable profiling"

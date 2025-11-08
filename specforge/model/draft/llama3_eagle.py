@@ -454,8 +454,15 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.tp_group = get_draft_tp_group()
-        self.tp_size = get_draft_tp_size()
+        if not torch.distributed.is_initialized():
+            print_with_rank(
+                "No distributed process group initialized, using single GPU mode"
+            )
+            self.tp_group = None
+            self.tp_size = 1
+        else:
+            self.tp_group = get_draft_tp_group()
+            self.tp_size = get_draft_tp_size()
         assert (
             config.num_attention_heads % self.tp_size == 0
         ), "num_attention_heads must be divisible by tp_size"
@@ -473,30 +480,50 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        self.q_proj = ColumnParallelLinear(
-            self.hidden_size * 2,
-            config.num_attention_heads * self.head_dim,
-            bias=False,
-            tp_group=self.tp_group,
-        )
-        self.k_proj = ColumnParallelLinear(
-            self.hidden_size * 2,
-            config.num_key_value_heads * self.head_dim,
-            bias=False,
-            tp_group=self.tp_group,
-        )
-        self.v_proj = ColumnParallelLinear(
-            self.hidden_size * 2,
-            config.num_key_value_heads * self.head_dim,
-            bias=False,
-            tp_group=self.tp_group,
-        )
-        self.o_proj = RowParallelLinear(
-            config.num_attention_heads * self.head_dim,
-            self.hidden_size,
-            bias=False,
-            tp_group=self.tp_group,
-        )
+        if self.tp_size > 1:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size * 2,
+                config.num_attention_heads * self.head_dim,
+                bias=False,
+                tp_group=self.tp_group,
+            )
+            self.k_proj = ColumnParallelLinear(
+                self.hidden_size * 2,
+                config.num_key_value_heads * self.head_dim,
+                bias=False,
+                tp_group=self.tp_group,
+            )
+            self.v_proj = ColumnParallelLinear(
+                self.hidden_size * 2,
+                config.num_key_value_heads * self.head_dim,
+                bias=False,
+                tp_group=self.tp_group,
+            )
+            self.o_proj = RowParallelLinear(
+                config.num_attention_heads * self.head_dim,
+                self.hidden_size,
+                bias=False,
+                tp_group=self.tp_group,
+            )
+        else:
+            self.q_proj = nn.Linear(
+                self.hidden_size * 2,
+                config.num_attention_heads * self.head_dim,
+                bias=False,
+            )
+            self.k_proj = nn.Linear(
+                self.hidden_size * 2,
+                config.num_key_value_heads * self.head_dim,
+                bias=False,
+            )
+            self.v_proj = nn.Linear(
+                self.hidden_size * 2,
+                config.num_key_value_heads * self.head_dim,
+                bias=False,
+            )
+            self.o_proj = nn.Linear(
+                config.num_attention_heads * self.head_dim, self.hidden_size, bias=False
+            )
         self._init_rope()
 
     def _init_rope(self):
@@ -799,17 +826,45 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.tp_group = get_draft_tp_group()
-        self.tp_size = get_draft_tp_size()
-        self.gate_proj = ColumnParallelLinear(
-            self.hidden_size, self.intermediate_size, bias=False, tp_group=self.tp_group
-        )
-        self.up_proj = ColumnParallelLinear(
-            self.hidden_size, self.intermediate_size, bias=False, tp_group=self.tp_group
-        )
-        self.down_proj = RowParallelLinear(
-            self.intermediate_size, self.hidden_size, bias=False, tp_group=self.tp_group
-        )
+        if not torch.distributed.is_initialized():
+            print_with_rank(
+                "No distributed process group initialized, using single GPU mode"
+            )
+            self.tp_group = None
+            self.tp_size = 1
+        else:
+            self.tp_group = get_draft_tp_group()
+            self.tp_size = get_draft_tp_size()
+
+        if self.tp_size > 1:
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+                tp_group=self.tp_group,
+            )
+            self.up_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+                tp_group=self.tp_group,
+            )
+            self.down_proj = RowParallelLinear(
+                self.intermediate_size,
+                self.hidden_size,
+                bias=False,
+                tp_group=self.tp_group,
+            )
+        else:
+            self.gate_proj = nn.Linear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.up_proj = nn.Linear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.down_proj = nn.Linear(
+                self.intermediate_size, self.hidden_size, bias=False
+            )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):

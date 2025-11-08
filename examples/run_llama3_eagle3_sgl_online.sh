@@ -59,8 +59,8 @@ python scripts/build_eagle3_dataset_cache.py \
     --max-length $MAX_LENGTH
 
 export NUM_GPUS=4
-export OUTPUT_DIR=$PERSIST_DIR/$MODEL_NAME/draft_tp_outputs/
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
+export OUTPUT_DIR=$PERSIST_DIR/$MODEL_NAME/draft_tp1_target_tp4_outputs/
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     scripts/train_eagle3_online.py \
@@ -69,9 +69,9 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
     --train-data-path $GENERATED_DATASET_PATH/train_data.jsonl \
     --eval-data-path $GENERATED_DATASET_PATH/eval_data.jsonl \
-    --target-tp-size 1 \
-    --draft-tp-size 4 \
-    --target-global-batch-size 64 \
+    --target-tp-size 4 \
+    --draft-tp-size 1 \
+    --target-batch-size 64 \
     --target-micro-batch-size $NUM_GPUS \
     --draft-global-batch-size 16 \
     --draft-micro-batch-size 1 \
@@ -91,7 +91,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --enable-zero2 \
     --resume \
     --wandb-project llama3-8b-eagle3 \
-    --wandb-name dev_draft_tp \
+    --wandb-name dev_draft_tp1_target_tp4 \
     --report-to wandb
 
 config_list=(
@@ -100,7 +100,7 @@ config_list=(
 )
 CUDA_VISIBLE_DEVICES=1,2 python3 benchmarks/bench_model_speedup.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path $OUTPUT_DIR/epoch_1/ \
+    --speculative-draft-model-path $OUTPUT_DIR/epoch_2/ \
     --port 20001 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \
