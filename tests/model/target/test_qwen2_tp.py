@@ -6,47 +6,52 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import LlamaConfig
-from transformers import LlamaForCausalLM as HFLLamaForCausalLM
+from transformers import Qwen2Config
+from transformers import Qwen2ForCausalLM as HFWen2ForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.custom_backend.llama import (
-    LlamaForCausalLM as SFLlamaForCausalLM,
+from specforge.model.target.custom_backend.qwen2 import (
+    Qwen2ForCausalLM as SFLQwen2ForCausalLM,
 )
 from tests.utils import get_available_port
 
 
-def test_llama3_tp(rank, world_size, temp_dir, port):
+def test_qwen2_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
 
-    init_distributed(tp_size=2)
+    init_distributed(timeout=10, target_tp_size=2, draft_tp_size=1)
     set_seed(42)
-    config = LlamaConfig(
+    config = Qwen2Config(
         vocab_size=1000,
         hidden_size=384,
         intermediate_size=512,
+        intermediate_size_mlp=512,
         num_hidden_layers=2,
         max_position_embeddings=1024,
         num_attention_heads=10,
         num_key_value_heads=2,
-        tie_word_embeddings=False,
+        head_dim=64,
+        num_local_experts=4,
+        tie_word_embedding=False,
         initializer_range=0.02,
         hidden_act="silu",
-        rms_norm_eps=1e-6,
     )
 
     # create the single-gpu
-    model = HFLLamaForCausalLM(config).cuda()
+    model = HFWen2ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
         model.save_pretrained(temp_dir)
         print(f"Saved model to {temp_dir}")
     dist.barrier()
-    dist_model = SFLlamaForCausalLM.from_pretrained(temp_dir).cuda()
+
+    # load the model weights to the distributed model
+    print(f"Loading model from {temp_dir}")
+    dist_model = SFLQwen2ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
@@ -66,7 +71,7 @@ def test_llama3_tp(rank, world_size, temp_dir, port):
     dist.destroy_process_group()
 
 
-class TestLlama3TP(unittest.TestCase):
+class TestQwen2TP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -74,13 +79,13 @@ class TestLlama3TP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_llama3_tp(self):
+    def test_qwen2_tp(self):
         port = get_available_port()
-        mp.spawn(test_llama3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(test_qwen2_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(TestLlama3TP))
+    suite.addTest(unittest.makeSuite(TestQwen2TP))
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

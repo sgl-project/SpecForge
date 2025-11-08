@@ -17,12 +17,18 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
-from specforge.distributed import get_target_tp_device_mesh, get_target_tp_group
+from specforge.distributed import (
+    get_draft_tp_rank,
+    get_draft_tp_size,
+    get_target_tp_device_mesh,
+    get_target_tp_group,
+    get_target_tp_rank,
+    get_target_tp_size,
+)
 from specforge.utils import padding
 
 from ...data import DataCollatorWithPadding
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
-from .target_head import TargetHead
 
 
 def get_dp_data_shard_from_tp(
@@ -31,19 +37,29 @@ def get_dp_data_shard_from_tp(
     """
     Get the data shard from the tensor.
     """
-    tp_size = dist.get_world_size(get_target_tp_group())
-    tp_rank = dist.get_rank(get_target_tp_group())
+    target_tp_size = get_target_tp_size()
+    target_tp_rank = get_target_tp_rank()
+    draft_tp_size = get_draft_tp_size()
+    if target_tp_size <= draft_tp_size:
+        return tensor
+
     tensor_length = len(tensor) if isinstance(tensor, List) else tensor.shape[0]
-    assert tensor_length % tp_size == 0, "Tensor length must be divisible by tp_size"
-    chunk_size = tensor_length // tp_size
-    return tensor[tp_rank * chunk_size : (tp_rank + 1) * chunk_size]
+    assert (
+        tensor_length % target_tp_size == 0
+    ), "Tensor length must be divisible by target_tp_size"
+    chunk_size = tensor_length // (target_tp_size // draft_tp_size)
+    return tensor[
+        (target_tp_rank // draft_tp_size)
+        * chunk_size : (target_tp_rank // draft_tp_size + 1)
+        * chunk_size
+    ]
 
 
 @dataclass
 class Eagle3TargetOutput:
     hidden_states: torch.Tensor  # [B, S, H*3]
     target: torch.Tensor  # [B, S, H]
-    loss_mask: torch.Tensor  # [B, S]
+    loss_mask: torch.Tensor  # [B, S, 1]
     input_ids: torch.Tensor  # [B, S]
     attention_mask: torch.Tensor  # [B, S]
 
@@ -189,7 +205,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     def __init__(self, model_runner: SGLangRunner, target_micro_batch_size: int):
         super().__init__()
         self.model_runner = model_runner
-        self.target_head = None
         self.draft_data_collator = DataCollatorWithPadding()
         self.target_micro_batch_size = target_micro_batch_size
 
@@ -305,8 +320,16 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
         data_for_draft = []
-        # if dist.get_rank() == 0:
-        #     print(f"generate eagle3 data: {input_ids[0].shape=}, {attention_mask[0].shape=}, {loss_mask[0].shape=}, {len(input_ids)=}, {len(attention_mask)=}, {len(loss_mask)=}, {self.target_micro_batch_size=}")
+        if len(input_ids) % self.target_micro_batch_size != 0:
+            num_padding_items = (
+                self.target_micro_batch_size
+                - len(input_ids) % self.target_micro_batch_size
+            )
+            input_ids = input_ids + [input_ids[-1]] * num_padding_items
+            attention_mask = attention_mask + [attention_mask[-1]] * num_padding_items
+            loss_mask = (
+                loss_mask + [torch.zeros_like(loss_mask[-1])] * num_padding_items
+            )
         for idx, (input_id_, attention_mask_, loss_mask_) in enumerate(
             zip(input_ids, attention_mask, loss_mask)
         ):
@@ -337,7 +360,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                         Eagle3TargetOutput(
                             hidden_states=aux_hidden_states.unsqueeze(0),
                             target=padding(hidden_states.unsqueeze(0), left=False),
-                            loss_mask=data[2],
+                            loss_mask=data[2].unsqueeze(-1),
                             input_ids=padding(data[0], left=False),
                             attention_mask=data[1],
                         )
@@ -391,7 +414,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         cache_dir: Optional[str] = None,
         **kwargs,
     ) -> "CustomEagle3TargetModel":
-        from specforge.modeling.auto import AutoDistributedTargetModel
+        from specforge.model.target import AutoDistributedTargetModel
 
         target_model = AutoDistributedTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -409,17 +432,10 @@ def get_eagle3_target_model(
     torch_dtype: torch.dtype = None,
     device: str = None,
     cache_dir: Optional[str] = None,
-    lm_head_key: str = "lm_head.weight",
     args: Optional[argparse.Namespace] = None,
     **kwargs,
 ) -> Eagle3TargetModel:
     if backend == "sglang":
-        target_head = TargetHead(pretrained_model_name_or_path)
-        target_head.load_weights(
-            model_path=pretrained_model_name_or_path, lm_head_key=lm_head_key
-        )
-        target_head.freeze_weights()
-        target_head = target_head.eval().cuda().to(torch_dtype)
         target_model = SGLangEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
@@ -428,7 +444,6 @@ def get_eagle3_target_model(
             args=args,
             **kwargs,
         )
-        target_model.target_head = target_head
         return target_model
     elif backend == "hf":
         return HFEagle3TargetModel.from_pretrained(

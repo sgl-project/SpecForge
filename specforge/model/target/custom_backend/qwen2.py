@@ -51,8 +51,8 @@ from transformers.utils import (
 )
 
 # [MODIFIED] Import from distributed library
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import gather_tensor, get_target_tp_group
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 
@@ -65,7 +65,7 @@ class Qwen2MLP(nn.Module):
         self.intermediate_size = config.intermediate_size
 
         # distributed linear layers
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=False
         )
@@ -102,7 +102,7 @@ class Qwen2Attention(nn.Module):
         self.is_causal = True
 
         # distributed linear layers
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -539,7 +539,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = gather_tensor(logits, get_tp_group())
+        logits = gather_tensor(logits, get_target_tp_group())
 
         loss = None
         if labels is not None:

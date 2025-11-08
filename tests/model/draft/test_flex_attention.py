@@ -1,4 +1,4 @@
-import sys
+import os
 import unittest
 
 import torch
@@ -7,20 +7,20 @@ import torch.nn as nn
 from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
-from specforge.modeling.draft.flex_attention import (
+from specforge.distributed import init_distributed
+from specforge.model.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     create_block_mask,
     generate_eagle3_mask,
 )
-from specforge.modeling.draft.llama3_eagle import (
+from specforge.model.draft.llama3_eagle import (
     LlamaAttention,
     LlamaFlexAttention,
     prepare_decoder_attention_mask,
 )
 from specforge.utils import padding
-
-from .utils import norm_tensor
+from tests.utils import norm_tensor
 
 dynamo.config.recompile_limit = 64
 TTT_LENGTH = 7
@@ -44,6 +44,12 @@ class TestFlexAttention(unittest.TestCase):
             "torch_dtype": "float32",
         }
         self.config = LlamaConfig(**self.config_dict)
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"
+        if not torch.distributed.is_initialized():
+            init_distributed(timeout=10, target_tp_size=1, draft_tp_size=1)
 
         self.seq_lengths = [128, 200, 256, 300, 512, 800, 1024, 2048]
         self.dtype = torch.float32

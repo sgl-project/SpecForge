@@ -43,8 +43,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import gather_tensor, get_target_tp_group
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 
@@ -64,11 +64,9 @@ class Qwen3MoeAttention(nn.Module):
         self.is_causal = True
 
         # Add TP support and head calculations
-        self.tp_group = get_tp_group()
-        self.tp_size = (
-            dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
-        )
-        self.tp_rank = dist.get_rank(self.tp_group) if self.tp_group is not None else 0
+        self.tp_group = get_target_tp_group()
+        self.tp_size = dist.get_world_size(self.tp_group)
+        self.tp_rank = dist.get_rank(self.tp_group)
 
         # Calculate head distribution for TP
         self.total_num_heads = config.num_attention_heads
@@ -187,7 +185,7 @@ class Qwen3MoeMLP(nn.Module):
         )
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
 
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=False
@@ -846,7 +844,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         # Gather logits from all TP ranks
-        logits = gather_tensor(logits, get_tp_group())
+        logits = gather_tensor(logits, get_target_tp_group())
 
         loss = None
         if labels is not None:

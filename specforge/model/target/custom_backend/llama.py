@@ -43,8 +43,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 from transformers.utils.generic import check_model_inputs
 
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import gather_tensor, get_target_tp_group
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 
@@ -60,7 +60,7 @@ class TensorParallelLlamaMLP(nn.Module):
         # self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         # self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
 
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=config.mlp_bias
         )
@@ -109,7 +109,7 @@ class TensorParallelLlamaAttention(nn.Module):
         # )
 
         # distributed linear layers
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -425,7 +425,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = gather_tensor(logits, get_tp_group())
+        logits = gather_tensor(logits, get_target_tp_group())
 
         loss = None
         if labels is not None:

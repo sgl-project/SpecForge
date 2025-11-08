@@ -15,3 +15,4 @@ pydantic
 sglang[all]==0.5.4
 openai-harmony
 rich
+matplotlib

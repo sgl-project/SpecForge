@@ -38,8 +38,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import OutputRecorder, check_model_inputs
 
-from specforge.distributed import get_tp_group, shard_tensor
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import get_target_tp_group, shard_tensor
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
 
 
 class GptOssExperts(nn.Module):
@@ -51,7 +51,7 @@ class GptOssExperts(nn.Module):
         self.expert_dim = self.intermediate_size
 
         # apply tp
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.expert_dim_per_shard = self.expert_dim // self.tp_size
         self.gate_up_proj = nn.Parameter(
@@ -372,7 +372,7 @@ class GptOssAttention(nn.Module):
         # self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
         # self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
 
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,

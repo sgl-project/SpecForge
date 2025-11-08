@@ -19,21 +19,19 @@ import os
 import re
 import shutil
 from collections import defaultdict
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from rich.logging import RichHandler
-
-# from sglang.bench_one_batch import BenchArgs
 from sglang.srt.server_args import ServerArgs
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig
 
 from specforge.data import (
     build_eagle3_dataset,
@@ -43,11 +41,20 @@ from specforge.data import (
 from specforge.distributed import (
     destroy_distributed,
     get_draft_dp_group,
+    get_draft_dp_rank,
     get_draft_tp_group,
+    get_draft_tp_rank,
+    get_draft_tp_size,
     get_target_dp_group,
+    get_target_tp_size,
     init_distributed,
 )
-from specforge.model.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from specforge.model.draft import (
+    AutoDraftModelConfig,
+    AutoEagle3DraftModel,
+    Eagle3DraftModel,
+    load_param_from_target_model,
+)
 from specforge.model.eagle3 import (
     OfflineEagle3Model,
     OnlineEagle3Model,
@@ -564,7 +571,6 @@ class Eagle3Trainer:
                 torch_dtype=torch.bfloat16,
                 device="cuda",
                 cache_dir=args.cache_dir,
-                lm_head_key=args.lm_head_key,
                 args=self.args,
             )
 
@@ -590,7 +596,9 @@ class Eagle3Trainer:
         print_with_rank("...Initialized target model")
         return target_model, processor
 
-    def _build_draft_model(self, param_dtype=torch.bfloat16):
+    def _build_draft_model(
+        self, param_dtype: torch.dtype = torch.bfloat16
+    ) -> Tuple[PretrainedConfig, Eagle3DraftModel]:
         args = self.trainer_args
         if args.draft_model_config is None:
             # Auto-generate and save config file
@@ -603,19 +611,21 @@ class Eagle3Trainer:
             draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
         if args.draft_model_last_checkpoint:
-            draft_model = AutoEagle3DraftModel.from_pretrained(
+            draft_model: Eagle3DraftModel = AutoEagle3DraftModel.from_pretrained(
                 args.draft_model_last_checkpoint,
                 attention_backend=args.draft_attention_backend,
                 torch_dtype=param_dtype,
             ).cuda()
         else:
-            draft_model = AutoEagle3DraftModel.from_config(
+            draft_model: Eagle3DraftModel = AutoEagle3DraftModel.from_config(
                 draft_model_config,
                 attention_backend=args.draft_attention_backend,
                 torch_dtype=param_dtype,
             ).cuda()
-        draft_model.load_embedding(
-            args.target_model_path, embedding_key=args.embedding_key
+        load_param_from_target_model(
+            target_model_path=args.target_model_path,
+            param_key=args.embedding_key,
+            param=draft_model.get_embedding_param(),
         )
         draft_model.freeze_embedding()
         print_with_rank("...Initialized draft model")
@@ -646,10 +656,15 @@ class Eagle3Trainer:
             ), "Target model must be a SGLangEagle3TargetModel"
             eagle3_model = OfflineEagle3Model(
                 draft_model=self.draft_model,
-                target_head=self.target_model.target_head,
                 length=args.ttt_length,
                 attention_backend=args.draft_attention_backend,
             )
+            load_param_from_target_model(
+                target_model_path=args.target_model_path,
+                param_key=args.lm_head_key,
+                param=eagle3_model.target_head.fc.weight,
+            )
+            eagle3_model.target_head.freeze_parameters()
         else:
             eagle3_model = OnlineEagle3Model(
                 draft_model=self.draft_model,
@@ -686,6 +701,8 @@ class Eagle3Trainer:
         )
         cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
         train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+        target_tp_size = get_target_tp_size()
+        draft_tp_size = get_draft_tp_size()
         with rank_0_priority():
             train_eagle3_dataset = build_eagle3_dataset(
                 dataset=train_dataset,
@@ -712,7 +729,11 @@ class Eagle3Trainer:
             num_workers=4,
             shuffle=True,
             prefetch_factor=8,
-            process_group=get_target_dp_group(),
+            process_group=(
+                get_target_dp_group()
+                if target_tp_size > draft_tp_size
+                else get_draft_dp_group()
+            ),
             is_vlm=args.is_vlm,
         )
         print_with_rank(f"...Initialized train dataloader")
@@ -749,7 +770,11 @@ class Eagle3Trainer:
                 num_workers=4,
                 shuffle=False,
                 prefetch_factor=8,
-                process_group=get_target_dp_group(),
+                process_group=(
+                    get_target_dp_group()
+                    if target_tp_size > draft_tp_size
+                    else get_draft_dp_group()
+                ),
                 is_vlm=args.is_vlm,
             )
             print_with_rank(f"...Initialized eval dataloader")
@@ -804,37 +829,33 @@ class Eagle3Trainer:
                 if "draft_model." in k and "embed" not in k.lower()
             }
 
+            draft_dp_rank = get_draft_dp_rank()
+            draft_tp_rank = get_draft_tp_rank()
             if not args.enable_zero2:
-                if dist.get_rank() == 0:
-                    torch.save(
-                        state_to_save,
-                        os.path.join(epoch_output_dir, "training_state.pt"),
-                    )
+                training_state_path = os.path.join(
+                    epoch_output_dir, f"training_state_draft_tp{draft_tp_rank}.pt"
+                )
+                if draft_dp_rank == 0:
+                    torch.save(state_to_save, training_state_path)
                     print_with_rank(
-                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                        f"Saved full training state to {training_state_path}"
                     )
             else:
-                draft_dp_droup = get_draft_dp_group()
-                draft_dp_rank = dist.get_rank(draft_dp_droup)
-                draft_tp_group = get_draft_tp_group()
-                draft_tp_rank = dist.get_rank(draft_tp_group)
-                torch.save(
-                    state_to_save,
-                    os.path.join(
-                        epoch_output_dir,
-                        f"training_state_draft_tp{draft_tp_rank}_dp{draft_dp_rank}.pt",
-                    ),
+                training_state_path = os.path.join(
+                    epoch_output_dir,
+                    f"training_state_draft_tp{draft_tp_rank}_dp{draft_dp_rank}.pt",
                 )
-                print_with_rank(
-                    f"Saved full training state to {epoch_output_dir}/training_state_draft_tp{draft_tp_rank}_dp{draft_dp_rank}.pt"
-                )
+                torch.save(state_to_save, training_state_path)
+                print_with_rank(f"Saved full training state to {training_state_path}")
 
-            if dist.get_rank() == 0:
+            if draft_dp_rank == 0:
                 self.draft_model.save_pretrained(
                     epoch_output_dir,
                     state_dict=draft_model_state_dict,
                 )
-                print_with_rank(f"Saved model configuration to {epoch_output_dir}")
+                print_with_rank(f"Saved draft model weights to {epoch_output_dir}")
+
+            if dist.get_rank() == 0:
                 if args.max_num_saved_checkpoints > 1:
                     if args.save_per_epoch:
                         step_re = re.compile(r"^epoch_(\d+)$")
@@ -923,7 +944,7 @@ class Eagle3Trainer:
         if dist.get_rank() == 0:
             progress_bar = tqdm(
                 self.eval_dataloader,
-                desc=f"Evaluating {self.global_batch_idx=}, {self.train_dataloader.epoch=}",
+                desc=f"Evaluating global_batch_idx={self.global_batch_idx}, epoch={self.train_dataloader.epoch}",
                 leave=True,
             )
         else:

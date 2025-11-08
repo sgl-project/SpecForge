@@ -1,3 +1,4 @@
+from .custom_backend import AutoDistributedTargetModel
 from .eagle3_target_model import (
     CustomEagle3TargetModel,
     Eagle3TargetModel,
@@ -14,4 +15,5 @@ __all__ = [
     "HFEagle3TargetModel",
     "CustomEagle3TargetModel",
     "get_eagle3_target_model",
+    "AutoDistributedTargetModel",
 ]

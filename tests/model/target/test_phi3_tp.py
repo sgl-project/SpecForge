@@ -6,42 +6,40 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import Llama4ForCausalLM as HFLlama4ForCausalLM
-from transformers import Llama4TextConfig
+from transformers.models.phi3 import Phi3Config
+from transformers.models.phi3 import Phi3ForCausalLM as HFPhi3ForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.custom_backend.llama4 import (
-    Llama4ForCausalLM as SFLlama4ForCausalLM,
+from specforge.model.target.custom_backend.phi3 import (
+    Phi3ForCausalLM as SFLPhi3ForCausalLM,
 )
 from tests.utils import get_available_port
 
 
-def test_llama4_tp(rank, world_size, temp_dir, port):
+def test_phi3_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
 
-    init_distributed(tp_size=world_size)
+    init_distributed(timeout=10, target_tp_size=2, draft_tp_size=1)
     set_seed(42)
-    config = Llama4TextConfig(
-        vocab_size=1000,
-        hidden_size=384,
-        intermediate_size=512,
-        intermediate_size_mlp=512,
+    config = Phi3Config(
+        vocab_size=32064,
+        hidden_size=3072,
+        intermediate_size=8192,
         num_hidden_layers=2,
-        max_position_embeddings=1024,
-        num_attention_heads=10,
-        num_key_value_heads=2,
-        head_dim=64,
-        num_local_experts=4,
-        tie_word_embedding=False,
-        initializer_range=0.02,
+        max_position_embeddings=4096,
+        num_attention_heads=32,
+        num_key_value_heads=32,
         hidden_act="silu",
+        rms_norm_eps=1e-6,
+        attention_dropout=0.0,
+        resid_pdrop=0.0,
     )
 
-    # create the single-gpu
-    model = HFLlama4ForCausalLM(config).cuda()
+    # create a simple single-gpu model
+    model = HFPhi3ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -50,27 +48,28 @@ def test_llama4_tp(rank, world_size, temp_dir, port):
     dist.barrier()
 
     # load the model weights to the distributed model
-    dist_model = SFLlama4ForCausalLM.from_pretrained(temp_dir).cuda()
+    dist_model = SFLPhi3ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
     input_ids = torch.randint(0, 1000, (1, 256)).cuda()
     attention_mask = torch.ones_like(input_ids).cuda()
 
+    # Run inference on both models
     expected_logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     dist_logits = dist_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
     assert torch.allclose(
         expected_logits,
         dist_logits,
-        rtol=1e-5,
-        atol=1e-5,
+        rtol=1e-4,
+        atol=1e-4,
     ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
     dist.destroy_process_group()
 
 
-class TestLlama4TP(unittest.TestCase):
+class TestPhi3TP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -78,13 +77,15 @@ class TestLlama4TP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_llama4_tp(self):
+    def test_phi3_tp(self):
         port = get_available_port()
-        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(test_phi3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(TestLlama4TP))
+
+    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPhi3TP))
+
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

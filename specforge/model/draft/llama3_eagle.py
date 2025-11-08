@@ -10,6 +10,8 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.distributed import get_draft_tp_group, get_draft_tp_size
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear, _AllReduce
 from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
@@ -452,26 +454,48 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.tp_group = get_draft_tp_group()
+        self.tp_size = get_draft_tp_size()
+        assert (
+            config.num_attention_heads % self.tp_size == 0
+        ), "num_attention_heads must be divisible by tp_size"
+        self.num_heads = config.num_attention_heads // self.tp_size
         if hasattr(config, "head_dim"):
             self.head_dim = config.head_dim
         else:
-            self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+            self.head_dim = self.hidden_size // config.num_attention_heads
+
+        assert (
+            config.num_key_value_heads % self.tp_size == 0
+        ), f"{config.num_key_value_heads=} must be divisible by {self.tp_size=}"
+        self.num_key_value_heads = config.num_key_value_heads // self.tp_size
+
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+        self.q_proj = ColumnParallelLinear(
+            self.hidden_size * 2,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            tp_group=self.tp_group,
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        self.k_proj = ColumnParallelLinear(
+            self.hidden_size * 2,
+            config.num_key_value_heads * self.head_dim,
+            bias=False,
+            tp_group=self.tp_group,
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+        self.v_proj = ColumnParallelLinear(
+            self.hidden_size * 2,
+            config.num_key_value_heads * self.head_dim,
+            bias=False,
+            tp_group=self.tp_group,
         )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            tp_group=self.tp_group,
         )
         self._init_rope()
 
@@ -653,6 +677,8 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
 
         attn_output = self.o_proj(attn_output)
+        if self.tp_size > 1:
+            attn_output = _AllReduce.apply(attn_output, self.tp_group)
 
         return attn_output
 
@@ -773,41 +799,28 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.tp_group = get_draft_tp_group()
+        self.tp_size = get_draft_tp_size()
+        self.gate_proj = ColumnParallelLinear(
+            self.hidden_size, self.intermediate_size, bias=False, tp_group=self.tp_group
+        )
+        self.up_proj = ColumnParallelLinear(
+            self.hidden_size, self.intermediate_size, bias=False, tp_group=self.tp_group
+        )
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size, self.hidden_size, bias=False, tp_group=self.tp_group
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+        # Remove the pretraining_tp > 1 branch in favor of a unified parallel layer implementation.
+        gate_output = self.gate_proj(x)
+        up_output = self.up_proj(x)
 
-            gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
+        down_proj = self.down_proj(self.act_fn(gate_output) * up_output)
 
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        if self.tp_size > 1:
+            down_proj = _AllReduce.apply(down_proj, self.tp_group)
 
         return down_proj
 
@@ -914,7 +927,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
-        self.config = config
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size

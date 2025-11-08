@@ -55,8 +55,8 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
 # [MODIFIED] Import from transformers library
-from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import gather_tensor, get_target_tp_group, shard_tensor
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 
@@ -69,7 +69,7 @@ class Llama4TextExperts(nn.Module):
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
 
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.expert_dim_per_shard = self.expert_dim // self.tp_size
         self.gate_up_proj = nn.Parameter(
@@ -130,7 +130,7 @@ class Llama4TextMLP(nn.Module):
             intermediate_size = config.intermediate_size
 
         self.config = config
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.gate_proj = ColumnParallelLinear(
             config.hidden_size, intermediate_size, bias=False
         )
@@ -172,7 +172,7 @@ class Llama4TextAttention(nn.Module):
         self.is_causal = True
         self.use_rope = config.no_rope_layers[layer_idx]
 
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -584,7 +584,7 @@ class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin):
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = gather_tensor(logits, get_tp_group())
+        logits = gather_tensor(logits, get_target_tp_group())
         loss = None
         if labels is not None:
             loss = self.loss_function(

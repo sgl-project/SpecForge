@@ -1,3 +1,7 @@
+"""
+torchrun  --standalone --nproc_per_node 1 benchmarks/module_benchmarks/benchmark_flex_attention.py
+"""
+
 import argparse
 import time
 
@@ -8,6 +12,7 @@ import torch._dynamo as dynamo
 from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
+from specforge.distributed import init_distributed
 from specforge.model.draft.llama3_eagle import (
     LlamaAttention,
     LlamaFlexAttention,
@@ -285,6 +290,7 @@ def plot_results(eagle_results, flex_results, seq_lengths):
 
 
 if __name__ == "__main__":
+    init_distributed(timeout=10, target_tp_size=1, draft_tp_size=1)
     parser = argparse.ArgumentParser(description="Benchmark attention mechanisms")
     parser.add_argument(
         "--enable-profile", action="store_true", help="Enable profiling"
@@ -306,7 +312,7 @@ if __name__ == "__main__":
     # Define sequence lengths to test
     seq_lengths = [128 * i for i in range(1, 28, 4)]
     # Add extra long context
-    seq_lengths.extend([16384, 32768])
+    seq_lengths.extend([16384])
 
     print(f"Testing sequence lengths: {seq_lengths}")
 

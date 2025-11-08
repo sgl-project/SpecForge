@@ -24,14 +24,86 @@ import glob
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from transformers import PretrainedConfig
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
+
+from specforge.distributed import (
+    gather_tensor,
+    get_draft_tp_group,
+    get_draft_tp_rank,
+    get_draft_tp_size,
+)
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.utils import print_with_rank
+
+
+@torch.no_grad()
+def load_param_from_target_model(
+    target_model_path: str, param_key: str, param: nn.Parameter
+) -> None:
+    """
+    Load the parameter from the target model.
+
+    Args:
+        target_model_path (str): Path to the target model. Can be either a Hugging Face
+        repository ID or a local directory path containing the model files.
+        param_key (str): The key of the parameter to load.
+        param (nn.Parameter): The parameter to load.
+    """
+    if os.path.exists(target_model_path):
+        # model_path is a local directory
+        # check if there is file ending with index.json
+        glob_path = os.path.join(target_model_path, "*.index.json")
+        index_json_path = glob.glob(glob_path)
+
+        if len(index_json_path) == 0:
+            # No index.json found, look for single model file
+            safetensors_path = os.path.join(target_model_path, "model.safetensors")
+            if os.path.exists(safetensors_path):
+                with safe_open(safetensors_path, framework="pt") as f:
+                    param.copy_(f.get_tensor(param_key))
+                return
+
+            pytorch_model_path = os.path.join(target_model_path, "pytorch_model.bin")
+            if os.path.exists(pytorch_model_path):
+                state_dict = torch.load(pytorch_model_path, map_location="cpu")
+                param.copy_(state_dict[param_key])
+                return
+
+            raise FileNotFoundError(
+                f"No index.json, model.safetensors or pytorch_model.bin found in {target_model_path}"
+            )
+        if len(index_json_path) > 1:
+            raise FileNotFoundError(
+                f"Multiple index.json files found in {target_model_path}"
+            )
+        index_json_path = index_json_path[0]
+
+        with open(index_json_path, "r") as f:
+            index_json = json.load(f)
+        ckpt_file = index_json["weight_map"][param_key]
+
+        if ckpt_file.endswith(".safetensors"):
+            with safe_open(
+                os.path.join(target_model_path, ckpt_file), framework="pt"
+            ) as f:
+                param.copy_(f.get_tensor(param_key))
+        else:
+            state_dict = torch.load(os.path.join(target_model_path, ckpt_file))
+            param.copy_(state_dict[param_key])
+    else:
+        # this is the case where model_path is a huggingface repository
+        # we first need to locate its local cache
+        local_cache_path = snapshot_download(repo_id=target_model_path)
+        load_param_from_target_model(local_cache_path, param_key, param)
 
 
 class Eagle3DraftModel(PreTrainedModel, ABC):
@@ -39,6 +111,10 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
     This is the base class for the Eagle3 draft model implementation. The child class needs to implement
     the abstract methods to support training with TTT.
     """
+
+    def __init__(self, config: PretrainedConfig):
+        super().__init__(config)
+        self.config = config
 
     @abstractmethod
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -83,64 +159,11 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         self.embed_tokens.weight.requires_grad = False
 
-    @torch.no_grad()
-    def load_embedding(
-        self, model_path: str, embedding_key: str = "model.embed_tokens.weight"
-    ) -> None:
+    def get_embedding_param(self) -> nn.Parameter:
         """
-        Load the embedding of the draft model.
-
-        Args:
-            model_path (str): Path to the target model. Can be either a Hugging Face
-            repository ID or a local directory path containing the model files.
+        Get the embedding parameter of the draft model.
         """
-        if os.path.exists(model_path):
-            # model_path is a local directory
-            # check if there is file ending with index.json
-            glob_path = os.path.join(model_path, "*.index.json")
-            index_json_path = glob.glob(glob_path)
-
-            if len(index_json_path) == 0:
-                # No index.json found, look for single model file
-                safetensors_path = os.path.join(model_path, "model.safetensors")
-                if os.path.exists(safetensors_path):
-                    with safe_open(safetensors_path, framework="pt") as f:
-                        self.embed_tokens.weight.copy_(f.get_tensor(embedding_key))
-                    return
-
-                pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
-                if os.path.exists(pytorch_model_path):
-                    state_dict = torch.load(pytorch_model_path, map_location="cpu")
-                    self.embed_tokens.weight.copy_(state_dict[embedding_key])
-                    return
-
-                raise FileNotFoundError(
-                    f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
-                )
-            if len(index_json_path) > 1:
-                raise FileNotFoundError(
-                    f"Multiple index.json files found in {model_path}"
-                )
-            index_json_path = index_json_path[0]
-
-            with open(index_json_path, "r") as f:
-                index_json = json.load(f)
-            ckpt_file = index_json["weight_map"][embedding_key]
-
-            if ckpt_file.endswith(".safetensors"):
-                with safe_open(
-                    os.path.join(model_path, ckpt_file), framework="pt"
-                ) as f:
-                    emb_tokens = f.get_tensor(embedding_key)
-            else:
-                state_dict = torch.load(os.path.join(model_path, ckpt_file))
-                emb_tokens = state_dict[embedding_key]
-            self.embed_tokens.weight.copy_(emb_tokens)
-        else:
-            # this is the case where model_path is a huggingface repository
-            # we first need to locate its local cache
-            local_cache_path = snapshot_download(repo_id=model_path)
-            self.load_embedding(local_cache_path, embedding_key)
+        return self.embed_tokens.weight
 
     def load_vocab_mapping(self, file_path: str) -> None:
         """
@@ -156,3 +179,52 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])
         self.vocab_mapping_loaded = True
+
+    def save_pretrained(self, save_directory, state_dict=None, **kwargs):
+        """
+        Overrides save_pretrained to handle TP weight aggregation robustly.
+        This method gathers sharded weights from all TP ranks and saves a single,
+        complete checkpoint from the main process.
+        """
+        if not dist.is_initialized():
+            # Standard non-distributed save
+            super().save_pretrained(save_directory, state_dict=state_dict, **kwargs)
+            return
+
+        # Use the provided state_dict or get it from the model
+        if state_dict is None:
+            state_dict = self.state_dict()
+
+        # Get distributed process groups and ranks
+        tp_group = get_draft_tp_group()
+        tp_size = get_draft_tp_size()
+        tp_rank = get_draft_tp_rank()
+
+        if tp_size > 1:
+            # --- Aggregation Logic for TP > 1 ---
+            reconstructed_state_dict = {}
+            # All ranks in a TP group participate in gathering shards for each parameter.
+            modules = dict(self.named_modules())
+            state_dict = dict(sorted(state_dict.items()))
+            for name, param in state_dict.items():
+                # Gather shards from all TP ranks into a list
+                module_name = ".".join(name.split(".")[:-1])
+                module = modules.get(module_name)
+
+                tensor = param
+                if name.endswith(".weight"):
+                    if isinstance(module, ColumnParallelLinear):
+                        tensor = gather_tensor(tensor, tp_group, 0)
+                    elif isinstance(module, RowParallelLinear):
+                        tensor = gather_tensor(tensor, tp_group, 1)
+
+                reconstructed_state_dict[name] = tensor
+            state_dict = reconstructed_state_dict
+
+        #  Only the TP Rank 0 process saves the final model.
+        if tp_rank == 0:
+            print_with_rank(f"TP Rank {tp_rank} saving aggregated model checkpoint...")
+            super().save_pretrained(save_directory, state_dict=state_dict, **kwargs)
+
+        # Barrier to ensure all processes wait until saving is complete.
+        dist.barrier(group=tp_group)

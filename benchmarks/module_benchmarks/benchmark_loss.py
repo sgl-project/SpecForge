@@ -11,6 +11,8 @@ TTT_LENGTH = 7
 def benchmark_loss_method(
     loss_method: str,
     test_configs: list,
+    num_runs: int = 20,
+    num_warmup_runs: int = 5,
 ):
     """Benchmark a loss computation method for speed and GPU memory usage."""
     print(f"\n=== Benchmarking {loss_method} Loss ===")
@@ -41,24 +43,30 @@ def benchmark_loss_method(
             logits_list.append(logits)
 
         torch.cuda.synchronize()  # Ensure all operations are complete
+
+        def f():
+            plosses = []
+            for i in range(TTT_LENGTH):
+                logits = logits_list[i]
+                if loss_method == "triton":
+                    loss = LogSoftmaxLoss.apply(logits, target, position_mask)
+                else:
+                    loss = _compute_loss(logits, target, position_mask)
+                plosses.append(loss)
+
+            ploss_weight = [0.8**i for i in range(len(plosses))]
+            ploss = (
+                sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+                / TTT_LENGTH
+            )
+            ploss.backward()
+
+        # warmup
+        for _ in range(num_warmup_runs):
+            f()
         start_time = time.time()
-
-        plosses = []
-        for i in range(TTT_LENGTH):
-            logits = logits_list[i]
-            if loss_method == "triton":
-                loss = LogSoftmaxLoss.apply(logits, target, position_mask)
-            else:
-                loss = _compute_loss(logits, target, position_mask)
-            plosses.append(loss)
-
-        ploss_weight = [0.8**i for i in range(len(plosses))]
-        ploss = (
-            sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-            / TTT_LENGTH
-        )
-        ploss.backward()
-
+        for _ in range(num_runs):
+            f()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -74,7 +82,7 @@ def benchmark_loss_method(
                 "B": B,
                 "T": T,
                 "V": V,
-                "time_total": total_time,
+                "time_total": total_time / num_runs,
                 "peak_memory": peak_memory,
             }
         )
@@ -86,12 +94,6 @@ def benchmark_loss_method(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark loss computation methods")
-    parser.add_argument(
-        "--num-runs", type=int, default=5, help="Number of runs for averaging"
-    )
-    args = parser.parse_args()
-
     print("PyTorch version:", torch.__version__)
     if torch.cuda.is_available():
         print("CUDA available:", torch.cuda.is_available())

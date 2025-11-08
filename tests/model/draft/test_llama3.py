@@ -2,20 +2,19 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
-import torch.nn as nn
+from accelerate.utils import set_seed
 from transformers import LlamaConfig
 
-from specforge.modeling.draft.llama3_eagle import (
+from specforge.distributed import init_distributed
+from specforge.model.draft.llama3_eagle import (
     LlamaAttention,
     LlamaForCausalLMEagle3,
     LlamaMLP,
     LlamaRMSNorm,
 )
-
-# from model_module import LlamaForCausalLMEagle3
 
 
 class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
@@ -48,6 +47,13 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         }
 
         self.config = LlamaConfig(**config_dict)
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"
+        if not torch.distributed.is_initialized():
+            init_distributed(timeout=10, target_tp_size=1, draft_tp_size=1)
+        set_seed(42)
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir)

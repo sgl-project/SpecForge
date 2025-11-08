@@ -19,9 +19,29 @@ def get_target_tp_group():
     return _TARGET_TP_GROUP
 
 
+def get_target_tp_size():
+    global _TARGET_TP_GROUP
+    return dist.get_world_size(_TARGET_TP_GROUP)
+
+
+def get_target_tp_rank():
+    global _TARGET_TP_GROUP
+    return dist.get_rank(_TARGET_TP_GROUP)
+
+
 def get_target_dp_group():
     global _TARGET_DP_GROUP
     return _TARGET_DP_GROUP
+
+
+def get_target_dp_size():
+    global _TARGET_DP_GROUP
+    return dist.get_world_size(_TARGET_DP_GROUP)
+
+
+def get_target_dp_rank():
+    global _TARGET_DP_GROUP
+    return dist.get_rank(_TARGET_DP_GROUP)
 
 
 def get_draft_tp_group():
@@ -29,9 +49,29 @@ def get_draft_tp_group():
     return _DRAFT_TP_GROUP
 
 
+def get_draft_tp_size():
+    global _DRAFT_TP_GROUP
+    return dist.get_world_size(_DRAFT_TP_GROUP)
+
+
+def get_draft_tp_rank():
+    global _DRAFT_TP_GROUP
+    return dist.get_rank(_DRAFT_TP_GROUP)
+
+
 def get_draft_dp_group():
     global _DRAFT_DP_GROUP
     return _DRAFT_DP_GROUP
+
+
+def get_draft_dp_size():
+    global _DRAFT_DP_GROUP
+    return dist.get_world_size(_DRAFT_DP_GROUP)
+
+
+def get_draft_dp_rank():
+    global _DRAFT_DP_GROUP
+    return dist.get_rank(_DRAFT_DP_GROUP)
 
 
 def get_device_mesh():
@@ -93,9 +133,11 @@ def init_distributed(
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
+    global _TARGET_TP_GROUP, _TARGET_DP_GROUP, _DRAFT_TP_GROUP, _DRAFT_DP_GROUP
+    dist.destroy_process_group(_TARGET_TP_GROUP)
+    dist.destroy_process_group(_TARGET_DP_GROUP)
+    dist.destroy_process_group(_DRAFT_TP_GROUP)
+    dist.destroy_process_group(_DRAFT_DP_GROUP)
     dist.destroy_process_group()
 
 
@@ -111,6 +153,13 @@ def gather_tensor(
     tensor: torch.Tensor, process_group: dist.ProcessGroup = None, dim: int = -1
 ) -> torch.Tensor:
     size = dist.get_world_size(process_group)
+    if dim == 0:
+        output_shape = (tensor.shape[0] * size, *tensor.shape[1:])
+        output_tensor = torch.empty(
+            output_shape, device=tensor.device, dtype=tensor.dtype
+        )
+        dist.all_gather_into_tensor(output_tensor, tensor, group=process_group)
+        return output_tensor
     obj_list = [torch.empty_like(tensor) for _ in range(size)]
     dist.all_gather(obj_list, tensor, group=process_group)
     gather_tensor = torch.cat(obj_list, dim=dim)

@@ -6,25 +6,25 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
-from transformers import Qwen2Config
-from transformers import Qwen2ForCausalLM as HFWen2ForCausalLM
+from transformers import Llama4ForCausalLM as HFLlama4ForCausalLM
+from transformers import Llama4TextConfig
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.custom_backend.qwen2 import (
-    Qwen2ForCausalLM as SFLQwen2ForCausalLM,
+from specforge.model.target.custom_backend.llama4 import (
+    Llama4ForCausalLM as SFLlama4ForCausalLM,
 )
 from tests.utils import get_available_port
 
 
-def test_qwen2_tp(rank, world_size, temp_dir, port):
+def test_llama4_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
 
-    init_distributed(tp_size=2)
+    init_distributed(timeout=10, target_tp_size=world_size, draft_tp_size=1)
     set_seed(42)
-    config = Qwen2Config(
+    config = Llama4TextConfig(
         vocab_size=1000,
         hidden_size=384,
         intermediate_size=512,
@@ -41,7 +41,7 @@ def test_qwen2_tp(rank, world_size, temp_dir, port):
     )
 
     # create the single-gpu
-    model = HFWen2ForCausalLM(config).cuda()
+    model = HFLlama4ForCausalLM(config).cuda()
 
     # save the model weights to a temp directory
     if dist.get_rank() == 0:
@@ -50,8 +50,7 @@ def test_qwen2_tp(rank, world_size, temp_dir, port):
     dist.barrier()
 
     # load the model weights to the distributed model
-    print(f"Loading model from {temp_dir}")
-    dist_model = SFLQwen2ForCausalLM.from_pretrained(temp_dir).cuda()
+    dist_model = SFLlama4ForCausalLM.from_pretrained(temp_dir).cuda()
     dist.barrier()
 
     # create data
@@ -71,7 +70,7 @@ def test_qwen2_tp(rank, world_size, temp_dir, port):
     dist.destroy_process_group()
 
 
-class TestQwen2TP(unittest.TestCase):
+class TestLlama4TP(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -79,13 +78,13 @@ class TestQwen2TP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_qwen2_tp(self):
+    def test_llama4_tp(self):
         port = get_available_port()
-        mp.spawn(test_qwen2_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name, port))
 
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(TestQwen2TP))
+    suite.addTest(unittest.makeSuite(TestLlama4TP))
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)

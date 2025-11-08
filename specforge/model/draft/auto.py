@@ -5,6 +5,7 @@ from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import LlamaConfig, PretrainedConfig, modeling_utils
 
+from .base import Eagle3DraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
 
 
@@ -15,7 +16,9 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     }
 
     @classmethod
-    def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
+    def from_config(
+        cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs
+    ) -> Eagle3DraftModel:
         """
         This class method takes a configuration object and create its model based on the
         _model_mapping class variable.
@@ -41,7 +44,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         pretrained_model_name_or_path: Union[str, os.PathLike[str]],
         *model_args,
         **kwargs,
-    ):
+    ) -> Eagle3DraftModel:
         original_warn = modeling_utils.logger.warning
 
         def filtered_warning(msg):
@@ -68,7 +71,7 @@ class AutoDraftModelConfig:
     }
 
     @classmethod
-    def from_file(cls, config_path: str):
+    def from_file(cls, config_path: str) -> PretrainedConfig:
         """
         This class method takes a configuration file path and create its configuration object based on the
         _config_mapping class variable.

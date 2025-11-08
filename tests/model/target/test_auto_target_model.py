@@ -7,7 +7,7 @@ from accelerate.utils import set_seed
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.custom_backend.llama import (
+from specforge.model.target.custom_backend.llama import (
     LlamaForCausalLM as SFLlamaForCausalLM,
 )
 from tests.utils import get_available_port
@@ -22,7 +22,7 @@ class TestAutoTargetModel(unittest.TestCase):
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(port)
 
-        init_distributed(tp_size=1)
+        init_distributed(timeout=10, target_tp_size=1, draft_tp_size=1)
 
         set_seed(42)
         hf_model = HFLlamaForCausalLM.from_pretrained(

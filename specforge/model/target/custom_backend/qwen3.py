@@ -42,8 +42,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import gather_tensor, get_target_tp_group
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 
@@ -56,7 +56,7 @@ class Qwen3MLP(nn.Module):
         self.intermediate_size = config.intermediate_size
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
 
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=False
@@ -95,7 +95,7 @@ class Qwen3Attention(nn.Module):
         self.is_causal = True
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
 
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -585,7 +585,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # We don't shard embed_tokens, so when tie_word_embeddings is True
         # lm_head is not sharded as well. Thus, we skip all_gather.
         if not self.config.tie_word_embeddings:
-            logits = gather_tensor(logits, get_tp_group())
+            logits = gather_tensor(logits, get_target_tp_group())
 
         loss = None
         if labels is not None:

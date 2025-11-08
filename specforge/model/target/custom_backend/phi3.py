@@ -45,8 +45,8 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import gather_tensor, get_target_tp_group
+from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
 
 
 class Phi3MLP(nn.Module):
@@ -56,7 +56,7 @@ class Phi3MLP(nn.Module):
         self.config = config
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
 
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -100,7 +100,7 @@ class Phi3Attention(nn.Module):
         self.is_causal = True
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         tp_size = dist.get_world_size(self.tp_group)
 
         # Adjust head counts for TP
@@ -429,7 +429,7 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin):
         # We don't shard embed_tokens, so when tie_word_embeddings is True
         # lm_head is not sharded as well. Thus, we skip all_gather.
         if not self.config.tie_word_embeddings:
-            logits = gather_tensor(logits, get_tp_group())
+            logits = gather_tensor(logits, get_target_tp_group())
 
         loss = None
         if labels is not None:

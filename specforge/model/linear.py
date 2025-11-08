@@ -3,7 +3,26 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
+from specforge.distributed import get_target_tp_group, shard_tensor
+
+
+class _AllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        group: dist.ProcessGroup,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ):
+        # ctx is a context object that can be used to stash information for backward computation
+        output = input.clone()
+        dist.all_reduce(output, op=op, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # # The gradient of all_reduce is an identity function, so we can directly return the gradient
+        return grad_output, None, None
 
 
 class RowParallelLinear(nn.Module):
@@ -16,11 +35,12 @@ class RowParallelLinear(nn.Module):
         dtype=None,
         kv_head_replicas=False,
         layout_type: str = "normal",
+        tp_group: dist.ProcessGroup = None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
-        self.tp_group = get_tp_group()
+        self.tp_group = tp_group if tp_group is not None else get_target_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
 
@@ -85,11 +105,12 @@ class ColumnParallelLinear(nn.Module):
         dtype=None,
         kv_head_replicas=False,
         layout_type: str = "normal",
+        tp_group: dist.ProcessGroup = None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
-        self.tp_group = get_tp_group()
+        self.tp_group = tp_group if tp_group is not None else get_target_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
 
