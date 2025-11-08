@@ -13,17 +13,19 @@ from specforge.model.target.eagle3_target_model import (
     HFEagle3TargetModel,
     SGLangEagle3TargetModel,
 )
+from tests.utils import get_available_port
 
 
 @torch.no_grad()
-def test_target_model_backend(rank, world_size):
+def test_target_model_backend(rank, world_size, port, tp_size):
+    model_name = "unsloth/Llama-3.2-1B"
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = str(port)
 
-    init_distributed(timeout=10, target_tp_size=2, draft_tp_size=1)
+    init_distributed(tp_size=1)
     set_seed(42)
 
     input_ids = torch.randint(0, 1000, (2, 256)).cuda()
@@ -31,7 +33,7 @@ def test_target_model_backend(rank, world_size):
     loss_mask = torch.ones_like(input_ids)
 
     hf_target_model = HFEagle3TargetModel.from_pretrained(
-        "meta-llama/Llama-3.1-8B-Instruct", torch_dtype=torch.float16, device="cuda"
+        model_name, torch_dtype=torch.float16, device="cuda"
     )
     hf_target_model.set_aux_hidden_states_layers()
     hf_out = hf_target_model.generate_eagle3_data(
@@ -42,7 +44,7 @@ def test_target_model_backend(rank, world_size):
     del hf_target_model
 
     custom_target_model = CustomEagle3TargetModel.from_pretrained(
-        "meta-llama/Llama-3.1-8B-Instruct", torch_dtype=torch.float16, device="cuda"
+        model_name, torch_dtype=torch.float16, device="cuda"
     )
     custom_target_model.set_aux_hidden_states_layers()
     custom_out = custom_target_model.generate_eagle3_data(
@@ -66,7 +68,7 @@ def test_target_model_backend(rank, world_size):
         hf_out.hidden_states, custom_out.hidden_states, atol=1e-5, rtol=1e-5
     ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
     server_args = ServerArgs(
-        model_path="meta-llama/Llama-3.1-8B-Instruct",
+        model_path=model_name,
         trust_remote_code=True,
         dtype=torch.float16,
         enable_return_hidden_states=True,
@@ -81,8 +83,9 @@ def test_target_model_backend(rank, world_size):
     server_args.data_parallel_size = 1
     server_args.expert_parallel_size = 1
     server_args.target_micro_batch_size = 2
+    model_name = "meta-llama/Llama-3.1-8B-Instruct"
     sgl_target_model = SGLangEagle3TargetModel.from_pretrained(
-        "meta-llama/Llama-3.1-8B-Instruct",
+        model_name,
         torch_dtype=torch.float16,
         device="cuda",
         args=server_args,
@@ -118,9 +121,19 @@ def test_target_model_backend(rank, world_size):
 
 class TestTargetModelBackend(unittest.TestCase):
 
-    def test_target_model_backend(self):
-        world_size = 4
-        mp.spawn(test_target_model_backend, nprocs=world_size, args=(world_size,))
+    def test_target_model_backend_dp(self):
+        world_size = 2
+        port = get_available_port()
+        mp.spawn(
+            test_target_model_backend, nprocs=world_size, args=(world_size, port, 1)
+        )
+
+    def test_target_model_backend_tp(self):
+        world_size = 2
+        port = get_available_port()
+        mp.spawn(
+            test_target_model_backend, nprocs=world_size, args=(world_size, port, 2)
+        )
 
 
 if __name__ == "__main__":

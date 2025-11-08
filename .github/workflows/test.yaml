@@ -24,11 +24,29 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Restore cache
         run: |
-          pip install -e .
+          if [ -d /github/home/sf ] && [ ! -z "$(ls -A /github/home/sf/)" ]; then
+            cp -p -r /github/home/sf/* ./
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          # if sf venv does not exist, create it
+          if [ ! -d sf ]; then
+            uv venv sf -p 3.11
+          fi
+          source sf/bin/activate
+          uv pip install -v . --prerelease=allow
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 30
+        shell: bash
         run: |
-          python tests/ci/gpu_lock_exec.py --devices 4,5,6,7 python -m unittest discover -s ./tests -p "test_*.py"
+          source sf/bin/activate
+          python -m unittest discover -s ./tests -p "test_*.py" -v
+
+      - name: Save cache
+        run: |
+          cp -p -r sf /github/home/

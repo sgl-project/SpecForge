@@ -263,6 +263,7 @@ def prepare_dp_dataloaders(
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
         collate_fn=datacollator_cls(),
+        drop_last=True,
         **dataloader_kwargs
     )
     return dataloader
