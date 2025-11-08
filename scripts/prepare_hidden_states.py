@@ -295,7 +295,11 @@ class HiddenStatesGenerator:
             if exists_list:
                 global_idx += batch_size
                 continue
-            eagle3_data_list = self.model.generate_eagle3_data(batch)
+            eagle3_data_list = self.model.generate_eagle3_data(
+                input_ids=batch["input_ids"].cuda(),
+                attention_mask=batch["attention_mask"].cuda(),
+                loss_mask=batch["loss_mask"].cuda(),
+            )
             for eagle3_data in eagle3_data_list:
                 seq_lengths = eagle3_data.attention_mask.sum(dim=1).tolist()
                 hidden_states_cpu = eagle3_data.hidden_states.cpu()
