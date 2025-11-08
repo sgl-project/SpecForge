@@ -1,10 +1,5 @@
-# coding=utf-8
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+﻿# coding=utf-8
+# Copyright 2025 Qwen Team and HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,77 +12,81 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, Dict, Optional, Union
+
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
-from torch import nn
+import torch.nn as nn
+from transformers import Qwen3Config
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import (
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3RMSNorm,
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
-from transformers.utils.generic import check_model_inputs
+from transformers.utils import auto_docstring, can_return_tuple, logging
 
 from specforge.distributed import gather_tensor, get_target_tp_group
-from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.linear import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 
 
-class TensorParallelLlamaMLP(nn.Module):
+class Qwen3MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
-        # self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        # self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        # self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
-
+        # Add TP support
         self.tp_group = get_target_tp_group()
+
         self.gate_proj = ColumnParallelLinear(
-            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+            self.hidden_size, self.intermediate_size, bias=False
         )
         self.up_proj = ColumnParallelLinear(
-            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+            self.hidden_size, self.intermediate_size, bias=False
         )
         self.down_proj = RowParallelLinear(
-            self.intermediate_size, self.hidden_size, bias=config.mlp_bias
+            self.intermediate_size, self.hidden_size, bias=False
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # Add all_reduce for TP
         dist.all_reduce(down_proj, op=dist.ReduceOp.SUM, group=self.tp_group)
         return down_proj
 
 
-class TensorParallelLlamaAttention(nn.Module):
+class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+        self.total_num_kv_heads = config.num_key_value_heads
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
@@ -95,21 +94,9 @@ class TensorParallelLlamaAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        # self.q_proj = nn.Linear(
-        #     config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        # )
-        # self.k_proj = nn.Linear(
-        #     config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        # )
-        # self.v_proj = nn.Linear(
-        #     config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        # )
-        # self.o_proj = nn.Linear(
-        #     config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        # )
-
-        # distributed linear layers
+        # Add TP support
         self.tp_group = get_target_tp_group()
+
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -130,21 +117,37 @@ class TensorParallelLlamaAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
+        self.q_norm = Qwen3RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # thus post q_norm does not need reshape
+        # Sliding window logic is kept as is, assuming it's handled in config.layer_types
+        self.sliding_window = (
+            config.sliding_window
+            if config.layer_types[layer_idx] == "sliding_attention"
+            else None
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
+        past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(
+            self.q_proj(hidden_states).view(hidden_shape)
+        ).transpose(1, 2)
+        key_states = self.k_norm(
+            self.k_proj(hidden_states).view(hidden_shape)
+        ).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -152,10 +155,10 @@ class TensorParallelLlamaAttention(nn.Module):
             query_states, key_states, cos, sin
         )
 
-        if past_key_values is not None:
+        if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
+            key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
@@ -173,51 +176,53 @@ class TensorParallelLlamaAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
+            sliding_window=self.sliding_window,  # diff with Llama
             **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        # Add all_reduce for TP
         dist.all_reduce(attn_output, op=dist.ReduceOp.SUM, group=self.tp_group)
         return attn_output, attn_weights
 
 
-class TensorParallelLlamaDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+class Qwen3DecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = TensorParallelLlamaAttention(
-            config=config, layer_idx=layer_idx
-        )
+        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
 
-        self.mlp = TensorParallelLlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(
+        self.mlp = Qwen3MLP(config)
+        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attention_type = config.layer_types[layer_idx]
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            past_key_value=past_key_value,
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
@@ -230,29 +235,93 @@ class TensorParallelLlamaDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        return outputs
 
 
-class LlamaPreTrainedModel(PreTrainedModel):
-    config: LlamaConfig
+class Qwen3RotaryEmbedding(nn.Module):
+    def __init__(self, config: Qwen3Config, device=None):
+        super().__init__()
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    @torch.no_grad()
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    def forward(self, x, position_ids):
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+@auto_docstring
+class Qwen3PreTrainedModel(PreTrainedModel):
+    config_class = Qwen3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["TensorParallelLlamaDecoderLayer"]
+    _no_split_modules = ["Qwen3DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
+    _supports_flash_attn_3 = True
+    _supports_flash_attn_2 = True
     _supports_sdpa = True
     _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
+    _supports_cache_class = True
+    _supports_quantized_cache = True
+    _supports_static_cache = True
     _supports_attention_backend = True
-    _can_record_outputs = {
-        "hidden_states": TensorParallelLlamaDecoderLayer,
-        "attentions": TensorParallelLlamaAttention,
-    }
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, Qwen3RMSNorm):
+            module.weight.data.fill_(1.0)
 
 
-class LlamaModel(LlamaPreTrainedModel):
-    def __init__(self, config: LlamaConfig):
+@auto_docstring
+class Qwen3Model(Qwen3PreTrainedModel):
+    def __init__(self, config: Qwen3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -262,45 +331,74 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                TensorParallelLlamaDecoderLayer(config, layer_idx)
+                Qwen3DecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    @can_return_tuple
+    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        **kwargs: Unpack[TransformersKwargs],
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
-        if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = DynamicCache()
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
             past_seen_tokens = (
                 past_key_values.get_seq_length() if past_key_values is not None else 0
             )
-            cache_position: torch.Tensor = torch.arange(
+            cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
                 device=inputs_embeds.device,
@@ -309,47 +407,83 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        # It may already have been prepared by e.g. `generate`
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            # Create the masks
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+            }
+            # The sliding window alternating layers are not always activated depending on the config
+            if self.has_sliding_layers:
+                causal_mask_mapping["sliding_attention"] = (
+                    create_sliding_window_causal_mask(**mask_kwargs)
+                )
 
         hidden_states = inputs_embeds
+
+        # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                **kwargs,
+                **flash_attn_kwargs,
             )
 
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
         hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
         )
 
 
-class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+@auto_docstring
+class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlamaModel(config)
+        self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
 
-        # distributed the lm head
+        # Use ColumnParallelLinear for lm_head
         self.lm_head = ColumnParallelLinear(
             config.hidden_size, config.vocab_size, bias=False
         )
@@ -375,27 +509,36 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    @can_return_tuple
+    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, LlamaForCausalLM
+        >>> from transformers import AutoTokenizer, Qwen3ForCausalLM
 
-        >>> model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+        >>> model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-8B")
+        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -405,6 +548,16 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
 
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -413,6 +566,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             cache_position=cache_position,
             **kwargs,
         )
@@ -425,7 +580,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = gather_tensor(logits, get_target_tp_group())
+
+        # Gather logits from all TP ranks
+        # We don't shard embed_tokens, so when tie_word_embeddings is True
+        # lm_head is not sharded as well. Thus, we skip all_gather.
+        if not self.config.tie_word_embeddings:
+            logits = gather_tensor(logits, get_target_tp_group())
 
         loss = None
         if labels is not None:
@@ -443,9 +603,3 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-
-__all__ = [
-    "LlamaForCausalLM",
-    "LlamaModel",
-]

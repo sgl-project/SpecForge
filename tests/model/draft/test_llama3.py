@@ -9,7 +9,7 @@ from accelerate.utils import set_seed
 from transformers import LlamaConfig
 
 from specforge.distributed import init_distributed
-from specforge.model.draft.llama3_eagle import (
+from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaForCausalLMEagle3,
     LlamaMLP,

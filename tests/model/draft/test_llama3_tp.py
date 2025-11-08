@@ -11,7 +11,7 @@ from transformers import LlamaConfig
 from transformers.activations import ACT2FN
 
 from specforge.distributed import destroy_distributed, init_distributed
-from specforge.model.draft.llama3_eagle import LlamaAttention, LlamaMLP
+from specforge.modeling.draft.llama3_eagle import LlamaAttention, LlamaMLP
 
 
 # === Temporary, Non-Parallel Model Definitions (for this test file only) ===

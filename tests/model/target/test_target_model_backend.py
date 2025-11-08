@@ -8,7 +8,7 @@ from accelerate.utils import set_seed
 from sglang.srt.server_args import ServerArgs
 
 from specforge.distributed import init_distributed
-from specforge.model.target.eagle3_target_model import (
+from specforge.modeling.target.eagle3_target_model import (
     CustomEagle3TargetModel,
     HFEagle3TargetModel,
     SGLangEagle3TargetModel,
@@ -97,26 +97,15 @@ def test_target_model_backend(rank, world_size, port, tp_size):
         loss_mask=loss_mask.chunk(2, dim=0),
     )
     del sgl_target_model
+    assert len(hf_out) == len(sgl_out)
+    hf_out = hf_out[0]
+    sgl_out = sgl_out[0]
 
-    s_loss_mask = torch.cat([s.loss_mask for s in sgl_out], dim=0)
-    s_input_ids = torch.cat([s.input_ids for s in sgl_out], dim=0)
-    s_hidden_states = torch.cat([s.hidden_states for s in sgl_out], dim=0)
-    s_target = torch.cat([s.target for s in sgl_out], dim=0)
-    print(
-        f"{s_loss_mask.shape=}, {s_input_ids.shape=}, {s_hidden_states.shape=}, {s_target.shape=}, {s_target.dtype=}"
-    )
-    print(
-        f"{hf_out.loss_mask.shape=}, {hf_out.input_ids.shape=}, {hf_out.hidden_states.shape=}, {hf_out.target.shape=}, {hf_out.target.dtype=}"
-    )
-
-    assert torch.equal(hf_out.loss_mask, s_loss_mask)
-    assert torch.equal(hf_out.input_ids, s_input_ids)
+    assert torch.equal(hf_out.loss_mask, sgl_out.loss_mask)
+    assert torch.equal(hf_out.input_ids, sgl_out.input_ids)
     assert torch.allclose(
-        hf_out.hidden_states, s_hidden_states, atol=1e-1, rtol=1e-2
-    ), f"Hidden states are not close, diff: \n{(hf_out.hidden_states - s_hidden_states).abs().max()}"
-    # assert torch.allclose(
-    #     hf_out.target, s_target, atol=1e-1, rtol=1e-2
-    # ), f"Target are not close, diff: \n{(hf_out.target - s_target).abs().max()}"
+        hf_out.hidden_states, sgl_out.hidden_states, atol=1e-1, rtol=1e-2
+    ), f"Hidden states are not close, diff: \n{(hf_out.hidden_states - sgl_out.hidden_states).abs().max()}"
 
 
 class TestTargetModelBackend(unittest.TestCase):

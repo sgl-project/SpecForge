@@ -3,7 +3,7 @@
 
 ## Introduction
 
-This document provides a step-by-step guide to reproducing the training process described in the EAGLE3 paper, using the script `examples/run_llama3_eagle3_sgl_online.sh`. We will walk through the script and explain each key step along the way.
+This document provides a step-by-step guide to reproducing the training process described in the EAGLE3 paper, using the script `examples/run_llama3_eagle3_online.sh`. We will walk through the script and explain each key step along the way.
 
 ## Workflow
 
@@ -34,8 +34,8 @@ hf download meta-llama/Llama-3.1-8B-Instruct
 hf download Aeala/ShareGPT_Vicuna_unfiltered --repo-type dataset
 hf download HuggingFaceH4/ultrachat_200k --repo-type dataset
 
-python scripts/prepare_data.py --dataset ultrachat --output_path /YOUR/PATH/Llama-3.1-8B-Instruct/dataset
-python scripts/prepare_data.py --dataset sharegpt --output_path /YOUR/PATH/Llama-3.1-8B-Instruct/dataset
+python scripts/prepare_data.py --dataset sharegpt --output-path $DATASET_PATH
+python scripts/prepare_data.py --dataset ultrachat --output-path $DATASET_PATH
 ```
 
 Then, launch the SGLang server and run `generate_data_by_target.py` to generate responses from the base model across different datasets. Make sure to update the `SYSTEM_PROMPT` value in `generate_data_by_target.py` to suit your requirements.
@@ -73,12 +73,12 @@ hf upload /YOUR/PATH/Llama-3.1-8B-Instruct/generated-dataset/ultrachat-llama-3.1
 ```
 
 ```python
-from datasets import load_dataset
-ds = load_dataset("zhuyksir/Ultrachat-Sharegpt-Llama3.1-8B", split="train")
-ds.to_json("merged.jsonl", orient="records", lines=True)
-ds = ds.train_test_split(test_size=0.05)
-train_ds = ds["train"]
-test_ds = ds["test"]
+hf download zhuyksir/Ultrachat-Sharegpt-Llama3.1-8B --repo-type dataset --local-dir $GENERATED_DATASET_PATH
+shuf $GENERATED_DATASET_PATH/sharegpt_ultrachat.jsonl -o $GENERATED_DATASET_PATH/shuffled_sharegpt_ultrachat.jsonl
+total=$(wc -l < $GENERATED_DATASET_PATH/shuffled_sharegpt_ultrachat.jsonl)
+train_count=$((total * 95 / 100))
+head -n $train_count $GENERATED_DATASET_PATH/shuffled_sharegpt_ultrachat.jsonl > $GENERATED_DATASET_PATH/train_data.jsonl
+tail -n +$((train_count + 1)) $GENERATED_DATASET_PATH/shuffled_sharegpt_ultrachat.jsonl > $GENERATED_DATASET_PATH/eval_data.jsonl
 ```
 
 Alternatively, For `meta-llama/Llama-3.1-8B-Instruct`, you can use the dataset we generated: [zhuyksir/Ultrachat-Sharegpt-Llama3.1-8B](https://huggingface.co/datasets/zhuyksir/Ultrachat-Sharegpt-Llama3.1-8B).
@@ -126,30 +126,39 @@ Use the following script to train.
 
 ```shell
 export NUM_GPUS=4
-export OUTPUT_DIR=/YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
+export OUTPUT_DIR=$PERSIST_DIR/$MODEL_NAME/dev_outputs/
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    scripts/train_eagle3_sgl_online.py \
+    scripts/train_eagle3_online.py \
     --target-model-path $MODEL_PATH \
     --model-path $MODEL_PATH \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path $DATASET_PATH/sharegpt_ultrachat_train.jsonl \
-    --eval-data-path $DATASET_PATH/sharegpt_ultrachat_test.jsonl \
-    --tp-size $NUM_GPUS \
+    --train-data-path $GENERATED_DATASET_PATH/train_data.jsonl \
+    --eval-data-path $GENERATED_DATASET_PATH/eval_data.jsonl \
+    --target-tp-size 4 \
+    --draft-tp-size 1 \
+    --target-batch-size 64 \
+    --target-micro-batch-size $NUM_GPUS \
+    --draft-global-batch-size 16 \
+    --draft-micro-batch-size 1 \
+    --target-model-backend sglang \
     --output-dir $OUTPUT_DIR \
     --num-epochs 10 \
-    --batch-size 1 \
     --learning-rate 5e-5 \
     --draft-attention-backend flex_attention \
+    --attention-backend fa3 \
     --max-length $MAX_LENGTH \
-    --chat-template $CHAT_TEMPLATE \
+    --eagle3-chat-template $CHAT_TEMPLATE \
     --cache-dir $CACHE_DIR \
     --mem-frac=0.4 \
     --total-steps=800000 \
+    --warmup-ratio=0.015 \
     --dist-timeout=10 \
+    --enable-zero2 \
+    --resume \
     --wandb-project llama3-8b-eagle3 \
-    --wandb-name sgl-online \
+    --wandb-name dev_draft_tp1_target_tp4 \
     --report-to wandb
 ```
 

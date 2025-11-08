@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from specforge.distributed import init_distributed
-from specforge.model.draft import AutoEagle3DraftModel, LlamaForCausalLMEagle3
+from specforge.modeling.draft import AutoEagle3DraftModel, LlamaForCausalLMEagle3
 
 
 class TestAutoModelForCausalLM(unittest.TestCase):

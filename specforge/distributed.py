@@ -84,11 +84,6 @@ def get_target_tp_device_mesh():
     return _TARGET_TP_DEVICE_MESH
 
 
-def get_draft_dp_device_mesh():
-    global _DRAFT_DP_DEVICE_MESH
-    return _DRAFT_DP_DEVICE_MESH
-
-
 def init_distributed(
     timeout: int = 10, target_tp_size: int = 1, draft_tp_size: int = 1
 ):
@@ -153,13 +148,6 @@ def gather_tensor(
     tensor: torch.Tensor, process_group: dist.ProcessGroup = None, dim: int = -1
 ) -> torch.Tensor:
     size = dist.get_world_size(process_group)
-    if dim == 0:
-        output_shape = (tensor.shape[0] * size, *tensor.shape[1:])
-        output_tensor = torch.empty(
-            output_shape, device=tensor.device, dtype=tensor.dtype
-        )
-        dist.all_gather_into_tensor(output_tensor, tensor, group=process_group)
-        return output_tensor
     obj_list = [torch.empty_like(tensor) for _ in range(size)]
     dist.all_gather(obj_list, tensor, group=process_group)
     gather_tensor = torch.cat(obj_list, dim=dim)
@@ -168,7 +156,7 @@ def gather_tensor(
 
 def is_tp_rank_0():
     """Return True if current process is rank 0 in its TP group."""
-    tp_group = get_tp_group()
+    tp_group = get_target_tp_group()
     if tp_group is None:
         return True
     return dist.get_rank(group=tp_group) == 0

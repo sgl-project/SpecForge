@@ -15,7 +15,7 @@ from specforge.data import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
 )
-from specforge.model.draft import AutoDraftModelConfig
+from specforge.modeling.draft import AutoDraftModelConfig
 
 
 def parse_args():

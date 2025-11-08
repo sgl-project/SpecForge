@@ -10,7 +10,7 @@ from transformers.models.qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe import Qwen3MoeForCausalLM as HFWen3MoeForCausalLM
 
 from specforge.distributed import init_distributed
-from specforge.model.target.custom_backend.qwen3_moe import (
+from specforge.modeling.target.custom_backend.qwen3_moe import (
     Qwen3MoeForCausalLM as SFLQwen3MoeForCausalLM,
 )
 from tests.utils import get_available_port

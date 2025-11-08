@@ -49,18 +49,18 @@ from specforge.distributed import (
     get_target_tp_size,
     init_distributed,
 )
-from specforge.model.draft import (
+from specforge.modeling.draft import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
     Eagle3DraftModel,
     load_param_from_target_model,
 )
-from specforge.model.eagle3 import (
+from specforge.modeling.eagle3 import (
     OfflineEagle3Model,
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
-from specforge.model.target import (
+from specforge.modeling.target import (
     Eagle3TargetOutput,
     SGLangEagle3TargetModel,
     get_eagle3_target_model,
@@ -335,7 +335,6 @@ class Eagle3TrainerArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        args.tensor_parallel_size = args.target_tp_size
         world_size = dist.get_world_size()
         # Parallelism Check
         if args.target_tp_size >= args.draft_tp_size:
@@ -402,6 +401,8 @@ class Eagle3TrainerArgs:
             args.draft_model_last_checkpoint = None
             print_on_rank0(f"Training from scratch")
 
+        # for sglang server args
+        args.tensor_parallel_size = args.target_tp_size
         args.context_length = args.max_length
         args.cuda_graph_max_bs = args.target_micro_batch_size
         args.cuda_graph_bs = [args.target_micro_batch_size]

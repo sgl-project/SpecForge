@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from specforge.model.loss import LogSoftmaxLoss, _compute_loss
+from specforge.modeling.loss import LogSoftmaxLoss, _compute_loss
 from tests.utils import norm_tensor
 
 

@@ -10,7 +10,7 @@ from transformers import Llama4ForCausalLM as HFLlama4ForCausalLM
 from transformers import Llama4TextConfig
 
 from specforge.distributed import init_distributed
-from specforge.model.target.custom_backend.llama4 import (
+from specforge.modeling.target.custom_backend.llama4 import (
     Llama4ForCausalLM as SFLlama4ForCausalLM,
 )
 from tests.utils import get_available_port

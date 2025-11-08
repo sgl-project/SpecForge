@@ -1,15 +1,14 @@
 import argparse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import List, Optional, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -18,7 +17,6 @@ from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import (
-    get_draft_tp_rank,
     get_draft_tp_size,
     get_target_tp_device_mesh,
     get_target_tp_group,
@@ -28,7 +26,7 @@ from specforge.distributed import (
 from specforge.utils import padding
 
 from ...data import DataCollatorWithPadding
-from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
+from .sglang_backend import SGLangRunner
 
 
 def get_dp_data_shard_from_tp(
@@ -224,7 +222,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         server_args = ServerArgs.from_cli_args(args)
         server_args.enable_return_hidden_states = True
         model_config = ModelConfig.from_server_args(server_args)
-        tp_rank = dist.get_rank(get_target_tp_group())
+        tp_rank = get_target_tp_rank()
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -238,7 +236,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             server_args=server_args,
             nccl_port=None,
         )
-        wrap_eagle3_logits_processors_in_module(model_runner.model)
         return cls(model_runner, args.target_micro_batch_size)
 
     def set_aux_hidden_states_layers(
@@ -249,17 +246,17 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     @torch.no_grad
     def extend(self, reqs, capture_aux_hidden_states: bool = True):
         # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
-        dummy_tree_cache = SimpleNamespace(
-            page_size=self.model_runner.server_args.page_size,
-            device=self.model_runner.device,
+        tree_cache = RadixCache(
+            None,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            page_size=self.model_runner.server_args.page_size,
         )
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-            tree_cache=dummy_tree_cache,
+            tree_cache=tree_cache,
             model_config=self.model_runner.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -405,36 +402,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 reqs, data_cache = [], []
         return data_for_draft
 
-        # aux_hidden_states_out = []
-        # target_out = []
-        # loss_mask_out = []
-        # input_ids_out = []
-
-        # for idx, (data, logits, aux_hidden_states) in enumerate(
-        #     zip(data_cache, logits_list, aux_hidden_states_list)
-        # ):
-        #     aux_hidden_states_out.append(aux_hidden_states.unsqueeze(0))
-        #     target_out.append(logits.unsqueeze(0))
-        #     loss_mask_out.append(data[2])
-        #     input_ids_out.append(data[0])
-
-        # aux_hidden_states_out = torch.cat(aux_hidden_states_out, dim=0)
-        # target_out = torch.cat(target_out, dim=0)
-        # loss_mask_out = torch.cat(loss_mask_out, dim=0)
-        # input_ids_out = torch.cat(input_ids_out, dim=0)
-
-        # target_out = padding(target_out, left=False)
-        # input_ids_out = padding(input_ids_out, left=False)
-        # loss_mask_out = loss_mask_out[..., None]
-
-        # return Eagle3TargetOutput(
-        #     hidden_states=aux_hidden_states_out,
-        #     target=target_out,
-        #     loss_mask=loss_mask_out,
-        #     input_ids=input_ids_out,
-        #     attention_mask=attention_mask,
-        # )
-
 
 class CustomEagle3TargetModel(Eagle3TargetModel):
 
@@ -451,7 +418,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         cache_dir: Optional[str] = None,
         **kwargs,
     ) -> "CustomEagle3TargetModel":
-        from specforge.model.target import AutoDistributedTargetModel
+        from specforge.modeling.target import AutoDistributedTargetModel
 
         target_model = AutoDistributedTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -473,7 +440,7 @@ def get_eagle3_target_model(
     **kwargs,
 ) -> Eagle3TargetModel:
     if backend == "sglang":
-        target_model = SGLangEagle3TargetModel.from_pretrained(
+        return SGLangEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
@@ -481,7 +448,6 @@ def get_eagle3_target_model(
             args=args,
             **kwargs,
         )
-        return target_model
     elif backend == "hf":
         return HFEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,

@@ -11,7 +11,11 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.distributed import get_draft_tp_group, get_draft_tp_size
-from specforge.model.linear import ColumnParallelLinear, RowParallelLinear, _AllReduce
+from specforge.modeling.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    _AllReduce,
+)
 from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel

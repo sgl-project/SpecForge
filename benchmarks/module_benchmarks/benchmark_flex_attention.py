@@ -1,7 +1,3 @@
-"""
-torchrun  --standalone --nproc_per_node 1 benchmarks/module_benchmarks/benchmark_flex_attention.py
-"""
-
 import argparse
 import time
 
@@ -12,8 +8,7 @@ import torch._dynamo as dynamo
 from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
-from specforge.distributed import init_distributed
-from specforge.model.draft.llama3_eagle import (
+from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaFlexAttention,
     prepare_decoder_attention_mask,
@@ -290,7 +285,6 @@ def plot_results(eagle_results, flex_results, seq_lengths):
 
 
 if __name__ == "__main__":
-    # init_distributed(timeout=10, target_tp_size=1, draft_tp_size=1)
     parser = argparse.ArgumentParser(description="Benchmark attention mechanisms")
     parser.add_argument(
         "--enable-profile", action="store_true", help="Enable profiling"

@@ -56,7 +56,7 @@ from transformers.utils.generic import check_model_inputs
 
 # [MODIFIED] Import from transformers library
 from specforge.distributed import gather_tensor, get_target_tp_group, shard_tensor
-from specforge.model.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.linear import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 
