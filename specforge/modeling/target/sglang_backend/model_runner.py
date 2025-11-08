@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     initialize_dp_attention,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
