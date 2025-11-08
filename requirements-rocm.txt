@@ -1,0 +1,19 @@
+# Use the PyTorch ROCm wheel index (choose the stream that matches your system)
+--extra-index-url https://download.pytorch.org/whl/rocm6.3
+
+pre-commit
+torch==2.8.0+rocm6.3
+torchaudio==2.8.0+rocm6.3
+torchvision==0.23.0+rocm6.3
+transformers==4.57.1
+qwen-vl-utils==0.0.11
+datasets
+setuptools
+tqdm
+wandb
+psutil
+numpy
+accelerate
+pydantic
+sglang[all]==0.5.4
+openai-harmony
