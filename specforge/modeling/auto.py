@@ -20,16 +20,16 @@ from transformers import (
     modeling_utils,
 )
 
-from specforge.utils import default_torch_dtype
-
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
-from .target.gpt_oss import GptOssForCausalLM
-from .target.llama import LlamaForCausalLM
-from .target.llama4 import Llama4ForCausalLM
-from .target.phi3 import Phi3ForCausalLM
-from .target.qwen2 import Qwen2ForCausalLM
-from .target.qwen3 import Qwen3ForCausalLM
-from .target.qwen3_moe import Qwen3MoeForCausalLM
+from .target.custom_backend import (
+    GptOssForCausalLM,
+    Llama4ForCausalLM,
+    LlamaForCausalLM,
+    Phi3ForCausalLM,
+    Qwen2ForCausalLM,
+    Qwen3ForCausalLM,
+    Qwen3MoeForCausalLM,
+)
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
