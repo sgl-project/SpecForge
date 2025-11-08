@@ -18,17 +18,19 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
-    get_dp_group,
-    get_tp_group,
+    get_target_dp_group,
+    get_target_dp_rank,
+    get_target_dp_size,
+    get_target_tp_group,
+    get_target_tp_rank,
+    get_target_tp_size,
     init_distributed,
-    is_tp_rank_0,
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.utils import print_with_rank, rank_0_priority
@@ -38,12 +40,13 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-model-path", type=str, required=True)
     parser.add_argument("--data-path", type=str, required=True)
+    parser.add_argument("--output-path", type=str, required=True)
     parser.add_argument("--cache-dir", type=str, default="./cache")
-    parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--chat-template", type=str, default="llama3")
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--target-tp-size", type=int, default=1)
+    parser.add_argument("--target-batch-size", type=int, default=32)
+    parser.add_argument("--target-micro-batch-size", type=int, default=1)
     parser.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
@@ -96,7 +99,11 @@ def build_target_model(
     For VLM models (Qwen2.5-VL) without TP, load directly from transformers.
     Otherwise, use the Eagle3 target model wrapper.
     """
-    if args.is_vlm and model_config.model_type == "qwen2_5_vl" and args.tp_size == 1:
+    if (
+        args.is_vlm
+        and model_config.model_type == "qwen2_5_vl"
+        and get_target_tp_size() == 1
+    ):
         from transformers import Qwen2_5_VLForConditionalGeneration
 
         target_model = (
@@ -169,8 +176,8 @@ class HiddenStatesGenerator:
         self.tp_sync_interval = tp_sync_interval
 
         # Determine if this rank should show progress (DP rank 0)
-        dp_group = get_dp_group()
-        self.show_progress = dist.get_rank(dp_group) == 0 if dp_group else True
+        dp_group = get_target_dp_group()
+        self.show_progress = get_target_dp_rank() == 0 if dp_group else True
 
         # --- REFACTOR: Thread pool is now managed by __enter__ and __exit__ ---
         self.io_executor = None
@@ -178,14 +185,13 @@ class HiddenStatesGenerator:
 
     def __enter__(self):
         """Initializes resources when entering a 'with' block."""
-        if is_tp_rank_0():
-            self.io_executor = ThreadPoolExecutor(max_workers=self.num_io_threads)
+        self.io_executor = ThreadPoolExecutor(max_workers=self.num_io_threads)
         self.pending_futures = []
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Cleans up resources when exiting a 'with' block."""
-        if is_tp_rank_0() and self.io_executor is not None:
+        if self.io_executor is not None:
             if self.show_progress:
                 print("\nWaiting for all async I/O operations to complete...")
             self._wait_all_saves()
@@ -193,8 +199,8 @@ class HiddenStatesGenerator:
             self.io_executor = None  # Reset for safety
 
         # Final barrier to ensure all processes exit generate() cleanly
-        if dist.is_initialized() and get_tp_group():
-            dist.barrier(group=get_tp_group())
+        if dist.is_initialized() and get_target_tp_group():
+            dist.barrier(group=get_target_tp_group())
 
     def _save_tensor_sync(self, data_point: Dict[str, torch.Tensor], output_file: str):
         if "hidden_state" in data_point and torch.any(
@@ -214,7 +220,6 @@ class HiddenStatesGenerator:
         torch.save(data_point, output_file)
 
     def _save_tensor_async(self, data_point: Dict[str, torch.Tensor], output_file: str):
-        assert is_tp_rank_0(), "Only tp_rank=0 should call _save_tensor_async"
         future = self.io_executor.submit(
             self._save_tensor_sync, data_point, output_file
         )
@@ -223,7 +228,7 @@ class HiddenStatesGenerator:
             self.pending_futures = [f for f in self.pending_futures if not f.done()]
 
     def _wait_all_saves(self):
-        if is_tp_rank_0() and self.pending_futures:
+        if self.pending_futures:
             for future in tqdm(
                 self.pending_futures,
                 desc="Finalizing Writes",
@@ -232,53 +237,44 @@ class HiddenStatesGenerator:
                 future.result()  # Wait and raise exception if any
             self.pending_futures.clear()
 
-    def _prepare_output_dirs(
-        self, output_path: str, start_idx: int, total_samples: int
-    ):
-        if not is_tp_rank_0() or total_samples == 0:
+    def _prepare_output_dirs(self, output_path: Path, total_samples: int):
+        if total_samples == 0:
             return
-        start_group = (start_idx // self.file_group_size) * self.file_group_size
-        end_idx = start_idx + total_samples - 1
+        start_group = 0
+        end_idx = total_samples - 1
         end_group = (end_idx // self.file_group_size) * self.file_group_size
         for group_idx in range(start_group, end_group + 1, self.file_group_size):
-            grouped_subdir = f"rows_{group_idx}-{group_idx + self.file_group_size}"
+            grouped_subdir = f"dp_{get_target_dp_rank()}_rows_{group_idx}-{group_idx + self.file_group_size}"
             output_dir = os.path.join(output_path, grouped_subdir)
             os.makedirs(output_dir, exist_ok=True)
 
     def _check_existing_files_batch(
-        self, output_path: str, global_indices: List[int]
-    ) -> List[bool]:
-        if not is_tp_rank_0():
-            return [False] * len(global_indices)
+        self, output_path: Path, global_indices: List[int]
+    ) -> bool:
+        # only skip file generation if all files exist
+        return all(
+            self._get_file_path(output_path, idx).exists() for idx in global_indices
+        )
 
-        def check_single_file(idx):
-            return os.path.exists(self._get_file_path(output_path, idx))
-
-        # Parallel file existence check
-        with ThreadPoolExecutor(max_workers=self.num_io_threads) as executor:
-            exists = list(executor.map(check_single_file, global_indices))
-        return exists
-
-    def _get_file_path(self, output_path: str, idx: int) -> str:
+    def _get_file_path(self, output_path: Path, idx: int) -> Path:
+        idx = idx * get_target_tp_size() + get_target_tp_rank()
         group_idx = (idx // self.file_group_size) * self.file_group_size
-        grouped_subdir = f"rows_{group_idx}-{group_idx + self.file_group_size}"
-        return os.path.join(output_path, grouped_subdir, f"data_{idx}.ckpt")
+        grouped_subdir = f"dp_{get_target_dp_rank()}_rows_{group_idx}-{group_idx + self.file_group_size}"
+        return output_path / grouped_subdir / f"data_{idx}.ckpt"
 
     @torch.no_grad()
     def generate(
         self,
         data_loader: torch.utils.data.DataLoader,
         output_path: str,
-        start_idx: int = 0,
-        samples_per_dp: int = 0,
     ):
-        self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
+        self._prepare_output_dirs(
+            output_path, len(data_loader) * data_loader.batch_size
+        )
 
-        tp_group = get_tp_group()
-        tp_size = dist.get_world_size(tp_group)
-        tp_group_ranks = dist.get_process_group_ranks(tp_group)
-        tp_rank_0_global = tp_group_ranks[0]
-        global_idx = start_idx
+        tp_group = get_target_tp_group()
+        tp_size = get_target_tp_size()
+        global_idx = 0
 
         progress_bar = tqdm(
             data_loader,
@@ -288,91 +284,19 @@ class HiddenStatesGenerator:
             leave=True,
         )
 
-        total_skipped, total_processed = 0, 0
-
         for batch_idx, batch in enumerate(progress_bar):
             batch_size = batch["input_ids"].size(0)
             current_batch_indices = list(range(global_idx, global_idx + batch_size))
 
             # Step 1: TP rank 0 checks which samples need processing
-            if is_tp_rank_0():
-                exists_list = self._check_existing_files_batch(
-                    output_path, current_batch_indices
-                )
-                valid_indices_in_batch = [
-                    i for i, exists in enumerate(exists_list) if not exists
-                ]
-                sample_global_indices = [
-                    current_batch_indices[i] for i in valid_indices_in_batch
-                ]
-                num_valid = len(valid_indices_in_batch)
-                total_skipped += batch_size - num_valid
-            else:
-                num_valid = 0
-                sample_global_indices = []
-
-            global_idx += batch_size
-
-            # Step 1: Synchronize valid indices across TP group
-            if tp_size > 1:
-                if is_tp_rank_0():
-                    # Use -1 as sentinel for empty batch
-                    if num_valid == 0:
-                        indices_to_broadcast = torch.tensor(
-                            [-1], dtype=torch.long, device="cuda"
-                        )
-                    else:
-                        indices_to_broadcast = torch.tensor(
-                            valid_indices_in_batch, dtype=torch.long, device="cuda"
-                        )
-                    length_tensor = torch.tensor(
-                        [indices_to_broadcast.size(0)], dtype=torch.long, device="cuda"
-                    )
-                else:
-                    length_tensor = torch.zeros(1, dtype=torch.long, device="cuda")
-
-                # Broadcast length first
-                dist.broadcast(length_tensor, src=tp_rank_0_global, group=tp_group)
-
-                # Create receive buffer on other ranks
-                if not is_tp_rank_0():
-                    indices_to_broadcast = torch.zeros(
-                        length_tensor.item(), dtype=torch.long, device="cuda"
-                    )
-
-                # Broadcast indices
-                dist.broadcast(
-                    indices_to_broadcast, src=tp_rank_0_global, group=tp_group
-                )
-
-                # Check for empty batch sentinel
-                if indices_to_broadcast[0].item() == -1:
-                    del length_tensor, indices_to_broadcast
-                    continue
-
-                # Convert to list on non-rank-0
-                if not is_tp_rank_0():
-                    valid_indices_in_batch = indices_to_broadcast.tolist()
-
-                del length_tensor, indices_to_broadcast
-            else:
-                if num_valid == 0:
-                    continue
-
-            # Step 2: Filter batch before moving to GPU to save memory
-            filtered_batch = {
-                "input_ids": batch["input_ids"][valid_indices_in_batch],
-                "attention_mask": batch["attention_mask"][valid_indices_in_batch],
-                "loss_mask": batch["loss_mask"][valid_indices_in_batch],
-            }
-            filtered_batch_gpu = {
-                k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
-            }
-
-            eagle3_data = self.model.generate_eagle3_data(**filtered_batch_gpu)
-            del filtered_batch_gpu
-
-            if is_tp_rank_0():
+            exists_list = self._check_existing_files_batch(
+                output_path, current_batch_indices
+            )
+            if exists_list:
+                global_idx += batch_size
+                continue
+            eagle3_data_list = self.model.generate_eagle3_data(batch)
+            for eagle3_data in eagle3_data_list:
                 seq_lengths = eagle3_data.attention_mask.sum(dim=1).tolist()
                 hidden_states_cpu = eagle3_data.hidden_states.cpu()
                 aux_hidden_states_cpu = None
@@ -382,11 +306,11 @@ class HiddenStatesGenerator:
                     aux_hidden_states_cpu = eagle3_data.aux_hidden_states.cpu()
 
                 for i, (current_global_idx, seq_len) in enumerate(
-                    zip(sample_global_indices, seq_lengths)
+                    zip(current_batch_indices, seq_lengths)
                 ):
                     data_point = {
-                        "input_ids": filtered_batch["input_ids"][i].clone(),
-                        "loss_mask": filtered_batch["loss_mask"][i].clone(),
+                        "input_ids": batch["input_ids"][i, :seq_len].clone(),
+                        "loss_mask": batch["loss_mask"][i, :seq_len].clone(),
                         "hidden_state": hidden_states_cpu[i, :seq_len, :]
                         .clone()
                         .unsqueeze(0),
@@ -400,9 +324,8 @@ class HiddenStatesGenerator:
                     self._save_tensor_async(data_point, output_file)
 
                 del hidden_states_cpu, aux_hidden_states_cpu
-                total_processed += len(sample_global_indices)
 
-            del eagle3_data, filtered_batch
+            del eagle3_data_list, batch
 
             if batch_idx % 5 == 0:
                 torch.cuda.empty_cache()
@@ -412,22 +335,17 @@ class HiddenStatesGenerator:
             if tp_size > 1 and batch_idx % self.tp_sync_interval == 0:
                 dist.barrier(group=tp_group)
 
+            global_idx += batch_size
             if self.show_progress:
                 progress_bar.set_postfix(
                     {
-                        "processed": total_processed,
-                        "skipped": total_skipped,
-                        "pending_io": (
-                            len(self.pending_futures) if is_tp_rank_0() else 0
-                        ),
+                        "processed": global_idx,
+                        "pending_io": len(self.pending_futures),
                     }
                 )
 
         # --- REFACTOR: Cleanup is now handled by __exit__ ---
-        if self.show_progress:
-            print(
-                f"\nGeneration loop finished. Processed: {total_processed}, Skipped: {total_skipped}"
-            )
+        print_with_rank(f"Generation loop finished. Processed: {global_idx}")
 
 
 def main():
@@ -438,27 +356,25 @@ def main():
         ]
 
     # Initialize distributed environment (TP + DP)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    args.dp_size = dist.get_world_size() // args.tp_size
+    init_distributed(
+        timeout=args.dist_timeout, target_tp_size=args.target_tp_size, draft_tp_size=1
+    )
+    if dist.get_rank() == 0:
+        Path(args.output_path).mkdir(parents=True, exist_ok=True)
 
     # Build target model (with TP)
     target_model_config = AutoConfig.from_pretrained(args.target_model_path)
     target_model, processor = build_target_model(args, target_model_config)
 
     print_with_rank(
-        f"DP Rank {dist.get_rank(get_dp_group())}, TP Rank {dist.get_rank(get_tp_group())}, "
-        f"DP Size {dist.get_world_size(get_dp_group())}, TP Size {dist.get_world_size(get_tp_group())}"
+        f"DP Rank {get_target_dp_rank()}, TP Rank {get_target_tp_rank()}, "
+        f"DP Size {get_target_dp_size()}, TP Size {get_target_tp_size()}"
     )
 
-    if args.output_path is None:
-        args.output_path = os.path.join(
-            Path(__file__).parent.parent, "cache", "hidden_states"
-        )
-
     # Load complete dataset
-    assert os.path.exists(
+    assert Path(
         args.data_path
-    ), f"Dataset path {args.data_path} does not exist"
+    ).exists(), f"Dataset path {args.data_path} does not exist"
     dataset = load_dataset("json", data_files=args.data_path)["train"]
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
@@ -490,64 +406,36 @@ def main():
     # Create DP-sharded dataloader
     data_loader = prepare_dp_dataloaders(
         dataset=eagle3_dataset,
-        batch_size=args.batch_size,
+        batch_size=args.target_batch_size,
         num_workers=args.num_workers,
         shuffle=False,
-        process_group=get_dp_group(),
+        process_group=get_target_dp_group(),
         is_vlm=args.is_vlm,
     )
 
     print_with_rank(
-        f"DataLoader created for DP Rank {dist.get_rank(get_dp_group())}. "
+        f"DataLoader created for DP Rank {get_target_dp_rank()}. "
         f"Number of batches: {len(data_loader)}"
     )
 
-    # Calculate starting index and sample count for current DP rank
-    total = len(eagle3_dataset)
-    dp_rank = dist.get_rank(get_dp_group())
-    dp_size = dist.get_world_size(get_dp_group())
+    # Pass configurable arguments from args if needed
+    with HiddenStatesGenerator(
+        target_model,
+        args.enable_aux_hidden_states,
+        num_io_threads=args.num_io_threads,
+        io_queue_size=args.io_queue_size,
+        file_group_size=args.file_group_size,
+        tp_sync_interval=args.tp_sync_interval,
+        # Other params like io_queue_size can also be added to argparse
+    ) as hidden_states_generator:
 
-    # Calculate samples per DP rank (handle non-divisible case)
-    samples_per_dp = total // dp_size
-    remainder = total % dp_size
+        # Generate hidden states
+        hidden_states_generator.generate(
+            data_loader,
+            output_path=Path(args.output_path),
+        )
 
-    # Earlier ranks handle one extra sample if there's a remainder
-    if dp_rank < remainder:
-        samples_per_dp += 1
-        start_idx = dp_rank * samples_per_dp
-    else:
-        start_idx = dp_rank * samples_per_dp + remainder
-
-    print_with_rank(
-        f"DP Rank {dp_rank} will process {samples_per_dp} samples, "
-        f"starting from index {start_idx}"
-    )
-
-    # Generate hidden states
-    try:
-        # Pass configurable arguments from args if needed
-        with HiddenStatesGenerator(
-            target_model,
-            args.enable_aux_hidden_states,
-            num_io_threads=args.num_io_threads,
-            io_queue_size=args.io_queue_size,
-            file_group_size=args.file_group_size,
-            tp_sync_interval=args.tp_sync_interval,
-            # Other params like io_queue_size can also be added to argparse
-        ) as hidden_states_generator:
-
-            # Generate hidden states
-            hidden_states_generator.generate(
-                data_loader,
-                output_path=args.output_path,
-                start_idx=start_idx,
-                samples_per_dp=samples_per_dp,
-            )
-
-    finally:
-        # The finally block ensures destroy_distributed is always called
-        print_with_rank("All hidden states generated or job finished.")
-        destroy_distributed()
+    destroy_distributed()
 
 
 if __name__ == "__main__":

@@ -219,7 +219,23 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         args: Optional[argparse.Namespace] = None,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
-        server_args = ServerArgs.from_cli_args(args)
+        if args is None:
+            server_args = ServerArgs(
+                model_path=pretrained_model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                dtype=torch_dtype,
+                enable_return_hidden_states=True,
+                disable_cuda_graph=True,
+                enable_torch_compile=True,
+                tp_size=get_target_tp_size(),
+                pp_size=1,
+                attention_backend="torch_native",
+                mem_fraction_static=0.4,
+            )
+            target_micro_batch_size = None
+        else:
+            server_args = ServerArgs.from_cli_args(args)
+            target_micro_batch_size = args.target_micro_batch_size
         server_args.enable_return_hidden_states = True
         model_config = ModelConfig.from_server_args(server_args)
         tp_rank = get_target_tp_rank()
@@ -236,7 +252,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             server_args=server_args,
             nccl_port=None,
         )
-        return cls(model_runner, args.target_micro_batch_size)
+        return cls(model_runner, target_micro_batch_size)
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -323,11 +339,12 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
         data_for_draft = []
+        if self.target_micro_batch_size is not None:
+            target_micro_batch_size = self.target_micro_batch_size
+        else:
+            target_micro_batch_size = input_ids.shape[0]
         padding_len = (
-            input_ids.shape[0]
-            - input_ids.shape[0]
-            // self.target_micro_batch_size
-            * self.target_micro_batch_size
+            target_micro_batch_size - input_ids.shape[0] % target_micro_batch_size
         )
         if padding_len > 0:
             input_ids = torch.cat(
@@ -378,7 +395,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             req.logprob_start_len = len(req.origin_input_ids) - 1
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
-            if len(reqs) == self.target_micro_batch_size:
+            if len(reqs) == target_micro_batch_size:
                 hidden_states_list, aux_hidden_states_list = self.extend(
                     reqs, capture_aux_hidden_states=True
                 )
