@@ -69,16 +69,19 @@ export NUM_GPUS=8
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    scripts/train_eagle3_sgl_online.py \
+    scripts/train_eagle3_online.py \
     --target-model-path $MODEL_PATH \
     --model-path $MODEL_PATH \
     --draft-model-config ./configs/gpt-oss-120B-eagle3.json \
     --train-data-path $DATASET_PATH/all_train.jsonl \
     --eval-data-path $DATASET_PATH/all_test.jsonl \
-    --target-tp-size $NUM_GPUS \
+    --tp-size $NUM_GPUS \
     --output-dir $OUTPUT_DIR \
     --num-epochs 10 \
-    --batch-size 1 \
+    --target-batch-size 64 \
+    --target-micro-batch-size 8 \
+    --draft-global-batch-size 16 \
+    --draft-micro-batch-size 1 \
     --learning-rate 7e-5 \
     --draft-attention-backend flex_attention \
     --draft-global-batch-size 32 \

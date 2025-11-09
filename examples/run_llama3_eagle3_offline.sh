@@ -28,7 +28,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun --nproc_per_node=4 \
     --chat-template $CHAT_TEMPLATE \
     --max-length $MAX_LENGTH \
     --enable-aux-hidden-states \
-    --target-tp-size 4 \
+    --tp-size 4 \
     --batch-size 4 \
     --mem-frac=0.75
 

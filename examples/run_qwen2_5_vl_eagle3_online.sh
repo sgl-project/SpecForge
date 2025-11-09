@@ -22,7 +22,7 @@ torchrun \
     --chat-template qwen2-vl \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
-    --target-tp-size 1 \
+    --tp-size 1 \
     --is-vlm \
     --min-pixels 50176 \
     --max-pixels 802816

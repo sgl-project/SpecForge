@@ -1,12 +1,5 @@
 """
-This script is used to train a eagle3 model with sglang server.
-
-This script has two TODOS. This TODOs won't affect the correctness of the training,
-but will make the code more easy to implement and understand.
-I will fix them in the future.
-
-1. --draft-micro-batch-size must be 1; This won't stop you from using larger `--draft-global-batch-size`;
-2. --target-tp-size must be equal to NUM_GPUS;
+This script is used to train a eagle3 model.
 
 """
 
@@ -89,7 +82,7 @@ class Eagle3TrainerArgs:
     max_grad_norm: float = 0.5
     build_dataset_num_proc: int = 8
     target_model_backend: str = "sglang"
-    target_tp_size: int = 8
+    target_tp_size: int = 1
     target_dp_size: int = 1
     target_batch_size: int = -1
     target_micro_batch_size: int = 8
@@ -405,7 +398,7 @@ class Eagle3TrainerArgs:
         if args.eagle3_chat_template is None:
             args.eagle3_chat_template = args.chat_template
             print_on_rank0(
-                f"Using chat template {args.eagle3_chat_template} for Eagle3; --chat-template is deprecated for duplicate argument name in sglang, please use --eagle3-chat-template instead"
+                f"--chat-template is deprecated for duplicate argument name in sglang, please use --eagle3-chat-template instead. For Now we will use --eagle3-chat-template = --chat-template = {args.chat_template}"
             )
 
         # for sglang server args
@@ -494,6 +487,16 @@ class TrainDataLoaderWrapper:
 class Eagle3Trainer:
     def __init__(self, args):
         self.args = args
+        if args.tensor_parallel_size > 1:
+            if args.target_tp_size == 1:
+                args.target_tp_size = args.tensor_parallel_size
+                print_on_rank0(
+                    "WARNING: --tp-size > 1 is deprecated, please use --target-tp-size instead. For Now we will use --target-tp-size = --tp-size"
+                )
+            else:
+                print_on_rank0(
+                    "WARNING: --tp-size > 1 is deprecated, ignoring its value and using --target-tp-size instead."
+                )
         if not dist.is_initialized():
             init_distributed(
                 timeout=args.dist_timeout,

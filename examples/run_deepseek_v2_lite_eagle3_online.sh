@@ -14,6 +14,7 @@ torchrun \
     --output-dir $ROOT_DIR/outputs/deepseek-v2-lite-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \
+    --tp-size 1 \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template deepseek \
