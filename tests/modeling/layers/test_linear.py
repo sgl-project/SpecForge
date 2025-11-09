@@ -6,7 +6,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
-from specforge.distributed import gather_tensor, get_tp_group, init_distributed
+from specforge.distributed import gather_tensor, get_target_tp_group, init_distributed
 from specforge.modeling.layers import ColumnParallelLinear, RowParallelLinear
 from tests.utils import get_available_port
 
@@ -16,7 +16,7 @@ def run_column_parallel_linear(rank, world_size, port):
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    init_distributed(tp_size=world_size)
+    init_distributed(target_tp_size=world_size)
     set_seed(42)
 
     # ===============================
@@ -33,7 +33,7 @@ def run_column_parallel_linear(rank, world_size, port):
     # forward
     native_output = native_linear(data)
     sf_output = sf_linear(data)
-    full_sf_output = gather_tensor(sf_output, get_tp_group())
+    full_sf_output = gather_tensor(sf_output, get_target_tp_group())
 
     # check
     assert torch.allclose(
@@ -54,9 +54,9 @@ def run_column_parallel_linear(rank, world_size, port):
     # forward
     q, k, v = native_linear(data).chunk(3, dim=1)
     sf_q, sf_k, sf_v = sf_linear(data).chunk(3, dim=1)
-    full_sf_q = gather_tensor(sf_q, get_tp_group())
-    full_sf_k = gather_tensor(sf_k, get_tp_group())
-    full_sf_v = gather_tensor(sf_v, get_tp_group())
+    full_sf_q = gather_tensor(sf_q, get_target_tp_group())
+    full_sf_k = gather_tensor(sf_k, get_target_tp_group())
+    full_sf_v = gather_tensor(sf_v, get_target_tp_group())
 
     # check
     assert torch.allclose(
@@ -83,8 +83,8 @@ def run_column_parallel_linear(rank, world_size, port):
     # forward
     gate, up = native_linear(data).chunk(2, dim=1)
     sf_gate, sf_up = sf_linear(data).chunk(2, dim=1)
-    full_sf_gate = gather_tensor(sf_gate, get_tp_group())
-    full_sf_up = gather_tensor(sf_up, get_tp_group())
+    full_sf_gate = gather_tensor(sf_gate, get_target_tp_group())
+    full_sf_up = gather_tensor(sf_up, get_target_tp_group())
 
     # check
     assert torch.allclose(
@@ -102,7 +102,7 @@ def run_row_parallel_linear(rank, world_size, port):
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    init_distributed(tp_size=world_size)
+    init_distributed(target_tp_size=world_size)
     set_seed(42)
 
     # ===============================
@@ -121,12 +121,12 @@ def run_row_parallel_linear(rank, world_size, port):
     # forward
     native_output = native_linear(data)
     sf_output = sf_linear(data.chunk(world_size, dim=0)[rank])
-    dist.all_reduce(sf_output, op=dist.ReduceOp.SUM, group=get_tp_group())
+    dist.all_reduce(sf_output, op=dist.ReduceOp.SUM, group=get_target_tp_group())
 
     # check
     assert torch.allclose(
         native_output, sf_output, rtol=1e-5, atol=1e-5
-    ), f"native_output: \n{native_output}, \nfull_sf_output: \n{full_sf_output}"
+    ), f"native_output: \n{native_output}, \nsf_output: \n{sf_output}"
 
 
 class TestLinear(unittest.TestCase):

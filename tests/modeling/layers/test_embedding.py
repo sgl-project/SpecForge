@@ -16,7 +16,7 @@ def run_embedding(rank, world_size, port):
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    init_distributed(tp_size=world_size)
+    init_distributed(target_tp_size=world_size)
     set_seed(42)
 
     # ===============================
