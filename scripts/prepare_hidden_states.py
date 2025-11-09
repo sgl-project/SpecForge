@@ -387,7 +387,7 @@ class HiddenStatesGenerator:
                     # Process ONE sample at a time to minimize CPU RAM footprint
                     # 1. Transfer only the required slice for one sample to CPU
                     hidden_state_cpu = (
-                        eagle3_data.target[i, :seq_len, :].cpu().unsqueeze(0)
+                        eagle3_data.target[i, :seq_len, :].cpu().clone().unsqueeze(0)
                     )
 
                     aux_hidden_state_cpu = None
@@ -395,13 +395,16 @@ class HiddenStatesGenerator:
                         eagle3_data, "hidden_states"
                     ):
                         aux_hidden_state_cpu = (
-                            eagle3_data.hidden_states[i, :seq_len, :].cpu().unsqueeze(0)
+                            eagle3_data.hidden_states[i, :seq_len, :]
+                            .cpu()
+                            .clone()
+                            .unsqueeze(0)
                         )
 
                     # 2. Prepare the data point for this single sample
                     data_point = {
-                        "input_ids": filtered_batch["input_ids"][i],
-                        "loss_mask": filtered_batch["loss_mask"][i],
+                        "input_ids": filtered_batch["input_ids"][i].clone(),
+                        "loss_mask": filtered_batch["loss_mask"][i].clone(),
                         "hidden_state": hidden_state_cpu,
                     }
                     if aux_hidden_state_cpu is not None:
