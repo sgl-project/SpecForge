@@ -46,12 +46,10 @@ class VocabParallelEmbedding(nn.Module):
                 ), "Padding_idx must be within num_embeddings"
                 padding_idx = self.num_embeddings + padding_idx
 
-        # original params
+        # tp-realted
         self.tp_group = get_tp_group()
         self.tp_rank = dist.get_rank(self.tp_group)
         self.tp_size = dist.get_world_size(self.tp_group)
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
 
         # deal with the case where the embedding is not divisible by the TP size
         self.num_embeddings_per_shard = math.ceil(num_embeddings / self.tp_size)
