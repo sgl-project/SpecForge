@@ -1027,10 +1027,11 @@ class Eagle3Trainer:
         if dist.get_rank() == 0:
             pbar = async_tqdm(
                 total=min(args.total_steps, self.steps_per_epoch * args.num_epochs),
+                initial=self.global_batch_idx,
                 desc="Training...",
                 leave=True,
+                dynamic_ncols=True,
             )
-            pbar.update(self.global_batch_idx)
         for data in self.train_dataloader:
             if self.global_batch_idx >= args.total_steps:
                 break
