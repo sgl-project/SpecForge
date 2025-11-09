@@ -44,7 +44,12 @@ from transformers.utils import TransformersKwargs, logging
 from transformers.utils.generic import check_model_inputs
 
 from specforge.distributed import get_tp_group
-from specforge.layers import ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding, ParallelLMHead
+from specforge.layers import (
+    ColumnParallelLinear,
+    ParallelLMHead,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -350,9 +355,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
 
         # distributed the lm head
-        self.lm_head = ParallelLMHead(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
