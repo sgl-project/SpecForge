@@ -231,12 +231,19 @@ class HiddenStatesGenerator:
         torch.save(data_point, output_file)
 
     def _save_tensor_async(self, data_point: Dict[str, torch.Tensor], output_file: str):
+        # If the queue of pending save operations is full, we must wait.
+        if len(self.pending_futures) >= self.io_queue_size:
+            # First, try to clear any futures that have already finished without waiting.
+            self.pending_futures = [f for f in self.pending_futures if not f.done()]
+            # If the queue is *still* full, it means all I/O threads are busy and we have
+            # a backlog. We must now block the main generation loop and wait for the
+            # oldest I/O operation to complete before proceeding.
+            if len(self.pending_futures) >= self.io_queue_size:
+                self.pending_futures.pop(0).result()
         future = self.io_executor.submit(
             self._save_tensor_sync, data_point, output_file
         )
         self.pending_futures.append(future)
-        if len(self.pending_futures) > self.io_queue_size:
-            self.pending_futures = [f for f in self.pending_futures if not f.done()]
 
     def _wait_all_saves(self):
         if self.pending_futures:
@@ -313,28 +320,38 @@ class HiddenStatesGenerator:
             )
             for eagle3_data in eagle3_data_list:
                 seq_lengths = eagle3_data.attention_mask.sum(dim=1).tolist()
-                hidden_states_cpu = eagle3_data.hidden_states.cpu()
-                aux_hidden_states_cpu = None
-                if self.enable_aux_hidden_states and hasattr(
-                    eagle3_data, "aux_hidden_states"
-                ):
-                    aux_hidden_states_cpu = eagle3_data.aux_hidden_states.cpu()
 
                 for i, (current_global_idx, seq_len) in enumerate(
                     zip(current_batch_indices, seq_lengths)
                 ):
+
+                    # Process ONE sample at a time to minimize CPU RAM footprint
+                    # 1. Transfer only the required slice for one sample to CPU
+                    hidden_state_cpu = (
+                        eagle3_data.target[i, :seq_len, :].cpu().clone().unsqueeze(0)
+                    )
+
+                    aux_hidden_state_cpu = None
+                    if self.enable_aux_hidden_states and hasattr(
+                        eagle3_data, "hidden_states"
+                    ):
+                        aux_hidden_state_cpu = (
+                            eagle3_data.hidden_states[i, :seq_len, :]
+                            .cpu()
+                            .clone()
+                            .unsqueeze(0)
+                        )
+
+                    # 2. Prepare the data point for this single sample
                     data_point = {
                         "input_ids": batch["input_ids"][i, :seq_len].clone(),
                         "loss_mask": batch["loss_mask"][i, :seq_len].clone(),
-                        "hidden_state": hidden_states_cpu[i, :seq_len, :]
-                        .clone()
-                        .unsqueeze(0),
+                        "hidden_state": hidden_states_cpu,
                     }
-                    if aux_hidden_states_cpu is not None:
-                        data_point["aux_hidden_state"] = (
-                            aux_hidden_states_cpu[i, :seq_len, :].clone().unsqueeze(0)
-                        )
+                    if aux_hidden_state_cpu is not None:
+                        data_point["aux_hidden_state"] = aux_hidden_state_cpu
 
+                    # 3. Save asynchronously (the backpressure logic is still crucial)
                     output_file = self._get_file_path(output_path, current_global_idx)
                     self._save_tensor_async(data_point, output_file)
 
@@ -342,9 +359,8 @@ class HiddenStatesGenerator:
 
             del eagle3_data_list, batch
 
-            if batch_idx % 5 == 0:
+            if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
                 torch.cuda.empty_cache()
-            if batch_idx % 20 == 0:
                 gc.collect()
 
             if tp_size > 1 and batch_idx % self.tp_sync_interval == 0:

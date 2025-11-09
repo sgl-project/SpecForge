@@ -89,12 +89,8 @@ class RowParallelLinear(nn.Module):
         if "weight" in state_dict:
             state_dict["weight"] = shard_tensor(state_dict["weight"], self.tp_group, -1)
 
-        if (
-            "bias" in state_dict
-            and state_dict["bias"] is not None
-            and self.tp_rank != 0
-        ):
-            state_dict["bias"].zero_()
+        if "bias" in state_dict and self.tp_rank != 0:
+            state_dict["bias"] = torch.zeros_like(state_dict["bias"])
 
     def forward(self, x):
         return F.linear(x, self.weight, self.bias)
