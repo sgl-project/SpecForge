@@ -1,6 +1,0 @@
-{"batch_size": 8, "steps": 7, "topk": 10, "num_draft_tokens": 60, "acc_length": 4.14, "duration": 40.99, "throughput": 1321.79, "completion_tokens": 54181, "benchmark": "mtbench"}
-{"batch_size": 8, "steps": 3, "topk": 1, "num_draft_tokens": 4, "acc_length": 2.46, "duration": 31.09, "throughput": 1754.67, "completion_tokens": 54547, "benchmark": "mtbench"}
-{"batch_size": 8, "steps": 7, "topk": 10, "num_draft_tokens": 60, "acc_length": 4.6, "duration": 37.17, "throughput": 1468.0, "completion_tokens": 54570, "benchmark": "mtbench"}
-{"batch_size": 8, "steps": 3, "topk": 1, "num_draft_tokens": 4, "acc_length": 2.61, "duration": 29.29, "throughput": 1864.16, "completion_tokens": 54598, "benchmark": "mtbench"}
-{"batch_size": 8, "steps": 7, "topk": 10, "num_draft_tokens": 60, "acc_length": 4.51, "duration": 38.13, "throughput": 1438.28, "completion_tokens": 54839, "benchmark": "mtbench"}
-{"batch_size": 8, "steps": 3, "topk": 1, "num_draft_tokens": 4, "acc_length": 2.6, "duration": 30.34, "throughput": 1796.37, "completion_tokens": 54500, "benchmark": "mtbench"}
