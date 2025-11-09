@@ -10,6 +10,7 @@ Optimized for lower memory usage and higher efficiency.
 import argparse
 import gc
 import hashlib
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
+from rich.logging import RichHandler
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
@@ -45,6 +47,15 @@ def parse_args():
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--chat-template", type=str, default="llama3")
     parser.add_argument("--target-tp-size", type=int, default=1)
+    parser.add_argument(
+        "--target-tp-size",
+        "--tp",
+        dest="target_tp_size",
+        type=int,
+        default=1,
+        help="Tensor parallel size (alias: --tp)",
+    )
+
     parser.add_argument("--target-batch-size", type=int, default=32)
     parser.add_argument("--target-micro-batch-size", type=int, default=1)
     parser.add_argument(
@@ -354,6 +365,13 @@ class HiddenStatesGenerator:
 
 def main():
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[RichHandler()],
+        force=True,
+    )
     if args.aux_hidden_states_layers is not None:
         args.aux_hidden_states_layers = [
             int(x) for x in args.aux_hidden_states_layers.split(",")

@@ -27,4 +27,4 @@ torchrun \
     --tp-size $TP_SIZE \
     --output-path $OUTPUT_ROOT_DIR/cache/hidden_states \
     --num-samples $NUM_SAMPLES \
-    --batch-size 4
+    --target-batch-size 4

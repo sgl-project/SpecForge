@@ -21,4 +21,4 @@ torchrun \
     --chat-template qwen \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
-    --tp-size $NUM_GPUS
+    --target-tp-size $NUM_GPUS

@@ -12,7 +12,7 @@ torchrun \
     --draft-model-config $ROOT_DIR/configs/gpt-oss-20B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/perfect-blend-gptoss-20B.jsonl \
     --output-dir $ROOT_DIR/outputs/gpt-oss-20b-eagle3 \
-    --tp-size 8 \
+    --target-tp-size 8 \
     --num-epochs 10 \
     --batch-size 1 \
     --learning-rate 1e-4 \

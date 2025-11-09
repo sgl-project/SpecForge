@@ -75,7 +75,7 @@ torchrun \
     --draft-model-config ./configs/gpt-oss-120B-eagle3.json \
     --train-data-path $DATASET_PATH/all_train.jsonl \
     --eval-data-path $DATASET_PATH/all_test.jsonl \
-    --tp-size $NUM_GPUS \
+    --target-tp-size $NUM_GPUS \
     --output-dir $OUTPUT_DIR \
     --num-epochs 10 \
     --batch-size 1 \

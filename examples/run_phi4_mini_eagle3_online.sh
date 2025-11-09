@@ -20,5 +20,5 @@ torchrun \
     --chat-template phi4-mini \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
-    --tp-size 1 \
+    --target-tp-size 1 \
     --ttt-length 7

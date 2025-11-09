@@ -127,7 +127,7 @@ class Eagle3TrainerArgs:
     draft_model_last_checkpoint: str = None
     max_length: int = 2048
     warmup_ratio: float = 0.015
-    eagle3_chat_template: str = "llama3"
+    eagle3_chat_template: Optional[str] = None
     enable_zero2: bool = False
 
     @staticmethod
@@ -400,6 +400,12 @@ class Eagle3TrainerArgs:
         else:
             args.draft_model_last_checkpoint = None
             print_on_rank0(f"Training from scratch")
+
+        if args.eagle3_chat_template is None:
+            args.eagle3_chat_template = args.chat_template
+            print_on_rank0(
+                f"Using chat template {args.eagle3_chat_template} for Eagle3; --chat-template is deprecated for duplicate argument name in sglang, please use --eagle3-chat-template instead"
+            )
 
         # for sglang server args
         args.tensor_parallel_size = args.target_tp_size
@@ -1074,6 +1080,7 @@ def main():
         format="%(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[RichHandler()],
+        force=True,
     )
     args = parse_args()
     trainer = Eagle3Trainer(args)

@@ -14,7 +14,7 @@ torchrun \
     --output-dir $ROOT_DIR/outputs/llama3.3-70b-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \
-    --tp-size 8 \
+    --target-tp-size 8 \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template llama3 \
