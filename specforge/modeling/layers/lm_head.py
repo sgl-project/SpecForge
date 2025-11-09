@@ -6,7 +6,12 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.distributed import get_tp_group, shard_tensor
+from specforge.distributed import (
+    get_target_tp_group,
+    get_target_tp_rank,
+    get_target_tp_size,
+    shard_tensor,
+)
 
 
 class ParallelLMHead(nn.Module):
@@ -19,14 +24,23 @@ class ParallelLMHead(nn.Module):
         bias: bool = True,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
         self.out_features = out_features
-        self.tp_group = get_tp_group()
-        self.tp_size = dist.get_world_size(self.tp_group)
-        self.tp_rank = dist.get_rank(self.tp_group)
+        self.tp_group = tp_group if tp_group is not None else get_target_tp_group()
+        self.tp_size = (
+            dist.get_world_size(self.tp_group)
+            if tp_group is not None
+            else get_target_tp_size()
+        )
+        self.tp_rank = (
+            dist.get_rank(self.tp_group)
+            if tp_group is not None
+            else get_target_tp_rank()
+        )
 
         # tp-related
         self.out_features_per_shard = math.ceil(out_features / self.tp_size)
