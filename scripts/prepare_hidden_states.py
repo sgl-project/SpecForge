@@ -215,12 +215,20 @@ class HiddenStatesGenerator:
 
     def _save_tensor_async(self, data_point: Dict[str, torch.Tensor], output_file: str):
         assert is_tp_rank_0(), "Only tp_rank=0 should call _save_tensor_async"
+        # If the queue of pending save operations is full, we must wait.
+        if len(self.pending_futures) >= self.io_queue_size:
+            # First, try to clear any futures that have already finished without waiting.
+            self.pending_futures = [f for f in self.pending_futures if not f.done()]
+            # If the queue is *still* full, it means all I/O threads are busy and we have
+            # a backlog. We must now block the main generation loop and wait for the
+            # oldest I/O operation to complete before proceeding.
+            if len(self.pending_futures) >= self.io_queue_size:
+                self.pending_futures.pop(0).result()
+
         future = self.io_executor.submit(
             self._save_tensor_sync, data_point, output_file
         )
         self.pending_futures.append(future)
-        if len(self.pending_futures) > self.io_queue_size:
-            self.pending_futures = [f for f in self.pending_futures if not f.done()]
 
     def _wait_all_saves(self):
         if is_tp_rank_0() and self.pending_futures:
@@ -272,6 +280,12 @@ class HiddenStatesGenerator:
         start_idx: int = 0,
         samples_per_dp: int = 0,
     ):
+        """
+        This version prioritizes minimal CPU RAM usage above all else, even at the cost of performance.
+        - It processes samples one-by-one within the tp_rank_0 process.
+        - It avoids batching GPU-to-CPU transfers.
+        - It ensures only one sample's data is in RAM for I/O at any given time.
+        """
         self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
 
         tp_group = get_tp_group()
@@ -316,7 +330,6 @@ class HiddenStatesGenerator:
             # Step 1: Synchronize valid indices across TP group
             if tp_size > 1:
                 if is_tp_rank_0():
-                    # Use -1 as sentinel for empty batch
                     if num_valid == 0:
                         indices_to_broadcast = torch.tensor(
                             [-1], dtype=torch.long, device="cuda"
@@ -330,30 +343,19 @@ class HiddenStatesGenerator:
                     )
                 else:
                     length_tensor = torch.zeros(1, dtype=torch.long, device="cuda")
-
-                # Broadcast length first
                 dist.broadcast(length_tensor, src=tp_rank_0_global, group=tp_group)
-
-                # Create receive buffer on other ranks
                 if not is_tp_rank_0():
                     indices_to_broadcast = torch.zeros(
                         length_tensor.item(), dtype=torch.long, device="cuda"
                     )
-
-                # Broadcast indices
                 dist.broadcast(
                     indices_to_broadcast, src=tp_rank_0_global, group=tp_group
                 )
-
-                # Check for empty batch sentinel
                 if indices_to_broadcast[0].item() == -1:
                     del length_tensor, indices_to_broadcast
                     continue
-
-                # Convert to list on non-rank-0
                 if not is_tp_rank_0():
                     valid_indices_in_batch = indices_to_broadcast.tolist()
-
                 del length_tensor, indices_to_broadcast
             else:
                 if num_valid == 0:
@@ -365,48 +367,60 @@ class HiddenStatesGenerator:
                 "attention_mask": batch["attention_mask"][valid_indices_in_batch],
                 "loss_mask": batch["loss_mask"][valid_indices_in_batch],
             }
+            del batch
+
             filtered_batch_gpu = {
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
 
             eagle3_data = self.model.generate_eagle3_data(**filtered_batch_gpu)
+
             del filtered_batch_gpu
 
             if is_tp_rank_0():
                 seq_lengths = eagle3_data.attention_mask.sum(dim=1).tolist()
-                hidden_states_cpu = eagle3_data.hidden_states.cpu()
-                aux_hidden_states_cpu = None
-                if self.enable_aux_hidden_states and hasattr(
-                    eagle3_data, "aux_hidden_states"
-                ):
-                    aux_hidden_states_cpu = eagle3_data.aux_hidden_states.cpu()
 
                 for i, (current_global_idx, seq_len) in enumerate(
                     zip(sample_global_indices, seq_lengths)
                 ):
-                    data_point = {
-                        "input_ids": filtered_batch["input_ids"][i].clone(),
-                        "loss_mask": filtered_batch["loss_mask"][i].clone(),
-                        "hidden_state": hidden_states_cpu[i, :seq_len, :]
-                        .clone()
-                        .unsqueeze(0),
-                    }
-                    if aux_hidden_states_cpu is not None:
-                        data_point["aux_hidden_state"] = (
-                            aux_hidden_states_cpu[i, :seq_len, :].clone().unsqueeze(0)
+
+                    # Process ONE sample at a time to minimize CPU RAM footprint
+                    # 1. Transfer only the required slice for one sample to CPU
+                    hidden_state_cpu = (
+                        eagle3_data.target[i, :seq_len, :].cpu().unsqueeze(0)
+                    )
+
+                    aux_hidden_state_cpu = None
+                    if self.enable_aux_hidden_states and hasattr(
+                        eagle3_data, "hidden_states"
+                    ):
+                        aux_hidden_state_cpu = (
+                            eagle3_data.hidden_states[i, :seq_len, :].cpu().unsqueeze(0)
                         )
 
+                    # 2. Prepare the data point for this single sample
+                    data_point = {
+                        "input_ids": filtered_batch["input_ids"][i],
+                        "loss_mask": filtered_batch["loss_mask"][i],
+                        "hidden_state": hidden_state_cpu,
+                    }
+                    if aux_hidden_state_cpu is not None:
+                        data_point["aux_hidden_state"] = aux_hidden_state_cpu
+
+                    # 3. Save asynchronously (the backpressure logic is still crucial)
                     output_file = self._get_file_path(output_path, current_global_idx)
                     self._save_tensor_async(data_point, output_file)
 
-                del hidden_states_cpu, aux_hidden_states_cpu
+                    # 4. Immediately clean up the single-sample CPU tensors
+                    del hidden_state_cpu, aux_hidden_state_cpu, data_point
+
                 total_processed += len(sample_global_indices)
 
+            # Clean up the large GPU and CPU batch data
             del eagle3_data, filtered_batch
 
-            if batch_idx % 5 == 0:
+            if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
                 torch.cuda.empty_cache()
-            if batch_idx % 20 == 0:
                 gc.collect()
 
             if tp_size > 1 and batch_idx % self.tp_sync_interval == 0:
@@ -423,7 +437,6 @@ class HiddenStatesGenerator:
                     }
                 )
 
-        # --- REFACTOR: Cleanup is now handled by __exit__ ---
         if self.show_progress:
             print(
                 f"\nGeneration loop finished. Processed: {total_processed}, Skipped: {total_skipped}"
