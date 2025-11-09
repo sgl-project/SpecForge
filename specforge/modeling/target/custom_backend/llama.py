@@ -44,7 +44,7 @@ from transformers.utils import TransformersKwargs, logging
 from transformers.utils.generic import check_model_inputs
 
 from specforge.distributed import gather_tensor, get_target_tp_group
-from specforge.modeling.linear import (
+from specforge.modeling.layers import (
     ColumnParallelLinear,
     ParallelLMHead,
     RowParallelLinear,

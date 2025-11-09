@@ -30,6 +30,14 @@ class _AllReduce(torch.autograd.Function):
         return grad_output, None, None
 
 
+def tp_all_reduce(
+    tensor: torch.Tensor,
+    group: dist.ProcessGroup,
+    op: dist.ReduceOp = dist.ReduceOp.SUM,
+):
+    return _AllReduce.apply(tensor, group, op)
+
+
 class RowParallelLinear(nn.Module):
     def __init__(
         self,

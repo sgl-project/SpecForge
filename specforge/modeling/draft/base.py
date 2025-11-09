@@ -41,7 +41,7 @@ from specforge.distributed import (
     get_draft_tp_rank,
     get_draft_tp_size,
 )
-from specforge.modeling.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.layers import ColumnParallelLinear, RowParallelLinear
 from specforge.utils import print_with_rank
 
 

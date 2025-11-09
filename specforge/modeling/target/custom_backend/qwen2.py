@@ -52,7 +52,7 @@ from transformers.utils import (
 
 # [MODIFIED] Import from distributed library
 from specforge.distributed import gather_tensor, get_target_tp_group
-from specforge.modeling.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.layers import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 

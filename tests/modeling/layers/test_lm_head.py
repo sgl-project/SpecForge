@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
 from specforge.distributed import init_distributed
-from specforge.layers import ParallelLMHead, VocabParallelEmbedding
+from specforge.modeling.layers import ParallelLMHead, VocabParallelEmbedding
 from tests.utils import get_available_port
 
 

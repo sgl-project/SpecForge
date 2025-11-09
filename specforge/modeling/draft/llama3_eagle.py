@@ -11,10 +11,10 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.distributed import get_draft_tp_group, get_draft_tp_size
-from specforge.modeling.linear import (
+from specforge.modeling.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
-    _AllReduce,
+    tp_all_reduce,
 )
 from specforge.utils import print_on_rank0
 
@@ -709,7 +709,7 @@ class LlamaAttention(nn.Module):
 
         attn_output = self.o_proj(attn_output)
         if self.tp_size > 1:
-            attn_output = _AllReduce.apply(attn_output, self.tp_group)
+            attn_output = tp_all_reduce(attn_output, self.tp_group)
 
         return attn_output
 
@@ -879,7 +879,7 @@ class LlamaMLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(gate_output) * up_output)
 
         if self.tp_size > 1:
-            down_proj = _AllReduce.apply(down_proj, self.tp_group)
+            down_proj = tp_all_reduce(down_proj, self.tp_group)
 
         return down_proj
 

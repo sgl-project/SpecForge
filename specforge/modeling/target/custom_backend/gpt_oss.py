@@ -39,7 +39,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import OutputRecorder, check_model_inputs
 
 from specforge.distributed import get_target_tp_group, shard_tensor
-from specforge.modeling.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.layers import ColumnParallelLinear, RowParallelLinear
 
 
 class GptOssExperts(nn.Module):
