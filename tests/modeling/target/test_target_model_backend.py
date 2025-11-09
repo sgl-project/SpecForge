@@ -17,7 +17,7 @@ from tests.utils import get_available_port
 
 @torch.no_grad()
 def test_target_model_backend(rank, world_size, port, tp_size):
-    model_name = "unsloth/Llama-3.2-1B"
+    model_name = "meta-llama/Llama-3.1-8B-Instruct"
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -58,11 +58,6 @@ def test_target_model_backend(rank, world_size, port, tp_size):
         custom_out_list
     ), f"Length not equal: {len(hf_out_list)=} vs {len(custom_out_list)=}"
     for hf_out, custom_out in zip(hf_out_list, custom_out_list):
-        from specforge.utils import print_with_rank
-
-        print_with_rank(
-            f"Comparing {hf_out.target.shape=} and {custom_out.target.shape=}, {hf_out.loss_mask.shape=} and {custom_out.loss_mask.shape=}, {hf_out.input_ids.shape=} and {custom_out.input_ids.shape=}, {hf_out.hidden_states.shape=} and {custom_out.hidden_states.shape=}"
-        )
         assert torch.allclose(
             hf_out.target, custom_out.target, atol=1e-5, rtol=1e-5
         ), f"Logits are not close: \nhf: {hf_out[0] - custom_out[0]}"
@@ -75,7 +70,6 @@ def test_target_model_backend(rank, world_size, port, tp_size):
         assert torch.allclose(
             hf_out.hidden_states, custom_out.hidden_states, atol=1e-5, rtol=1e-5
         ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
-    model_name = "meta-llama/Llama-3.1-8B-Instruct"
     sgl_target_model = SGLangEagle3TargetModel.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
@@ -101,11 +95,11 @@ def test_target_model_backend(rank, world_size, port, tp_size):
 
 class TestTargetModelBackend(unittest.TestCase):
 
-    def test_target_model_backend_tp(self):
+    def test_target_model_backend_dp(self):
         world_size = 2
         port = get_available_port()
         mp.spawn(
-            test_target_model_backend, nprocs=world_size, args=(world_size, port, 2)
+            test_target_model_backend, nprocs=world_size, args=(world_size, port, 1)
         )
 
 
