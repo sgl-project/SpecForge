@@ -43,8 +43,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 from transformers.utils.generic import check_model_inputs
 
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import get_tp_group
+from specforge.layers import ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding, ParallelLMHead
 
 logger = logging.get_logger(__name__)
 
@@ -257,7 +257,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
@@ -350,7 +350,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
 
         # distributed the lm head
-        self.lm_head = ColumnParallelLinear(
+        self.lm_head = ParallelLMHead(
             config.hidden_size, config.vocab_size, bias=False
         )
 
@@ -424,8 +424,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = gather_tensor(logits, get_tp_group())
+        logits = self.lm_head(hidden_states[:, slice_indices, :], gather_output=True)
 
         loss = None
         if labels is not None:

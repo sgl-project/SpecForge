@@ -24,44 +24,51 @@ def test_llama3_tp(rank, world_size, temp_dir, port):
 
     init_distributed(tp_size=2)
     set_seed(42)
-    config = LlamaConfig(
-        vocab_size=1000,
-        hidden_size=384,
-        intermediate_size=512,
-        num_hidden_layers=2,
-        max_position_embeddings=1024,
-        num_attention_heads=10,
-        num_key_value_heads=2,
-        tie_word_embeddings=False,
-        initializer_range=0.02,
-        hidden_act="silu",
-        rms_norm_eps=1e-6,
-    )
 
-    # create the single-gpu
-    model = HFLLamaForCausalLM(config).cuda()
+    for tie_word_embedding in [True, False]:
+        config = LlamaConfig(
+            vocab_size=1000,
+            hidden_size=384,
+            intermediate_size=512,
+            num_hidden_layers=2,
+            max_position_embeddings=1024,
+            num_attention_heads=10,
+            num_key_value_heads=2,
+            tie_word_embeddings=False,
+            initializer_range=0.02,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            tie_word_embedding=tie_word_embedding,
+        )
 
-    # save the model weights to a temp directory
-    if dist.get_rank() == 0:
-        model.save_pretrained(temp_dir)
-        print(f"Saved model to {temp_dir}")
-    dist.barrier()
-    dist_model = SFLlamaForCausalLM.from_pretrained(temp_dir).cuda()
-    dist.barrier()
+        # create the single-gpu
+        model = HFLLamaForCausalLM(config).cuda()
 
-    # create data
-    input_ids = torch.randint(0, 1000, (1, 256)).cuda()
-    attention_mask = torch.ones_like(input_ids).cuda()
+        # save the model weights to a temp directory
+        if dist.get_rank() == 0:
+            model.save_pretrained(temp_dir)
+            print(f"Saved model to {temp_dir}")
+        dist.barrier()
+        dist_model = SFLlamaForCausalLM.from_pretrained(temp_dir).cuda()
+        dist.barrier()
 
-    expected_logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-    dist_logits = dist_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        # create data
+        input_ids = torch.randint(0, 1000, (1, 256)).cuda()
+        attention_mask = torch.ones_like(input_ids).cuda()
 
-    assert torch.allclose(
-        expected_logits,
-        dist_logits,
-        rtol=1e-5,
-        atol=1e-5,
-    ), f"Logits are not close, {expected_logits} vs {dist_logits}"
+        expected_logits = model(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).logits
+        dist_logits = dist_model(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).logits
+
+        assert torch.allclose(
+            expected_logits,
+            dist_logits,
+            rtol=1e-5,
+            atol=1e-5,
+        ), f"Logits are not close, {expected_logits} vs {dist_logits}"
 
     dist.destroy_process_group()
 

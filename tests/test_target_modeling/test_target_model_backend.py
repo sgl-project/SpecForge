@@ -24,7 +24,7 @@ def test_target_model_backend(rank, world_size, port, tp_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
 
-    init_distributed(tp_size=1)
+    init_distributed(tp_size=tp_size)
     set_seed(42)
 
     input_ids = torch.randint(0, 1000, (2, 256)).cuda()
