@@ -56,7 +56,10 @@ def print_with_rank(message):
 
 
 def print_on_rank0(message):
-    if dist.get_rank() == 0:
+    if dist.is_available() and dist.is_initialized():
+        if dist.get_rank() == 0:
+            logger.info(message)
+    else:
         logger.info(message)
 
 
