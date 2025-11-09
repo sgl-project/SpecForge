@@ -1,6 +1,5 @@
 import os
 import unittest
-from types import SimpleNamespace
 
 import torch
 import torch.multiprocessing as mp
@@ -25,10 +24,10 @@ def test_target_model_backend(rank, world_size, port, tp_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
 
-    init_distributed(tp_size=1)
+    init_distributed(target_tp_size=tp_size)
     set_seed(42)
 
-    input_ids = torch.randint(0, 1000, (2, 256)).cuda()
+    input_ids = torch.randint(0, 1000, (tp_size, 256)).cuda()
     attention_mask = torch.ones_like(input_ids)
     loss_mask = torch.ones_like(input_ids)
 
@@ -36,7 +35,7 @@ def test_target_model_backend(rank, world_size, port, tp_size):
         model_name, torch_dtype=torch.float16, device="cuda"
     )
     hf_target_model.set_aux_hidden_states_layers()
-    hf_out = hf_target_model.generate_eagle3_data(
+    hf_out_list = hf_target_model.generate_eagle3_data(
         input_ids=input_ids,
         attention_mask=attention_mask,
         loss_mask=loss_mask,
@@ -47,7 +46,7 @@ def test_target_model_backend(rank, world_size, port, tp_size):
         model_name, torch_dtype=torch.float16, device="cuda"
     )
     custom_target_model.set_aux_hidden_states_layers()
-    custom_out = custom_target_model.generate_eagle3_data(
+    custom_out_list = custom_target_model.generate_eagle3_data(
         input_ids=input_ids,
         attention_mask=attention_mask,
         loss_mask=loss_mask,
@@ -55,67 +54,52 @@ def test_target_model_backend(rank, world_size, port, tp_size):
     del custom_target_model
 
     # compare weights
-    assert torch.allclose(
-        hf_out.target, custom_out.target, atol=1e-5, rtol=1e-5
-    ), f"Logits are not close: \nhf: {hf_out[0] - custom_out[0]}"
-    assert torch.allclose(
-        hf_out.loss_mask, custom_out.loss_mask, atol=1e-5, rtol=1e-5
-    ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
-    assert torch.allclose(
-        hf_out.input_ids, custom_out.input_ids, atol=1e-5, rtol=1e-5
-    ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
-    assert torch.allclose(
-        hf_out.hidden_states, custom_out.hidden_states, atol=1e-5, rtol=1e-5
-    ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
-    server_args = ServerArgs(
-        model_path=model_name,
-        trust_remote_code=True,
-        dtype=torch.float16,
-        enable_return_hidden_states=True,
-        disable_cuda_graph=True,
-        enable_torch_compile=True,
-        tp_size=2,
-        pp_size=1,
-        attention_backend="torch_native",
-    )
-    server_args.tensor_parallel_size = 2
-    server_args.pipeline_parallel_size = 1
-    server_args.data_parallel_size = 1
-    server_args.expert_parallel_size = 1
-    server_args.target_micro_batch_size = 2
+    assert len(hf_out_list) == len(
+        custom_out_list
+    ), f"Length not equal: {len(hf_out_list)=} vs {len(custom_out_list)=}"
+    for hf_out, custom_out in zip(hf_out_list, custom_out_list):
+        from specforge.utils import print_with_rank
+
+        print_with_rank(
+            f"Comparing {hf_out.target.shape=} and {custom_out.target.shape=}, {hf_out.loss_mask.shape=} and {custom_out.loss_mask.shape=}, {hf_out.input_ids.shape=} and {custom_out.input_ids.shape=}, {hf_out.hidden_states.shape=} and {custom_out.hidden_states.shape=}"
+        )
+        assert torch.allclose(
+            hf_out.target, custom_out.target, atol=1e-5, rtol=1e-5
+        ), f"Logits are not close: \nhf: {hf_out[0] - custom_out[0]}"
+        assert torch.allclose(
+            hf_out.loss_mask, custom_out.loss_mask, atol=1e-5, rtol=1e-5
+        ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
+        assert torch.allclose(
+            hf_out.input_ids, custom_out.input_ids, atol=1e-5, rtol=1e-5
+        ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
+        assert torch.allclose(
+            hf_out.hidden_states, custom_out.hidden_states, atol=1e-5, rtol=1e-5
+        ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
     model_name = "meta-llama/Llama-3.1-8B-Instruct"
     sgl_target_model = SGLangEagle3TargetModel.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
         device="cuda",
-        args=server_args,
     )
     sgl_target_model.set_aux_hidden_states_layers()
-    sgl_out = sgl_target_model.generate_eagle3_data(
-        input_ids=input_ids.chunk(2, dim=0),
-        attention_mask=attention_mask.chunk(2, dim=0),
-        loss_mask=loss_mask.chunk(2, dim=0),
+    sgl_out_list = sgl_target_model.generate_eagle3_data(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
     )
     del sgl_target_model
-    assert len(hf_out) == len(sgl_out)
-    hf_out = hf_out[0]
-    sgl_out = sgl_out[0]
-
-    assert torch.equal(hf_out.loss_mask, sgl_out.loss_mask)
-    assert torch.equal(hf_out.input_ids, sgl_out.input_ids)
-    assert torch.allclose(
-        hf_out.hidden_states, sgl_out.hidden_states, atol=1e-1, rtol=1e-2
-    ), f"Hidden states are not close, diff: \n{(hf_out.hidden_states - sgl_out.hidden_states).abs().max()}"
+    assert len(hf_out_list) == len(
+        sgl_out_list
+    ), f"Length not equal: {len(hf_out_list)=} vs {len(sgl_out_list)=}"
+    for hf_out, sgl_out in zip(hf_out_list, sgl_out_list):
+        assert torch.equal(hf_out.loss_mask, sgl_out.loss_mask)
+        assert torch.equal(hf_out.input_ids, sgl_out.input_ids)
+        assert torch.allclose(
+            hf_out.hidden_states, sgl_out.hidden_states, atol=1e-1, rtol=1e-2
+        ), f"Hidden states are not close, diff: \n{(hf_out.hidden_states - sgl_out.hidden_states).abs().max()}"
 
 
 class TestTargetModelBackend(unittest.TestCase):
-
-    def test_target_model_backend_dp(self):
-        world_size = 2
-        port = get_available_port()
-        mp.spawn(
-            test_target_model_backend, nprocs=world_size, args=(world_size, port, 1)
-        )
 
     def test_target_model_backend_tp(self):
         world_size = 2

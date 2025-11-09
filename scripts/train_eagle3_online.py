@@ -343,6 +343,10 @@ class Eagle3TrainerArgs:
         args.draft_dp_size = world_size // args.draft_tp_size
 
         # GA Check
+        if args.target_model_backend == "sglang":
+            assert (
+                args.draft_micro_batch_size == 1
+            ), "draft_micro_batch_size must be 1 for sglang online backend"
         args.draft_accumulation_steps = (
             args.draft_global_batch_size
             // args.draft_dp_size

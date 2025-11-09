@@ -3,7 +3,12 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.distributed import get_target_tp_group, shard_tensor
+from specforge.distributed import (
+    get_target_tp_group,
+    get_target_tp_rank,
+    get_target_tp_size,
+    shard_tensor,
+)
 
 
 class _AllReduce(torch.autograd.Function):
@@ -41,8 +46,16 @@ class RowParallelLinear(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
         self.tp_group = tp_group if tp_group is not None else get_target_tp_group()
-        self.tp_size = dist.get_world_size(self.tp_group)
-        self.tp_rank = dist.get_rank(self.tp_group)
+        self.tp_size = (
+            dist.get_world_size(self.tp_group)
+            if tp_group is not None
+            else get_target_tp_size()
+        )
+        self.tp_rank = (
+            dist.get_rank(self.tp_group)
+            if tp_group is not None
+            else get_target_tp_rank()
+        )
 
         self.in_features = in_features
         self.out_features = out_features
@@ -111,8 +124,16 @@ class ColumnParallelLinear(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
         self.tp_group = tp_group if tp_group is not None else get_target_tp_group()
-        self.tp_size = dist.get_world_size(self.tp_group)
-        self.tp_rank = dist.get_rank(self.tp_group)
+        self.tp_size = (
+            dist.get_world_size(self.tp_group)
+            if tp_group is not None
+            else get_target_tp_size()
+        )
+        self.tp_rank = (
+            dist.get_rank(self.tp_group)
+            if tp_group is not None
+            else get_target_tp_rank()
+        )
 
         self.in_features = in_features
         self.out_features = out_features

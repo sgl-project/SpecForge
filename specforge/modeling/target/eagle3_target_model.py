@@ -29,7 +29,7 @@ from ...data import DataCollatorWithPadding
 from .sglang_backend import SGLangRunner
 
 
-def get_dp_data_shard_from_tp(
+def get_draft_data_shard_from_target(
     tensor: Union[torch.Tensor, List[torch.Tensor]]
 ) -> torch.Tensor:
     """
@@ -127,11 +127,11 @@ class Eagle3TargetModel(ABC):
 
         return [
             Eagle3TargetOutput(
-                hidden_states=get_dp_data_shard_from_tp(hidden_states),
-                target=get_dp_data_shard_from_tp(target),
-                loss_mask=get_dp_data_shard_from_tp(loss_mask),
-                input_ids=get_dp_data_shard_from_tp(input_ids),
-                attention_mask=get_dp_data_shard_from_tp(attention_mask),
+                hidden_states=get_draft_data_shard_from_target(hidden_states),
+                target=get_draft_data_shard_from_target(target),
+                loss_mask=get_draft_data_shard_from_target(loss_mask),
+                input_ids=get_draft_data_shard_from_target(input_ids),
+                attention_mask=get_draft_data_shard_from_target(attention_mask),
             )
         ]
 
@@ -344,7 +344,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             target_micro_batch_size = input_ids.shape[0]
         padding_len = (
-            target_micro_batch_size - input_ids.shape[0] % target_micro_batch_size
+            target_micro_batch_size
+            - input_ids.shape[0] // target_micro_batch_size * target_micro_batch_size
         )
         if padding_len > 0:
             input_ids = torch.cat(
@@ -399,11 +400,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 hidden_states_list, aux_hidden_states_list = self.extend(
                     reqs, capture_aux_hidden_states=True
                 )
-                hidden_states_list = get_dp_data_shard_from_tp(list(hidden_states_list))
-                aux_hidden_states_list = get_dp_data_shard_from_tp(
+                hidden_states_list = get_draft_data_shard_from_target(
+                    list(hidden_states_list)
+                )
+                aux_hidden_states_list = get_draft_data_shard_from_target(
                     list(aux_hidden_states_list)
                 )
-                data_cache = get_dp_data_shard_from_tp(list(data_cache))
+                data_cache = get_draft_data_shard_from_target(list(data_cache))
                 for data, hidden_states, aux_hidden_states in zip(
                     data_cache, hidden_states_list, aux_hidden_states_list
                 ):
