@@ -31,6 +31,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from tqdm.asyncio import tqdm as async_tqdm
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig
 
 from specforge.data import (
@@ -544,8 +545,9 @@ class Eagle3Trainer:
 
     def _auto_calculate_num_steps(self):
         args = self.trainer_args
-        if args.target_tp_size <= args.draft_tp_size:
-            # all data generate this target instance will contribute to one draft instance
+        if args.target_tp_size >= args.draft_tp_size:
+            # data generate this target instance will contribute to multiple draft instances
+            # thus target dp size should be used
             steps_per_epoch = math.ceil(
                 len(self.train_dataloader.dataloader)
                 * args.target_batch_size
@@ -556,7 +558,8 @@ class Eagle3Trainer:
                 f"Auto-Calculated {steps_per_epoch=} = ceil({len(self.train_dataloader.dataloader)=} * {args.target_batch_size=} / {args.draft_accumulation_steps})"
             )
         else:
-            # data generate this target instance will contribute to multiple draft instances
+            # all data generate this target instance will contribute to one draft instance
+            # thus draft dp size should be used
             steps_per_epoch = math.ceil(
                 len(self.train_dataloader.dataloader)
                 * args.target_batch_size
@@ -566,6 +569,8 @@ class Eagle3Trainer:
             print_on_rank0(
                 f"Auto-Calculated {steps_per_epoch=} = ceil({len(self.train_dataloader.dataloader)=} * {args.target_batch_size=} * {args.draft_dp_size=} / {args.draft_global_batch_size=})"
             )
+        self.steps_per_epoch = steps_per_epoch
+
         if args.total_steps is None:
             args.total_steps = args.num_epochs * steps_per_epoch
             print_on_rank0(
@@ -765,7 +770,7 @@ class Eagle3Trainer:
             prefetch_factor=8,
             process_group=(
                 get_target_dp_group()
-                if target_tp_size > draft_tp_size
+                if target_tp_size >= draft_tp_size
                 else get_draft_dp_group()
             ),
             is_vlm=args.is_vlm,
@@ -806,7 +811,7 @@ class Eagle3Trainer:
                 prefetch_factor=8,
                 process_group=(
                     get_target_dp_group()
-                    if target_tp_size > draft_tp_size
+                    if target_tp_size >= draft_tp_size
                     else get_draft_dp_group()
                 ),
                 is_vlm=args.is_vlm,
@@ -1015,16 +1020,15 @@ class Eagle3Trainer:
         train_acces = [[] for _ in range(args.ttt_length)]
         self.train_logdict = defaultdict(float)
         self.draft_model.train()
+        pbar = None
         if dist.get_rank() == 0:
-            progress_bar = tqdm(
-                self.train_dataloader,
-                total=len(self.train_dataloader),
-                desc=f"Training...",
+            pbar = async_tqdm(
+                total=min(args.total_steps, self.steps_per_epoch * args.num_epochs),
+                desc="Training...",
                 leave=True,
             )
-        else:
-            progress_bar = self.train_dataloader
-        for data in progress_bar:
+            pbar.update(self.global_batch_idx)
+        for data in self.train_dataloader:
             if self.global_batch_idx >= args.total_steps:
                 break
             eagle3_data_list = self._generate_eagle3_data(data)
@@ -1043,6 +1047,8 @@ class Eagle3Trainer:
                     )
 
                 if do_optimizer_step:
+                    if pbar is not None:
+                        pbar.update(1)
                     if self.global_batch_idx % args.log_interval == 0:
                         self.train_logdict["train/lr"] = (
                             self.optimizer.get_learning_rate()

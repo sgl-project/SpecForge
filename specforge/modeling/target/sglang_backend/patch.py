@@ -20,6 +20,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 from specforge.distributed import get_target_tp_group as get_specforge_tp_group
+from specforge.utils import print_with_rank
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def wrap_eagle3_logits_processors_in_module(module: nn.Module):
         if isinstance(submodule, LogitsProcessor):
             wrapped = LogitsProcessorForEAGLE3(submodule)
             setattr(module, name, wrapped)
-            print(f"wrapped {name} with LogitsProcessorForEAGLE3")
+            print_with_rank(f"wrapped {name} with LogitsProcessorForEAGLE3")
 
 
 def init_distributed_environment(
@@ -312,7 +313,6 @@ def initialize_dp_attention(
         use_npu_communicator=False,
         group_name="attention_tp",
     )
-    # print(f"{parallel_state._ATTN_TP_GROUP=}")
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

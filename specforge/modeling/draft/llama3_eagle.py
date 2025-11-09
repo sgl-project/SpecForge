@@ -16,7 +16,7 @@ from specforge.modeling.linear import (
     RowParallelLinear,
     _AllReduce,
 )
-from specforge.utils import print_with_rank
+from specforge.utils import print_on_rank0
 
 from .base import Eagle3DraftModel
 from .flex_attention import (
@@ -910,7 +910,7 @@ class LlamaDecoderLayer(nn.Module):
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
         elif attention_backend == "flex_attention":
-            print_with_rank("Using flex attention on draft model training!")
+            print_on_rank0("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")

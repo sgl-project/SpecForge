@@ -5,6 +5,8 @@ from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import LlamaConfig, PretrainedConfig, modeling_utils
 
+from specforge.utils import print_on_rank0
+
 from .base import Eagle3DraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
 
@@ -86,7 +88,7 @@ class AutoDraftModelConfig:
             config = json.load(f)
 
         if "tie_word_embeddings" in config:
-            print("Set draft model tie_word_embeddings to False")
+            print_on_rank0("Set draft model tie_word_embeddings to False")
             config["tie_word_embeddings"] = False
 
         # check for architectures

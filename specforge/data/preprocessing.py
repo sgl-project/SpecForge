@@ -39,7 +39,7 @@ except ImportError:
     HAS_QWEN_VL_UTILS = False
     process_vision_info = None
 
-from specforge.utils import padding
+from specforge.utils import padding, print_on_rank0, print_with_rank
 
 from .parse import GeneralParser, HarmonyParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
@@ -104,7 +104,9 @@ def _apply_loss_mask_from_chat_template(
             loss_mask[idx] = 1
 
     if matches_found == 0:
-        print("WARNING: No assistant response spans found in the conversation text.")
+        print_with_rank(
+            "WARNING: No assistant response spans found in the conversation text."
+        )
 
     return loss_mask
 
@@ -383,11 +385,11 @@ def build_eagle3_dataset(
         load_from_cache_file = True
         os.makedirs(cache_dir, exist_ok=True)
         cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
-        print(f"dataset is cached at {cache_file_name}")
+        print_on_rank0(f"dataset is cached at {cache_file_name}")
     elif cache_dir is None and cache_key is None:
         load_from_cache_file = False
         cache_file_name = None
-        print(f"dataset is not cached")
+        print_on_rank0(f"dataset is not cached")
     else:
         warnings.warn(
             f"cache_dir and cache_key must be provided together to make caching work"
@@ -467,7 +469,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         try:
             data = self._open_file(index)
         except Exception as e:
-            print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
+            print_with_rank(
+                f"ERROR Failed to load {self.datapaths[index]} with error {e}"
+            )
             data = self._open_file(0)
         return self.process_data(data, self.max_len, self.transform)
 
@@ -513,7 +517,9 @@ def generate_vocab_mapping_file(
     vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")
 
     if os.path.exists(vocab_mapping_path):
-        print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
+        print_on_rank0(
+            f"Loading vocab mapping from the cached file at: {vocab_mapping_path}"
+        )
         return vocab_mapping_path
 
     # we first count the frequency of effectiev tokens in the dataset
@@ -538,7 +544,7 @@ def generate_vocab_mapping_file(
         "t2d": t2d,
     }
     torch.save(vocab_mapping, vocab_mapping_path)
-    print(f"Saved vocab mapping to: {vocab_mapping_path}")
+    print_on_rank0(f"Saved vocab mapping to: {vocab_mapping_path}")
     return vocab_mapping_path
 
 
@@ -567,21 +573,23 @@ def process_token_dict_to_mappings(
             token_dict[token] = 0
             if len(token_dict) >= draft_vocab_size:
                 break
-    print(f"Added missing tokens to reach draft vocab size: {draft_vocab_size}")
-    print(f"Total tokens after addition: {len(token_dict)}")
+    print_on_rank0(
+        f"Added missing tokens to reach draft vocab size: {draft_vocab_size}"
+    )
+    print_on_rank0(f"Total tokens after addition: {len(token_dict)}")
     total_frequency = sum(token_dict.values())
     top_N = token_dict.most_common(draft_vocab_size)
     top_N_frequency_sum = sum(freq for key, freq in top_N)
 
     if total_frequency == 0:
-        print(
+        print_on_rank0(
             "Warning: Total token frequency is zero. All tokens will have zero ratio."
         )
         top_N_ratio = 0.0
     else:
         top_N_ratio = top_N_frequency_sum / total_frequency
 
-    print(f"top {draft_vocab_size} token frequency ratio: {top_N_ratio:.2%}")
+    print_on_rank0(f"top {draft_vocab_size} token frequency ratio: {top_N_ratio:.2%}")
     used_tokens = [key for key, freq in top_N]
     used_tokens.sort()
 

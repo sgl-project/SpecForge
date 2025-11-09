@@ -29,6 +29,7 @@ try:
 except ImportError:
     mlflow = None
 
+from specforge.utils import print_with_rank
 
 # --- End Lazy Imports ---
 
@@ -243,7 +244,7 @@ class MLflowTracker(Tracker):
         if args.mlflow_tracking_uri is None and "MLFLOW_TRACKING_URI" in os.environ:
             args.mlflow_tracking_uri = os.environ["MLFLOW_TRACKING_URI"]
         elif args.mlflow_tracking_uri is None:
-            print(
+            print_with_rank(
                 "Warning: MLflow tracking URI not set. Defaulting to local './mlruns'."
             )
 

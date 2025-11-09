@@ -3,7 +3,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from specforge.utils import print_with_rank
+from specforge.utils import print_on_rank0, print_with_rank
 
 _DEVICE_MESH = None
 _TARGET_TP_DEVICE_MESH = None
@@ -115,8 +115,8 @@ def init_distributed(
     draft_device_mesh = dist.device_mesh.init_device_mesh(
         "cuda", (draft_dp_size, draft_tp_size), mesh_dim_names=["draft_dp", "draft_tp"]
     )
-    print_with_rank(f"target device mesh: {target_device_mesh}")
-    print_with_rank(f"draft device mesh: {draft_device_mesh}")
+    print_on_rank0(f"target device mesh: {target_device_mesh}")
+    print_on_rank0(f"draft device mesh: {draft_device_mesh}")
     global _TARGET_TP_GROUP, _TARGET_DP_GROUP, _DRAFT_TP_GROUP, _DRAFT_DP_GROUP, _TARGET_TP_DEVICE_MESH
     _TARGET_TP_GROUP = target_device_mesh.get_group("target_tp")
     _TARGET_DP_GROUP = target_device_mesh.get_group("target_dp")

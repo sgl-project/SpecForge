@@ -166,7 +166,7 @@ def save_draft_model_config(config_dict: dict, output_path: str):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-    print(f"Draft model config saved to: {output_path}")
+    print_with_rank(f"Draft model config saved to: {output_path}")
 
 
 def create_draft_config_from_target(
