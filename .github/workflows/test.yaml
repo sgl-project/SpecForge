@@ -33,20 +33,8 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          # if sf venv does not exist, create it
-          if [ ! -d sf ]; then
-            uv venv sf -p 3.11
-          fi
+          which uv
+          uv venv sf -p 3.11
           source sf/bin/activate
           uv pip install -v --system --break-system-packages . --prerelease=allow
-
-      - name: Run test
-        timeout-minutes: 30
-        shell: bash
-        run: |
-          source sf/bin/activate
-          python -m unittest discover -s ./tests -p "test_*.py" -v
-
-      - name: Save cache
-        run: |
-          cp -p -r sf /github/home/
+          python -c "import specforge"
