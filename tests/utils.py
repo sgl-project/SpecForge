@@ -9,6 +9,7 @@ def norm_tensor(shape, device, dtype, std=0.02):
     torch.nn.init.trunc_normal_(t, mean=0.0, std=std)
     return t
 
+
 def is_port_in_use(port: int) -> bool:
     """Check if a port is in use"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

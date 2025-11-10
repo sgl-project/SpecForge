@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 from transformers.cache_utils import DynamicCache
 
 from specforge.utils import padding
+
 from .draft import Eagle3DraftModel
 from .loss import LogSoftmaxLoss
 
@@ -196,18 +197,18 @@ class OnlineEagle3Model(Eagle3Model):
         return plosses, vlosses, acces
 
 
-class TargetHead(nn.Module):
-    def __init__(self, config: PretrainedConfig):
-        super().__init__()
-        self.fc = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+# class TargetHead(nn.Module):
+#     def __init__(self, config: PretrainedConfig):
+#         super().__init__()
+#         self.fc = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def freeze_parameters(self):
-        for param in self.fc.parameters():
-            param.requires_grad = False
+#     def freeze_parameters(self):
+#         for param in self.fc.parameters():
+#             param.requires_grad = False
 
-    def forward(self, hidden_states):
-        return self.fc(hidden_states)
-    
+#     def forward(self, hidden_states):
+#         return self.fc(hidden_states)
+
 
 class OfflineEagle3Model(OnlineEagle3Model):
     """
@@ -232,13 +233,12 @@ class OfflineEagle3Model(OnlineEagle3Model):
             length=length,
             attention_backend=attention_backend,
         )
-        self.target_head = (
-            TargetHead(draft_model.config)
-            .eval()
-            .to(draft_model.device)
-            .to(draft_model.dtype)
-        )
-
+        # self.target_head = (
+        #     TargetHead(draft_model.config)
+        #     .eval()
+        #     .to(draft_model.device)
+        #     .to(draft_model.dtype)
+        # )
 
     def forward(
         self,
@@ -268,7 +268,6 @@ class OfflineEagle3Model(OnlineEagle3Model):
             vlosses: List of validation losses (not used in this implementation).
             acces: List of accuracies for each TTT step.
         """
-        target = self.target_head(target) # [B, S, H] -> [B, S, V]
         return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,

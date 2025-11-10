@@ -4,7 +4,8 @@ import unittest
 import torch
 from transformers import AutoTokenizer
 
-from specforge.data import preprocess_conversations, TEMPLATE_REGISTRY
+from specforge.data import TEMPLATE_REGISTRY
+from specforge.data.preprocessing import preprocess_conversations
 
 
 # Utility function for visual debugging

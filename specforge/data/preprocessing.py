@@ -104,7 +104,9 @@ def _apply_loss_mask_from_chat_template(
             loss_mask[idx] = 1
 
     if matches_found == 0:
-        print_with_rank("WARNING: No assistant response spans found in the conversation text.")
+        print_with_rank(
+            "WARNING: No assistant response spans found in the conversation text."
+        )
 
     return loss_mask
 
@@ -467,7 +469,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         try:
             data = self._open_file(index)
         except Exception as e:
-            print_with_rank(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
+            print_with_rank(
+                f"ERROR Failed to load {self.datapaths[index]} with error {e}"
+            )
             data = self._open_file(0)
         return self.process_data(data, self.max_len, self.transform)
 
@@ -513,7 +517,9 @@ def generate_vocab_mapping_file(
     vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")
 
     if os.path.exists(vocab_mapping_path):
-        print_on_rank0(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
+        print_on_rank0(
+            f"Loading vocab mapping from the cached file at: {vocab_mapping_path}"
+        )
         return vocab_mapping_path
 
     # we first count the frequency of effectiev tokens in the dataset
@@ -567,7 +573,9 @@ def process_token_dict_to_mappings(
             token_dict[token] = 0
             if len(token_dict) >= draft_vocab_size:
                 break
-    print_on_rank0(f"Added missing tokens to reach draft vocab size: {draft_vocab_size}")
+    print_on_rank0(
+        f"Added missing tokens to reach draft vocab size: {draft_vocab_size}"
+    )
     print_on_rank0(f"Total tokens after addition: {len(token_dict)}")
     total_frequency = sum(token_dict.values())
     top_N = token_dict.most_common(draft_vocab_size)

@@ -1,9 +1,10 @@
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional
 from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
 
 

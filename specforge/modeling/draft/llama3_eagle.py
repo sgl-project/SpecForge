@@ -10,14 +10,14 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.utils import print_on_rank0
+
+from .base import Eagle3DraftModel
 from .flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.utils import print_on_rank0
-
-from .base import Eagle3DraftModel
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask

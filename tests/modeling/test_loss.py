@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 
 from specforge.modeling.loss import LogSoftmaxLoss, _compute_loss
-
 from tests.utils import norm_tensor
 
 

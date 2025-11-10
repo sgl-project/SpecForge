@@ -34,6 +34,7 @@ from transformers import PretrainedConfig
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
+
 @torch.no_grad()
 def load_param_from_target_model(
     target_model_path: str, param_key: str, param: nn.Parameter

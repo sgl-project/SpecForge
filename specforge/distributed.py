@@ -85,7 +85,7 @@ def get_target_tp_device_mesh():
 
 
 def init_distributed(
-    timeout: int = 10, target_tp_size: int = 1, draft_tp_size: int = 1
+    timeout: int = 10, target_tp_size: int = 1, draft_tp_size: int = 1, tp_size: int = 1
 ):
     """Initialize distributed training.
 
@@ -93,6 +93,11 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
+    if tp_size > 1:
+        print_on_rank0(
+            f"WARNING: tp_size > 1 is deprecated, ignoring its value and using target_tp_size and draft_tp_size instead."
+        )
+        target_tp_size = tp_size
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
     local_rank = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
@@ -153,8 +158,11 @@ def gather_tensor(
     gather_tensor = torch.cat(obj_list, dim=dim)
     return gather_tensor
 
+
+# deprecated
 def get_tp_group():
     return get_target_tp_group()
+
 
 def is_tp_rank_0():
     """Return True if current process is rank 0 in its TP group."""
