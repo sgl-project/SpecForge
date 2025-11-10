@@ -228,3 +228,20 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
         # Barrier to ensure all processes wait until saving is complete.
         dist.barrier(group=tp_group)
+
+    def sync_state_dict_across_tp(self) -> None:
+        """
+        Sync the state dict of the draft model across tp ranks.
+        """
+        tp_group = get_draft_tp_group()
+        tp_size = get_draft_tp_size()
+        if tp_size <= 1:
+            return
+        for name, param in sorted(self.named_parameters()):
+            if hasattr(param, "allreduce") and param.allreduce:
+                pass
+            else:
+                print_with_rank(
+                    f"Aligning {name} with shape {param.shape} in draft tp group"
+                )
+                dist.all_reduce(param, group=tp_group)

@@ -75,6 +75,7 @@ class RowParallelLinear(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(self.out_features, self.in_features_per_shard, **factory_kwargs)
         )
+        self.weight.allreduce = True
         if bias:
             self.bias = nn.Parameter(torch.empty(self.out_features, **factory_kwargs))
         else:
@@ -149,6 +150,7 @@ class ColumnParallelLinear(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(self.out_features_per_shard, self.in_features, **factory_kwargs)
         )
+        self.weight.allreduce = True
         if bias:
             self.bias = nn.Parameter(
                 torch.empty(self.out_features_per_shard, **factory_kwargs)

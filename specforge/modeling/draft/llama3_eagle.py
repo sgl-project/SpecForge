@@ -459,7 +459,7 @@ class LlamaAttention(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         if not torch.distributed.is_initialized():
-            print_with_rank(
+            print_on_rank0(
                 "No distributed process group initialized, using single GPU mode"
             )
             self.tp_group = None

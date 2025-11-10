@@ -668,6 +668,7 @@ class Eagle3Trainer:
                 attention_backend=args.draft_attention_backend,
                 torch_dtype=param_dtype,
             ).cuda()
+            draft_model.sync_state_dict_across_tp()
         load_param_from_target_model(
             target_model_path=args.target_model_path,
             param_key=args.embedding_key,
