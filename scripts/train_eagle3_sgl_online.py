@@ -280,6 +280,11 @@ class SglOnlineEagle3Trainer:
         self.draft_model_config = AutoDraftModelConfig.from_file(
             self.args.draft_model_config
         )
+        if self.draft_model_config.draft_vocab_size is None:
+            self.draft_model_config.draft_vocab_size = (
+                self.draft_model_config.vocab_size
+            )
+
         self.draft_model_last_checkpoint = None
         if args.resume and os.path.isdir(args.output_dir):
             print_on_rank0(args.output_dir)

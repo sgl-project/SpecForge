@@ -241,6 +241,9 @@ def main():
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
+    if draft_model_config.draft_vocab_size is None:
+        draft_model_config.draft_vocab_size = draft_model_config.vocab_size
+
     if draft_model_last_checkpoint:
         draft_model = (
             AutoEagle3DraftModel.from_pretrained(

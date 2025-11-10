@@ -313,6 +313,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
+    if draft_model_config.draft_vocab_size is None:
+        draft_model_config.draft_vocab_size = draft_model_config.vocab_size
+
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
     if args.resume and os.path.isdir(args.output_dir):
