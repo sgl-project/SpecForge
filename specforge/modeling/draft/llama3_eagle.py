@@ -204,7 +204,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
                 orig_max_position,
             ]
         ):
-            print(
+            print_with_rank(
                 f"Using Llama3 style rotary embedding with scaling_factor={scaling_factor}, low_freq_factor={low_freq_factor}, high_freq_factor={high_freq_factor}, orig_max_position={orig_max_position}"
             )
             self.scaling_factor = scaling_factor
