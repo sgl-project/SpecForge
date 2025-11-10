@@ -1,11 +1,11 @@
 import logging
-import os
-from datetime import timedelta
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 import sglang.srt.distributed.parallel_state as parallel_state
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import init_model_parallel_group
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -14,12 +14,59 @@ from sglang.srt.layers.dp_attention import (
     compute_dp_attention_local_info,
     compute_dp_attention_world_info,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 from specforge.distributed import get_tp_group as get_specforge_tp_group
+from specforge.utils import print_with_rank
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReplacedLogitsProcessorEagle3Output:
+    """
+    A dataclass to store the logits and aux hidden states needed for EAGLE3.
+    """
+
+    hidden_states: torch.Tensor
+    aux_hidden_states: torch.Tensor
+
+
+class LogitsProcessorForEAGLE3(torch.nn.Module):
+    def __init__(
+        self, logits_processor: LogitsProcessor, return_full_logits: bool = False
+    ):
+        super().__init__()
+        self.logits_processor = logits_processor
+        self.return_full_logits = return_full_logits
+
+    def forward(
+        self,
+        input_ids,
+        hidden_states,
+        lm_head,
+        logits_metadata,
+        aux_hidden_states: Optional[List[torch.Tensor]] = None,
+    ) -> LogitsProcessorOutput:
+        logits_metadata.forward_mode = ForwardMode.DECODE
+        return ReplacedLogitsProcessorEagle3Output(
+            hidden_states=hidden_states,
+            aux_hidden_states=torch.cat(aux_hidden_states, dim=-1),
+        )
+
+
+def wrap_eagle3_logits_processors_in_module(module: nn.Module):
+    """
+    This function will wrap the SGLang's original logits processor with the modified one for EAGLE3.
+    """
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, LogitsProcessor):
+            wrapped = LogitsProcessorForEAGLE3(submodule)
+            setattr(module, name, wrapped)
+            print_with_rank(f"wrapped {name} with LogitsProcessorForEAGLE3")
 
 
 def init_distributed_environment(
@@ -135,7 +182,6 @@ def initialize_model_parallel(
         torch_compile=torch_compile,
     )
 
-    parallel_state._MOE_TP = parallel_state._TP
     if duplicate_tp_group:
         assert (
             parallel_state._PDMUX_PREFILL_TP_GROUP is None
@@ -267,7 +313,6 @@ def initialize_dp_attention(
         use_npu_communicator=False,
         group_name="attention_tp",
     )
-    # print(f"{parallel_state._ATTN_TP_GROUP=}")
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

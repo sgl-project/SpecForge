@@ -10,9 +10,12 @@ from accelerate.utils import set_seed
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from specforge import AutoDraftModelConfig
-from specforge.data import build_eagle3_dataset, generate_vocab_mapping_file
-from specforge.data.template import TEMPLATE_REGISTRY
+from specforge.data import (
+    TEMPLATE_REGISTRY,
+    build_eagle3_dataset,
+    generate_vocab_mapping_file,
+)
+from specforge.modeling.draft import AutoDraftModelConfig
 
 
 def parse_args():

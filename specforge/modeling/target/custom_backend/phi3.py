@@ -46,7 +46,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
 from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.layers import ColumnParallelLinear, RowParallelLinear
 
 
 class Phi3MLP(nn.Module):

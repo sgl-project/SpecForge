@@ -3,7 +3,6 @@ import logging
 import os
 import re
 from contextlib import contextmanager
-from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -57,7 +56,10 @@ def print_with_rank(message):
 
 
 def print_on_rank0(message):
-    if dist.get_rank() == 0:
+    if dist.is_available() and dist.is_initialized():
+        if dist.get_rank() == 0:
+            logger.info(message)
+    else:
         logger.info(message)
 
 
@@ -167,7 +169,7 @@ def save_draft_model_config(config_dict: dict, output_path: str):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-    print(f"Draft model config saved to: {output_path}")
+    print_with_rank(f"Draft model config saved to: {output_path}")
 
 
 def create_draft_config_from_target(

@@ -24,6 +24,7 @@ class VocabParallelEmbedding(nn.Module):
         sparse: bool = False,
         device=None,
         dtype=None,
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -47,7 +48,7 @@ class VocabParallelEmbedding(nn.Module):
                 padding_idx = self.num_embeddings + padding_idx
 
         # tp-realted
-        self.tp_group = get_tp_group()
+        self.tp_group = tp_group if tp_group is not None else get_tp_group()
         self.tp_rank = dist.get_rank(self.tp_group)
         self.tp_size = dist.get_world_size(self.tp_group)
 

@@ -18,3 +18,5 @@ sphinxcontrib-mermaid
 urllib3<2.0.0
 gguf>=0.10.0
 sphinx-autobuild
+rich
+matplotlib

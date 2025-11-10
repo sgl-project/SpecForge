@@ -43,7 +43,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 
 from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.layers import ColumnParallelLinear, RowParallelLinear
 
 logger = logging.get_logger(__name__)
 

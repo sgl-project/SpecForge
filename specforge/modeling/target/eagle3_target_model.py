@@ -1,10 +1,9 @@
+import argparse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -17,19 +16,49 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
-from specforge.distributed import get_tp_device_mesh, get_tp_group
+from specforge.distributed import (
+    get_draft_tp_size,
+    get_target_tp_device_mesh,
+    get_target_tp_group,
+    get_target_tp_rank,
+    get_target_tp_size,
+)
 from specforge.utils import padding
 
-from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
+from .sglang_backend import SGLangRunner
+
+
+def get_draft_data_shard_from_target(
+    tensor: Union[torch.Tensor, List[torch.Tensor]]
+) -> torch.Tensor:
+    """
+    Get the data shard from the tensor.
+    """
+    target_tp_size = get_target_tp_size()
+    target_tp_rank = get_target_tp_rank()
+    draft_tp_size = get_draft_tp_size()
+    if target_tp_size <= draft_tp_size:
+        return tensor
+
+    tensor_length = len(tensor) if isinstance(tensor, List) else tensor.shape[0]
+    assert (
+        tensor_length % target_tp_size == 0
+    ), "Tensor length must be divisible by target_tp_size"
+    chunk_size = tensor_length // (target_tp_size // draft_tp_size)
+    return tensor[
+        (target_tp_rank // draft_tp_size)
+        * chunk_size : (target_tp_rank // draft_tp_size + 1)
+        * chunk_size
+    ]
 
 
 @dataclass
 class Eagle3TargetOutput:
-    hidden_states: torch.Tensor
-    target: torch.Tensor
-    loss_mask: torch.Tensor
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
+    hidden_states: torch.Tensor  # [B, S, H*3]
+    target: torch.Tensor  # [B, S, H]
+    loss_mask: torch.Tensor  # [B, S, 1]
+    input_ids: torch.Tensor  # [B, S]
+    attention_mask: torch.Tensor  # [B, S]
 
 
 class Eagle3TargetModel(ABC):
@@ -64,7 +93,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Eagle3TargetOutput:
+    ) -> List[Eagle3TargetOutput]:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -95,13 +124,15 @@ class Eagle3TargetModel(ABC):
         loss_mask = loss_mask[..., None]
         loss_mask = loss_mask.to(target.device)
 
-        return Eagle3TargetOutput(
-            hidden_states=hidden_states,
-            target=target,
-            loss_mask=loss_mask,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        return [
+            Eagle3TargetOutput(
+                hidden_states=get_draft_data_shard_from_target(hidden_states),
+                target=get_draft_data_shard_from_target(target),
+                loss_mask=get_draft_data_shard_from_target(loss_mask),
+                input_ids=get_draft_data_shard_from_target(input_ids),
+                attention_mask=get_draft_data_shard_from_target(attention_mask),
+            )
+        ]
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -145,13 +176,13 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         """
         Initialize the HuggingFace target model backend from a pretrained model path.
         """
-        tp_size = get_tp_group().size()
+        tp_size = get_target_tp_group().size()
 
         if tp_size > 1:
             device_kwargs = {
                 "tp_plan": "auto",
                 "tp_size": tp_size,
-                "device_mesh": get_tp_device_mesh(),
+                "device_mesh": get_target_tp_device_mesh(),
             }
         else:
             device_kwargs = {
@@ -170,9 +201,10 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
 class SGLangEagle3TargetModel(Eagle3TargetModel):
 
-    def __init__(self, model_runner: SGLangRunner):
+    def __init__(self, model_runner: SGLangRunner, target_micro_batch_size: Optional[int]):
         super().__init__()
         self.model_runner = model_runner
+        self.target_micro_batch_size = target_micro_batch_size
 
     @classmethod
     def from_pretrained(
@@ -184,7 +216,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
-        tp_size = dist.get_world_size(get_tp_group())
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
@@ -192,16 +223,18 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             enable_return_hidden_states=True,
             disable_cuda_graph=True,
             enable_torch_compile=True,
-            tp_size=tp_size,
+            tp_size=get_target_tp_size(),
             pp_size=1,
             attention_backend="torch_native",
         )
+        target_micro_batch_size = None
+        server_args.enable_return_hidden_states = True
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=0.4,
             gpu_id=torch.cuda.current_device(),
-            tp_rank=dist.get_rank(get_tp_group()),
+            tp_rank=get_target_tp_rank(),
             tp_size=server_args.tp_size,
             moe_ep_rank=0,
             moe_ep_size=1,
@@ -210,10 +243,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             server_args=server_args,
             nccl_port=None,
         )
-        wrap_eagle3_logits_processors_in_module(
-            model_runner.model, return_full_logits=False
-        )
-        return cls(model_runner)
+        return cls(model_runner, target_micro_batch_size)
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -246,7 +276,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         aux_hidden_states_list = None
         input_lens = [len(req.origin_input_ids) for req in reqs]
-        logits = torch.split(logits_output.logits, input_lens, dim=0)
+        hidden_states = torch.split(logits_output.hidden_states, input_lens, dim=0)
         if capture_aux_hidden_states:
             aux_hidden_states_list = torch.split(
                 logits_output.aux_hidden_states, input_lens, dim=0
@@ -254,10 +284,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             aux_hidden_states_list = None
 
-        # TODO: can we not clear?
-        self.model_runner.req_to_token_pool.clear()
-        self.model_runner.token_to_kv_pool_allocator.clear()
-        return logits, aux_hidden_states_list
+        # self.model_runner.req_to_token_pool.clear()
+        # self.model_runner.token_to_kv_pool_allocator.clear()
+        return hidden_states, aux_hidden_states_list
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
         if require_mlp_sync(self.model_runner.server_args):
@@ -283,8 +312,12 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Eagle3TargetOutput:
+    ) -> List[Eagle3TargetOutput]:
         """
+        args:
+            input_ids: (batch_size, seq_len)
+            attention_mask: (batch_size, seq_len)
+            loss_mask: (batch_size, seq_len)
         return:
             data_for_draft: List[Dict[str, torch.Tensor]] of draft_batch_size, draft_micro_batch_size = 1
                 - input_ids: (1, seq_len)
@@ -296,6 +329,42 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
         data_for_draft = []
+        target_micro_batch_size = self.target_micro_batch_size if self.target_micro_batch_size is not None else input_ids.shape[0]
+        padding_len = (
+            target_micro_batch_size
+            - input_ids.shape[0] // target_micro_batch_size * target_micro_batch_size
+        )
+        if padding_len > 0:
+            input_ids = torch.cat(
+                [
+                    input_ids,
+                    torch.zeros(
+                        (padding_len, *input_ids.shape[1:]),
+                        device=input_ids.device,
+                        dtype=input_ids.dtype,
+                    ),
+                ]
+            )
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.zeros(
+                        (padding_len, *attention_mask.shape[1:]),
+                        device=attention_mask.device,
+                        dtype=attention_mask.dtype,
+                    ),
+                ]
+            )
+            loss_mask = torch.cat(
+                [
+                    loss_mask,
+                    torch.zeros(
+                        (padding_len, *loss_mask.shape[1:]),
+                        device=loss_mask.device,
+                        dtype=loss_mask.dtype,
+                    ),
+                ]
+            )
         for idx, (input_id_, attention_mask_, loss_mask_) in enumerate(
             zip(
                 input_ids.unsqueeze(1),
@@ -314,40 +383,31 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             req.logprob_start_len = len(req.origin_input_ids) - 1
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
-
-        logits_list, aux_hidden_states_list = self.extend(
-            reqs, capture_aux_hidden_states=True
-        )
-
-        aux_hidden_states_out = []
-        target_out = []
-        loss_mask_out = []
-        input_ids_out = []
-
-        for idx, (data, logits, aux_hidden_states) in enumerate(
-            zip(data_cache, logits_list, aux_hidden_states_list)
-        ):
-            aux_hidden_states_out.append(aux_hidden_states.unsqueeze(0))
-            target_out.append(logits.unsqueeze(0))
-            loss_mask_out.append(data[2])
-            input_ids_out.append(data[0])
-
-        aux_hidden_states_out = torch.cat(aux_hidden_states_out, dim=0)
-        target_out = torch.cat(target_out, dim=0)
-        loss_mask_out = torch.cat(loss_mask_out, dim=0)
-        input_ids_out = torch.cat(input_ids_out, dim=0)
-
-        target_out = padding(target_out, left=False)
-        input_ids_out = padding(input_ids_out, left=False)
-        loss_mask_out = loss_mask_out[..., None]
-
-        return Eagle3TargetOutput(
-            hidden_states=aux_hidden_states_out,
-            target=target_out,
-            loss_mask=loss_mask_out,
-            input_ids=input_ids_out,
-            attention_mask=attention_mask,
-        )
+            if len(reqs) == target_micro_batch_size:
+                hidden_states_list, aux_hidden_states_list = self.extend(
+                    reqs, capture_aux_hidden_states=True
+                )
+                hidden_states_list = get_draft_data_shard_from_target(
+                    list(hidden_states_list)
+                )
+                aux_hidden_states_list = get_draft_data_shard_from_target(
+                    list(aux_hidden_states_list)
+                )
+                data_cache = get_draft_data_shard_from_target(list(data_cache))
+                for data, hidden_states, aux_hidden_states in zip(
+                    data_cache, hidden_states_list, aux_hidden_states_list
+                ):
+                    data_for_draft.append(
+                        Eagle3TargetOutput(
+                            hidden_states=aux_hidden_states.unsqueeze(0),
+                            target=padding(hidden_states.unsqueeze(0), left=False),
+                            loss_mask=data[2].unsqueeze(-1),
+                            input_ids=padding(data[0], left=False),
+                            attention_mask=data[1],
+                        )
+                    )
+                reqs, data_cache = [], []
+        return data_for_draft
 
 
 class CustomEagle3TargetModel(Eagle3TargetModel):
@@ -365,7 +425,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         cache_dir: Optional[str] = None,
         **kwargs,
     ) -> "CustomEagle3TargetModel":
-        from specforge.modeling.auto import AutoDistributedTargetModel
+        from specforge.modeling.target import AutoDistributedTargetModel
 
         target_model = AutoDistributedTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,

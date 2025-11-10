@@ -29,6 +29,7 @@ try:
 except ImportError:
     mlflow = None
 
+from specforge.utils import print_with_rank
 
 # --- End Lazy Imports ---
 
@@ -50,7 +51,7 @@ class Tracker(abc.ABC):
 
     @classmethod
     @abc.abstractmethod
-    def validate_args(cls, parser, args) -> None:
+    def validate_args(cls, args) -> None:
         """
         Validate necessary arguments for this tracker.
         This method is called during argument parsing.
@@ -77,7 +78,7 @@ class NoOpTracker(Tracker):
     """A tracker that does nothing, for when no tracking is desired."""
 
     @classmethod
-    def validate_args(cls, parser, args):
+    def validate_args(cls, args):
         pass  # No arguments to validate
 
     def __init__(self, args, output_dir: str):
@@ -95,9 +96,9 @@ class WandbTracker(Tracker):
     """Tracks experiments using Weights & Biases."""
 
     @classmethod
-    def validate_args(cls, parser, args):
+    def validate_args(cls, args):
         if wandb is None:
-            parser.error(
+            raise ValueError(
                 "To use --report-to wandb, you must install wandb: 'pip install wandb'"
             )
 
@@ -121,7 +122,7 @@ class WandbTracker(Tracker):
             pass
 
         if args.wandb_key is None:
-            parser.error(
+            raise ValueError(
                 "When --report-to is 'wandb', you must provide a wandb API key via one of:\n"
                 "  1. --wandb-key argument\n"
                 "  2. WANDB_API_KEY environment variable\n"
@@ -151,9 +152,9 @@ class SwanlabTracker(Tracker):
     """Tracks experiments using SwanLab."""
 
     @classmethod
-    def validate_args(cls, parser, args):
+    def validate_args(cls, args):
         if swanlab is None:
-            parser.error(
+            raise ValueError(
                 "To use --report-to swanlab, you must install swanlab: 'pip install swanlab'"
             )
 
@@ -169,7 +170,7 @@ class SwanlabTracker(Tracker):
             and dist.get_world_size() > 1
             and args.swanlab_key is None
         ):
-            parser.error(
+            raise ValueError(
                 "In a distributed environment, when --report-to is 'swanlab', you must provide a swanlab API key via:\n"
                 "  1. --swanlab-key argument\n"
                 "  2. SWANLAB_API_KEY environment variable"
@@ -205,9 +206,9 @@ class TensorboardTracker(Tracker):
     """Tracks experiments using TensorBoard."""
 
     @classmethod
-    def validate_args(cls, parser, args):
+    def validate_args(cls, args):
         if SummaryWriter is None:
-            parser.error(
+            raise ValueError(
                 "To use --report-to tensorboard, you must have tensorboard installed: 'pip install tensorboard'"
             )
 
@@ -234,16 +235,16 @@ class MLflowTracker(Tracker):
     """Tracks experiments using MLflow."""
 
     @classmethod
-    def validate_args(cls, parser, args):
+    def validate_args(cls, args):
         if mlflow is None:
-            parser.error(
+            raise ValueError(
                 "To use --report-to mlflow, you must install mlflow: 'pip install mlflow'"
             )
         # Set tracking URI from environment variable if not explicitly provided
         if args.mlflow_tracking_uri is None and "MLFLOW_TRACKING_URI" in os.environ:
             args.mlflow_tracking_uri = os.environ["MLFLOW_TRACKING_URI"]
         elif args.mlflow_tracking_uri is None:
-            print(
+            print_with_rank(
                 "Warning: MLflow tracking URI not set. Defaulting to local './mlruns'."
             )
 
@@ -292,9 +293,10 @@ def get_tracker_class(report_to: str) -> Optional[Tracker]:
     return TRACKER_REGISTRY.get(report_to)
 
 
-def create_tracker(args, output_dir: str) -> Tracker:
+def build_tracker(args, output_dir: str) -> Tracker:
     """Factory function to create an experiment tracker instance."""
     tracker_class = get_tracker_class(args.report_to)
     if not tracker_class:
         raise ValueError(f"Unsupported report_to type: {args.report_to}")
+    tracker_class.validate_args(args)
     return tracker_class(args, output_dir)

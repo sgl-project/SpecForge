@@ -49,7 +49,7 @@ However, if your model is too large and requires tensor parallelism, you can imp
 
 ```python
 from .base import DistributedTargetModel
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.layers import ColumnParallelLinear, RowParallelLinear
 
 
 class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin, DistributedTargetModel):

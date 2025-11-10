@@ -3,6 +3,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import Optional
 from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
 
 
@@ -16,11 +17,12 @@ class RowParallelLinear(nn.Module):
         dtype=None,
         kv_head_replicas=False,
         layout_type: str = "normal",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
-        self.tp_group = get_tp_group()
+        self.tp_group = tp_group if tp_group is not None else get_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
 
@@ -81,11 +83,12 @@ class ColumnParallelLinear(nn.Module):
         dtype=None,
         kv_head_replicas=False,
         layout_type: str = "normal",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
-        self.tp_group = get_tp_group()
+        self.tp_group = tp_group if tp_group is not None else get_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
 

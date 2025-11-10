@@ -5,17 +5,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
+from transformers import LlamaConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from specforge.modeling.draft.flex_attention import (
+from .flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.utils import print_with_rank
+from specforge.utils import print_on_rank0
 
 from .base import Eagle3DraftModel
 
@@ -779,35 +779,10 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+        gate_output = self.gate_proj(x)
+        up_output = self.up_proj(x)
 
-            gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.down_proj(self.act_fn(gate_output) * up_output)
 
         return down_proj
 
@@ -838,7 +813,7 @@ class LlamaDecoderLayer(nn.Module):
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
         elif attention_backend == "flex_attention":
-            print_with_rank("Using flex attention on draft model training!")
+            print_on_rank0("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
@@ -960,10 +935,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            print_with_rank("using ttt_length 1, no need to cache hidden states")
+            print_on_rank0("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
+            print_on_rank0(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()

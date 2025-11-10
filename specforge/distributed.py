@@ -3,23 +3,75 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from specforge.utils import print_with_rank
+from specforge.utils import print_on_rank0, print_with_rank
 
 _DEVICE_MESH = None
-_TP_DEVICE_MESH = None
-_TP_GROUP = None
-_DP_DEVICE_MESH = None
-_DP_GROUP = None
+_TARGET_TP_DEVICE_MESH = None
+_DRAFT_DP_DEVICE_MESH = None
+_TARGET_TP_GROUP = None
+_TARGET_DP_GROUP = None
+_DRAFT_TP_GROUP = None
+_DRAFT_DP_GROUP = None
 
 
-def get_tp_group():
-    global _TP_GROUP
-    return _TP_GROUP
+def get_target_tp_group():
+    global _TARGET_TP_GROUP
+    return _TARGET_TP_GROUP
 
 
-def get_dp_group():
-    global _DP_GROUP
-    return _DP_GROUP
+def get_target_tp_size():
+    global _TARGET_TP_GROUP
+    return dist.get_world_size(_TARGET_TP_GROUP)
+
+
+def get_target_tp_rank():
+    global _TARGET_TP_GROUP
+    return dist.get_rank(_TARGET_TP_GROUP)
+
+
+def get_target_dp_group():
+    global _TARGET_DP_GROUP
+    return _TARGET_DP_GROUP
+
+
+def get_target_dp_size():
+    global _TARGET_DP_GROUP
+    return dist.get_world_size(_TARGET_DP_GROUP)
+
+
+def get_target_dp_rank():
+    global _TARGET_DP_GROUP
+    return dist.get_rank(_TARGET_DP_GROUP)
+
+
+def get_draft_tp_group():
+    global _DRAFT_TP_GROUP
+    return _DRAFT_TP_GROUP
+
+
+def get_draft_tp_size():
+    global _DRAFT_TP_GROUP
+    return dist.get_world_size(_DRAFT_TP_GROUP)
+
+
+def get_draft_tp_rank():
+    global _DRAFT_TP_GROUP
+    return dist.get_rank(_DRAFT_TP_GROUP)
+
+
+def get_draft_dp_group():
+    global _DRAFT_DP_GROUP
+    return _DRAFT_DP_GROUP
+
+
+def get_draft_dp_size():
+    global _DRAFT_DP_GROUP
+    return dist.get_world_size(_DRAFT_DP_GROUP)
+
+
+def get_draft_dp_rank():
+    global _DRAFT_DP_GROUP
+    return dist.get_rank(_DRAFT_DP_GROUP)
 
 
 def get_device_mesh():
@@ -27,17 +79,14 @@ def get_device_mesh():
     return _DEVICE_MESH
 
 
-def get_tp_device_mesh():
-    global _TP_DEVICE_MESH
-    return _TP_DEVICE_MESH
+def get_target_tp_device_mesh():
+    global _TARGET_TP_DEVICE_MESH
+    return _TARGET_TP_DEVICE_MESH
 
 
-def get_dp_device_mesh():
-    global _DP_DEVICE_MESH
-    return _DP_DEVICE_MESH
-
-
-def init_distributed(timeout: int = 10, tp_size: int = 1):
+def init_distributed(
+    timeout: int = 10, target_tp_size: int = 1, draft_tp_size: int = 1
+):
     """Initialize distributed training.
 
     Args:
@@ -50,29 +99,40 @@ def init_distributed(timeout: int = 10, tp_size: int = 1):
     print_with_rank(f"bind to device {local_rank}")
 
     world_size = dist.get_world_size()
-    dp_size = world_size // tp_size
-    assert world_size == tp_size * dp_size, "world size must be divisible by tp size"
-    device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (dp_size, tp_size), mesh_dim_names=["dp", "tp"]
+    target_dp_size = world_size // target_tp_size
+    draft_dp_size = world_size // draft_tp_size
+    assert (
+        world_size == target_tp_size * target_dp_size
+    ), "world size must be divisible by target tp size"
+    assert (
+        world_size == draft_tp_size * draft_dp_size
+    ), "world size must be divisible by draft tp size"
+    target_device_mesh = dist.device_mesh.init_device_mesh(
+        "cuda",
+        (target_dp_size, target_tp_size),
+        mesh_dim_names=["target_dp", "target_tp"],
     )
-    print_with_rank(f"device mesh: {device_mesh}")
-    tp_group = device_mesh.get_group("tp")
-    dp_group = device_mesh.get_group("dp")
-
-    # we need to create a 1D submesh
-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH
-    _DEVICE_MESH = device_mesh
-    _TP_GROUP = tp_group
-    _TP_DEVICE_MESH = tp_device_mesh
-    _DP_GROUP = dp_group
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
+    draft_device_mesh = dist.device_mesh.init_device_mesh(
+        "cuda", (draft_dp_size, draft_tp_size), mesh_dim_names=["draft_dp", "draft_tp"]
+    )
+    print_on_rank0(f"target device mesh: {target_device_mesh}")
+    print_on_rank0(f"draft device mesh: {draft_device_mesh}")
+    global _TARGET_TP_GROUP, _TARGET_DP_GROUP, _DRAFT_TP_GROUP, _DRAFT_DP_GROUP, _TARGET_TP_DEVICE_MESH
+    _TARGET_TP_GROUP = target_device_mesh.get_group("target_tp")
+    _TARGET_DP_GROUP = target_device_mesh.get_group("target_dp")
+    _DRAFT_TP_GROUP = draft_device_mesh.get_group("draft_tp")
+    _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
+    _TARGET_TP_DEVICE_MESH = dist.DeviceMesh.from_group(
+        _TARGET_TP_GROUP, device_type="cuda"
+    )
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
+    global _TARGET_TP_GROUP, _TARGET_DP_GROUP, _DRAFT_TP_GROUP, _DRAFT_DP_GROUP
+    dist.destroy_process_group(_TARGET_TP_GROUP)
+    dist.destroy_process_group(_TARGET_DP_GROUP)
+    dist.destroy_process_group(_DRAFT_TP_GROUP)
+    dist.destroy_process_group(_DRAFT_DP_GROUP)
     dist.destroy_process_group()
 
 
@@ -93,6 +153,8 @@ def gather_tensor(
     gather_tensor = torch.cat(obj_list, dim=dim)
     return gather_tensor
 
+def get_tp_group():
+    return get_target_tp_group()
 
 def is_tp_rank_0():
     """Return True if current process is rank 0 in its TP group."""

@@ -25,12 +25,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import PretrainedConfig
 from transformers.cache_utils import DynamicCache
 
-from specforge.core.loss import LogSoftmaxLoss
-from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
+from .draft import Eagle3DraftModel
+from .loss import LogSoftmaxLoss
 
 
 class Eagle3Model(nn.Module):
@@ -196,6 +196,19 @@ class OnlineEagle3Model(Eagle3Model):
         return plosses, vlosses, acces
 
 
+class TargetHead(nn.Module):
+    def __init__(self, config: PretrainedConfig):
+        super().__init__()
+        self.fc = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def freeze_parameters(self):
+        for param in self.fc.parameters():
+            param.requires_grad = False
+
+    def forward(self, hidden_states):
+        return self.fc(hidden_states)
+    
+
 class OfflineEagle3Model(OnlineEagle3Model):
     """
     In sgl-spec, we implement offline/online training.
@@ -204,8 +217,7 @@ class OfflineEagle3Model(OnlineEagle3Model):
 
     def __init__(
         self,
-        target_head,
-        draft_model,
+        draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
     ):
@@ -220,21 +232,13 @@ class OfflineEagle3Model(OnlineEagle3Model):
             length=length,
             attention_backend=attention_backend,
         )
-        self.target_head = target_head
+        self.target_head = (
+            TargetHead(draft_model.config)
+            .eval()
+            .to(draft_model.device)
+            .to(draft_model.dtype)
+        )
 
-    @torch.no_grad()
-    def _prepare_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        device: Optional[torch.device] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_states = kwargs["hidden_states"]
-        target = kwargs["target"]
-        target = self.target_head(target)
-        return hidden_states, target, loss_mask, input_ids
 
     def forward(
         self,
@@ -264,6 +268,7 @@ class OfflineEagle3Model(OnlineEagle3Model):
             vlosses: List of validation losses (not used in this implementation).
             acces: List of accuracies for each TTT step.
         """
+        target = self.target_head(target) # [B, S, H] -> [B, S, V]
         return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,

@@ -3,6 +3,7 @@ from .preprocessing import (
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
 )
+from .template import TEMPLATE_REGISTRY
 from .utils import prepare_dp_dataloaders
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "build_offline_eagle3_dataset",
     "generate_vocab_mapping_file",
     "prepare_dp_dataloaders",
+    "TEMPLATE_REGISTRY",
 ]

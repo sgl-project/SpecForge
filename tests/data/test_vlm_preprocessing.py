@@ -1,7 +1,6 @@
 from transformers import AutoProcessor
 
-from specforge.data.preprocessing import preprocess_vlm_conversations
-from specforge.data.template import TEMPLATE_REGISTRY
+from specforge.data import preprocess_vlm_conversations, TEMPLATE_REGISTRY
 
 model_path = "Qwen/Qwen2.5-VL-7B-Instruct"
 processor = AutoProcessor.from_pretrained(model_path)

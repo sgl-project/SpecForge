@@ -1,35 +1,14 @@
 import json
 import os
-import warnings
-from typing import Optional, Union
+from typing import Union
 
-import torch
-from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
-from transformers import (
-    GptOssConfig,
-    Llama4Config,
-    Llama4TextConfig,
-    LlamaConfig,
-    Phi3Config,
-    PretrainedConfig,
-    Qwen2_5_VLConfig,
-    Qwen2Config,
-    Qwen3Config,
-    Qwen3MoeConfig,
-    modeling_utils,
-)
+from transformers import LlamaConfig, PretrainedConfig, modeling_utils
 
-from .draft.llama3_eagle import LlamaForCausalLMEagle3
-from .target.custom_backend import (
-    GptOssForCausalLM,
-    Llama4ForCausalLM,
-    LlamaForCausalLM,
-    Phi3ForCausalLM,
-    Qwen2ForCausalLM,
-    Qwen3ForCausalLM,
-    Qwen3MoeForCausalLM,
-)
+from specforge.utils import print_on_rank0
+
+from .base import Eagle3DraftModel
+from .llama3_eagle import LlamaForCausalLMEagle3
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
@@ -39,7 +18,9 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     }
 
     @classmethod
-    def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
+    def from_config(
+        cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs
+    ) -> Eagle3DraftModel:
         """
         This class method takes a configuration object and create its model based on the
         _model_mapping class variable.
@@ -65,7 +46,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         pretrained_model_name_or_path: Union[str, os.PathLike[str]],
         *model_args,
         **kwargs,
-    ):
+    ) -> Eagle3DraftModel:
         original_warn = modeling_utils.logger.warning
 
         def filtered_warning(msg):
@@ -85,52 +66,6 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         return model
 
 
-class AutoDistributedTargetModel(AutoModelForCausalLMBase):
-    # the model mapping is currently hardcoded, we should support lazy model mapping via registry
-    _model_mapping = {
-        Llama4TextConfig: [Llama4ForCausalLM],
-        Qwen3MoeConfig: [Qwen3MoeForCausalLM],
-        Qwen2Config: [Qwen2ForCausalLM],
-        LlamaConfig: [LlamaForCausalLM],
-        Qwen3Config: [Qwen3ForCausalLM],
-        Phi3Config: [Phi3ForCausalLM],
-        GptOssConfig: [GptOssForCausalLM],
-    }
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
-        torch_dtype: torch.dtype = None,
-        device: str = None,
-        cache_dir: Optional[str] = None,
-        **config_kwargs,
-    ):
-        config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path,
-        )
-
-        if isinstance(config, Llama4Config):
-            config = config.text_config
-
-        assert (
-            type(config) in cls._model_mapping
-        ), f"Unsupported config type: {type(config)}"
-        model_cls = cls._model_mapping[type(config)][0]
-        model = model_cls.from_pretrained(
-            pretrained_model_name_or_path,
-            torch_dtype=torch_dtype,
-            cache_dir=cache_dir,
-            **config_kwargs,
-        )
-
-        if device is not None:
-            model = model.to(device)
-        else:
-            model = model.cuda()
-        return model
-
-
 class AutoDraftModelConfig:
 
     _config_mapping = {
@@ -138,7 +73,7 @@ class AutoDraftModelConfig:
     }
 
     @classmethod
-    def from_file(cls, config_path: str):
+    def from_file(cls, config_path: str) -> PretrainedConfig:
         """
         This class method takes a configuration file path and create its configuration object based on the
         _config_mapping class variable.
@@ -153,7 +88,7 @@ class AutoDraftModelConfig:
             config = json.load(f)
 
         if "tie_word_embeddings" in config:
-            print("Set draft model tie_word_embeddings to False")
+            print_on_rank0("Set draft model tie_word_embeddings to False")
             config["tie_word_embeddings"] = False
 
         # check for architectures
