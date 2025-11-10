@@ -32,7 +32,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          ls ~/.local/bin
           # if sf venv does not exist, create it
           if [ ! -d sf ]; then
             uv venv sf -p 3.11

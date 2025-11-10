@@ -4,11 +4,10 @@ FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
 RUN apt-get update \
     && apt-get install -y git curl tmux net-tools vim \
     && bash -c "$(curl -fsSL https://raw.githubusercontent.com/ohmybash/oh-my-bash/master/tools/install.sh)" \
-    && curl -fsSL https://astral.sh/uv/install.sh | sh
+    && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
 
 # # install specforge from source
-RUN . $HOME/.local/bin/env \
-    && uv python install 3.11 \
+RUN uv python install 3.11 \
     && git clone https://github.com/sgl-project/SpecForge.git \
     && cd SpecForge \
     && uv pip install --system --break-system-packages -v -e . --prerelease=allow
