@@ -18,7 +18,7 @@ jobs:
         github.event.pull_request.draft == false
     runs-on: [self-hosted]
     container:
-      image: frankleeeee/specforge:ci
+      image: lmsysorg/sglang:v0.5.5 # we lock to this version to avoid repeated docker pull
       options: --gpus all --shm-size=2g --rm -v /dev/shm
     steps:
       - name: Checkout code
