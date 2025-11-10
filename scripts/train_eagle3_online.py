@@ -26,7 +26,7 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as async_tqdm
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig
 
-from specforge import BF16Optimizer, build_tracker, parse_specforge_args, SpecForgeArgs
+from specforge import BF16Optimizer, SpecForgeArgs, build_tracker, parse_specforge_args
 from specforge.data import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
@@ -122,12 +122,11 @@ class TrainDataLoaderWrapper:
 
 class Eagle3Trainer:
     def __init__(self, args):
-        self.raw_args = args
         if not dist.is_initialized():
             init_distributed(
                 timeout=args.dist_timeout,
-                target_tp_size=self.args.target_tp_size,
-                draft_tp_size=self.args.draft_tp_size,
+                target_tp_size=args.target_tp_size,
+                draft_tp_size=args.draft_tp_size,
             )
         self.trainer_args = SpecForgeArgs.from_cli_args(args)
 
@@ -467,7 +466,7 @@ class Eagle3Trainer:
         with FSDP.state_dict_type(self.eagle3_model, StateDictType.FULL_STATE_DICT):
             model_state_dict = self.eagle3_model.state_dict()
             state_to_save = {
-                "args": self.args,
+                "args": self.trainer_args,
                 "global_batch_idx": self.global_batch_idx,
                 "micro_batch_idx": self.micro_batch_idx,
             }

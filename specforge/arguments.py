@@ -1,6 +1,6 @@
-import os
 import argparse
 import dataclasses
+import os
 from typing import Optional
 
 import torch.distributed as dist
@@ -126,15 +126,11 @@ class SpecForgeArgs:
             type=int,
             default=SpecForgeArgs.draft_micro_batch_size,
         )
-        parser.add_argument(
-            "--num-epochs", type=int, default=SpecForgeArgs.num_epochs
-        )
+        parser.add_argument("--num-epochs", type=int, default=SpecForgeArgs.num_epochs)
         parser.add_argument(
             "--learning-rate", type=float, default=SpecForgeArgs.learning_rate
         )
-        parser.add_argument(
-            "--max-length", type=int, default=SpecForgeArgs.max_length
-        )
+        parser.add_argument("--max-length", type=int, default=SpecForgeArgs.max_length)
         parser.add_argument(
             "--warmup-ratio", type=float, default=SpecForgeArgs.warmup_ratio
         )
@@ -158,9 +154,7 @@ class SpecForgeArgs:
             help="enabled to shard the optimizer state; if enabled we cannot change number of GPUs for resume training",
         )
         # other args
-        parser.add_argument(
-            "--cache-dir", type=str, default=SpecForgeArgs.cache_dir
-        )
+        parser.add_argument("--cache-dir", type=str, default=SpecForgeArgs.cache_dir)
         parser.add_argument(
             "--log-interval", type=int, default=SpecForgeArgs.log_interval
         )
@@ -283,8 +277,12 @@ class SpecForgeArgs:
             args.target_dp_size = world_size // args.target_tp_size
             args.draft_dp_size = world_size // args.draft_tp_size
         else:
-            assert args.target_tp_size == 1, "not distributed training, target_tp_size must be 1"
-            assert args.draft_tp_size == 1, "not distributed training, draft_tp_size must be 1"
+            assert (
+                args.target_tp_size == 1
+            ), "not distributed training, target_tp_size must be 1"
+            assert (
+                args.draft_tp_size == 1
+            ), "not distributed training, draft_tp_size must be 1"
             args.target_dp_size = 1
             args.draft_dp_size = 1
 
@@ -318,6 +316,7 @@ class SpecForgeArgs:
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
+
 
 def parse_specforge_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SpecForge arguments")
