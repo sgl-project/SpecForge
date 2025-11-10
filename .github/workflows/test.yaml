@@ -37,4 +37,5 @@ jobs:
           uv venv sf -p 3.11
           source sf/bin/activate
           uv pip install -v --system --break-system-packages . --prerelease=allow
+          which python
           python -c "import specforge"
