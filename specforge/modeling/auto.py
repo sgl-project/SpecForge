@@ -170,4 +170,8 @@ class AutoDraftModelConfig:
         if architecture not in cls._config_mapping:
             raise ValueError(f"Architecture {architecture} not supported")
 
+        # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
+        if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
+            config["draft_vocab_size"] = config.get("vocab_size", None)
+
         return cls._config_mapping[architecture].from_dict(config)
