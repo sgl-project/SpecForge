@@ -39,7 +39,12 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import OutputRecorder, check_model_inputs
 
 from specforge.distributed import get_tp_group, shard_tensor
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.layers import (
+    ColumnParallelLinear,
+    ParallelLMHead,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 
 class GptOssExperts(nn.Module):
@@ -568,7 +573,7 @@ class GptOssModel(GptOssPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
@@ -753,7 +758,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = GptOssModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -832,7 +837,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(hidden_states[:, slice_indices, :], gather_output=True)
 
         loss = None
         if labels is not None:

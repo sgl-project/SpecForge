@@ -51,8 +51,13 @@ from transformers.utils import (
 )
 
 # [MODIFIED] Import from distributed library
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import get_tp_group
+from specforge.layers import (
+    ColumnParallelLinear,
+    ParallelLMHead,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -279,7 +284,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
@@ -442,9 +447,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
 
         # distributed the lm head
-        self.lm_head = ColumnParallelLinear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -538,8 +541,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = gather_tensor(logits, get_tp_group())
+        logits = self.lm_head(hidden_states[:, slice_indices, :], gather_output=True)
 
         loss = None
         if labels is not None:

@@ -21,6 +21,7 @@ from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
+from .sglang_backend.utils import LogitsProcessorForEAGLE3
 
 
 @dataclass
@@ -30,6 +31,7 @@ class Eagle3TargetOutput:
     loss_mask: torch.Tensor
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
+    last_hidden_states: Optional[torch.Tensor] = None
 
 
 class Eagle3TargetModel(ABC):
@@ -221,7 +223,19 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         self.model_runner.model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
 
     @torch.no_grad
-    def extend(self, reqs, capture_aux_hidden_states: bool = True):
+    def _extend(
+        self,
+        reqs,
+        capture_aux_hidden_states: bool = True,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = False,
+    ):
+        # set the logits processor for the model runner
+        for name, module in self.model_runner.model.named_modules():
+            if isinstance(module, LogitsProcessorForEAGLE3):
+                module.return_last_hidden_states = return_last_hidden_states
+                module.return_logits = return_logits
+
         tree_cache = RadixCache(
             None,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
@@ -242,22 +256,34 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        logits_output, _ = self.model_runner.forward(forward_batch)
+        eagle3_output, _ = self.model_runner.forward(forward_batch)
 
         aux_hidden_states_list = None
         input_lens = [len(req.origin_input_ids) for req in reqs]
-        logits = torch.split(logits_output.logits, input_lens, dim=0)
+
+        if return_logits:
+            logits = torch.split(eagle3_output.logits, input_lens, dim=0)
+        else:
+            logits = [None] * len(reqs)
+
         if capture_aux_hidden_states:
             aux_hidden_states_list = torch.split(
-                logits_output.aux_hidden_states, input_lens, dim=0
+                eagle3_output.aux_hidden_states, input_lens, dim=0
             )
         else:
-            aux_hidden_states_list = None
+            aux_hidden_states_list = [None] * len(reqs)
+
+        if return_last_hidden_states:
+            last_hidden_states = torch.split(
+                eagle3_output.last_hidden_states, input_lens, dim=0
+            )
+        else:
+            last_hidden_states = [None] * len(reqs)
 
         # TODO: can we not clear?
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
-        return logits, aux_hidden_states_list
+        return logits, aux_hidden_states_list, last_hidden_states
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
         if require_mlp_sync(self.model_runner.server_args):
@@ -277,6 +303,50 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 offload_tags=set(),
             )
 
+    def extend(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = True,
+    ):
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
+        reqs, data_cache = [], []
+
+        if isinstance(input_ids, torch.Tensor):
+            input_ids = torch.split(input_ids, 1, dim=0)
+            attention_mask = torch.split(attention_mask, 1, dim=0)
+            loss_mask = torch.split(loss_mask, 1, dim=0)
+
+        for idx, (input_id_, attention_mask_, loss_mask_) in enumerate(
+            zip(
+                input_ids,
+                attention_mask,
+                loss_mask,
+            )
+        ):
+            req = Req(
+                rid=str(idx),
+                origin_input_text="",
+                origin_input_ids=input_id_.view(-1).tolist(),
+                sampling_params=sampling_params,
+            )
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+            data_cache.append([input_id_, attention_mask_, loss_mask_])
+            reqs.append(req)
+
+        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
+            reqs,
+            capture_aux_hidden_states=True,
+            return_last_hidden_states=return_last_hidden_states,
+            return_logits=return_logits,
+        )
+
+        return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+
     @torch.no_grad()
     def generate_eagle3_data(
         self,
@@ -293,49 +363,56 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 - target: (1, seq_len, vocab_size) or (1, seq_len, hidden_size)
                 - hidden_states: (1, seq_len, hidden_size)
         """
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
-        reqs, data_cache = [], []
-        data_for_draft = []
-        for idx, (input_id_, attention_mask_, loss_mask_) in enumerate(
-            zip(
-                input_ids.unsqueeze(1),
-                attention_mask.unsqueeze(1),
-                loss_mask.unsqueeze(1),
+        data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
+            self.extend(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                return_last_hidden_states=False,
+                return_logits=True,
             )
-        ):
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=input_id_.view(-1).tolist(),
-                sampling_params=sampling_params,
-            )
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-            data_cache.append([input_id_, attention_mask_, loss_mask_])
-            reqs.append(req)
-
-        logits_list, aux_hidden_states_list = self.extend(
-            reqs, capture_aux_hidden_states=True
         )
-
         aux_hidden_states_out = []
         target_out = []
         loss_mask_out = []
         input_ids_out = []
+        last_hidden_states_out = []
 
-        for idx, (data, logits, aux_hidden_states) in enumerate(
-            zip(data_cache, logits_list, aux_hidden_states_list)
+        for idx, (data, logits, aux_hidden_states, last_hidden_states) in enumerate(
+            zip(
+                data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+            )
         ):
             aux_hidden_states_out.append(aux_hidden_states.unsqueeze(0))
-            target_out.append(logits.unsqueeze(0))
             loss_mask_out.append(data[2])
             input_ids_out.append(data[0])
 
+            # when generating hidden states for offline training, we don't compute logits and only keep the last_hidden_states
+            # when training online, we don't keep the last_hidden_states and only keep the logits
+            if logits is not None:
+                target_out.append(logits.unsqueeze(0))
+            else:
+                target_out.append(None)
+
+            if last_hidden_states is not None:
+                last_hidden_states_out.append(last_hidden_states.unsqueeze(0))
+            else:
+                last_hidden_states_out.append(None)
+
         aux_hidden_states_out = torch.cat(aux_hidden_states_out, dim=0)
-        target_out = torch.cat(target_out, dim=0)
+
         loss_mask_out = torch.cat(loss_mask_out, dim=0)
         input_ids_out = torch.cat(input_ids_out, dim=0)
+
+        if target_out[0] is not None:
+            target_out = torch.cat(target_out, dim=0)
+        else:
+            target_out = None
+
+        if last_hidden_states_out[0] is not None:
+            last_hidden_states_out = torch.cat(last_hidden_states_out, dim=0)
+        else:
+            last_hidden_states_out = None
 
         target_out = padding(target_out, left=False)
         input_ids_out = padding(input_ids_out, left=False)
@@ -347,6 +424,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             loss_mask=loss_mask_out,
             input_ids=input_ids_out,
             attention_mask=attention_mask,
+            last_hidden_states=last_hidden_states_out,
         )
 
 

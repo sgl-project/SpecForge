@@ -280,6 +280,7 @@ class SglOnlineEagle3Trainer:
         self.draft_model_config = AutoDraftModelConfig.from_file(
             self.args.draft_model_config
         )
+
         self.draft_model_last_checkpoint = None
         if args.resume and os.path.isdir(args.output_dir):
             print_on_rank0(args.output_dir)

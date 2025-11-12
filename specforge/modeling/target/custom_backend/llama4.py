@@ -55,8 +55,13 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
 # [MODIFIED] Import from transformers library
-from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import get_tp_group, shard_tensor
+from specforge.layers import (
+    ColumnParallelLinear,
+    ParallelLMHead,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -413,7 +418,7 @@ class Llama4TextModel(Llama4PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
@@ -521,9 +526,7 @@ class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Llama4TextModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = ColumnParallelLinear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -583,8 +586,7 @@ class Llama4ForCausalLM(Llama4PreTrainedModel, GenerationMixin):
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = gather_tensor(logits, get_tp_group())
+        logits = self.lm_head(hidden_states[:, slice_indices, :], gather_output=True)
         loss = None
         if labels is not None:
             loss = self.loss_function(

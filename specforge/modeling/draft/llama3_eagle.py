@@ -175,7 +175,17 @@ def prepare_decoder_attention_mask(
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=None,
+        low_freq_factor=None,
+        high_freq_factor=None,
+        orig_max_position=None,
+    ):
         super().__init__()
 
         self.dim = dim
@@ -184,6 +194,46 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         inv_freq = 1.0 / (
             self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
+        # Llama3 style rotary embedding frequency scaling
+        if all(
+            v is not None
+            for v in [
+                scaling_factor,
+                low_freq_factor,
+                high_freq_factor,
+                orig_max_position,
+            ]
+        ):
+            print_with_rank(
+                f"Using Llama3 style rotary embedding with scaling_factor={scaling_factor}, low_freq_factor={low_freq_factor}, high_freq_factor={high_freq_factor}, orig_max_position={orig_max_position}"
+            )
+            self.scaling_factor = scaling_factor
+            self.low_freq_factor = low_freq_factor
+            self.high_freq_factor = high_freq_factor
+            self.orig_max_position = orig_max_position
+
+            low_freq_wavelen = orig_max_position / low_freq_factor
+            high_freq_wavelen = orig_max_position / high_freq_factor
+            wave_len = 2 * math.pi / inv_freq
+
+            if low_freq_factor != high_freq_factor:
+                smooth = (orig_max_position / wave_len - low_freq_factor) / (
+                    high_freq_factor - low_freq_factor
+                )
+            else:
+                smooth = 0
+
+            new_freqs = torch.where(
+                wave_len < high_freq_wavelen,
+                inv_freq,
+                torch.where(
+                    wave_len > low_freq_wavelen,
+                    inv_freq / self.scaling_factor,
+                    (1 - smooth) * inv_freq / self.scaling_factor + smooth * inv_freq,
+                ),
+            )
+            inv_freq = new_freqs
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Build here to make `torch.jit.trace` work.
@@ -483,16 +533,31 @@ class LlamaAttention(nn.Module):
                 base=getattr(self.config, "rope_theta", 10000),
             )
         else:
-            scaling_type = self.config.rope_scaling["rope_type"]
-            if hasattr(self.config.rope_scaling, "factor"):
-                scaling_factor = self.config.rope_scaling["factor"]
+            rope_scaling = self.config.rope_scaling
+
+            def rope_get(key, default=None):
+                if isinstance(rope_scaling, dict):
+                    return rope_scaling.get(key, default)
+                return getattr(rope_scaling, key, default)
+
+            scaling_type = rope_get("rope_type", rope_get("type"))
+            scaling_factor = rope_get("factor")
+
             if scaling_type == "linear":
+                if scaling_factor is None:
+                    raise ValueError(
+                        "Linear RoPE scaling requires 'factor' in rope_scaling config."
+                    )
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "dynamic":
+                if scaling_factor is None:
+                    raise ValueError(
+                        "Dynamic RoPE scaling requires 'factor' in rope_scaling config."
+                    )
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
@@ -501,7 +566,15 @@ class LlamaAttention(nn.Module):
             elif scaling_type == "llama3":
                 # for nv type
                 self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                    scaling_factor=(
+                        scaling_factor if scaling_factor is not None else 1.0
+                    ),
+                    low_freq_factor=rope_get("low_freq_factor"),
+                    high_freq_factor=rope_get("high_freq_factor"),
+                    orig_max_position=rope_get("original_max_position_embeddings"),
                 )
             elif scaling_type == "mrope":
                 self.rotary_emb = LlamaMutiRotaryEmbedding(
@@ -511,14 +584,14 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    original_max_position_embeddings=self.config.rope_scaling[
+                    original_max_position_embeddings=rope_get(
                         "original_max_position_embeddings"
-                    ],
-                    scaling_factor=self.config.rope_scaling["factor"],
-                    beta_fast=self.config.rope_scaling["beta_fast"],
-                    beta_slow=self.config.rope_scaling["beta_slow"],
-                    mscale=self.config.rope_scaling["mscale"],
-                    mscale_all_dim=self.config.rope_scaling["mscale_all_dim"],
+                    ),
+                    scaling_factor=scaling_factor,
+                    beta_fast=rope_get("beta_fast"),
+                    beta_slow=rope_get("beta_slow"),
+                    mscale=rope_get("mscale"),
+                    mscale_all_dim=rope_get("mscale_all_dim"),
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")

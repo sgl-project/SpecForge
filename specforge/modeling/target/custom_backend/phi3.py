@@ -45,8 +45,13 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
-from specforge.distributed import gather_tensor, get_tp_group
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
+from specforge.distributed import get_tp_group
+from specforge.layers import (
+    ColumnParallelLinear,
+    ParallelLMHead,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 
 class Phi3MLP(nn.Module):
@@ -266,7 +271,7 @@ class Phi3Model(Phi3PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
@@ -366,9 +371,7 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
 
         # Use ColumnParallelLinear for lm_head
-        self.lm_head = ColumnParallelLinear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -423,13 +426,7 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin):
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        # Gather logits from all TP ranks
-        # We don't shard embed_tokens, so when tie_word_embeddings is True
-        # lm_head is not sharded as well. Thus, we skip all_gather.
-        if not self.config.tie_word_embeddings:
-            logits = gather_tensor(logits, get_tp_group())
+        logits = self.lm_head(hidden_states[:, slice_indices, :], gather_output=True)
 
         loss = None
         if labels is not None:

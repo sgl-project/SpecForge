@@ -208,7 +208,6 @@ class OfflineEagle3Model(OnlineEagle3Model):
         draft_model,
         length: int = 7,
         attention_backend="sdpa",
-        target_model=None,
     ):
         """
         Args:
@@ -217,7 +216,6 @@ class OfflineEagle3Model(OnlineEagle3Model):
             length: TTT length, it means how many turns to unroll during TTT.
         """
         super().__init__(
-            target_model=target_model,
             draft_model=draft_model,
             length=length,
             attention_backend=attention_backend,
@@ -242,7 +240,9 @@ class OfflineEagle3Model(OnlineEagle3Model):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        target: torch.Tensor,
         loss_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
         **kwargs,
@@ -264,18 +264,14 @@ class OfflineEagle3Model(OnlineEagle3Model):
             vlosses: List of validation losses (not used in this implementation).
             acces: List of accuracies for each TTT step.
         """
-        assert (
-            "hidden_states" in kwargs
-        ), "hidden_states must be provided for OfflineEagle3Model forward"
-        assert (
-            "target" in kwargs
-        ), "target must be provided for OfflineEagle3Model forward"
         return super().forward(
-            input_ids,
-            attention_mask,
-            loss_mask,
-            past_key_values,
-            position_ids,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            target=target,
+            hidden_states=hidden_states,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
             **kwargs,
         )
 

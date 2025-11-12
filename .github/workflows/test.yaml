@@ -18,7 +18,7 @@ jobs:
         github.event.pull_request.draft == false
     runs-on: [self-hosted]
     container:
-      image: lmsysorg/sglang:dev
+      image: lmsysorg/sglang:v0.5.5 # we lock to this version to avoid repeated docker pull
       options: --gpus all --shm-size=2g --rm -v /dev/shm
     steps:
       - name: Checkout code
@@ -45,6 +45,7 @@ jobs:
         shell: bash
         run: |
           source sf/bin/activate
+          export PYTHONPATH=$PWD
           python -m unittest discover -s ./tests -p "test_*.py" -v
 
       - name: Save cache
