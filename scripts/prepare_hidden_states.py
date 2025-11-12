@@ -175,7 +175,7 @@ class HiddenStatesGenerator:
         self.io_queue_size = io_queue_size
         self.file_group_size = file_group_size
 
-        # Determine if this rank should show progress (DP rank 0)
+        # progress bar should only shown on TP rank = 0
         self.show_progress = dist.get_rank(get_tp_group()) == 0
 
         # --- REFACTOR: Thread pool is now managed by __enter__ and __exit__ ---
@@ -283,8 +283,8 @@ class HiddenStatesGenerator:
         start_group = (start_idx // self.file_group_size) * self.file_group_size
         end_sample_idx = start_idx + total_samples - 1
         end_group = (end_sample_idx // self.file_group_size) * self.file_group_size
-        for sample_idx in range(start_group, end_group + 1, self.file_group_size):
-            grouped_subdir = f"rows_{sample_idx}-{sample_idx + self.file_group_size}"
+        for group_start_idx in range(start_group, end_group + 1, self.file_group_size):
+            grouped_subdir = f"rows_{group_start_idx}-{group_start_idx + self.file_group_size}"
             output_dir = os.path.join(output_path, grouped_subdir)
             os.makedirs(output_dir, exist_ok=True)
 
