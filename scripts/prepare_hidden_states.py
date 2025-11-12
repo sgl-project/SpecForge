@@ -24,9 +24,9 @@ import gc
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from torch._tensor import Tensor
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -44,7 +44,7 @@ from specforge.distributed import (
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.utils import print_with_rank, rank_0_priority
-from dataclasses import dataclass, asdict
+
 
 @dataclass
 class DataPoint:
@@ -113,6 +113,7 @@ def build_target_model(
     if args.is_vlm and model_config.model_type == "qwen2_5_vl" and args.tp_size == 1:
         # TODO: replace with sglang
         from transformers import Qwen2_5_VLForConditionalGeneration
+
         target_model = (
             Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
@@ -124,7 +125,7 @@ def build_target_model(
     else:
         target_model = get_eagle3_target_model(
             pretrained_model_name_or_path=args.target_model_path,
-            backend="sglang", # we set this as the default backend to minimize precision mismatch in training and serving
+            backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
             torch_dtype=torch.bfloat16,
             device="cuda",
             cache_dir=args.cache_dir,
@@ -168,7 +169,7 @@ class HiddenStatesGenerator:
             file_group_size: Number of files per subdirectory.
         """
         self.model = target_model
-        self.enable_aux_hidden_states = True
+        self.enable_aux_hidden_states = enable_aux_hidden_states
 
         # --- Configurable parameters ---
         self.num_io_threads = num_io_threads
@@ -209,13 +210,14 @@ class HiddenStatesGenerator:
             data_point (DataPoint): The data point to save.
             output_file (str): The path to the output file.
         """
-        if data_point.hidden_state is not None and torch.any(torch.isnan(data_point.hidden_state)):
+        if data_point.hidden_state is not None and torch.any(
+            torch.isnan(data_point.hidden_state)
+        ):
             print(
                 f"Warning: NaN found in hidden_state for {output_file}. Skipping save."
             )
             return
 
-        
         if data_point.aux_hidden_state is not None and torch.any(
             torch.isnan(data_point.aux_hidden_state)
         ):
@@ -267,7 +269,7 @@ class HiddenStatesGenerator:
         self, output_path: str, start_idx: int, total_samples: int
     ) -> None:
         """
-        The dataset is organized into groups of files, each group has a folder which contains the files for this group. For example, if the 
+        The dataset is organized into groups of files, each group has a folder which contains the files for this group. For example, if the
         file_group_size is 2000, the 0-1999 samples will be saved in the folder "rows_0-2000", the 2000-3999 samples will be saved in the folder "rows_2000-4000", etc.
 
         Args:
@@ -284,7 +286,9 @@ class HiddenStatesGenerator:
         end_sample_idx = start_idx + total_samples - 1
         end_group = (end_sample_idx // self.file_group_size) * self.file_group_size
         for group_start_idx in range(start_group, end_group + 1, self.file_group_size):
-            grouped_subdir = f"rows_{group_start_idx}-{group_start_idx + self.file_group_size}"
+            grouped_subdir = (
+                f"rows_{group_start_idx}-{group_start_idx + self.file_group_size}"
+            )
             output_dir = os.path.join(output_path, grouped_subdir)
             os.makedirs(output_dir, exist_ok=True)
 
@@ -369,14 +373,18 @@ class HiddenStatesGenerator:
                 exists_list = self._check_existing_files_batch(
                     output_path, current_batch_indices
                 )
-                exists_tensor = torch.tensor(exists_list, dtype=torch.bool, device="cuda")
+                exists_tensor = torch.tensor(
+                    exists_list, dtype=torch.bool, device="cuda"
+                )
             else:
-                exists_tensor = torch.tensor([False] * batch_size, dtype=torch.bool, device="cuda")
+                exists_tensor = torch.tensor(
+                    [False] * batch_size, dtype=torch.bool, device="cuda"
+                )
             dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
 
             # Step 1: TP rank 0 checks which samples need processing
             valid_indices_in_batch = [
-                i for i, exists in enumerate[Tensor](exists_tensor) if not exists
+                i for i, exists in enumerate(exists_tensor) if not exists
             ]
             sample_global_indices = [
                 current_batch_indices[i] for i in valid_indices_in_batch
@@ -397,19 +405,39 @@ class HiddenStatesGenerator:
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
 
-            _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(**filtered_batch_gpu, return_last_hidden_states=True, return_logits=False)
+            _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
+                **filtered_batch_gpu,
+                return_last_hidden_states=True,
+                return_logits=False,
+            )
 
             del filtered_batch_gpu
 
             if is_tp_rank_0():
-                for i, (current_global_idx, aux_hidden_states, last_hidden_states) in enumerate(
-                    zip(sample_global_indices, aux_hidden_states_list, last_hidden_states_list)
+                for i, (
+                    current_global_idx,
+                    aux_hidden_states,
+                    last_hidden_states,
+                ) in enumerate(
+                    zip(
+                        sample_global_indices,
+                        aux_hidden_states_list,
+                        last_hidden_states_list,
+                    )
                 ):
 
                     # Process ONE sample at a time to minimize CPU RAM footprint
                     # 1. Transfer only the required slice for one sample to CPU
-                    aux_hidden_states = aux_hidden_states.cpu().clone().unsqueeze(0) if aux_hidden_states is not None else None
-                    last_hidden_states = last_hidden_states.cpu().clone().unsqueeze(0) if last_hidden_states is not None else None
+                    aux_hidden_states = (
+                        aux_hidden_states.cpu().clone().unsqueeze(0)
+                        if aux_hidden_states is not None
+                        else None
+                    )
+                    last_hidden_states = (
+                        last_hidden_states.cpu().clone().unsqueeze(0)
+                        if last_hidden_states is not None
+                        else None
+                    )
                     data_point = DataPoint(
                         input_ids=filtered_batch["input_ids"][i].clone(),
                         loss_mask=filtered_batch["loss_mask"][i].clone(),
@@ -449,6 +477,7 @@ class HiddenStatesGenerator:
                 f"\nGeneration loop finished. Processed: {total_processed}, Skipped: {total_skipped}"
             )
         dist.barrier()
+
 
 def main():
     args = parse_args()
