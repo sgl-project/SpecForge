@@ -80,53 +80,56 @@ def main(args):
     #####################################
 
     # Run requests
-    tic = time.perf_counter()
-    states = few_shot_gsm8k.run_batch(
-        arguments,
-        temperature=0,
-        max_new_tokens=2048,
-        num_threads=args.parallel,
-        progress_bar=True,
-    )
-    latency = time.perf_counter() - tic
-
-    preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
-
-    # Compute accuracy
-    acc = np.mean(np.array(preds) == np.array(labels))
-    invalid = np.mean(np.array(preds) == INVALID)
-
-    # Compute speed
-    num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
-    )
-    output_throughput = num_output_tokens / latency
-
-    has_verify = "spec_verify_ct" in states[0].get_meta_info("answer")
-    if has_verify:
-        num_verify_tokens = sum(
-            s.get_meta_info("answer")["spec_verify_ct"] for s in states
+    latency_list = []
+    output_throughput_list = []
+    accept_length_list = []
+    for _ in range(args.num_runs):
+        tic = time.perf_counter()
+        states = few_shot_gsm8k.run_batch(
+            arguments,
+            temperature=0,
+            max_new_tokens=2048,
+            num_threads=args.parallel,
+            progress_bar=True,
         )
-        if num_verify_tokens == 0:
-            accept_length = 1.0
+        latency = time.perf_counter() - tic
+
+        preds = []
+        for i in range(len(states)):
+            preds.append(get_answer_value(states[i]["answer"]))
+
+        # Compute speed
+        num_output_tokens = sum(
+            s.get_meta_info("answer")["completion_tokens"] for s in states
+        )
+        output_throughput = num_output_tokens / latency
+
+        has_verify = "spec_verify_ct" in states[0].get_meta_info("answer")
+        if has_verify:
+            num_verify_tokens = sum(
+                s.get_meta_info("answer")["spec_verify_ct"] for s in states
+            )
+            if num_verify_tokens == 0:
+                accept_length = 1.0
+            else:
+                accept_length = num_output_tokens / num_verify_tokens
         else:
-            accept_length = num_output_tokens / num_verify_tokens
-    else:
-        accept_length = 1.0
+            accept_length = 1.0
+
+        latency_list.append(latency)
+        output_throughput_list.append(output_throughput)
+        accept_length_list.append(accept_length)
 
     # Print results
-    print(f"Accuracy: {acc:.3f}")
-    print(f"Invalid: {invalid:.3f}")
-    print(f"Latency: {latency:.3f} s")
-    print(f"Output throughput: {output_throughput:.3f} token/s")
-    print(f"Accept length: {accept_length:.3f}")
+    print(f"Average Latency: {np.mean(latency_list):.3f} s")
+    print(f"Average Output throughput: {np.mean(output_throughput_list):.3f} token/s")
+    print(f"Average Accept length: {np.mean(accept_length_list):.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--num-runs", type=int, default=1)
     args = add_common_sglang_args_and_parse(parser)
     main(args)

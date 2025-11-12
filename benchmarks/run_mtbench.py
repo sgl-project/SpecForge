@@ -13,6 +13,7 @@ import os
 import time
 import uuid
 
+import numpy as np
 import sglang as sgl
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
@@ -71,46 +72,56 @@ def main(args):
     backend = select_sglang_backend(args)
     sgl.set_default_backend(backend)
 
-    # Run requests
-    tic = time.perf_counter()
-    rets = answer_mt_bench.run_batch(
-        arguments,
-        temperature=0,
-        max_new_tokens=2048,
-        num_threads=args.parallel,
-        progress_bar=True,
-    )
+    latency_list = []
+    output_throughput_list = []
+    accept_length_list = []
 
-    latency = time.perf_counter() - tic
-    num_output_tokens = sum(
-        s.get_meta_info("answer_1")["completion_tokens"]
-        + s.get_meta_info("answer_2")["completion_tokens"]
-        for s in rets
-    )
+    for _ in range(args.num_runs):
+        # Run requests
+        tic = time.perf_counter()
+        rets = answer_mt_bench.run_batch(
+            arguments,
+            temperature=0,
+            max_new_tokens=2048,
+            num_threads=args.parallel,
+            progress_bar=True,
+        )
 
-    output_throughput = num_output_tokens / latency
-
-    has_verify = "spec_verify_ct" in rets[0].get_meta_info("answer_1")
-    if has_verify:
-        num_verify_tokens = sum(
-            s.get_meta_info("answer_1")["spec_verify_ct"]
-            + s.get_meta_info("answer_2")["spec_verify_ct"]
+        latency = time.perf_counter() - tic
+        num_output_tokens = sum(
+            s.get_meta_info("answer_1")["completion_tokens"]
+            + s.get_meta_info("answer_2")["completion_tokens"]
             for s in rets
         )
-        if num_verify_tokens == 0:
-            accept_length = 1.0
-        else:
-            accept_length = num_output_tokens / num_verify_tokens
-    else:
-        accept_length = 1.0
 
-    print(f"Number of questions: {len(questions)}")
-    print(f"Output throughput: {output_throughput:.3f} token/s")
-    print(f"Accept length: {accept_length:.3f}")
+        output_throughput = num_output_tokens / latency
+
+        has_verify = "spec_verify_ct" in rets[0].get_meta_info("answer_1")
+        if has_verify:
+            num_verify_tokens = sum(
+                s.get_meta_info("answer_1")["spec_verify_ct"]
+                + s.get_meta_info("answer_2")["spec_verify_ct"]
+                for s in rets
+            )
+            if num_verify_tokens == 0:
+                accept_length = 1.0
+            else:
+                accept_length = num_output_tokens / num_verify_tokens
+        else:
+            accept_length = 1.0
+
+        latency_list.append(latency)
+        output_throughput_list.append(output_throughput)
+        accept_length_list.append(accept_length)
+
+    print(f"Average Latency: {np.mean(latency_list):.3f} s")
+    print(f"Average Output throughput: {np.mean(output_throughput_list):.3f} token/s")
+    print(f"Average Accept length: {np.mean(accept_length_list):.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-questions", type=int, default=80)
+    parser.add_argument("--num-runs", type=int, default=1)
     args = add_common_sglang_args_and_parse(parser)
     main(args)
