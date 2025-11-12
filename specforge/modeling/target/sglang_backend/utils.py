@@ -107,12 +107,14 @@ def replaced_logits_processor_forward_for_eagle3(
         else:
             assert False, "Should never reach"
 
-    assert not logits_metadata.extend_return_logprob, "extend_return_logprob is not supported"
+    assert (
+        not logits_metadata.extend_return_logprob
+    ), "extend_return_logprob is not supported"
     # Decode mode or extend mode without return_logprob.
     return ReplacedLogitsProcessorEagle3Output(
         logits=logits,
         aux_hidden_states=hidden_states_to_store,
-        last_hidden_states=last_hidden_states
+        last_hidden_states=last_hidden_states,
     )
 
 
@@ -121,7 +123,7 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
         self,
         logits_processor: LogitsProcessor,
         return_last_hidden_states: bool = False,
-        return_logits: bool = False
+        return_logits: bool = False,
     ):
         super().__init__()
         self.logits_processor = logits_processor
@@ -145,7 +147,7 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
             logits_metadata,
             aux_hidden_states,
             self.return_last_hidden_states,
-            self.return_logits
+            self.return_logits,
         )
         return ret
 

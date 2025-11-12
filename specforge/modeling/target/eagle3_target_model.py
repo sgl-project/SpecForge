@@ -223,7 +223,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         self.model_runner.model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
 
     @torch.no_grad
-    def _extend(self, reqs, capture_aux_hidden_states: bool = True, return_last_hidden_states: bool = False, return_logits: bool = False):
+    def _extend(
+        self,
+        reqs,
+        capture_aux_hidden_states: bool = True,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = False,
+    ):
         # set the logits processor for the model runner
         for name, module in self.model_runner.model.named_modules():
             if isinstance(module, LogitsProcessorForEAGLE3):
@@ -268,7 +274,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             aux_hidden_states_list = [None] * len(reqs)
 
         if return_last_hidden_states:
-            last_hidden_states = torch.split(eagle3_output.last_hidden_states, input_lens, dim=0)
+            last_hidden_states = torch.split(
+                eagle3_output.last_hidden_states, input_lens, dim=0
+            )
         else:
             last_hidden_states = [None] * len(reqs)
 
@@ -295,10 +303,17 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 offload_tags=set(),
             )
 
-    def extend(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor, return_last_hidden_states: bool = False, return_logits: bool = True):
+    def extend(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = True,
+    ):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
-    
+
         if isinstance(input_ids, torch.Tensor):
             input_ids = torch.split(input_ids, 1, dim=0)
             attention_mask = torch.split(attention_mask, 1, dim=0)
@@ -324,7 +339,10 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             reqs.append(req)
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
-            reqs, capture_aux_hidden_states=True, return_last_hidden_states=return_last_hidden_states, return_logits=return_logits
+            reqs,
+            capture_aux_hidden_states=True,
+            return_last_hidden_states=return_last_hidden_states,
+            return_logits=return_logits,
         )
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
@@ -345,17 +363,25 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 - target: (1, seq_len, vocab_size) or (1, seq_len, hidden_size)
                 - hidden_states: (1, seq_len, hidden_size)
         """
-        data_cache,logits_list, aux_hidden_states_list, last_hidden_states_list = self.extend(
-            input_ids, attention_mask, loss_mask, return_last_hidden_states=False, return_logits=True
+        data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
+            self.extend(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                return_last_hidden_states=False,
+                return_logits=True,
+            )
         )
         aux_hidden_states_out = []
         target_out = []
         loss_mask_out = []
         input_ids_out = []
         last_hidden_states_out = []
-        
+
         for idx, (data, logits, aux_hidden_states, last_hidden_states) in enumerate(
-            zip(data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list)
+            zip(
+                data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+            )
         ):
             aux_hidden_states_out.append(aux_hidden_states.unsqueeze(0))
             loss_mask_out.append(data[2])
@@ -378,7 +404,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         loss_mask_out = torch.cat(loss_mask_out, dim=0)
         input_ids_out = torch.cat(input_ids_out, dim=0)
 
-        if target_out[0] is not None:   
+        if target_out[0] is not None:
             target_out = torch.cat(target_out, dim=0)
         else:
             target_out = None
@@ -400,7 +426,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             attention_mask=attention_mask,
             last_hidden_states=last_hidden_states_out,
         )
-
 
 
 class CustomEagle3TargetModel(Eagle3TargetModel):
