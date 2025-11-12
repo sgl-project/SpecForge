@@ -5,6 +5,18 @@ By generating hidden states in advance, we can avoid:
 - the latency overhead of generating hidden states for each request.
 
 Optimized for lower memory usage and higher efficiency.
+
+Usage:
+torchrun --nproc_per_node=8 \
+    scripts/prepare_hidden_states.py \
+    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --enable-aux-hidden-states \
+    --data-path ./cache/dataset/sharegpt_train.jsonl \
+    --chat-template llama3 \
+    --max-length 2048 \
+    --tp-size 4 \
+    --batch-size 4 \
+    --num-samples 1000
 """
 
 import argparse
@@ -13,12 +25,12 @@ import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from torch._tensor import Tensor
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
@@ -32,6 +44,14 @@ from specforge.distributed import (
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.utils import print_with_rank, rank_0_priority
+from dataclasses import dataclass, asdict
+
+@dataclass
+class DataPoint:
+    input_ids: torch.Tensor
+    loss_mask: torch.Tensor
+    hidden_state: torch.Tensor
+    aux_hidden_state: Optional[torch.Tensor] = None
 
 
 def parse_args():
@@ -55,7 +75,7 @@ def parse_args():
         "--dist-timeout",
         type=int,
         default=2000,
-        help="Timeout for collective communication in minutes",
+        help="Timeout for collective communication in minutes, default to 2000 so that it does not go timeout",
     )
     parser.add_argument(
         "--num-io-threads",
@@ -78,12 +98,6 @@ def parse_args():
         default=2000,
         help="Number of files per subdirectory.",
     )
-    parser.add_argument(
-        "--tp-sync-interval",
-        type=int,
-        default=10,
-        help="Batch interval for TP group barrier synchronization.",
-    )
     return parser.parse_args()
 
 
@@ -97,8 +111,8 @@ def build_target_model(
     Otherwise, use the Eagle3 target model wrapper.
     """
     if args.is_vlm and model_config.model_type == "qwen2_5_vl" and args.tp_size == 1:
+        # TODO: replace with sglang
         from transformers import Qwen2_5_VLForConditionalGeneration
-
         target_model = (
             Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
@@ -110,17 +124,14 @@ def build_target_model(
     else:
         target_model = get_eagle3_target_model(
             pretrained_model_name_or_path=args.target_model_path,
-            backend="hf",
+            backend="sglang", # we set this as the default backend to minimize precision mismatch in training and serving
             torch_dtype=torch.bfloat16,
             device="cuda",
             cache_dir=args.cache_dir,
         )
 
     # Set auxiliary hidden states layers if specified
-    if args.aux_hidden_states_layers is not None:
-        target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
-    else:
-        target_model.set_aux_hidden_states_layers()
+    target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
 
     if args.is_vlm:
         processor = AutoProcessor.from_pretrained(args.target_model_path)
@@ -132,13 +143,12 @@ def build_target_model(
 
 class HiddenStatesGenerator:
     """
-    Generator for creating and saving hidden states from target model.
-
-    (Refactored Version)
-    - Fixes a potential deadlock in TP > 1 scenarios when a batch is skipped.
-    - Implements a context manager (`with` statement) for robust resource handling.
-    - Makes internal settings (like queue sizes, group sizes) configurable.
-    - Centralizes resource cleanup logic.
+    This is a generator for creating and saving the hidden states based on the target model.
+    It includes the following features:
+        1. Fixes a potential deadlock in TP > 1 scenarios when a batch is skipped.
+        2. Implements a context manager (`with` statement) for robust resource handling.
+        3. Makes internal settings (like queue sizes, group sizes) configurable.
+        4. Centralizes resource cleanup logic.
     """
 
     def __init__(
@@ -148,7 +158,6 @@ class HiddenStatesGenerator:
         num_io_threads: int = 4,
         io_queue_size: int = 50,
         file_group_size: int = 2000,
-        tp_sync_interval: int = 10,
     ):
         """
         Args:
@@ -157,20 +166,17 @@ class HiddenStatesGenerator:
             num_io_threads: Number of threads for async I/O.
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
-            tp_sync_interval: How often (in batches) to synchronize TP group with a barrier.
         """
         self.model = target_model
-        self.enable_aux_hidden_states = enable_aux_hidden_states
+        self.enable_aux_hidden_states = True
 
-        # --- REFACTOR: Configurable parameters ---
+        # --- Configurable parameters ---
         self.num_io_threads = num_io_threads
         self.io_queue_size = io_queue_size
         self.file_group_size = file_group_size
-        self.tp_sync_interval = tp_sync_interval
 
         # Determine if this rank should show progress (DP rank 0)
-        dp_group = get_dp_group()
-        self.show_progress = dist.get_rank(dp_group) == 0 if dp_group else True
+        self.show_progress = dist.get_rank(get_tp_group()) == 0
 
         # --- REFACTOR: Thread pool is now managed by __enter__ and __exit__ ---
         self.io_executor = None
@@ -193,27 +199,41 @@ class HiddenStatesGenerator:
             self.io_executor = None  # Reset for safety
 
         # Final barrier to ensure all processes exit generate() cleanly
-        if dist.is_initialized() and get_tp_group():
-            dist.barrier(group=get_tp_group())
+        dist.barrier()
 
-    def _save_tensor_sync(self, data_point: Dict[str, torch.Tensor], output_file: str):
-        if "hidden_state" in data_point and torch.any(
-            torch.isnan(data_point["hidden_state"])
-        ):
+    def _save_tensor_sync(self, data_point: DataPoint, output_file: str) -> None:
+        """
+        Save a data point to a file synchronously. If there is any NaN value in the data, this datapoint will be skipped.
+
+        Args:
+            data_point (DataPoint): The data point to save.
+            output_file (str): The path to the output file.
+        """
+        if data_point.hidden_state is not None and torch.any(torch.isnan(data_point.hidden_state)):
             print(
                 f"Warning: NaN found in hidden_state for {output_file}. Skipping save."
             )
             return
-        if "aux_hidden_state" in data_point and torch.any(
-            torch.isnan(data_point["aux_hidden_state"])
+
+        
+        if data_point.aux_hidden_state is not None and torch.any(
+            torch.isnan(data_point.aux_hidden_state)
         ):
             print(
                 f"Warning: NaN found in aux_hidden_state for {output_file}. Skipping save."
             )
             return
-        torch.save(data_point, output_file)
 
-    def _save_tensor_async(self, data_point: Dict[str, torch.Tensor], output_file: str):
+        torch.save(asdict(data_point), output_file)
+
+    def _save_tensor_async(self, data_point: DataPoint, output_file: str) -> None:
+        """
+        Submit a job to the io_executor to save the data point asynchronously.
+
+        Args:
+            data_point (DataPoint): The data point to save.
+            output_file (str): The path to the output file.
+        """
         assert is_tp_rank_0(), "Only tp_rank=0 should call _save_tensor_async"
         # If the queue of pending save operations is full, we must wait.
         if len(self.pending_futures) >= self.io_queue_size:
@@ -231,6 +251,9 @@ class HiddenStatesGenerator:
         self.pending_futures.append(future)
 
     def _wait_all_saves(self):
+        """
+        This method is to ensure that all submitted jobs are completed.
+        """
         if is_tp_rank_0() and self.pending_futures:
             for future in tqdm(
                 self.pending_futures,
@@ -242,20 +265,42 @@ class HiddenStatesGenerator:
 
     def _prepare_output_dirs(
         self, output_path: str, start_idx: int, total_samples: int
-    ):
+    ) -> None:
+        """
+        The dataset is organized into groups of files, each group has a folder which contains the files for this group. For example, if the 
+        file_group_size is 2000, the 0-1999 samples will be saved in the folder "rows_0-2000", the 2000-3999 samples will be saved in the folder "rows_2000-4000", etc.
+
+        Args:
+            output_path (str): The path to the output directory.
+            start_idx (int): The starting index of the samples to save.
+            total_samples (int): The total number of samples to save.
+
+        Returns:
+            None
+        """
         if not is_tp_rank_0() or total_samples == 0:
             return
         start_group = (start_idx // self.file_group_size) * self.file_group_size
-        end_idx = start_idx + total_samples - 1
-        end_group = (end_idx // self.file_group_size) * self.file_group_size
-        for group_idx in range(start_group, end_group + 1, self.file_group_size):
-            grouped_subdir = f"rows_{group_idx}-{group_idx + self.file_group_size}"
+        end_sample_idx = start_idx + total_samples - 1
+        end_group = (end_sample_idx // self.file_group_size) * self.file_group_size
+        for sample_idx in range(start_group, end_group + 1, self.file_group_size):
+            grouped_subdir = f"rows_{sample_idx}-{sample_idx + self.file_group_size}"
             output_dir = os.path.join(output_path, grouped_subdir)
             os.makedirs(output_dir, exist_ok=True)
 
     def _check_existing_files_batch(
         self, output_path: str, global_indices: List[int]
     ) -> List[bool]:
+        """
+        A helper function to check if the files for the given global indices exist.
+
+        Args:
+            output_path (str): The path to the output directory.
+            global_indices (List[int]): The global indices of the samples to check.
+
+        Returns:
+            List[bool]: A list of booleans indicating if the files for the given global indices exist.
+        """
         if not is_tp_rank_0():
             return [False] * len(global_indices)
 
@@ -268,6 +313,16 @@ class HiddenStatesGenerator:
         return exists
 
     def _get_file_path(self, output_path: str, idx: int) -> str:
+        """
+        A helper function to get the standard file path for the data point with the given index.
+
+        Args:
+            output_path (str): The path to the output directory.
+            idx (int): The global index of the data point.
+
+        Returns:
+            str: The file path for the data point.
+        """
         group_idx = (idx // self.file_group_size) * self.file_group_size
         grouped_subdir = f"rows_{group_idx}-{group_idx + self.file_group_size}"
         return os.path.join(output_path, grouped_subdir, f"data_{idx}.ckpt")
@@ -289,7 +344,6 @@ class HiddenStatesGenerator:
         self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
 
         tp_group = get_tp_group()
-        tp_size = dist.get_world_size(tp_group)
         tp_group_ranks = dist.get_process_group_ranks(tp_group)
         tp_rank_0_global = tp_group_ranks[0]
         global_idx = start_idx
@@ -298,7 +352,7 @@ class HiddenStatesGenerator:
             data_loader,
             disable=(not self.show_progress),
             desc="Generating Hidden States",
-            position=0,
+            position=dist.get_rank(get_dp_group()),
             leave=True,
         )
 
@@ -308,60 +362,30 @@ class HiddenStatesGenerator:
             batch_size = batch["input_ids"].size(0)
             current_batch_indices = list(range(global_idx, global_idx + batch_size))
 
-            # Step 1: TP rank 0 checks which samples need processing
+            # # Step 1: Synchronize valid indices across TP group
+            # we check which files already exist and sync this info across TP ranks
+            # if exists, we will skip these samples
             if is_tp_rank_0():
                 exists_list = self._check_existing_files_batch(
                     output_path, current_batch_indices
                 )
-                valid_indices_in_batch = [
-                    i for i, exists in enumerate(exists_list) if not exists
-                ]
-                sample_global_indices = [
-                    current_batch_indices[i] for i in valid_indices_in_batch
-                ]
-                num_valid = len(valid_indices_in_batch)
-                total_skipped += batch_size - num_valid
+                exists_tensor = torch.tensor(exists_list, dtype=torch.bool, device="cuda")
             else:
-                num_valid = 0
-                sample_global_indices = []
+                exists_tensor = torch.tensor([False] * batch_size, dtype=torch.bool, device="cuda")
+            dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
 
-            global_idx += batch_size
-
-            # Step 1: Synchronize valid indices across TP group
-            if tp_size > 1:
-                if is_tp_rank_0():
-                    if num_valid == 0:
-                        indices_to_broadcast = torch.tensor(
-                            [-1], dtype=torch.long, device="cuda"
-                        )
-                    else:
-                        indices_to_broadcast = torch.tensor(
-                            valid_indices_in_batch, dtype=torch.long, device="cuda"
-                        )
-                    length_tensor = torch.tensor(
-                        [indices_to_broadcast.size(0)], dtype=torch.long, device="cuda"
-                    )
-                else:
-                    length_tensor = torch.zeros(1, dtype=torch.long, device="cuda")
-                dist.broadcast(length_tensor, src=tp_rank_0_global, group=tp_group)
-                if not is_tp_rank_0():
-                    indices_to_broadcast = torch.zeros(
-                        length_tensor.item(), dtype=torch.long, device="cuda"
-                    )
-                dist.broadcast(
-                    indices_to_broadcast, src=tp_rank_0_global, group=tp_group
-                )
-                if indices_to_broadcast[0].item() == -1:
-                    del length_tensor, indices_to_broadcast
-                    continue
-                if not is_tp_rank_0():
-                    valid_indices_in_batch = indices_to_broadcast.tolist()
-                del length_tensor, indices_to_broadcast
-            else:
-                if num_valid == 0:
-                    continue
+            # Step 1: TP rank 0 checks which samples need processing
+            valid_indices_in_batch = [
+                i for i, exists in enumerate[Tensor](exists_tensor) if not exists
+            ]
+            sample_global_indices = [
+                current_batch_indices[i] for i in valid_indices_in_batch
+            ]
+            num_valid = len(valid_indices_in_batch)
+            total_skipped += batch_size - num_valid
 
             # Step 2: Filter batch before moving to GPU to save memory
+            global_idx += batch_size
             filtered_batch = {
                 "input_ids": batch["input_ids"][valid_indices_in_batch],
                 "attention_mask": batch["attention_mask"][valid_indices_in_batch],
@@ -373,61 +397,41 @@ class HiddenStatesGenerator:
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
 
-            eagle3_data = self.model.generate_eagle3_data(**filtered_batch_gpu)
+            _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(**filtered_batch_gpu, return_last_hidden_states=True, return_logits=False)
 
             del filtered_batch_gpu
 
             if is_tp_rank_0():
-                seq_lengths = eagle3_data.attention_mask.sum(dim=1).tolist()
-
-                for i, (current_global_idx, seq_len) in enumerate(
-                    zip(sample_global_indices, seq_lengths)
+                for i, (current_global_idx, aux_hidden_states, last_hidden_states) in enumerate(
+                    zip(sample_global_indices, aux_hidden_states_list, last_hidden_states_list)
                 ):
 
                     # Process ONE sample at a time to minimize CPU RAM footprint
                     # 1. Transfer only the required slice for one sample to CPU
-                    hidden_state_cpu = (
-                        eagle3_data.target[i, :seq_len, :].cpu().clone().unsqueeze(0)
+                    aux_hidden_states = aux_hidden_states.cpu().clone().unsqueeze(0) if aux_hidden_states is not None else None
+                    last_hidden_states = last_hidden_states.cpu().clone().unsqueeze(0) if last_hidden_states is not None else None
+                    data_point = DataPoint(
+                        input_ids=filtered_batch["input_ids"][i].clone(),
+                        loss_mask=filtered_batch["loss_mask"][i].clone(),
+                        hidden_state=last_hidden_states,
+                        aux_hidden_state=aux_hidden_states,
                     )
-
-                    aux_hidden_state_cpu = None
-                    if self.enable_aux_hidden_states and hasattr(
-                        eagle3_data, "hidden_states"
-                    ):
-                        aux_hidden_state_cpu = (
-                            eagle3_data.hidden_states[i, :seq_len, :]
-                            .cpu()
-                            .clone()
-                            .unsqueeze(0)
-                        )
-
-                    # 2. Prepare the data point for this single sample
-                    data_point = {
-                        "input_ids": filtered_batch["input_ids"][i].clone(),
-                        "loss_mask": filtered_batch["loss_mask"][i].clone(),
-                        "hidden_state": hidden_state_cpu,
-                    }
-                    if aux_hidden_state_cpu is not None:
-                        data_point["aux_hidden_state"] = aux_hidden_state_cpu
 
                     # 3. Save asynchronously (the backpressure logic is still crucial)
                     output_file = self._get_file_path(output_path, current_global_idx)
                     self._save_tensor_async(data_point, output_file)
 
                     # 4. Immediately clean up the single-sample CPU tensors
-                    del hidden_state_cpu, aux_hidden_state_cpu, data_point
+                    del last_hidden_states, aux_hidden_states
 
                 total_processed += len(sample_global_indices)
 
             # Clean up the large GPU and CPU batch data
-            del eagle3_data, filtered_batch
+            del aux_hidden_states_list, last_hidden_states_list, filtered_batch
 
             if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
                 torch.cuda.empty_cache()
                 gc.collect()
-
-            if tp_size > 1 and batch_idx % self.tp_sync_interval == 0:
-                dist.barrier(group=tp_group)
 
             if self.show_progress:
                 progress_bar.set_postfix(
@@ -444,7 +448,7 @@ class HiddenStatesGenerator:
             print(
                 f"\nGeneration loop finished. Processed: {total_processed}, Skipped: {total_skipped}"
             )
-
+        dist.barrier()
 
 def main():
     args = parse_args()
@@ -455,7 +459,6 @@ def main():
 
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    args.dp_size = dist.get_world_size() // args.tp_size
 
     # Build target model (with TP)
     target_model_config = AutoConfig.from_pretrained(args.target_model_path)
@@ -500,7 +503,6 @@ def main():
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
-
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 
     # Create DP-sharded dataloader
@@ -548,7 +550,6 @@ def main():
             num_io_threads=args.num_io_threads,
             io_queue_size=args.io_queue_size,
             file_group_size=args.file_group_size,
-            tp_sync_interval=args.tp_sync_interval,
             # Other params like io_queue_size can also be added to argparse
         ) as hidden_states_generator:
 
