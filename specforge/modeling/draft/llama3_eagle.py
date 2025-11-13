@@ -1012,7 +1012,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
 
         # create vocab buffers
-        t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
+        t2d = torch.ones(self.vocab_size, dtype=torch.bool)
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)

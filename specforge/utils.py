@@ -7,6 +7,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+from torch.distributed._tensor import DTensor, Shard, distribute_tensor
 from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
@@ -248,3 +249,41 @@ def get_full_optimizer_state(optimizer_state_dict: dict):
             for param_id, param_state in optimizer_state_dict["state"].items()
         }
     return full_optimizer_state_dict
+
+
+def shard_optimizer_state_with_dtensor(bf16_optimizer, device_mesh):
+    """
+    Shards the optimizer state tensors of a BF16Optimizer instance using DTensor.
+
+    Args:
+        bf16_optimizer (BF16Optimizer): An instance of BF16Optimizer, which contains
+            the actual optimizer (e.g., torch.optim.Adam) as its `.optimizer` attribute.
+    """
+
+    optim = bf16_optimizer.optimizer
+
+    for group in optim.param_groups:
+        for p in group["params"]:
+            if not isinstance(p, DTensor):
+                continue
+
+            state = optim.state.get(p, None)
+            if state is None:
+                continue
+
+            mesh = device_mesh
+            placements = (Shard(dim=0),)
+
+            for k, v in list(state.items()):
+                if k == "step":
+                    continue
+
+                if isinstance(v, DTensor):
+                    continue
+
+                if not isinstance(v, torch.Tensor):
+                    continue
+
+                state[k] = distribute_tensor(
+                    v.to(p.device), device_mesh=mesh, placements=placements
+                )
