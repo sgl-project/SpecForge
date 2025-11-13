@@ -264,6 +264,9 @@ class OfflineEagle3Model(OnlineEagle3Model):
             vlosses: List of validation losses (not used in this implementation).
             acces: List of accuracies for each TTT step.
         """
+        with torch.no_grad():
+            target = self.target_head(target)
+
         return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
