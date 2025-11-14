@@ -25,7 +25,7 @@ def test_llama3_tp(rank, world_size, temp_dir, port):
     init_distributed(tp_size=2)
     set_seed(42)
 
-    for tie_word_embedding in [True, False]:
+    for tie_word_embeddings in [True, False]:
         config = LlamaConfig(
             vocab_size=1000,
             hidden_size=384,
@@ -34,11 +34,10 @@ def test_llama3_tp(rank, world_size, temp_dir, port):
             max_position_embeddings=1024,
             num_attention_heads=10,
             num_key_value_heads=2,
-            tie_word_embeddings=False,
             initializer_range=0.02,
             hidden_act="silu",
             rms_norm_eps=1e-6,
-            tie_word_embedding=tie_word_embedding,
+            tie_word_embeddings=tie_word_embeddings,
         )
 
         # create the single-gpu
@@ -51,6 +50,14 @@ def test_llama3_tp(rank, world_size, temp_dir, port):
         dist.barrier()
         dist_model = SFLlamaForCausalLM.from_pretrained(temp_dir).cuda()
         dist.barrier()
+
+        if tie_word_embeddings:
+            assert torch.equal(
+                model.get_input_embeddings().weight, model.lm_head.weight
+            )
+            assert torch.equal(
+                dist_model.get_input_embeddings().weight, dist_model.lm_head.weight
+            )
 
         # create data
         input_ids = torch.randint(0, 1000, (1, 256)).cuda()

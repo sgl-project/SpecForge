@@ -24,6 +24,7 @@ class ReplacedLogitsProcessorEagle3Output:
 
     logits: torch.Tensor
     aux_hidden_states: torch.Tensor
+    last_hidden_states: Optional[torch.Tensor] = None
 
 
 def replaced_logits_processor_forward_for_eagle3(
@@ -33,6 +34,8 @@ def replaced_logits_processor_forward_for_eagle3(
     lm_head,
     logits_metadata: Union[LogitsMetadata, ForwardBatch],
     aux_hidden_states: Optional[torch.Tensor] = None,
+    return_last_hidden_states: bool = False,
+    return_logits: bool = False,
 ) -> LogitsProcessorOutput:
     """
     This is a modified forward function for the SGLang's logits processor, adapted from https://github.com/sgl-project/sglang/blob/v0.5.4/python/sglang/srt/layers/logits_processor.py.
@@ -65,9 +68,18 @@ def replaced_logits_processor_forward_for_eagle3(
             f"The modified logits processor is not supported for this forward mode: {logits_metadata.forward_mode}"
         )
 
-    # Compute logits for both input and sampled tokens.
-    logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+    if return_last_hidden_states:
+        last_hidden_states = pruned_states
+    else:
+        last_hidden_states = None
 
+    if return_logits:
+        # Compute logits for both input and sampled tokens.
+        logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+    else:
+        logits = None
+
+    # get the aux hidden states
     hidden_states_to_store: Optional[torch.Tensor] = None
     if logits_metadata.capture_hidden_mode.need_capture():
         if logits_metadata.capture_hidden_mode.is_full():
@@ -95,21 +107,28 @@ def replaced_logits_processor_forward_for_eagle3(
         else:
             assert False, "Should never reach"
 
-    if not logits_metadata.extend_return_logprob:
-        # Decode mode or extend mode without return_logprob.
-        return ReplacedLogitsProcessorEagle3Output(
-            logits=logits,
-            aux_hidden_states=hidden_states_to_store,
-        )
+    assert (
+        not logits_metadata.extend_return_logprob
+    ), "extend_return_logprob is not supported"
+    # Decode mode or extend mode without return_logprob.
+    return ReplacedLogitsProcessorEagle3Output(
+        logits=logits,
+        aux_hidden_states=hidden_states_to_store,
+        last_hidden_states=last_hidden_states,
+    )
 
 
 class LogitsProcessorForEAGLE3(torch.nn.Module):
     def __init__(
-        self, logits_processor: LogitsProcessor, return_full_logits: bool = False
+        self,
+        logits_processor: LogitsProcessor,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = False,
     ):
         super().__init__()
         self.logits_processor = logits_processor
-        self.return_full_logits = return_full_logits
+        self.return_last_hidden_states = return_last_hidden_states
+        self.return_logits = return_logits
 
     def forward(
         self,
@@ -127,6 +146,8 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
             lm_head,
             logits_metadata,
             aux_hidden_states,
+            self.return_last_hidden_states,
+            self.return_logits,
         )
         return ret
 
