@@ -41,7 +41,7 @@ except ImportError:
 
 from specforge.utils import padding
 
-from .parse import GeneralParser, HarmonyParser
+from .parse import GeneralParser, HarmonyParser, DeepSeekParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -108,6 +108,24 @@ def _apply_loss_mask_from_chat_template(
 
     return loss_mask
 
+def print_data_example(tokenizer, example: dict[str, list[int]]) -> None:
+    IGNORE_INDEX = -100
+    # valid_labels = list(filter(lambda x: x != IGNORE_INDEX, example["labels"]))
+    input_ids = example["input_ids"][0]
+    mask_ids = example["loss_mask"][0]
+    print("input_ids:\n{}".format(input_ids))
+    print("inputs:\n{}".format(tokenizer.decode(input_ids, skip_special_tokens=False)))
+    print("mask_ids:\n{}".format(mask_ids))
+    label_ids =  []
+    for inp, mask in zip(input_ids, mask_ids):
+        if mask != 0:
+            label_ids.append(inp)
+    print("label_ids:\n{}".format(label_ids))
+    print("labels:\n{}".format(tokenizer.decode(label_ids, skip_special_tokens=False)))
+    # label_ids = example["input_ids"] * example["loss_mask"]
+    # print("label ids:", label_ids, tokenizer.decode(label_ids, skip_special_tokens=False))
+    # print(f"labels:\n{tokenizer.decode(valid_labels, skip_special_tokens=False)}")
+    # {"input_ids": [], "loss_mask": [], "attention_mask": []}
 
 # Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
 def preprocess_conversations(
@@ -143,6 +161,8 @@ def preprocess_conversations(
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "DeepSeek":
+        parser = DeepSeekParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
 
@@ -157,9 +177,10 @@ def preprocess_conversations(
         input_ids, loss_mask = parser.parse(
             source, max_length, preformatted=is_preformatted, **kwargs_item
         )
-        results["input_ids"].append(input_ids[None, :])
-        results["loss_mask"].append(loss_mask[None, :])
-        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        if input_ids is not None:
+            results["input_ids"].append(input_ids[None, :])
+            results["loss_mask"].append(loss_mask[None, :])
+            results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
     return results
 
 
@@ -410,7 +431,7 @@ def build_eagle3_dataset(
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
-
+    print_data_example(tokenizer, next(iter(dataset)))
     dataset.set_format(type="torch")
     return dataset
 

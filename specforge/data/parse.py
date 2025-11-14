@@ -7,7 +7,7 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from .template import ChatTemplate
-
+from specforge.utils import print_on_rank0
 __all__ = ["GeneralParser", "HarmonyParser"]
 
 
@@ -81,8 +81,8 @@ class GeneralParser(Parser):
 
             conversation = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs
-            )
-
+            ) 
+            # print_on_rank0(f"conversation = {conversation}")
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
@@ -118,6 +118,10 @@ class GeneralParser(Parser):
                 if token_start > assistant_end_char:
                     continue  # token after assistant text
                 loss_mask[idx] = 1
+        # print_on_rank0(f"input_ids = {input_ids}, loss_mask = {loss_mask}")
+
+        # 重写loss_mask逻辑：学special token 后的所有输出，包括eos_token
+
         return input_ids, loss_mask
 
 
@@ -205,3 +209,102 @@ class HarmonyParser(Parser):
                 continue
             loss_mask[idx] = 1
         return input_ids, loss_mask
+
+
+class DeepSeekParser(Parser):
+    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+        super().__init__(tokenizer, chat_template)
+        self.system_prompt = chat_template.system_prompt
+        self.user_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+        )
+        self.assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+        )
+        self.bos = chat_template.bos_token
+
+    def parse(
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        **kwargs,
+    ) -> Dict[str, List[torch.Tensor]]:
+        if not preformatted:
+            messages = []
+            labels = []
+            if conversation[0]["role"] == "system":
+                warnings.warn(
+                    f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+                )
+                messages.append(
+                    {"role": "system", "content": conversation[0]["content"]}
+                )
+                conversation = conversation[1:]
+            else:
+                if self.system_prompt:
+                    messages.append({"role": "system", "content": self.system_prompt})
+
+            
+            for j, msg in enumerate(conversation):
+                role = msg["role"]
+                if role == "assistant":
+                    if not msg.get("content"): msg["content"] = "" # 保证apply_chat_template编码正确
+                    labels.append(msg)
+
+                messages.append(msg)
+
+
+            conversation = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False, **kwargs
+            ) 
+            
+            conversation_labels = self.tokenizer.apply_chat_template(
+                labels, tokenize=False, add_generation_prompt=False, **kwargs
+            ).split(self.bos)[-1]
+            
+        if not self.tokenizer.pad_token_id:
+            self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
+
+        encoding = self.tokenizer(
+            conversation,
+            return_offsets_mapping=True,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        encoding_label = self.tokenizer(
+            conversation_labels,
+            return_offsets_mapping=True,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        input_ids = encoding.input_ids[0]
+        label_ids = encoding_label.input_ids[0]
+        if len(input_ids) > max_length: 
+            print_on_rank0(f"data len > max length")
+            return None, None
+        loss_mask = create_mask(input_ids, label_ids)
+
+        return input_ids, loss_mask
+
+
+def create_mask(input_ids, lable_ids):
+    """
+        找到input_ids里label_ids中位置的, 返回一个与mask列表，包含的部分标记为1，非包含的部分标记为0
+    """
+    # result = [0] * len(input_ids)
+    i, j = 0, 0  # i遍历text1，j遍历text2
+    loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+    while i < len(input_ids) and j < len(lable_ids):
+        if input_ids[i] == lable_ids[j]:
+            # result[i] = 1
+            loss_mask[i] = 1
+            j += 1  # 匹配成功，移动到text2的下一个字符
+        i += 1
+    # print("result", result)
+    # return result
+    return loss_mask
