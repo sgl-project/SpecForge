@@ -7,6 +7,7 @@ torchaudio==2.8.0+rocm6.3
 torchvision==0.23.0+rocm6.3
 transformers==4.57.1
 qwen-vl-utils==0.0.11
+qwen-omni-utils==0.0.8
 datasets
 setuptools
 tqdm

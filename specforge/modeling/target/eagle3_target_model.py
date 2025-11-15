@@ -15,7 +15,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
@@ -66,13 +66,25 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        is_vlm: Optional[bool] = False,
     ) -> Eagle3TargetOutput:
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+
+        model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if is_vlm:
+            model_kwargs.update(
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                }
+            )
+        outputs = self.model(**model_kwargs)
 
         # extract the aux hidden states
         # output_hidden_states = True will return the embedding output as well
@@ -130,6 +142,10 @@ class Eagle3TargetModel(ABC):
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
+    _mllm_model_pool = [
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3OmniMoeForConditionalGeneration",
+    ]
 
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -160,7 +176,22 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 "device_map": device,
             }
 
-        target_model = AutoModelForCausalLM.from_pretrained(
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        architecture = config.architectures[0]
+        if architecture in cls._mllm_model_pool:
+            if architecture == "Qwen2_5_VLForConditionalGeneration":
+                from transformers import Qwen2_5_VLForConditionalGeneration
+
+                auto_model_loader = Qwen2_5_VLForConditionalGeneration
+            elif architecture == "Qwen3OmniMoeForConditionalGeneration":
+                # todo: change load method from `modelscope` to `transformers` after new version release
+                from modelscope import Qwen3OmniMoeThinkerForConditionalGeneration
+
+                auto_model_loader = Qwen3OmniMoeThinkerForConditionalGeneration
+        else:
+            auto_model_loader = AutoModelForCausalLM
+
+        target_model = auto_model_loader.from_pretrained(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             cache_dir=cache_dir,

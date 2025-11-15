@@ -31,14 +31,6 @@ from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
-try:
-    from qwen_vl_utils import process_vision_info
-
-    HAS_QWEN_VL_UTILS = True
-except ImportError:
-    HAS_QWEN_VL_UTILS = False
-    process_vision_info = None
-
 from specforge.utils import padding
 
 from .parse import GeneralParser, HarmonyParser
@@ -237,17 +229,43 @@ def preprocess_vlm_conversations(
             tokenize=False,
             add_generation_prompt=False,
         )
-        # get vision infor use qwen_vl_utils
-        if not HAS_QWEN_VL_UTILS:
-            raise ImportError(
-                "qwen_vl_utils is required for VLM preprocessing but is not installed. "
-                "Please install it to use VLM features."
+
+        _mm_processor_type_pool = ["Qwen2_5_VLProcessor", "Qwen3OmniMoeProcessor"]
+        processor_type = type(processor).__name__
+        if processor_type not in _mm_processor_type_pool:
+            supported = ", ".join(_mm_processor_type_pool)
+            raise ValueError(
+                f"Unsupported processor type: '{processor_type}'. "
+                f"Expected one of: [{supported}]"
             )
-        image_inputs, video_inputs = process_vision_info(messages)
+
+        if processor_type == "Qwen2_5_VLProcessor":
+            try:
+                from qwen_vl_utils import process_vision_info
+            except ImportError:
+                process_vision_info = None
+                raise ImportError(
+                    "qwen_vl_utils is required for MLLM preprocessing but is not installed. "
+                    "Please install it to use MLLM features."
+                )
+            audio_inputs = None
+            image_inputs, video_inputs = process_vision_info(messages)
+        elif processor_type == "Qwen3OmniMoeProcessor":
+            try:
+                from qwen_omni_utils import process_mm_info
+            except ImportError:
+                process_mm_info = None
+                raise ImportError(
+                    "qwen_omni_utils is required for MLLM preprocessing but is not installed. "
+                    "Please install it to use MLLM features."
+                )
+            audio_inputs, image_inputs, video_inputs = process_mm_info(messages)
+
         assert image_inputs is not None, "image_inputs must not be None"
 
         encoding = processor(
             text=[conversation],
+            audio=audio_inputs,
             images=image_inputs,
             videos=video_inputs,
             max_length=max_length,
