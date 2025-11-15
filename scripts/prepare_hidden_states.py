@@ -16,7 +16,8 @@ torchrun --nproc_per_node=8 \
     --max-length 2048 \
     --tp-size 4 \
     --batch-size 4 \
-    --num-samples 1000
+    --num-samples 1000 \
+    --output-path ./cache/hidden_states
 """
 
 import argparse
@@ -400,6 +401,19 @@ class HiddenStatesGenerator:
                 "loss_mask": batch["loss_mask"][valid_indices_in_batch],
             }
             del batch
+            if num_valid == 0:
+                # Data has already been generated, no sample processing, update progress bar.
+                if self.show_progress:
+                    progress_bar.set_postfix(
+                        {
+                            "processed": total_processed,
+                            "skipped": total_skipped,
+                            "pending_io": (
+                                len(self.pending_futures) if is_tp_rank_0() else 0
+                            ),
+                        }
+                    )
+                continue
 
             filtered_batch_gpu = {
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
