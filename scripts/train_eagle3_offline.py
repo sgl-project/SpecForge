@@ -36,6 +36,7 @@ from specforge.utils import (
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
+    shard_optimizer_state_with_dtensor,
 )
 
 
@@ -275,23 +276,24 @@ def main():
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
     with rank_0_priority():
-        train_eagle3_dataset_tmp = build_eagle3_dataset(
-            dataset=train_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            is_preformatted=args.is_preformatted,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            num_proc=args.build_dataset_num_proc,
-        )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset_tmp,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
-        )
+        if draft_model_config.draft_vocab_size != draft_model_config.vocab_size:
+            train_eagle3_dataset_tmp = build_eagle3_dataset(
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                is_preformatted=args.is_preformatted,
+                max_length=args.max_length,
+                cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                cache_key=cache_key,
+                num_proc=args.build_dataset_num_proc,
+            )
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset_tmp,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+            )
         train_eagle3_dataset = build_offline_eagle3_dataset(
             args.train_hidden_states_path,
             args.max_length,
@@ -320,8 +322,9 @@ def main():
         print_with_rank(f"Using provided total_steps: {args.total_steps}")
 
     # we load the vocab mapping then
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank("Loaded vocab mapping")
+    if draft_model_config.draft_vocab_size != draft_model_config.vocab_size:
+        draft_model.load_vocab_mapping(vocab_mapping_path)
+        print_with_rank("Loaded vocab mapping")
 
     if args.eval_data_path is not None:
         eval_eagle3_dataset = build_offline_eagle3_dataset(
@@ -364,10 +367,29 @@ def main():
     )
     print_with_rank("Initialized optimizer and scheduler")
 
+    start_epoch = 0
+    if draft_model_last_checkpoint is not None:
+        print_on_rank0(
+            f"Resuming draft model training from checkpoint: {draft_model_last_checkpoint}"
+        )
+        state_path = os.path.join(draft_model_last_checkpoint, "training_state.pt")
+
+        if os.path.exists(state_path):
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+            optimizer.load_state_dict(state)
+            shard_optimizer_state_with_dtensor(optimizer, get_dp_device_mesh())
+            start_epoch = state["epoch"] + 1
+            global_step = state.get("global_step", start_epoch * steps_per_epoch)
+            print_on_rank0(f"Resuming from epoch {start_epoch}")
+        else:
+            print_on_rank0(
+                f"Warning: Checkpoint directory {draft_model_last_checkpoint} found, but training_state.pt is missing. Starting from scratch."
+            )
+
     last_time = time.time()
 
     # start running
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
