@@ -95,6 +95,21 @@ def generate_draft_model_config(
     # Get target model config
     target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir)
 
+    # Handle nested config structures (e.g., Qwen3-VL, Qwen2.5-VL have text_config)
+    # Extract text_config if it exists, otherwise use the config directly
+    if hasattr(target_config, "text_config") and target_config.text_config is not None:
+        # For vision-language models, use text_config which contains the text model parameters
+        text_config = target_config.text_config
+        # Also get vocab_size from top level if available (some models have it at top level)
+        vocab_size = getattr(target_config, "vocab_size", None) or getattr(
+            text_config, "vocab_size", None
+        )
+        if vocab_size is not None:
+            text_config.vocab_size = vocab_size
+        source_config = text_config
+    else:
+        source_config = target_config
+
     # If no template specified, use default llama3-8B-eagle3.json
     if template_config_path is None:
         # Use the script execution directory as base
@@ -111,7 +126,7 @@ def generate_draft_model_config(
         draft_config = json.load(f)
 
     # Adjust architecture config based on target model type
-    if hasattr(target_config, "model_type"):
+    if hasattr(source_config, "model_type"):
         # Default to llama architecture
         draft_config["model_type"] = "llama"
 
@@ -130,10 +145,10 @@ def generate_draft_model_config(
         "torch_dtype": "torch_dtype",
     }
 
-    # Copy parameters from target model to draft config
+    # Copy parameters from source config (text_config if available, otherwise target_config) to draft config
     for target_param, draft_param in param_mappings.items():
-        if hasattr(target_config, target_param):
-            value = getattr(target_config, target_param)
+        if hasattr(source_config, target_param):
+            value = getattr(source_config, target_param)
             # Special handling for torch_dtype to make it JSON serializable
             if target_param == "torch_dtype" and isinstance(value, torch.dtype):
                 value = str(value).replace("torch.", "")

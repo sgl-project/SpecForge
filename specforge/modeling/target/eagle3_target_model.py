@@ -124,11 +124,22 @@ class Eagle3TargetModel(ABC):
         Set the layers to capture the aux hidden states from the target model outputs.
         """
         if aux_hidden_states_layers is None:
-            if hasattr(self.model.config, "num_hidden_layers"):
-                num_layers = self.model.config.num_hidden_layers
+            # Handle nested config structures (e.g., Qwen3-VL, Qwen2.5-VL have text_config)
+            # Extract text_config if it exists, otherwise use the config directly
+            if (
+                hasattr(self.model.config, "text_config")
+                and self.model.config.text_config is not None
+            ):
+                # For vision-language models, use text_config which contains the text model parameters
+                source_config = self.model.config.text_config
+            else:
+                source_config = self.model.config
+
+            if hasattr(source_config, "num_hidden_layers"):
+                num_layers = source_config.num_hidden_layers
             else:
                 raise ValueError(
-                    f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers"
+                    f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers (checked in {'text_config' if hasattr(self.model.config, 'text_config') and self.model.config.text_config is not None else 'root config'})"
                 )
             aux_hidden_states_layers = [
                 1,
@@ -144,6 +155,7 @@ class Eagle3TargetModel(ABC):
 class HFEagle3TargetModel(Eagle3TargetModel):
     _mllm_model_pool = [
         "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
     ]
 
@@ -183,6 +195,10 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 from transformers import Qwen2_5_VLForConditionalGeneration
 
                 auto_model_loader = Qwen2_5_VLForConditionalGeneration
+            elif architecture == "Qwen3VLForConditionalGeneration":
+                from transformers import Qwen3VLForConditionalGeneration
+
+                auto_model_loader = Qwen3VLForConditionalGeneration
             elif architecture == "Qwen3OmniMoeForConditionalGeneration":
                 # todo: change load method from `modelscope` to `transformers` after new version release
                 from modelscope import Qwen3OmniMoeThinkerForConditionalGeneration
