@@ -10,7 +10,7 @@ TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels \
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    $ROOT_DIR/scripts/train_eagle3_online.py \
+    $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \

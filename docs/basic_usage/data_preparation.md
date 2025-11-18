@@ -100,7 +100,7 @@ To use pre-formatted datasets, add the `--is-preformatted` flag to your training
 
 ```bash
 torchrun --standalone --nproc_per_node 8 \
-    scripts/train_eagle3_online.py \
+    scripts/train_eagle3.py \
     --is-preformatted \
     --chat-template qwen \
     --train-data-path ./your_preformatted_dataset.jsonl \

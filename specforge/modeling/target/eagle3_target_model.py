@@ -22,6 +22,7 @@ from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
+from .target_head import TargetHead
 
 
 @dataclass
@@ -196,7 +197,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             enable_torch_compile=True,
             tp_size=tp_size,
             pp_size=1,
-            attention_backend="torch_native",
+            attention_backend="flashinfer",
         )
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(

@@ -12,10 +12,11 @@ torchrun --nproc_per_node=8 \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --enable-aux-hidden-states \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
+    --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
     --chat-template llama3 \
     --max-length 2048 \
-    --tp-size 4 \
-    --batch-size 4 \
+    --tp-size 1 \
+    --batch-size 32 \
     --num-samples 1000 \
     --output-path ./cache/hidden_states
 """

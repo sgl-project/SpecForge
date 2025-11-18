@@ -1,75 +1,35 @@
-#!/bin/bash
-export PERSIST_DIR=/tmp # Please Change this to your own directory
-export MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
-export DATASET_PATH=$PERSIST_DIR/dataset/
-export CACHE_DIR=$PERSIST_DIR/cache/
-export OUTPUT_DIR=$PERSIST_DIR/outputs/
-export HIDDEN_STATES_DIR=$PERSIST_DIR/hidden_states/
-export MAX_LENGTH=2048
-export CHAT_TEMPLATE=llama3
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+ROOT_DIR=$(dirname $SCRIPT_DIR)
+NUM_GPUS=${1:-8}
 
-hf download $MODEL_PATH
-hf download Aeala/ShareGPT_Vicuna_unfiltered --repo-type dataset
+# generate hidden states
+# torchrun \
+#     --standalone \
+#     --nproc_per_node $NUM_GPUS \
+#     scripts/prepare_hidden_states.py \
+#     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+#     --enable-aux-hidden-states \
+#     --data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
+#     --output-path $ROOT_DIR/cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
+#     --chat-template llama3 \
+#     --max-length 4096 \
+#     --tp-size 1 \
+#     --batch-size 32
 
-python scripts/prepare_data.py --dataset sharegpt --output-path $DATASET_PATH --split-eval
-python scripts/build_eagle3_dataset.py \
-    --model-path $MODEL_PATH \
-    --data-path $DATASET_PATH \
-    --cache-dir $CACHE_DIR \
-    --chat-template $CHAT_TEMPLATE \
-    --max-length $MAX_LENGTH \
-
-CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun --nproc_per_node=4 \
-    scripts/prepare_hidden_states.py \
-    --data-path $DATASET_PATH/sharegpt_test.jsonl \
-    --model-path $MODEL_PATH \
-    --cache-dir $CACHE_DIR \
-    --output-path $HIDDEN_STATES_DIR/sharegpt_test \
-    --chat-template $CHAT_TEMPLATE \
-    --max-length $MAX_LENGTH \
-    --enable-aux-hidden-states \
-    --tp-size 4 \
-    --batch-size 4 \
-    --mem-frac=0.75
-
-CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun --nproc_per_node=4 \
-    scripts/prepare_hidden_states.py \
-    --data-path $DATASET_PATH/sharegpt_train.jsonl \
-    --model-path $MODEL_PATH \
-    --cache-dir $CACHE_DIR \
-    --output-path $HIDDEN_STATES_DIR/sharegpt_train \
-    --chat-template $CHAT_TEMPLATE \
-    --max-length $MAX_LENGTH \
-    --enable-aux-hidden-states \
-    --tp-size 4 \
-    --batch-size 4 \
-    --mem-frac=0.75
-
-# python scripts/view_data.py --data-path $HIDDEN_STATES_DIR/all_test/rows_0-5000/data_100.ckpt --tokenizer $MODEL_PATH
-# python scripts/view_data.py --data-path $HIDDEN_STATES_DIR/all_train/rows_0-5000/data_100.ckpt --tokenizer $MODEL_PATH
-
-export NUM_GPUS=4
-CUDA_VISIBLE_DEVICES=1,2,3,4 torchrun \
+# train eagle3 offline
+torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    scripts/train_eagle3_offline.py \
-    --target-model-path $MODEL_PATH \
-    --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path $DATASET_PATH/sharegpt_train.jsonl \
-    --train-hidden-states-path $HIDDEN_STATES_DIR/sharegpt_train/ \
-    --eval-data-path $DATASET_PATH/sharegpt_test.jsonl \
-    --eval-hidden-states-path $HIDDEN_STATES_DIR/sharegpt_test/ \
-    --output-dir $OUTPUT_DIR \
+    $ROOT_DIR/scripts/train_eagle3.py \
+    --target-model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
+    --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
+    --train-hidden-states-path $ROOT_DIR/cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
+    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-sharegpt-offline \
     --num-epochs 10 \
-    --draft-global-batch-size 16 \
-    --draft-micro-batch-size 1 \
-    --learning-rate 5e-5 \
-    --draft-attention-backend flex_attention \
-    --max-length $MAX_LENGTH \
-    --chat-template $CHAT_TEMPLATE \
-    --cache-dir $CACHE_DIR \
-    --dist-timeout=10 \
-    --log-steps 1 \
-    --report-to wandb \
-    --wandb-project llama3-8b-eagle3 \
-    --wandb-name offline-100k-4gpus
+    --batch-size 1 \
+    --tp-size 1 \
+    --learning-rate 1e-4 \
+    --max-length 4096 \
+    --chat-template llama3 \
+    --cache-dir $ROOT_DIR/cache
