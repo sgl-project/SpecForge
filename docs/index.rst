@@ -29,4 +29,5 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
    :maxdepth: 1
    :caption: Advanced Features
 
+   advanced_features/regenerate_dataset.md
    advanced_features/customization.md
