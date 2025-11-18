@@ -10,6 +10,7 @@ N_PER_NODE=$RESOURCE_NUM_GPU
 pip install sglang[all]==0.5.4  --trusted-host didiyum.sys.xiaojukeji.com -i http://didiyum.sys.xiaojukeji.com/didiyum/pip/simple/
 sed -i.bak '644s/log_info_on_rank0(logger, "Chunked prefix cache is turned on.")/pass/' /home/luban/miniconda3/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py
 export FLASHINFER_DISABLE_VERSION_CHECK=1
+cp patch/deepseek_v2.py /home/luban/miniconda3/lib/python3.12/site-packages/sglang/srt/models/.
 pip list
 cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" || exit 1
 torchrun \
