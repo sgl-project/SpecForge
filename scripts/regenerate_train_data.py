@@ -6,20 +6,10 @@ which better aligns the draft model with the target model’s output distributio
 import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor
-from math import e
-from typing import List
 
 import requests
-from torch import Future
-from torch._higher_order_ops.while_loop import WhileLoopOp
 from tqdm import tqdm
 from transformers import AutoTokenizer
-
-# Global variables will be initialized in main function
-TEMPERATURE = None
-BASE_URL = None
-
-SERVER_PROCESS = None
 
 
 def parse_arguments():
