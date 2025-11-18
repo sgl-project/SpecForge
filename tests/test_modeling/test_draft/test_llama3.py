@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 from transformers import LlamaConfig
 
+from specforge import OfflineEagle3Model
 from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaForCausalLMEagle3,
@@ -85,7 +86,7 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
     def test_model_forward_pass(self):
         """forward"""
-        model = LlamaForCausalLMEagle3(self.config)
+        model = OfflineEagle3Model(self.config)
         model.eval()
 
         batch_size = 2
@@ -100,9 +101,24 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
                 inputs_embeds=input_emb,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
+                ttt_length=4,
             )
 
         self.assertEqual(outputs.shape, (batch_size, seq_len, self.config.hidden_size))
+
+
+    def test_ups_attention_forward_passs(self):
+        usp_model = OfflineEagle3Model(self.config, attention_backend="usp")
+        usp_model.eval()
+
+        batch_size = 1
+        seq_len = 10
+
+        input_emb = torch.randn(batch_size, seq_len, self.config.hidden_size)
+        hidden_states = torch.randn(batch_size, seq_len, self.config.hidden_size * 3)
+        attention_mask = torch.ones(batch_size, seq_len)
+
+
 
     def test_state_dict_compatibility(self):
         model1 = LlamaForCausalLMEagle3(self.config)

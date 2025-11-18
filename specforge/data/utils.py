@@ -83,7 +83,13 @@ class DataCollatorWithPadding:
                 - attention_mask: torch.Tensor of shape (B, N)
                 - loss_mask: torch.Tensor of shape (B, N)
         """
+        ulysses_degree = 8
         max_length = max(item["input_ids"].shape[1] for item in features)
+        if max_length % ulysses_degree == 0:
+            max_length = max_length
+        else:
+            max_length = ((max_length + ulysses_degree - 1) // ulysses_degree) * ulysses_degree
+
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
         )
@@ -221,12 +227,12 @@ class VlmDataCollatorWithPadding:
 def prepare_dp_dataloaders(
     dataset: Dataset,
     batch_size: int,
-    num_workers: int = 4,
+    num_workers: int = 8,
     process_group: Optional[dist.ProcessGroup] = None,
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
-    prefetch_factor: Optional[int] = 2,
+    prefetch_factor: Optional[int] = 3,
     **dataloader_kwargs
 ) -> DataLoader:
     """

@@ -1,4 +1,5 @@
 import torch
+from torch.distributed.tensor import DTensor
 
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
@@ -41,7 +42,7 @@ class BF16Optimizer:
                 mp.grad = (
                     p.grad.detach().to(torch.float32) if p.grad is not None else None
                 )
-        torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
@@ -49,6 +50,9 @@ class BF16Optimizer:
             for p, mp in zip(self.model_params, self.fp32_params):
                 p.data.copy_(mp.data.to(p.dtype))
                 p.grad = None
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
+        return grad_norm
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])

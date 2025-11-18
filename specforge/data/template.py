@@ -219,6 +219,6 @@ TEMPLATE_REGISTRY.register(
         system_prompt="",
         end_of_turn_token="<｜end▁of▁sentence｜>",
         bos_token = "<｜begin▁of▁sentence｜>",
-        parser_type="DeepSeek"
+        parser_type="DeepSeek3"
     ),
 )

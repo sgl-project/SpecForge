@@ -8,7 +8,7 @@ from transformers import PreTrainedTokenizer
 
 from .template import ChatTemplate
 from specforge.utils import print_on_rank0
-__all__ = ["GeneralParser", "HarmonyParser"]
+__all__ = ["GeneralParser", "HarmonyParser", "DeepSeekParser", "DeepSeek3Parser"]
 
 
 class Parser(ABC):
@@ -81,7 +81,7 @@ class GeneralParser(Parser):
 
             conversation = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs
-            ) 
+            )
             # print_on_rank0(f"conversation = {conversation}")
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
@@ -245,7 +245,7 @@ class DeepSeekParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            
+
             for j, msg in enumerate(conversation):
                 role = msg["role"]
                 if role == "assistant":
@@ -257,12 +257,14 @@ class DeepSeekParser(Parser):
 
             conversation = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs
-            ) 
-            
+            ) # 所有inputs
+
             conversation_labels = self.tokenizer.apply_chat_template(
                 labels, tokenize=False, add_generation_prompt=False, **kwargs
-            ).split(self.bos)[-1]
-            
+            ).split(self.bos)[-1] #  个性化 <think> </think> 有问题
+
+
+
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
@@ -284,7 +286,7 @@ class DeepSeekParser(Parser):
         )
         input_ids = encoding.input_ids[0]
         label_ids = encoding_label.input_ids[0]
-        if len(input_ids) > max_length: 
+        if len(input_ids) > max_length:
             print_on_rank0(f"data len > max length")
             return None, None
         loss_mask = create_mask(input_ids, label_ids)
@@ -308,3 +310,75 @@ def create_mask(input_ids, lable_ids):
     # print("result", result)
     # return result
     return loss_mask
+class DeepSeek3Parser(Parser): # 改进
+    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+        super().__init__(tokenizer, chat_template)
+        self.system_prompt = chat_template.system_prompt
+        self.user_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.user_header}"
+        )
+        self.assistant_message_separator = (
+            f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
+        )
+        self.bos = chat_template.bos_token
+        self.eos = chat_template.end_of_turn_token
+
+    def parse(
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        **kwargs,
+    ) -> Dict[str, List[torch.Tensor]]:
+        if not preformatted:
+            input_ids = []
+            loss_mask = []
+            if conversation[0]["role"] == "system":
+                warnings.warn(
+                    f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+                )
+                self.system_prompt = conversation[0]["content"]
+                conversation = conversation[1:]
+
+
+            # encode system
+            if self.system_prompt:
+                system_ids = self.tokenizer.encode(self.system_prompt, add_special_tokens=True) #
+                input_ids.extend(system_ids)
+                loss_mask.extend([0] * len(system_ids))
+
+            for j, msg in enumerate(conversation):
+                role = msg["role"]
+                if role == "assistant":
+                    assistant_token = "<｜Assistant｜></think>"
+                    assistant_token_ids = self.tokenizer.encode(assistant_token, add_special_tokens=False)
+                    # if msg.get("tool_calls"):  # TODO
+                    #    f"<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>search_history_order<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>"
+                    assistant_content = assistant_token + msg.get("content", "") + self.eos
+                    assistant_ids = self.tokenizer.encode(assistant_content, add_special_tokens=False)
+                    input_ids.extend(assistant_ids)
+                    loss_mask.extend([0] * len(assistant_token_ids) + [1] * (len(assistant_ids) - len(assistant_token_ids)))
+                elif role == "user":
+                    user_content = "<｜User｜>" + msg.get("content", "")
+                    user_ids = self.tokenizer.encode(user_content, add_special_tokens=False)
+                    input_ids.extend(user_ids)
+                    loss_mask.extend([0] * len(user_ids))
+                elif role == "tool":
+                    pass
+
+
+        if not self.tokenizer.pad_token_id:
+            self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
+
+        assert len(input_ids) == len(loss_mask)
+
+        if len(input_ids) > max_length:
+            print_on_rank0(f"data len > max length")
+            return None, None
+        input_ids = torch.tensor(input_ids)
+        loss_mask = torch.tensor(loss_mask)
+
+        return input_ids, loss_mask
+
+
+

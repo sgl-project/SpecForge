@@ -1,11 +1,12 @@
 import unittest
-
+import sys
 import torch
 from transformers import AutoTokenizer
+sys.path.append("/nfs/ofs-llm-ssd/user/daiyajun/project/online/specforge")
 
 from specforge.data.preprocessing import preprocess_conversations
 from specforge.data.template import TEMPLATE_REGISTRY
-
+from specforge.data.parse import DeepSeek3Parser
 
 # Utility function for visual debugging
 def visualize_loss_mask(tokenizer, input_ids, loss_mask):
@@ -65,9 +66,9 @@ class TestPreprocessing(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures with Qwen3-8B tokenizer and template."""
-        self.model_path = "Qwen/Qwen3-8B"
+        self.model_path = "/nfs/ofs-llab-cold/model/deepseek-ai/DeepSeek-V3.1" #"Qwen/Qwen3-8B"
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        self.chat_template = TEMPLATE_REGISTRY.get("qwen")
+        self.chat_template = TEMPLATE_REGISTRY.get("deepseek3")
         self.max_length = 512
 
     def test_conversation_preprocessing_basic(self):
@@ -299,14 +300,43 @@ class TestPreprocessing(unittest.TestCase):
                     f"User content '{user_content}' found in assistant spans for test case '{test_case['name']}': '{assistant_text}'",
                 )
 
+    def test_parser(self):
+        parser = DeepSeek3Parser(self.tokenizer, self.chat_template)
+        conversations =  [
+                {"role": "system", "content": "一个测试脚本"},
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "The answer is 4."},
+                {"role": "user", "content": "What is 2-2?"},
+                {"role": "assistant", "content": "The answer is 0."},
+            ]
+        conversations_text = self.tokenizer.apply_chat_template(
+                conversations, tokenize=False, add_generation_prompt=False
+            ) 
+        print("conversations_text", conversations_text)
+        encoding = self.tokenizer(
+            conversations_text,
+            return_offsets_mapping=True,
+            max_length=1024,
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        encoding_ids = encoding.input_ids[0]
+        print("encoding_ids:", encoding_ids, type(encoding_ids))
+        input_ids, loss_mask = parser.parse(conversations, 512)
+        print("input_ids:", input_ids, type(input_ids))
+        print("loss_mask:", loss_mask, type(loss_mask))
 
 if __name__ == "__main__":
-    suite = unittest.TestSuite()
+    c = TestPreprocessing()
+    c.setUp()
+    c.test_parser()
+    # suite = unittest.TestSuite()
 
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPreprocessing))
+    # suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPreprocessing))
 
-    runner = unittest.TextTestRunner(verbosity=2)
-    runner.run(suite)
+    # runner = unittest.TextTestRunner(verbosity=2)
+    # runner.run(suite)
 
     # Commented-out example for using visualize_loss_mask function directly
     """
