@@ -4,7 +4,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -243,7 +243,7 @@ def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
 
 def build_target_model(
     args: Namespace, draft_model_config: AutoDraftModelConfig, is_online: bool = True
-) -> Eagle3TargetModel:
+) -> Tuple[Union[Eagle3TargetModel, TargetHead], Optional[AutoProcessor]]:
     """
     Build the target model according to the arguments.
 
