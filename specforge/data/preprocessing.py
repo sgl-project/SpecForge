@@ -31,14 +31,6 @@ from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
-try:
-    from qwen_vl_utils import process_vision_info
-
-    HAS_QWEN_VL_UTILS = True
-except ImportError:
-    HAS_QWEN_VL_UTILS = False
-    process_vision_info = None
-
 from specforge.utils import padding
 
 from .parse import GeneralParser, HarmonyParser
@@ -48,9 +40,72 @@ from .template import TEMPLATE_REGISTRY, ChatTemplate
 Conversation = List[Dict[str, str]]
 
 
-# ==============================
-# This file is for preprocessing the data
-# ==============================
+# Processor configuration for multimodal message processing
+_PROCESSOR_CONFIGS = {
+    "Qwen2_5_VLProcessor": {
+        "module": "qwen_vl_utils",
+        "function": "process_vision_info",
+        "supports_audio": False,
+    },
+    "Qwen3VLProcessor": {
+        "module": "qwen_vl_utils",
+        "function": "process_vision_info",
+        "supports_audio": False,
+    },
+    "Qwen3OmniMoeProcessor": {
+        "module": "qwen_omni_utils",
+        "function": "process_mm_info",
+        "supports_audio": True,
+    },
+}
+
+
+def _process_mm_messages(
+    processor_type: str, messages: List[Dict]
+) -> Tuple[Optional[List], List, List]:
+    """
+    Process multimodal messages based on processor type.
+
+    Args:
+        processor_type: The name of the processor class.
+        messages: List of message dictionaries to process.
+
+    Returns:
+        A tuple of (audio_inputs, image_inputs, video_inputs).
+        audio_inputs will be None if the processor doesn't support audio.
+
+    Raises:
+        ValueError: If the processor type is not supported.
+        ImportError: If the required processing module is not installed.
+    """
+    if processor_type not in _PROCESSOR_CONFIGS:
+        supported = ", ".join(_PROCESSOR_CONFIGS.keys())
+        raise ValueError(
+            f"Unsupported processor type: '{processor_type}'. "
+            f"Expected one of: [{supported}]"
+        )
+
+    config = _PROCESSOR_CONFIGS[processor_type]
+
+    # Dynamically import the processing function
+    try:
+        module = __import__(config["module"], fromlist=[config["function"]])
+        process_func = getattr(module, config["function"])
+    except ImportError:
+        module_name = config["module"]
+        raise ImportError(
+            f"{module_name} is required for MLLM preprocessing but is not installed. "
+            "Please install it to use MLLM features."
+        )
+
+    # Call the processing function based on whether it supports audio
+    if config["supports_audio"]:
+        audio_inputs, image_inputs, video_inputs = process_func(messages)
+    else:
+        audio_inputs = None
+        image_inputs, video_inputs = process_func(messages)
+
+    return audio_inputs, image_inputs, video_inputs
 
 
 def _apply_loss_mask_from_chat_template(
@@ -237,17 +292,17 @@ def preprocess_vlm_conversations(
             tokenize=False,
             add_generation_prompt=False,
         )
-        # get vision infor use qwen_vl_utils
-        if not HAS_QWEN_VL_UTILS:
-            raise ImportError(
-                "qwen_vl_utils is required for VLM preprocessing but is not installed. "
-                "Please install it to use VLM features."
-            )
-        image_inputs, video_inputs = process_vision_info(messages)
+
+        processor_type = type(processor).__name__
+        audio_inputs, image_inputs, video_inputs = _process_mm_messages(
+            processor_type, messages
+        )
+
         assert image_inputs is not None, "image_inputs must not be None"
 
         encoding = processor(
             text=[conversation],
+            audio=audio_inputs,
             images=image_inputs,
             videos=video_inputs,
             max_length=max_length,
