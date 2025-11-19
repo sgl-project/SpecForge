@@ -11,7 +11,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama4-scout-17B-16E-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --output-dir $ROOT_DIR/outputs/llama4-scout-17B-16E-eagle3 \
     --num-epochs 10 \
     --batch-size 1 \

@@ -153,13 +153,18 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
 
 
 def wrap_eagle3_logits_processors_in_module(
-    module: nn.Module, return_full_logits: bool = False
+    module: nn.Module, return_last_hidden_states: bool = False, return_logits: bool = False
 ):
     """
     This function will wrap the SGLang's original logits processor with the modified one for EAGLE3.
     """
+    target_list = []
     for name, submodule in module.named_modules():
         if isinstance(submodule, LogitsProcessor):
-            wrapped = LogitsProcessorForEAGLE3(submodule, return_full_logits)
-            setattr(module, name, wrapped)
-            print(f"wrapped {name} with LogitsProcessorForEAGLE3")
+            target_list.append(name)
+
+    for name in target_list:
+        logits_processor = module.get_submodule(name)
+        wrapped_logits_processor = LogitsProcessorForEAGLE3(logits_processor, return_last_hidden_states=return_last_hidden_states, return_logits=return_logits)
+        module.set_submodule(name, wrapped_logits_processor)
+        print(f"wrapped {name} with LogitsProcessorForEAGLE3")

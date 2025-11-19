@@ -216,7 +216,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             nccl_port=None,
         )
         wrap_eagle3_logits_processors_in_module(
-            model_runner.model, return_full_logits=False
+            model_runner.model, return_last_hidden_states=False, return_logits=True
         )
         return cls(model_runner)
 
