@@ -11,4 +11,3 @@ Speculative decoding is an important and powerful technique for speeding up infe
 ## ✅ SGLang-ready
 
 As SpecForge is built by the SGLang, we ensures that the draft models trained with SpecForge are directly compatible with [SGLang](https://github.com/sgl-project/sglang). This means that no postprocessing or weights conversion is required, providing users with a seamless experience from training to serving. We export our data in the Hugging Face format, so you can load it to other serving frameworks as well if the model is supported by them.
-

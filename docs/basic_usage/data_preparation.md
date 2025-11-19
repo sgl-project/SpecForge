@@ -2,7 +2,7 @@
 
 ## 📍 Overview
 
-Data is an important aspect of speculative decoding as the quality of the dataset directly affects the acceptance rate of the draft model. In this section, we will introduce how to prepare the dataset for both online and offline training. 
+Data is an important aspect of speculative decoding as the quality of the dataset directly affects the acceptance rate of the draft model. In this section, we will introduce how to prepare the dataset for both online and offline training.
 
 ## ☁️ Pre-supported Datasets
 

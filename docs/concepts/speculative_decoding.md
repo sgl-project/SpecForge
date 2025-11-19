@@ -28,8 +28,3 @@ In simple words, it will only accept the candidate tokens that are most likely t
   <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2025/09/speculative-decoding-verification-phase-target-model.gif" alt="Verification"><br>
   <span>Source: <a href="https://developer.nvidia.com/blog/an-introduction-to-speculative-decoding-for-reducing-latency-in-ai-inference/">Blog by NVIDIA</a></span>
 </p>
-
-
-
-
-
