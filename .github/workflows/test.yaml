@@ -30,6 +30,10 @@ jobs:
             cp -p -r /github/home/sf/* ./
           fi
 
+      - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
+        run: |
+          rm -rf /github/home/.cache/flashinfer
+
       - name: Install dependencies
         shell: bash
         run: |
