@@ -1,11 +1,10 @@
 # Eagle3 for Llama3 - Offline
 
-
 ## Introduction
 
-This document provides a step-by-step guide on how train the EAGLE3 model for the Llama3.1-8B-Instruct model in an offline manner. In offline training, we generate the hidden states required by EAGLE3 draft model beforehand and store them to the disk. During training, we load them back to the GPU memory. As offline training requires a lot of disk space, we do not recommend running this on large datasets such as Perfect-Blend.
+This document provides a step-by-step guide on how to train the EAGLE3 model for the Llama3.1-8B-Instruct model in an offline manner. In offline training, we generate the hidden states required by EAGLE3 draft model beforehand and store them to the disk. During training, we load them back to the GPU memory. As offline training requires a lot of disk space, we do not recommend running this on large datasets such as Perfect-Blend.
 
-## Trainining on ShareGPT dataset
+## Training on ShareGPT dataset
 
 ### **Step 1. Prepare ShareGPT dataset**
 
@@ -34,7 +33,7 @@ torchrun \
     --batch-size 32
 ```
 
-The hidden states will be saved to the disk in the `output-path` diretory.
+The hidden states will be saved to the disk in the `output-path` directory.
 
 ### **Step 3. Start Training**
 
@@ -42,8 +41,8 @@ The hidden states will be saved to the disk in the `output-path` diretory.
 torchrun \
     --standalone \
     --nproc_per_node 8 \
-    $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    ./scripts/train_eagle3.py \
+    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
     --train-data-path ./cache/dataset/sharegpt_train.jsonl \
     --train-hidden-states-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \

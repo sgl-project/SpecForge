@@ -6,11 +6,11 @@ Data is an important aspect of speculative decoding as the quality of the datase
 
 ## ☁️ Pre-supported Datasets
 
-We have provided a script to prepare some sample datasets out of the box, these datastes include:
+We have provided a script to prepare some sample datasets out of the box, these datasets include:
 1. [ultrachat](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) (200k)
 2. [sharegpt](https://huggingface.co/datasets/Aeala/ShareGPT_Vicuna_unfiltered) (120k)
 3. [perfectblend](https://huggingface.co/datasets/mlabonne/open-perfectblend) (1.4M)
-4. and others (we add support for more datasets once a while)
+4. and others (we continuously add support for more datasets)
 
 You can run the script below to prepare the corresponding dataset.
 
@@ -101,7 +101,7 @@ torchrun --standalone --nproc_per_node 8 \
     # ... other arguments
 ```
 
-Once you have the `jsonl` file ready, you can go straight for online training or hidden states generation for offline training.
+Once you have the `jsonl` file ready, you can proceed with online training or generate hidden states for offline training. See the Training guide for more details.
 
 
 ## ➕ Handling Multiple Datasets

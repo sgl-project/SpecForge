@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This document provides a step-by-step guide on how train the EAGLE3 model for the Llama3.1-8B-Instruct model in an online manner. In online training, we generate the hidden states required by EAGLE3 draft model on the fly during training. This example is using `ShareGPT` dataset for training, the performance is not optimal due to the size and limited coverage of the dataset. If you look for optimal performance, we recommend you to try more diverse datasets such as [`Perfect-Blend`](https://huggingface.co/datasets/facebook/perfect-blend). We have also included a section on training on `Perfect-Blend` dataset at the end of this document.
+This document provides a step-by-step guide on how to train the EAGLE3 model for the Llama3.1-8B-Instruct model in an online manner. In online training, we generate the hidden states required by EAGLE3 draft model on the fly during training. This example is using `ShareGPT` dataset for training, the performance is not optimal due to the size and limited coverage of the dataset. If you look for optimal performance, we recommend you to try more diverse datasets such as [`Perfect-Blend`](https://huggingface.co/datasets/facebook/perfect-blend). We have also included a section on training on `Perfect-Blend` dataset at the end of this document.
 
 
 ## Training on ShareGPT dataset
@@ -40,7 +40,7 @@ For `Llama3.1-8B`, we add a system prompt to all training data, following the ap
 
 The four numbers in the config represent: `batch_size, num_steps, topk, num_verify_tokens`.  You can adjust the values in the config list to experiment with different test cases.
 
-I have upload my trained eagle model in [zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct). You are welcome to download and check its accept length.
+A pre-trained EAGLE model is available at [zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct) for reference.
 
 ```shell
 config_list=(

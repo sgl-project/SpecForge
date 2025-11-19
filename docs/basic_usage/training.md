@@ -39,7 +39,7 @@ bash ./examples/run_llama3_eagle3_online.sh
 
 ## 💨 Offline Training
 
-The difference between online and offline trainining is that we need to generate the hidden states before training. We also use ShareGPT and Llama3-8B-Instruct as an example.
+The difference between online and offline training is that we need to generate the hidden states before training. We also use ShareGPT and Llama3-8B-Instruct as an example.
 
 **Step 1: Prepare the dataset**
 
