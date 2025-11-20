@@ -54,7 +54,7 @@
     <link rel="prev" title="📦 Installation" href="../get_started/install.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-    <meta name="docbuild:last-update" content="Nov 18, 2025"/>
+    <meta name="docbuild:last-update" content="Nov 20, 2025"/>
   </head>
   
   
@@ -519,7 +519,7 @@ python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--d
 <p>This format is useful when you have pre-formatted prompts that were used during training of the target model and have raw generations from the target model.</p>
 <p>To use pre-formatted datasets, add the <code class="docutils literal notranslate"><span class="pre">--is-preformatted</span></code> flag to your training command. Note that the <code class="docutils literal notranslate"><span class="pre">--chat-template</span></code> parameter is still needed and should match the template used in your pre-formatted text, as it is used to identify user/assistant tokens to determine the assistant spans and generate the corresponding loss mask.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>scripts/train_eagle3_online.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>scripts/train_eagle3.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--is-preformatted<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--chat-template<span class="w"> </span>qwen<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--train-data-path<span class="w"> </span>./your_preformatted_dataset.jsonl<span class="w"> </span><span class="se">\</span>
@@ -621,7 +621,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 18, 2025.
+  Last updated on Nov 20, 2025.
   <br/>
 </p>
   </div>

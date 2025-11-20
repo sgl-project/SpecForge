@@ -53,7 +53,7 @@
     <link rel="prev" title="↩️ Regenerate Datasets" href="regenerate_dataset.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-    <meta name="docbuild:last-update" content="Nov 18, 2025"/>
+    <meta name="docbuild:last-update" content="Nov 20, 2025"/>
   </head>
   
   
@@ -433,7 +433,7 @@ document.write(`
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--standalone<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>./scripts/train_eagle3_online.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>./scripts/train_eagle3.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--target-model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--draft-model-config<span class="w"> </span>./configs/llama3-8B-eagle3.json<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--train-data-path<span class="w"> </span>./cache/dataset/sharegpt.jsonl<span class="w"> </span><span class="se">\</span>
@@ -446,7 +446,7 @@ document.write(`
 <span class="w">    </span>--cache-dir<span class="w"> </span>./cache
 </pre></div>
 </div>
-<p>If you wish to understand what each argument does, you can run <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">scripts/train_eagle3_online.py</span> <span class="pre">--help</span></code> to see the full list of arguments. Particularly, we will discuss some important arguments below.</p>
+<p>If you wish to understand what each argument does, you can run <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">scripts/train_eagle3.py</span> <span class="pre">--help</span></code> to see the full list of arguments. Particularly, we will discuss some important arguments below.</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">--chat-template</span></code>: This should be the chat template to use for the model, so please make sure you set it to the correct value.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code>: This directory contains the dataset cache including the <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">attention_mask</span></code> and <code class="docutils literal notranslate"><span class="pre">vocab_mapping</span></code>. These caches can make your data loading much faster once a cache is generated. The cache file has a name which is obtained by hashing the dataset path to avoid cache collision.</p></li>
@@ -614,7 +614,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 18, 2025.
+  Last updated on Nov 20, 2025.
   <br/>
 </p>
   </div>
