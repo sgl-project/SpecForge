@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="🚀 Training" href="training.html" />
-    <link rel="prev" title="📦 Installation" href="../get_started/install.html" />
+    <link rel="prev" title="🦅 EAGLE3" href="../concepts/EAGLE3.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
     <meta name="docbuild:last-update" content="Nov 20, 2025"/>
@@ -164,22 +164,32 @@
     <div class="bd-toc-item navbar-nav active">
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../get_started/install.html">📦 Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/about.html">⚡️ About SpecForge</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">📝 Data Preparation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="training.html">🚀 Training</a></li>
+
+
+
+
 <li class="toctree-l1"><a class="reference internal" href="benchmarking.html">🤖 Benchmarking On SGLang</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3.html">Eagle3 for Llama3</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../advanced_features/regenerate_dataset.html">↩️ Regenerate Datasets</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">💡 Customize Your Own Training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">Eagle3 for Llama3 - Online</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">Eagle3 for Llama3 - Offline</a></li>
 </ul>
 
     </div>
@@ -409,14 +419,15 @@ document.write(`
             </div>
             <nav aria-label="Page">
                 <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-train-dataset">🔄 Regenerate Train Dataset</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-online-training-dataset">☁️ Prepare Online Training Dataset</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-offline-training-dataset">💾 Prepare Offline Training Dataset</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">📍 Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pre-supported-datasets">☁️ Pre-supported Datasets</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-datasets">↩️ Regenerate Datasets</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-your-own-dataset">🤩 Prepare your own dataset</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-conversation-format">Option 1: Conversation Format</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-pre-formatted-text-format">Option 2: Pre-formatted Text Format</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#handling-multiple-datasets">➕ Handling Multiple Datasets</a></li>
 </ul>
             </nav>
         </div>
@@ -428,31 +439,22 @@ document.write(`
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="data-preparation">
+  <section class="tex2jax_ignore mathjax_ignore" id="data-preparation">
 <h1>📝 Data Preparation<a class="headerlink" href="#data-preparation" title="Link to this heading">#</a></h1>
-<p>In this section, we will introduce how to prepare the dataset for both online and offline training. As mentioned in the Overview section, online training only requires the raw dataset while offline training requires the hidden states generated from the target model. In the section below, we will introduce how to prepare both the raw dataset and the hidden states.</p>
-<section id="regenerate-train-dataset">
-<h2>🔄 Regenerate Train Dataset<a class="headerlink" href="#regenerate-train-dataset" title="Link to this heading">#</a></h2>
-<p>Many public datasets were not generated by your target model, which may lead to misalignment between the draft model’s outputs and the target model’s behavior — reducing acceptance rate and inference efficiency. To address this, we <strong>recommend regenerating the dataset using the target model</strong>, which better aligns the draft model with the target model’s output distribution, improving acceptance length and overall performance.</p>
-<p>Run the following command to regenerate your dataset:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>scripts/regenerate_data.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--model<span class="w"> </span>&lt;target-model-path&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--input-file-path<span class="w"> </span>&lt;jsonl-file-path&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--output-file-path<span class="w"> </span>&lt;regenerated-jsonl-file-path&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--batch-size<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--num-samples<span class="w"> </span><span class="m">1000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--temperature<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.85<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--auto-launch-server
-</pre></div>
-</div>
+<section id="overview">
+<h2>📍 Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>Data is an important aspect of speculative decoding as the quality of the dataset directly affects the acceptance rate of the draft model. In this section, we will introduce how to prepare the dataset for both online and offline training.</p>
 </section>
-<section id="prepare-online-training-dataset">
-<h2>☁️ Prepare Online Training Dataset<a class="headerlink" href="#prepare-online-training-dataset" title="Link to this heading">#</a></h2>
-<p>We have provided a script to prepare some sample datasets including ultrachat (200k) and sharegpt (120k) for demo purpose. You can easily process the dataset by running the following command. The jsonl files will be placed in the <code class="docutils literal notranslate"><span class="pre">cache/dataset/&lt;dataset_name&gt;</span></code> directory of the project path by default. These datasets will be processed into <code class="docutils literal notranslate"><span class="pre">jsonl</span></code> files, which are the raw dataset ready for online training!</p>
+<section id="pre-supported-datasets">
+<h2>☁️ Pre-supported Datasets<a class="headerlink" href="#pre-supported-datasets" title="Link to this heading">#</a></h2>
+<p>We have provided a script to prepare some sample datasets out of the box, these datasets include:</p>
+<ol class="arabic simple">
+<li><p><a class="reference external" href="https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k">ultrachat</a> (200k)</p></li>
+<li><p><a class="reference external" href="https://huggingface.co/datasets/Aeala/ShareGPT_Vicuna_unfiltered">sharegpt</a> (120k)</p></li>
+<li><p><a class="reference external" href="https://huggingface.co/datasets/mlabonne/open-perfectblend">perfectblend</a> (1.4M)</p></li>
+<li><p>and others (we continuously add support for more datasets)</p></li>
+</ol>
+<p>You can run the script below to prepare the corresponding dataset.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># ultrachat</span>
 python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--dataset<span class="w"> </span>ultrachat
 
@@ -460,38 +462,41 @@ python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--d
 python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--dataset<span class="w"> </span>sharegpt
 </pre></div>
 </div>
+<p>You can view the full list of pre-supported datasets using <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">scripts/prepare_data.py</span> <span class="pre">--help</span></code>. The datasets are processed and saved as <code class="docutils literal notranslate"><span class="pre">jsonl</span></code> files in the <code class="docutils literal notranslate"><span class="pre">cache/dataset/&lt;dataset_name&gt;</span></code> directory of the project path by default.</p>
 </section>
-<section id="prepare-offline-training-dataset">
-<h2>💾 Prepare Offline Training Dataset<a class="headerlink" href="#prepare-offline-training-dataset" title="Link to this heading">#</a></h2>
-<p>Compared to online data, offline data requires one more step for hidden states generation. Thus, before you delve into this section, make sure you have your <code class="docutils literal notranslate"><span class="pre">jsonl</span></code> files ready as mentioned in the Prepare Online Training Dataset section. Once you have the <code class="docutils literal notranslate"><span class="pre">jsonl</span></code> files, you can start the hidden states generation.</p>
-<p>You can run the following command to obtain the hidden states.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>scripts/prepare_hidden_states.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--model-path<span class="w"> </span>&lt;target-model-path&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--enable-aux-hidden-states<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--data-path<span class="w"> </span>&lt;jsonl-file-path&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--chat-template<span class="w"> </span>llama3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max-length<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--batch-size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--mem-frac<span class="o">=</span><span class="m">0</span>.75<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--num-samples<span class="w"> </span><span class="m">1000</span>
+<section id="regenerate-datasets">
+<h2>↩️ Regenerate Datasets<a class="headerlink" href="#regenerate-datasets" title="Link to this heading">#</a></h2>
+<p>When training speculative decoding draft models for a specific target model, instead of using the original dataset, we can regenerate the assistant responses using the target model to better align the draft model with the target model’s output distribution. This will improve the acceptance rate of the draft model and the overall performance of the speculative decoding. According to the <a class="reference external" href="https://arxiv.org/pdf/2401.15077">EAGLE1 paper</a>, the EAGLE method is not very sensitive to the dataset quality, which means the performance is still good even if you use the original dataset. However, if you are looking for optimal performance in the production environment, it is recommended to regenerate the dataset using the target model.</p>
+<p>We can follow the following steps to regenerate the dataset. In the example below, we will use <code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.1-8B-Instruct</span></code> as an example, you can replace it with your own target model.</p>
+<ol class="arabic simple">
+<li><p>Start the SGLang server for the target model.</p></li>
+</ol>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--cuda-graph-bs<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mem-frac<span class="o">=</span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span>
 </pre></div>
 </div>
-<blockquote>
-<div><p>⚠️ This extract may take 2 hours and about 5T Disk</p>
-</div></blockquote>
-<p>You need to specify the following arguments:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">--model-path</span></code>: this is the huggingface repo name or path to the target model.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--data-path</span></code>: this is actual output path from the previous <code class="docutils literal notranslate"><span class="pre">prepare_data.py</span></code> script.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--chat-template</span></code>: this is the chat template to use for this model.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--num-samples</span></code>: this specifies how many data samples to use for hidden states generation. By default it will use all the data from <code class="docutils literal notranslate"><span class="pre">data-path</span></code>.</p></li>
-</ul>
+<ol class="arabic simple" start="2">
+<li><p>Regenerate the dataset using the <code class="docutils literal notranslate"><span class="pre">regenerate_train_data.py</span></code> script.</p></li>
+</ol>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/regenerate_train_data.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--concurrency<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-tokens<span class="w"> </span><span class="m">98304</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--server-address<span class="w"> </span>localhost:30000<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--temperature<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--input-file-path<span class="w"> </span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-file-path<span class="w"> </span>./cache/dataset/sharegpt_train_regen.jsonl
+</pre></div>
+</div>
+<p>For maximum performance, we recommend to scale the number of GPUs to regenerate the dataset in data parallel mode. To do this, you can simply add more server addresses to the <code class="docutils literal notranslate"><span class="pre">--server-address</span></code> argument, e.g. <code class="docutils literal notranslate"><span class="pre">--server-address</span> <span class="pre">localhost:30000</span> <span class="pre">localhost:30001</span> <span class="pre">localhost:30002</span> <span class="pre">localhost:30003</span></code>.</p>
 </section>
 <section id="prepare-your-own-dataset">
 <h2>🤩 Prepare your own dataset<a class="headerlink" href="#prepare-your-own-dataset" title="Link to this heading">#</a></h2>
-<p>Besides the provided ShareGPT/Ultrachat datasets, you can also prepare your own dataset. We support two formats:</p>
+<p>Besides the provided datasets, you can also prepare your own dataset. We support two formats:</p>
 <section id="option-1-conversation-format">
 <h3>Option 1: Conversation Format<a class="headerlink" href="#option-1-conversation-format" title="Link to this heading">#</a></h3>
 <p>You should prepare the dataset in jsonl format and the schema should look like this:</p>
@@ -521,17 +526,19 @@ python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--d
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>scripts/train_eagle3.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--is-preformatted<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--chat-template<span class="w"> </span>qwen<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--train-data-path<span class="w"> </span>./your_preformatted_dataset.jsonl<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span><span class="c1"># ... other arguments</span>
 </pre></div>
 </div>
-<p>Once you have the <code class="docutils literal notranslate"><span class="pre">jsonl</span></code> file ready, you can go straight for online training or hidden states generation for offline training.</p>
+<p>Once you have the <code class="docutils literal notranslate"><span class="pre">jsonl</span></code> file ready, you can proceed with online training or generate hidden states for offline training. See the Training guide for more details.</p>
+</section>
+</section>
+<section id="handling-multiple-datasets">
+<h2>➕ Handling Multiple Datasets<a class="headerlink" href="#handling-multiple-datasets" title="Link to this heading">#</a></h2>
 <p>If you have multiple datasets, you can just merge them into the one jsonl file. For example, you can do something like this</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span>dataset1.jsonl<span class="w"> </span>dataset2.jsonl<span class="w"> </span>&gt;<span class="w"> </span>merged_dataset.jsonl
 </pre></div>
 </div>
-</section>
 </section>
 </section>
 
@@ -547,12 +554,12 @@ python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--d
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../get_started/install.html"
+       href="../concepts/EAGLE3.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">📦 Installation</p>
+        <p class="prev-next-title">🦅 EAGLE3</p>
       </div>
     </a>
     <a class="right-next"
@@ -580,14 +587,15 @@ python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--d
   </div>
   <nav class="bd-toc-nav page-toc">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-train-dataset">🔄 Regenerate Train Dataset</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-online-training-dataset">☁️ Prepare Online Training Dataset</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-offline-training-dataset">💾 Prepare Offline Training Dataset</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">📍 Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pre-supported-datasets">☁️ Pre-supported Datasets</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-datasets">↩️ Regenerate Datasets</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-your-own-dataset">🤩 Prepare your own dataset</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-conversation-format">Option 1: Conversation Format</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-pre-formatted-text-format">Option 2: Pre-formatted Text Format</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#handling-multiple-datasets">➕ Handling Multiple Datasets</a></li>
 </ul>
   </nav></div>
 
