@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specforge"
+dynamic = ["version", "description"]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pre-commit",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "transformers==4.57.1",
+    "qwen-vl-utils==0.0.11",
+    "datasets",
+    "setuptools",
+    "tqdm",
+    "wandb",
+    "psutil",
+    "numpy",
+    "accelerate",
+    "pydantic",
+    "sglang[all]==0.5.4",
+    "openai-harmony",
+    "flash-attn>=2.6.3",
+]
+
+[tool.setuptools]
+packages = ["specforge"]
+
+[tool.setuptools.dynamic]
+version = {file = "version.txt"}
+description = {file = "README.md"}
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch==2.8.0"]

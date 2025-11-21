@@ -1,10 +1,6 @@
 from setuptools import find_packages, setup
-
-
-def read_requirements():
-    with open(f"requirements.txt", "r") as f:
-        lines = (line.strip() for line in f)
-        return [line for line in lines if line and not line.startswith(("#", "--"))]
+import tomllib
+from pathlib import Path
 
 
 def read_readme():
@@ -17,11 +13,18 @@ def read_version():
         return f.read().strip()
 
 
+def read_dependencies():
+    pyproject_path = Path(__file__).parent / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        pyproject = tomllib.load(f)
+        return pyproject.get("project", {}).get("dependencies", [])
+
+
 setup(
     name="specforge",
     packages=find_packages(exclude=["configs", "scripts", "tests"]),
     version=read_version(),
-    install_requires=read_requirements(),
+    install_requires=read_dependencies(),
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     author="SGLang Team",
