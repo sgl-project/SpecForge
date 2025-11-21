@@ -1,6 +1,7 @@
-from setuptools import find_packages, setup
 import tomllib
 from pathlib import Path
+
+from setuptools import find_packages, setup
 
 
 def read_readme():
