@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import LlamaConfig
 from transformers.activations import ACT2FN
