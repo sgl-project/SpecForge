@@ -131,6 +131,9 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     parser.add_argument("--cache-key", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="./cache")
     parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument(
+        "--base-model-dir", type=str, default=None, help="base model for finetuning"
+    )
     parser.add_argument("--eval-interval", type=int, default=5000)
     parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=0)
@@ -336,8 +339,18 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-    # detecting last ckpt for draft model
+    # Handle finetuning from base model
     draft_model_last_checkpoint = None
+    if args.base_model_dir is not None and os.path.isdir(args.base_model_dir):
+        draft_model_config = os.path.join(args.base_model_dir, "config.json")
+        draft_model_last_checkpoint = args.base_model_dir
+        print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
+    else:
+        raise ValueError(
+            f"Provided base model dir {args.base_model_dir} is not a valid directory."
+        )
+
+    # detecting last ckpt for draft model
     if args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
