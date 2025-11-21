@@ -36,6 +36,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
+from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
@@ -100,6 +101,7 @@ def parse_args():
         default=2000,
         help="Number of files per subdirectory.",
     )
+    SGLangBackendArgs.add_args(parser)
     return parser.parse_args()
 
 
@@ -119,20 +121,29 @@ def build_target_model(
         target_model = (
             Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=(
+                    model_config.dtype
+                    if hasattr(model_config, "dtype")
+                    else model_config.torch_dtype
+                ),
             )
             .eval()
             .cuda()
         )
     else:
+        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
         target_model = get_eagle3_target_model(
             pretrained_model_name_or_path=args.target_model_path,
             backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
-            torch_dtype=torch.bfloat16,
+            torch_dtype=(
+                model_config.dtype
+                if hasattr(model_config, "dtype")
+                else model_config.torch_dtype
+            ),
             device="cuda",
             cache_dir=args.cache_dir,
+            **target_model_kwargs,
         )
-
     # Set auxiliary hidden states layers if specified
     target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
 
