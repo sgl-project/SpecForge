@@ -69,6 +69,17 @@ def parse_args():
         action="store_true",
         help="Whether to split the dataset into train and eval sets, default is False",
     )
+    parser.add_argument(
+        "--opc-subset",
+        type=str,
+        default="largescale_diverse_instruct",
+        choices=[
+            "largescale_diverse_instruct",
+            "filtered_infinity_instruct",
+            "realuser_instruct",
+        ],
+        help="The subset of OpenCoder opc-sft-stage1 dataset to use (default: largescale_diverse_instruct)",
+    )
     return parser.parse_args()
 
 
@@ -254,7 +265,7 @@ def main():
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "opc":
         ds = load_dataset(
-            "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
+            "OpenCoder-LLM/opc-sft-stage1", args.opc_subset
         )["train"]
         proc_fn = process_opc_sft_stage1
     else:
