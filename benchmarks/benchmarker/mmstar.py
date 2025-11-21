@@ -2,22 +2,16 @@
 MMStar benchmark evaluation script.
 """
 
-import argparse
 import os
 import re
 import shutil
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
-from sglang.test.test_utils import add_common_sglang_args_and_parse
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from benchmarks.base_benchmark import BaseBenchmark
-from benchmarks.utils import create_image_sgl_function
+from .base import Benchmarker
+from .registry import BENCHMARKS
+from .utils import create_image_sgl_function
 
 
 def extract_mmstar_answer(
@@ -65,12 +59,13 @@ def extract_mmstar_answer(
     return None
 
 
-class MMStarBenchmark(BaseBenchmark):
+@BENCHMARKS.register("mmstar")
+class MMStarBenchmarker(Benchmarker):
     """MMStar benchmark implementation."""
 
-    def __init__(self, args):
+    def __init__(self, num_samples: Optional[int] = None):
+        super().__init__(num_samples, None)
         """Initialize benchmark and set up cache directory."""
-        super().__init__(args)
         self.cache_dir = None
         self.options_list = []  # Store options for each question
 
@@ -88,8 +83,9 @@ class MMStarBenchmark(BaseBenchmark):
         self.options_list = []
 
         for idx, q in enumerate(dataset):
-            if idx >= self.args.num_questions:
+            if self.num_samples is not None and idx >= self.num_samples:
                 break
+
             image = q["image"]
             image_path = os.path.join(self.cache_dir, q["meta_info"]["image_path"])
             image.convert("RGB").save(image_path, "JPEG")
@@ -178,26 +174,12 @@ class MMStarBenchmark(BaseBenchmark):
             max_tokens=self.get_max_new_tokens(),
         )
 
-    def run(self):
+    def run(self, *args, **kwargs):
         """Run benchmark and clean up cache directory."""
         try:
-            super().run()
+            super().run(*args, **kwargs)
         finally:
             # Clean up cache directory
             if self.cache_dir and os.path.exists(self.cache_dir):
                 shutil.rmtree(self.cache_dir)
                 print(f"Deleted temporary directory: {self.cache_dir}")
-
-
-def main(args):
-    """Main entry point."""
-    benchmark = MMStarBenchmark(args)
-    benchmark.run()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-questions", type=int, default=20)
-    parser.add_argument("--num-runs", type=int, default=1)
-    args = add_common_sglang_args_and_parse(parser)
-    main(args)

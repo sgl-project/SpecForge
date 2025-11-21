@@ -2,20 +2,14 @@
 HumanEval benchmark evaluation script.
 """
 
-import argparse
 import re
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
-from sglang.test.test_utils import add_common_sglang_args_and_parse
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from benchmarks.base_benchmark import BaseBenchmark
-from benchmarks.utils import create_simple_sgl_function
+from .base import Benchmarker
+from .registry import BENCHMARKS
+from .utils import create_simple_sgl_function
 
 
 def extract_code_from_output(output: str) -> Optional[str]:
@@ -67,12 +61,13 @@ def check_code_passes_tests(code: str, test_code: str, entry_point: str) -> bool
         return False
 
 
-class HumanEvalBenchmark(BaseBenchmark):
+@BENCHMARKS.register("humaneval")
+class HumanEvalBenchmarker(Benchmarker):
     """HumanEval benchmark implementation."""
 
-    def __init__(self, args):
+    def __init__(self, num_samples: Optional[int] = None):
         """Initialize benchmark and store test cases."""
-        super().__init__(args)
+        super().__init__(num_samples, None)
         self.test_cases = []
         self.entry_points = []
 
@@ -85,8 +80,9 @@ class HumanEvalBenchmark(BaseBenchmark):
         self.entry_points = []
 
         for idx, q in enumerate(dataset):
-            if idx >= self.args.num_questions:
+            if self.num_samples is not None and idx >= self.num_samples:
                 break
+
             questions.append({"question": q["prompt"]})
 
             # Store test case and entry point for evaluation
@@ -190,17 +186,3 @@ class HumanEvalBenchmark(BaseBenchmark):
     def get_max_new_tokens(self) -> int:
         """HumanEval code generation requires more tokens."""
         return 1024
-
-
-def main(args):
-    """Main entry point."""
-    benchmark = HumanEvalBenchmark(args)
-    benchmark.run()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-questions", type=int, default=200)
-    parser.add_argument("--num-runs", type=int, default=1)
-    args = add_common_sglang_args_and_parse(parser)
-    main(args)

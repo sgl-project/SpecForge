@@ -20,6 +20,7 @@ class BenchmarkMetrics:
     accuracy: Optional[float] = None
     num_questions: int = 0
     num_valid_predictions: int = 0
+    categorical_performance: Optional[Dict[str, "BenchmarkMetrics"]] = None
 
 
 def compute_metrics(

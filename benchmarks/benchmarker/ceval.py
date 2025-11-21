@@ -2,21 +2,14 @@
 C-Eval benchmark evaluation script.
 """
 
-import argparse
-import os
 import re
-import sys
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import concatenate_datasets, load_dataset
-from sglang.test.test_utils import add_common_sglang_args_and_parse
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from benchmarks.base_benchmark import BaseBenchmark
-from benchmarks.utils import create_simple_sgl_function
+from .base import Benchmarker
+from .registry import BENCHMARKS
+from .utils import create_simple_sgl_function
 
 
 def extract_answer(answer_str: str) -> str:
@@ -57,8 +50,16 @@ def format_question(question: str, options: List[str]) -> str:
     return prompt
 
 
-class CEvalBenchmark(BaseBenchmark):
+@BENCHMARKS.register("ceval")
+class CEvalBenchmarker(Benchmarker):
     """C-Eval benchmark implementation."""
+
+    def __init__(
+        self, num_samples: Optional[int] = None, subset: Optional[List[str]] = None
+    ):
+        if subset is None:
+            subset = "all"
+        super().__init__(num_samples, subset)
 
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Load and preprocess C-Eval dataset."""
@@ -118,10 +119,14 @@ class CEvalBenchmark(BaseBenchmark):
         ]
 
         # Select configs to load
-        if len(self.args.configs) == 1 and self.args.configs[0] == "all":
+        if self.subset == "all":
             configs_to_load = all_configs
         else:
-            configs_to_load = self.args.configs
+            for subset in self.subset:
+                assert (
+                    subset in all_configs
+                ), f"Subset {subset} not found in C-Eval dataset"
+            configs_to_load = self.subset
 
         # Load datasets
         try:
@@ -140,6 +145,7 @@ class CEvalBenchmark(BaseBenchmark):
                 f"Successfully loaded C-Eval dataset with all configs (total: {len(dataset)} samples)"
             )
         except Exception as e:
+            print(e)
             print(f"Failed to load C-Eval dataset from 'ceval/ceval-exam': {e}")
             print("Please ensure the dataset is available or install it manually.")
             print("You can try: pip install datasets")
@@ -150,7 +156,7 @@ class CEvalBenchmark(BaseBenchmark):
         questions = []
         labels = []
         for idx, item in enumerate(dataset):
-            if idx >= self.args.num_questions:
+            if self.num_samples is not None and idx >= self.num_samples:
                 break
 
             # Handle different dataset formats
@@ -259,24 +265,3 @@ class CEvalBenchmark(BaseBenchmark):
                 if predictions[i] == labels[i]:
                     correct += 1
         return correct / valid_count if valid_count > 0 else 0.0
-
-
-def main(args):
-    """Main entry point."""
-    benchmark = CEvalBenchmark(args)
-    benchmark.run()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-questions", type=int, default=200)
-    parser.add_argument("--num-runs", type=int, default=1)
-    parser.add_argument(
-        "--configs",
-        type=str,
-        nargs="+",
-        default=["logic"],
-        help="C-Eval configs to test. Use 'all' to test all configs. Default: logic only.",
-    )
-    args = add_common_sglang_args_and_parse(parser)
-    main(args)

@@ -2,20 +2,14 @@
 MATH-500 benchmark evaluation script.
 """
 
-import argparse
 import re
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
-from sglang.test.test_utils import add_common_sglang_args_and_parse
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from benchmarks.base_benchmark import BaseBenchmark
-from benchmarks.utils import create_simple_sgl_function
+from .base import Benchmarker
+from .registry import BENCHMARKS
+from .utils import create_simple_sgl_function
 
 
 def extract_math_answer(output: str) -> Optional[str]:
@@ -55,8 +49,12 @@ def extract_math_answer(output: str) -> Optional[str]:
     return None
 
 
-class Math500Benchmark(BaseBenchmark):
+@BENCHMARKS.register("math500")
+class Math500Benchmarker(Benchmarker):
     """MATH-500 benchmark implementation."""
+
+    def __init__(self, num_samples: Optional[int] = None):
+        super().__init__(num_samples, None)
 
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[Optional[str]]]:
         """Load and preprocess MATH-500 dataset."""
@@ -64,8 +62,9 @@ class Math500Benchmark(BaseBenchmark):
         questions = []
         labels = []
         for idx, q in enumerate(dataset):
-            if idx >= self.args.num_questions:
+            if self.num_samples is not None and idx >= self.num_samples:
                 break
+
             questions.append({"question": q["problem"]})
             # Extract answer from solution or answer field
             answer = None
@@ -121,17 +120,3 @@ class Math500Benchmark(BaseBenchmark):
             answer_key="answer",
             max_tokens=self.get_max_new_tokens(),
         )
-
-
-def main(args):
-    """Main entry point."""
-    benchmark = Math500Benchmark(args)
-    benchmark.run()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-questions", type=int, default=200)
-    parser.add_argument("--num-runs", type=int, default=1)
-    args = add_common_sglang_args_and_parse(parser)
-    main(args)

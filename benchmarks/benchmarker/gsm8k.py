@@ -2,21 +2,15 @@
 GSM8K benchmark evaluation script.
 """
 
-import argparse
 import ast
 import re
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from sglang.test.test_utils import add_common_sglang_args_and_parse
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from benchmarks.base_benchmark import BaseBenchmark
-from benchmarks.utils import create_few_shot_sgl_function
+from .base import Benchmarker
+from .registry import BENCHMARKS
+from .utils import create_few_shot_sgl_function
 
 INVALID = -9999999
 
@@ -49,8 +43,12 @@ def get_answer_value(answer_str: str) -> int:
         return INVALID
 
 
-class GSM8KBenchmark(BaseBenchmark):
+@BENCHMARKS.register("gsm8k")
+class GSM8KBenchmarker(Benchmarker):
     """GSM8K benchmark implementation."""
+
+    def __init__(self, num_samples: Optional[int] = None):
+        super().__init__(num_samples, None)
 
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[int]]:
         """Load and preprocess GSM8K dataset."""
@@ -60,13 +58,14 @@ class GSM8KBenchmark(BaseBenchmark):
         lines = list(read_jsonl(data_path))
 
         # Construct prompts
-        num_questions = self.args.num_questions
-        num_shots = self.args.num_shots
-        few_shot_examples = get_few_shot_examples(lines, num_shots)
+        few_shot_examples = get_few_shot_examples(lines, 5)
 
         questions = []
         labels = []
-        for i in range(min(len(lines), num_questions)):
+        for i in range((len(lines))):
+            if self.num_samples is not None and i >= self.num_samples:
+                break
+
             question_text = get_one_example(lines, i, False)
             questions.append({"question": question_text})
             labels.append(get_answer_value(lines[i]["answer"]))
@@ -96,21 +95,5 @@ class GSM8KBenchmark(BaseBenchmark):
             few_shot_examples=self.few_shot_examples,
             function_name="few_shot_gsm8k",
             answer_key="answer",
-            max_tokens=self.get_max_new_tokens(),
             stop=["Question", "Assistant:", "<|separator|>"],
         )
-
-
-def main(args):
-    """Main entry point."""
-    benchmark = GSM8KBenchmark(args)
-    benchmark.run()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--num-questions", type=int, default=200)
-    parser.add_argument("--num-runs", type=int, default=1)
-    args = add_common_sglang_args_and_parse(parser)
-    main(args)
