@@ -220,12 +220,11 @@ def main():
                 f"Running benchmark {benchmark_name} with {num_prompts} prompts, batch size {batch_size}, steps {steps}, topk {topk}, num_draft_tokens {num_draft_tokens}, subset {subset}"
             )
             benchmarkder_cls = BENCHMARKS.get(benchmark_name)
+            num_prompts = int(num_prompts) if num_prompts is not None else None
             if subset is None:
-                benchmarker = benchmarkder_cls(num_samples=int(num_prompts))
+                benchmarker = benchmarkder_cls(num_samples=num_prompts)
             else:
-                benchmarker = benchmarkder_cls(
-                    num_samples=int(num_prompts), subset=subset
-                )
+                benchmarker = benchmarkder_cls(num_samples=num_prompts, subset=subset)
             metrics_list = benchmarker.run(
                 host=args.host, port=args.port, batch_size=batch_size
             )
