@@ -342,7 +342,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-    # Handle finetuning from base model
+    # Handle base ckpt, config file
     draft_model_last_checkpoint = None
     if args.ckpt_dir is not None and os.path.isdir(args.ckpt_dir):
         draft_model_config = os.path.join(args.ckpt_dir, "config.json")
