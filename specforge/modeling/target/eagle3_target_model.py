@@ -193,21 +193,23 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             trust_remote_code=trust_remote_code,
             dtype=torch_dtype,
             enable_return_hidden_states=True,
-            disable_cuda_graph=True,
-            enable_torch_compile=True,
+            disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
             tp_size=tp_size,
             pp_size=1,
-            attention_backend="flashinfer",
+            **kwargs,
         )
+
+        tp_rank = dist.get_rank(get_tp_group())
+        moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
             model_config=model_config,
-            mem_fraction_static=0.4,
+            mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=torch.cuda.current_device(),
             tp_rank=dist.get_rank(get_tp_group()),
             tp_size=server_args.tp_size,
-            moe_ep_rank=0,
-            moe_ep_size=1,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
             pp_rank=0,
             pp_size=1,
             server_args=server_args,

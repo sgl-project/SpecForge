@@ -24,6 +24,7 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
+from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
@@ -145,56 +146,6 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     # resume
     parser.add_argument("--resume", action="store_true")
 
-    parser.add_argument(
-        "--report-to",
-        type=str,
-        default="none",
-        choices=["wandb", "tensorboard", "swanlab", "mlflow", "none"],
-        help="The integration to report results and logs to.",
-    )
-    # wandb-specific args
-    parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--wandb-name", type=str, default=None)
-    parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
-    # swanlab-specific args
-    parser.add_argument(
-        "--swanlab-project",
-        type=str,
-        default=None,
-        help="The project name for swanlab.",
-    )
-    parser.add_argument(
-        "--swanlab-name",
-        type=str,
-        default=None,
-        help="The experiment name for swanlab.",
-    )
-    parser.add_argument(
-        "--swanlab-key",
-        type=str,
-        default=None,
-        help="The API key for swanlab non-interactive login.",
-    )
-    # mlflow-specific args
-    parser.add_argument(
-        "--mlflow-tracking-uri",
-        type=str,
-        default=None,
-        help="The MLflow tracking URI. If not set, uses MLFLOW_TRACKING_URI environment variable or defaults to local './mlruns'.",
-    )
-    parser.add_argument(
-        "--mlflow-experiment-name",
-        type=str,
-        default=None,
-        help="The MLflow experiment name. If not set, uses MLFLOW_EXPERIMENT_NAME environment variable.",
-    )
-    parser.add_argument(
-        "--mlflow-run-name",
-        type=str,
-        default=None,
-        help="The MLflow run name. If not set, MLflow will auto-generate one.",
-    )
-
     # vlm related args
     parser.add_argument(
         "--min-pixels", type=int, default=50176
@@ -216,6 +167,9 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         choices=["sglang", "hf", "custom"],
         help="The backend of the target model",
     )
+
+    SGLangBackendArgs.add_args(parser)
+    TrackerArgs.add_args(parser)
 
     args = parser.parse_args()
     return parser, args
@@ -271,12 +225,17 @@ def build_target_model(
                 .cuda()
             )
         else:
+            if args.target_model_backend == "sglang":
+                target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+            else:
+                target_model_kwargs = {}
             target_model = get_eagle3_target_model(
                 pretrained_model_name_or_path=args.target_model_path,
                 backend=args.target_model_backend,
                 torch_dtype=torch.bfloat16,
                 device="cuda",
                 cache_dir=args.cache_dir,
+                **target_model_kwargs,
             )
 
         # set the aux hidden states layers
