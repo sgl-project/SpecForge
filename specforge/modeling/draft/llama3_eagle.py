@@ -4,12 +4,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
-from flash_attn import flash_attn_func
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -866,9 +866,7 @@ class LlamaFlashAttention(LlamaAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        )
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
@@ -921,7 +919,13 @@ class LlamaFlashAttention(LlamaAttention):
 
         lck = len(cache_k)
         if lck > 1:
-            q_shape_expanded = (bsz, q_len, self.num_key_value_heads, self.num_key_value_groups, self.head_dim)
+            q_shape_expanded = (
+                bsz,
+                q_len,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+            )
             attn_outputs = [attn_output.view(q_shape_expanded)]
             lses = [lse.view(q_shape_expanded[:-1])]
 

@@ -147,9 +147,7 @@ class OnlineEagle3Model(Eagle3Model):
             cache_hidden = None
             past_key_values = DynamicCache()
         else:
-            raise ValueError(
-                f"Unknown attention backend: {self.attention_backend}"
-            )
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
@@ -524,9 +522,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             cache_hidden = None
             past_key_values = DynamicCache()
         else:
-            raise ValueError(
-                f"Unknown attention backend: {self.attention_backend}"
-            )
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
