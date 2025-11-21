@@ -116,9 +116,10 @@ def main():
     print("-" * 50)
 
     # Create progress bar
-    with open(args.input_file_path, "r") as input_file, open(
-        args.output_file_path, "w"
-    ) as output_file_handle:
+    with (
+        open(args.input_file_path, "r") as input_file,
+        open(args.output_file_path, "w") as output_file_handle,
+    ):
 
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
