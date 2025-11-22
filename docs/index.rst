@@ -8,8 +8,16 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
    :maxdepth: 1
    :caption: Get Started
 
-   get_started/motivation.md
-   get_started/install.md
+   get_started/installation.md
+   get_started/about.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Concepts
+
+   concepts/speculative_decoding.md
+   concepts/EAGLE3.md
+
 
 .. toctree::
    :maxdepth: 1
@@ -21,13 +29,13 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
 .. toctree::
    :maxdepth: 1
-   :caption: Examples
+   :caption: Advanced Features
 
-   examples/llama3-eagle3.md
+   advanced_features/customization.md
 
 .. toctree::
    :maxdepth: 1
-   :caption: Advanced Features
+   :caption: Examples
 
-   advanced_features/regenerate_dataset.md
-   advanced_features/customization.md
+   examples/llama3-eagle3-online.md
+   examples/llama3-eagle3-offline.md

@@ -86,7 +86,7 @@ export NUM_GPUS=8
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    scripts/train_eagle3_sgl_online.py \
+    scripts/train_eagle3.py \
     --target-model-path $MODEL_PATH \
     --model-path $MODEL_PATH \
     --draft-model-config $DRAFT_MODEL_CONFIG \

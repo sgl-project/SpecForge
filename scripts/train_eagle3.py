@@ -4,7 +4,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -26,6 +26,7 @@ from specforge import (
 )
 from specforge.data import (
     build_eagle3_dataset,
+    build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
@@ -35,7 +36,11 @@ from specforge.distributed import (
     get_tp_group,
     init_distributed,
 )
-from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
+from specforge.modeling.target import (
+    Eagle3TargetModel,
+    TargetHead,
+    get_eagle3_target_model,
+)
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
@@ -68,12 +73,22 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         help="The key of the embedding weight to load from the target model",
     )
     parser.add_argument(
+        "--lm-head-key",
+        type=str,
+        default="lm_head.weight",
+        help="The key of the lm head weight to load from the target model",
+    )
+    parser.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
 
-    # add training-related arguments
+    # dataset arguments
     parser.add_argument("--train-data-path", type=str, required=True)
+    parser.add_argument("--train-hidden-states-path", type=str, default=None)
+    parser.add_argument("--eval-hidden-states-path", type=str, default=None)
     parser.add_argument("--eval-data-path", type=str, default=None)
+
+    # training hyper params
     parser.add_argument("--num-epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -116,6 +131,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     parser.add_argument("--cache-key", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="./cache")
     parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument(
+        "--ckpt-dir",
+        type=str,
+        default=None,
+        help="directory includes the checkpoint to start training with",
+    )
     parser.add_argument("--eval-interval", type=int, default=5000)
     parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=0)
@@ -227,8 +248,8 @@ def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
 
 
 def build_target_model(
-    args: Namespace, draft_model_config: AutoDraftModelConfig
-) -> Eagle3TargetModel:
+    args: Namespace, draft_model_config: AutoDraftModelConfig, is_online: bool = True
+) -> Tuple[Union[Eagle3TargetModel, TargetHead], Optional[AutoProcessor]]:
     """
     Build the target model according to the arguments.
 
@@ -239,32 +260,32 @@ def build_target_model(
     Returns:
         The target model.
     """
-    if (
-        args.is_vlm
-        and draft_model_config.target_model_type == "qwen2_5_vl"
-        and args.tp_size == 1
-    ):
-        from transformers import Qwen2_5_VLForConditionalGeneration
+    if is_online:
+        if (
+            args.is_vlm
+            and draft_model_config.target_model_type == "qwen2_5_vl"
+            and args.tp_size == 1
+        ):
+            from transformers import Qwen2_5_VLForConditionalGeneration
 
-        target_model = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=torch.bfloat16,
+            target_model = (
+                Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    torch_dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
             )
-            .eval()
-            .cuda()
-        )
-    else:
-        target_model = get_eagle3_target_model(
-            pretrained_model_name_or_path=args.target_model_path,
-            backend=args.target_model_backend,
-            torch_dtype=torch.bfloat16,
-            device="cuda",
-            cache_dir=args.cache_dir,
-        )
+        else:
+            target_model = get_eagle3_target_model(
+                pretrained_model_name_or_path=args.target_model_path,
+                backend=args.target_model_backend,
+                torch_dtype=torch.bfloat16,
+                device="cuda",
+                cache_dir=args.cache_dir,
+            )
 
-    # set the aux hidden states layers, current not support vlm
-    if not args.is_vlm:
+        # set the aux hidden states layers
         if (
             hasattr(draft_model_config, "eagle_config")
             and draft_model_config.eagle_config is not None
@@ -276,16 +297,23 @@ def build_target_model(
         else:
             target_model.set_aux_hidden_states_layers()
 
-    if args.is_vlm:
-        processor = AutoProcessor.from_pretrained(
-            args.target_model_path,
-            min_pixels=args.min_pixels,
-            max_pixels=args.max_pixels,
-        )
-    else:
-        processor = None
+        if args.is_vlm:
+            processor = AutoProcessor.from_pretrained(
+                args.target_model_path,
+                min_pixels=args.min_pixels,
+                max_pixels=args.max_pixels,
+            )
+        else:
+            processor = None
 
-    return target_model, processor
+        return target_model, processor
+    else:
+        target_head = TargetHead.from_pretrained(
+            model_path=args.target_model_path,
+            lm_head_key=args.lm_head_key,
+            cache_dir=args.cache_dir,
+        )
+        return target_head, None
 
 
 def sanity_check(args: Namespace) -> None:
@@ -314,8 +342,18 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-    # detecting last ckpt for draft model
+    # Handle base ckpt, config file
     draft_model_last_checkpoint = None
+    if args.ckpt_dir is not None and os.path.isdir(args.ckpt_dir):
+        draft_model_config = os.path.join(args.ckpt_dir, "config.json")
+        draft_model_last_checkpoint = args.ckpt_dir
+        print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
+    else:
+        raise ValueError(
+            f"Provided base model dir {args.ckpt_dir} is not a valid directory."
+        )
+
+    # detecting last ckpt for draft model
     if args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
@@ -376,6 +414,13 @@ def build_dataloaders(
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
         )
+
+        if args.train_hidden_states_path is not None:
+            train_eagle3_dataset = build_offline_eagle3_dataset(
+                args.train_hidden_states_path,
+                args.max_length,
+            )
+
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
@@ -385,18 +430,24 @@ def build_dataloaders(
         is_vlm=args.is_vlm,
     )
 
-    if args.eval_data_path is not None:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
-        eval_eagle3_dataset = build_eagle3_dataset(
-            eval_dataset,
-            tokenizer,
-            args.chat_template,
-            args.max_length,
-            is_vlm=args.is_vlm,
-            processor=processor,
-            num_proc=args.build_dataset_num_proc,
-            is_preformatted=args.is_preformatted,
-        )
+    if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
+        if args.eval_data_path is not None:
+            eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+            eval_eagle3_dataset = build_eagle3_dataset(
+                eval_dataset,
+                tokenizer,
+                args.chat_template,
+                args.max_length,
+                is_vlm=args.is_vlm,
+                processor=processor,
+                num_proc=args.build_dataset_num_proc,
+                is_preformatted=args.is_preformatted,
+            )
+        elif args.eval_hidden_states_path is not None:
+            eval_eagle3_dataset = build_offline_eagle3_dataset(
+                args.eval_hidden_states_path,
+                args.max_length,
+            )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.target_batch_size,
@@ -462,6 +513,7 @@ def run_forward(
     eagle3_model: nn.Module,
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
+    is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if args.is_vlm:
         plosses, _, acces = eagle3_model(
@@ -472,26 +524,36 @@ def run_forward(
             image_grid_thw=data["image_grid_thw"].cuda(),
         )
     else:
-        eagle3_data = target_model.generate_eagle3_data(
-            input_ids=data["input_ids"].cuda(),
-            attention_mask=data["attention_mask"].cuda(),
-            loss_mask=data["loss_mask"].cuda(),
-        )
+        if is_online:
+            # we generate the eagle3 using the target model in an online fashion
+            eagle3_data = target_model.generate_eagle3_data(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+            )
 
-        eagle3_data.input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
-        eagle3_data.attention_mask = get_dp_data_shard_from_tp(
-            eagle3_data.attention_mask
-        )
-        eagle3_data.loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-        eagle3_data.target = get_dp_data_shard_from_tp(eagle3_data.target)
-        eagle3_data.hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+            attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
+            loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+            target = get_dp_data_shard_from_tp(eagle3_data.target)
+            hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+        else:
+            # we generate the logits using the hidden states loaded from disk
+            input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
+            loss_mask = data["loss_mask"].cuda()
+            hidden_states = data["hidden_state"].cuda()
+            target = target_model(data["target"].cuda())
+            input_ids, target, loss_mask = target_model.preprocess(
+                input_ids, target, loss_mask
+            )
 
         plosses, _, acces = eagle3_model(
-            input_ids=eagle3_data.input_ids,
-            attention_mask=eagle3_data.attention_mask,
-            loss_mask=eagle3_data.loss_mask,
-            target=eagle3_data.target,
-            hidden_states=eagle3_data.hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            target=target,
+            hidden_states=hidden_states,
         )
     return plosses, acces
 
@@ -562,6 +624,10 @@ def main():
     parser, args = parse_args()
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    is_online = (
+        args.train_data_path is not None and args.train_hidden_states_path is None
+    )
+
     sanity_check(args)
     print_with_rank("Initialized distributed environment")
 
@@ -569,7 +635,7 @@ def main():
     # 2. Build models
     # ================================================
     draft_model_config, draft_model = build_draft_model(args)
-    target_model, processor = build_target_model(args, draft_model_config)
+    target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
     # 3. Build dataloader
@@ -672,7 +738,9 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(args, eagle3_model, data, target_model)
+            plosses, acces = run_forward(
+                args, eagle3_model, data, target_model, is_online
+            )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
             # log training metrics
@@ -709,7 +777,7 @@ def main():
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
                         plosses, acces = run_forward(
-                            args, eagle3_model, data, target_model
+                            args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))
