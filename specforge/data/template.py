@@ -196,3 +196,13 @@ TEMPLATE_REGISTRY.register(
         system_prompt=None,
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3-omni",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt=None,
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)

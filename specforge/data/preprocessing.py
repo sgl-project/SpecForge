@@ -100,7 +100,9 @@ def _process_mm_messages(
 
     # Call the processing function based on whether it supports audio
     if config["supports_audio"]:
-        audio_inputs, image_inputs, video_inputs = process_func(messages)
+        audio_inputs, image_inputs, video_inputs = process_func(
+            messages, use_audio_in_video=False
+        )
     else:
         audio_inputs = None
         image_inputs, video_inputs = process_func(messages)
@@ -310,6 +312,7 @@ def preprocess_vlm_conversations(
             return_tensors="pt",
             return_offsets_mapping=True,
             add_special_tokens=False,
+            use_audio_in_video=False,
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
