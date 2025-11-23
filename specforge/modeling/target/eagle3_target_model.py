@@ -200,8 +200,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
                 auto_model_loader = Qwen3VLForConditionalGeneration
             elif architecture == "Qwen3OmniMoeForConditionalGeneration":
-                # todo: change load method from `modelscope` to `transformers` after new version release
-                from modelscope import Qwen3OmniMoeThinkerForConditionalGeneration
+                from transformers import Qwen3OmniMoeThinkerForConditionalGeneration
 
                 auto_model_loader = Qwen3OmniMoeThinkerForConditionalGeneration
         else:
