@@ -3,6 +3,7 @@ ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 # train eagle3 for deepseek-v2-lite
 NUM_GPUS=${1:-8}
+TP_SIZE=${2:-1}
 
 torchrun \
     --standalone \
@@ -14,7 +15,7 @@ torchrun \
     --output-dir $ROOT_DIR/outputs/deepseek-v2-lite-eagle3-sharegpt \
     --num-epochs 10 \
     --batch-size 1 \
-    --tp-size 1 \
+    --tp-size $TP_SIZE \
     --learning-rate 1e-4 \
     --max-length 4096 \
     --chat-template deepseek \

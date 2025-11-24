@@ -4,7 +4,8 @@ ROOT_DIR=$(dirname $SCRIPT_DIR)
 export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # train eagle3 for qwq-32b
-NUM_GPUS=${1:-8}
+NUM_GPUS=${1:-4}
+TP_SIZE=${2:-4}
 
 torchrun \
     --standalone \
@@ -21,4 +22,5 @@ torchrun \
     --chat-template qwen \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
-    --tp-size 4
+    --tp-size $TP_SIZE \
+    --target-model-backend sglang

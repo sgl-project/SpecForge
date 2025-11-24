@@ -100,7 +100,7 @@ class SGLangBackendArgs:
         )
         parser.add_argument(
             "--sglang-mem-fraction-static",
-            type=str,
+            type=float,
             default=0.4,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
         )

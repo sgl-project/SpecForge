@@ -3,6 +3,7 @@ ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 # train eagle3 for GPT-OSS-20B
 NUM_GPUS=${1:-8}
+TP_SIZE=${2:-2}
 
 torchrun \
     --standalone \
@@ -17,5 +18,7 @@ torchrun \
     --learning-rate 1e-4 \
     --max-length 4096 \
     --chat-template gpt-oss \
+    --tp-size $TP_SIZE \
+    --target-model-backend sglang \
     --cache-dir $ROOT_DIR/cache \
     --dist-timeout 60

@@ -4,6 +4,7 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # train eagle3 for qwen3-coder
 NUM_GPUS=${1:-8}
+TP_SIZE=${2:-8}
 
 torchrun \
     --standalone \
@@ -16,8 +17,8 @@ torchrun \
     --output-dir $ROOT_DIR/outputs/Qwen3-Coder-480B-A35B-Instruct \
     --num-epochs 10 \
     --draft-micro-batch-size 1 \
-    --draft-global-batch-size $NUM_GPUS \
+    --draft-global-batch-size $TP_SIZE \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template qwen \
-    --resume
+    --target-model-backend sglang
