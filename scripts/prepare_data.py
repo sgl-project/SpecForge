@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Dict, Tuple
 
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
 
 """
@@ -77,8 +77,9 @@ def parse_args():
             "largescale_diverse_instruct",
             "filtered_infinity_instruct",
             "realuser_instruct",
+            "all",
         ],
-        help="The subset of OpenCoder opc-sft-stage1 dataset to use (default: largescale_diverse_instruct)",
+        help="The subset of OpenCoder opc-sft-stage1 dataset to use, or 'all' to use all subsets (default: largescale_diverse_instruct)",
     )
     return parser.parse_args()
 
@@ -264,9 +265,20 @@ def main():
         ]
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "opc":
-        ds = load_dataset(
-            "OpenCoder-LLM/opc-sft-stage1", args.opc_subset
-        )["train"]
+        if args.opc_subset == "all":
+            # Load all subsets and concatenate them
+            subsets = [
+                "largescale_diverse_instruct",
+                "filtered_infinity_instruct",
+                "realuser_instruct",
+            ]
+            datasets_list = [
+                load_dataset("OpenCoder-LLM/opc-sft-stage1", subset)["train"]
+                for subset in subsets
+            ]
+            ds = concatenate_datasets(datasets_list)
+        else:
+            ds = load_dataset("OpenCoder-LLM/opc-sft-stage1", args.opc_subset)["train"]
         proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
