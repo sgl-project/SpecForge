@@ -20,6 +20,7 @@ class BenchmarkMetrics:
     accuracy: Optional[float] = None
     num_questions: int = 0
     num_valid_predictions: int = 0
+    categorical_performance: Optional[Dict[str, "BenchmarkMetrics"]] = None
 
 
 def compute_metrics(
@@ -256,11 +257,17 @@ def create_image_sgl_function(
     """
 
     @sgl.function
-    def sgl_func(s, question):
-        # question should be a dict with "image_path" and "question" keys
-        image_path = question.get("image_path", "")
-        question_text = question.get("question", "")
-        s += sgl.user(sgl.image(image_path) + question_text)
+    def sgl_func(s, image_path, question, **kwargs):
+        """
+        The body of the SGL function: constructs a multimodal conversation flow.
+
+        - First, it inputs an image + text question as 'user'.
+        - Then, it generates an answer as 'assistant', binding the response to the specified `answer_key`.
+
+        Note: sgl.image() automatically encodes the image into a format supported by the model for multimodal input.
+        """
+        # User input: Image + Text question
+        s += sgl.user(sgl.image(image_path) + question)
         s += sgl.assistant(sgl.gen(answer_key, max_tokens=max_tokens))
 
     sgl_func.__name__ = function_name

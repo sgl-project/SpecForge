@@ -8,7 +8,7 @@ NUM_GPUS=${1:-8}
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    $ROOT_DIR/scripts/train_eagle3_offline.py \
+    $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path Qwen/Qwen3-Coder-480B-A35B-Instruct \
     --draft-model-config $ROOT_DIR/configs/qwen3-coder-480B-A35B-instruct-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/opc.jsonl \

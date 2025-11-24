@@ -181,7 +181,6 @@ def main():
         # deal with all the remaining requests
         for server_address, waiting_queue_items in waiting_queue.items():
             for req_data, req_future in waiting_queue_items:
-                req_future.wait()
                 req_output = req_future.result()
                 if req_output is not None:
                     req_data["conversations"].append(

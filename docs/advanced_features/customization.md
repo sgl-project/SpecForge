@@ -1,12 +1,12 @@
 # 💡 Customize Your Own Training
 
-### 🔧 Customize Training Args
+## 🔧 Customize Training Args
 
 ```bash
 torchrun \
     --standalone \
     --nproc_per_node 8 \
-    ./scripts/train_eagle3_online.py \
+    ./scripts/train_eagle3.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config ./configs/llama3-8B-eagle3.json \
     --train-data-path ./cache/dataset/sharegpt.jsonl \
@@ -19,11 +19,11 @@ torchrun \
     --cache-dir ./cache
 ```
 
-If you wish to understand what each argument does, you can run `python scripts/train_eagle3_online.py --help` to see the full list of arguments. Particularly, we will discuss some important arguments below.
+If you wish to understand what each argument does, you can run `python scripts/train_eagle3.py --help` to see the full list of arguments. Particularly, we will discuss some important arguments below.
 - `--chat-template`: This should be the chat template to use for the model, so please make sure you set it to the correct value.
 - `--cache-dir`: This directory contains the dataset cache including the `input_ids`, `loss_mask`, `attention_mask` and `vocab_mapping`. These caches can make your data loading much faster once a cache is generated. The cache file has a name which is obtained by hashing the dataset path to avoid cache collision.
 
-### 💬 Customize Chat Template
+## 💬 Customize Chat Template
 
 You can register a new chat template for your model by adding a new entry to the `TEMPLATE_REGISTRY` in the `specforge.data.template.py` file.
 
@@ -39,9 +39,9 @@ TEMPLATE_REGISTRY.register(
 )
 ```
 
-### 🪅 Customize Model
+## 🪅 Customize Model
 
-#### Customize Target Model
+### Customize Target Model
 
 If you wish to train Eagle3 for other models, you need to modify the `--target-model-path` value. We support loading these models directly from HuggingFace.
 
@@ -71,7 +71,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
 
 When `tp_size` is greater than 1, the script will automatically load the distributed version of the model for tensor parallelism.
 
-#### Customize Draft Model
+### Customize Draft Model
 
 If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. Or, if you do not provide the `--draft-model-config` argument, the script will automatically generate the draft model configuration based on the target model configuration. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `specforge.modeling.draft.base.py` file.
 
