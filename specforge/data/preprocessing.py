@@ -24,7 +24,7 @@ import os
 import re
 import warnings
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from datasets import Dataset as HFDataset
@@ -41,6 +41,7 @@ except ImportError:
 
 from specforge.utils import padding
 
+from .parse import GeneralParser, HarmonyParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -50,29 +51,26 @@ Conversation = List[Dict[str, str]]
 # ==============================
 # This file is for preprocessing the data
 # ==============================
-# Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
-def preprocess_conversations(
-    tokenizer: PreTrainedTokenizer,
-    conversations: List[Conversation],
+
+
+def _apply_loss_mask_from_chat_template(
+    text: str,
+    offsets: torch.Tensor,
     chat_template: ChatTemplate,
-    max_length: int = 2048,
-) -> Dict[str, List[torch.Tensor]]:
+) -> torch.Tensor:
     """
-    Preprocess a batch of ShareGPT style conversations.
+    Apply loss mask to identify assistant response spans using chat template.
 
     Args:
-        tokenizer: The tokenizer to use for tokenization.
-        conversations: A list of conversations, where each conversation is a list of messages.
-        chat_template: The chat template to use for formatting the conversations.
-        max_length: The maximum length of the tokenized input.
+        text: The formatted conversation text.
+        offsets: Token offset mapping from tokenizer.
+        chat_template: The chat template to use for identifying assistant spans.
 
     Returns:
-        A dictionary containing:
-            - input_ids: List of tokenized input IDs.
-            - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
-            - attention_mask: List of attention masks.
+        A tensor indicating which tokens should contribute to the loss (1) or not (0).
     """
-    system_prompt = chat_template.system_prompt
+    loss_mask = torch.zeros(len(offsets), dtype=torch.long)
+
     user_message_separator = (
         f"{chat_template.end_of_turn_token}{chat_template.user_header}"
     )
@@ -80,67 +78,85 @@ def preprocess_conversations(
         f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
     )
 
+    # Find spans of assistant responses using regex
+    assistant_pattern = (
+        re.escape(assistant_message_separator)
+        + r"(.*?)(?="
+        + re.escape(user_message_separator)
+        + "|$)"
+    )
+
+    matches_found = 0
+
+    for match in re.finditer(assistant_pattern, text, re.DOTALL):
+        matches_found += 1
+        # Assistant response text span (excluding assistant_header itself)
+        assistant_start_char = match.start(1)
+        assistant_end_char = match.end(1)
+
+        # Mark tokens overlapping with assistant response
+        for idx, (token_start, token_end) in enumerate(offsets):
+            # Token is part of the assistant response span
+            if token_end <= assistant_start_char:
+                continue  # token before assistant text
+            if token_start > assistant_end_char:
+                continue  # token after assistant text
+            loss_mask[idx] = 1
+
+    if matches_found == 0:
+        print("WARNING: No assistant response spans found in the conversation text.")
+
+    return loss_mask
+
+
+# Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
+def preprocess_conversations(
+    tokenizer: PreTrainedTokenizer,
+    conversations: Union[List[Conversation], List[str]],
+    chat_template: ChatTemplate,
+    max_length: int = 2048,
+    is_preformatted: bool = False,
+    **kwargs,
+) -> Dict[str, List[torch.Tensor]]:
+    """
+    Preprocess a batch of ShareGPT style conversations or pre-formatted text.
+
+    Args:
+        tokenizer: The tokenizer to use for tokenization.
+        conversations: A list of conversations (if is_preformatted=False) or
+                      a list of pre-formatted text strings (if is_preformatted=True).
+        chat_template: The chat template to use for formatting/identifying spans.
+        max_length: The maximum length of the tokenized input.
+        is_preformatted: Whether the input is already formatted text strings.
+
+    Returns:
+        A dictionary containing:
+            - input_ids: List of tokenized input IDs.
+            - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
+            - attention_mask: List of attention masks.
+    """
+
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
 
-    for source in conversations:
-        messages = [{"role": "system", "content": system_prompt}]
+    if chat_template.parser_type == "general":
+        parser = GeneralParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "openai-harmony":
+        parser = HarmonyParser(tokenizer, chat_template)
+    else:
+        raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
+
+    kwargs_list = [{} for _ in range(len(conversations))]
+    for key, value_list in kwargs.items():
+        for i, value in enumerate(value_list):
+            kwargs_list[i][key] = value
+    for source, kwargs_item in zip(conversations, kwargs_list):
         if not source:
             # if the source is None, skip it
             continue
-
-        if source[0]["role"] != "user":
-            # if the first message is not from user, skip it
-            source = source[1:]
-
-        convroles = ["user", "assistant"]
-        for j, sentence in enumerate(source):
-            role = sentence["role"]
-            assert role == convroles[j % 2], f"unexpected role {role}"
-            messages.append({"role": role, "content": sentence["content"]})
-
-        conversation = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
+        input_ids, loss_mask = parser.parse(
+            source, max_length, preformatted=is_preformatted, **kwargs_item
         )
-
-        if not tokenizer.pad_token_id:
-            tokenizer.pad_token_id = tokenizer.unk_token_id
-
-        encoding = tokenizer(
-            conversation,
-            return_offsets_mapping=True,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        input_ids = encoding.input_ids[0]
-        offsets = encoding.offset_mapping[0]
-        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
-
-        # Find spans of assistant responses using regex
-        assistant_pattern = (
-            re.escape(assistant_message_separator)
-            + r"(.*?)(?="
-            + re.escape(user_message_separator)
-            + "|$)"
-        )
-        for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
-            # Assistant response text span (excluding assistant_header itself)
-            assistant_start_char = match.start(1)
-            assistant_end_char = match.end(1)
-
-            # Mark tokens overlapping with assistant response
-            for idx, (token_start, token_end) in enumerate(offsets):
-                # Token is part of the assistant response span
-                if token_end <= assistant_start_char:
-                    continue  # token before assistant text
-                if token_start > assistant_end_char:
-                    continue  # token after assistant text
-                loss_mask[idx] = 1
-
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
@@ -173,12 +189,6 @@ def preprocess_vlm_conversations(
             - image_grid_thw: List of image grid tensors.
     """
     system_prompt = chat_template.system_prompt
-    user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    )
 
     # prepare result
     results = {
@@ -248,36 +258,18 @@ def preprocess_vlm_conversations(
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
-        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
         pixel_values = encoding.pixel_values
         image_grid_thw = encoding.image_grid_thw[0]
 
-        # Find spans of assistant responses using regex
-        assistant_pattern = (
-            re.escape(assistant_message_separator)
-            + r"(.*?)(?="
-            + re.escape(user_message_separator)
-            + "|$)"
-        )
-
-        # get conversation with image info
+        # get conversation with image info for loss mask generation
         decoded_conversation = processor.tokenizer.decode(
             encoding.input_ids[0], skip_special_tokens=False
         )
 
-        for match in re.finditer(assistant_pattern, decoded_conversation, re.DOTALL):
-            # Assistant response text span (excluding assistant_header itself)
-            assistant_start_char = match.start(1)
-            assistant_end_char = match.end(1)
-
-            # Mark tokens overlapping with assistant response
-            for idx, (token_start, token_end) in enumerate(offsets):
-                # Token is part of the assistant response span
-                if token_end <= assistant_start_char:
-                    continue  # token before assistant text
-                if token_start > assistant_end_char:
-                    continue  # token after assistant text
-                loss_mask[idx] = 1
+        # Apply loss mask
+        loss_mask = _apply_loss_mask_from_chat_template(
+            decoded_conversation, offsets, chat_template
+        )
 
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
@@ -290,7 +282,7 @@ def preprocess_vlm_conversations(
 def build_eagle3_dataset(
     dataset: HFDataset,
     tokenizer: PreTrainedTokenizer,
-    chat_template: str,
+    chat_template: Optional[str] = None,
     max_length: Optional[int] = 2048,
     shuffle_seed: Optional[int] = 42,
     num_proc: Optional[int] = 8,
@@ -298,6 +290,7 @@ def build_eagle3_dataset(
     cache_key: Optional[str] = None,
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
+    is_preformatted: Optional[bool] = False,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -305,7 +298,10 @@ def build_eagle3_dataset(
     Args:
         dataset: HF dataset to process.
         tokenizer: The tokenizer to use for tokenization.
-        chat_template: The chat template to use for formatting the conversations.
+        chat_template: The chat template to use for formatting conversations.
+                        This includes the system prompt and user/assistant tokens
+                        required to delineate different parts of the conversation
+                        for loss mask generation.
         max_length: The maximum length of the tokenized input.
         shuffle_seed: The seed for shuffling the dataset.
         num_proc: The number of processes to use for multiprocessing.
@@ -313,23 +309,35 @@ def build_eagle3_dataset(
         cache_key: The key to use for caching the processed dataset.
         is_vlm: Whether the dataset is for VLM models.
         processor: The image processor to use for processing images.
+        is_preformatted: Whether the dataset contains preformatted text of the conversation
+                        (e.g. includes system prompt, user and assistant start and end tokens)
+                        and doesn't need to have the chat template applied.
+                        Note that the chat_template still needs to be specified to determine
+                        the assistant spans for loss mask generation.
+                        If True, expects "text" column with ready-to-train text.
+                        If False, expects "conversations" column with ShareGPT format.
 
     Returns:
         The processed HF dataset.
     """
     if is_vlm:
         assert processor is not None, "processor must be provided when is_vlm is True"
-    # Get chat template
+
+    # Validate chat_template requirement
+    if chat_template is None:
+        raise ValueError("chat_template must be provided for all dataset types")
+
     assert (
         chat_template in TEMPLATE_REGISTRY.get_all_template_names()
     ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
+
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 
     dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
 
     def preprocess_function(examples):
-        # Always do preprocessing
+        # Handle different dataset formats
         if is_vlm:
             processed = preprocess_vlm_conversations(
                 processor,
@@ -337,13 +345,37 @@ def build_eagle3_dataset(
                 template,
                 max_length,
             )
-        else:
+        elif is_preformatted:
+            # Handle pre-formatted text (should be in "text" column)
+            if "text" not in examples:
+                raise ValueError(
+                    f"Expected 'text' column for is_preformatted=True, but found columns: {list(examples.keys())}"
+                )
             processed = preprocess_conversations(
                 tokenizer,
-                examples["conversations"],
+                examples["text"],
                 template,
                 max_length,
+                is_preformatted=True,
             )
+        else:
+            # Handle ShareGPT conversations
+            if "conversations" not in examples:
+                raise ValueError(
+                    f"Expected 'conversations' column for is_preformatted=False, but found columns: {list(examples.keys())}"
+                )
+            conversations = examples.pop("conversations")
+            if "id" in examples:
+                examples.pop("id")
+            processed = preprocess_conversations(
+                tokenizer,
+                conversations,
+                template,
+                max_length,
+                is_preformatted=False,
+                **examples,
+            )
+
         return processed
 
     # Process dataset only once
@@ -361,11 +393,13 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
-    # reduce batch size for VLM datasets to avoid PyArrow offset overflow
+    # adjust batch size based on dataset type
     if is_vlm:
-        batch_size = 200
+        batch_size = (
+            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
+        )
     else:
-        batch_size = 1000
+        batch_size = 1000  # default for conversations
     dataset = dataset.map(
         preprocess_function,
         batched=True,
@@ -403,6 +437,26 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         self._epoch = 0
         self.max_len = max_len
 
+    @staticmethod
+    def process_data(data, max_len, transform=None):
+        new_data = {}
+        # Squeeze due to our data generation script adding a batch dimension
+        hidden_state = data["aux_hidden_state"].squeeze(0)[:max_len][None, :]
+        target = data["hidden_state"].squeeze(0)[:max_len][None, :]
+
+        input_ids = data["input_ids"][:max_len][None, :]
+        loss_mask = data["loss_mask"][:max_len][None, :]
+        loss_mask[0, -1] = 0
+
+        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
+        new_data["loss_mask"] = loss_mask
+        new_data["target"] = padding(target, left=False)
+        new_data["hidden_state"] = hidden_state
+        new_data["input_ids"] = padding(input_ids, left=False)
+        if transform:
+            new_data = transform(new_data)
+        return new_data
+
     def __len__(self):
         return len(self.datapaths)
 
@@ -415,26 +469,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
             data = self._open_file(0)
-            # raise e
-        new_data = {}
-
-        # Squeeze due to our data generation script adding a batch dimension
-        hidden_state = data["aux_hidden_state"].squeeze(0)[: self.max_len][None, :]
-        target = data["hidden_state"].squeeze(0)[: self.max_len][None, :]
-
-        input_ids = data["input_ids"][: self.max_len][None, :]
-        loss_mask = data["loss_mask"][: self.max_len][None, :]
-        loss_mask[0, -1] = 0
-
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["target"] = padding(target, left=False)
-        new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = padding(input_ids, left=False)
-        if self.transform:
-            new_data = self.transform(new_data)
-
-        return new_data
+        return self.process_data(data, self.max_len, self.transform)
 
     def set_epoch(self, epoch):
         self._epoch = epoch

@@ -1,0 +1,57 @@
+name: PR Test
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: [self-hosted]
+    container:
+      image: lmsysorg/sglang:v0.5.5 # we lock to this version to avoid repeated docker pull
+      options: --gpus all --shm-size=2g --rm -v /dev/shm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore cache
+        run: |
+          if [ -d /github/home/sf ] && [ ! -z "$(ls -A /github/home/sf/)" ]; then
+            cp -p -r /github/home/sf/* ./
+          fi
+
+      - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
+        run: |
+          rm -rf /github/home/.cache/flashinfer
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          # if sf venv does not exist, create it
+          if [ ! -d sf ]; then
+            uv venv sf -p 3.11
+          fi
+          source sf/bin/activate
+          uv pip install -v . --prerelease=allow
+
+      - name: Run test
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          source sf/bin/activate
+          export PYTHONPATH=$PWD
+          python -m unittest discover -s ./tests -p "test_*.py" -v
+
+      - name: Save cache
+        run: |
+          cp -p -r sf /github/home/

@@ -12,10 +12,15 @@ def read_readme():
         return f.read()
 
 
+def read_version():
+    with open("version.txt", "r") as f:
+        return f.read().strip()
+
+
 setup(
     name="specforge",
     packages=find_packages(exclude=["configs", "scripts", "tests"]),
-    version="0.1.0",
+    version=read_version(),
     install_requires=read_requirements(),
     long_description=read_readme(),
     long_description_content_type="text/markdown",

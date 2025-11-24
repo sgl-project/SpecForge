@@ -15,10 +15,11 @@ class ChatTemplate(BaseModel):
         end_of_turn_token(str): The end token of a turn of conversation.
     """
 
-    assistant_header: str
-    user_header: str
-    system_prompt: str
-    end_of_turn_token: str
+    assistant_header: str | None
+    user_header: str | None
+    system_prompt: str | None
+    end_of_turn_token: str | None
+    parser_type: str = "general"
 
 
 class TemplateRegistry:
@@ -131,5 +132,67 @@ TEMPLATE_REGISTRY.register(
         user_header="User:",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="phi3",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>\n",
+        user_header="<|user|>\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="phi4",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant<|im_sep|>",
+        user_header="<|im_start|>user<|im_sep|>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="phi4-mini",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|end|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="gpt-oss-naive",
+    template=ChatTemplate(
+        assistant_header="<|start|>assistant<|channel|>analysis<|message|>",
+        user_header="<|start|>user<|message|>",
+        system_prompt=None,
+        end_of_turn_token="<|end|>",
+    ),
+)
+
+
+TEMPLATE_REGISTRY.register(
+    name="gpt-oss",
+    template=ChatTemplate(
+        assistant_header=None,  # the headers are not applicable to openai-harmony's channel tags
+        user_header=None,
+        system_prompt=None,
+        end_of_turn_token=None,
+        parser_type="openai-harmony",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-r1-distill",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        end_of_turn_token=None,
+        system_prompt=None,
     ),
 )

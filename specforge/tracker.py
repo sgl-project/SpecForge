@@ -239,7 +239,6 @@ class MLflowTracker(Tracker):
             parser.error(
                 "To use --report-to mlflow, you must install mlflow: 'pip install mlflow'"
             )
-
         # Set tracking URI from environment variable if not explicitly provided
         if args.mlflow_tracking_uri is None and "MLFLOW_TRACKING_URI" in os.environ:
             args.mlflow_tracking_uri = os.environ["MLFLOW_TRACKING_URI"]

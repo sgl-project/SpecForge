@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Dict, Tuple
 
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
 
 """
@@ -34,7 +34,16 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["ultrachat", "sharegpt", "sharegpt4v", "allava4v", "opc"],
+        choices=[
+            "ultrachat",
+            "sharegpt",
+            "eaglechat",
+            "perfectblend",
+            "magpie-qwen2.5-pro-1m-v0.1",
+            "sharegpt4v",
+            "allava4v",
+            "opc",
+        ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
     parser.add_argument(
@@ -59,6 +68,18 @@ def parse_args():
         "--split-eval",
         action="store_true",
         help="Whether to split the dataset into train and eval sets, default is False",
+    )
+    parser.add_argument(
+        "--opc-subset",
+        type=str,
+        default="largescale_diverse_instruct",
+        choices=[
+            "largescale_diverse_instruct",
+            "filtered_infinity_instruct",
+            "realuser_instruct",
+            "all",
+        ],
+        help="The subset of OpenCoder opc-sft-stage1 dataset to use, or 'all' to use all subsets (default: largescale_diverse_instruct)",
     )
     return parser.parse_args()
 
@@ -172,7 +193,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
             if row is None:
                 continue
             total_skipped_count += skipped_count
-            f.write(json.dumps(row) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if test_ds is not None:
         test_output_jsonl_path = output_path.joinpath(f"{dataset_name}_test.jsonl")
@@ -182,11 +203,12 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
                 if row is None:
                     continue
                 total_skipped_count += skipped_count
-                f.write(json.dumps(row) + "\n")
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if total_skipped_count > 0:
+        total_messages = len(train_ds) + (len(test_ds) if test_ds is not None else 0)
         print(
-            f"Skipped {total_skipped_count}/{len(train_ds)+len(test_ds)} messages for {dataset_name}"
+            f"Skipped {total_skipped_count}/{total_messages} messages for {dataset_name}"
         )
 
 
@@ -205,6 +227,11 @@ def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
     return processed_row, 0
 
 
+def add_index(row, idx) -> Dict:
+    row["id"] = idx
+    return row
+
+
 def main():
     args = parse_args()
     # load dataset
@@ -218,8 +245,19 @@ def main():
             print("Loading dataset from custom data path: ", args.data_path)
             ds = load_dataset_from_path(Path(args.data_path))
         proc_fn = process_sharegpt_row
+    elif args.dataset == "eaglechat":
+        ds = load_dataset("zhaode/EagleChat")["train"]
+        proc_fn = lambda row: (row, 0)
+    elif args.dataset == "perfectblend":
+        ds = load_dataset("mlabonne/open-perfectblend")["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = process_sharegpt_row
+    elif args.dataset == "magpie-qwen2.5-pro-1m-v0.1":
+        ds = load_dataset("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")["train"]
+        ds = ds.rename_column("uuid", "id")
+        proc_fn = process_sharegpt_row
     elif args.dataset == "sharegpt4v":
-        ds = load_dataset("Lin-Chen/ShareGPT4V")["train"]
+        ds = load_dataset("Lin-Chen/ShareGPT4V", "ShareGPT4V")["train"]
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "allava4v":
         ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
@@ -227,13 +265,24 @@ def main():
         ]
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "opc":
-        ds = load_dataset(
-            "OpenCoder-LLM/opc-sft-stage1", "largescale_diverse_instruct"
-        )["train"]
+        if args.opc_subset == "all":
+            # Load all subsets and concatenate them
+            subsets = [
+                "largescale_diverse_instruct",
+                "filtered_infinity_instruct",
+                "realuser_instruct",
+            ]
+            datasets_list = [
+                load_dataset("OpenCoder-LLM/opc-sft-stage1", subset)["train"]
+                for subset in subsets
+            ]
+            ds = concatenate_datasets(datasets_list)
+        else:
+            ds = load_dataset("OpenCoder-LLM/opc-sft-stage1", args.opc_subset)["train"]
         proc_fn = process_opc_sft_stage1
     else:
         raise ValueError(
-            "This script only supports ultrachat_200k and sharegpt datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
 
     # filter and split dataset

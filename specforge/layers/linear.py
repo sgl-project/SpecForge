@@ -3,7 +3,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
 
 
 class RowParallelLinear(nn.Module):
@@ -15,9 +15,11 @@ class RowParallelLinear(nn.Module):
         device=None,
         dtype=None,
         kv_head_replicas=False,
+        layout_type: str = "normal",
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
+        self.layout_type = layout_type
         self.tp_group = get_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
@@ -38,6 +40,25 @@ class RowParallelLinear(nn.Module):
             self.register_parameter("bias", None)
         self.reset_parameters()
 
+        self._register_load_state_dict_pre_hook(self.shard_state_dict)
+
+    def shard_state_dict(self, state_dict, *args):
+        """
+        This is a state dict hook to be triggered before loading the state dict. This will shard the weights and biases according to the layout type.
+        """
+        if self.layout_type == "normal":
+            self.handle_normal_layout(state_dict, *args)
+        else:
+            raise ValueError(f"Invalid layout type: {self.layout_type}")
+
+    def handle_normal_layout(self, state_dict, *args):
+        # shard the weights
+        if "weight" in state_dict:
+            state_dict["weight"] = shard_tensor(state_dict["weight"], self.tp_group, -1)
+
+        if "bias" in state_dict and self.tp_rank != 0:
+            state_dict["bias"] = torch.zeros_like(state_dict["bias"])
+
     def forward(self, x):
         return F.linear(x, self.weight, self.bias)
 
@@ -45,21 +66,6 @@ class RowParallelLinear(nn.Module):
         nn.init.xavier_normal_(self.weight)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-
-    def load_state_dict(self, state_dict, strict=True):
-        weight_of_current_shard = state_dict["weight"][
-            self.tp_rank
-            * self.in_features_per_shard : (self.tp_rank + 1)
-            * self.in_features_per_shard
-        ]
-        self.weight.data.copy_(weight_of_current_shard)
-        if self.bias is not None:
-            bias_of_current_shard = state_dict["bias"][
-                self.tp_rank
-                * self.in_features_per_shard : (self.tp_rank + 1)
-                * self.in_features_per_shard
-            ]
-            self.bias.data.copy_(bias_of_current_shard)
 
     def __repr__(self):
         return f"RowParallelLinear(in_features={self.in_features_per_shard}, out_features={self.out_features}, tp_size={self.tp_size}, tp_rank={self.tp_rank})"
@@ -74,9 +80,11 @@ class ColumnParallelLinear(nn.Module):
         device=None,
         dtype=None,
         kv_head_replicas=False,
+        layout_type: str = "normal",
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
+        self.layout_type = layout_type
         self.tp_group = get_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
@@ -99,6 +107,67 @@ class ColumnParallelLinear(nn.Module):
             self.register_parameter("bias", None)
         self.reset_parameters()
 
+        self._register_load_state_dict_pre_hook(self.shard_state_dict)
+
+    def shard_state_dict(self, state_dict, *args):
+        """
+        This is a state dict hook to be triggered before loading the state dict. This will shard the weights and biases according to the layout type.
+        """
+        if self.layout_type == "normal":
+            self.handle_normal_layout(state_dict, *args)
+        elif self.layout_type == "merged_qkv":
+            self.handle_merged_qkv(state_dict, *args)
+        elif self.layout_type == "gate_up":
+            self.handle_gate_up_layout(state_dict, *args)
+        else:
+            raise ValueError(f"Invalid layout type: {self.layout_type}")
+
+    def handle_normal_layout(self, state_dict, *args):
+        """
+        This shards the weights and biases along the column dimension.
+        """
+        # shard the weights
+        if "weight" in state_dict:
+            state_dict["weight"] = shard_tensor(state_dict["weight"], self.tp_group, 0)
+
+        if "bias" in state_dict and state_dict["bias"] is not None:
+            state_dict["bias"] = shard_tensor(state_dict["bias"], self.tp_group, 0)
+
+    def handle_gate_up_layout(self, state_dict, *args):
+        """
+        This handles the gate_up layout where the gate and up weights are concatenated along the column dimension.
+        """
+        if "weight" in state_dict:
+            gate, up = state_dict["weight"].chunk(2, dim=0)
+            gate = shard_tensor(gate, self.tp_group, 0)
+            up = shard_tensor(up, self.tp_group, 0)
+            state_dict["weight"] = torch.cat((gate, up), dim=0)
+
+        if "bias" in state_dict and state_dict["bias"] is not None:
+            gate, up = state_dict["bias"].chunk(2, dim=0)
+            gate = shard_tensor(gate, self.tp_group, 0)
+            up = shard_tensor(up, self.tp_group, 0)
+            state_dict["bias"] = torch.cat((gate, up), dim=0)
+
+    def handle_merged_qkv(self, state_dict, *args):
+        """
+        This handles the merged QKV layout where the q, k, v weights are concatenated along the column dimension.
+        """
+        if "weight" in state_dict:
+            # need to split into qkv and take the correct chunk for the rank
+            q, k, v = state_dict["weight"].chunk(3, dim=0)
+            q = shard_tensor(q, self.tp_group, 0)
+            k = shard_tensor(k, self.tp_group, 0)
+            v = shard_tensor(v, self.tp_group, 0)
+            state_dict["weight"] = torch.cat((q, k, v), dim=0)
+
+        if "bias" in state_dict and state_dict["bias"] is not None:
+            q, k, v = state_dict["bias"].chunk(3, dim=0)
+            q = shard_tensor(q, self.tp_group, 0)
+            k = shard_tensor(k, self.tp_group, 0)
+            v = shard_tensor(v, self.tp_group, 0)
+            state_dict["bias"] = torch.cat((q, k, v), dim=0)
+
     def forward(self, x):
         return F.linear(x, self.weight, self.bias)
 
@@ -106,22 +175,6 @@ class ColumnParallelLinear(nn.Module):
         nn.init.xavier_normal_(self.weight)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-
-    def load_state_dict(self, state_dict, strict=True):
-        weight_of_current_shard = state_dict["weight"][
-            self.tp_rank
-            * self.out_features_per_shard : (self.tp_rank + 1)
-            * self.out_features_per_shard,
-            :,
-        ]
-        self.weight.data.copy_(weight_of_current_shard)
-        if self.bias is not None:
-            bias_of_current_shard = state_dict["bias"][
-                self.tp_rank
-                * self.out_features_per_shard : (self.tp_rank + 1)
-                * self.out_features_per_shard
-            ]
-            self.bias.data.copy_(bias_of_current_shard)
 
     def __repr__(self):
         return f"ColumnParallelLinear(in_features={self.in_features}, out_features={self.out_features_per_shard}, tp_size={self.tp_size}, tp_rank={self.tp_rank})"

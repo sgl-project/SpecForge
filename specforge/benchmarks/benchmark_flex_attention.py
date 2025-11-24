@@ -111,15 +111,6 @@ def run_attention(
         loss = output[0].sum()
         loss_list.append(loss)
 
-        if attention_backend == "sdpa" and not is_last:
-            # Step 5.7: we need to update the loss mask
-            ind = torch.arange(seq_len, device=decoder_attention_mask.device)
-            ind0 = ind[idx:]
-            ind1 = ind[: seq_len - idx]
-            decoder_attention_mask[:, :, ind0, ind1] = torch.finfo(
-                decoder_attention_mask.dtype
-            ).min
-
     # Compute mean loss and backward pass
     if loss_list:
         mean_loss = sum(loss_list) / len(loss_list)
@@ -168,12 +159,10 @@ def benchmark_function(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
-
         # Record initial memory
         initial_memory = 0
         if torch.cuda.is_available():
             initial_memory = torch.cuda.memory_allocated()
-
         hidden_states = [
             torch.randn(
                 BATCH_SIZE,
@@ -202,7 +191,6 @@ def benchmark_function(
         if torch.cuda.is_available():
             peak_memory = torch.cuda.max_memory_allocated()
             current_memory = torch.cuda.memory_allocated()
-
         results_per_seq_len.append(
             {
                 "seq_len": seq_len,
@@ -214,6 +202,9 @@ def benchmark_function(
 
         print(f"  Time: {end_time - start_time:.3f}s")
         print(f"  Peak memory: {peak_memory / 1024**3:.3f} GB")
+        print(
+            f"  Memory increase: {(current_memory - initial_memory) / 1024**3:.3f} GB"
+        )
 
     return results_per_seq_len
 
