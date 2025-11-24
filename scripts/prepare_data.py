@@ -40,11 +40,11 @@ def parse_args():
             "eaglechat",
             "perfectblend",
             "magpie-qwen2.5-pro-1m-v0.1",
-            "magpie-llama3.3-pro-1m-v0.1",
             "sharegpt4v",
             "allava4v",
             "opc",
-
+            "perfectblend-regenerated-llama-3.1-8b-instruct",
+            "perfectblend-regenerated-llama-3.3-70b-instruct"
         ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
@@ -242,12 +242,20 @@ def main():
         ds = load_dataset("mlabonne/open-perfectblend")["train"]
         ds = ds.map(add_index, with_indices=True)
         proc_fn = process_sharegpt_row
+    elif args.dataset == "perfectblend-regenerated-llama-3.1-8b-instruct":
+        ds = load_dataset("frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct")["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = process_sharegpt_row
+    elif args.dataset == "perfectblend-regenerated-llama-3.1-8b-instruct":
+        ds = load_dataset("frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct")["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = process_sharegpt_row
+    elif args.dataset == "perfectblend-regenerated-llama-3.3-70b-instruct":
+        ds = load_dataset("frankleeeee/PerfectBlend-Regenerated-Llama-3.3-70B-Instruct")["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = process_sharegpt_row
     elif args.dataset == "magpie-qwen2.5-pro-1m-v0.1":
         ds = load_dataset("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")["train"]
-        ds = ds.rename_column("uuid", "id")
-        proc_fn = process_sharegpt_row
-    elif args.dataset == "magpie-llama3.3-pro-1m-v0.1":
-        ds = load_dataset("Magpie-Align/Magpie-Llama-3.3-Pro-1M-v0.1")["train"]
         ds = ds.rename_column("uuid", "id")
         proc_fn = process_sharegpt_row
     elif args.dataset == "sharegpt4v":
