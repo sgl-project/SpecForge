@@ -12,7 +12,7 @@ export CUDA_VISIBLE_DEVICES=4,5,6,7
 NUM_GPUS=4
 
 # Weights & Biases Configuration
-export WANDB_API_KEY="0db9fd073cc9e49c8bcec2b0a6929792ecb64e4e"
+export WANDB_API_KEY="YOUR_WANDB_API_KEY"
 
 torchrun \
     --standalone \
