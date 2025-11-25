@@ -34,7 +34,7 @@ python scripts/prepare_data.py --dataset sharegpt
 
 ```bash
 # train llama3-8B-instruct
-bash ./examples/run_llama3_eagle3_online.sh
+bash ./examples/run_llama3_eagle3.1_8b_online.sh
 ```
 
 ## 💨 Offline Training
@@ -49,7 +49,7 @@ Same as above
 
 ```bash
 # train llama3-8B-instruct in an offline manner
-bash ./examples/run_llama3_eagle3_offline.sh
+bash ./examples/run_llama3_eagle3.1_8b_offline.sh
 ```
 
 It is important to note that the `run_llama3_eagle3_offline.sh` script consists of two steps:

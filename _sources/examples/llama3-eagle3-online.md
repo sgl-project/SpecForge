@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python3 bench_model_speedup.py \
 First of all, we should download the dataset.
 
 ```shell
-python ./scripts/prepare_data.py --dataset perfect-blend
+python ./scripts/prepare_data.py --dataset perfectblend
 ```
 
 ### **Step 2. Launch Online Training**
