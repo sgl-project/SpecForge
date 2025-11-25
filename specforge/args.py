@@ -2,7 +2,7 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES, ServerArgs
+from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
 
 
 @dataclass

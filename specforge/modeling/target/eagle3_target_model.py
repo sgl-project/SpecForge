@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -22,7 +21,6 @@ from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
-from .target_head import TargetHead
 
 
 @dataclass
@@ -59,7 +57,6 @@ class Eagle3TargetModel(ABC):
         """
         Initialize the target model backend from a pretrained model path.
         """
-        pass
 
     @torch.no_grad()
     def generate_eagle3_data(

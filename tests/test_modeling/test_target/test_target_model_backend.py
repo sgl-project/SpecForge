@@ -1,9 +1,7 @@
 import os
-import tempfile
 import unittest
 
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 

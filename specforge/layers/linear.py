@@ -3,7 +3,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.distributed import gather_tensor, get_tp_group, shard_tensor
+from specforge.distributed import get_tp_group, shard_tensor
 
 
 class RowParallelLinear(nn.Module):

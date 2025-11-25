@@ -3,7 +3,6 @@ import logging
 import os
 import re
 from contextlib import contextmanager
-from datetime import timedelta
 
 import torch
 import torch.distributed as dist

@@ -1,9 +1,6 @@
-from typing import ClassVar, List, Optional, Tuple
-
 import torch
 import torch._dynamo as dynamo
 from torch.nn.attention.flex_attention import (
-    and_masks,
     create_block_mask,
     flex_attention,
     or_masks,

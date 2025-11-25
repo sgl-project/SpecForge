@@ -2,10 +2,9 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
-import torch.nn as nn
 from transformers import LlamaConfig
 
 from specforge.modeling.draft.llama3_eagle import (

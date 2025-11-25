@@ -2,7 +2,6 @@ import logging
 import os
 
 import torch
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -11,27 +10,11 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-from sglang.srt.eplb.eplb_manager import EPLBManager
-from sglang.srt.eplb.expert_distribution import (
-    ExpertDistributionRecorder,
-    set_global_expert_distribution_recorder,
-)
-from sglang.srt.eplb.expert_location import (
-    compute_initial_expert_location_metadata,
-    get_global_expert_location_metadata,
-    set_global_expert_location_metadata,
-)
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     initialize_dp_attention,
 )
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
@@ -40,9 +23,6 @@ from sglang.srt.utils import (
     is_npu,
     monkey_patch_p2p_access_check,
 )
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
-from specforge.distributed import get_tp_group as get_specforge_tp_group
 
 from .patch import (
     init_distributed_environment,
