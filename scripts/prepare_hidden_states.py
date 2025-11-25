@@ -36,7 +36,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
-from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.args import SGLangBackendArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,

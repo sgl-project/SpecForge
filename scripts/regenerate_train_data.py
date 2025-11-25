@@ -1,15 +1,40 @@
 ﻿"""
 This script will re-generate the dataset from target model,
 which better aligns the draft model with the target model’s output distribution.
+
+Usage:
+1. Set up one or more SGLang servers for the target model.
+
+python3 -m sglang.launch_server \
+	--model meta-llama/Llama-3.1-8B-Instruct \
+	--mem-fraction-static 0.75 \
+	--cuda-graph-max-bs 128 \
+	--tp 1 \
+	--trust-remote-code \
+	--host 0.0.0.0 \
+	--port 30000 \
+	--dtype bfloat16
+
+
+2. Regenerate the dataset using the `regenerate_train_data.py` script.
+python scripts/regenerate_train_data.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --concurrency 128 \
+    --max-tokens 4096 \
+    --server-address localhost:30000 \
+    --temperature 0.8 \
+    --input-file-path ./cache/dataset/sharegpt_train.jsonl \
+    --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
 """
 
 import argparse
 import json
+import random
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List
 
-import requests
+from openai import OpenAI
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
 
 def parse_arguments():
@@ -48,29 +73,92 @@ def parse_arguments():
         nargs="+",
         help="Server address and port for sglang model server",
     )
+    parser.add_argument(
+        "--is-reasoning-model",
+        action="store_true",
+        help="Whether the model is a reasoning model",
+    )
+    parser.add_argument(
+        "--is-gpt-oss",
+        action="store_true",
+        help="Whether the model is a GPT-OSS model",
+    )
     return parser.parse_args()
 
 
+def get_random_reasoning_effort() -> str:
+    """Get a random reasoning effort level for the model with weighted probabilities."""
+    # usage example: https://huggingface.co/openai/gpt-oss-20b/discussions/28
+    # Reasoning effort levels with weights: LOW(4), MEDIUM(4), HIGH(2)
+    reasoning_efforts = [
+        "low",
+        "medium",
+        "high",
+    ]
+    weights = [4, 4, 2]
+    return random.choices(reasoning_efforts, weights=weights, k=1)[0]
+
+
 def call_sglang(
-    model: str, max_tokens: int, temperature: float, server_address: str, prompt: str
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    server_address: str,
+    data: List[Dict[str, Any]],
+    is_reasoning_model: bool,
+    is_gpt_oss: bool,
 ) -> str:
     """Send a batch of prompts to sglang /v1/completions."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "skip_special_tokens": False,
-    }
-    headers = {"Content-Type": "application/json"}
-    url = f"http://{server_address}/v1/completions"
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=600)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["text"].strip()
-    except:
-        return None
+    client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
+
+    messages = data["conversations"]
+    regenerated_messages = []
+
+    # ignore data which starts with an assistant message
+    if messages[0]["role"] == "assistant":
+        data["status"] = "error"
+        data["error"] = "Data starts with an assistant message"
+        return data
+
+    for message in messages:
+        if message["role"] == "system":
+            regenerated_messages.append(message)
+        elif message["role"] == "assistant":
+            continue
+        elif message["role"] == "user":
+            regenerated_messages.append(message)
+
+            query_kwargs = dict(
+                model=model,
+                messages=regenerated_messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=False,
+            )
+            if is_gpt_oss:
+                query_kwargs["reasoning_effort"] = get_random_reasoning_effort()
+
+            try:
+                resp = client.chat.completions.create(**query_kwargs)
+            except Exception as e:
+                data["status"] = "error"
+                data["error"] = str(e)
+                return data
+            response_text = resp.choices[0].message.content
+            resp_msg = {
+                "role": "assistant",
+                "content": response_text,
+            }
+            if is_reasoning_model:
+                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
+            regenerated_messages.append(resp_msg)
+        else:
+            data["status"] = "error"
+            data["error"] = f"Invalid message role: {message['role']}"
+            return data
+    data["conversations"] = regenerated_messages
+    data["status"] = "success"
+    return data
 
 
 def main():
@@ -93,15 +181,22 @@ def main():
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")
     print("-" * 50)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
     total_lines = sum(1 for _ in open(args.input_file_path))
 
     # test all server addresses
     valid_server_addresses = []
     for server_address in args.server_address:
+        dummy_data = dict(
+            conversations=[{"role": "user", "content": "Hello, how are you?"}]
+        )
         result = call_sglang(
-            args.model, 1, args.temperature, server_address, "Hello, how are you?"
+            args.model,
+            1,
+            args.temperature,
+            server_address,
+            dummy_data,
+            args.is_reasoning_model,
+            args.is_gpt_oss,
         )
         if result is not None:
             valid_server_addresses.append(server_address)
@@ -115,11 +210,17 @@ def main():
     )
     print("-" * 50)
 
+    # create error file path if not exists
+    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+    print(
+        f"Regenerating dataset and saving the output to {args.output_file_path} and error log to {error_file_path}"
+    )
+    print("-" * 50)
+
     # Create progress bar
     with open(args.input_file_path, "r") as input_file, open(
         args.output_file_path, "w"
-    ) as output_file_handle:
-
+    ) as output_file_handle, open(error_file_path, "w") as error_file_handle:
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
         )
@@ -131,14 +232,6 @@ def main():
 
         for line in input_file:
             data = json.loads(line.strip())
-            messages = data["conversations"]
-
-            # Remove original last assistant message
-            if messages[-1]["role"] == "assistant":
-                messages.pop()
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
 
             # find server address with the least waiting requests
             server_address = valid_server_addresses[start_server_index]
@@ -148,20 +241,19 @@ def main():
             while len(waiting_queue[server_address]) >= args.concurrency:
                 finished_on_request = False
                 # check if any future is done, if so, write the result to the output file
-                for req_data, req_future in waiting_queue[server_address]:
+                for req_future in waiting_queue[server_address]:
                     if req_future.done():
-                        req_output = req_future.result()
+                        regen_data = req_future.result()
 
-                        if req_output is None:
-                            pass
+                        if regen_data["status"] == "error":
+                            error_file_handle.write(
+                                json.dumps(regen_data, ensure_ascii=False) + "\n"
+                            )
                         else:
-                            req_data["conversations"].append(
-                                {"role": "assistant", "content": req_output}
-                            )
                             output_file_handle.write(
-                                json.dumps(req_data, ensure_ascii=False) + "\n"
+                                json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
-                        waiting_queue[server_address].remove((req_data, req_future))
+                        waiting_queue[server_address].remove(req_future)
                         finished_on_request = True
 
                 if finished_on_request:
@@ -173,21 +265,24 @@ def main():
                 args.max_tokens,
                 args.temperature,
                 server_address,
-                prompt,
+                data,
+                args.is_reasoning_model,
+                args.is_gpt_oss,
             )
-            waiting_queue[server_address].append((data, req_future))
+            waiting_queue[server_address].append(req_future)
             pbar.update(1)
 
         # deal with all the remaining requests
         for server_address, waiting_queue_items in waiting_queue.items():
-            for req_data, req_future in waiting_queue_items:
-                req_output = req_future.result()
-                if req_output is not None:
-                    req_data["conversations"].append(
-                        {"role": "assistant", "content": req_output}
+            for req_future in waiting_queue_items:
+                regen_data = req_future.result()
+                if regen_data["status"] == "error":
+                    error_file_handle.write(
+                        json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
+                else:
                     output_file_handle.write(
-                        json.dumps(req_data, ensure_ascii=False) + "\n"
+                        json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
 
     print(f"\nProcessing completed!")

@@ -56,21 +56,18 @@ class Tracker(abc.ABC):
         This method is called during argument parsing.
         It should raise an error if required arguments are missing.
         """
-        pass
 
     @abc.abstractmethod
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None) -> None:
         """
         Log metrics to the tracker.
         """
-        pass
 
     @abc.abstractmethod
     def close(self) -> None:
         """
         Close the tracker and clean up resources.
         """
-        pass
 
 
 class NoOpTracker(Tracker):

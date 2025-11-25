@@ -6,6 +6,7 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # support tp8 train eagle3 for Qwen3-4B/8B/32B up to tp_size = 8
 NUM_GPUS=${1:-1}
+TP_SIZE=${2:-1}
 
 torchrun \
     --standalone \
@@ -22,4 +23,5 @@ torchrun \
     --chat-template qwen \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
-    --tp-size 1
+    --tp-size $TP_SIZE \
+    --target-model-backend sglang

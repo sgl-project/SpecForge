@@ -24,7 +24,6 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import PreTrainedTokenizer
 
 
 class DataCollatorWithPadding:

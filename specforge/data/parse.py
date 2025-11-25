@@ -30,7 +30,6 @@ class Parser(ABC):
         Returns:
             A list of tensors: [input_ids, loss_mask]
         """
-        pass
 
 
 _harmony_encoding = None

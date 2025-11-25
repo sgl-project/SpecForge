@@ -1,5 +1,4 @@
 import argparse
-import gc
 import time
 
 import matplotlib.pyplot as plt
@@ -14,7 +13,6 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaFlexAttention,
     prepare_decoder_attention_mask,
 )
-from specforge.utils import padding
 
 dynamo.config.recompile_limit = 64
 
