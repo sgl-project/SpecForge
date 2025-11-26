@@ -45,6 +45,8 @@ class TestRegenerateTrainData(unittest.TestCase):
         self.assertTrue(
             CACHE_DIR.joinpath("dataset", "sharegpt_train_regen.jsonl").exists()
         )
+        sglang_process.terminate()
+        sglang_process.wait()
 
 
 if __name__ == "__main__":
