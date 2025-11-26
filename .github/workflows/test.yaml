@@ -55,6 +55,7 @@ jobs:
           source sf/bin/activate
           export PYTHONPATH=$PWD
           # python -m unittest discover -s ./tests -p "test_*.py" -v
+          echo $HF_TOKEN
           python tests/test_scripts/test_train_eagle3.py
         env:
           HF_TOKEN: ${{ vars.HF_TOKEN_FOR_LLAMA }}
