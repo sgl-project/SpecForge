@@ -1,0 +1,41 @@
+import unittest
+from sglang.utils import execute_shell_command, wait_for_server
+from pathlib import Path
+
+CACHE_DIR = Path(__file__).parent.parent.parent.joinpath("cache")
+
+class TestRegenerateTrainData(unittest.TestCase):
+
+    def test_regenerate_sharegpt(self):
+        # prepare data
+        data_process = execute_shell_command("python scripts/prepare_data.py --dataset sharegpt")
+        data_process.wait()
+
+        # launch sglang
+        sglang_process = execute_shell_command("""python3 -m sglang.launch_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --tp 1 \
+    --cuda-graph-bs 4 \
+    --dtype bfloat16 \
+    --mem-frac=0.8 \
+    --port 30000
+        """)
+        wait_for_server(f"http://localhost:30000")
+
+        regeneration_process = execute_shell_command("""python scripts/regenerate_train_data.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --concurrency 128 \
+    --max-tokens 128 \
+    --server-address localhost:30000 \
+    --temperature 0.8 \
+    --input-file-path ./cache/dataset/sharegpt_train.jsonl \
+    --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl \
+    --num-samples 10
+        """)
+        regeneration_process.wait()
+        self.assertEqual(regeneration_process.returncode, 0)
+        self.assertTrue(CACHE_DIR.joinpath("dataset", "sharegpt_train_regen.jsonl").exists())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

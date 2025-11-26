@@ -83,6 +83,12 @@ def parse_arguments():
         action="store_true",
         help="Whether the model is a GPT-OSS model",
     )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="The number of samples to regenerate, if not provided, all samples will be regenerated",
+    )
     return parser.parse_args()
 
 
@@ -217,6 +223,9 @@ def main():
     )
     print("-" * 50)
 
+    success_samples = 0
+    error_samples = 0
+
     # Create progress bar
     with open(args.input_file_path, "r") as input_file, open(
         args.output_file_path, "w"
@@ -231,6 +240,9 @@ def main():
         start_server_index = 0
 
         for line in input_file:
+            if args.num_samples is not None and success_samples + error_samples >= args.num_samples:
+                break
+
             data = json.loads(line.strip())
 
             # find server address with the least waiting requests
@@ -249,10 +261,12 @@ def main():
                             error_file_handle.write(
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
+                            error_samples += 1
                         else:
                             output_file_handle.write(
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
+                            success_samples += 1
                         waiting_queue[server_address].remove(req_future)
                         finished_on_request = True
 
@@ -280,12 +294,14 @@ def main():
                     error_file_handle.write(
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
+                    error_samples += 1
                 else:
                     output_file_handle.write(
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
+                    success_samples += 1
 
-    print(f"\nProcessing completed!")
+    print(f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed.")
 
 
 if __name__ == "__main__":
