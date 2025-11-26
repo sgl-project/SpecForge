@@ -240,7 +240,10 @@ def main():
         start_server_index = 0
 
         for line in input_file:
-            if args.num_samples is not None and success_samples + error_samples >= args.num_samples:
+            if (
+                args.num_samples is not None
+                and success_samples + error_samples >= args.num_samples
+            ):
                 break
 
             data = json.loads(line.strip())
@@ -301,7 +304,9 @@ def main():
                     )
                     success_samples += 1
 
-    print(f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed.")
+    print(
+        f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed."
+    )
 
 
 if __name__ == "__main__":

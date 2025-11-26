@@ -1,8 +1,10 @@
 import unittest
-from sglang.utils import execute_shell_command
 from pathlib import Path
 
+from sglang.utils import execute_shell_command
+
 CACHE_DIR = Path(__file__).parent.parent.parent.joinpath("cache")
+
 
 class TestPrepareData(unittest.TestCase):
 
@@ -12,10 +14,13 @@ class TestPrepareData(unittest.TestCase):
         if sharegpt_train_path.exists():
             # delete the file
             sharegpt_train_path.unlink()
-        process = execute_shell_command("python scripts/prepare_data.py --dataset sharegpt")
+        process = execute_shell_command(
+            "python scripts/prepare_data.py --dataset sharegpt"
+        )
         process.wait()
         self.assertEqual(process.returncode, 0)
         self.assertTrue(sharegpt_train_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
