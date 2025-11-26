@@ -54,9 +54,7 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
-          # python -m unittest discover -s ./tests -p "test_*.py" -v
-          echo ${{ vars.HF_TOKEN_FOR_LLAMA }}
-          python tests/test_scripts/test_train_eagle3.py
+          python -m unittest discover -s ./tests -p "test_*.py" -v
 
       - name: Save cache
         run: |
