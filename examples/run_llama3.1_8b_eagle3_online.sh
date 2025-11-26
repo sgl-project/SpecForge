@@ -21,4 +21,4 @@ torchrun \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
     --target-model-backend sglang \
-    --log-interval 10 --max-num-steps 10
+    --log-interval 10 --max-num-steps 10 --max-num-steps 10
