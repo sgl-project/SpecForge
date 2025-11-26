@@ -18,7 +18,7 @@ class TestRegenerateTrainData(unittest.TestCase):
         # launch sglang
         sglang_process = execute_shell_command(
             """python3 -m sglang.launch_server \
-    --model meta-llama/Llama-3.1-8B-Instruct \
+    --model unsloth/Llama-3.2-1B-Instruct \
     --tp 1 \
     --cuda-graph-bs 4 \
     --dtype bfloat16 \
@@ -30,7 +30,7 @@ class TestRegenerateTrainData(unittest.TestCase):
 
         regeneration_process = execute_shell_command(
             """python scripts/regenerate_train_data.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
+    --model unsloth/Llama-3.2-1B-Instruct \
     --concurrency 128 \
     --max-tokens 128 \
     --server-address localhost:30000 \

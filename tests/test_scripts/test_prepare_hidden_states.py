@@ -28,10 +28,10 @@ class TestPrepareHiddenStates(unittest.TestCase):
     --standalone \
     --nproc_per_node 2 \
     scripts/prepare_hidden_states.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --target-model-path unsloth/Llama-3.2-1B-Instruct \
     --enable-aux-hidden-states \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
+    --output-path ./cache/hidden_states/sharegpt_train_Llama-3.2-1B-Instruct \
     --chat-template llama3 \
     --max-length 4096 \
     --tp-size 1 \

@@ -27,6 +27,15 @@ class TestTrainEagle3(unittest.TestCase):
         script = [line for line in script if line.strip()]
         script[-1] = script[-1].rstrip() + " --max-num-steps 10"
 
+        # replace meta-llama/Llama-3.1-8B-Instruct with unsloth/Llama-3.2-1B-Instruct
+        script = [
+            line.replace(
+                "meta-llama/Llama-3.1-8B-Instruct", "unsloth/Llama-3.2-1B-Instruct"
+            )
+            for line in script
+        ]
+
+        # write the script back to the file
         with open(script_path, "w") as f:
             for line in script:
                 f.write(line)
