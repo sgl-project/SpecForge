@@ -56,7 +56,7 @@ jobs:
           export PYTHONPATH=$PWD
           python -m unittest discover -s ./tests -p "test_*.py" -v
         env:
-          HF_TOKEN: ${{ variables.HF_TOKEN_FOR_LLAMA }}
+          HF_TOKEN: ${{ vars.HF_TOKEN_FOR_LLAMA }}
 
       - name: Save cache
         run: |
