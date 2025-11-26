@@ -1,5 +1,7 @@
 import unittest
 from sglang.utils import execute_shell_command
+from pathlib import Path
+import shutil
 
 class TestPrepareHiddenStates(unittest.TestCase):
 
@@ -7,6 +9,12 @@ class TestPrepareHiddenStates(unittest.TestCase):
         # prepare data
         sharegpt_process = execute_shell_command("python scripts/prepare_data.py --dataset sharegpt")
         sharegpt_process.wait()
+
+        # remove the hidden states if they exist
+        hidden_states_path = Path(__file__).parent.parent.parent.joinpath("cache", "hidden_states")
+        if hidden_states_path.exists():
+            # delete the directory
+            shutil.rmtree(hidden_states_path)
 
         # generate hidden states
         hidden_states_generation_process = execute_shell_command("""torchrun \
