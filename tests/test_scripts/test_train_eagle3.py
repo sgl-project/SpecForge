@@ -30,7 +30,7 @@ class TestTrainEagle3(unittest.TestCase):
         # replace meta-llama/Llama-3.1-8B-Instruct with unsloth/Llama-3.2-1B-Instruct
         script = [
             line.replace(
-                "meta-llama/Llama-3.1-8B-Instruct", "unsloth/Llama-3.2-1B-Instruct"
+                "meta-llama/Llama-3.1-8B-Instruct", "nreHieW/Llama-3.1-8B-Instruct"
             )
             for line in script
         ]
