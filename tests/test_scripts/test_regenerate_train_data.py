@@ -21,6 +21,7 @@ def execute_shell_command_without_proxy(command: str) -> subprocess.Popen:
     env.pop("HTTP_PROXY", None)
     env.pop("HTTPS_PROXY", None)
     env.pop("NO_PROXY", None)
+    env["HF_ENDPOINT"] = "https://hf-mirror.com"
     return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
@@ -44,7 +45,7 @@ class TestRegenerateTrainData(unittest.TestCase):
     --port 30000
         """
         )
-        wait_for_server(f"http://localhost:30000")
+        wait_for_server(f"http://localhost:30000", timeout=60)
 
         regeneration_process = execute_shell_command_without_proxy(
             """python scripts/regenerate_train_data.py \
