@@ -1,16 +1,14 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
-
 # train eagle3 for llama3.1-8b
 NUM_GPUS=${1:-1}
 TP_SIZE=${2:-1}
-
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --target-model-path nreHieW/Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-sharegpt \
@@ -22,5 +20,5 @@ torchrun \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
-    --target-model-backend sglang \
-    --log-interval 10
+    --target-model-backend custom \
+    --log-interval 10 --max-num-steps 10 --max-num-steps 10 --max-num-steps 10 --max-num-steps 10 --max-num-steps 10
