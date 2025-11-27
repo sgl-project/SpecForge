@@ -1,28 +1,11 @@
-import os
-import subprocess
 import unittest
 from pathlib import Path
 
-from sglang.utils import execute_shell_command, wait_for_server
+from sglang.utils import wait_for_server
+
+from tests.utils import execute_shell_command
 
 CACHE_DIR = Path(__file__).parent.parent.parent.joinpath("cache")
-
-
-def execute_shell_command_without_proxy(command: str) -> subprocess.Popen:
-    """
-    Execute a shell command and return its process handle.
-    """
-    command = command.replace("\\\n", " ").replace("\\", " ")
-    parts = command.split()
-    env = os.environ.copy()
-    env.pop("http_proxy", None)
-    env.pop("https_proxy", None)
-    env.pop("no_proxy", None)
-    env.pop("HTTP_PROXY", None)
-    env.pop("HTTPS_PROXY", None)
-    env.pop("NO_PROXY", None)
-    env["HF_ENDPOINT"] = "https://hf-mirror.com"
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
 class TestRegenerateTrainData(unittest.TestCase):
@@ -35,7 +18,7 @@ class TestRegenerateTrainData(unittest.TestCase):
         data_process.wait()
 
         # launch sglang
-        sglang_process = execute_shell_command_without_proxy(
+        sglang_process = execute_shell_command(
             """python3 -m sglang.launch_server \
     --model unsloth/Llama-3.2-1B-Instruct \
     --tp 1 \
@@ -43,11 +26,13 @@ class TestRegenerateTrainData(unittest.TestCase):
     --dtype bfloat16 \
     --mem-frac=0.8 \
     --port 30000
-        """
+        """,
+            disable_proxy=True,
+            enable_hf_mirror=True,
         )
-        wait_for_server(f"http://localhost:30000", timeout=60)
+        wait_for_server(f"http://localhost:30000")
 
-        regeneration_process = execute_shell_command_without_proxy(
+        regeneration_process = execute_shell_command(
             """python scripts/regenerate_train_data.py \
     --model unsloth/Llama-3.2-1B-Instruct \
     --concurrency 128 \
@@ -57,7 +42,9 @@ class TestRegenerateTrainData(unittest.TestCase):
     --input-file-path ./cache/dataset/sharegpt_train.jsonl \
     --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl \
     --num-samples 10
-        """
+        """,
+            disable_proxy=True,
+            enable_hf_mirror=True,
         )
         regeneration_process.wait()
         self.assertEqual(regeneration_process.returncode, 0)
