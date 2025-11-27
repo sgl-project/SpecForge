@@ -1,9 +1,27 @@
+import os
+import subprocess
 import unittest
 from pathlib import Path
 
 from sglang.utils import execute_shell_command, wait_for_server
 
 CACHE_DIR = Path(__file__).parent.parent.parent.joinpath("cache")
+
+
+def execute_shell_command_without_proxy(command: str) -> subprocess.Popen:
+    """
+    Execute a shell command and return its process handle.
+    """
+    command = command.replace("\\\n", " ").replace("\\", " ")
+    parts = command.split()
+    env = os.environ.copy()
+    env.pop("http_proxy", None)
+    env.pop("https_proxy", None)
+    env.pop("no_proxy", None)
+    env.pop("HTTP_PROXY", None)
+    env.pop("HTTPS_PROXY", None)
+    env.pop("NO_PROXY", None)
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
 class TestRegenerateTrainData(unittest.TestCase):
@@ -16,7 +34,7 @@ class TestRegenerateTrainData(unittest.TestCase):
         data_process.wait()
 
         # launch sglang
-        sglang_process = execute_shell_command(
+        sglang_process = execute_shell_command_without_proxy(
             """python3 -m sglang.launch_server \
     --model unsloth/Llama-3.2-1B-Instruct \
     --tp 1 \
@@ -28,7 +46,7 @@ class TestRegenerateTrainData(unittest.TestCase):
         )
         wait_for_server(f"http://localhost:30000")
 
-        regeneration_process = execute_shell_command(
+        regeneration_process = execute_shell_command_without_proxy(
             """python scripts/regenerate_train_data.py \
     --model unsloth/Llama-3.2-1B-Instruct \
     --concurrency 128 \
