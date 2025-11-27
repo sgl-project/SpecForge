@@ -23,7 +23,7 @@ def get_available_port():
 
 
 def execute_shell_command(
-    command: str, disable_proxy: bool = True, enable_hf_mirror: bool = False
+    command: str, disable_proxy: bool = False, enable_hf_mirror: bool = False
 ):
     """
     Execute a shell command and return its process handle.
