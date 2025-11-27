@@ -132,6 +132,8 @@ class Benchmarker(ABC):
             max_new_tokens (int): Maximum number of new tokens to generate, default is 2048
             num_runs (int): The number of times to run this benchmark, default is 1. You can set it to a larger number if you want to get more stable results.
         """
+        if not host.startswith(("http://", "https://")):
+            host = f"http://{host}"
         # Initialize backend
         sglang_args = Namespace(host=host, port=port, backend="srt-no-parallel")
         set_default_backend(select_sglang_backend(sglang_args))

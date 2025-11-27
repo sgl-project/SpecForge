@@ -177,7 +177,7 @@ class MMStarBenchmarker(Benchmarker):
     def run(self, *args, **kwargs):
         """Run benchmark and clean up cache directory."""
         try:
-            super().run(*args, **kwargs)
+            return super().run(*args, **kwargs)
         finally:
             # Clean up cache directory
             if self.cache_dir and os.path.exists(self.cache_dir):
