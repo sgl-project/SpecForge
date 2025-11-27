@@ -1,9 +1,7 @@
 import unittest
 from pathlib import Path
 
-from sglang.utils import wait_for_server
-
-from tests.utils import execute_shell_command
+from tests.utils import execute_shell_command, wait_for_server
 
 CACHE_DIR = Path(__file__).parent.parent.parent.joinpath("cache")
 
@@ -30,7 +28,7 @@ class TestRegenerateTrainData(unittest.TestCase):
             disable_proxy=True,
             enable_hf_mirror=True,
         )
-        wait_for_server(f"http://localhost:30000")
+        wait_for_server(f"http://localhost:30000", disable_proxy=True)
 
         regeneration_process = execute_shell_command(
             """python scripts/regenerate_train_data.py \
