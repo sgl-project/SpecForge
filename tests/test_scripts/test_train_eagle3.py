@@ -51,47 +51,47 @@ class TestTrainEagle3(unittest.TestCase):
             for line in script:
                 f.write(line)
 
-    # def test_online_train_eagle3_with_sglang_backend(self):
-    #     # run training
-    #     train_process = execute_shell_command(
-    #         "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
-    #     )
-    #     train_process.wait()
-    #     self.assertEqual(train_process.returncode, 0)
+    def test_online_train_eagle3_with_sglang_backend(self):
+        # run training
+        train_process = execute_shell_command(
+            "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
+        )
+        train_process.wait()
+        self.assertEqual(train_process.returncode, 0)
 
-    # def test_online_train_eagle3_with_hf_backend(self):
-    #     # replace --target-model-backend sglang with --target-model-backend hf
-    #     script_path = Path(__file__).parent.parent.parent.joinpath(
-    #         "examples", "run_llama3.1_8b_eagle3_online.sh"
-    #     )
-    #     replace_in_script(
-    #         script_path, "--target-model-backend sglang", "--target-model-backend hf"
-    #     )
+    def test_online_train_eagle3_with_hf_backend(self):
+        # replace --target-model-backend sglang with --target-model-backend hf
+        script_path = Path(__file__).parent.parent.parent.joinpath(
+            "examples", "run_llama3.1_8b_eagle3_online.sh"
+        )
+        replace_in_script(
+            script_path, "--target-model-backend sglang", "--target-model-backend hf"
+        )
 
-    #     # run training
-    #     train_process = execute_shell_command(
-    #         "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
-    #     )
-    #     train_process.wait()
-    #     self.assertEqual(train_process.returncode, 0)
+        # run training
+        train_process = execute_shell_command(
+            "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
+        )
+        train_process.wait()
+        self.assertEqual(train_process.returncode, 0)
 
-    # def test_online_train_eagle3_with_custom_backend(self):
-    #     # replace --target-model-backend sglang with --target-model-backend custom
-    #     script_path = Path(__file__).parent.parent.parent.joinpath(
-    #         "examples", "run_llama3.1_8b_eagle3_online.sh"
-    #     )
-    #     replace_in_script(
-    #         script_path,
-    #         "--target-model-backend sglang",
-    #         "--target-model-backend custom",
-    #     )
+    def test_online_train_eagle3_with_custom_backend(self):
+        # replace --target-model-backend sglang with --target-model-backend custom
+        script_path = Path(__file__).parent.parent.parent.joinpath(
+            "examples", "run_llama3.1_8b_eagle3_online.sh"
+        )
+        replace_in_script(
+            script_path,
+            "--target-model-backend sglang",
+            "--target-model-backend custom",
+        )
 
-    #     # run training
-    #     train_process = execute_shell_command(
-    #         "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
-    #     )
-    #     train_process.wait()
-    #     self.assertEqual(train_process.returncode, 0)
+        # run training
+        train_process = execute_shell_command(
+            "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
+        )
+        train_process.wait()
+        self.assertEqual(train_process.returncode, 0)
 
     def test_offline_train_eagle3(self):
         # remove the hidden states if they exist
