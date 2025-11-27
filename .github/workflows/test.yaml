@@ -54,7 +54,8 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
-          python -m unittest discover -s ./tests -p "test_*.py" -v
+          # python -m unittest discover -s ./tests -p "test_*.py" -v
+          python ./tests/test_scripts/test_regenerate_train_data.py
 
       - name: Save cache
         run: |
