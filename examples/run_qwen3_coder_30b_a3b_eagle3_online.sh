@@ -11,9 +11,6 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 NUM_GPUS=4
 
-# Weights & Biases Configuration
-export WANDB_API_KEY="YOUR_WANDB_API_KEY"
-
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
