@@ -91,6 +91,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # training hyper params
     parser.add_argument("--num-epochs", type=int, default=10)
+    parser.add_argument(
+        "--max-num-steps",
+        type=int,
+        default=None,
+        help="The maximum number of steps to train. If not provided, will be calculated as num_epochs * steps_per_epoch",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
@@ -765,6 +771,12 @@ def main():
             if global_step % args.save_interval == 0:
                 # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+
+            if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                break
+
+        if args.max_num_steps is not None and global_step >= args.max_num_steps:
+            break
 
     # Close the tracker
     tracker.close()
