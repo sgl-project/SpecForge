@@ -30,7 +30,6 @@ python3 bench_eagle3.py \
     --attention-backend fa3 \
     --config-list 1,0,0,0 1,3,1,4 \
     --benchmark-list mtbench gsm8k:5 ceval:5:accountant \
-    --output test.jsonl \
     --dtype bfloat16
 ```
 

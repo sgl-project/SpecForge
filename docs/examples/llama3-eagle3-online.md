@@ -47,16 +47,14 @@ config_list=(
     "4,3,1,4"
     "4,7,10,60"
 )
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 bench_model_speedup.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 benchmarks/bench_eagle3.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-draft-model-path /YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/epoch_0 \
-    --port 20001 \
-    --trust-remote-code \
+    --port 30000 \
     --mem-fraction-static 0.8 \
-    --tp-size 4 \
+    --tp-size 1 \
     --config-list "${config_list[@]}" \
-    --benchmark-list mtbench:80 gsm8k:200 humaneval:200 math500:200 \
-    --output output.jsonl
+    --benchmark-list mtbench gsm8k humaneval math500
 ```
 
 

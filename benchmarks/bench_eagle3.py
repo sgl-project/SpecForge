@@ -70,9 +70,7 @@ def parse_args():
         "--skip-launch-server", action="store_true", default=False
     )
     benchmark_group.add_argument("--num-prompts", type=int, default=80)
-    benchmark_group.add_argument(
-        "--output-dir", type=str, default="./bernchmark_results"
-    )
+    benchmark_group.add_argument("--output-dir", type=str, default="./results")
     benchmark_group.add_argument(
         "--config-list", type=str, nargs="+", default=["1,0,0,0", "1,3,1,4"]
     )
