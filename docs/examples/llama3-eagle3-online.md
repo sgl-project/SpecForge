@@ -47,7 +47,7 @@ config_list=(
     "4,3,1,4"
     "4,7,10,60"
 )
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 benchmarks/bench_eagle3.py \
+python3 benchmarks/bench_eagle3.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-draft-model-path /YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/epoch_0 \
     --port 30000 \
