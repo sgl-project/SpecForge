@@ -43,11 +43,13 @@ The four numbers in the config represent: `batch_size, num_steps, topk, num_veri
 A pre-trained EAGLE model is available at [zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct) for reference.
 
 ```shell
+cd benchmarks
+
 config_list=(
     "4,3,1,4"
     "4,7,10,60"
 )
-python3 benchmarks/bench_eagle3.py \
+python3 bench_eagle3.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-draft-model-path /YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/epoch_0 \
     --port 30000 \
