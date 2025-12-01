@@ -54,7 +54,7 @@
     <link rel="prev" title="💡 Customize Your Own Training" href="../advanced_features/customization.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-    <meta name="docbuild:last-update" content="Nov 27, 2025"/>
+    <meta name="docbuild:last-update" content="Dec 01, 2025"/>
   </head>
   
   
@@ -481,20 +481,20 @@ document.write(`
 <p>For <code class="docutils literal notranslate"><span class="pre">Llama3.1-8B</span></code>, we add a system prompt to all training data, following the approach used in the official repository. Consequently, when benchmarking, we should also include this system prompt to obtain the full accept length. Please uncomment the corresponding line and add the system prompt.</p>
 <p>The four numbers in the config represent: <code class="docutils literal notranslate"><span class="pre">batch_size,</span> <span class="pre">num_steps,</span> <span class="pre">topk,</span> <span class="pre">num_verify_tokens</span></code>.  You can adjust the values in the config list to experiment with different test cases.</p>
 <p>A pre-trained EAGLE model is available at <a class="reference external" href="https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct">zhuyksir/EAGLE3-Llama-3.1-8B-Instruct</a> for reference.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">config_list</span><span class="o">=(</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>benchmarks
+
+<span class="nv">config_list</span><span class="o">=(</span>
 <span class="w">    </span><span class="s2">&quot;4,3,1,4&quot;</span>
 <span class="w">    </span><span class="s2">&quot;4,7,10,60&quot;</span>
 <span class="o">)</span>
-<span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">4</span>,5,6,7<span class="w"> </span>python3<span class="w"> </span>bench_model_speedup.py<span class="w"> </span><span class="se">\</span>
+python3<span class="w"> </span>bench_eagle3.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--speculative-draft-model-path<span class="w"> </span>/YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/epoch_0<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--port<span class="w"> </span><span class="m">20001</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--config-list<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">config_list</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--benchmark-list<span class="w"> </span>mtbench:80<span class="w"> </span>gsm8k:200<span class="w"> </span>humaneval:200<span class="w"> </span>math500:200<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--output<span class="w"> </span>output.jsonl
+<span class="w">    </span>--benchmark-list<span class="w"> </span>mtbench<span class="w"> </span>gsm8k<span class="w"> </span>humaneval<span class="w"> </span>math500
 </pre></div>
 </div>
 </section>
@@ -605,7 +605,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 27, 2025.
+  Last updated on Dec 01, 2025.
   <br/>
 </p>
   </div>
