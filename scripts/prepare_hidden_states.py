@@ -84,6 +84,12 @@ def parse_args():
     others_group.add_argument("--cache-dir", type=str, default="./cache")
     others_group.add_argument("--output-path", type=str, default=None)
     others_group.add_argument(
+        "--model-download-dir",
+        type=str,
+        default=None,
+        help="The directory to download the target model to",
+    )
+    others_group.add_argument(
         "--dist-timeout",
         type=int,
         default=2000,
@@ -152,7 +158,7 @@ def build_target_model(
                 else model_config.torch_dtype
             ),
             device="cuda",
-            cache_dir=args.cache_dir,
+            cache_dir=args.model_download_dir,
             **target_model_kwargs,
         )
     # Set auxiliary hidden states layers if specified

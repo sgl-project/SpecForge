@@ -176,6 +176,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=20,
         help="Timeout for collective communication in minutes",
     )
+    other_group.add_argument(
+        "--model-download-dir",
+        type=str,
+        default=None,
+        help="The directory to download the target model to",
+    )
 
     # vlm related args
     vlm_group = parser.add_argument_group("vlm")
@@ -264,7 +270,7 @@ def build_target_model(
                 backend=args.target_model_backend,
                 torch_dtype=torch.bfloat16,
                 device="cuda",
-                cache_dir=args.cache_dir,
+                cache_dir=args.model_download_dir,
                 **target_model_kwargs,
             )
 
