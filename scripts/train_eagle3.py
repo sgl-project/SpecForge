@@ -300,7 +300,7 @@ def build_target_model(
         target_head = TargetHead.from_pretrained(
             model_path=args.target_model_path,
             lm_head_key=args.lm_head_key,
-            cache_dir=args.cache_dir,
+            cache_dir=args.model_download_dir,
         )
         return target_head, None
 
@@ -324,7 +324,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     if args.draft_model_config is None:
         # Auto-generate and save config file
         auto_config_path = create_draft_config_from_target(
-            target_model_path=args.target_model_path, cache_dir=args.cache_dir
+            target_model_path=args.target_model_path, cache_dir=args.model_download_dir
         )
         draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
     else:
