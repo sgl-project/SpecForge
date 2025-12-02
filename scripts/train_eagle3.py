@@ -702,6 +702,31 @@ def main():
             global_step += 1
 
             # ================================================
+            # 7.0 Profiling
+            # ================================================
+            if args.profile:
+                # we add the step by 1 to align with global step
+                if global_step == args.profile_start_step + 1:
+                    print("Start profile")
+                    torch_profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=True,
+                        record_shapes=args.profile_record_shapes,
+                    )
+                    torch_profiler.start()
+                if global_step == args.profile_start_step + args.profile_num_steps + 1:
+                    output_path = os.path.join(
+                        args.output_dir,
+                        f"profile_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
+                    )
+                    print(f"End profile {output_path=}")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(output_path)
+
+            # ================================================
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
