@@ -133,6 +133,24 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         )
         return cls(target_model)
 
+    def _get_transformer_layers(self):
+        """
+        Helper to find the module list containing the transformer layers.
+        Adapts to common architectures (Llama, Qwen, Mistral, OPT, etc.)
+        """
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            return self.model.model.layers
+        elif hasattr(self.model, "layers"):
+            return self.model.layers
+        elif hasattr(self.model, "transformer") and hasattr(
+            self.model.transformer, "h"
+        ):
+            return self.model.transformer.h
+        else:
+            raise ValueError(
+                "Could not locate transformer layers in the model architecture to register hooks."
+            )
+
     @torch.no_grad()
     def generate_eagle3_data(
         self,
@@ -141,29 +159,66 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         loss_mask: torch.Tensor,
     ) -> Eagle3TargetOutput:
         """
-        HF backend does not support customizing which layers to capture the aux hidden states.
-        We capture all hidden states and layers
+        Optimized HF backend:
+        Instead of returning all hidden states (memory heavy), we use forward hooks
+        to capture only the specific layers required by Eagle3.
         """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            output_attentions=False,  # Explicit
-            output_router_logits=False,  # Explicit
-            use_cache=False,
-        )
+        captured_states = {}
+        handles = []
 
-        # extract the aux hidden states
-        # output_hidden_states = True will return the embedding output as well
-        # so we have an offset of 1
-        offset = 1
-        low_aux_layer = self.aux_hidden_states_layers[0] + offset
-        mid_aux_layer = self.aux_hidden_states_layers[1] + offset
-        last_aux_layer = self.aux_hidden_states_layers[2] + offset
+        def get_hook(layer_idx):
+            def hook(module, input, output):
+                # HF outputs for layers are usually tuples (hidden_states, present_key_value, ...)
+                # We only need the hidden_states (first element)
+                if isinstance(output, tuple):
+                    hidden = output[0]
+                else:
+                    hidden = output
+                captured_states[layer_idx] = hidden
 
-        hidden_states0 = outputs.hidden_states[low_aux_layer]
-        hidden_states1 = outputs.hidden_states[mid_aux_layer]
-        hidden_states2 = outputs.hidden_states[last_aux_layer]
+            return hook
+
+        # Locate the transformer layers ModuleList
+        layers = self._get_transformer_layers()
+
+        target_indices = self.aux_hidden_states_layers
+
+        # Register hooks
+        for idx in target_indices:
+            # Ensure index is within bounds
+            if 0 <= idx < len(layers):
+                handles.append(layers[idx].register_forward_hook(get_hook(idx)))
+            else:
+                raise ValueError(
+                    f"Layer index {idx} out of bounds for model with {len(layers)} layers."
+                )
+
+        try:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                output_attentions=False,
+                output_router_logits=False,
+                use_cache=False,
+            )
+            target = outputs.logits
+        finally:
+            # Always remove hooks to prevent memory leaks or side effects on subsequent calls
+            for handle in handles:
+                handle.remove()
+
+        # Verify we captured everything
+        if len(captured_states) != len(target_indices):
+            raise RuntimeError(
+                f"Expected to capture {len(target_indices)} layers, but captured {len(captured_states)}. "
+                f"Captured layers: {sorted(captured_states.keys())}, Target layers: {target_indices}"
+            )
+
+        # Extract in the correct order
+        hidden_states0 = captured_states[target_indices[0]]
+        hidden_states1 = captured_states[target_indices[1]]
+        hidden_states2 = captured_states[target_indices[2]]
 
         hidden_states = torch.cat(
             (hidden_states0, hidden_states1, hidden_states2), dim=-1
