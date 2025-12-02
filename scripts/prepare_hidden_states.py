@@ -59,49 +59,60 @@ class DataPoint:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target-model-path", type=str, required=True)
-    parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--cache-dir", type=str, default="./cache")
-    parser.add_argument("--output-path", type=str, default=None)
-    parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--chat-template", type=str, default="llama3")
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument(
+
+    # model-related arguments
+    model_group = parser.add_argument_group("model")
+    model_group.add_argument("--target-model-path", type=str, required=True)
+    model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
-    parser.add_argument("--num-samples", type=int, default=None)
-    parser.add_argument("--enable-aux-hidden-states", action="store_true")
-    parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
-    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
-    parser.add_argument(
+    model_group.add_argument("--enable-aux-hidden-states", action="store_true")
+    model_group.add_argument("--aux-hidden-states-layers", type=str, default=None)
+
+    data_group = parser.add_argument_group("data")
+    data_group.add_argument("--data-path", type=str, required=True)
+    data_group.add_argument("--max-length", type=int, default=2048)
+    data_group.add_argument("--chat-template", type=str, default="llama3")
+    data_group.add_argument("--num-samples", type=int, default=None)
+    data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
+
+    inference_group = parser.add_argument_group("inference")
+    inference_group.add_argument("--tp-size", type=int, default=1)
+    inference_group.add_argument("--batch-size", type=int, default=32)
+
+    others_group = parser.add_argument_group("others")
+    others_group.add_argument("--cache-dir", type=str, default="./cache")
+    others_group.add_argument("--output-path", type=str, default=None)
+    others_group.add_argument(
         "--dist-timeout",
         type=int,
         default=2000,
         help="Timeout for collective communication in minutes, default to 2000 so that it does not go timeout",
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--num-io-threads",
         type=int,
         default=4,
         help="Number of threads for async I/O operations",
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--num-workers", type=int, default=4, help="Number of workers for DataLoader"
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--io-queue-size",
         type=int,
         default=50,
         help="Max number of pending I/O futures.",
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--file-group-size",
         type=int,
         default=2000,
         help="Number of files per subdirectory.",
     )
-    SGLangBackendArgs.add_args(parser)
+
+    sglang_group = parser.add_argument_group("sglang")
+    SGLangBackendArgs.add_args(sglang_group)
     return parser.parse_args()
 
 

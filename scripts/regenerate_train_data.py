@@ -42,70 +42,85 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Re-generate training data using sglang model server"
     )
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument(
+
+    # model related arguments
+    model_group = parser.add_argument_group("model")
+    model_group.add_argument("--model", type=str, required=True)
+    model_group.add_argument(
+        "--is-reasoning-model",
+        action="store_true",
+        help="Whether the model is a reasoning model",
+    )
+    model_group.add_argument(
+        "--is-gpt-oss",
+        action="store_true",
+        help="Whether the model is a GPT-OSS model",
+    )
+
+    # sampling params
+    sampling_params_group = parser.add_argument_group("sampling parameters")
+    sampling_params_group.add_argument(
         "--temperature",
         type=float,
         default=0.7,
         help="Temperature for sglang model server",
     )
-    parser.add_argument(
+    sampling_params_group.add_argument(
         "--top-p",
         type=float,
         default=None,
         help="Nucleus sampling top_p",
     )
-    parser.add_argument(
+    sampling_params_group.add_argument(
         "--top-k",
         type=int,
         default=None,
         help="Top-k sampling value sent via extra_body",
     )
-    parser.add_argument(
+    sampling_params_group.add_argument(
         "--repetition-penalty",
         type=float,
         default=None,
         help="Mapped to presence_penalty in the OpenAI API",
     )
-    parser.add_argument(
+    sampling_params_group.add_argument(
         "--max-tokens",
         type=int,
         default=4096,
         help="Maximum number of tokens (default: 4096)",
     )
-    parser.add_argument(
+
+    # optimization
+    optimization_group = parser.add_argument_group("optimization")
+    optimization_group.add_argument(
         "--concurrency",
         type=int,
         default=64,
         help="The number of requests to send to a single server concurrently, the total number of concurrent requests is concurrency * number of server addresses",
     )
-    parser.add_argument(
+
+    # data related arguments
+    data_group = parser.add_argument_group("data")
+    data_group.add_argument(
         "--input-file-path", type=str, required=True, help="Path to the input file"
     )
-    parser.add_argument(
+    data_group.add_argument(
         "--output-file-path", type=str, required=True, help="Path to the output file"
     )
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        nargs="+",
-        help="Server address and port for sglang model server",
-    )
-    parser.add_argument(
-        "--is-reasoning-model",
-        action="store_true",
-        help="Whether the model is a reasoning model",
-    )
-    parser.add_argument(
-        "--is-gpt-oss",
-        action="store_true",
-        help="Whether the model is a GPT-OSS model",
-    )
-    parser.add_argument(
+    data_group.add_argument(
         "--num-samples",
         type=int,
         default=None,
         help="The number of samples to regenerate, if not provided, all samples will be regenerated",
+    )
+
+    # sglang server
+    server_group = parser.add_argument_group("sglang server")
+    server_group.add_argument(
+        "--server-address",
+        type=str,
+        nargs="+",
+        help="Server address and port for sglang model server",
     )
     return parser.parse_args()
 
