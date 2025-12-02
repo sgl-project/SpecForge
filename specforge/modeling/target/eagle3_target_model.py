@@ -209,10 +209,9 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 handle.remove()
 
         # Verify we captured everything
-        if len(captured_states) != len(target_indices):
+        if len(captured_states) != 3:
             raise RuntimeError(
-                f"Expected to capture {len(target_indices)} layers, but captured {len(captured_states)}. "
-                f"Captured layers: {sorted(captured_states.keys())}, Target layers: {target_indices}"
+                f"Expected to capture 3 layers, but captured {len(captured_states)}"
             )
 
         # Extract in the correct order
