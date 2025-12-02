@@ -60,119 +60,30 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
 
     # add model-related arguments
-    parser.add_argument("--target-model-path", type=str, required=True)
-    parser.add_argument(
+    model_group = parser.add_argument_group("model")
+    model_group.add_argument("--target-model-path", type=str, required=True)
+    model_group.add_argument(
         "--draft-model-config",
         type=str,
         required=False,
         help="Draft model config path. If not provided, will auto-generate from target model.",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--embedding-key",
         type=str,
         default="model.embed_tokens.weight",
         help="The key of the embedding weight to load from the target model",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--lm-head-key",
         type=str,
         default="lm_head.weight",
-        help="The key of the lm head weight to load from the target model",
+        help="The key of the lm head weight to load from the target model, this is only required for offline training",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
-
-    # dataset arguments
-    parser.add_argument("--train-data-path", type=str, required=True)
-    parser.add_argument("--train-hidden-states-path", type=str, default=None)
-    parser.add_argument("--eval-hidden-states-path", type=str, default=None)
-    parser.add_argument("--eval-data-path", type=str, default=None)
-
-    # training hyper params
-    parser.add_argument("--num-epochs", type=int, default=10)
-    parser.add_argument(
-        "--max-num-steps",
-        type=int,
-        default=None,
-        help="The maximum number of steps to train. If not provided, will be calculated as num_epochs * steps_per_epoch",
-    )
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--warmup-ratio", type=float, default=0.015)
-    parser.add_argument(
-        "--total-steps",
-        type=int,
-        default=None,
-        help="Total training steps. If not provided, will be calculated as num_epochs * steps_per_epoch",
-    )
-    parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument(
-        "--log-interval",
-        type=int,
-        default=50,
-        help="Log training metrics every N steps",
-    )
-    parser.add_argument(
-        "--ttt-length",
-        type=int,
-        default=7,
-        help="The length for Test-Time Training (TTT).",
-    )
-
-    # data processing type
-    parser.add_argument("--chat-template", type=str, default="llama3")
-    parser.add_argument(
-        "--is-preformatted",
-        action="store_true",
-        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
-    )
-
-    # distributed training
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--dp-size", type=int, default=1)
-    parser.add_argument("--draft-accumulation-steps", type=int, default=1)
-
-    # other args
-    parser.add_argument("--cache-key", type=str, default=None)
-    parser.add_argument("--cache-dir", type=str, default="./cache")
-    parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument(
-        "--ckpt-dir",
-        type=str,
-        default=None,
-        help="directory includes the checkpoint to start training with",
-    )
-    parser.add_argument("--eval-interval", type=int, default=5000)
-    parser.add_argument("--save-interval", type=int, default=5000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--dist-timeout",
-        type=int,
-        default=20,
-        help="Timeout for collective communication in minutes",
-    )
-    parser.add_argument("--attention-backend", type=str, default="flex_attention")
-
-    # resume
-    parser.add_argument("--resume", action="store_true")
-
-    # vlm related args
-    parser.add_argument(
-        "--min-pixels", type=int, default=50176
-    )  # 64*28*28 for qwen2.5-vl
-    parser.add_argument(
-        "--max-pixels", type=int, default=802816
-    )  # 1024*28*28 for qwen2.5-vl
-
-    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--profile-start-step", type=int, default=30)
-    parser.add_argument("--profile-num-steps", type=int, default=4)
-    parser.add_argument("--profile-record-shapes", action="store_true")
-    parser.add_argument(
+    model_group.add_argument(
         "--target-model-backend",
         type=str,
         default="sglang",
@@ -180,8 +91,115 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         help="The backend of the target model",
     )
 
-    SGLangBackendArgs.add_args(parser)
-    TrackerArgs.add_args(parser)
+    # dataset arguments
+    dataset_group = parser.add_argument_group("dataset")
+    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
+    dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
+    dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument("--chat-template", type=str, default="llama3")
+    dataset_group.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
+    )
+    dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
+
+    # training hyper params
+    training_group = parser.add_argument_group("training")
+    training_group.add_argument("--num-epochs", type=int, default=10)
+    training_group.add_argument(
+        "--max-num-steps",
+        type=int,
+        default=None,
+        help="The maximum number of steps to train. If not provided, will be calculated as num_epochs * steps_per_epoch",
+    )
+    training_group.add_argument("--batch-size", type=int, default=1)
+    training_group.add_argument("--learning-rate", type=float, default=1e-4)
+    training_group.add_argument("--max-length", type=int, default=2048)
+    training_group.add_argument("--warmup-ratio", type=float, default=0.015)
+    training_group.add_argument(
+        "--total-steps",
+        type=int,
+        default=None,
+        help="Total training steps. If not provided, will be calculated as num_epochs * steps_per_epoch",
+    )
+    training_group.add_argument("--max-grad-norm", type=float, default=0.5)
+    training_group.add_argument(
+        "--ttt-length",
+        type=int,
+        default=7,
+        help="The length for Test-Time Training (TTT).",
+    )
+    training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--ckpt-dir",
+        type=str,
+        default=None,
+        help="directory includes the checkpoint to start training with",
+    )
+    training_group.add_argument("--eval-interval", type=int, default=5000)
+    training_group.add_argument("--save-interval", type=int, default=5000)
+    training_group.add_argument(
+        "--log-interval",
+        type=int,
+        default=50,
+        help="Log training metrics every N steps",
+    )
+    training_group.add_argument("--seed", type=int, default=0)
+    training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+
+    # data processing type
+    optimization_group = parser.add_argument_group("optimization")
+    optimization_group.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="The size of the tensor parallel for the target model",
+    )
+    optimization_group.add_argument(
+        "--attention-backend",
+        type=str,
+        default="flex_attention",
+        help="The attention backend for the draft model",
+    )
+
+    # other args
+    other_group = parser.add_argument_group("others")
+    other_group.add_argument("--cache-key", type=str, default=None)
+    other_group.add_argument("--cache-dir", type=str, default="./cache")
+    other_group.add_argument("--output-dir", type=str, required=True)
+    other_group.add_argument("--verbose", action="store_true")
+    other_group.add_argument(
+        "--dist-timeout",
+        type=int,
+        default=20,
+        help="Timeout for collective communication in minutes",
+    )
+
+    # vlm related args
+    vlm_group = parser.add_argument_group("vlm")
+    vlm_group.add_argument(
+        "--min-pixels", type=int, default=50176
+    )  # 64*28*28 for qwen2.5-vl
+    vlm_group.add_argument(
+        "--max-pixels", type=int, default=802816
+    )  # 1024*28*28 for qwen2.5-vl
+
+    # profiling related args
+    profiling_group = parser.add_argument_group("profiling")
+    profiling_group.add_argument("--profile", action="store_true")
+    profiling_group.add_argument("--profile-start-step", type=int, default=30)
+    profiling_group.add_argument("--profile-num-steps", type=int, default=4)
+    profiling_group.add_argument("--profile-record-shapes", action="store_true")
+
+    # sglang target model backend related args
+    sglang_group = parser.add_argument_group("sglang target model backend")
+    SGLangBackendArgs.add_args(sglang_group)
+
+    # tracker related args
+    tracker_group = parser.add_argument_group("tracker")
+    TrackerArgs.add_args(tracker_group)
 
     args = parser.parse_args()
     return parser, args
