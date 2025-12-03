@@ -1,0 +1,1 @@
+from .qwenvl_evaluator import QwenVLEagle3Evaluator
