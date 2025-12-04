@@ -17,8 +17,18 @@ torchrun --nproc_per_node=8 \
     --max-length 2048 \
     --tp-size 1 \
     --batch-size 32 \
-    --num-samples 1000 \
-    --output-path ./cache/hidden_states
+    --num-samples 1000
+
+For pre-formatted data (with chat template already applied), add --is-preformatted:
+torchrun --nproc_per_node=8 \
+    scripts/prepare_hidden_states.py \
+    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --enable-aux-hidden-states \
+    --data-path ./cache/dataset/preformatted_data.jsonl \
+    --output-path ./cache/hidden_states \
+    --chat-template llama3 \
+    --is-preformatted \
+    --max-length 2048
 """
 
 import argparse
