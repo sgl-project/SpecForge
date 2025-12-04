@@ -17,7 +17,8 @@ torchrun --nproc_per_node=8 \
     --max-length 2048 \
     --tp-size 1 \
     --batch-size 32 \
-    --num-samples 1000
+    --num-samples 1000 \
+    --output-path ./cache/hidden_states
 
 For pre-formatted data (with chat template already applied), add --is-preformatted:
 torchrun --nproc_per_node=8 \
