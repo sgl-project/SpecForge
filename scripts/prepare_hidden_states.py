@@ -73,6 +73,11 @@ def parse_args():
     data_group.add_argument("--data-path", type=str, required=True)
     data_group.add_argument("--max-length", type=int, default=2048)
     data_group.add_argument("--chat-template", type=str, default="llama3")
+    data_group.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
+    )
     data_group.add_argument("--num-samples", type=int, default=None)
     data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
 
@@ -558,7 +563,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=True
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}"
+    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     # Preprocess on complete, un-sharded dataset
@@ -572,6 +577,7 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
             is_vlm=args.is_vlm,
+            is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
