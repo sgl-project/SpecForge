@@ -3,8 +3,8 @@ from typing import Optional, Any
 
 import torch
 import torch.distributed as dist
-from yunchang import set_seq_parallel_pg
-from yunchang.globals import PROCESS_GROUP
+from torch.distributed import init_device_mesh, DeviceMesh
+from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
 from specforge.utils import print_with_rank
 
@@ -13,6 +13,8 @@ _TP_DEVICE_MESH = None
 _TP_GROUP = None
 _DP_DEVICE_MESH = None
 _DP_GROUP = None
+_DRAFT_DP_GROUP = None
+_DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
 
@@ -25,6 +27,14 @@ def get_dp_group():
     global _DP_GROUP
     return _DP_GROUP
 
+
+def get_draft_dp_group():
+    global _DRAFT_DP_GROUP
+    return _DRAFT_DP_GROUP
+
+def get_draft_sp_group():
+    global _DRAFT_SP_GROUP
+    return _DRAFT_SP_GROUP
 
 def get_device_mesh():
     global _DEVICE_MESH
@@ -66,38 +76,48 @@ def init_distributed(timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int =
     print_with_rank(f"bind to device {local_rank}")
 
     world_size = dist.get_world_size()
-    dp_size = world_size // tp_size // sp_ulysses_size // sp_ring_size
-    assert world_size == tp_size * dp_size * sp_ulysses_size * sp_ring_size, f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size * sp_ulysses_size * sp_ring_size)=} "
+    dp_size = world_size // tp_size
+    assert world_size == tp_size * dp_size, f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
 
     device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (dp_size, tp_size, sp_ulysses_size, sp_ring_size), mesh_dim_names=["dp", "tp", "ulysses", "ring"]
+        "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
+
+    draft_dp_size = world_size // sp_ulysses_size // sp_ring_size
+    draft_device_mesh = dist.device_mesh.init_device_mesh(
+        "cuda", (draft_dp_size, sp_ulysses_size*sp_ring_size), mesh_dim_names=("draft_dp", "sp")
+    )
+    set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
+
     print_with_rank(f"device mesh: {device_mesh}")
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
-    sp_ulysses_group = device_mesh.get_group("ulysses")
-    sp_ring_group = device_mesh.get_group("ring")
-    PROCESS_GROUP.ULYSSES_PG = device_mesh.get_group("ulysses")
-    PROCESS_GROUP.RING_PG = device_mesh.get_group("ring")
 
+    sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
+    sp_ring_group = PROCESS_GROUP.RING_PG
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
 
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, \
+        _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
     _TP_DEVICE_MESH = tp_device_mesh
     _SP_ULYSSES_GROUP = sp_ulysses_group
     _SP_RING_GROUP = sp_ring_group
     _DP_GROUP = dp_group
+    _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
+    _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_ULYSSES_GROUP
+    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
     dist.destroy_process_group(_TP_GROUP)
     dist.destroy_process_group(_DP_GROUP)
     dist.destroy_process_group(_SP_ULYSSES_GROUP)
+    dist.destroy_process_group(_SP_RING_GROUP)
+    dist.destroy_process_group(_DRAFT_DP_GROUP)
     dist.destroy_process_group()
 
 
@@ -191,7 +211,7 @@ def gather_outputs_and_unpad(
         Tensor: The gathered tensor, with padding removed if requested.
     """
     if not group:
-        group = get_sp_ulysses_group()
+        group = get_draft_sp_group()
     if torch.distributed.get_world_size(group) == 1:
         return x
     x = Gather.apply(group, x, gather_dim, grad_scaler)

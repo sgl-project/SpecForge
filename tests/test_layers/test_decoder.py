@@ -9,9 +9,10 @@ from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import PretrainedConfig
 from yunchang import EXTRACT_FUNC_DICT
+from yunchang.comm import SeqAllToAll4D
 
 from specforge import AutoEagle3DraftModel, AutoDraftModelConfig, OfflineEagle3Model
-from specforge.distributed import init_distributed, get_dp_device_mesh, destroy_distributed
+from specforge.distributed import init_distributed, get_dp_device_mesh, destroy_distributed, get_sp_ulysses_group
 from specforge.modeling.draft.llama3_eagle import LlamaDecoderLayer
 from specforge.modeling.target.target_head import TargetHead
 from specforge.utils import padding
@@ -23,11 +24,10 @@ def test_usp_decoder_layer(rank, world_size, port):
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    sp_ring_degree = 1
-    sp_ulysses_degree = world_size
-    init_distributed(tp_size=1, sp_ulysses_size=sp_ulysses_degree, sp_ring_size=sp_ring_degree)
+    sp_ring_degree = 2
+    sp_ulysses_degree = 1
+    init_distributed(tp_size=1, sp_ulysses_size=4, sp_ring_size=1)
     print(f"rank: {rank}, world_size: {world_size}, port: {port}")
-
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     set_seed(42)
@@ -97,6 +97,9 @@ def test_usp_decoder_layer(rank, world_size, port):
     )
     # sdpa_output = torch.load(f"sdpa_output_{rank}.pt")
     torch.save(sdpa_output, f"sdpa_output_{rank}.pt")
+    destroy_distributed()
+    init_distributed(tp_size=1, sp_ulysses_size=1, sp_ring_size=2)
+
     # torch.save(sdpa_decoder_layer.state_dict(), f"sdpa_decoder_layer_{rank}.pt")
     # create layers
     usp_decoder_layer = LlamaDecoderLayer(config, attention_backend="usp").to(device)
@@ -106,7 +109,7 @@ def test_usp_decoder_layer(rank, world_size, port):
     extract_func = EXTRACT_FUNC_DICT["basic"]
     input_ids = (
         extract_func(
-            input_ids, rank, world_size=world_size, rd=sp_ring_degree, ud=sp_ulysses_degree
+            input_ids, rank%(sp_ring_degree*sp_ulysses_degree), world_size=sp_ring_degree*sp_ulysses_degree, rd=sp_ring_degree, ud=sp_ulysses_degree
         )
         .detach()
         .clone()
@@ -114,7 +117,7 @@ def test_usp_decoder_layer(rank, world_size, port):
 
     hidden_states = (
         extract_func(
-            hidden_states, rank, world_size=world_size, rd=sp_ring_degree, ud=sp_ulysses_degree
+            hidden_states, rank%(sp_ring_degree*sp_ulysses_degree), world_size=sp_ring_degree*sp_ulysses_degree, rd=sp_ring_degree, ud=sp_ulysses_degree
         )
         .detach()
         .clone()
@@ -132,10 +135,30 @@ def test_usp_decoder_layer(rank, world_size, port):
         use_cache=False,
     )
 
+    torch.save(usp_output, f"usp_output{torch.distributed.get_rank()}.pt")
+    torch.save(sdpa_output, f"sdpa_output{torch.distributed.get_rank()}.pt")
+
     # check
     assert torch.allclose(
-        usp_output, sdpa_output.chunk(2, dim=1)[rank], rtol=1e-5, atol=1e-5
+        usp_output, sdpa_output.chunk(2, dim=1)[rank%(sp_ring_degree*sp_ulysses_degree)], rtol=1e-5, atol=1e-5
     ), f"native_output: \n{usp_output}, \nsf_output: \n{sdpa_output}"
+
+
+def test_all_to_all(rank, world_size, port):
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    init_distributed(tp_size=1, sp_ulysses_size=2, sp_ring_size=2)
+    ulysses_pg = get_sp_ulysses_group()
+    device = f'cuda:{rank}'
+    # bs, seq_len, num_head, hidden_size
+    input_tensor = torch.zeros(1, 1, 4, 1).to(device)
+    input_tensor = input_tensor + rank
+    query_states = SeqAllToAll4D.apply(
+        ulysses_pg, input_tensor, 2, 1, True
+    )
+    print(f"{torch.distributed.get_rank()}. {query_states=}")
 
 
 def test_ttt(rank, world_size, port):
@@ -143,10 +166,10 @@ def test_ttt(rank, world_size, port):
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    sp_ring_degree = 1
-    sp_ulysses_degree = world_size
-    init_distributed(tp_size=1, sp_ulysses_size=sp_ulysses_degree, sp_ring_size=sp_ring_degree)
-    ttt_length =3
+
+
+    init_distributed(tp_size=1, sp_ulysses_size=1, sp_ring_size=1)
+    ttt_length = 3
     print(f"rank: {rank}, world_size: {world_size}, port: {port}")
 
     torch.cuda.set_device(rank)
@@ -205,7 +228,7 @@ def test_ttt(rank, world_size, port):
     past_key_values = None
     cache_hidden = [[], []]
 
-    sdpa_decoder_layer = LlamaDecoderLayer(config, attention_backend="sdpa").to(device)
+    sdpa_decoder_layer = LlamaDecoderLayer(config, attention_backend="sdpa").to(device).to(torch.bfloat16)
     for idx in range(ttt_length):
         is_last = idx == ttt_length - 1
         print(f"sdpa {hidden_states.shape=}")
@@ -224,7 +247,6 @@ def test_ttt(rank, world_size, port):
             past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
-            ttt_step = idx,
         )
 
         # update hidden states for next step
@@ -237,7 +259,11 @@ def test_ttt(rank, world_size, port):
     import pickle
     with open(f"sdpa_cache_hidden_{rank}.pickle", "wb") as f:
         pickle.dump(cache_hidden, f)
+    destroy_distributed()
 
+    sp_ulysses_degree = 2
+    sp_ring_degree = 2
+    init_distributed(tp_size=1, sp_ulysses_size=sp_ulysses_degree, sp_ring_size=sp_ring_degree)
 
     # sdpa_hidden_states_out = torch.load(f"sdpa_hidden_states_out_{rank}.pt")
     # torch.save(sdpa_decoder_layer.state_dict(), "ttt_sdpa_decoder_layer.pt")
@@ -245,12 +271,11 @@ def test_ttt(rank, world_size, port):
     hidden_states = torch.load("hidden_states.pt", map_location=device)
     attention_mask = torch.load("attention_mask.pt", map_location=device)
     position_ids = torch.load("position_ids.pt", map_location=device)
-    usp_decoder_layer = LlamaDecoderLayer(config, attention_backend="usp").to(device)
+    usp_decoder_layer = LlamaDecoderLayer(config, attention_backend="usp").to(device).to(torch.bfloat16)
     usp_decoder_layer.load_state_dict(sdpa_decoder_layer.state_dict())
     cache_hidden = [[], []]
     past_key_values = None
     extract_func = EXTRACT_FUNC_DICT["basic"]
-
 
     hidden_states = (
         extract_func(
@@ -269,7 +294,7 @@ def test_ttt(rank, world_size, port):
             .clone()
         )
         is_last = idx == ttt_length - 1
-        print(f"usp {hidden_states.shape=}")
+        print(f"usp {hidden_states.shape=}, {hidden_states.dtype=}")
         # Step 5.1: embed the input ids
         inputs_embeds = embed_tokens(input_ids)
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
@@ -284,7 +309,6 @@ def test_ttt(rank, world_size, port):
             past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
-            ttt_step=idx,
         )
 
         # update hidden states for next step
@@ -295,10 +319,15 @@ def test_ttt(rank, world_size, port):
             origin_input_ids = padding(origin_input_ids, left=False)
     with open(f"usp_cache_hidden_{rank}.pickle", "wb") as f:
         pickle.dump(cache_hidden, f)
-    # check
+
+    torch.save(usp_hidden_states_out, f"usp_hidden_states_out_{rank}.pt")
+    torch.save(sdpa_hidden_states_out, f"sdpa_hidden_states_out_{rank}.pt")
+
+    # check, bf16 has larger differ. set threshold to 2e-2
     assert torch.allclose(
-        usp_hidden_states_out, sdpa_hidden_states_out.chunk(2, dim=1)[rank], rtol=1e-5, atol=1e-5
+        usp_hidden_states_out, sdpa_hidden_states_out.chunk(sp_ring_degree * sp_ulysses_degree, dim=1)[rank%(sp_ring_degree * sp_ulysses_degree)], rtol=2e-2, atol=2e-2
     ), f"usp_output: \n{usp_hidden_states_out}, \nsdpa_output: \n{sdpa_hidden_states_out}"
+
 
 def test_ttt_backward(rank, world_size, port):
     os.environ["RANK"] = str(rank)
@@ -430,13 +459,10 @@ def test_ttt_backward(rank, world_size, port):
     torch.save( usp_model.draft_model.midlayer.self_attn.o_proj.weight.grad, f"usp_o_proj_grad_{torch.distributed.get_rank()}.pt",)
 
 
-
-
-
 class TestLinear(unittest.TestCase):
     def test_usp_decoder_layer1(self):
         port = get_available_port()
-        mp.spawn(test_ttt_backward, nprocs=4, args=(4, port))
+        mp.spawn(test_usp_decoder_layer, nprocs=4, args=(4, port))
 
 
 if __name__ == "__main__":

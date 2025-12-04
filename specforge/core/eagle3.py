@@ -72,7 +72,8 @@ class OnlineEagle3Model(Eagle3Model):
         self.world_size = torch.distributed.get_world_size()
         self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
         self.sp_ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
-        self.sp_rank = torch.distributed.get_rank(get_sp_ulysses_group())
+        self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
+        self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
         self.gather_idx = 1
         self.scatter_idx = 2
         self.use_sync = False
@@ -82,7 +83,7 @@ class OnlineEagle3Model(Eagle3Model):
     def prepare_usp_input(self, global_input_ids):
         input_ids = (
             self.extract_func(
-                global_input_ids, rank=self.sp_rank, world_size=self.sp_ulysses_degree,
+                global_input_ids, rank=self.sp_rank, world_size=self.sp_world_size,
             )
             .detach()
             .clone()
@@ -176,7 +177,7 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values = None
             hidden_states = (
                 self.extract_func(
-                    hidden_states, rank=self.sp_rank, world_size=self.sp_ulysses_degree,
+                    hidden_states, rank=self.sp_rank, world_size=self.sp_world_size,
                 )
                 .detach()
                 .clone()

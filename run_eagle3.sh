@@ -71,7 +71,7 @@ hidden_state_path=/nfs/ofs-llab-cold/users/daiyajun/models/Eagle3_ds_hidden_stat
 train_data_path=/nfs/ofs-llm-ssd/user/daiyajun/dtaxi/data/MTP/processed_data/$data_verison.json
 eval_data_path=/nfs/ofs-llm-ssd/user/daiyajun/dtaxi/data/MTP/processed_data/val_$data_verison.json
 eval_hidden_state_path=/nfs/ofs-llab-cold/users/daiyajun/models/Eagle3_ds_hidden_state_val_eval_$data_verison.json
-save_model_path=/nfs/ofs-llm-ssd/models/fengyu/output/2Eagle3_ds_$data_verison
+save_model_path=/nfs/ofs-llm-ssd/models/fengyu/output/ups_Eagle3_ds_$data_verison
 export SGLANG_TORCH_PROFILER_DIR=$save_model_path
 
 # max_len=16400 #20480
@@ -104,12 +104,13 @@ else
         --draft-micro-batch-size 1 \
         --learning-rate 5e-5 \
         --draft-attention-backend usp \
-        --sp-ulysses-size 4 \
+        --sp-ulysses-size 2 \
+        --sp-ring-size 2 \
         --max-length $max_len \
         --chat-template $template \
         --cache-dir ./cache \
         --dist-timeout=10 \
-        --log-steps 5 \
+        --log-steps 1 \
         --ttt-length 5 \
         --report tensorboard \
         --eval-data-path $eval_data_path \

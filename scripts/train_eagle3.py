@@ -35,7 +35,7 @@ from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
     get_tp_group,
-    init_distributed,
+    init_distributed, get_draft_dp_group, get_draft_sp_group,
 )
 from specforge.modeling.target import (
     Eagle3TargetModel,
@@ -604,8 +604,35 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     """
     tp_size = dist.get_world_size(get_tp_group())
     tp_rank = dist.get_rank(get_tp_group())
+
     return tensor.chunk(tp_size, dim=0)[tp_rank]
 
+def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Get the data shard from the tensor.
+    """
+    tp_size = dist.get_world_size(get_tp_group())
+    tp_rank = dist.get_rank(get_tp_group())
+
+    draft_dp_size = dist.get_world_size(get_draft_dp_group())
+    draft_dp_rank = dist.get_rank(get_draft_dp_group())
+    sp_size = dist.get_world_size(get_draft_sp_group())
+    if tp_size >= sp_size:
+        return tensor.chunk(tp_size//sp_size, dim=0)[tp_rank//sp_size]
+    else:
+        # When SP dimension is larger, gather complete data from all TP ranks and re-shard
+        # First, gather the complete tensor from all TP ranks
+        tp_group = get_tp_group()
+        gathered_tensors = [torch.empty_like(tensor) for _ in range(tp_size)]
+        dist.all_gather(gathered_tensors, tensor, group=tp_group)
+        full_tensor = torch.cat(gathered_tensors, dim=0)
+
+        # Shard according to SP dimension
+        sp_shards = full_tensor.chunk(draft_dp_size, dim=0)
+
+        # Each TP rank takes its corresponding shard
+        # Different ranks within the same TP group take different SP shards
+        return sp_shards[draft_dp_rank]
 
 def main():
     # ================================================
