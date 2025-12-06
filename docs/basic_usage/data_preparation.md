@@ -94,11 +94,26 @@ This format is useful when you have pre-formatted prompts that were used during 
 To use pre-formatted datasets, add the `--is-preformatted` flag to your training command. Note that the `--chat-template` parameter is still needed and should match the template used in your pre-formatted text, as it is used to identify user/assistant tokens to determine the assistant spans and generate the corresponding loss mask.
 
 ```bash
+# Online training with pre-formatted data
 torchrun --standalone --nproc_per_node 8 \
     scripts/train_eagle3.py \
     --is-preformatted \
     --train-data-path ./your_preformatted_dataset.jsonl \
     # ... other arguments
+```
+
+For offline training, you can also use `--is-preformatted` when generating hidden states:
+
+```bash
+# Generate hidden states from pre-formatted data
+torchrun --nproc_per_node=8 \
+    scripts/prepare_hidden_states.py \
+    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --data-path ./your_preformatted_dataset.jsonl \
+    --output-path ./cache/hidden_states \
+    --chat-template llama3 \
+    --is-preformatted \
+    --max-length 2048
 ```
 
 Once you have the `jsonl` file ready, you can proceed with online training or generate hidden states for offline training. See the Training guide for more details.
