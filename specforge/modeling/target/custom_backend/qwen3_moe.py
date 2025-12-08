@@ -202,11 +202,6 @@ class Qwen3MoeMLP(nn.Module):
 
         # Add TP support
         self.tp_group = get_tp_group()
-
-        # self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        # self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        # self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size,
             self.intermediate_size,
