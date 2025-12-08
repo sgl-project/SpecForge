@@ -134,7 +134,8 @@ class ColumnParallelLinear(nn.Module):
 
     def handle_kv_head_replicas(self, state_dict, *args):
         """
-        This handles the kv head replicas layout where the weights and biases are split along the column dimension.
+        This is a special case for GQA where the key/value are split according to the number of kv heads and the head which belongs to this rank.
+        As the TP size is larger than the number of kv heads, we only keep one kv head per rank.
         """
         if "weight" in state_dict:
             state_dict["weight"] = state_dict["weight"].chunk(
