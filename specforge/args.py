@@ -178,11 +178,11 @@ class SGLangBackendArgs:
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
             sglang_max_running_requests=(
-                args.batch_size if hasattr(args, "batch_size") else None
+                args.target_batch_size if hasattr(args, "target_batch_size") else None
             ),
             sglang_max_total_tokens=(
-                args.batch_size * args.max_length
-                if hasattr(args, "batch_size") and hasattr(args, "max_length")
+                args.target_batch_size * args.max_length
+                if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
                 else None
             ),
         )
