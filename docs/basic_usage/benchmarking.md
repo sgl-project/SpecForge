@@ -1,3 +1,3 @@
 # 🤖 Benchmarking On SGLang
 
-Please refer to the [benchmarks](./benchmarks/README.md) document for more details.
+Please refer to the [benchmarks](../benchmarks/benchmark.md) document for more details.
