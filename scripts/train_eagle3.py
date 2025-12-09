@@ -319,7 +319,8 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
-    args.target_batch_size = args.tp_size * args.batch_size * args.sp_ring_size * args.sp_ulysses_size
+    args.target_batch_size = args.tp_size * args.batch_size
+    args.draft_accumulation_steps = args.draft_accumulation_steps * args.sp_ring_size * args.sp_ulysses_size
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -568,8 +569,8 @@ def run_backward_and_update(
 
 def record_metrcs(
     args: Namespace,
-    accuracies: List[torch.Tensor],
-    plosses: List[torch.Tensor],
+    accuracies: List[List[torch.Tensor]] | List[torch.Tensor],
+    plosses: List[List[torch.Tensor]] | List[torch.Tensor],
     global_step: int,
     tracker: Tracker,
     optimizer: Optional[Optimizer] = None,
@@ -580,8 +581,15 @@ def record_metrcs(
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
 
-    accuracies = torch.stack(accuracies)
-    plosses = torch.stack(plosses)
+        accuracies = torch.stack([torch.stack(step_acc) for step_acc in accuracies])
+        accuracies = torch.mean(accuracies, dim=0)  # shape from (grad_accum, ttt_length) to (ttt_length,)
+
+        # 处理 plosses
+        plosses = torch.stack([torch.stack(step_loss) for step_loss in plosses])
+        plosses = torch.mean(plosses, dim=0)
+    else:
+        accuracies = torch.stack(accuracies)
+        plosses = torch.stack(plosses)
 
     assert accuracies.shape[0] == args.ttt_length
     dist.all_reduce(accuracies, op=dist.ReduceOp.AVG)
@@ -754,6 +762,8 @@ def main():
         else:
             progress_bar = train_dataloader
 
+        total_acc = []
+        total_plosses = []
         for data in progress_bar:
             global_step += 1
 
@@ -790,10 +800,15 @@ def main():
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
-            # log training metrics
-            if global_step % args.log_interval == 0:
+            # accumulate for global batch size
+            if global_step % args.draft_accumulation_steps != 0:
+                total_acc += [acces]
+                total_plosses += [plosses]
+
+            # log training metrics for global batch size
+            if global_step % (args.draft_accumulation_steps * args.log_interval) == 0:
                 record_metrcs(
-                    args, acces, plosses, global_step, tracker, optimizer, mode="train"
+                    args, total_acc, total_plosses, global_step//args.draft_accumulation_steps, tracker, optimizer, mode="train"
                 )
 
             if dist.get_rank() == 0:
@@ -808,6 +823,9 @@ def main():
                         "time": f"{time_per_step:.2f}s",
                     }
                 )
+            if global_step % args.draft_accumulation_steps == 0:
+                total_acc = []
+                total_plosses = []
 
             # ================================================
             # 7.2 Evaluation Step
