@@ -118,6 +118,7 @@ def parse_args():
     )
 
     sglang_group = parser.add_argument_group("sglang")
+    sglang_group.add_argument("--mem-fraction-static", type=float, default=0.4)
     SGLangBackendArgs.add_args(sglang_group)
     return parser.parse_args()
 

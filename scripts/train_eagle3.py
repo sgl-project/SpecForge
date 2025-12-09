@@ -49,9 +49,8 @@ from specforge.utils import (
     get_last_checkpoint,
     print_on_rank0,
     print_with_rank,
-    rank_0_priority,
+    rank_0_priority, print_args_with_dots,
 )
-
 
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
     """
@@ -157,6 +156,9 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=1,
         help="The size of the tensor parallel for the target model",
     )
+    # distributed training
+    optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
+    optimization_group.add_argument("--sp-ring-size", type=int, default=1)
     optimization_group.add_argument(
         "--attention-backend",
         type=str,
@@ -201,6 +203,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # sglang target model backend related args
     sglang_group = parser.add_argument_group("sglang target model backend")
+    profiling_group.add_argument("--mem-fraction-static", type=float, default=0.4)
     SGLangBackendArgs.add_args(sglang_group)
 
     # tracker related args
@@ -397,6 +400,7 @@ def build_dataloaders(
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
+
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
             target_vocab_size=draft_model_config.vocab_size,
@@ -416,7 +420,7 @@ def build_dataloaders(
         args.target_batch_size,
         num_workers=4,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=get_draft_dp_group(),
         is_vlm=args.is_vlm,
     )
 
@@ -443,7 +447,7 @@ def build_dataloaders(
             args.target_batch_size,
             num_workers=4,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=get_draft_dp_group(),
             is_vlm=args.is_vlm,
         )
         print_with_rank("Initialized eval dataloader")
@@ -607,32 +611,32 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
 
     return tensor.chunk(tp_size, dim=0)[tp_rank]
 
-def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Get the data shard from the tensor.
-    """
-    tp_size = dist.get_world_size(get_tp_group())
-    tp_rank = dist.get_rank(get_tp_group())
-
-    draft_dp_size = dist.get_world_size(get_draft_dp_group())
-    draft_dp_rank = dist.get_rank(get_draft_dp_group())
-    sp_size = dist.get_world_size(get_draft_sp_group())
-    if tp_size >= sp_size:
-        return tensor.chunk(tp_size//sp_size, dim=0)[tp_rank//sp_size]
-    else:
-        # When SP dimension is larger, gather complete data from all TP ranks and re-shard
-        # First, gather the complete tensor from all TP ranks
-        tp_group = get_tp_group()
-        gathered_tensors = [torch.empty_like(tensor) for _ in range(tp_size)]
-        dist.all_gather(gathered_tensors, tensor, group=tp_group)
-        full_tensor = torch.cat(gathered_tensors, dim=0)
-
-        # Shard according to SP dimension
-        sp_shards = full_tensor.chunk(draft_dp_size, dim=0)
-
-        # Each TP rank takes its corresponding shard
-        # Different ranks within the same TP group take different SP shards
-        return sp_shards[draft_dp_rank]
+# def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
+#     """
+#     Get the data shard from the tensor.
+#     """
+#     tp_size = dist.get_world_size(get_tp_group())
+#     tp_rank = dist.get_rank(get_tp_group())
+#
+#     draft_dp_size = dist.get_world_size(get_draft_dp_group())
+#     draft_dp_rank = dist.get_rank(get_draft_dp_group())
+#     sp_size = dist.get_world_size(get_draft_sp_group())
+#     if tp_size >= sp_size:
+#         return tensor.chunk(tp_size//sp_size, dim=0)[tp_rank//sp_size]
+#     else:
+#         # When SP dimension is larger, gather complete data from all TP ranks and re-shard
+#         # First, gather the complete tensor from all TP ranks
+#         tp_group = get_tp_group()
+#         gathered_tensors = [torch.empty_like(tensor) for _ in range(tp_size)]
+#         dist.all_gather(gathered_tensors, tensor, group=tp_group)
+#         full_tensor = torch.cat(gathered_tensors, dim=0)
+#
+#         # Shard according to SP dimension
+#         sp_shards = full_tensor.chunk(draft_dp_size, dim=0)
+#
+#         # Each TP rank takes its corresponding shard
+#         # Different ranks within the same TP group take different SP shards
+#         return sp_shards[draft_dp_rank]
 
 def main():
     # ================================================
@@ -640,12 +644,14 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size,
+                     sp_ring_size=args.sp_ring_size, sp_ulysses_size=args.sp_ulysses_size)
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
 
     sanity_check(args)
+    print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
     # ================================================
@@ -736,7 +742,6 @@ def main():
     # 7. Start training
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
-
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)

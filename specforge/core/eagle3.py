@@ -79,7 +79,6 @@ class OnlineEagle3Model(Eagle3Model):
         self.use_sync = False
         self.rank = torch.distributed.get_rank()
 
-    @torch.compile()
     def prepare_usp_input(self, global_input_ids):
         input_ids = (
             self.extract_func(
