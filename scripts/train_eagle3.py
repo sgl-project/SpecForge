@@ -319,7 +319,7 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
-    args.target_batch_size = args.tp_size * args.batch_size
+    args.target_batch_size = args.tp_size * args.batch_size * args.sp_ring_size * args.sp_ulysses_size
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:

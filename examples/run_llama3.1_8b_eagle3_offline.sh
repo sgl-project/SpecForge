@@ -46,7 +46,7 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --train-hidden-states-path $ROOT_DIR/cache/hidden_states/Qwen3-8B \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
-    --output-dir $ROOT_DIR/outputs/qwen3-8b-eagle3-sharegpt_ulysses \
+    --output-dir $ROOT_DIR/outputs/qwen3-8b-eagle3-sharegpt_usp_grad_accum \
     --num-epochs 10 \
     --batch-size 1 \
     --learning-rate 1e-4 \
@@ -60,6 +60,8 @@ torchrun \
     --log-interval 5 \
     --report tensorboard \
     --attention-backend usp \
-    --sp-ulysses-size 4 \
+    --sp-ulysses-size 2 \
+    --sp-ring-size 2 \
+
 
 
