@@ -46,8 +46,8 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --train-hidden-states-path $ROOT_DIR/cache/hidden_states/Qwen3-8B \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
-    --output-dir $ROOT_DIR/outputs/qwen3-8b-eagle3-sharegpt_usp_grad_accum \
-    --num-epochs 10 \
+    --output-dir $ROOT_DIR/outputs/usp_u2_grad_accum\
+    --num-epochs 5 \
     --batch-size 1 \
     --learning-rate 1e-4 \
     --max-length 4096 \
@@ -57,11 +57,10 @@ torchrun \
     --tp-size $TP_SIZE \
     --target-model-backend sglang \
     --total-steps 10000 \
-    --log-interval 5 \
+    --log-interval 2 \
     --report tensorboard \
+    --draft-accumulation-steps 2 \
     --attention-backend usp \
     --sp-ulysses-size 2 \
-    --sp-ring-size 2 \
-
-
+    --sp-ring-size 1 $@
 

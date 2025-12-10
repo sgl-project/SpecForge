@@ -55,6 +55,7 @@ def print_with_rank(message):
     else:
         logger.info(f"non-distributed: {message}")
 
+
 def print_args_with_dots(args):
     if dist.get_rank() == 0:
         args_dict = vars(args)

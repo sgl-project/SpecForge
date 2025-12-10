@@ -62,7 +62,6 @@ def get_sp_ring_group():
     return _SP_RING_GROUP
 
 
-
 def init_distributed(timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1):
     """Initialize distributed training.
 

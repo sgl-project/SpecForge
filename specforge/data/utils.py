@@ -25,6 +25,8 @@ import torch.distributed as dist
 from datasets import Dataset
 from torch.utils.data import DataLoader, DistributedSampler
 
+from specforge.distributed import get_sp_ring_group, get_sp_ulysses_group
+
 
 class DataCollatorWithPadding:
     """
@@ -253,6 +255,9 @@ def prepare_dp_dataloaders(
     """
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
+    ring_rank = dist.get_rank(get_sp_ring_group())
+    ulysses_rank = dist.get_rank(get_sp_ulysses_group())
+    print(f"world_rank={dist.get_rank()},{world_size=}, {rank=}, {ring_rank=}, {ulysses_rank=}")
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
     )

@@ -4,6 +4,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
+from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -319,6 +320,8 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
+    # args.target_batch_size = args.tp_size * args.batch_size * args.sp_ring_size * args.sp_ulysses_size
+
     args.target_batch_size = args.tp_size * args.batch_size
     args.draft_accumulation_steps = args.draft_accumulation_steps * args.sp_ring_size * args.sp_ulysses_size
 
@@ -564,7 +567,11 @@ def run_backward_and_update(
     ploss.backward()
 
     if global_step % args.draft_accumulation_steps == 0:
-        optimizer.step()
+        grad_norm = optimizer.step()
+        return grad_norm
+    else:
+        return 0
+
 
 
 def record_metrcs(
@@ -573,6 +580,7 @@ def record_metrcs(
     plosses: List[List[torch.Tensor]] | List[torch.Tensor],
     global_step: int,
     tracker: Tracker,
+    grad_norm: float = 0,
     optimizer: Optional[Optimizer] = None,
     mode: str = "train",
 ) -> None:
@@ -580,7 +588,7 @@ def record_metrcs(
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
-
+        logdict["train/grad_norm"] = grad_norm.item()
         accuracies = torch.stack([torch.stack(step_acc) for step_acc in accuracies])
         accuracies = torch.mean(accuracies, dim=0)  # shape from (grad_accum, ttt_length) to (ttt_length,)
 
@@ -607,6 +615,7 @@ def record_metrcs(
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
         )
+    print(f"{logdict=}")
     tracker.log(logdict, step=global_step)
 
 
@@ -716,8 +725,8 @@ def main():
         eagle3_model,
         use_orig_params=True,
         mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
+            param_dtype=torch.float32,
+            buffer_dtype=torch.float32,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         process_group=dist.group.WORLD,  # the draft model should run dp for all processes
@@ -795,20 +804,21 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
+            # context = eagle3_model.no_sync() if global_step % args.draft_accumulation_steps else nullcontext()
+            # with context:
             plosses, acces = run_forward(
                 args, eagle3_model, data, target_model, is_online
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
             # accumulate for global batch size
-            if global_step % args.draft_accumulation_steps != 0:
-                total_acc += [acces]
-                total_plosses += [plosses]
+            total_acc += [acces]
+            total_plosses += [plosses]
 
             # log training metrics for global batch size
             if global_step % (args.draft_accumulation_steps * args.log_interval) == 0:
                 record_metrcs(
-                    args, total_acc, total_plosses, global_step//args.draft_accumulation_steps, tracker, optimizer, mode="train"
+                    args, total_acc, total_plosses, global_step//args.draft_accumulation_steps, tracker, grad_norm=torch.tensor(0), optimizer=optimizer, mode="train"
                 )
 
             if dist.get_rank() == 0:

@@ -50,9 +50,9 @@ class BF16Optimizer:
             for p, mp in zip(self.model_params, self.fp32_params):
                 p.data.copy_(mp.data.to(p.dtype))
                 p.grad = None
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
-        return grad_norm
+        # if isinstance(grad_norm, DTensor):
+        #     grad_norm = grad_norm.full_tensor()
+        # return grad_norm
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
