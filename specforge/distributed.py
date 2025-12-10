@@ -3,7 +3,6 @@ from typing import Optional, Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed import init_device_mesh, DeviceMesh
 from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
 from specforge.utils import print_with_rank

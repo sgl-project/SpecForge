@@ -22,19 +22,19 @@ export PYTHONPATH=$ROOT_DIR:$PYTHONPATH
 export TMPDIR=/tmp-data
 sudo chmod -R 777 /tmp-data
 # generate hidden states
-#torchrun \
-#    --standalone \
-#    --nproc_per_node $NUM_GPUS \
-#    scripts/prepare_hidden_states.py \
-#    --target-model-path  /nfs/volume-1615-2/models/Qwen3-8B \
-#    --enable-aux-hidden-states \
-#    --data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
-#    --output-path $ROOT_DIR/cache/hidden_states/Qwen3-8B \
-#    --chat-template qwen \
-#    --max-length 4096 \
-#    --tp-size $TP_SIZE \
-#    --batch-size 32 \
-#    --mem-fraction-static 0.8\
+torchrun \
+    --standalone \
+    --nproc_per_node $NUM_GPUS \
+    scripts/prepare_hidden_states.py \
+    --target-model-path  /nfs/volume-1615-2/models/Qwen3-8B \
+    --enable-aux-hidden-states \
+    --data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
+    --output-path $ROOT_DIR/cache/hidden_states/Qwen3-8B \
+    --chat-template qwen \
+    --max-length 4096 \
+    --tp-size $TP_SIZE \
+    --batch-size 32 \
+    --mem-fraction-static 0.8\
 
 # train eagle3 offline
 torchrun \
@@ -58,9 +58,4 @@ torchrun \
     --target-model-backend sglang \
     --total-steps 10000 \
     --log-interval 2 \
-    --report tensorboard \
-    --draft-accumulation-steps 2 \
-    --attention-backend usp \
-    --sp-ulysses-size 2 \
-    --sp-ring-size 1 $@
-
+    --report tensorboard

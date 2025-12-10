@@ -4,7 +4,6 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -34,9 +33,9 @@ from specforge.data import (
 )
 from specforge.distributed import (
     destroy_distributed,
-    get_dp_group,
     get_tp_group,
-    init_distributed, get_draft_dp_group, get_draft_sp_group,
+    init_distributed,
+    get_draft_dp_group, get_draft_sp_group,
 )
 from specforge.modeling.target import (
     Eagle3TargetModel,
@@ -50,8 +49,10 @@ from specforge.utils import (
     get_last_checkpoint,
     print_on_rank0,
     print_with_rank,
-    rank_0_priority, print_args_with_dots,
+    rank_0_priority,
+    print_args_with_dots,
 )
+
 
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
     """
@@ -320,8 +321,6 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
-    # args.target_batch_size = args.tp_size * args.batch_size * args.sp_ring_size * args.sp_ulysses_size
-
     args.target_batch_size = args.tp_size * args.batch_size
     args.draft_accumulation_steps = args.draft_accumulation_steps * args.sp_ring_size * args.sp_ulysses_size
 
@@ -567,20 +566,15 @@ def run_backward_and_update(
     ploss.backward()
 
     if global_step % args.draft_accumulation_steps == 0:
-        grad_norm = optimizer.step()
-        return grad_norm
-    else:
-        return 0
-
+        optimizer.step()
 
 
 def record_metrcs(
     args: Namespace,
-    accuracies: List[List[torch.Tensor]] | List[torch.Tensor],
-    plosses: List[List[torch.Tensor]] | List[torch.Tensor],
+    accuracies: List[torch.Tensor],
+    plosses: List[torch.Tensor],
     global_step: int,
     tracker: Tracker,
-    grad_norm: float = 0,
     optimizer: Optional[Optimizer] = None,
     mode: str = "train",
 ) -> None:
@@ -588,16 +582,9 @@ def record_metrcs(
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
-        logdict["train/grad_norm"] = grad_norm.item()
-        accuracies = torch.stack([torch.stack(step_acc) for step_acc in accuracies])
-        accuracies = torch.mean(accuracies, dim=0)  # shape from (grad_accum, ttt_length) to (ttt_length,)
 
-        # 处理 plosses
-        plosses = torch.stack([torch.stack(step_loss) for step_loss in plosses])
-        plosses = torch.mean(plosses, dim=0)
-    else:
-        accuracies = torch.stack(accuracies)
-        plosses = torch.stack(plosses)
+    accuracies = torch.stack(accuracies)
+    plosses = torch.stack(plosses)
 
     assert accuracies.shape[0] == args.ttt_length
     dist.all_reduce(accuracies, op=dist.ReduceOp.AVG)
@@ -615,18 +602,8 @@ def record_metrcs(
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
         )
-    print(f"{logdict=}")
     tracker.log(logdict, step=global_step)
 
-
-def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Get the data shard from the tensor.
-    """
-    tp_size = dist.get_world_size(get_tp_group())
-    tp_rank = dist.get_rank(get_tp_group())
-
-    return tensor.chunk(tp_size, dim=0)[tp_rank]
 
 # def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
 #     """
@@ -635,25 +612,34 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
 #     tp_size = dist.get_world_size(get_tp_group())
 #     tp_rank = dist.get_rank(get_tp_group())
 #
-#     draft_dp_size = dist.get_world_size(get_draft_dp_group())
-#     draft_dp_rank = dist.get_rank(get_draft_dp_group())
-#     sp_size = dist.get_world_size(get_draft_sp_group())
-#     if tp_size >= sp_size:
-#         return tensor.chunk(tp_size//sp_size, dim=0)[tp_rank//sp_size]
-#     else:
-#         # When SP dimension is larger, gather complete data from all TP ranks and re-shard
-#         # First, gather the complete tensor from all TP ranks
-#         tp_group = get_tp_group()
-#         gathered_tensors = [torch.empty_like(tensor) for _ in range(tp_size)]
-#         dist.all_gather(gathered_tensors, tensor, group=tp_group)
-#         full_tensor = torch.cat(gathered_tensors, dim=0)
-#
-#         # Shard according to SP dimension
-#         sp_shards = full_tensor.chunk(draft_dp_size, dim=0)
-#
-#         # Each TP rank takes its corresponding shard
-#         # Different ranks within the same TP group take different SP shards
-#         return sp_shards[draft_dp_rank]
+#     return tensor.chunk(tp_size, dim=0)[tp_rank]
+
+def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Get the data shard from the tensor.
+    """
+    tp_size = dist.get_world_size(get_tp_group())
+    tp_rank = dist.get_rank(get_tp_group())
+
+    draft_dp_size = dist.get_world_size(get_draft_dp_group())
+    draft_dp_rank = dist.get_rank(get_draft_dp_group())
+    sp_size = dist.get_world_size(get_draft_sp_group())
+    if tp_size >= sp_size:
+        return tensor.chunk(tp_size//sp_size, dim=0)[tp_rank//sp_size]
+    else:
+        # When SP dimension is larger, gather complete data from all TP ranks and re-shard
+        # First, gather the complete tensor from all TP ranks
+        tp_group = get_tp_group()
+        gathered_tensors = [torch.empty_like(tensor) for _ in range(tp_size)]
+        dist.all_gather(gathered_tensors, tensor, group=tp_group)
+        full_tensor = torch.cat(gathered_tensors, dim=0)
+
+        # Shard according to SP dimension
+        sp_shards = full_tensor.chunk(draft_dp_size, dim=0)
+
+        # Each TP rank takes its corresponding shard
+        # Different ranks within the same TP group take different SP shards
+        return sp_shards[draft_dp_rank]
 
 def main():
     # ================================================
@@ -725,8 +711,8 @@ def main():
         eagle3_model,
         use_orig_params=True,
         mixed_precision=MixedPrecision(
-            param_dtype=torch.float32,
-            buffer_dtype=torch.float32,
+            param_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         process_group=dist.group.WORLD,  # the draft model should run dp for all processes
@@ -759,6 +745,7 @@ def main():
     # 7. Start training
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
+
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -771,8 +758,6 @@ def main():
         else:
             progress_bar = train_dataloader
 
-        total_acc = []
-        total_plosses = []
         for data in progress_bar:
             global_step += 1
 
@@ -804,21 +789,15 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            # context = eagle3_model.no_sync() if global_step % args.draft_accumulation_steps else nullcontext()
-            # with context:
             plosses, acces = run_forward(
                 args, eagle3_model, data, target_model, is_online
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
-            # accumulate for global batch size
-            total_acc += [acces]
-            total_plosses += [plosses]
-
-            # log training metrics for global batch size
-            if global_step % (args.draft_accumulation_steps * args.log_interval) == 0:
+            # log training metrics
+            if global_step % args.log_interval == 0:
                 record_metrcs(
-                    args, total_acc, total_plosses, global_step//args.draft_accumulation_steps, tracker, grad_norm=torch.tensor(0), optimizer=optimizer, mode="train"
+                    args, acces, plosses, global_step, tracker, optimizer, mode="train"
                 )
 
             if dist.get_rank() == 0:
@@ -833,9 +812,6 @@ def main():
                         "time": f"{time_per_step:.2f}s",
                     }
                 )
-            if global_step % args.draft_accumulation_steps == 0:
-                total_acc = []
-                total_plosses = []
 
             # ================================================
             # 7.2 Evaluation Step

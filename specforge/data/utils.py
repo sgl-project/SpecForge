@@ -25,13 +25,15 @@ import torch.distributed as dist
 from datasets import Dataset
 from torch.utils.data import DataLoader, DistributedSampler
 
-from specforge.distributed import get_sp_ring_group, get_sp_ulysses_group
+from specforge.distributed import get_sp_ring_group, get_sp_ulysses_group, get_draft_sp_group
 
 
 class DataCollatorWithPadding:
     """
     Datacollator that will dynamically pad the inputs for batching.
     """
+    def __init__(self):
+        self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -85,12 +87,11 @@ class DataCollatorWithPadding:
                 - attention_mask: torch.Tensor of shape (B, N)
                 - loss_mask: torch.Tensor of shape (B, N)
         """
-        ulysses_degree = 8
         max_length = max(item["input_ids"].shape[1] for item in features)
-        if max_length % ulysses_degree == 0:
+        if max_length % self.sp_degree == 0:
             max_length = max_length
         else:
-            max_length = ((max_length + ulysses_degree - 1) // ulysses_degree) * ulysses_degree
+            max_length = ((max_length + self.sp_degree - 1) // self.sp_degree) * self.sp_degree
 
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -229,12 +230,12 @@ class VlmDataCollatorWithPadding:
 def prepare_dp_dataloaders(
     dataset: Dataset,
     batch_size: int,
-    num_workers: int = 8,
+    num_workers: int = 4,
     process_group: Optional[dist.ProcessGroup] = None,
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
-    prefetch_factor: Optional[int] = 3,
+    prefetch_factor: Optional[int] = 2,
     **dataloader_kwargs
 ) -> DataLoader:
     """
@@ -255,9 +256,6 @@ def prepare_dp_dataloaders(
     """
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
-    ring_rank = dist.get_rank(get_sp_ring_group())
-    ulysses_rank = dist.get_rank(get_sp_ulysses_group())
-    print(f"world_rank={dist.get_rank()},{world_size=}, {rank=}, {ring_rank=}, {ulysses_rank=}")
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
     )

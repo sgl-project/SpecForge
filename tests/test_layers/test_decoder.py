@@ -466,30 +466,6 @@ class TestLinear(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    # import debugpy
-    # import os
-    #
-    # # 获取全局rank，用于计算端口号
-    # rank = int(os.environ.get('RANK', 0))
-    # local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    #
-    # # 设置基础端口，每个rank使用不同的端口
-    # base_port = 5678
-    # debug_port = base_port + local_rank # 使用local_rank而不是rank，避免多机冲突
-    #
-    # # 启动调试器
-    # debugpy.listen(("0.0.0.0", debug_port))
-    # print(f"Rank {rank} (Local rank {local_rank}) waiting for debugger on port {debug_port}...")
-    #
-    # # 只有rank 0等待调试器，其他rank继续执行
-    # if rank == 0:
-    #     debugpy.wait_for_client()
-    #     print(f"Debugger attached to rank {rank}!")
-    # else:
-    #     # 其他rank可以选择等待或者直接继续
-    #     # 如果要调试所有rank，取消下面的注释
-    #     # debugpy.wait_for_client()
-    #     print(f"Rank {rank} debug port: {debug_port}")
     suite = unittest.TestSuite()
     suite.addTest(unittest.makeSuite(TestLinear))
     runner = unittest.TextTestRunner(verbosity=2)
