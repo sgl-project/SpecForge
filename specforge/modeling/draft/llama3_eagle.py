@@ -19,6 +19,7 @@ from specforge.modeling.draft.flex_attention import (
     generate_eagle3_mask,
 )
 from specforge.utils import print_with_rank
+
 from .base import Eagle3DraftModel
 from ...distributed import get_sp_ulysses_group, get_sp_ring_group
 
@@ -616,7 +617,8 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size() # bs, seq_len, hidden_size
+        bsz, q_len, _ = hidden_states.size()
+
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -680,56 +682,55 @@ class LlamaAttention(nn.Module):
                     query_states, key_states, cos, sin, position_ids
                 )
 
-            key_states = repeat_kv(key_states, self.num_key_value_groups) # bs, head_num, seq_len, hidden_size
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
             cache_hidden[0] = cache_hidden[0] + [key_states]
             cache_hidden[1] = cache_hidden[1] + [value_states]
 
-            cache_k = cache_hidden[0] # bs, head_num, seq_len, dim
-            cache_v = cache_hidden[1] # bs, head_num, seq_len, dim
+            cache_k = cache_hidden[0]
+            cache_v = cache_hidden[1]
 
             k0 = cache_k[0]
             v0 = cache_v[0]
-            # print(f"{query_states.shape=}")
-            # print(f"{k0.shape=}")
+
             # causal
             attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
                 self.head_dim
-            ) # 1, 32, 1558, 1558
+            )
             lck = len(cache_k)
 
-            attn_weights = attn_weights + attention_mask # TODO: 第二轮attention mask能不能用
+            attn_weights = attn_weights + attention_mask
 
             for i in range(1, lck):
                 ki = cache_k[i]
                 qi = query_states
                 kiq = ki
 
-                attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim) # 1, 32, 1558
-                attn_weights = torch.cat( # attn_weight 1,32,1558,1558
+                attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
+                attn_weights = torch.cat(
                     (attn_weights, attn_weightsi[..., None]), dim=-1
                 )
-                # 1, 32, 1558, 1559
 
             # upcast attention to fp32
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype) # [1, 32, 1558, 1559]
+            ).to(query_states.dtype)
             attn_weights0 = attn_weights[..., :q_len]
 
-            attn_output = torch.matmul(attn_weights0, v0) # [1, 32, 1558, 1558]
+            attn_output = torch.matmul(attn_weights0, v0)
 
             for i in range(1, lck):
                 vi = cache_v[i]
-                attn_weightsi = attn_weights[..., q_len + i - 1] #lck=2 i=1 [1, 32, 1558]
-                attn_outputi = attn_weightsi[..., None] * vi # [1, 32, 1558, 224]
-                attn_output = attn_output + attn_outputi #[1, 1558, 224, 32]
+                attn_weightsi = attn_weights[..., q_len + i - 1]
+                attn_outputi = attn_weightsi[..., None] * vi
+                attn_output = attn_output + attn_outputi
 
-        attn_output = attn_output.transpose(1, 2).contiguous() # [1, 1558, 32, 224]
+        attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
 
-        attn_output = self.o_proj(attn_output) # [1, 1558, 7168]
+        attn_output = self.o_proj(attn_output)
+
         return attn_output
 
 
@@ -744,6 +745,10 @@ class LlamaUSPAttention(LlamaAttention):
         self.world_size = torch.distributed.get_world_size()
         self.ring_group_ranks = dist.get_process_group_ranks(self.ring_pg)
 
+        if self.sp_ring_degree == 1:
+            self.attention_impl = self.attention_with_cache
+        else:
+            self.attention_impl = self.ring_attention_hybrid_masked
         self.extract_func = EXTRACT_FUNC_DICT["basic"]
         self.scatter_idx = 2
         self.gather_idx = 1
@@ -842,7 +847,7 @@ class LlamaUSPAttention(LlamaAttention):
 
             cache_k = cache_hidden[0]  # bs, head_num, seq_len, dim
             cache_v = cache_hidden[1]  # bs, head_num, seq_len, dim
-            attn_output = self.ring_attention_hybrid_masked(query_states, attention_mask, cache_k, cache_v, q_len)
+            attn_output = self.attention_impl(query_states, attention_mask, cache_k, cache_v, q_len)
 
 
         attn_output = SeqAllToAll4D.apply(
@@ -852,7 +857,6 @@ class LlamaUSPAttention(LlamaAttention):
         attn_output = attn_output.reshape(bsz, local_q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)  # [1, 1558, 7168]
         return attn_output
-
 
     def ring_attention_hybrid_masked(
         self,
@@ -915,7 +919,6 @@ class LlamaUSPAttention(LlamaAttention):
         curr_k, curr_v = local_k0, local_v0
         next_k, next_v = torch.empty_like(local_k0), torch.empty_like(local_v0)
 
-
         for step in range(world_size):
             # 2.1 communicate
             if step < world_size - 1:
@@ -941,8 +944,7 @@ class LlamaUSPAttention(LlamaAttention):
             end_k_idx = start_k_idx + local_seq_len
 
             # 2.3 [FP32] MatMul Score
-            attn_block = torch.matmul(local_q, curr_k.transpose(2, 3))
-            attn_block = attn_block * scale
+            attn_block = torch.matmul(local_q, curr_k.transpose(2, 3)) * scale
 
             # 2.4 [FP32] Mask slice
             mask_slice = attention_mask[:, :, start_q_idx:end_q_idx, start_k_idx:end_k_idx]
@@ -991,7 +993,7 @@ class LlamaUSPAttention(LlamaAttention):
         v0 = repeat_kv(cache_v[0], self.num_key_value_groups)
         attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
             self.head_dim
-        )  # 1, 32, 1558, 1558
+        )
         lck = len(cache_k)
 
         attn_weights = attn_weights + attention_mask
@@ -1001,27 +1003,27 @@ class LlamaUSPAttention(LlamaAttention):
             qi = query_states
             kiq = ki
 
-            attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)  # 1, 32, 1558
-            attn_weights = torch.cat(  # attn_weight 1,32,1558,1558
+            attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
+            attn_weights = torch.cat(
                 (attn_weights, attn_weightsi[..., None]), dim=-1
             )
-            # 1, 32, 1558, 1559
+
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)  # [1, 32, 1558, 1559]
+        ).to(query_states.dtype)
         attn_weights0 = attn_weights[..., :q_len]
 
-        attn_output = torch.matmul(attn_weights0, v0)  # [1, 32, 1558, 1558]
+        attn_output = torch.matmul(attn_weights0, v0)
 
         for i in range(1, lck):
             vi = repeat_kv(cache_v[i], self.num_key_value_groups)
-            attn_weightsi = attn_weights[..., q_len + i - 1]  # lck=2 i=1 [1, 32, 1558]
-            attn_outputi = attn_weightsi[..., None] * vi  # [1, 32, 1558, 224]
-            attn_output = attn_output + attn_outputi  # [1, 1558, 224, 32]
+            attn_weightsi = attn_weights[..., q_len + i - 1]
+            attn_outputi = attn_weightsi[..., None] * vi
+            attn_output = attn_output + attn_outputi
 
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [1, 1558, 32, 224]
+        attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output
 
 
@@ -1122,21 +1124,12 @@ class LlamaFlexAttention(LlamaAttention):
             KV_LEN=key_cache.shape[-2],
             device=query_states.device,
         )
-        kernel_options = {
-            "BLOCK_M": 32,
-            "BLOCK_N": 32,
-            "BLOCK_M1": 32,
-            "BLOCK_N1": 32,
-            "BLOCK_M2": 32,
-            "BLOCK_N2": 32,
-        }
         attn_output = flex_attention_func(
             query=query_states,
             key=key_cache.contiguous(),
             value=value_cache.contiguous(),
             block_mask=block_mask,
             enable_gqa=True,
-            kernel_options=kernel_options
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
@@ -1208,7 +1201,7 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa", ring_impl_type: str = "basic"):
+    def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
 

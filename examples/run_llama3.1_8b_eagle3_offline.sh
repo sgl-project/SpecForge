@@ -15,7 +15,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 echo ROOT_DIR:$ROOT_DIR
 cd $ROOT_DIR
-NUM_GPUS=8
+NUM_GPUS=4
 TP_SIZE=1
 BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 export PYTHONPATH=$ROOT_DIR:$PYTHONPATH
@@ -37,9 +37,44 @@ sudo chmod -R 777 /tmp-data
 #    --mem-fraction-static 0.8\
 
 # train eagle3 offline
-torchrun \
-    --standalone \
-    --nproc_per_node $NUM_GPUS \
+# 单机, 可指定机器数
+N_NODE=1
+N_PER_NODE=$NUM_GPUS
+ddp_config_option=" --nproc_per_node ${N_PER_NODE} \
+            --nnodes 1 \
+            --node_rank 0 \
+            --master_addr 127.0.0.1 \
+            --master_port 65531 "
+
+# 多机
+if [ ! -z $DISTRIBUTED_NODE_COUNT ]; then
+    N_NODE=$DISTRIBUTED_NODE_COUNT
+    N_PER_NODE=$RESOURCE_NUM_GPU
+    ddp_config_option=" --nproc_per_node $NUM_GPUS \
+              --nnodes $DISTRIBUTED_NODE_COUNT \
+              --node_rank $DISTRIBUTED_NODE_RANK \
+              --master_addr $DISTRIBUTED_MASTER_HOSTS \
+              --master_port $DISTRIBUTED_PYTORCH_PORT "
+
+    export NCCL_DEBUG=INFO
+    export NCCL_SOCKET_IFNAME=eth0
+    export NCCL_IB_GID_INDEX=3
+    export NCCL_IB_DISABLE=0
+    # export NCCL_IB_HCA=${hca_list::-1}
+    export NCCL_IB_HCA="mlx5_0:1,mlx5_3:1,mlx5_4:1,mlx5_5:1"
+    export NCCL_NET_GDR_LEVEL=2
+    export NCCL_IB_QPS_PER_CONNECTION=4
+    # export NCCL_IB_TC=160
+    export NCCL_IB_TC=98        # 内部98  cat /sys/class/infiniband/mlx5_5/tc/1/traffic_class
+    export NCCL_IB_TIMEOUT=22
+    export NCCL_PXN_DISABLE=0
+
+    export NCCL_DEBUG_SUBSYS=INIT,ENV,GRAPH
+
+    export GLOO_SOCKET_IFNAME=eth0
+fi
+
+torchrun $ddp_config_option \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path  /nfs/volume-1615-2/models/Qwen3-8B \
     --draft-model-config $ROOT_DIR/configs/qwen3-8b-eagle3.json \
@@ -56,11 +91,6 @@ torchrun \
     --embedding-key model.embed_tokens.weight \
     --tp-size $TP_SIZE \
     --target-model-backend sglang \
-    --total-steps 10000 \
     --log-interval 2 \
-    --report tensorboard \
-    --draft-accumulation-steps 2 \
-    --attention-backend usp \
-    --sp-ulysses-size 2 \
-    --sp-ring-size 1 $@
+    --report tensorboard $@
 

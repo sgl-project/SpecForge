@@ -20,7 +20,6 @@ class ChatTemplate(BaseModel):
     system_prompt: str | None
     end_of_turn_token: str | None
     parser_type: str = "general"
-    bos_token: str | None = None
 
 
 class TemplateRegistry:
@@ -208,17 +207,5 @@ TEMPLATE_REGISTRY.register(
         bos_token="<｜begin of sentence｜>",
         eos_token="<｜end of sentence｜>",
         parser_type="general",
-    ),
-)
-
-TEMPLATE_REGISTRY.register(
-    name="deepseek3",
-    template=ChatTemplate(
-        assistant_header="<｜Assistant｜></think>",
-        user_header="<｜User｜>",
-        system_prompt="",
-        end_of_turn_token="<｜end▁of▁sentence｜>",
-        bos_token = "<｜begin▁of▁sentence｜>",
-        parser_type="DeepSeek3"
     ),
 )

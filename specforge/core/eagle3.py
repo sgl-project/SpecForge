@@ -85,7 +85,6 @@ class OnlineEagle3Model(Eagle3Model):
             self.extract_func(
                 global_input_ids, rank=self.sp_rank, world_size=self.sp_world_size,
             )
-            .detach()
             .clone()
         )
         return input_ids
@@ -179,7 +178,6 @@ class OnlineEagle3Model(Eagle3Model):
                 self.extract_func(
                     hidden_states, rank=self.sp_rank, world_size=self.sp_world_size,
                 )
-                .detach()
                 .clone()
             )
 
@@ -216,6 +214,7 @@ class OnlineEagle3Model(Eagle3Model):
             logits = gather_outputs_and_unpad(logits, gather_dim=1)
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
+
                 acces.append(
                     _compute_metric_acc(
                         logits=logits,
@@ -226,7 +225,7 @@ class OnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask) # target_p [1, 1558, 32000]
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
             plosses.append(loss)
 
             if not is_last:
