@@ -5,6 +5,7 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 # train eagle3 for llama3.1-8b
 NUM_GPUS=${1:-1}
 TP_SIZE=${2:-1}
+BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
 torchrun \
     --standalone \
@@ -13,6 +14,7 @@ torchrun \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
+    --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-sharegpt \
     --num-epochs 10 \
     --batch-size 1 \
@@ -23,4 +25,5 @@ torchrun \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
     --target-model-backend sglang \
-    --log-interval 10
+    --log-interval 10 \
+    --sglang-mem-fraction-static 0.25
