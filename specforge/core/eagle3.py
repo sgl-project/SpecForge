@@ -216,7 +216,6 @@ class OnlineEagle3Model(Eagle3Model):
             logits = gather_outputs_and_unpad(logits, gather_dim=1)
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
-
                 acces.append(
                     _compute_metric_acc(
                         logits=logits,
