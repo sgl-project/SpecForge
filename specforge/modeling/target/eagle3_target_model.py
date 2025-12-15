@@ -484,6 +484,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             last_hidden_states_out = None
 
+        print(f"{torch.distributed.get_rank()=}, target_out === {target_out}")
         target_out = padding(target_out, left=False)
         input_ids_out = padding(input_ids_out, left=False)
         loss_mask_out = loss_mask_out[..., None]

@@ -25,7 +25,7 @@ import torch.distributed as dist
 from datasets import Dataset
 from torch.utils.data import DataLoader, DistributedSampler
 
-from specforge.distributed import get_sp_ring_group, get_sp_ulysses_group, get_draft_sp_group
+from specforge.distributed import get_draft_sp_group
 
 
 class DataCollatorWithPadding:

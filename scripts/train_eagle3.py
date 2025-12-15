@@ -35,7 +35,7 @@ from specforge.distributed import (
     destroy_distributed,
     get_tp_group,
     init_distributed,
-    get_draft_dp_group, get_draft_sp_group,
+    get_draft_dp_group, get_dp_group,
 )
 from specforge.modeling.target import (
     Eagle3TargetModel,
@@ -405,7 +405,6 @@ def build_dataloaders(
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
-
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
             target_vocab_size=draft_model_config.vocab_size,
@@ -425,7 +424,7 @@ def build_dataloaders(
         args.target_batch_size,
         num_workers=4,
         shuffle=True,
-        process_group=get_draft_dp_group(),
+        process_group=get_draft_dp_group() if args.attention_backend == "usp" else get_dp_group(),
         is_vlm=args.is_vlm,
     )
 
@@ -452,7 +451,7 @@ def build_dataloaders(
             args.target_batch_size,
             num_workers=4,
             shuffle=False,
-            process_group=get_draft_dp_group(),
+            process_group=get_draft_dp_group() if args.attention_backend == "usp" else get_dp_group(),
             is_vlm=args.is_vlm,
         )
         print_with_rank("Initialized eval dataloader")
@@ -613,49 +612,8 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     """
     tp_size = dist.get_world_size(get_tp_group())
     tp_rank = dist.get_rank(get_tp_group())
-
     return tensor.chunk(tp_size, dim=0)[tp_rank]
 
-# def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
-#     """
-#     Get the data shard from the tensor.
-#     """
-#     tp_size = dist.get_world_size(get_tp_group())
-#     tp_rank = dist.get_rank(get_tp_group())
-#
-#     sp_size = dist.get_world_size(get_draft_sp_group())
-#     sp_group = get_draft_sp_group()
-#     if tp_size >= sp_size:
-#         return tensor.chunk(tp_size//sp_size, dim=0)[tp_rank//sp_size]
-#     else:
-#         # When SP dimension is larger, gather complete data from all TP ranks and re-shard
-#         # First, gather the complete tensor from all TP ranks
-#         """
-#         dp=4, tp=2
-#         rank:       | 0, 1 |  | 2, 3 |   | 4, 5 |   | 6, 7 |
-#         data:      (0), (0)   (1), (1)   (2), (2),  (3), (3)
-#
-#         draft_dp=2, sp=4
-#         rank:            | 0, 1, 2, 3 |        | 4, 5, 6, 7  |
-#         data:     (0,1) (0,1) (0,1) (0,1) | (2,3) (2,3) (2,3) (2,3)
-#
-#         gather by sp and shard with tp duplicate
-#         """
-#
-#         # 1. Gather data from all ranks within the SP group.
-#         # Result example: [Data0, Data0, Data1, Data1]
-#         gathered_tensors = [torch.empty_like(tensor) for _ in range(sp_size)]
-#         dist.all_gather(gathered_tensors, tensor, group=sp_group)
-#
-#         # 2. Deduplicate.
-#         # Since data within a TP group is identical, the gathered list contains redundant copies.
-#         # We step by 'tp_size' to select only the unique shards (e.g., indices 0, 2, 4...).
-#         # unique_shards becomes: [Data0, Data1]
-#         unique_shards = gathered_tensors[::tp_size]
-#
-#         # 3. Concatenate.
-#         # Result: Data0 and Data1 are merged into a single larger tensor.
-#         return torch.cat(unique_shards, dim=0)
 
 def main():
     # ================================================
