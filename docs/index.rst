@@ -1,5 +1,5 @@
 SpecForge Documentation
-====================
+=======================
 
 SpecForge is an ecosystem project developed by the SGLang team. It is a framework for training speculative decoding models so that you can smoothly port them over to the SGLang serving framework to speed up your inference.
 
@@ -25,7 +25,6 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    basic_usage/data_preparation.md
    basic_usage/training.md
-   basic_usage/benchmarking.md
 
 .. toctree::
    :maxdepth: 1
@@ -39,3 +38,9 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    examples/llama3-eagle3-online.md
    examples/llama3-eagle3-offline.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Benchmarks
+
+   benchmarks/benchmark.md

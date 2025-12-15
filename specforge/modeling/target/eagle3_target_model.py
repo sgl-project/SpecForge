@@ -8,6 +8,7 @@ import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -306,11 +307,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 module.return_last_hidden_states = return_last_hidden_states
                 module.return_logits = return_logits
 
-        tree_cache = RadixCache(
-            None,
+        cache_params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
             page_size=self.model_runner.server_args.page_size,
         )
+        tree_cache = RadixCache(cache_params)
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,

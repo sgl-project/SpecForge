@@ -78,14 +78,18 @@ class Qwen3MoeAttention(nn.Module):
         # Calculate head distribution for TP
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
-        self.num_heads = self.total_num_heads // self.tp_size
+        self.num_heads = (
+            self.total_num_heads // self.tp_size
+        )  # this is the number heads per rank
 
         # Handle KV head replication when tp_size > total_num_kv_heads
         if self.tp_size > self.total_num_kv_heads:
             # In replication mode, each rank gets 1 KV head (replicated across groups)
             self.num_kv_heads = 1
             self.num_kv_head_replicas = self.tp_size // self.total_num_kv_heads
-            self.num_key_value_groups = self.num_heads // self.num_kv_heads
+            self.num_key_value_groups = (
+                self.num_heads // self.num_kv_heads
+            )  # this is size for expanding kv for gqa
             self.kv_head_replicas = True
         else:
             self.num_kv_heads = self.total_num_kv_heads
@@ -103,18 +107,23 @@ class Qwen3MoeAttention(nn.Module):
             self.num_kv_heads * self.head_dim,
             bias=config.attention_bias,
             kv_head_replicas=self.kv_head_replicas,
+            kv_head_idx=self.tp_rank // self.num_kv_head_replicas,
+            total_num_kv_heads=config.num_key_value_heads,
         )
         self.v_proj = ColumnParallelLinear(
             config.hidden_size,
             self.num_kv_heads * self.head_dim,
             bias=config.attention_bias,
             kv_head_replicas=self.kv_head_replicas,
+            kv_head_idx=self.tp_rank // self.num_kv_head_replicas,
+            total_num_kv_heads=config.num_key_value_heads,
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
         )
+
         self.q_norm = Qwen3MoeRMSNorm(
             self.head_dim, eps=config.rms_norm_eps
         )  # unlike olmo, only on the head dim!
@@ -193,9 +202,10 @@ class Qwen3MoeMLP(nn.Module):
 
         # Add TP support
         self.tp_group = get_tp_group()
-
         self.gate_proj = ColumnParallelLinear(
-            self.hidden_size, self.intermediate_size, bias=False
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
         )
         self.up_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=False
