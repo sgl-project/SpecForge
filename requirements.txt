@@ -14,3 +14,4 @@ accelerate
 pydantic
 sglang[all]==0.5.5
 openai-harmony
+yunchang

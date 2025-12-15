@@ -35,7 +35,8 @@ from specforge.distributed import (
     destroy_distributed,
     get_tp_group,
     init_distributed,
-    get_draft_dp_group, get_dp_group,
+    get_draft_dp_group,
+    get_dp_group,
 )
 from specforge.modeling.target import (
     Eagle3TargetModel,
@@ -205,7 +206,6 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # sglang target model backend related args
     sglang_group = parser.add_argument_group("sglang target model backend")
-    profiling_group.add_argument("--mem-fraction-static", type=float, default=0.4)
     SGLangBackendArgs.add_args(sglang_group)
 
     # tracker related args
