@@ -34,7 +34,6 @@ def generate_question(row: Dict[str, Any]) -> str:
 
     # 0 means A, 1 means B, 2 means C, 3 means D
     answer = row["answer"]
-    print(answer)
     return question, answer
 
 
