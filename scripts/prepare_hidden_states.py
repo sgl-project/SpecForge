@@ -134,7 +134,6 @@ def parse_args():
     )
 
     sglang_group = parser.add_argument_group("sglang")
-
     SGLangBackendArgs.add_args(sglang_group)
     return parser.parse_args()
 

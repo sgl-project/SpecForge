@@ -744,6 +744,8 @@ class LlamaUSPAttention(LlamaAttention):
         self.sp_ulysses_degree = torch.distributed.get_world_size(self.ulysses_pg)
         self.world_size = torch.distributed.get_world_size()
         self.ring_group_ranks = dist.get_process_group_ranks(self.ring_pg)
+        self.ring_rank = torch.distributed.get_rank(self.ring_pg)
+
 
         if self.sp_ring_degree == 1:
             self.attention_impl = self.attention_with_cache
@@ -792,6 +794,14 @@ class LlamaUSPAttention(LlamaAttention):
         ).transpose(1, 2)
         q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
 
+        if self.sp_ring_degree > 1:
+            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+                # mRoPE: [3, bs, seq_len] -> split dim 2
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[self.ring_rank].clone()
+            else:
+                # Standard RoPE: [bs, seq_len] -> split dim 1
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[self.ring_rank].clone()
+
         # bs, shard_seqlen, hc, hs
         if cache_hidden is None:
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
@@ -811,17 +821,9 @@ class LlamaUSPAttention(LlamaAttention):
                     query_states, key_states, cos, sin, position_ids
                 )
 
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
-                is_causal=attention_mask is None,
-                dropout_p=0.0,
-            )
+            cache_k = [key_states]
+            cache_v = [value_states]
+            attn_output = self.attention_impl(query_states, attention_mask, cache_k, cache_v, q_len)
         else:
             lck = len(cache_hidden[0])
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
@@ -837,7 +839,6 @@ class LlamaUSPAttention(LlamaAttention):
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[torch.distributed.get_rank(self.ring_pg)].detach().clone()
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, position_ids
                 )
@@ -848,7 +849,6 @@ class LlamaUSPAttention(LlamaAttention):
             cache_k = cache_hidden[0]  # bs, head_num, seq_len, dim
             cache_v = cache_hidden[1]  # bs, head_num, seq_len, dim
             attn_output = self.attention_impl(query_states, attention_mask, cache_k, cache_v, q_len)
-
 
         attn_output = SeqAllToAll4D.apply(
             self.ulysses_pg, attn_output, self.gather_idx, self.scatter_idx, self.use_sync
@@ -867,8 +867,8 @@ class LlamaUSPAttention(LlamaAttention):
         q_len: int,  # Global_S
     ):
         group = self.ring_pg
-        rank = dist.get_rank(group=group)
-        world_size = dist.get_world_size(group=group)
+        rank = self.ring_rank
+        world_size = self.sp_ring_degree
 
         # bs=1
         _, H, local_seq_len, head_dim = local_q.shape

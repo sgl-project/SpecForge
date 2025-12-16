@@ -149,6 +149,7 @@ def all_gather_tensor(local_tensor: torch.Tensor, group: Optional[dist.ProcessGr
     dist.all_gather_into_tensor(output, local_tensor, group=group, async_op=async_op)
     return output
 
+# Adapted from https://github.com/volcengine/verl/blob/a0e8e4472b8b472409defb0c8fcc5162301450af/verl/utils/ulysses.py#L194
 class Gather(torch.autograd.Function):
     @staticmethod
     def forward(
