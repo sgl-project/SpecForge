@@ -80,37 +80,14 @@ def init_distributed(timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int =
     device_mesh = dist.device_mesh.init_device_mesh(
         "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
-    total_sp_size = sp_ulysses_size * sp_ring_size
-    dist.barrier()
 
-    # 确保 Draft DP 大小计算正确
-    draft_dp_size = world_size // total_sp_size
-    assert world_size == draft_dp_size * total_sp_size, \
-        f"World size ({world_size}) cannot be evenly divided by total SP size ({total_sp_size})"
+    assert world_size % (sp_ulysses_size*sp_ring_size) == 0, \
+        f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
 
-    print_with_rank(f"Initializing Draft Groups: Draft_DP={draft_dp_size}, SP={total_sp_size}")
-    draft_dp_size = world_size // sp_ulysses_size // sp_ring_size
-
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, \
-        _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
-
-    for i in range(draft_dp_size):
-        start_rank = i * total_sp_size
-        end_rank = start_rank + total_sp_size
-        ranks = list(range(start_rank, end_rank))
-        group = dist.new_group(ranks)
-        if dist.get_rank() in ranks:
-            _DRAFT_SP_GROUP = group
-
-        # 2. 创建 Draft DP Group (Data Parallel for Draft Model)
-        # 逻辑：跨越 SP 组取 rank
-        # 例如：[0, 4], [1, 5], [2, 6], [3, 7] ...
-    for i in range(total_sp_size):
-        ranks = [j * total_sp_size + i for j in range(draft_dp_size)]
-        group = dist.new_group(ranks)
-        if dist.get_rank() in ranks:
-            _DRAFT_DP_GROUP = group
-
+    draft_dp_size = world_size // (sp_ulysses_size*sp_ring_size)
+    draft_device_mesh = dist.device_mesh.init_device_mesh(
+        "cuda", (draft_dp_size, sp_ulysses_size*sp_ring_size), mesh_dim_names=("draft_dp", "sp")
+    )
     set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
 
     print_with_rank(f"device mesh: {device_mesh}")
@@ -122,15 +99,17 @@ def init_distributed(timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int =
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
 
-
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, \
+        _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
     _TP_DEVICE_MESH = tp_device_mesh
-    _DP_GROUP = dp_group
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
     _SP_ULYSSES_GROUP = sp_ulysses_group
     _SP_RING_GROUP = sp_ring_group
-
+    _DP_GROUP = dp_group
+    _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
+    _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
 
 
 def destroy_distributed():
@@ -140,6 +119,7 @@ def destroy_distributed():
     dist.destroy_process_group(_SP_ULYSSES_GROUP)
     dist.destroy_process_group(_SP_RING_GROUP)
     dist.destroy_process_group(_DRAFT_DP_GROUP)
+    dist.destroy_process_group(_DRAFT_SP_GROUP)
     dist.destroy_process_group()
 
 
@@ -223,8 +203,6 @@ def gather_outputs_and_unpad(
     Args:
         x (Tensor): Input tensor to gather.
         gather_dim (int): Dimension along which to gather across ranks.
-        unpad_dim (int, optional): Dimension from which to remove padding. If None, no unpadding.
-        padding_size (int): Number of padding elements to remove on `unpad_dim`. Defaults to 0.
         grad_scaler (bool): Whether to apply gradient scaling during gather. Defaults to True.
         group (ProcessGroup, optional): Process group for gathering. If None, uses
             `get_ulysses_sequence_parallel_group()`. If still None, returns `x` unchanged.

@@ -855,7 +855,7 @@ class LlamaUSPAttention(LlamaAttention):
         )
 
         attn_output = attn_output.reshape(bsz, local_q_len, self.head_dim * self.num_heads)
-        attn_output = self.o_proj(attn_output)  # [1, 1558, 7168]
+        attn_output = self.o_proj(attn_output)
         return attn_output
 
     def ring_attention_hybrid_masked(
