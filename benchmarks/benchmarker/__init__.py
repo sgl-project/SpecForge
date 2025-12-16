@@ -23,7 +23,6 @@ __all__ = [
     "MMStarBenchmarker",
     "GPQABenchmarker",
     "FinanceQABenchmarker",
-    "SciEvalBenchmarker",
     "MMLUBenchmarker",
     "LCBBenchmarker",
     "SimpleQABenchmarker",
