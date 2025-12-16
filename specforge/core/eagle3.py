@@ -80,14 +80,14 @@ class OnlineEagle3Model(Eagle3Model):
         self.rank = torch.distributed.get_rank()
 
     @torch.compile()
-    def prepare_usp_input(self, global_input_ids):
-        input_ids = (
+    def prepare_usp_input(self, full_input):
+        shared_input = (
             self.extract_func(
-                global_input_ids, rank=self.sp_rank, world_size=self.sp_world_size,
+                full_input, rank=self.sp_rank, world_size=self.sp_world_size,
             )
             .clone()
         )
-        return input_ids
+        return shared_input
 
     def forward(
         self,
@@ -174,13 +174,7 @@ class OnlineEagle3Model(Eagle3Model):
         elif self.attention_backend == "usp":
             cache_hidden = [[], []]
             past_key_values = None
-            hidden_states = (
-                self.extract_func(
-                    hidden_states, rank=self.sp_rank, world_size=self.sp_world_size,
-                )
-                .clone()
-            )
-
+            hidden_states = self.prepare_usp_input(hidden_states)
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
