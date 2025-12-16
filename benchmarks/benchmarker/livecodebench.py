@@ -9,7 +9,6 @@ from datasets import load_dataset
 from .base import Benchmarker
 from .registry import BENCHMARKS
 from .utils import create_simple_sgl_function
-import random
 
 
 def generate_question(row: Dict[str, Any]) -> str:

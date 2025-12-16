@@ -74,7 +74,12 @@ def parse_args():
     benchmark_group.add_argument(
         "--config-list", type=str, nargs="+", default=["1,0,0,0", "1,3,1,4"]
     )
-    benchmark_group.add_argument("--name", type=str, default=None, help="name of this benchmark run, if provided, will be added to the output file name")
+    benchmark_group.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="name of this benchmark run, if provided, will be added to the output file name",
+    )
     benchmark_group.add_argument(
         "--benchmark-list",
         type=str,
@@ -243,7 +248,10 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_file = os.path.join(args.output_dir, f"{args.name + '_' if args.name else ''}results_{timestamp}.jsonl")
+    result_file = os.path.join(
+        args.output_dir,
+        f"{args.name + '_' if args.name else ''}results_{timestamp}.jsonl",
+    )
     with open(result_file, "w") as f:
         json.dump(results, f, indent=4)
     print(f"Results saved to {result_file}")

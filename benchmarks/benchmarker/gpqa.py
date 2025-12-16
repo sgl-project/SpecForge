@@ -2,6 +2,7 @@
 GSM8K benchmark evaluation script.
 """
 
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
@@ -9,7 +10,6 @@ from datasets import load_dataset
 from .base import Benchmarker
 from .registry import BENCHMARKS
 from .utils import create_simple_sgl_function
-import random
 
 GPQA_QUERY_TEMPLATE = """
 Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
@@ -25,7 +25,11 @@ D) {D}
 
 def generate_question(row: Dict[str, Any]) -> str:
     gold_index = random.randint(0, 3)
-    choices = [row["Incorrect Answer 1"], row["Incorrect Answer 2"], row["Incorrect Answer 3"]]
+    choices = [
+        row["Incorrect Answer 1"],
+        row["Incorrect Answer 2"],
+        row["Incorrect Answer 3"],
+    ]
     choices.insert(gold_index, row["Correct Answer"])
 
     question = GPQA_QUERY_TEMPLATE.format(

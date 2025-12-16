@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
 
-
 from .base import Benchmarker
 from .registry import BENCHMARKS
 from .utils import create_simple_sgl_function
@@ -16,11 +15,12 @@ QUESTION_PROMPT = """Given a question and four options, please select the right 
 Question: {question}
 """
 
+
 def generate_question(row: Dict[str, Any]) -> str:
-    assert row['type'] == "multiple-choice", "expect only multiple-choice questions"
-    question = row['question']
+    assert row["type"] == "multiple-choice", "expect only multiple-choice questions"
+    question = row["question"]
     question_prompt = QUESTION_PROMPT.format(question=question)
-    answer = row['answer'][0]
+    answer = row["answer"][0]
     return question_prompt, answer
 
 
