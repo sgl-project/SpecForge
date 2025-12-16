@@ -10,7 +10,6 @@ from .mmlu import MMLUBenchmarker
 from .mmstar import MMStarBenchmarker
 from .mtbench import MTBenchBenchmarker
 from .registry import BENCHMARKS
-from .scieval import SciEvalBenchmarker
 from .simpleqa import SimpleQABenchmarker
 
 __all__ = [

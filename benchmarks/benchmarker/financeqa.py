@@ -18,11 +18,14 @@ Can you answer the following question?
 
 
 def generate_question(row: Dict[str, Any]) -> str:
-    question = QUESTION_PROMPT.format(
-        context=row["context"].strip(),
-        question=row["question"].strip(),
-    )
-    return question
+    if row["context"] is None:
+        return row["question"].strip()
+    else:
+        question = QUESTION_PROMPT.format(
+            context=row["context"].strip(),
+            question=row["question"].strip(),
+        )
+        return question
 
 
 @BENCHMARKS.register("financeqa")
