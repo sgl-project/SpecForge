@@ -24,7 +24,6 @@ class LCBBenchmarker(Benchmarker):
         super().__init__(num_samples, None)
 
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[int]]:
-        """Load and preprocess GPQA dataset."""
         # Read data
         ds = load_dataset("livecodebench/code_generation")["test"]
 

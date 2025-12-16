@@ -1,7 +1,3 @@
-"""
-GSM8K benchmark evaluation script.
-"""
-
 from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
@@ -33,7 +29,8 @@ def generate_question(row: Dict[str, Any]) -> str:
     )
 
     # 0 means A, 1 means B, 2 means C, 3 means D
-    answer = row["answer"]
+    answer = ["A", "B", "C", "D"][row["answer"]]
+    print(answer)
     return question, answer
 
 

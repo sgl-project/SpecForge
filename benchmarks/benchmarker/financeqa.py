@@ -1,7 +1,3 @@
-"""
-GSM8K benchmark evaluation script.
-"""
-
 from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset

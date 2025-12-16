@@ -1,7 +1,3 @@
-"""
-GSM8K benchmark evaluation script.
-"""
-
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
