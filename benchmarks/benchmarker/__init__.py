@@ -5,6 +5,12 @@ from .humaneval import HumanEvalBenchmarker
 from .math500 import Math500Benchmarker
 from .mmstar import MMStarBenchmarker
 from .mtbench import MTBenchBenchmarker
+from .gpqa import GPQABenchmarker
+from .financeqa import FinanceQABenchmarker
+from .scieval import SciEvalBenchmarker
+from .mmlu import MMLUBenchmarker
+from .livecodebench import LCBBenchmarker
+from .simpleqa import SimpleQABenchmarker
 from .registry import BENCHMARKS
 
 __all__ = [
@@ -16,4 +22,10 @@ __all__ = [
     "Math500Benchmarker",
     "MTBenchBenchmarker",
     "MMStarBenchmarker",
+    "GPQABenchmarker",
+    "FinanceQABenchmarker",
+    "SciEvalBenchmarker",
+    "MMLUBenchmarker",
+    "LCBBenchmarker",
+    "SimpleQABenchmarker",
 ]
