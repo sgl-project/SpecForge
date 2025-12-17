@@ -1,5 +1,5 @@
 from datetime import timedelta
-from typing import Optional, Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -17,6 +17,7 @@ _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
 
+
 def get_tp_group():
     global _TP_GROUP
     return _TP_GROUP
@@ -31,9 +32,11 @@ def get_draft_dp_group():
     global _DRAFT_DP_GROUP
     return _DRAFT_DP_GROUP
 
+
 def get_draft_sp_group():
     global _DRAFT_SP_GROUP
     return _DRAFT_SP_GROUP
+
 
 def get_device_mesh():
     global _DEVICE_MESH
@@ -50,7 +53,6 @@ def get_dp_device_mesh():
     return _DP_DEVICE_MESH
 
 
-
 def get_sp_ulysses_group():
     global _SP_ULYSSES_GROUP
     return _SP_ULYSSES_GROUP
@@ -61,7 +63,9 @@ def get_sp_ring_group():
     return _SP_RING_GROUP
 
 
-def init_distributed(timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1):
+def init_distributed(
+    timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
+):
     """Initialize distributed training.
 
     Args:
@@ -75,18 +79,23 @@ def init_distributed(timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int =
 
     world_size = dist.get_world_size()
     dp_size = world_size // tp_size
-    assert world_size == tp_size * dp_size, f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
+    assert (
+        world_size == tp_size * dp_size
+    ), f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
 
     device_mesh = dist.device_mesh.init_device_mesh(
         "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
 
-    assert world_size % (sp_ulysses_size*sp_ring_size) == 0, \
-        f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
+    assert (
+        world_size % (sp_ulysses_size * sp_ring_size) == 0
+    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
 
-    draft_dp_size = world_size // (sp_ulysses_size*sp_ring_size)
+    draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
     draft_device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (draft_dp_size, sp_ulysses_size*sp_ring_size), mesh_dim_names=("draft_dp", "sp")
+        "cuda",
+        (draft_dp_size, sp_ulysses_size * sp_ring_size),
+        mesh_dim_names=("draft_dp", "sp"),
     )
     set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
 
@@ -99,8 +108,7 @@ def init_distributed(timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int =
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
 
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, \
-        _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
     _TP_DEVICE_MESH = tp_device_mesh
@@ -141,13 +149,20 @@ def gather_tensor(
     return gather_tensor
 
 
-def all_gather_tensor(local_tensor: torch.Tensor, group: Optional[dist.ProcessGroup] = None, async_op: bool = False):
+def all_gather_tensor(
+    local_tensor: torch.Tensor,
+    group: Optional[dist.ProcessGroup] = None,
+    async_op: bool = False,
+):
     sp_world_size = dist.get_world_size(group=group)
     output_shape = list(local_tensor.shape)
     output_shape[0] = output_shape[0] * sp_world_size
-    output = torch.empty(output_shape, dtype=local_tensor.dtype, device=local_tensor.device)
+    output = torch.empty(
+        output_shape, dtype=local_tensor.dtype, device=local_tensor.device
+    )
     dist.all_gather_into_tensor(output, local_tensor, group=group, async_op=async_op)
     return output
+
 
 # Adapted from https://github.com/volcengine/verl/blob/a0e8e4472b8b472409defb0c8fcc5162301450af/verl/utils/ulysses.py#L194
 class Gather(torch.autograd.Function):
@@ -185,12 +200,15 @@ class Gather(torch.autograd.Function):
             grad_output = grad_output * ctx.sp_world_size
         return (
             None,
-            grad_output.split(ctx.part_size, dim=ctx.gather_dim)[ctx.sp_rank].contiguous(),
+            grad_output.split(ctx.part_size, dim=ctx.gather_dim)[
+                ctx.sp_rank
+            ].contiguous(),
             None,
             None,
             None,
             None,
         )
+
 
 def gather_outputs_and_unpad(
     x: torch.Tensor,

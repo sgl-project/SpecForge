@@ -20,8 +20,8 @@ from specforge.modeling.draft.flex_attention import (
 )
 from specforge.utils import print_with_rank
 
+from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
-from ...distributed import get_sp_ulysses_group, get_sp_ring_group
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -746,7 +746,6 @@ class LlamaUSPAttention(LlamaAttention):
         self.ring_group_ranks = dist.get_process_group_ranks(self.ring_pg)
         self.ring_rank = torch.distributed.get_rank(self.ring_pg)
 
-
         if self.sp_ring_degree == 1:
             self.attention_impl = self.attention_with_cache
         else:
@@ -770,11 +769,13 @@ class LlamaUSPAttention(LlamaAttention):
         bsz, q_len, _ = hidden_states.size()  # bs, seq_len, hidden_size
         local_q_len = q_len
         query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        )
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         query_states = SeqAllToAll4D.apply(
-            self.ulysses_pg, query_states, self.scatter_idx, self.gather_idx, self.use_sync
+            self.ulysses_pg,
+            query_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
         ).transpose(1, 2)
 
         key_states = self.k_proj(hidden_states)
@@ -782,7 +783,11 @@ class LlamaUSPAttention(LlamaAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
         key_states = SeqAllToAll4D.apply(
-            self.ulysses_pg, key_states, self.scatter_idx, self.gather_idx, self.use_sync
+            self.ulysses_pg,
+            key_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
         ).transpose(1, 2)
 
         value_states = self.v_proj(hidden_states)
@@ -790,17 +795,25 @@ class LlamaUSPAttention(LlamaAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
         value_states = SeqAllToAll4D.apply(
-            self.ulysses_pg, value_states, self.scatter_idx, self.gather_idx, self.use_sync
+            self.ulysses_pg,
+            value_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
         ).transpose(1, 2)
         q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
 
         if self.sp_ring_degree > 1:
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
                 # mRoPE: [3, bs, seq_len] -> split dim 2
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[self.ring_rank].clone()
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
+                    self.ring_rank
+                ].clone()
             else:
                 # Standard RoPE: [bs, seq_len] -> split dim 1
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[self.ring_rank].clone()
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
+                    self.ring_rank
+                ].clone()
 
         # bs, shard_seqlen, hc, hs
         if cache_hidden is None:
@@ -823,7 +836,9 @@ class LlamaUSPAttention(LlamaAttention):
 
             cache_k = [key_states]
             cache_v = [value_states]
-            attn_output = self.attention_impl(query_states, attention_mask, cache_k, cache_v, q_len)
+            attn_output = self.attention_impl(
+                query_states, attention_mask, cache_k, cache_v, q_len
+            )
         else:
             lck = len(cache_hidden[0])
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
@@ -848,13 +863,21 @@ class LlamaUSPAttention(LlamaAttention):
 
             cache_k = cache_hidden[0]  # bs, head_num, seq_len, dim
             cache_v = cache_hidden[1]  # bs, head_num, seq_len, dim
-            attn_output = self.attention_impl(query_states, attention_mask, cache_k, cache_v, q_len)
+            attn_output = self.attention_impl(
+                query_states, attention_mask, cache_k, cache_v, q_len
+            )
 
         attn_output = SeqAllToAll4D.apply(
-            self.ulysses_pg, attn_output, self.gather_idx, self.scatter_idx, self.use_sync
+            self.ulysses_pg,
+            attn_output,
+            self.gather_idx,
+            self.scatter_idx,
+            self.use_sync,
         )
 
-        attn_output = attn_output.reshape(bsz, local_q_len, self.head_dim * self.num_heads)
+        attn_output = attn_output.reshape(
+            bsz, local_q_len, self.head_dim * self.num_heads
+        )
         attn_output = self.o_proj(attn_output)
         return attn_output
 
@@ -881,9 +904,18 @@ class LlamaUSPAttention(LlamaAttention):
         # =============================================================
         # [FP32] 1. init Online Softmax static to float32
         # =============================================================
-        m = torch.full((1, H, local_seq_len), float("-inf"), device=local_q.device, dtype=torch.float32)
-        l = torch.zeros((1, H, local_seq_len), device=local_q.device, dtype=torch.float32)
-        acc = torch.zeros((1, H, local_seq_len, head_dim), device=local_q.device, dtype=torch.float32)
+        m = torch.full(
+            (1, H, local_seq_len),
+            float("-inf"),
+            device=local_q.device,
+            dtype=torch.float32,
+        )
+        l = torch.zeros(
+            (1, H, local_seq_len), device=local_q.device, dtype=torch.float32
+        )
+        acc = torch.zeros(
+            (1, H, local_seq_len, head_dim), device=local_q.device, dtype=torch.float32
+        )
 
         # =============================================================
         # Phase 1: Extras (cache_k[1:]) - local compute
@@ -947,7 +979,9 @@ class LlamaUSPAttention(LlamaAttention):
             attn_block = torch.matmul(local_q, curr_k.transpose(2, 3)) * scale
 
             # 2.4 [FP32] Mask slice
-            mask_slice = attention_mask[:, :, start_q_idx:end_q_idx, start_k_idx:end_k_idx]
+            mask_slice = attention_mask[
+                :, :, start_q_idx:end_q_idx, start_k_idx:end_k_idx
+            ]
             if mask_slice.dtype != torch.float32:
                 mask_slice = mask_slice.to(torch.float32)
             if mask_slice.device != attn_block.device:
@@ -1004,10 +1038,7 @@ class LlamaUSPAttention(LlamaAttention):
             kiq = ki
 
             attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
-            attn_weights = torch.cat(
-                (attn_weights, attn_weightsi[..., None]), dim=-1
-            )
-
+            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
@@ -1228,7 +1259,9 @@ class LlamaDecoderLayer(nn.Module):
 
         self.world_size = torch.distributed.get_world_size()
         self.sp_ring_degree = 1
-        self.sp_ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
+        self.sp_ulysses_degree = torch.distributed.get_world_size(
+            get_sp_ulysses_group()
+        )
         self.sp_rank = torch.distributed.get_rank(get_sp_ulysses_group())
         self.gather_idx = 1
         self.scatter_idx = 2

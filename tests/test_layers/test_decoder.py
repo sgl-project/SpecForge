@@ -7,7 +7,7 @@ from accelerate.utils import set_seed
 from torch import nn
 from yunchang import EXTRACT_FUNC_DICT
 
-from specforge.distributed import init_distributed, destroy_distributed
+from specforge.distributed import destroy_distributed, init_distributed
 from specforge.modeling.draft.llama3_eagle import LlamaDecoderLayer
 from specforge.utils import padding
 from tests.utils import get_available_port
@@ -29,16 +29,10 @@ def test_ttt(rank, world_size, port):
     from transformers import PretrainedConfig
 
     config = {
-        "architectures": [
-            "LlamaForCausalLMEagle3"
-        ],
+        "architectures": ["LlamaForCausalLMEagle3"],
         "eagle_config": {
-            "eagle_aux_hidden_state_layer_ids": [
-                1,
-                29,
-                57
-            ],
-            "use_aux_hidden_state": True
+            "eagle_aux_hidden_state_layer_ids": [1, 29, 57],
+            "use_aux_hidden_state": True,
         },
         "bos_token_id": 128000,
         "eos_token_id": 128001,
@@ -72,9 +66,15 @@ def test_ttt(rank, world_size, port):
     ).to(device)
 
     # 3.
-    data_input_ids = torch.randint(0, 10000, (batch_size, seq_len), device='cuda')
-    data_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size).cuda().to(torch.bfloat16)
-    attention_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).view(1, 1, seq_len, seq_len).cuda()
+    data_input_ids = torch.randint(0, 10000, (batch_size, seq_len), device="cuda")
+    data_hidden_states = (
+        torch.randn(batch_size, seq_len, config.hidden_size).cuda().to(torch.bfloat16)
+    )
+    attention_mask = (
+        torch.tril(torch.ones(seq_len, seq_len, device=device))
+        .view(1, 1, seq_len, seq_len)
+        .cuda()
+    )
 
     position_ids = torch.arange(seq_len).unsqueeze(0).cuda()
     hidden_states = data_hidden_states.clone()
@@ -83,7 +83,11 @@ def test_ttt(rank, world_size, port):
     past_key_values = None
     cache_hidden = [[], []]
 
-    sdpa_decoder_layer = LlamaDecoderLayer(config, attention_backend="sdpa").to(device).to(torch.bfloat16)
+    sdpa_decoder_layer = (
+        LlamaDecoderLayer(config, attention_backend="sdpa")
+        .to(device)
+        .to(torch.bfloat16)
+    )
     for idx in range(ttt_length):
         is_last = idx == ttt_length - 1
 
@@ -113,10 +117,14 @@ def test_ttt(rank, world_size, port):
 
     sp_ulysses_degree = 2
     sp_ring_degree = 2
-    init_distributed(tp_size=1, sp_ulysses_size=sp_ulysses_degree, sp_ring_size=sp_ring_degree)
+    init_distributed(
+        tp_size=1, sp_ulysses_size=sp_ulysses_degree, sp_ring_size=sp_ring_degree
+    )
     origin_input_ids = data_input_ids.clone()
     hidden_states = data_hidden_states.clone()
-    usp_decoder_layer = LlamaDecoderLayer(config, attention_backend="usp").to(device).to(torch.bfloat16)
+    usp_decoder_layer = (
+        LlamaDecoderLayer(config, attention_backend="usp").to(device).to(torch.bfloat16)
+    )
     usp_decoder_layer.load_state_dict(sdpa_decoder_layer.state_dict())
     cache_hidden = [[], []]
     past_key_values = None
@@ -124,7 +132,11 @@ def test_ttt(rank, world_size, port):
 
     hidden_states = (
         extract_func(
-            hidden_states, rank, world_size=world_size, rd=sp_ring_degree, ud=sp_ulysses_degree
+            hidden_states,
+            rank,
+            world_size=world_size,
+            rd=sp_ring_degree,
+            ud=sp_ulysses_degree,
         )
         .detach()
         .clone()
@@ -133,7 +145,11 @@ def test_ttt(rank, world_size, port):
     for idx in range(ttt_length):
         input_ids = (
             extract_func(
-                origin_input_ids, rank, world_size=world_size, rd=sp_ring_degree, ud=sp_ulysses_degree
+                origin_input_ids,
+                rank,
+                world_size=world_size,
+                rd=sp_ring_degree,
+                ud=sp_ulysses_degree,
             )
             .detach()
             .clone()
@@ -163,9 +179,14 @@ def test_ttt(rank, world_size, port):
             origin_input_ids = padding(origin_input_ids, left=False)
     # check, bf16 has larger differ. set threshold to 2e-2
     assert torch.allclose(
-        usp_hidden_states_out, sdpa_hidden_states_out.chunk(sp_ring_degree * sp_ulysses_degree, dim=1)[rank%(sp_ring_degree * sp_ulysses_degree)],
-        rtol=2e-2, atol=2e-2
+        usp_hidden_states_out,
+        sdpa_hidden_states_out.chunk(sp_ring_degree * sp_ulysses_degree, dim=1)[
+            rank % (sp_ring_degree * sp_ulysses_degree)
+        ],
+        rtol=2e-2,
+        atol=2e-2,
     ), f"usp_output: \n{usp_hidden_states_out}, \nsdpa_output: \n{sdpa_hidden_states_out}"
+
 
 class TestLinear(unittest.TestCase):
     def test_usp_decoder_layer1(self):

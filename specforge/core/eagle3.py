@@ -29,7 +29,11 @@ from transformers.cache_utils import DynamicCache
 from yunchang import EXTRACT_FUNC_DICT
 
 from specforge.core.loss import LogSoftmaxLoss
-from specforge.distributed import get_sp_ring_group, get_sp_ulysses_group, gather_outputs_and_unpad
+from specforge.distributed import (
+    gather_outputs_and_unpad,
+    get_sp_ring_group,
+    get_sp_ulysses_group,
+)
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -71,7 +75,9 @@ class OnlineEagle3Model(Eagle3Model):
 
         self.world_size = torch.distributed.get_world_size()
         self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
-        self.sp_ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
+        self.sp_ulysses_degree = torch.distributed.get_world_size(
+            get_sp_ulysses_group()
+        )
         self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
         self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
         self.gather_idx = 1
@@ -81,12 +87,11 @@ class OnlineEagle3Model(Eagle3Model):
 
     @torch.compile()
     def prepare_usp_input(self, full_input):
-        shared_input = (
-            self.extract_func(
-                full_input, rank=self.sp_rank, world_size=self.sp_world_size,
-            )
-            .clone()
-        )
+        shared_input = self.extract_func(
+            full_input,
+            rank=self.sp_rank,
+            world_size=self.sp_world_size,
+        ).clone()
         return shared_input
 
     def forward(
