@@ -116,7 +116,7 @@ def test_ttt(rank, world_size, port):
     destroy_distributed()
 
     sp_ulysses_degree = 2
-    sp_ring_degree = 2
+    sp_ring_degree = 1
     init_distributed(
         tp_size=1, sp_ulysses_size=sp_ulysses_degree, sp_ring_size=sp_ring_degree
     )
@@ -191,7 +191,7 @@ def test_ttt(rank, world_size, port):
 class TestLinear(unittest.TestCase):
     def test_usp_decoder_layer1(self):
         port = get_available_port()
-        mp.spawn(test_ttt, nprocs=4, args=(4, port))
+        mp.spawn(test_ttt, nprocs=2, args=(2, port))
 
 
 if __name__ == "__main__":

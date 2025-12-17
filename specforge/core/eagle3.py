@@ -70,20 +70,15 @@ class OnlineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
-        ring_impl_type = "basic"
-        self.extract_func = EXTRACT_FUNC_DICT[ring_impl_type]
 
-        self.world_size = torch.distributed.get_world_size()
-        self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
-        self.sp_ulysses_degree = torch.distributed.get_world_size(
-            get_sp_ulysses_group()
-        )
-        self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
-        self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
-        self.gather_idx = 1
-        self.scatter_idx = 2
-        self.use_sync = False
-        self.rank = torch.distributed.get_rank()
+        if self.attention_backend == "usp":
+            self.extract_func = EXTRACT_FUNC_DICT["basic"]
+            self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
+            self.sp_ulysses_degree = torch.distributed.get_world_size(
+                get_sp_ulysses_group()
+            )
+            self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
+            self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
 
     @torch.compile()
     def prepare_usp_input(self, full_input):

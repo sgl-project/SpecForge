@@ -737,6 +737,9 @@ class LlamaAttention(nn.Module):
 class LlamaUSPAttention(LlamaAttention):
     def __init__(self, config):
         super().__init__(config)
+        assert (
+            dist.is_initialized()
+        ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
         self.rank = torch.distributed.get_rank()
         self.ring_pg = get_sp_ring_group()
         self.ulysses_pg = get_sp_ulysses_group()
@@ -754,7 +757,6 @@ class LlamaUSPAttention(LlamaAttention):
         self.scatter_idx = 2
         self.gather_idx = 1
         self.use_sync = False
-        self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
 
     def forward(
         self,
@@ -1256,17 +1258,6 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
-        self.world_size = torch.distributed.get_world_size()
-        self.sp_ring_degree = 1
-        self.sp_ulysses_degree = torch.distributed.get_world_size(
-            get_sp_ulysses_group()
-        )
-        self.sp_rank = torch.distributed.get_rank(get_sp_ulysses_group())
-        self.gather_idx = 1
-        self.scatter_idx = 2
-        self.use_sync = False
-        self.rank = torch.distributed.get_rank()
 
     def forward(
         self,
