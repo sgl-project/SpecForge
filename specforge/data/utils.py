@@ -254,6 +254,10 @@ def prepare_dp_dataloaders(
         datacollator_cls = VlmDataCollatorWithPadding
     else:
         datacollator_cls = DataCollatorWithPadding
+    
+    if num_workers == 0:
+        prefetch_factor = None
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,

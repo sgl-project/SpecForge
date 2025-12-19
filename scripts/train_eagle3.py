@@ -104,7 +104,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
     )
     dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
-
+    dataset_group.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=4,
+        help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+    )
     # training hyper params
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=10)
@@ -414,7 +419,7 @@ def build_dataloaders(
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
-        num_workers=4,
+        num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
         is_vlm=args.is_vlm,
@@ -441,7 +446,7 @@ def build_dataloaders(
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.target_batch_size,
-            num_workers=4,
+            num_workers=num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
