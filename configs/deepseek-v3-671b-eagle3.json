@@ -10,8 +10,8 @@
     ],
     "use_aux_hidden_state": true
   },
-  "bos_token_id": 128000,
-  "eos_token_id": 128001,
+  "bos_token_id": 151643,
+  "eos_token_id": 151645,
   "hidden_act": "silu",
   "hidden_size": 7168,
   "initializer_range": 0.02,
@@ -25,7 +25,7 @@
   "rms_norm_eps": 1e-05,
   "tie_word_embeddings": false,
   "torch_dtype": "float16",
-  "transformers_version": "4.28.1",
+  "transformers_version": "4.51.0",
   "use_cache": true,
   "vocab_size": 129280,
   "draft_vocab_size": 32000
