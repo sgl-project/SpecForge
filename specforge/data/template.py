@@ -202,10 +202,10 @@ TEMPLATE_REGISTRY.register(
     template=ChatTemplate(
         assistant_header="<｜Assistant｜>",
         user_header="<｜User｜>",
-        system_prompt="", 
+        system_prompt="",
         end_of_turn_token="",
         bos_token="<｜begin of sentence｜>",
         eos_token="<｜end of sentence｜>",
-        parser_type="general", 
+        parser_type="general",
     ),
 )
