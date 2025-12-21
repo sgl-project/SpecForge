@@ -364,7 +364,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    draft_model_config = AutoDraftModelConfig.from_file(draft_model_config)
+    draft_model_config = AutoDraftModelConfig.from_file(draft_model_config) if isinstance(draft_model_config, str) else draft_model_config
     return draft_model_config, draft_model
 
 
