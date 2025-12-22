@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -266,3 +267,47 @@ def prepare_dp_dataloaders(
         **dataloader_kwargs
     )
     return dataloader
+
+
+def parse_harmony_message_content(content):
+    """
+    解析 content 字符串中的 Harmony 格式。
+    如果匹配到 Harmony 格式，返回包含 channel 和 content 的列表；
+    否则，返回原内容并标记为默认 channel。
+    """
+    # 匹配 <|channel|>xxx<|message|>yyy<|end|>
+    pattern = r"<\|channel\|>(.*?)<\|message\|>(.*?)<\|end|>"
+    matches = re.findall(pattern, content, re.DOTALL)
+
+    if not matches:
+        # 如果没有匹配到 Harmony 标签，视作普通文本
+        return [{"channel": "text", "content": content}]
+
+    results = []
+    for channel, msg_body in matches:
+        results.append({"channel": channel.strip(), "content": msg_body.strip()})
+    return results
+
+
+def process_harmony_conversations(conversation):
+    """
+    处理传入的 list[list[dict]] 结构
+    """
+    new_conversation = []
+    for msg in conversation:
+        role = msg.get("role")
+        original_content = msg.get("content", "")
+
+        # 解析 content 中的 Harmony 结构
+        segments = parse_harmony_message_content(original_content)
+
+        # 为每个解析出的通道生成一个新的消息字典
+        for seg in segments:
+            new_msg = {
+                "role": role,
+                "channel": seg["channel"],  # 新增字段标识通道
+                "content": seg["content"],
+            }
+            new_conversation.append(new_msg)
+
+    return new_conversation
