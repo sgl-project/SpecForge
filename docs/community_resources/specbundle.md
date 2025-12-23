@@ -1,7 +1,7 @@
 # 🔥 SpecBundle
 
 <div style="text-align:center;">
-    <img src="/_static/imgs/specbundle-logo.png" alt="specbundle logo" width="400"></img>
+    <img src="/SpecForge/_static/imgs/specbundle-logo.png" alt="specbundle logo" width="400"></img>
 </div>
 
 

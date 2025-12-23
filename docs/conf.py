@@ -120,7 +120,7 @@ html_context = {
     "conf_py_path": "/docs/",
 }
 
-html_static_path = ["_static"]
+html_static_path = ["_static", "spec_bundle/public"]
 html_css_files = ["css/custom_log.css"]
 
 

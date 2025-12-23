@@ -1,0 +1,40 @@
+{
+  "name": "specforge-spec-bundle",
+  "private": false,
+  "version": "1.0.0",
+  "description": "Interactive SpecBundle visualization dashboard for SpecForge",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "npm run build && gh-pages -d dist"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sgl-project/SpecForge.git",
+    "directory": "docs/spec_bundle"
+  },
+  "keywords": [
+    "specforge",
+    "specbundle",
+    "benchmark",
+    "visualization",
+    "speculative-decoding",
+    "llm",
+    "performance"
+  ],
+  "author": "SpecForge Team",
+  "license": "MIT",
+  "dependencies": {
+    "echarts": "^6.0.0",
+    "papaparse": "^5.5.3",
+    "vue": "^3.5.24",
+    "vue-echarts": "^8.0.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.1",
+    "vite": "^7.2.4"
+  }
+}
