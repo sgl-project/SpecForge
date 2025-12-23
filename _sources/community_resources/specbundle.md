@@ -17,6 +17,10 @@ Speculative decoding, especially EAGLE3, offer strong theoretical guarantees alo
 
 We call for all open-source developers and industry partners to join this exciting initiative.
 
+## Performance Scores
+
+We evaluate the performance of SpecBundle draft models on various benchmarks, please visit the [Performance Dashboard](https://docs.sglang.io/SpecForge/SpecBundle/index.html) for more details.
+
 ## Usage
 
 You can use the following command to launch the SGLang server with SpecBundle models. Please add `--tp`, `--ep` and `--mem-fraction-static` arguments when you encounter memory issues.
