@@ -1,13 +1,13 @@
 # 🔥 SpecBundle
 
 <div style="text-align:center;">
-    <img src="/_static/imgs/specbundle-logo.png" alt="specbundle logo" width="400" margin="10px"></img>
+    <img src="/_static/imgs/specbundle-logo.png" alt="specbundle logo" width="400"></img>
 </div>
 
 
 ## About SpecBundle
 
-Speculative decoding, especiially EAGLE3, offer strong theoretical guarantees alongside consistent empirical improvements in token acceptance rate and end-to-end inference speed. However, despite these advances, adoption of speculative decoding—especially EAGLE3—remains limited in the open-source ecosystem, due primarily to three key factors.
+Speculative decoding, especially EAGLE3, offer strong theoretical guarantees alongside consistent empirical improvements in token acceptance rate and end-to-end inference speed. However, despite these advances, adoption of speculative decoding—especially EAGLE3—remains limited in the open-source ecosystem, due primarily to three key factors.
 
 1. Lack of production-ready training infrastructure: Existing speculative decoding toolchains are largely research prototypes, offering limited system-level optimization and inadequate support for diverse architectures and large-scale models.
 2. Scarcity of high-quality draft models: Effective speculative decoding depends on strong draft models, yet publicly available EAGLE3-compatible checkpoints are extremely limited, primarily originating from the original authors.
@@ -33,7 +33,7 @@ python3 -m sglang.launch_server \
 
 ## Released Models
 
-We list the models released by the SpedForge and several industrial partners below. These models are released as part of the SpecBundle models, which are trained on large-scale multi-domain datasets and deliver exceptional performance on various benchmarks.
+We list the models released by the SpecForge and several industrial partners below. These models are released as part of the SpecBundle models, which are trained on large-scale multi-domain datasets and deliver exceptional performance on various benchmarks.
 
 > We also include some of the models previously trained by the SpecForge team but not technically part of the SpecBundle release.
 > We mark models trained on ShareGPT+Ultrachat datasets with a **\*** mark and models trained on Perfect-Blend datasets but released before SpecBundle with **+** mark.

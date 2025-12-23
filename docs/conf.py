@@ -51,7 +51,7 @@ myst_enable_extensions = [
     "substitution",
 ]
 
-myst_heading_anchors = 3
+myst_heading_anchors = 5
 
 nbsphinx_kernel_name = "python3"
 nbsphinx_execute_arguments = [
@@ -74,17 +74,6 @@ nb_render_priority = {
     )
 }
 
-myst_enable_extensions = [
-    "dollarmath",
-    "amsmath",
-    "deflist",
-    "colon_fence",
-    "html_image",
-    "linkify",
-    "substitution",
-]
-
-myst_heading_anchors = 3
 myst_ref_domains = ["std", "py"]
 
 templates_path = ["_templates"]
@@ -139,15 +128,6 @@ html_css_files = ["css/custom_log.css"]
 def setup(app):
     app.add_css_file("css/custom_log.css")
 
-
-myst_enable_extensions = [
-    "dollarmath",
-    "amsmath",
-    "deflist",
-    "colon_fence",
-    "html_image",
-]
-myst_heading_anchors = 5
 
 htmlhelp_basename = "sglangdoc"
 
