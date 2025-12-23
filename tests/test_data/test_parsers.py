@@ -11,7 +11,7 @@ from specforge.data.template import TEMPLATE_REGISTRY
 
 class TestTemplatePreprocessing(unittest.TestCase):
     # Configuration section
-    SAVE_REFERENCE = True
+    SAVE_REFERENCE = False
     REF_DIR = os.path.join(os.path.dirname(__file__), "test_references")
 
     @classmethod
@@ -112,6 +112,7 @@ class TestTemplatePreprocessing(unittest.TestCase):
         print("-" * 30)
         for tid, m in zip(input_ids, loss_mask):
             txt = tokenizer.decode([tid])
+            txt = txt.replace("\n", "\\n")
             print(f"{RED if m == 1 else ''}{txt}{RESET}", end="")
         print("\n" + "-" * 30)
 

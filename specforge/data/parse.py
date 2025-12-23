@@ -86,12 +86,7 @@ class GeneralParser(Parser):
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
-        assistant_pattern = (
-            re.escape(self.assistant_message_separator)
-            + r"(.*?)(?="
-            + re.escape(self.chat_template.end_of_turn_token)
-            + "|$)"
-        )
+        assistant_pattern = f"{re.escape(self.assistant_message_separator)}(.*?(?:{re.escape(self.chat_template.end_of_turn_token)}|$))"
         try:
             # use fast tokenizer's offset mapping to create loss mask
             encoding = self.tokenizer(
@@ -111,11 +106,17 @@ class GeneralParser(Parser):
                 assistant_end_char = match.end(1)
 
                 for idx, (token_start, token_end) in enumerate(offsets):
-                    if token_end <= assistant_start_char:
-                        continue
-                    if token_start > assistant_end_char:
-                        continue
-                    loss_mask[idx] = 1
+                    # if token_end <= assistant_start_char:
+                    #     continue
+                    # if token_start > assistant_end_char:
+                    #     continue
+                    if (
+                        assistant_start_char
+                        <= token_start
+                        <= token_end
+                        <= assistant_end_char
+                    ):
+                        loss_mask[idx] = 1
 
         except (NotImplementedError, TypeError, ValueError):
             assistant_pattern = (
