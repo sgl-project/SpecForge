@@ -145,6 +145,7 @@ myst_enable_extensions = [
     "amsmath",
     "deflist",
     "colon_fence",
+    "html_image",
 ]
 myst_heading_anchors = 5
 
