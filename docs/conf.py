@@ -47,7 +47,6 @@ myst_enable_extensions = [
     "deflist",
     "colon_fence",
     "html_image",
-    "linkify",
     "substitution",
 ]
 
