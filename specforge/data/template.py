@@ -253,16 +253,15 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>",
+    ),
+)
 
 TEMPLATE_REGISTRY.register(
     name="deepseek-v3",
     template=ChatTemplate(
         assistant_header="<｜Assistant｜>",
         user_header="<｜User｜>",
-        system_prompt="",
-        end_of_turn_token="",
-        bos_token="<｜begin of sentence｜>",
-        eos_token="<｜end of sentence｜>",
-        parser_type="general",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
     ),
 )
