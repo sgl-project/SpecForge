@@ -26,8 +26,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
+from yunchang import EXTRACT_FUNC_DICT
 
 from specforge.core.loss import LogSoftmaxLoss
+from specforge.distributed import (
+    gather_outputs_and_unpad,
+    get_sp_ring_group,
+    get_sp_ulysses_group,
+)
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -64,6 +70,24 @@ class OnlineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
+
+        if self.attention_backend == "usp":
+            self.extract_func = EXTRACT_FUNC_DICT["basic"]
+            self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
+            self.sp_ulysses_degree = torch.distributed.get_world_size(
+                get_sp_ulysses_group()
+            )
+            self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
+            self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
+
+    @torch.compile()
+    def prepare_usp_input(self, full_input):
+        shared_input = self.extract_func(
+            full_input,
+            rank=self.sp_rank,
+            world_size=self.sp_world_size,
+        ).clone()
+        return shared_input
 
     def forward(
         self,
@@ -126,7 +150,7 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
+        if self.attention_backend in ("sdpa", "usp"):
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -139,15 +163,26 @@ class OnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
+        # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
+        global_input_ids = input_ids
         if self.attention_backend == "sdpa":
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        elif self.attention_backend == "usp":
+            cache_hidden = [[], []]
+            past_key_values = None
+            hidden_states = self.prepare_usp_input(hidden_states)
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
+            if self.attention_backend == "usp":
+                input_ids = self.prepare_usp_input(global_input_ids)
+            else:
+                input_ids = global_input_ids
+
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -170,7 +205,7 @@ class OnlineEagle3Model(Eagle3Model):
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
-
+            logits = gather_outputs_and_unpad(logits, gather_dim=1)
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
                 acces.append(
@@ -188,7 +223,7 @@ class OnlineEagle3Model(Eagle3Model):
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
-                input_ids = padding(input_ids, left=False)
+                global_input_ids = padding(global_input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module

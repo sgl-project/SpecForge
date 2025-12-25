@@ -34,6 +34,7 @@ from specforge.data import (
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
+    get_draft_dp_group,
     get_tp_group,
     init_distributed,
 )
@@ -47,6 +48,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
+    print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
@@ -157,6 +159,9 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=1,
         help="The size of the tensor parallel for the target model",
     )
+    # distributed training
+    optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
+    optimization_group.add_argument("--sp-ring-size", type=int, default=1)
     optimization_group.add_argument(
         "--attention-backend",
         type=str,
@@ -317,6 +322,13 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    args.draft_accumulation_steps = (
+        args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
+    )
+    if args.attention_backend == "usp":
+        assert (
+            args.train_hidden_states_path is not None
+        ), "train_hidden_states_path should not be None for usp"
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -416,7 +428,9 @@ def build_dataloaders(
         args.target_batch_size,
         num_workers=4,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=(
+            get_draft_dp_group() if args.attention_backend == "usp" else get_dp_group()
+        ),
         is_vlm=args.is_vlm,
     )
 
@@ -443,7 +457,11 @@ def build_dataloaders(
             args.target_batch_size,
             num_workers=4,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=(
+                get_draft_dp_group()
+                if args.attention_backend == "usp"
+                else get_dp_group()
+            ),
             is_vlm=args.is_vlm,
         )
         print_with_rank("Initialized eval dataloader")
@@ -613,12 +631,18 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(
+        timeout=args.dist_timeout,
+        tp_size=args.tp_size,
+        sp_ring_size=args.sp_ring_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+    )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
 
     sanity_check(args)
+    print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
     # ================================================
@@ -759,9 +783,15 @@ def main():
             run_backward_and_update(args, plosses, optimizer, global_step)
 
             # log training metrics
-            if global_step % args.log_interval == 0:
+            if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
                 record_metrcs(
-                    args, acces, plosses, global_step, tracker, optimizer, mode="train"
+                    args,
+                    acces,
+                    plosses,
+                    global_step // args.draft_accumulation_steps,
+                    tracker,
+                    optimizer,
+                    mode="train",
                 )
 
             if dist.get_rank() == 0:

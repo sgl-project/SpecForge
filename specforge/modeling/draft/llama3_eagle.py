@@ -2,6 +2,7 @@ import math
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -9,6 +10,8 @@ from transformers import LlamaConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
+from yunchang import EXTRACT_FUNC_DICT
+from yunchang.comm import SeqAllToAll4D
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -17,6 +20,7 @@ from specforge.modeling.draft.flex_attention import (
 )
 from specforge.utils import print_with_rank
 
+from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
 
 
@@ -262,7 +266,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
     @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
+        if seq_len and seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
         return (
@@ -730,6 +734,332 @@ class LlamaAttention(nn.Module):
         return attn_output
 
 
+class LlamaUSPAttention(LlamaAttention):
+    def __init__(self, config):
+        super().__init__(config)
+        assert (
+            dist.is_initialized()
+        ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        self.rank = torch.distributed.get_rank()
+        self.ring_pg = get_sp_ring_group()
+        self.ulysses_pg = get_sp_ulysses_group()
+        self.sp_ring_degree = torch.distributed.get_world_size(self.ring_pg)
+        self.sp_ulysses_degree = torch.distributed.get_world_size(self.ulysses_pg)
+        self.world_size = torch.distributed.get_world_size()
+        self.ring_group_ranks = dist.get_process_group_ranks(self.ring_pg)
+        self.ring_rank = torch.distributed.get_rank(self.ring_pg)
+
+        if self.sp_ring_degree == 1:
+            self.attention_impl = self.attention_with_cache
+        else:
+            self.attention_impl = self.ring_attention_hybrid_masked
+        self.extract_func = EXTRACT_FUNC_DICT["basic"]
+        self.scatter_idx = 2
+        self.gather_idx = 1
+        self.use_sync = False
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()  # bs, seq_len, hidden_size
+        local_q_len = q_len
+        query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        query_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            query_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        ).transpose(1, 2)
+
+        key_states = self.k_proj(hidden_states)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        key_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            key_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        ).transpose(1, 2)
+
+        value_states = self.v_proj(hidden_states)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            value_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        ).transpose(1, 2)
+        q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
+
+        if self.sp_ring_degree > 1:
+            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+                # mRoPE: [3, bs, seq_len] -> split dim 2
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
+                    self.ring_rank
+                ].clone()
+            else:
+                # Standard RoPE: [bs, seq_len] -> split dim 1
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
+                    self.ring_rank
+                ].clone()
+
+        # bs, shard_seqlen, hc, hs
+        if cache_hidden is None:
+            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_multimodal_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    self.config.rope_scaling["mrope_section"],
+                )
+            else:
+                cos, sin = self.rotary_emb(query_states, seq_len=q_len)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids
+                )
+
+            cache_k = [key_states]
+            cache_v = [value_states]
+            attn_output = self.attention_impl(
+                query_states, attention_mask, cache_k, cache_v, q_len
+            )
+        else:
+            lck = len(cache_hidden[0])
+            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_multimodal_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    self.config.rope_scaling["mrope_section"],
+                )
+            else:
+                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids
+                )
+
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+
+            cache_k = cache_hidden[0]  # bs, head_num, seq_len, dim
+            cache_v = cache_hidden[1]  # bs, head_num, seq_len, dim
+            attn_output = self.attention_impl(
+                query_states, attention_mask, cache_k, cache_v, q_len
+            )
+
+        attn_output = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            attn_output,
+            self.gather_idx,
+            self.scatter_idx,
+            self.use_sync,
+        )
+
+        attn_output = attn_output.reshape(
+            bsz, local_q_len, self.head_dim * self.num_heads
+        )
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+    def ring_attention_hybrid_masked(
+        self,
+        local_q: torch.Tensor,  # [1, H, Local_S, D]
+        attention_mask: torch.Tensor,  # [1, 1, Global_S, Global_S] (global Mask)
+        cache_k: List[torch.Tensor],
+        cache_v: List[torch.Tensor],
+        q_len: int,  # Global_S
+    ):
+        group = self.ring_pg
+        rank = self.ring_rank
+        world_size = self.sp_ring_degree
+
+        # bs=1
+        _, H, local_seq_len, head_dim = local_q.shape
+        scale = 1.0 / math.sqrt(head_dim)
+
+        # global Q index
+        start_q_idx = rank * local_seq_len
+        end_q_idx = start_q_idx + local_seq_len
+
+        # =============================================================
+        # [FP32] 1. init Online Softmax static to float32
+        # =============================================================
+        m = torch.full(
+            (1, H, local_seq_len),
+            float("-inf"),
+            device=local_q.device,
+            dtype=torch.float32,
+        )
+        l = torch.zeros(
+            (1, H, local_seq_len), device=local_q.device, dtype=torch.float32
+        )
+        acc = torch.zeros(
+            (1, H, local_seq_len, head_dim), device=local_q.device, dtype=torch.float32
+        )
+
+        # =============================================================
+        # Phase 1: Extras (cache_k[1:]) - local compute
+        # =============================================================
+        num_extras = len(cache_k) - 1
+        if num_extras > 0:
+            for i in range(1, len(cache_k)):
+                ki = repeat_kv(cache_k[i], self.num_key_value_groups)  # bf16
+                vi = repeat_kv(cache_v[i], self.num_key_value_groups)  # bf16
+
+                score_i = (local_q * ki).sum(dim=-1).to(torch.float32) * scale
+
+                # [FP32] Online Softmax Update
+                m_new = torch.maximum(m, score_i)
+                alpha = torch.exp(m - m_new)
+                p_i = torch.exp(score_i - m_new)  # fp32
+
+                l_new = l * alpha + p_i
+
+                # [FP32] Accumulation
+                # acc(fp32) = acc * alpha + p_i * vi(bf16->fp32)
+                acc = acc * alpha.unsqueeze(-1)
+                acc += p_i.unsqueeze(-1) * vi.to(torch.float32)
+
+                m, l = m_new, l_new
+
+        # =============================================================
+        # Phase 2: Main Sequence (cache_k[0]) - Ring Attention
+        # =============================================================
+        local_k0 = repeat_kv(cache_k[0], self.num_key_value_groups)
+        local_v0 = repeat_kv(cache_v[0], self.num_key_value_groups)
+
+        curr_k, curr_v = local_k0, local_v0
+        next_k, next_v = torch.empty_like(local_k0), torch.empty_like(local_v0)
+
+        for step in range(world_size):
+            # 2.1 communicate
+            if step < world_size - 1:
+                # ring group rank to global rank for isend and irecv
+                send_dst = self.ring_group_ranks[(rank + 1) % world_size]
+                recv_src = self.ring_group_ranks[(rank - 1 + world_size) % world_size]
+                reqs = []
+
+                if rank % 2 == 0:
+                    reqs.append(dist.isend(curr_k, dst=send_dst, group=group))
+                    reqs.append(dist.isend(curr_v, dst=send_dst, group=group))
+                    reqs.append(dist.irecv(next_k, src=recv_src, group=group))
+                    reqs.append(dist.irecv(next_v, src=recv_src, group=group))
+                else:
+                    reqs.append(dist.irecv(next_k, src=recv_src, group=group))
+                    reqs.append(dist.irecv(next_v, src=recv_src, group=group))
+                    reqs.append(dist.isend(curr_k, dst=send_dst, group=group))
+                    reqs.append(dist.isend(curr_v, dst=send_dst, group=group))
+
+            # 2.2 get index
+            block_rank = (rank - step + world_size) % world_size
+            start_k_idx = block_rank * local_seq_len
+            end_k_idx = start_k_idx + local_seq_len
+
+            # 2.3 [FP32] MatMul Score
+            attn_block = torch.matmul(local_q, curr_k.transpose(2, 3)) * scale
+
+            # 2.4 [FP32] Mask slice
+            mask_slice = attention_mask[
+                :, :, start_q_idx:end_q_idx, start_k_idx:end_k_idx
+            ]
+            if mask_slice.dtype != torch.float32:
+                mask_slice = mask_slice.to(torch.float32)
+            if mask_slice.device != attn_block.device:
+                mask_slice = mask_slice.to(attn_block.device)
+
+            attn_block = attn_block + mask_slice
+
+            # 2.5 [FP32] Online Softmax Update
+            m_block = attn_block.max(dim=-1).values  # fp32
+            m_new = torch.maximum(m, m_block)
+
+            alpha = torch.exp(m - m_new)
+            p_block = torch.exp(attn_block - m_new.unsqueeze(-1))  # fp32
+
+            l_new = l * alpha + p_block.sum(dim=-1)
+
+            acc = acc * alpha.unsqueeze(-1)
+            acc += torch.matmul(p_block, curr_v.to(torch.float32))
+
+            m, l = m_new, l_new
+
+            if step < world_size - 1:
+                for req in reqs:
+                    req.wait()
+                curr_k, curr_v = next_k.clone(), next_v.clone()
+
+        # =============================================================
+        # 3. Finalize
+        # =============================================================
+        final_output = acc / (l.unsqueeze(-1) + 1e-6)
+
+        return final_output.to(local_q.dtype).transpose(1, 2).contiguous()
+
+    def attention_with_cache(
+        self,
+        query_states: torch.Tensor,
+        attention_mask,
+        cache_k,
+        cache_v,
+        q_len,
+    ):
+        k0 = repeat_kv(cache_k[0], self.num_key_value_groups)
+        v0 = repeat_kv(cache_v[0], self.num_key_value_groups)
+        attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
+            self.head_dim
+        )
+        lck = len(cache_k)
+
+        attn_weights = attn_weights + attention_mask
+
+        for i in range(1, lck):
+            ki = repeat_kv(cache_k[i], self.num_key_value_groups)
+            qi = query_states
+            kiq = ki
+
+            attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
+            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attn_weights0 = attn_weights[..., :q_len]
+
+        attn_output = torch.matmul(attn_weights0, v0)
+
+        for i in range(1, lck):
+            vi = repeat_kv(cache_v[i], self.num_key_value_groups)
+            attn_weightsi = attn_weights[..., q_len + i - 1]
+            attn_outputi = attn_weightsi[..., None] * vi
+            attn_output = attn_output + attn_outputi
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output
+
+
 class LlamaFlexAttention(LlamaAttention):
     """
     Attention layer implemented with flex attention. We keep the parameters consistent with LlamaAttention.
@@ -910,12 +1240,15 @@ class LlamaDecoderLayer(nn.Module):
 
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
+        elif attention_backend == "usp":
+            self.self_attn = LlamaUSPAttention(config=config)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
+        self.attention_backend = attention_backend
         self.mlp = LlamaMLP(config)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
