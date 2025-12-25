@@ -76,9 +76,9 @@ def print_on_rank0(message):
         logger.info(message)
 
 
-def get_last_checkpoint(folder, prefix="epoch"):
+def get_last_checkpoint(folder):
     content = os.listdir(folder)
-    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
+    _re_checkpoint = re.compile(r"^epoch_(\d+)_step_(\d+)$")
     checkpoints = [
         path
         for path in content

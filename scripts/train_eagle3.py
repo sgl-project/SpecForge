@@ -4,7 +4,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -315,6 +315,39 @@ def build_target_model(
         return target_head, None
 
 
+def load_checkpoint(args: Namespace) -> Tuple[int, int, Optional[str], Any]:
+    """
+    Load checkpoint and return starting epoch and global_step
+    returns:
+        start_epoch: The starting epoch.
+        global_step: The global step.
+        checkpoint_path: The path to the checkpoint.
+        state: The training state.
+    """
+    if not args.resume or not os.path.isdir(args.output_dir):
+        print_on_rank0("Starting training from scratch")
+        return 0, 0, None, None
+
+    checkpoint_path = get_last_checkpoint(args.output_dir)
+    if not checkpoint_path:
+        print_on_rank0("No checkpoint found, starting from scratch")
+        return 0, 0, None, None
+
+    training_state_path = os.path.join(checkpoint_path, "training_state.pt")
+    if not os.path.exists(training_state_path):
+        # Could be fine-tuning from a pretrained model without training state
+        print_on_rank0(f"Training state not found at {training_state_path}")
+        return 0, 0, checkpoint_path, None
+
+    # Load training state
+    state = torch.load(training_state_path, weights_only=False, map_location="cpu")
+    start_epoch = state["epoch"]
+    global_step = state["global_step"]
+
+    print_on_rank0(f"Resumed from epoch {start_epoch}, step {global_step}")
+    return start_epoch, global_step, checkpoint_path, state
+
+
 def sanity_check(args: Namespace) -> None:
     """
     Perform sanity checks on the arguments.
@@ -336,7 +369,9 @@ def sanity_check(args: Namespace) -> None:
         ), "train_hidden_states_path should not be None for usp"
 
 
-def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
+def build_draft_model(
+    args: Namespace, draft_model_last_checkpoint: Optional[str]
+) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # Handle draft model config
     if args.draft_model_config is None:
         # Auto-generate and save config file
@@ -348,27 +383,10 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-    # Handle base ckpt, config file
-    draft_model_last_checkpoint = None
-    if args.ckpt_dir is not None:
-        if os.path.isdir(args.ckpt_dir):
-            draft_model_config = AutoDraftModelConfig.from_file(
-                os.path.join(args.ckpt_dir, "config.json")
-            )
-            draft_model_last_checkpoint = args.ckpt_dir
-            print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
-        else:
-            raise ValueError(
-                f"Provided base model dir {args.ckpt_dir} is not a valid directory."
-            )
-
-    # detecting last ckpt for draft model
-    if args.resume and os.path.isdir(args.output_dir):
-        print_on_rank0(args.output_dir)
-        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
-
     if draft_model_last_checkpoint:
+        draft_model_config = AutoDraftModelConfig.from_file(
+            os.path.join(args.ckpt_dir, "config.json")
+        )
         draft_model = AutoEagle3DraftModel.from_pretrained(
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
@@ -652,10 +670,16 @@ def main():
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
+    start_epoch, global_step, draft_model_last_checkpoint, optimizer_state = (
+        load_checkpoint(args)
+    )
+
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model = build_draft_model(args)
+    draft_model_config, draft_model = build_draft_model(
+        args, draft_model_last_checkpoint
+    )
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
@@ -664,6 +688,8 @@ def main():
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
         args, draft_model_config, processor
     )
+    # Set this attribute to show draft model config in the tracker
+    args.draft_model_config_dict = draft_model_config.__dict__
 
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
@@ -724,14 +750,15 @@ def main():
         warmup_ratio=args.warmup_ratio,
         total_steps=args.total_steps,
     )
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+        print_with_rank("Loaded optimizer state from checkpoint")
     print_with_rank("Initialized optimizer and scheduler")
 
     # ================================================
     # 6. Build tracker
     # ================================================
     tracker = build_tracker(args, parser)
-    global_step = 0
-    start_epoch = 0
     dist.barrier()
 
     last_time = time.time()
@@ -740,6 +767,9 @@ def main():
     # 7. Start training
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
+
+    # Calculate which batch index we should be at based on training state
+    target_batch_idx = global_step - (start_epoch * len(train_dataloader))
 
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
@@ -753,7 +783,11 @@ def main():
         else:
             progress_bar = train_dataloader
 
-        for data in progress_bar:
+        for batch_idx, data in enumerate(progress_bar):
+            if batch_idx < target_batch_idx:
+                continue
+
+            target_batch_idx = 0  # reset for next epoch
             global_step += 1
 
             # ================================================
@@ -789,12 +823,16 @@ def main():
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
+            # detach losses and accuracies to avoid memory leak
+            plosses_for_metrics = [p.detach() for p in plosses]
+            acces_for_metrics = [a.detach() for a in acces]
+
             # log training metrics
             if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
                 record_metrcs(
                     args,
-                    acces,
-                    plosses,
+                    acces_for_metrics,
+                    plosses_for_metrics,
                     global_step // args.draft_accumulation_steps,
                     tracker,
                     optimizer,
@@ -804,8 +842,10 @@ def main():
             if dist.get_rank() == 0:
                 time_per_step = time.time() - last_time
                 last_time = time.time()
-                avg_loss = sum(pl for pl in plosses) / len(plosses)
-                avg_acc = sum(acces) / len(acces)
+                avg_loss = sum(pl for pl in plosses_for_metrics) / len(
+                    plosses_for_metrics
+                )
+                avg_acc = sum(acces_for_metrics) / len(acces_for_metrics)
                 progress_bar.set_postfix(
                     {
                         "loss": f"{avg_loss:.2f}",

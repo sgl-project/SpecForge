@@ -197,9 +197,14 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
                 row, skipped_count = proc_fn(item)
                 if row is None:
                     continue
+                # Data starts with an assistant message, skip the entire conversation
+                if row["conversations"][0]["role"] == "assistant":
+                    total_skipped_count += len(row["conversations"])
+                    continue
                 total_skipped_count += skipped_count
             else:
                 row = item
+            row, skipped_count = proc_fn(item)
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if test_ds is not None:
@@ -209,6 +214,10 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
                 if proc_fn is not None:
                     row, skipped_count = proc_fn(item)
                     if row is None:
+                        continue
+                    # Data starts with an assistant message, skip the entire conversation
+                    if row["conversations"][0]["role"] == "assistant":
+                        total_skipped_count += len(row["conversations"])
                         continue
                     total_skipped_count += skipped_count
                 else:

@@ -130,8 +130,14 @@ class WandbTracker(Tracker):
         if self.rank == 0:
             wandb.login(key=args.wandb_key)
             wandb.init(
-                project=args.wandb_project, name=args.wandb_name, config=vars(args)
+                project=args.wandb_project,
+                name=args.wandb_name,
+                config={
+                    **vars(args),
+                    "draft_model_config_dict": args.draft_model_config_dict,
+                },
             )
+            wandb.save(args.draft_model_config)
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
