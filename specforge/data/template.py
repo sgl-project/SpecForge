@@ -196,3 +196,16 @@ TEMPLATE_REGISTRY.register(
         system_prompt=None,
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v3",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt="",
+        end_of_turn_token="",
+        bos_token="<｜begin of sentence｜>",
+        eos_token="<｜end of sentence｜>",
+        parser_type="general",
+    ),
+)
