@@ -16,7 +16,7 @@ concurrency:
 jobs:
   deploy-github-pages:
     runs-on: ubuntu-latest
-    if: github.repository == 'sgl-project/specforge'
+    if: github.repository == 'sgl-project/specforge' || github.repository == 'sleepcoo/SpecForge'
     permissions:
       contents: write
     steps:
@@ -28,17 +28,42 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: docs/spec_bundle/package-lock.json
 
       - name: Install dependencies
         run: |
-          apt-get update && apt-get install -y pandoc parallel retry
+          sudo apt-get update && sudo apt-get install -y pandoc parallel retry
           pip install -r docs/requirements.txt
+
+      - name: Build spec bundle dashboard
+        run: |
+          # Copy logos to public directory
+          cp assets/logo.png docs/spec_bundle/public/logo.png
+          cp docs/_static/imgs/specbundle-logo.png docs/spec_bundle/public/specbundle-logo.png
+          cd docs/spec_bundle
+          npm ci
+          npm run build
+          # Clean up node_modules to prevent Sphinx from processing them
+          rm -rf node_modules
+          cd ..
 
       - name: Build documentation
         run: |
           cd docs
           make compile
           make html
+          # Copy SpecBundle to root of output directory
+          mkdir -p _build/html/SpecBundle
+          cp -r spec_bundle/dist/* _build/html/SpecBundle/
+
+      - name: Add .nojekyll file
+        run: |
+          touch ./docs/_build/html/.nojekyll
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4

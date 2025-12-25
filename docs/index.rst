@@ -34,6 +34,13 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
 .. toctree::
    :maxdepth: 1
+   :caption: Community Resources
+
+   community_resources/specbundle.md
+   community_resources/dashboard.md
+
+.. toctree::
+   :maxdepth: 1
    :caption: Examples
 
    examples/llama3-eagle3-online.md
