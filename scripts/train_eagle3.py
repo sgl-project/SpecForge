@@ -617,10 +617,20 @@ def record_metrcs(
     for i in range(len(accuracies)):
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
 
+        if mode == "eval":
+            print_on_rank0(
+                f"Eval - Step {global_step}, position {i},  Acc: {accuracies[i]:.2f}"
+            )
+
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
     plosses = plosses.cpu().tolist()
     for i in range(len(plosses)):
         logdict[f"{mode}/ploss_{i}"] = plosses[i]
+
+        if mode == "eval":
+            print_on_rank0(
+                f"Eval - Step {global_step}, position {i}, pLoss: {plosses[i]}"
+            )
 
     tracker.log(logdict, step=global_step)
 
@@ -749,9 +759,7 @@ def main():
         draft_model.train()
 
         if dist.get_rank() == 0:
-            progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
-            )
+            progress_bar = tqdm(train_dataloader, desc=f"Training Epoch {epoch}")
         else:
             progress_bar = train_dataloader
 
@@ -828,9 +836,11 @@ def main():
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
+                print_on_rank0(f"Starting evaluation at step {global_step}")
+
                 if dist.get_rank() == 0:
                     eval_progress_bar = tqdm(
-                        eval_dataloader, desc=f"Evaluating Epoch {epoch}", leave=True
+                        eval_dataloader, desc=f"Evaluating Epoch {epoch}"
                     )
                 else:
                     eval_progress_bar = eval_dataloader
@@ -846,6 +856,7 @@ def main():
                         eval_plosses = [
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
                         ]
+                draft_model.train()
 
                 # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
