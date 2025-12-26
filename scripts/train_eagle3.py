@@ -309,6 +309,7 @@ def build_target_model(
         )
         return target_head, None
 
+
 def load_checkpoint(args: Namespace) -> Tuple[int, int, Optional[str], Any]:
     """
     Load checkpoint and return starting epoch and global_step
@@ -326,20 +327,21 @@ def load_checkpoint(args: Namespace) -> Tuple[int, int, Optional[str], Any]:
     if not checkpoint_path:
         print_on_rank0("No checkpoint found, starting from scratch")
         return 0, 0, None, None
-    
+
     training_state_path = os.path.join(checkpoint_path, "training_state.pt")
     if not os.path.exists(training_state_path):
         # Could be fine-tuning from a pretrained model without training state
         print_on_rank0(f"Training state not found at {training_state_path}")
         return 0, 0, checkpoint_path, None
-    
+
     # Load training state
     state = torch.load(training_state_path, weights_only=False, map_location="cpu")
     start_epoch = state["epoch"]
     global_step = state["global_step"]
-        
+
     print_on_rank0(f"Resumed from epoch {start_epoch}, step {global_step}")
     return start_epoch, global_step, checkpoint_path, state
+
 
 def sanity_check(args: Namespace) -> None:
     """
@@ -362,7 +364,9 @@ def sanity_check(args: Namespace) -> None:
         ), "train_hidden_states_path should not be None for usp"
 
 
-def build_draft_model(args: Namespace, draft_model_last_checkpoint: Optional[str]) -> Tuple[AutoDraftModelConfig, nn.Module]:
+def build_draft_model(
+    args: Namespace, draft_model_last_checkpoint: Optional[str]
+) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # Handle draft model config
     if args.draft_model_config is None:
         # Auto-generate and save config file
@@ -658,12 +662,16 @@ def main():
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
-    start_epoch, global_step, draft_model_last_checkpoint, optimizer_state = load_checkpoint(args)
+    start_epoch, global_step, draft_model_last_checkpoint, optimizer_state = (
+        load_checkpoint(args)
+    )
 
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model = build_draft_model(args, draft_model_last_checkpoint)
+    draft_model_config, draft_model = build_draft_model(
+        args, draft_model_last_checkpoint
+    )
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
@@ -771,7 +779,7 @@ def main():
             if batch_idx < target_batch_idx:
                 continue
 
-            target_batch_idx = 0 # reset for next epoch
+            target_batch_idx = 0  # reset for next epoch
             global_step += 1
 
             # ================================================
@@ -826,7 +834,9 @@ def main():
             if dist.get_rank() == 0:
                 time_per_step = time.time() - last_time
                 last_time = time.time()
-                avg_loss = sum(pl for pl in plosses_for_metrics) / len(plosses_for_metrics)
+                avg_loss = sum(pl for pl in plosses_for_metrics) / len(
+                    plosses_for_metrics
+                )
                 avg_acc = sum(acces_for_metrics) / len(acces_for_metrics)
                 progress_bar.set_postfix(
                     {
