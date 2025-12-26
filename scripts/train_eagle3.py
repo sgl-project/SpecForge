@@ -11,12 +11,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from accelerate.utils import set_seed
 from datasets import load_dataset
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    StateDictOptions,
-)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
