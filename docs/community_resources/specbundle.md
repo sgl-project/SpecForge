@@ -48,8 +48,8 @@ We list the models released by the SpecForge and several industrial partners bel
 |---------------|--------------------|--------------------|
 | meta-llama/Llama-3.1-8B-Instruct | [🤗 Model](https://huggingface.co/lmsys/SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge) | [🤗 Dataset](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct) |
 | meta-llama/Llama-3.3-70B-Instruct | [🤗 Model](https://huggingface.co/lmsys/SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge) | [🤗 Dataset](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.3-70B-Instruct) |
-| meta-llama/Llama-4-Scout-17B-16E-Instruct | [🤗 Model](https://huggingface.co/lmsys/SGLang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-SpecForge) | [🤗 Dataset](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-4-Scout-17B-16E-Instruct/tree/main) |
-| meta-llama/Llama-4-Maverick-17B-128E-Instruct | [🤗 Model *](https://huggingface.co/lmsys/sglang-EAGLE3-Llama-4-Maverick-17B-128E-Instruct-v1) | [🤗 Dataset](frankleeeee/PerfectBlend-Regenerated-Llama-4-Maverick-17B-128E-Instruct) |
+| meta-llama/Llama-4-Scout-17B-16E-Instruct | [🤗 Model](https://huggingface.co/lmsys/SGLang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-SpecForge) | [🤗 Dataset](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-4-Scout-17B-16E-Instruct) |
+| meta-llama/Llama-4-Maverick-17B-128E-Instruct | [🤗 Model *](https://huggingface.co/lmsys/sglang-EAGLE3-Llama-4-Maverick-17B-128E-Instruct-v1) | [🤗 Dataset](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-4-Maverick-17B-128E-Instruct) |
 
 ### Qwen Series
 
