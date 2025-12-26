@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 import re
 from contextlib import contextmanager
@@ -8,8 +7,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor, Shard, distribute_tensor
 from transformers import AutoConfig, PretrainedConfig
-
-logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -51,9 +48,9 @@ def load_config_from_file(config_path: str):
 
 def print_with_rank(message):
     if dist.is_available() and dist.is_initialized():
-        logger.info(f"rank {dist.get_rank()}: {message}")
+        print(f"rank {dist.get_rank()}: {message}")
     else:
-        logger.info(f"non-distributed: {message}")
+        print(f"non-distributed: {message}")
 
 
 def print_args_with_dots(args):
@@ -73,7 +70,7 @@ def print_args_with_dots(args):
 
 def print_on_rank0(message):
     if dist.get_rank() == 0:
-        logger.info(message)
+        print(message)
 
 
 def get_last_checkpoint(folder, prefix="epoch"):
