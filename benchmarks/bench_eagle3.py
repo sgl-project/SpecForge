@@ -51,11 +51,7 @@ from typing import List
 import requests
 from benchmarker import BENCHMARKS
 from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    kill_process_tree,
-    popen_launch_server,
-)
+from sglang.test.test_utils import kill_process_tree, popen_launch_server
 from sglang.utils import wait_for_server
 
 
@@ -69,6 +65,7 @@ def parse_args():
     benchmark_group.add_argument(
         "--skip-launch-server", action="store_true", default=False
     )
+    benchmark_group.add_argument("--timeout-for-server-launch", type=int, default=600)
     benchmark_group.add_argument("--num-prompts", type=int, default=80)
     benchmark_group.add_argument("--output-dir", type=str, default="./results")
     benchmark_group.add_argument(
@@ -108,6 +105,7 @@ def launch_sglang_server(
     steps: int,
     topk: int,
     num_draft_tokens: int,
+    timeout: int,
 ):
     """
     This function launches the SGLang server with the given server arguments.
@@ -163,7 +161,7 @@ def launch_sglang_server(
     process = popen_launch_server(
         server_args.model_path,
         base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        timeout=timeout,
         other_args=sglang_args,
         env={
             "SGLANG_RECORD_STEP_TIME": "1",
@@ -240,11 +238,18 @@ def main():
         # we itearate over each config from args
         for batch_size, steps, topk, num_draft_tokens in configs:
             process = launch_sglang_server(
-                server_args, base_url, batch_size, steps, topk, num_draft_tokens
+                server_args,
+                base_url,
+                batch_size,
+                steps,
+                topk,
+                num_draft_tokens,
+                args.timeout_for_server_launch,
             )
             wait_for_server(base_url)
             run_benchmarks(batch_size, steps, topk, num_draft_tokens)
             kill_process_tree(process.pid)
+            process.wait()
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
