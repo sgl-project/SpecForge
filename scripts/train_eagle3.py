@@ -12,8 +12,11 @@ import torch.nn as nn
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
-from torch.optim import Optimizer
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    StateDictOptions,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
@@ -484,41 +487,44 @@ def save_checkpoints(
     epoch: int,
     step: int,
     eagle3_model: nn.Module,
-    optimizer: Optimizer,
+    optimizer: BF16Optimizer,
 ):
     epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
         os.makedirs(epoch_output_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
-        model_state_dict = eagle3_model.state_dict()
-        state_to_save = {
-            "epoch": epoch,
-            "global_step": step,
-            "args": args,
-        }
-        state_to_save.update(optimizer.state_dict())
-        draft_model_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
-        }
+    model_state_dict = get_model_state_dict(
+        eagle3_model,
+        options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+    )
+    state_to_save = {
+        "epoch": epoch,
+        "global_step": step,
+        "args": args,
+    }
+    state_to_save.update(optimizer.state_dict())
+    draft_model_state_dict = {
+        k.replace("draft_model.", ""): v
+        for k, v in model_state_dict.items()
+        if "draft_model." in k and "embed" not in k.lower()
+    }
 
-        if dist.get_rank() == 0:
-            torch.save(
-                state_to_save,
-                os.path.join(epoch_output_dir, "training_state.pt"),
-            )
-            print_on_rank0(
-                f"Saved full training state to {epoch_output_dir}/training_state.pt"
-            )
-            eagle3_model.draft_model.save_pretrained(
-                epoch_output_dir,
-                state_dict=draft_model_state_dict,
-            )
-            print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-        dist.barrier()
+    if dist.get_rank() == 0:
+        torch.save(
+            state_to_save,
+            os.path.join(epoch_output_dir, "training_state.pt"),
+        )
+        print_on_rank0(
+            f"Saved full training state to {epoch_output_dir}/training_state.pt"
+        )
+        eagle3_model.draft_model.save_pretrained(
+            epoch_output_dir,
+            state_dict=draft_model_state_dict,
+        )
+        print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+
+    dist.barrier()
 
 
 def run_forward(
@@ -572,7 +578,10 @@ def run_forward(
 
 
 def run_backward_and_update(
-    args: Namespace, plosses: List[torch.Tensor], optimizer: Optimizer, global_step: int
+    args: Namespace,
+    plosses: List[torch.Tensor],
+    optimizer: BF16Optimizer,
+    global_step: int,
 ) -> None:
     ploss_weight = [0.8**i for i in range(len(plosses))]
     ploss = (
@@ -591,7 +600,7 @@ def record_metrcs(
     plosses: List[torch.Tensor],
     global_step: int,
     tracker: Tracker,
-    optimizer: Optional[Optimizer] = None,
+    optimizer: Optional[BF16Optimizer] = None,
     mode: str = "train",
 ) -> None:
     logdict = {}
@@ -607,17 +616,12 @@ def record_metrcs(
     accuracies = accuracies.cpu().tolist()
     for i in range(len(accuracies)):
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
-        print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
-        )
 
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
     plosses = plosses.cpu().tolist()
     for i in range(len(plosses)):
         logdict[f"{mode}/ploss_{i}"] = plosses[i]
-        print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
-        )
+
     tracker.log(logdict, step=global_step)
 
 
@@ -824,7 +828,14 @@ def main():
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
-                for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
+                if dist.get_rank() == 0:
+                    eval_progress_bar = tqdm(
+                        eval_dataloader, desc=f"Evaluating Epoch {epoch}", leave=True
+                    )
+                else:
+                    eval_progress_bar = eval_dataloader
+
+                for data in eval_progress_bar:
                     with torch.no_grad():
                         plosses, acces = run_forward(
                             args, eagle3_model, data, target_model, is_online
