@@ -39,6 +39,10 @@ def parse_args():
             "sharegpt",
             "eaglechat",
             "perfectblend",
+            "perfectblend-llama3.1-8b-instruct",
+            "perfectblend-llama3.3-70b-instruct",
+            "perfectblend-llama4-scout-instruct",
+            "perfectblend-llama4-maverick-instruct",
             "magpie-qwen2.5-pro-1m-v0.1",
             "sharegpt4v",
             "allava4v",
@@ -189,20 +193,26 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
     total_skipped_count = 0
     with open(train_output_jsonl_path, "w") as f:
         for item in tqdm(train_ds, desc=f"Processing {dataset_name} dataset"):
-            row, skipped_count = proc_fn(item)
-            if row is None:
-                continue
-            total_skipped_count += skipped_count
+            if proc_fn is not None:
+                row, skipped_count = proc_fn(item)
+                if row is None:
+                    continue
+                total_skipped_count += skipped_count
+            else:
+                row = item
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if test_ds is not None:
         test_output_jsonl_path = output_path.joinpath(f"{dataset_name}_test.jsonl")
         with open(test_output_jsonl_path, "w") as f:
             for item in tqdm(test_ds, desc=f"Processing {dataset_name} test dataset"):
-                row, skipped_count = proc_fn(item)
-                if row is None:
-                    continue
-                total_skipped_count += skipped_count
+                if proc_fn is not None:
+                    row, skipped_count = proc_fn(item)
+                    if row is None:
+                        continue
+                    total_skipped_count += skipped_count
+                else:
+                    row = item
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if total_skipped_count > 0:
@@ -252,6 +262,30 @@ def main():
         ds = load_dataset("mlabonne/open-perfectblend")["train"]
         ds = ds.map(add_index, with_indices=True)
         proc_fn = process_sharegpt_row
+    elif args.dataset == "perfectblend-llama3.1-8b-instruct":
+        ds = load_dataset("frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct")[
+            "train"
+        ]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
+    elif args.dataset == "perfectblend-llama3.3-70b-instruct":
+        ds = load_dataset(
+            "frankleeeee/PerfectBlend-Regenerated-Llama-3.3-70B-Instruct"
+        )["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
+    elif args.dataset == "perfectblend-llama4-scout-instruct":
+        ds = load_dataset(
+            "frankleeeee/PerfectBlend-Regenerated-Llama-4-Scout-17B-16E-Instruct"
+        )["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
+    elif args.dataset == "perfectblend-llama4-maverick-instruct":
+        ds = load_dataset(
+            "frankleeeee/PerfectBlend-Regenerated-Llama-4-Maverick-17B-128E-Instruct"
+        )["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
     elif args.dataset == "magpie-qwen2.5-pro-1m-v0.1":
         ds = load_dataset("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")["train"]
         ds = ds.rename_column("uuid", "id")
