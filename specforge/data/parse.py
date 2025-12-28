@@ -86,7 +86,14 @@ class GeneralParser(Parser):
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
-        assistant_pattern = f"{re.escape(self.assistant_message_separator)}(.*?(?:{re.escape(self.chat_template.end_of_turn_token)}|$))"
+        sep = re.escape(self.assistant_message_separator)
+        eos = re.escape(self.chat_template.end_of_turn_token)
+
+        if "<role>" in self.assistant_message_separator:
+            assistant_pattern = f"{sep}(.*?(?={eos}|<role|$))"
+        else:
+            assistant_pattern = f"{sep}(.*?(?:{eos}|$))"
+
         try:
             # use fast tokenizer's offset mapping to create loss mask
             encoding = self.tokenizer(
