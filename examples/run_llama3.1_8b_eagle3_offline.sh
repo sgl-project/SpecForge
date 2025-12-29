@@ -8,22 +8,22 @@ BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    scripts/prepare_hidden_states.py --num-samples 10 --num-samples 10 \
-    --target-model-path nreHieW/Llama-3.1-8B-Instruct \
+    scripts/prepare_hidden_states.py \
+    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --enable-aux-hidden-states \
     --data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --output-path $ROOT_DIR/cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
     --chat-template llama3 \
     --max-length 4096 \
     --tp-size $TP_SIZE \
-    --batch-size 5
+    --batch-size 32
 
 # train eagle3 offline
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    $ROOT_DIR/scripts/train_eagle3.py --max-num-steps 2 --max-num-steps 2 \
-    --target-model-path nreHieW/Llama-3.1-8B-Instruct \
+    $ROOT_DIR/scripts/train_eagle3.py \
+    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --train-hidden-states-path $ROOT_DIR/cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
