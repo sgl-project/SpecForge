@@ -13,6 +13,7 @@ from tests.utils import get_available_port
 
 def run_column_parallel_linear(rank, world_size, port):
     os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
@@ -99,6 +100,7 @@ def run_column_parallel_linear(rank, world_size, port):
 
 def run_row_parallel_linear(rank, world_size, port):
     os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
