@@ -18,7 +18,7 @@ torchrun \
     --output-path $ROOT_DIR/cache/hidden_states/perfect-blend-ling-flash-2.0 \
     --chat-template ling-flash-2.0 \
     --max-length 2048 \
-    --tp-size 8 \
+    --tp-size $TP_SIZE \
     --batch-size 4 \
     --sglang-mem-fraction-static 0.75 \
     --trust-remote-code
