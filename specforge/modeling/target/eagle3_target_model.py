@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -9,6 +8,7 @@ import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -22,7 +22,6 @@ from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
-from .target_head import TargetHead
 
 
 @dataclass
@@ -59,52 +58,17 @@ class Eagle3TargetModel(ABC):
         """
         Initialize the target model backend from a pretrained model path.
         """
-        pass
 
-    @torch.no_grad()
+    @abstractmethod
     def generate_eagle3_data(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> Eagle3TargetOutput:
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-
-        # extract the aux hidden states
-        # output_hidden_states = True will return the embedding output as well
-        # so we have an offset of 1
-        offset = 1
-        low_aux_layer = self.aux_hidden_states_layers[0] + offset
-        mid_aux_layer = self.aux_hidden_states_layers[1] + offset
-        last_aux_layer = self.aux_hidden_states_layers[2] + offset
-
-        hidden_states0 = outputs.hidden_states[low_aux_layer]
-        hidden_states1 = outputs.hidden_states[mid_aux_layer]
-        hidden_states2 = outputs.hidden_states[last_aux_layer]
-
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
-
-        # apply pading
-        target = outputs.logits
-        target = padding(target, left=False)
-        input_ids = padding(input_ids, left=False)
-        loss_mask = loss_mask[..., None]
-        loss_mask = loss_mask.to(target.device)
-
-        return Eagle3TargetOutput(
-            hidden_states=hidden_states,
-            target=target,
-            loss_mask=loss_mask,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        """
+        Generate the eagle3 data from the target model.
+        """
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -170,6 +134,110 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         )
         return cls(target_model)
 
+    def _get_transformer_layers(self):
+        """
+        Helper to find the module list containing the transformer layers.
+        Adapts to common architectures (Llama, Qwen, Mistral, OPT, etc.)
+        """
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            return self.model.model.layers
+        elif hasattr(self.model, "layers"):
+            return self.model.layers
+        elif hasattr(self.model, "transformer") and hasattr(
+            self.model.transformer, "h"
+        ):
+            return self.model.transformer.h
+        else:
+            raise ValueError(
+                "Could not locate transformer layers in the model architecture to register hooks."
+            )
+
+    @torch.no_grad()
+    def generate_eagle3_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> Eagle3TargetOutput:
+        """
+        Optimized HF backend:
+        Instead of returning all hidden states (memory heavy), we use forward hooks
+        to capture only the specific layers required by Eagle3.
+        """
+        captured_states = {}
+        handles = []
+
+        def get_hook(layer_idx):
+            def hook(module, input, output):
+                # HF outputs for layers are usually tuples (hidden_states, present_key_value, ...)
+                # We only need the hidden_states (first element)
+                if isinstance(output, tuple):
+                    hidden = output[0]
+                else:
+                    hidden = output
+                captured_states[layer_idx] = hidden
+
+            return hook
+
+        # Locate the transformer layers ModuleList
+        layers = self._get_transformer_layers()
+
+        target_indices = self.aux_hidden_states_layers
+
+        # Register hooks
+        for idx in target_indices:
+            # Ensure index is within bounds
+            if 0 <= idx < len(layers):
+                handles.append(layers[idx].register_forward_hook(get_hook(idx)))
+            else:
+                raise ValueError(
+                    f"Layer index {idx} out of bounds for model with {len(layers)} layers."
+                )
+
+        try:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                output_attentions=False,
+                output_router_logits=False,
+                use_cache=False,
+            )
+            target = outputs.logits
+        finally:
+            # Always remove hooks to prevent memory leaks or side effects on subsequent calls
+            for handle in handles:
+                handle.remove()
+
+        # Verify we captured everything
+        if len(captured_states) != 3:
+            raise RuntimeError(
+                f"Expected to capture 3 layers, but captured {len(captured_states)}"
+            )
+
+        # Extract in the correct order
+        hidden_states0 = captured_states[target_indices[0]]
+        hidden_states1 = captured_states[target_indices[1]]
+        hidden_states2 = captured_states[target_indices[2]]
+
+        hidden_states = torch.cat(
+            (hidden_states0, hidden_states1, hidden_states2), dim=-1
+        )
+
+        # apply pading
+        target = outputs.logits
+        target = padding(target, left=False)
+        input_ids = padding(input_ids, left=False)
+        loss_mask = loss_mask[..., None].to(target.device)
+
+        return Eagle3TargetOutput(
+            hidden_states=hidden_states,
+            target=target,
+            loss_mask=loss_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
 
 class SGLangEagle3TargetModel(Eagle3TargetModel):
 
@@ -193,21 +261,23 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             trust_remote_code=trust_remote_code,
             dtype=torch_dtype,
             enable_return_hidden_states=True,
-            disable_cuda_graph=True,
-            enable_torch_compile=True,
+            disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
             tp_size=tp_size,
             pp_size=1,
-            attention_backend="flashinfer",
+            **kwargs,
         )
+
+        tp_rank = dist.get_rank(get_tp_group())
+        moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
             model_config=model_config,
-            mem_fraction_static=0.4,
+            mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=torch.cuda.current_device(),
             tp_rank=dist.get_rank(get_tp_group()),
             tp_size=server_args.tp_size,
-            moe_ep_rank=0,
-            moe_ep_size=1,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
             pp_rank=0,
             pp_size=1,
             server_args=server_args,
@@ -237,11 +307,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 module.return_last_hidden_states = return_last_hidden_states
                 module.return_logits = return_logits
 
-        tree_cache = RadixCache(
-            None,
+        cache_params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
             page_size=self.model_runner.server_args.page_size,
         )
+        tree_cache = RadixCache(cache_params)
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
@@ -454,6 +526,38 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
             **kwargs,
         )
         return cls(target_model)
+
+    @torch.no_grad()
+    def generate_eagle3_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> Eagle3TargetOutput:
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            layers_to_output_hidden_states=self.aux_hidden_states_layers,
+            use_cache=False,
+        )
+
+        # For custom backends, the model implementation is responsible for only
+        # returning the requested layers in `outputs.hidden_states`.
+        hidden_states = torch.cat(outputs.hidden_states, dim=-1)
+
+        target = outputs.logits
+        target = padding(target, left=False)
+        input_ids = padding(input_ids, left=False)
+        loss_mask = loss_mask[..., None].to(target.device)
+
+        return Eagle3TargetOutput(
+            hidden_states=hidden_states,
+            target=target,
+            loss_mask=loss_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
 
 
 def get_eagle3_target_model(

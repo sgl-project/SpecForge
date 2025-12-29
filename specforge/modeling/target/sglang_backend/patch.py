@@ -1,6 +1,4 @@
 import logging
-import os
-from datetime import timedelta
 from typing import Optional
 
 import sglang.srt.distributed.parallel_state as parallel_state
@@ -53,7 +51,7 @@ def init_distributed_environment(
         use_pynccl=False,
         use_pymscclpp=False,
         use_custom_allreduce=False,
-        use_torch_symm_mem=False,
+        use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
@@ -135,7 +133,6 @@ def initialize_model_parallel(
         torch_compile=torch_compile,
     )
 
-    parallel_state._MOE_TP = parallel_state._TP
     if duplicate_tp_group:
         assert (
             parallel_state._PDMUX_PREFILL_TP_GROUP is None
@@ -178,6 +175,27 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="moe_ep",
     )
+
+    assert (
+        parallel_state._MOE_TP is None
+    ), "moe tensor model parallel group is already initialized"
+    if moe_ep_size == 1:
+        parallel_state._MOE_TP = parallel_state._TP
+    else:
+        group_ranks = []
+        for i in range(num_tensor_model_parallel_groups):
+            for j in range(moe_ep_size):
+                st = i * tensor_model_parallel_size + j * moe_tp_size
+                en = i * tensor_model_parallel_size + (j + 1) * moe_tp_size
+                ranks = list(range(st, en))
+                group_ranks.append(ranks)
+        parallel_state._MOE_TP = init_model_parallel_group(
+            group_ranks,
+            parallel_state._WORLD.local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="moe_tp",
+        )
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = (
@@ -261,7 +279,7 @@ def initialize_dp_attention(
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_pymscclpp=False,
         use_custom_allreduce=False,
-        use_torch_symm_mem=False,
+        use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,

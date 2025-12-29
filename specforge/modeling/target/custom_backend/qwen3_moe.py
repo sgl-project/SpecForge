@@ -78,14 +78,18 @@ class Qwen3MoeAttention(nn.Module):
         # Calculate head distribution for TP
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
-        self.num_heads = self.total_num_heads // self.tp_size
+        self.num_heads = (
+            self.total_num_heads // self.tp_size
+        )  # this is the number heads per rank
 
         # Handle KV head replication when tp_size > total_num_kv_heads
         if self.tp_size > self.total_num_kv_heads:
             # In replication mode, each rank gets 1 KV head (replicated across groups)
             self.num_kv_heads = 1
             self.num_kv_head_replicas = self.tp_size // self.total_num_kv_heads
-            self.num_key_value_groups = self.num_heads // self.num_kv_heads
+            self.num_key_value_groups = (
+                self.num_heads // self.num_kv_heads
+            )  # this is size for expanding kv for gqa
             self.kv_head_replicas = True
         else:
             self.num_kv_heads = self.total_num_kv_heads
@@ -103,18 +107,23 @@ class Qwen3MoeAttention(nn.Module):
             self.num_kv_heads * self.head_dim,
             bias=config.attention_bias,
             kv_head_replicas=self.kv_head_replicas,
+            kv_head_idx=self.tp_rank // self.num_kv_head_replicas,
+            total_num_kv_heads=config.num_key_value_heads,
         )
         self.v_proj = ColumnParallelLinear(
             config.hidden_size,
             self.num_kv_heads * self.head_dim,
             bias=config.attention_bias,
             kv_head_replicas=self.kv_head_replicas,
+            kv_head_idx=self.tp_rank // self.num_kv_head_replicas,
+            total_num_kv_heads=config.num_key_value_heads,
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
         )
+
         self.q_norm = Qwen3MoeRMSNorm(
             self.head_dim, eps=config.rms_norm_eps
         )  # unlike olmo, only on the head dim!
@@ -193,9 +202,10 @@ class Qwen3MoeMLP(nn.Module):
 
         # Add TP support
         self.tp_group = get_tp_group()
-
         self.gate_proj = ColumnParallelLinear(
-            self.hidden_size, self.intermediate_size, bias=False
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
         )
         self.up_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=False
@@ -543,6 +553,9 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
+        layers_to_output_hidden_states = flash_attn_kwargs.pop(
+            "layers_to_output_hidden_states", None
+        )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -599,10 +612,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
-        for decoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
+        for idx, decoder_layer in enumerate(self.layers):
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -618,6 +628,13 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            if output_hidden_states:
+                if (
+                    layers_to_output_hidden_states is None
+                    or idx in layers_to_output_hidden_states
+                ):
+                    all_hidden_states += (hidden_states,)
+
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -625,10 +642,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 all_router_logits += (layer_outputs[-1],)
 
         hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
 
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,

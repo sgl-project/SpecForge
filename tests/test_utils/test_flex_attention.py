@@ -1,16 +1,13 @@
-import sys
 import unittest
 
 import torch
 import torch._dynamo as dynamo
-import torch.nn as nn
 from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
-    create_block_mask,
     generate_eagle3_mask,
 )
 from specforge.modeling.draft.llama3_eagle import (

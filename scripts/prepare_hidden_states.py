@@ -19,6 +19,17 @@ torchrun --nproc_per_node=8 \
     --batch-size 32 \
     --num-samples 1000 \
     --output-path ./cache/hidden_states
+
+For pre-formatted data (with chat template already applied), add --is-preformatted:
+torchrun --nproc_per_node=8 \
+    scripts/prepare_hidden_states.py \
+    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --enable-aux-hidden-states \
+    --data-path ./cache/dataset/preformatted_data.jsonl \
+    --output-path ./cache/hidden_states \
+    --chat-template llama3 \
+    --is-preformatted \
+    --max-length 2048
 """
 
 import argparse
@@ -36,6 +47,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
+from specforge.args import SGLangBackendArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
@@ -58,48 +70,71 @@ class DataPoint:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target-model-path", type=str, required=True)
-    parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--cache-dir", type=str, default="./cache")
-    parser.add_argument("--output-path", type=str, default=None)
-    parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--chat-template", type=str, default="llama3")
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument(
+
+    # model-related arguments
+    model_group = parser.add_argument_group("model")
+    model_group.add_argument("--target-model-path", type=str, required=True)
+    model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
-    parser.add_argument("--num-samples", type=int, default=None)
-    parser.add_argument("--enable-aux-hidden-states", action="store_true")
-    parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
-    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
-    parser.add_argument(
+    model_group.add_argument("--enable-aux-hidden-states", action="store_true")
+    model_group.add_argument("--aux-hidden-states-layers", type=str, default=None)
+
+    data_group = parser.add_argument_group("data")
+    data_group.add_argument("--data-path", type=str, required=True)
+    data_group.add_argument("--max-length", type=int, default=2048)
+    data_group.add_argument("--chat-template", type=str, default="llama3")
+    data_group.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
+    )
+    data_group.add_argument("--num-samples", type=int, default=None)
+    data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
+
+    inference_group = parser.add_argument_group("inference")
+    inference_group.add_argument("--tp-size", type=int, default=1)
+    inference_group.add_argument("--batch-size", type=int, default=32)
+
+    others_group = parser.add_argument_group("others")
+    others_group.add_argument("--cache-dir", type=str, default="./cache")
+    others_group.add_argument("--output-path", type=str, default=None)
+    others_group.add_argument(
+        "--model-download-dir",
+        type=str,
+        default=None,
+        help="The directory to download the target model to",
+    )
+    others_group.add_argument(
         "--dist-timeout",
         type=int,
         default=2000,
         help="Timeout for collective communication in minutes, default to 2000 so that it does not go timeout",
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--num-io-threads",
         type=int,
         default=4,
         help="Number of threads for async I/O operations",
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--num-workers", type=int, default=4, help="Number of workers for DataLoader"
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--io-queue-size",
         type=int,
         default=50,
         help="Max number of pending I/O futures.",
     )
-    parser.add_argument(
+    others_group.add_argument(
         "--file-group-size",
         type=int,
         default=2000,
         help="Number of files per subdirectory.",
     )
+
+    sglang_group = parser.add_argument_group("sglang")
+    SGLangBackendArgs.add_args(sglang_group)
     return parser.parse_args()
 
 
@@ -119,20 +154,29 @@ def build_target_model(
         target_model = (
             Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=(
+                    model_config.dtype
+                    if hasattr(model_config, "dtype")
+                    else model_config.torch_dtype
+                ),
             )
             .eval()
             .cuda()
         )
     else:
+        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
         target_model = get_eagle3_target_model(
             pretrained_model_name_or_path=args.target_model_path,
             backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
-            torch_dtype=torch.bfloat16,
+            torch_dtype=(
+                model_config.dtype
+                if hasattr(model_config, "dtype")
+                else model_config.torch_dtype
+            ),
             device="cuda",
-            cache_dir=args.cache_dir,
+            cache_dir=args.model_download_dir,
+            **target_model_kwargs,
         )
-
     # Set auxiliary hidden states layers if specified
     target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
 
@@ -530,7 +574,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=True
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}"
+    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     # Preprocess on complete, un-sharded dataset
@@ -544,6 +588,7 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
             is_vlm=args.is_vlm,
+            is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )

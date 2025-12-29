@@ -24,6 +24,7 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
+from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
@@ -33,6 +34,7 @@ from specforge.data import (
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
+    get_draft_dp_group,
     get_tp_group,
     init_distributed,
 )
@@ -46,6 +48,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
+    print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
@@ -59,169 +62,160 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
 
     # add model-related arguments
-    parser.add_argument("--target-model-path", type=str, required=True)
-    parser.add_argument(
+    model_group = parser.add_argument_group("model")
+    model_group.add_argument("--target-model-path", type=str, required=True)
+    model_group.add_argument(
         "--draft-model-config",
         type=str,
         required=False,
         help="Draft model config path. If not provided, will auto-generate from target model.",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--embedding-key",
         type=str,
         default="model.embed_tokens.weight",
         help="The key of the embedding weight to load from the target model",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--lm-head-key",
         type=str,
         default="lm_head.weight",
-        help="The key of the lm head weight to load from the target model",
+        help="The key of the lm head weight to load from the target model, this is only required for offline training",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
-
-    # dataset arguments
-    parser.add_argument("--train-data-path", type=str, required=True)
-    parser.add_argument("--train-hidden-states-path", type=str, default=None)
-    parser.add_argument("--eval-hidden-states-path", type=str, default=None)
-    parser.add_argument("--eval-data-path", type=str, default=None)
-
-    # training hyper params
-    parser.add_argument("--num-epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--warmup-ratio", type=float, default=0.015)
-    parser.add_argument(
-        "--total-steps",
-        type=int,
-        default=None,
-        help="Total training steps. If not provided, will be calculated as num_epochs * steps_per_epoch",
-    )
-    parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument(
-        "--log-interval",
-        type=int,
-        default=50,
-        help="Log training metrics every N steps",
-    )
-    parser.add_argument(
-        "--ttt-length",
-        type=int,
-        default=7,
-        help="The length for Test-Time Training (TTT).",
-    )
-
-    # data processing type
-    parser.add_argument("--chat-template", type=str, default="llama3")
-    parser.add_argument(
-        "--is-preformatted",
-        action="store_true",
-        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
-    )
-
-    # distributed training
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--dp-size", type=int, default=1)
-    parser.add_argument("--draft-accumulation-steps", type=int, default=1)
-
-    # other args
-    parser.add_argument("--cache-key", type=str, default=None)
-    parser.add_argument("--cache-dir", type=str, default="./cache")
-    parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument(
-        "--ckpt-dir",
-        type=str,
-        default=None,
-        help="directory includes the checkpoint to start training with",
-    )
-    parser.add_argument("--eval-interval", type=int, default=5000)
-    parser.add_argument("--save-interval", type=int, default=5000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--dist-timeout",
-        type=int,
-        default=20,
-        help="Timeout for collective communication in minutes",
-    )
-    parser.add_argument("--attention-backend", type=str, default="flex_attention")
-
-    # resume
-    parser.add_argument("--resume", action="store_true")
-
-    parser.add_argument(
-        "--report-to",
-        type=str,
-        default="none",
-        choices=["wandb", "tensorboard", "swanlab", "mlflow", "none"],
-        help="The integration to report results and logs to.",
-    )
-    # wandb-specific args
-    parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--wandb-name", type=str, default=None)
-    parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
-    # swanlab-specific args
-    parser.add_argument(
-        "--swanlab-project",
-        type=str,
-        default=None,
-        help="The project name for swanlab.",
-    )
-    parser.add_argument(
-        "--swanlab-name",
-        type=str,
-        default=None,
-        help="The experiment name for swanlab.",
-    )
-    parser.add_argument(
-        "--swanlab-key",
-        type=str,
-        default=None,
-        help="The API key for swanlab non-interactive login.",
-    )
-    # mlflow-specific args
-    parser.add_argument(
-        "--mlflow-tracking-uri",
-        type=str,
-        default=None,
-        help="The MLflow tracking URI. If not set, uses MLFLOW_TRACKING_URI environment variable or defaults to local './mlruns'.",
-    )
-    parser.add_argument(
-        "--mlflow-experiment-name",
-        type=str,
-        default=None,
-        help="The MLflow experiment name. If not set, uses MLFLOW_EXPERIMENT_NAME environment variable.",
-    )
-    parser.add_argument(
-        "--mlflow-run-name",
-        type=str,
-        default=None,
-        help="The MLflow run name. If not set, MLflow will auto-generate one.",
-    )
-
-    # vlm related args
-    parser.add_argument(
-        "--min-pixels", type=int, default=50176
-    )  # 64*28*28 for qwen2.5-vl
-    parser.add_argument(
-        "--max-pixels", type=int, default=802816
-    )  # 1024*28*28 for qwen2.5-vl
-
-    parser.add_argument("--build-dataset-num-proc", type=int, default=8)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--profile-start-step", type=int, default=30)
-    parser.add_argument("--profile-num-steps", type=int, default=4)
-    parser.add_argument("--profile-record-shapes", action="store_true")
-    parser.add_argument(
+    model_group.add_argument(
         "--target-model-backend",
         type=str,
         default="sglang",
         choices=["sglang", "hf", "custom"],
         help="The backend of the target model",
     )
+
+    # dataset arguments
+    dataset_group = parser.add_argument_group("dataset")
+    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
+    dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
+    dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument("--chat-template", type=str, default="llama3")
+    dataset_group.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
+    )
+    dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
+    dataset_group.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=4,
+        help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+    )
+    # training hyper params
+    training_group = parser.add_argument_group("training")
+    training_group.add_argument("--num-epochs", type=int, default=10)
+    training_group.add_argument(
+        "--max-num-steps",
+        type=int,
+        default=None,
+        help="The maximum number of steps to train. If not provided, will be calculated as num_epochs * steps_per_epoch",
+    )
+    training_group.add_argument("--batch-size", type=int, default=1)
+    training_group.add_argument("--learning-rate", type=float, default=1e-4)
+    training_group.add_argument("--max-length", type=int, default=2048)
+    training_group.add_argument("--warmup-ratio", type=float, default=0.015)
+    training_group.add_argument(
+        "--total-steps",
+        type=int,
+        default=None,
+        help="Total training steps. If not provided, will be calculated as num_epochs * steps_per_epoch",
+    )
+    training_group.add_argument("--max-grad-norm", type=float, default=0.5)
+    training_group.add_argument(
+        "--ttt-length",
+        type=int,
+        default=7,
+        help="The length for Test-Time Training (TTT).",
+    )
+    training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--ckpt-dir",
+        type=str,
+        default=None,
+        help="directory includes the checkpoint to start training with",
+    )
+    training_group.add_argument("--eval-interval", type=int, default=5000)
+    training_group.add_argument("--save-interval", type=int, default=5000)
+    training_group.add_argument(
+        "--log-interval",
+        type=int,
+        default=50,
+        help="Log training metrics every N steps",
+    )
+    training_group.add_argument("--seed", type=int, default=0)
+    training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+
+    # data processing type
+    optimization_group = parser.add_argument_group("optimization")
+    optimization_group.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="The size of the tensor parallel for the target model",
+    )
+    # distributed training
+    optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
+    optimization_group.add_argument("--sp-ring-size", type=int, default=1)
+    optimization_group.add_argument(
+        "--attention-backend",
+        type=str,
+        default="flex_attention",
+        help="The attention backend for the draft model",
+    )
+
+    # other args
+    other_group = parser.add_argument_group("others")
+    other_group.add_argument("--cache-key", type=str, default=None)
+    other_group.add_argument("--cache-dir", type=str, default="./cache")
+    other_group.add_argument("--output-dir", type=str, required=True)
+    other_group.add_argument("--verbose", action="store_true")
+    other_group.add_argument(
+        "--dist-timeout",
+        type=int,
+        default=20,
+        help="Timeout for collective communication in minutes",
+    )
+    other_group.add_argument(
+        "--model-download-dir",
+        type=str,
+        default=None,
+        help="The directory to download the target model to",
+    )
+
+    # vlm related args
+    vlm_group = parser.add_argument_group("vlm")
+    vlm_group.add_argument(
+        "--min-pixels", type=int, default=50176
+    )  # 64*28*28 for qwen2.5-vl
+    vlm_group.add_argument(
+        "--max-pixels", type=int, default=802816
+    )  # 1024*28*28 for qwen2.5-vl
+
+    # profiling related args
+    profiling_group = parser.add_argument_group("profiling")
+    profiling_group.add_argument("--profile", action="store_true")
+    profiling_group.add_argument("--profile-start-step", type=int, default=30)
+    profiling_group.add_argument("--profile-num-steps", type=int, default=4)
+    profiling_group.add_argument("--profile-record-shapes", action="store_true")
+
+    # sglang target model backend related args
+    sglang_group = parser.add_argument_group("sglang target model backend")
+    SGLangBackendArgs.add_args(sglang_group)
+
+    # tracker related args
+    tracker_group = parser.add_argument_group("tracker")
+    TrackerArgs.add_args(tracker_group)
 
     args = parser.parse_args()
     return parser, args
@@ -277,12 +271,17 @@ def build_target_model(
                 .cuda()
             )
         else:
+            if args.target_model_backend == "sglang":
+                target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+            else:
+                target_model_kwargs = {}
             target_model = get_eagle3_target_model(
                 pretrained_model_name_or_path=args.target_model_path,
                 backend=args.target_model_backend,
                 torch_dtype=torch.bfloat16,
                 device="cuda",
-                cache_dir=args.cache_dir,
+                cache_dir=args.model_download_dir,
+                **target_model_kwargs,
             )
 
         # set the aux hidden states layers
@@ -311,7 +310,7 @@ def build_target_model(
         target_head = TargetHead.from_pretrained(
             model_path=args.target_model_path,
             lm_head_key=args.lm_head_key,
-            cache_dir=args.cache_dir,
+            cache_dir=args.model_download_dir,
         )
         return target_head, None
 
@@ -328,6 +327,13 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    args.draft_accumulation_steps = (
+        args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
+    )
+    if args.attention_backend == "usp":
+        assert (
+            args.train_hidden_states_path is not None
+        ), "train_hidden_states_path should not be None for usp"
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -335,7 +341,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     if args.draft_model_config is None:
         # Auto-generate and save config file
         auto_config_path = create_draft_config_from_target(
-            target_model_path=args.target_model_path, cache_dir=args.cache_dir
+            target_model_path=args.target_model_path, cache_dir=args.model_download_dir
         )
         draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
     else:
@@ -344,14 +350,15 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     # Handle base ckpt, config file
     draft_model_last_checkpoint = None
-    if args.ckpt_dir is not None and os.path.isdir(args.ckpt_dir):
-        draft_model_config = os.path.join(args.ckpt_dir, "config.json")
-        draft_model_last_checkpoint = args.ckpt_dir
-        print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
-    else:
-        raise ValueError(
-            f"Provided base model dir {args.ckpt_dir} is not a valid directory."
-        )
+    if args.ckpt_dir is not None:
+        if os.path.isdir(args.ckpt_dir):
+            draft_model_config = os.path.join(args.ckpt_dir, "config.json")
+            draft_model_last_checkpoint = args.ckpt_dir
+            print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
+        else:
+            raise ValueError(
+                f"Provided base model dir {args.ckpt_dir} is not a valid directory."
+            )
 
     # detecting last ckpt for draft model
     if args.resume and os.path.isdir(args.output_dir):
@@ -424,9 +431,11 @@ def build_dataloaders(
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
-        num_workers=4,
+        num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=(
+            get_draft_dp_group() if args.attention_backend == "usp" else get_dp_group()
+        ),
         is_vlm=args.is_vlm,
     )
 
@@ -451,9 +460,13 @@ def build_dataloaders(
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.target_batch_size,
-            num_workers=4,
+            num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=(
+                get_draft_dp_group()
+                if args.attention_backend == "usp"
+                else get_dp_group()
+            ),
             is_vlm=args.is_vlm,
         )
         print_with_rank("Initialized eval dataloader")
@@ -623,12 +636,18 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(
+        timeout=args.dist_timeout,
+        tp_size=args.tp_size,
+        sp_ring_size=args.sp_ring_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+    )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
 
     sanity_check(args)
+    print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
     # ================================================
@@ -736,6 +755,31 @@ def main():
             global_step += 1
 
             # ================================================
+            # 7.0 Profiling
+            # ================================================
+            if args.profile:
+                # we add the step by 1 to align with global step
+                if global_step == args.profile_start_step + 1:
+                    print("Start profile")
+                    torch_profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=True,
+                        record_shapes=args.profile_record_shapes,
+                    )
+                    torch_profiler.start()
+                if global_step == args.profile_start_step + args.profile_num_steps + 1:
+                    output_path = os.path.join(
+                        args.output_dir,
+                        f"profile_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
+                    )
+                    print(f"End profile {output_path=}")
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(output_path)
+
+            # ================================================
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
@@ -744,9 +788,15 @@ def main():
             run_backward_and_update(args, plosses, optimizer, global_step)
 
             # log training metrics
-            if global_step % args.log_interval == 0:
+            if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
                 record_metrcs(
-                    args, acces, plosses, global_step, tracker, optimizer, mode="train"
+                    args,
+                    acces,
+                    plosses,
+                    global_step // args.draft_accumulation_steps,
+                    tracker,
+                    optimizer,
+                    mode="train",
                 )
 
             if dist.get_rank() == 0:
@@ -805,6 +855,12 @@ def main():
             if global_step % args.save_interval == 0:
                 # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+
+            if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                break
+
+        if args.max_num_steps is not None and global_step >= args.max_num_steps:
+            break
 
     # Close the tracker
     tracker.close()

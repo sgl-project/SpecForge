@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-import torch.nn as nn
 
 from specforge.core.loss import LogSoftmaxLoss, _compute_loss
 

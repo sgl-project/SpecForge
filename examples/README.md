@@ -1,25 +1,9 @@
-## Training with Flex Attention
+# Run SpecForge Examples
 
-Flex attention saves 10x memory and also makes training faster. It is currently in experimental stage. To enable flex attention, you need to pass `--attention-backend flex_attention` to the training script. To allow sharing of compiled kernels, you need to set `TORCHINDUCTOR_CACHE_DIR` to the cache directory.
+This folder contains the examples of running SpecForge on different models. The scripts can be invoked by the following command:
 
-> <b> Note: Make sure you install torch 2.8.0!</b>
-
-Example training script:
 ```bash
-TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels \
-torchrun \
-    --standalone \
-    --nproc_per_node $NUM_GPUS \
-    $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/sharegpt.jsonl \
-    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3 \
-    --num-epochs 1 \
-    --batch-size 4 \
-    --learning-rate 1e-4 \
-    --max-length 2048 \
-    --chat-template llama3 \
-    --cache-dir $ROOT_DIR/cache
-    --attention-backend flex_attention
+bash examples/<script-name>.sh [NUM_GPUS] [TP_SIZE]
 ```
+
+We use the ShareGPT dataset for all the examples for now, but you can replace it with more robust datasets such as perfectblend, magpie-qwen2.5-pro-1m-v0.1, etc.

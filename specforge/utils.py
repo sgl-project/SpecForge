@@ -3,7 +3,6 @@ import logging
 import os
 import re
 from contextlib import contextmanager
-from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -55,6 +54,21 @@ def print_with_rank(message):
         logger.info(f"rank {dist.get_rank()}: {message}")
     else:
         logger.info(f"non-distributed: {message}")
+
+
+def print_args_with_dots(args):
+    if dist.get_rank() == 0:
+        args_dict = vars(args)
+        max_key_length = max(len(key) for key in args_dict.keys())
+        total_width = 50
+
+        print("\n -----------【args】-----------")
+        for key, value in args_dict.items():
+            key_str = f"{key:<{max_key_length}}"
+            value_str = str(value)
+            dot_count = total_width - len(key_str) - len(value_str)
+            dot_fill = "·" * dot_count
+            print(f"{key_str} {dot_fill} {value_str}")
 
 
 def print_on_rank0(message):

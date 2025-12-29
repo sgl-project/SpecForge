@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -407,11 +407,7 @@ class Llama4TextModel(Llama4PreTrainedModel):
     _no_split_modules = ["Llama4TextDecoderLayer"]
     base_model_prefix = "model"
     config: Llama4TextConfig
-    _can_record_outputs = {
-        "attentions": Llama4TextAttention,
-        "hidden_states": Llama4TextDecoderLayer,
-        "router_logits": Llama4TextMoe,
-    }
+    _can_record_outputs = {}
 
     def __init__(self, config: Llama4TextConfig):
         super().__init__(config)
@@ -452,6 +448,10 @@ class Llama4TextModel(Llama4PreTrainedModel):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
+
+        layers_to_output_hidden_states: Optional[List[int]] = kwargs.pop(
+            "layers_to_output_hidden_states", None
+        )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(
@@ -496,7 +496,8 @@ class Llama4TextModel(Llama4PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         freq_cis = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        all_hidden_states = ()
+        for idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -507,11 +508,18 @@ class Llama4TextModel(Llama4PreTrainedModel):
                 position_embeddings=freq_cis,
                 **kwargs,
             )
+            if (
+                layers_to_output_hidden_states is None
+                or idx in layers_to_output_hidden_states
+            ):
+                all_hidden_states += (hidden_states,)
+
         hidden_states = self.norm(hidden_states)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
         )
 
 

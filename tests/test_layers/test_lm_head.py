@@ -1,6 +1,5 @@
 import os
 import unittest
-from asyncio.runners import run
 
 import torch
 import torch.distributed as dist

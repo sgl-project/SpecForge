@@ -26,8 +26,12 @@ jobs:
 
       - name: Restore cache
         run: |
+          if [ -d /github/home/cache ] && [ ! -z "$(ls -A /github/home/cache/)" ]; then
+            cp -p -r /github/home/cache ./
+          fi
+
           if [ -d /github/home/sf ] && [ ! -z "$(ls -A /github/home/sf/)" ]; then
-            cp -p -r /github/home/sf/* ./
+            cp -p -r /github/home/sf ./
           fi
 
       - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
@@ -55,3 +59,4 @@ jobs:
       - name: Save cache
         run: |
           cp -p -r sf /github/home/
+          cp -p -r cache /github/home/

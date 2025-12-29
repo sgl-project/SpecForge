@@ -7,9 +7,12 @@ To install this project, you can simply run the following command.
 - **Install from source (recommended)**
 
 ```bash
-# create a new virtual environment
+# git clone the source code
 git clone https://github.com/sgl-project/SpecForge.git
-uv .venv -p 3.11
+cd SpecForge
+
+# create a new virtual environment
+uv venv -p 3.11
 source .venv/bin/activate
 
 # install specforge

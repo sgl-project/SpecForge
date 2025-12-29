@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-from typing import Callable, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -257,10 +257,7 @@ class Phi3PreTrainedModel(PreTrainedModel):
 
     _can_compile_fullgraph = True
     _supports_attention_backend = True
-    _can_record_outputs = {
-        "hidden_states": Phi3DecoderLayer,
-        "attentions": Phi3Attention,
-    }
+    _can_record_outputs = {}
     _version = "0.0.5"
 
 
@@ -305,6 +302,10 @@ class Phi3Model(Phi3PreTrainedModel):
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
+        layers_to_output_hidden_states: Optional[List[int]] = kwargs.pop(
+            "layers_to_output_hidden_states", None
+        )
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -341,7 +342,8 @@ class Phi3Model(Phi3PreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        all_hidden_states = ()
+        for idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -352,10 +354,18 @@ class Phi3Model(Phi3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            if (
+                layers_to_output_hidden_states is None
+                or idx in layers_to_output_hidden_states
+            ):
+                all_hidden_states += (hidden_states,)
+
         hidden_states = self.norm(hidden_states)
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
         )
 
 

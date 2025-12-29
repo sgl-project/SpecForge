@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -334,6 +334,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        layers_to_output_hidden_states = flash_attn_kwargs.pop(
+            "layers_to_output_hidden_states", None
+        )
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
@@ -400,10 +404,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
+        for idx, decoder_layer in enumerate(self.layers):
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -418,14 +419,17 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            if output_hidden_states:
+                if (
+                    layers_to_output_hidden_states is None
+                    or idx in layers_to_output_hidden_states
+                ):
+                    all_hidden_states += (hidden_states,)
+
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -520,6 +524,10 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             else self.config.output_hidden_states
         )
 
+        layers_to_output_hidden_states = kwargs.pop(
+            "layers_to_output_hidden_states", None
+        )
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -531,6 +539,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
+            layers_to_output_hidden_states=layers_to_output_hidden_states,
             **kwargs,
         )
 

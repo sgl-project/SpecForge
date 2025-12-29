@@ -1,6 +1,5 @@
 import json
 import os
-import warnings
 from typing import Optional, Union
 
 import torch
@@ -13,7 +12,6 @@ from transformers import (
     LlamaConfig,
     Phi3Config,
     PretrainedConfig,
-    Qwen2_5_VLConfig,
     Qwen2Config,
     Qwen3Config,
     Qwen3MoeConfig,

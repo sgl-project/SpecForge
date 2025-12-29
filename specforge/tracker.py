@@ -56,21 +56,18 @@ class Tracker(abc.ABC):
         This method is called during argument parsing.
         It should raise an error if required arguments are missing.
         """
-        pass
 
     @abc.abstractmethod
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None) -> None:
         """
         Log metrics to the tracker.
         """
-        pass
 
     @abc.abstractmethod
     def close(self) -> None:
         """
         Close the tracker and clean up resources.
         """
-        pass
 
 
 class NoOpTracker(Tracker):
@@ -196,7 +193,7 @@ class SwanlabTracker(Tracker):
             swanlab.log(log_dict, step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized and swanlab.is_running():
+        if self.rank == 0 and self.is_initialized and swanlab.get_run() is not None:
             swanlab.finish()
             self.is_initialized = False
 

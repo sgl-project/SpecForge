@@ -5,8 +5,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-from torch.nn.parameter import Parameter
 
 from specforge.distributed import get_tp_group, shard_tensor
 

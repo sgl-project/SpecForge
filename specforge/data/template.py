@@ -20,6 +20,7 @@ class ChatTemplate(BaseModel):
     system_prompt: str | None
     end_of_turn_token: str | None
     parser_type: str = "general"
+    enable_thinking: bool = False
 
 
 class TemplateRegistry:
@@ -126,16 +127,6 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
-    name="deepseek",
-    template=ChatTemplate(
-        assistant_header="Assistant:",
-        user_header="User:",
-        system_prompt="You are a helpful assistant.",
-        end_of_turn_token="",
-    ),
-)
-
-TEMPLATE_REGISTRY.register(
     name="phi3",
     template=ChatTemplate(
         assistant_header="<|assistant|>\n",
@@ -176,6 +167,17 @@ TEMPLATE_REGISTRY.register(
 )
 
 
+# TEMPLATE_REGISTRY.register(
+#     name="gpt-oss-naive",
+#     template=ChatTemplate(
+#         assistant_header="<|start|>assistant<|channel|>final<|message|>",
+#         user_header="<|start|>user<|message|>",
+#         system_prompt=None,
+#         end_of_turn_token="<|end|>",
+#     ),
+# )
+
+
 TEMPLATE_REGISTRY.register(
     name="gpt-oss",
     template=ChatTemplate(
@@ -194,5 +196,72 @@ TEMPLATE_REGISTRY.register(
         user_header="<｜User｜>",
         end_of_turn_token=None,
         system_prompt=None,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3-thinking",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3-instruct",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3-next-thinking",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n<think>\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="kimi-k2-thinking",
+    template=ChatTemplate(
+        assistant_header="<|im_assistant|>assistant<|im_middle|>",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="kimi-k2-instruct",
+    template=ChatTemplate(
+        assistant_header="<|im_assistant|>assistant<|im_middle|>",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v3",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
     ),
 )
