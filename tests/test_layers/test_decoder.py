@@ -15,6 +15,7 @@ from tests.utils import get_available_port
 
 def test_ttt(rank, world_size, port):
     os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)

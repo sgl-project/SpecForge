@@ -18,6 +18,7 @@ from tests.utils import get_available_port
 
 def test_qwen3_moe_tp(rank, world_size, temp_dir, port, num_heads, num_kv_heads):
     os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
