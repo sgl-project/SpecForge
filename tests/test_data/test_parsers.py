@@ -150,6 +150,9 @@ class TestTemplatePreprocessing(unittest.TestCase):
             "openai/gpt-oss-120b", "gpt-oss", messages=self.gpt_oss_messages
         )
 
+    def test_ling_flash_2_0(self):
+        self._run_template_test("inclusionAI/Ling-flash-2.0", "ling-flash-2.0")
+
 
 if __name__ == "__main__":
     unittest.main()

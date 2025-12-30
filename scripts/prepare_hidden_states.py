@@ -75,6 +75,11 @@ def parse_args():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading models",
+    )
+    model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
     model_group.add_argument("--enable-aux-hidden-states", action="store_true")
@@ -175,6 +180,7 @@ def build_target_model(
             ),
             device="cuda",
             cache_dir=args.model_download_dir,
+            trust_remote_code=args.trust_remote_code,
             **target_model_kwargs,
         )
     # Set auxiliary hidden states layers if specified
@@ -549,7 +555,9 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
 
     # Build target model (with TP)
-    target_model_config = AutoConfig.from_pretrained(args.target_model_path)
+    target_model_config = AutoConfig.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
     target_model, processor = build_target_model(args, target_model_config)
 
     print_with_rank(
