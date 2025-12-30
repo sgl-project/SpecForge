@@ -71,7 +71,7 @@ class OnlineEagle3Model(Eagle3Model):
         self.length = length
         self.attention_backend = attention_backend
 
-        if self.attention_backend == "usp":
+        if self.attention_backend in ("usp", "usp_fa"):
             self.extract_func = EXTRACT_FUNC_DICT["basic"]
             self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
             self.sp_ulysses_degree = torch.distributed.get_world_size(
@@ -171,14 +171,14 @@ class OnlineEagle3Model(Eagle3Model):
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
-        elif self.attention_backend == "usp":
+        elif self.attention_backend in ("usp", "usp_fa"):
             cache_hidden = [[], []]
             past_key_values = None
             hidden_states = self.prepare_usp_input(hidden_states)
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
-            if self.attention_backend == "usp":
+            if self.attention_backend in ("usp", "usp_fa"):
                 input_ids = self.prepare_usp_input(global_input_ids)
             else:
                 input_ids = global_input_ids

@@ -113,10 +113,11 @@ def test_ttt(rank, world_size, port):
         if not is_last:
             # Step 5.7: we need to update the loss mask
             input_ids = padding(input_ids, left=False)
+
     destroy_distributed()
 
     sp_ulysses_degree = 2
-    sp_ring_degree = 1
+    sp_ring_degree = 2
     init_distributed(
         tp_size=1, sp_ulysses_size=sp_ulysses_degree, sp_ring_size=sp_ring_degree
     )
@@ -185,7 +186,11 @@ def test_ttt(rank, world_size, port):
         ],
         rtol=2e-2,
         atol=2e-2,
-    ), f"usp_output: \n{usp_hidden_states_out}, \nsdpa_output: \n{sdpa_hidden_states_out}"
+    ), (
+        f"usp_output: \n{usp_hidden_states_out},"
+        f" \nsdpa_output: \n"
+        f"{sdpa_hidden_states_out.chunk(sp_ring_degree * sp_ulysses_degree, dim=1)[rank % (sp_ring_degree * sp_ulysses_degree)]}"
+    )
 
 
 class TestLinear(unittest.TestCase):
