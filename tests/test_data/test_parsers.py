@@ -121,6 +121,9 @@ class TestTemplatePreprocessing(unittest.TestCase):
     def test_deepseek(self):
         self._run_template_test("deepseek-ai/DeepSeek-V3", "deepseek-v3")
 
+    def test_deepseek_v32(self):
+        self._run_template_test("deepseek-ai/DeepSeek-V3.2", "deepseek-v32")
+
     def test_qwen3_thinking(self):
         self._run_template_test(
             "Qwen/Qwen3-0.6B", "qwen3-thinking", enable_thinking=True
