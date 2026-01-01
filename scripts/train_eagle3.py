@@ -92,6 +92,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         choices=["sglang", "hf", "custom"],
         help="The backend of the target model",
     )
+    model_group.add_argument(
+        "--num-draft-hidden-layers",
+        type=int,
+        default=3,
+        help="The number of MLPs in the draft model decoder"
+    )
 
     # dataset arguments
     dataset_group = parser.add_argument_group("dataset")
@@ -370,12 +376,14 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         draft_model = AutoEagle3DraftModel.from_pretrained(
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
+            num_draft_hidden_layers=args.num_draft_hidden_layers,
             torch_dtype=torch.bfloat16,
         ).cuda()
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
             attention_backend=args.attention_backend,
+            num_draft_hidden_layers=args.num_draft_hidden_layers,
             torch_dtype=torch.bfloat16,
         ).cuda()
 
