@@ -1234,7 +1234,9 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, num_draft_hidden_layers=1, attention_backend: str = "sdpa"):
+    def __init__(
+        self, config, num_draft_hidden_layers=1, attention_backend: str = "sdpa"
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -1249,7 +1251,9 @@ class LlamaDecoderLayer(nn.Module):
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
         self.attention_backend = attention_backend
-        self.mlps = nn.Sequential(*[LlamaMLP(config) for _ in range(num_draft_hidden_layers)])
+        self.mlps = nn.Sequential(
+            *[LlamaMLP(config) for _ in range(num_draft_hidden_layers)]
+        )
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1318,7 +1322,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
-    def __init__(self, config, num_draft_hidden_layers=1, quant_config=None, attention_backend="sdpa") -> None:
+    def __init__(
+        self,
+        config,
+        num_draft_hidden_layers=1,
+        quant_config=None,
+        attention_backend="sdpa",
+    ) -> None:
         super().__init__(config)
         self.config = config
         self.quant_config = quant_config
@@ -1329,9 +1339,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.midlayer = LlamaDecoderLayer(
-            config, 
-            num_draft_hidden_layers=num_draft_hidden_layers, 
-            attention_backend=attention_backend
+            config,
+            num_draft_hidden_layers=num_draft_hidden_layers,
+            attention_backend=attention_backend,
         )
 
         if hasattr(config, "target_hidden_size"):

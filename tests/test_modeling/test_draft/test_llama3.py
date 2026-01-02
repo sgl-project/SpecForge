@@ -54,13 +54,15 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         shutil.rmtree(self.temp_dir)
 
     def test_model_initialization(self):
-        model = LlamaForCausalLMEagle3(self.config, num_draft_hidden_layers=self.num_draft_hidden_layers)
+        model = LlamaForCausalLMEagle3(
+            self.config, num_draft_hidden_layers=self.num_draft_hidden_layers
+        )
 
         self.assertIsInstance(model.midlayer.self_attn, LlamaAttention)
         self.assertIsInstance(model.midlayer.mlps, nn.Sequential)
         self.assertEqual(len(model.midlayer.mlps), self.num_draft_hidden_layers)
         for i in range(self.num_draft_hidden_layers):
-          self.assertIsInstance(model.midlayer.mlps[i], LlamaMLP)
+            self.assertIsInstance(model.midlayer.mlps[i], LlamaMLP)
         self.assertIsInstance(model.midlayer.hidden_norm, LlamaRMSNorm)
         self.assertIsInstance(model.midlayer.input_layernorm, LlamaRMSNorm)
         self.assertIsInstance(model.midlayer.post_attention_layernorm, LlamaRMSNorm)
@@ -68,7 +70,9 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
     def test_save_pretrained(self):
         """Test the model's save_pretrained functionality."""
-        model = LlamaForCausalLMEagle3(self.config, num_draft_hidden_layers=self.num_draft_hidden_layers)
+        model = LlamaForCausalLMEagle3(
+            self.config, num_draft_hidden_layers=self.num_draft_hidden_layers
+        )
 
         self.config.save_pretrained(self.temp_dir)
 
@@ -81,7 +85,9 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
     @patch("transformers.modeling_utils.PreTrainedModel.from_pretrained")
     def test_from_pretrained_mock(self, mock_from_pretrained):
         """mock"""
-        mock_model = LlamaForCausalLMEagle3(self.config, num_draft_hidden_layers=self.num_draft_hidden_layers)
+        mock_model = LlamaForCausalLMEagle3(
+            self.config, num_draft_hidden_layers=self.num_draft_hidden_layers
+        )
         mock_from_pretrained.return_value = mock_model
 
         loaded_model = LlamaForCausalLMEagle3.from_pretrained(self.temp_dir)
@@ -90,7 +96,9 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
     def test_model_forward_pass(self):
         """forward"""
-        model = LlamaForCausalLMEagle3(self.config, num_draft_hidden_layers=self.num_draft_hidden_layers)
+        model = LlamaForCausalLMEagle3(
+            self.config, num_draft_hidden_layers=self.num_draft_hidden_layers
+        )
         model.eval()
 
         batch_size = 2
@@ -110,8 +118,12 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         self.assertEqual(outputs.shape, (batch_size, seq_len, self.config.hidden_size))
 
     def test_state_dict_compatibility(self):
-        model1 = LlamaForCausalLMEagle3(self.config, num_draft_hidden_layers=self.num_draft_hidden_layers)
-        model2 = LlamaForCausalLMEagle3(self.config, num_draft_hidden_layers=self.num_draft_hidden_layers)
+        model1 = LlamaForCausalLMEagle3(
+            self.config, num_draft_hidden_layers=self.num_draft_hidden_layers
+        )
+        model2 = LlamaForCausalLMEagle3(
+            self.config, num_draft_hidden_layers=self.num_draft_hidden_layers
+        )
 
         state_dict = model1.state_dict()
 

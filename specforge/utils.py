@@ -155,7 +155,7 @@ def generate_draft_model_config(
             draft_config[draft_param] = value
 
     # Special handling for some parameters
-    # Ensure (target) num_hidden_layers is 1. However, the draft model can 
+    # Ensure (target) num_hidden_layers is 1. However, the draft model can
     # deviate from this configuration with the command line arg num_draft_hidden_layers
     draft_config["num_hidden_layers"] = 1
 

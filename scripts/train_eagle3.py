@@ -96,7 +96,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--num-draft-hidden-layers",
         type=int,
         default=3,
-        help="The number of MLPs in the draft model decoder"
+        help="The number of MLPs in the draft model decoder",
     )
 
     # dataset arguments
