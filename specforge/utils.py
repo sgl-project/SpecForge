@@ -155,8 +155,7 @@ def generate_draft_model_config(
             draft_config[draft_param] = value
 
     # Special handling for some parameters
-    # Ensure (target) num_hidden_layers is 1. However, the draft model can
-    # deviate from this configuration with the command line arg num_draft_hidden_layers
+    # Ensure num_hidden_layers is always 1 (EAGLE3 feature)
     draft_config["num_hidden_layers"] = 1
 
     # Keep some fixed draft model specific parameters
