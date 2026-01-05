@@ -352,7 +352,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     draft_model_last_checkpoint = None
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
-            draft_model_config = os.path.join(args.ckpt_dir, "config.json")
+            draft_model_config = AutoDraftModelConfig.from_file(
+                os.path.join(args.ckpt_dir, "config.json")
+            )
             draft_model_last_checkpoint = args.ckpt_dir
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
         else:
