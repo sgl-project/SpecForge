@@ -54,7 +54,7 @@
     <link rel="prev" title="📝 Data Preparation" href="data_preparation.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-    <meta name="docbuild:last-update" content="Dec 27, 2025"/>
+    <meta name="docbuild:last-update" content="Jan 07, 2026"/>
   </head>
   
   
@@ -497,7 +497,7 @@ python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--d
 </div>
 <p><strong>Step 2: Start the training</strong></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># train llama3-8B-instruct</span>
-bash<span class="w"> </span>./examples/run_llama3_eagle3.1_8b_online.sh
+bash<span class="w"> </span>./examples/run_llama3.1_8b_eagle3_online.sh
 </pre></div>
 </div>
 </section>
@@ -508,10 +508,10 @@ bash<span class="w"> </span>./examples/run_llama3_eagle3.1_8b_online.sh
 <p>Same as above</p>
 <p><strong>Step 2: Generate the hidden states and train</strong></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># train llama3-8B-instruct in an offline manner</span>
-bash<span class="w"> </span>./examples/run_llama3_eagle3.1_8b_offline.sh
+bash<span class="w"> </span>./examples/run_llama3.1_8b_eagle3_offline.sh
 </pre></div>
 </div>
-<p>It is important to note that the <code class="docutils literal notranslate"><span class="pre">run_llama3_eagle3_offline.sh</span></code> script consists of two steps:</p>
+<p>It is important to note that the <code class="docutils literal notranslate"><span class="pre">run_llama3.1_8b_eagle3_offline.sh</span></code> script consists of two steps:</p>
 <ol class="arabic simple">
 <li><p>Generate the hidden states using the <code class="docutils literal notranslate"><span class="pre">prepare_hidden_states.py</span></code> script. This script will generate the hidden states for the test and train datasets and save them to the disk.</p></li>
 <li><p>Train the model: suppling the <code class="docutils literal notranslate"><span class="pre">--train-hidden-states-path</span></code> argument to the script so that the script will load the hidden states from the disk during training.</p></li>
@@ -597,7 +597,7 @@ By SpecForge Team
 
   <p class="copyright">
     
-      © Copyright 2025-2025, SpecForge.
+      © Copyright 2025-2026, SpecForge.
       <br/>
     
   </p>
@@ -606,7 +606,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Dec 27, 2025.
+  Last updated on Jan 07, 2026.
   <br/>
 </p>
   </div>
