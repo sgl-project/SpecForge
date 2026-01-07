@@ -165,7 +165,7 @@ class OnlineEagle3Model(Eagle3Model):
         acces = []
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
-        if self.attention_backend == "sdpa":
+        if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
@@ -175,6 +175,8 @@ class OnlineEagle3Model(Eagle3Model):
             cache_hidden = [[], []]
             past_key_values = None
             hidden_states = self.prepare_usp_input(hidden_states)
+        else:
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
@@ -464,12 +466,14 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
+        if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        else:
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
