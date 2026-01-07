@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate.utils import set_seed
-from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.optim import Optimizer
@@ -18,6 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
+from datasets import load_dataset
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,

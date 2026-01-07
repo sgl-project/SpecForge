@@ -27,9 +27,10 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
+
+from datasets import Dataset as HFDataset
 
 try:
     from qwen_vl_utils import process_vision_info
