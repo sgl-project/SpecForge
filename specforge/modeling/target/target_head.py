@@ -13,9 +13,11 @@ from specforge.utils import padding
 
 
 class TargetHead(nn.Module):
-    def __init__(self, model_path):
+    def __init__(self, model_path, trust_remote_code: bool = False):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(model_path)
+        self.config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
         self.fc = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
     @classmethod
@@ -24,8 +26,9 @@ class TargetHead(nn.Module):
         model_path,
         lm_head_key: str = "lm_head.weight",
         cache_dir: Optional[str] = None,
+        trust_remote_code: bool = False,
     ) -> "TargetHead":
-        target_head = cls(model_path)
+        target_head = cls(model_path, trust_remote_code=trust_remote_code)
         target_head.load_weights(
             model_path=model_path,
             lm_head_key=lm_head_key,

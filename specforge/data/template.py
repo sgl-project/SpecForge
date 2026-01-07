@@ -265,3 +265,13 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<｜end▁of▁sentence｜>",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="ling-flash-2.0",
+    template=ChatTemplate(
+        assistant_header="<role>ASSISTANT</role>",
+        user_header="<role>HUMAN</role>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|role_end|>",
+    ),
+)
