@@ -34,7 +34,7 @@ python scripts/prepare_data.py --dataset sharegpt
 
 ```bash
 # train llama3-8B-instruct
-bash ./examples/run_llama3_eagle3.1_8b_online.sh
+bash ./examples/run_llama3.1_8b_eagle3_online.sh
 ```
 
 ## 💨 Offline Training
@@ -49,10 +49,10 @@ Same as above
 
 ```bash
 # train llama3-8B-instruct in an offline manner
-bash ./examples/run_llama3_eagle3.1_8b_offline.sh
+bash ./examples/run_llama3.1_8b_eagle3_offline.sh
 ```
 
-It is important to note that the `run_llama3_eagle3_offline.sh` script consists of two steps:
+It is important to note that the `run_llama3.1_8b_eagle3_offline.sh` script consists of two steps:
 
 1. Generate the hidden states using the `prepare_hidden_states.py` script. This script will generate the hidden states for the test and train datasets and save them to the disk.
 2. Train the model: suppling the `--train-hidden-states-path` argument to the script so that the script will load the hidden states from the disk during training.
