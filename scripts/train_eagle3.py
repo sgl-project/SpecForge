@@ -330,7 +330,7 @@ def sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
-    if args.attention_backend == "usp":
+    if args.attention_backend in ("usp", "usp_fa"):
         assert (
             args.train_hidden_states_path is not None
         ), "train_hidden_states_path should not be None for usp"
@@ -434,7 +434,9 @@ def build_dataloaders(
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=(
-            get_draft_dp_group() if args.attention_backend == "usp" else get_dp_group()
+            get_draft_dp_group()
+            if args.attention_backend in ("usp", "usp_fa")
+            else get_dp_group()
         ),
         is_vlm=args.is_vlm,
     )
@@ -464,7 +466,7 @@ def build_dataloaders(
             shuffle=False,
             process_group=(
                 get_draft_dp_group()
-                if args.attention_backend == "usp"
+                if args.attention_backend in ("usp", "usp_fa")
                 else get_dp_group()
             ),
             is_vlm=args.is_vlm,

@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import LlamaConfig
 from transformers.activations import ACT2FN
@@ -94,12 +95,12 @@ def rotate_half(x):
 
 
 @torch.compile(dynamic=True)
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -1170,6 +1171,383 @@ class LlamaFlexAttention(LlamaAttention):
         return attn_output
 
 
+class LlamaFlashAttention(LlamaAttention):
+    """
+    Attention layer implemented with flash attention. We keep the parameters consistent with LlamaAttention.
+    The used parameters are:
+        - hidden_states: input hidden states
+        - position_ids: position ids
+        - cache_hidden: manual cache used for storing past key and value states
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+
+        lck = 0 if cache_hidden is None else len(cache_hidden[0])
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+                unsqueeze_dim=2,
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids, unsqueeze_dim=2
+            )
+
+        if cache_hidden is not None:
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+
+            cache_k = cache_hidden[0]
+            cache_v = cache_hidden[1]
+        else:
+            cache_k = [key_states]
+            cache_v = [value_states]
+
+        k0 = cache_k[0]
+        v0 = cache_v[0]
+
+        attn_output, lse, _ = flash_attn_func(
+            query_states,
+            k0,
+            v0,
+            dropout_p=0.0,
+            softmax_scale=1.0 / math.sqrt(self.head_dim),
+            causal=True,
+            return_attn_probs=True,
+        )
+        lse = lse.transpose(1, 2)
+
+        lck = len(cache_k)
+        if lck > 1:
+            q_shape_expanded = (
+                bsz,
+                q_len,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+            )
+            attn_outputs = [attn_output.view(q_shape_expanded)]
+            lses = [lse.view(q_shape_expanded[:-1])]
+
+            for i in range(1, lck):
+                ki = cache_k[i].unsqueeze(-2)
+                qi = query_states.view(q_shape_expanded)
+                vi = cache_v[i].unsqueeze(-2)
+
+                attn_outputs.append(vi)
+                lses.append((qi * ki).sum(-1) / math.sqrt(self.head_dim))
+
+            lse = torch.logsumexp(torch.stack(lses, dim=-1), dim=-1)
+            attn_output = sum(
+                attn_outputi * torch.exp(lsei - lse).unsqueeze(-1)
+                for attn_outputi, lsei in zip(attn_outputs, lses)
+            )
+            # lse is fp32, downcast attn_output back
+            attn_output = attn_output.to(self.o_proj.weight.dtype)
+
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
+
+class LlamaUSPFlashAttention(LlamaUSPAttention):
+    """
+    Combines Ulysses Sequence Parallelism (USP) and Ring Attention with Flash Attention backend.
+
+    - Supports sp_ulysses_degree > 1 (via AllToAll scatter/gather).
+    - Supports sp_ring_degree > 1 (via Block-wise Ring Flash Attention with LSE accumulation).
+    - Supports Eagle3 draft model tree verification (handling list of cache_k/v).
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        bsz, q_len, _ = hidden_states.size()
+        local_q_len = q_len  # Length before potential Ulysses gather or Ring split logic implicitly handled
+
+        # [B, S_local, H_total, D]
+        query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        # [B, S_local, H_total, D] -> [B, S_global_usp, H_local, D]
+        query_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            query_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        key_states = self.k_proj(hidden_states)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        key_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            key_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        value_states = self.v_proj(hidden_states)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            value_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        # Current sequence length on this device (Global for Ulysses, but Local chunk for Ring)
+        # If Ring > 1, this is only a chunk of the full causal sequence.
+        q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
+        device_q_len = query_states.shape[1]
+
+        # Handle Ring Position IDs
+        if self.sp_ring_degree > 1:
+            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+                # mRoPE usually splits dim 2
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
+                    self.ring_rank
+                ].clone()
+            else:
+                # Standard RoPE splits dim 1
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
+                    self.ring_rank
+                ].clone()
+
+        lck = 0 if cache_hidden is None else len(cache_hidden[0])
+
+        # Apply RoPE (Note: Using unsqueeze_dim=2 for FlashAttn layout [B, S, H, D])
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+                unsqueeze_dim=2,
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids, unsqueeze_dim=2
+            )
+
+        # Update Cache (Eagle3 Logic: Cache is a list of tensors for tree branches)
+        if cache_hidden is not None:
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+            cache_k = cache_hidden[0]
+            cache_v = cache_hidden[1]
+        else:
+            cache_k = [key_states]
+            cache_v = [value_states]
+
+        attn_output = self.ring_flash_attention(
+            query_states, cache_k, cache_v, bsz, device_q_len
+        )
+
+        # Ulysses Gather & Output Projection
+        # [B, S_global_usp, H_local, D] -> [B, S_local, H_total, D]
+        attn_output = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            attn_output,
+            self.gather_idx,  # Scatter idx: 1 (Seq)
+            self.scatter_idx,  # Gather idx: 2 (Heads)
+            self.use_sync,
+        )
+
+        attn_output = attn_output.reshape(
+            bsz, local_q_len, self.head_dim * self.num_heads
+        )
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
+    def ring_flash_attention(self, local_q, cache_k, cache_v, bsz, local_seq_len):
+        """
+        Refactored to match LlamaUSPAttention structure using Online Softmax accumulation.
+        Phase 1: Accumulate Local Eagle Branches.
+        Phase 2: Accumulate Global Main Branch via Ring.
+        """
+        group = self.ring_pg
+        rank = self.ring_rank
+        world_size = self.sp_ring_degree
+
+        # acc_out stores the current weighted sum (normalized Attention Output)
+        # acc_lse stores the current LogSumExp
+        acc_out = torch.zeros_like(local_q)
+        acc_lse = torch.full(
+            (bsz, local_seq_len, self.num_heads // self.sp_ulysses_degree),
+            float("-inf"),
+            device=local_q.device,
+            dtype=torch.float32,
+        )
+
+        # Pre-calculate GQA expanded dimensions for Phase 1
+        num_kv_heads_local = cache_k[0].shape[2]
+        local_groups = self.num_heads // self.sp_ulysses_degree // num_kv_heads_local
+        q_shape_expanded = (
+            bsz,
+            local_seq_len,
+            num_kv_heads_local,
+            local_groups,
+            self.head_dim,
+        )
+
+        # Phase 1: Extras (Eagle Branches)
+        lck = len(cache_k)
+        if lck > 1:
+            # View Q as GQA shape for dot product
+            qi_reshaped = local_q.view(q_shape_expanded)
+
+            for i in range(1, lck):
+                ki = cache_k[i]  # [B, S, KV, D]
+                vi = cache_v[i]  # [B, S, KV, D]
+
+                # 1.1 Compute Point-wise Score (Logits)
+                # Q: [B, S, KV, G, D], K: [B, S, KV, 1, D] -> Score: [B, S, KV, G]
+                ki_expanded = ki.unsqueeze(-2)
+                score_i = (qi_reshaped * ki_expanded).sum(-1) / math.sqrt(self.head_dim)
+
+                # Flatten back to [B, S, H] to merge with acc_lse
+                step_lse = score_i.view(bsz, local_seq_len, -1)
+
+                # 1.2 Prepare Value
+                # Eagle branch is effectively a Block with Sequence Length=1
+                vi_expanded = vi.unsqueeze(-2)  # [B, S, KV, 1, D]
+                # Broadcast to [B, S, KV, G, D] -> Flatten -> [B, S, H, D]
+                step_out = vi_expanded.expand(q_shape_expanded).reshape(acc_out.shape)
+
+                # 1.3 Online Softmax Update (Merge into Accumulator)
+                # new_lse = log( e^acc_lse + e^step_lse )
+                new_lse = torch.logaddexp(acc_lse, step_lse)
+
+                # out = out * (e^acc_lse / e^new_lse) + val * (e^step_lse / e^new_lse)
+                acc_out = acc_out * torch.exp(acc_lse - new_lse).unsqueeze(
+                    -1
+                ) + step_out * torch.exp(step_lse - new_lse).unsqueeze(-1)
+
+                acc_lse = new_lse
+
+        # Phase 2: Main Sequence (cache_k[0]) - Ring Attention
+        curr_k = cache_k[0].clone()
+        curr_v = cache_v[0].clone()
+        next_k = torch.empty_like(curr_k)
+        next_v = torch.empty_like(curr_v)
+
+        for step in range(world_size):
+            block_rank = (rank - step + world_size) % world_size
+
+            # Calculate only for diagonal or upper triangular blocks (if non-Causal)
+            if block_rank <= rank:
+                is_causal_block = block_rank == rank
+
+                # 2.1 Compute Block Flash Attention
+                step_out, step_lse = self._compute_block_flash_attention(
+                    local_q, curr_k, curr_v, causal=is_causal_block
+                )
+
+                # 2.2 Online Softmax Update (Merge Ring Block into Accumulator)
+                new_lse = torch.logaddexp(acc_lse, step_lse)
+
+                acc_out = acc_out * torch.exp(acc_lse - new_lse).unsqueeze(
+                    -1
+                ) + step_out * torch.exp(step_lse - new_lse).unsqueeze(-1)
+
+                acc_lse = new_lse
+
+            # 2.3 Communication
+            if step < world_size - 1:
+                send_dst = self.ring_group_ranks[(rank + 1) % world_size]
+                recv_src = self.ring_group_ranks[(rank - 1 + world_size) % world_size]
+
+                ops = []
+                k_to_send = curr_k.contiguous()
+                v_to_send = curr_v.contiguous()
+
+                ops.append(dist.P2POp(dist.isend, k_to_send, send_dst, group=group))
+                ops.append(dist.P2POp(dist.irecv, next_k, recv_src, group=group))
+                ops.append(dist.P2POp(dist.isend, v_to_send, send_dst, group=group))
+                ops.append(dist.P2POp(dist.irecv, next_v, recv_src, group=group))
+
+                reqs = dist.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
+
+                curr_k, next_k = next_k, curr_k
+                curr_v, next_v = next_v, curr_v
+
+        return acc_out.to(local_q.dtype)
+
+    def _compute_block_flash_attention(
+        self, query_states, k_block, v_block, causal=True
+    ):
+        """
+        Helper for standard Flash Attention call.
+        """
+        attn_output, lse, _ = flash_attn_func(
+            query_states,
+            k_block,
+            v_block,
+            dropout_p=0.0,
+            softmax_scale=1.0 / math.sqrt(self.head_dim),
+            causal=causal,
+            return_attn_probs=True,
+        )
+        # Ensure LSE shape is [B, S, H]
+        if lse.shape[-1] == query_states.shape[1]:
+            lse = lse.transpose(1, 2).contiguous()
+        return attn_output, lse
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1245,6 +1623,10 @@ class LlamaDecoderLayer(nn.Module):
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
+        elif attention_backend == "fa":
+            self.self_attn = LlamaFlashAttention(config=config)
+        elif attention_backend == "usp_fa":
+            self.self_attn = LlamaUSPFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
