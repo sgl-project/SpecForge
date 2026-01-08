@@ -862,6 +862,13 @@ def main():
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
 
+    # Save final checkpoint if training ended without saving
+    if global_step % args.save_interval != 0:
+        print_on_rank0(
+            f"Training completed at step {global_step}, saving final checkpoint..."
+        )
+        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+
     # Close the tracker
     tracker.close()
     destroy_distributed()
