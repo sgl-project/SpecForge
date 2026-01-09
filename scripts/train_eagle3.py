@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate.utils import set_seed
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
@@ -528,7 +529,8 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    if args.is_vlm:
+    use_transformers = False
+    if args.is_vlm and use_transformers:
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
@@ -539,10 +541,16 @@ def run_forward(
     else:
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
+            # Handle VLM data: pixel_values and image_grid_thw are lists
+            # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
+            image_grid_thw = [thw.cuda().squeeze() for thw in data["image_grid_thw"]] if args.is_vlm else None
             eagle3_data = target_model.generate_eagle3_data(
                 input_ids=data["input_ids"].cuda(),
                 attention_mask=data["attention_mask"].cuda(),
                 loss_mask=data["loss_mask"].cuda(),
+                is_vlm=args.is_vlm,
+                pixel_values=data["pixel_values"].cuda(),
+                image_grid_thw=image_grid_thw,
             )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
@@ -550,6 +558,16 @@ def run_forward(
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            plosses, _, acces = eagle3_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                target=target,
+                hidden_states=hidden_states,
+                image_grid_thw=image_grid_thw,
+                is_vlm=args.is_vlm,
+            )
+            return plosses, acces
         else:
             # we generate the logits using the hidden states loaded from disk
             input_ids = data["input_ids"].cuda()
@@ -636,6 +654,7 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
+    init_mm_embedding_cache(1024 * 1024 * 512)
     init_distributed(
         timeout=args.dist_timeout,
         tp_size=args.tp_size,
@@ -685,6 +704,7 @@ def main():
     if (
         args.is_vlm
         and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
+        and args.tp_size == 1
     ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
@@ -695,6 +715,7 @@ def main():
         )
     else:
         eagle3_model = OnlineEagle3Model(
+            target_model=target_model,
             draft_model=draft_model,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
@@ -849,18 +870,20 @@ def main():
                     mode="eval",
                 )
 
-            # ================================================
-            # 7.3 Save Checkpoints
-            # ================================================
-            if global_step % args.save_interval == 0:
-                # Save the model
-                save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
-
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
+        # ================================================
+        # 7.3 Save Checkpoints (at end of each epoch)
+        # ================================================
+        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+
+    # Save final checkpoint after training completes
+    save_checkpoints(args, args.num_epochs - 1, global_step, eagle3_model, optimizer)
+    print_on_rank0("Training completed. Final checkpoint saved.")
 
     # Close the tracker
     tracker.close()

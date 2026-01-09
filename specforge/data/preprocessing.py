@@ -152,6 +152,7 @@ def preprocess_conversations(
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
+    # import pdb; pdb.set_trace()
     for source, kwargs_item in zip(conversations, kwargs_list):
         if not source:
             # if the source is None, skip it
@@ -203,6 +204,10 @@ def preprocess_vlm_conversations(
 
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
+        # Remove leading "./" if present and prepend the base path
+        if image.startswith("./"):
+            image = image[2:]
+        image = "/mnt/cephfs/user_xuanweifu/data/datasets/" + image
         source = examples["conversations"][i]
         messages = [{"role": "system", "content": system_prompt}]
         if not source:
@@ -260,8 +265,8 @@ def preprocess_vlm_conversations(
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
-        pixel_values = encoding.pixel_values
-        image_grid_thw = encoding.image_grid_thw[0]
+        pixel_values = encoding.pixel_values  # [total_patches, hidden_dim], no batch dim
+        image_grid_thw = encoding.image_grid_thw  # [num_images, 3], no batch dim
 
         # get conversation with image info for loss mask generation
         decoded_conversation = processor.tokenizer.decode(
@@ -277,7 +282,7 @@ def preprocess_vlm_conversations(
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
         results["pixel_values"].append(pixel_values)
-        results["image_grid_thw"].append(image_grid_thw[None, :])
+        results["image_grid_thw"].append(image_grid_thw)
     return results
 
 
