@@ -1328,7 +1328,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+        self.num_hidden_layers = config.num_hidden_layers
+        self.midlayers = nn.ModuleList(
+            [LlamaDecoderLayer(config, attention_backend=attention_backend) for _ in range(self.num_hidden_layers)]
+        )
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -1366,11 +1369,11 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            print_with_rank("using ttt_length 1, no need to cache hidden states")
-            cache_hidden = None
+            print_with_rank("using ttt_length 1, no need to cache hidden states for decoder layer(s)")
+            caches_hidden = None
         else:
-            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
-            cache_hidden = [[], []]
+            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states for decoder layer(s)")
+            caches_hidden = [[[], []] for _ in range(self.num_hidden_layers)]
 
         batch_size, seq_length, _ = hidden_states.size()
 
@@ -1390,15 +1393,15 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # fc
         hidden_states = self.fc(hidden_states)
-        hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            output_attentions=False,
-            use_cache=False,
+
+        hidden_states = self.backbone(
+              input_embeds=inputs_embeds,
+              hidden_states=hidden_states,
+              caches_hidden=caches_hidden,
+              attention_mask=attention_mask,
+              position_ids=position_ids,
+              past_key_values=None,
+              use_cache=False,
         )
 
         # norm
@@ -1422,19 +1425,21 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self,
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
+        caches_hidden: Optional[List[List[List[torch.Tensor]]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[Cache]] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
-            input_emb=input_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            output_attentions=False,
-            use_cache=False,
-        )
+        for i, layer in enumerate(self.midlayers):
+          hidden_states = layer(
+              input_emb=input_embeds,
+              hidden_states=hidden_states,
+              cache_hidden=caches_hidden[i] if caches_hidden is not None else None,
+              attention_mask=attention_mask,
+              position_ids=position_ids,
+              past_key_values=past_key_values[i] if past_key_values is not None else None,
+              output_attentions=False,
+              use_cache=False,
+          )
+        return hidden_states
