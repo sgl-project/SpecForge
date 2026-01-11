@@ -71,14 +71,30 @@ class GeneralParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            convroles = ["user", "assistant"]
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
-                if role != convroles[j % 2]:
+                if j == 0 and role != "user":
                     warnings.warn(
-                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
+                        f"The first message is from user, we will use the system prompt from the template and ignore the system prompt from the data"
                     )
                     break
+                else:
+                    if role == "tool" and conversation[j - 1]["role"] not in [
+                        "assistant",
+                        "tool",
+                    ]:
+                        warnings.warn(
+                            "The tool message must follow the assistant message."
+                        )
+                        break
+                    if role == "assistant" and conversation[j - 1]["role"] not in [
+                        "user",
+                        "tool",
+                    ]:
+                        warnings.warn(
+                            "The assistant message must follow the user message or tool message."
+                        )
+                        break
                 messages.append(sentence)
 
             conversation = self.apply_chat_template(messages, **kwargs)
