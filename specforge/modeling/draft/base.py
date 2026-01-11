@@ -101,7 +101,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         caches_hidden: List[List[List[torch.Tensor]]],
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        past_key_values: List[Optional[Cache]] = None,
+        past_key_values: Optional[List[Cache]] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         """
