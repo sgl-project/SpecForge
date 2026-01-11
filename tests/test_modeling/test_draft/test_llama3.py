@@ -57,12 +57,12 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         self.assertEqual(model.num_hidden_layers, self.config.num_hidden_layers)
         self.assertIsInstance(model.midlayers, nn.ModuleList)
         for layer in model.midlayers:
-          self.assertIsInstance(layer.self_attn, LlamaAttention)
-          self.assertIsInstance(layer.mlp, LlamaMLP)
-          self.assertIsInstance(layer.hidden_norm, LlamaRMSNorm)
-          self.assertIsInstance(layer.input_layernorm, LlamaRMSNorm)
-          self.assertIsInstance(layer.post_attention_layernorm, LlamaRMSNorm)
-          self.assertEqual(layer.hidden_size, self.config.hidden_size)
+            self.assertIsInstance(layer.self_attn, LlamaAttention)
+            self.assertIsInstance(layer.mlp, LlamaMLP)
+            self.assertIsInstance(layer.hidden_norm, LlamaRMSNorm)
+            self.assertIsInstance(layer.input_layernorm, LlamaRMSNorm)
+            self.assertIsInstance(layer.post_attention_layernorm, LlamaRMSNorm)
+            self.assertEqual(layer.hidden_size, self.config.hidden_size)
 
     def test_save_pretrained(self):
         """Test the model's save_pretrained functionality."""

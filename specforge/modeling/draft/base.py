@@ -24,7 +24,7 @@ import glob
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Optional, List
+from typing import List, Optional
 
 import torch
 from huggingface_hub import snapshot_download
