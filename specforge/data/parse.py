@@ -73,26 +73,22 @@ class GeneralParser(Parser):
 
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
-                if j == 0 and role != "user":
-                    warnings.warn(
-                        f"The first message is from user, we will use the system prompt from the template and ignore the system prompt from the data"
-                    )
-                    break
-                else:
-                    if role == "tool" and conversation[j - 1]["role"] not in [
-                        "assistant",
-                        "tool",
-                    ]:
+                if j == 0:
+                    if role != "user":
                         warnings.warn(
-                            "The tool message must follow the assistant message."
+                            f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
                         )
                         break
-                    if role == "assistant" and conversation[j - 1]["role"] not in [
-                        "user",
-                        "tool",
-                    ]:
+                else:
+                    prev_role = conversation[j - 1]["role"]
+                    if role == "tool" and prev_role not in ["assistant", "tool"]:
                         warnings.warn(
-                            "The assistant message must follow the user message or tool message."
+                            f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        )
+                        break
+                    if role == "assistant" and prev_role not in ["user", "tool"]:
+                        warnings.warn(
+                            f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
                         break
                 messages.append(sentence)
