@@ -81,7 +81,31 @@ class GeneralParser(Parser):
                     break
                 messages.append(sentence)
 
-            conversation = self.apply_chat_template(messages, **kwargs)
+            try:
+                conversation = self.apply_chat_template(messages, **kwargs)
+            except (ValueError, TypeError):
+                # Fallback rendering for tokenizers without built-in chat_template
+                warnings.warn(
+                    "Tokenizer does not have a chat_template, using fallback rendering."
+                )
+                parts = []
+                bos_token = getattr(self.tokenizer, "bos_token", None)
+                user_header = self.chat_template.user_header or ""
+                assistant_header = self.chat_template.assistant_header or ""
+                end_of_turn = self.chat_template.end_of_turn_token or ""
+
+                # Add BOS token at the start
+                if bos_token:
+                    parts.append(bos_token)
+
+                for msg in messages:
+                    if msg["role"] == "system":
+                        parts.append(msg["content"])
+                    elif msg["role"] == "user":
+                        parts.append(f"{user_header}{msg['content']}")
+                    elif msg["role"] == "assistant":
+                        parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
+                conversation = "".join(parts)
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
