@@ -275,3 +275,15 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|role_end|>",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v32",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt="",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)

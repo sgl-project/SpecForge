@@ -357,7 +357,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     draft_model_last_checkpoint = None
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
-            draft_model_config = os.path.join(args.ckpt_dir, "config.json")
+            draft_model_config = AutoDraftModelConfig.from_file(
+                os.path.join(args.ckpt_dir, "config.json")
+            )
             draft_model_last_checkpoint = args.ckpt_dir
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
         else:
@@ -868,6 +870,13 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+
+    # Save final checkpoint if training ended without saving
+    if global_step % args.save_interval != 0:
+        print_on_rank0(
+            f"Training completed at step {global_step}, saving final checkpoint..."
+        )
+        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
     # Close the tracker
     tracker.close()

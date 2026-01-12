@@ -71,17 +71,53 @@ class GeneralParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            convroles = ["user", "assistant"]
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
-                if role != convroles[j % 2]:
-                    warnings.warn(
-                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
-                    )
-                    break
+                if j == 0:
+                    if role != "user":
+                        warnings.warn(
+                            f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
+                        )
+                        break
+                else:
+                    prev_role = conversation[j - 1]["role"]
+                    if role == "tool" and prev_role not in ["assistant", "tool"]:
+                        warnings.warn(
+                            f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        )
+                        break
+                    if role == "assistant" and prev_role not in ["user", "tool"]:
+                        warnings.warn(
+                            f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        )
+                        break
                 messages.append(sentence)
 
-            conversation = self.apply_chat_template(messages, **kwargs)
+            try:
+                conversation = self.apply_chat_template(messages, **kwargs)
+            except (ValueError, TypeError):
+                # Fallback rendering for tokenizers without built-in chat_template
+                warnings.warn(
+                    "Tokenizer does not have a chat_template, using fallback rendering."
+                )
+                parts = []
+                bos_token = getattr(self.tokenizer, "bos_token", None)
+                user_header = self.chat_template.user_header or ""
+                assistant_header = self.chat_template.assistant_header or ""
+                end_of_turn = self.chat_template.end_of_turn_token or ""
+
+                # Add BOS token at the start
+                if bos_token:
+                    parts.append(bos_token)
+
+                for msg in messages:
+                    if msg["role"] == "system":
+                        parts.append(msg["content"])
+                    elif msg["role"] == "user":
+                        parts.append(f"{user_header}{msg['content']}")
+                    elif msg["role"] == "assistant":
+                        parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
+                conversation = "".join(parts)
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
