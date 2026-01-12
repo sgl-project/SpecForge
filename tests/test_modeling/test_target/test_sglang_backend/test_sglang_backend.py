@@ -93,7 +93,7 @@ def test_vlm(rank, world_size, port, tp_size):
     init_distributed(tp_size=tp_size)
     set_seed(42)
 
-    model_path = "/home/qspace/Qwen2.5-VL-32B-Instruct"
+    model_path = "Qwen/Qwen2.5-VL-32B-Instruct"
     
     # Use Qwen2.5-VL processor to prepare inputs
     from transformers import Qwen2_5_VLProcessor
@@ -109,7 +109,7 @@ def test_vlm(rank, world_size, port, tp_size):
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": "/mnt/cephfs/user_xuanweifu/SpecForge/tests/test_modeling/test_target/test_sglang_backend/images/demo.jpeg"},
+                {"type": "image", "image": "./images/demo.jpeg"},
                 {"type": "text", "text": "Describe this image."},
             ],
         }
@@ -120,7 +120,7 @@ def test_vlm(rank, world_size, port, tp_size):
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": "/mnt/cephfs/user_xuanweifu/SpecForge/tests/test_modeling/test_target/test_sglang_backend/images/demo.jpeg"},
+                {"type": "image", "image": "./images/demo.jpeg"},
                 {"type": "text", "text": "What do you see in this picture?"},
             ],
         }
@@ -238,7 +238,7 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
 
     processor = Qwen2_5_VLProcessor.from_pretrained(model_path)
     
-    image_path = "/mnt/cephfs/user_xuanweifu/SpecForge/tests/test_modeling/test_target/test_sglang_backend/images/demo.jpeg"
+    image_path = os.path.join(os.path.dirname(__file__), "images", "demo.jpeg")
 
     # Create test messages with different configurations (batch_size=4)
     # Sample 1: single image
@@ -400,20 +400,20 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
 
 class TestTargetModelBackend(unittest.TestCase):
 
-    # def test_sglang_backend_with_dense(self):
-    #     world_size = 2
-    #     port = get_available_port()
-    #     mp.spawn(test_dense, nprocs=world_size, args=(world_size, port, 2))
+    def test_sglang_backend_with_dense(self):
+        world_size = 2
+        port = get_available_port()
+        mp.spawn(test_dense, nprocs=world_size, args=(world_size, port, 2))
 
-    # def test_sglang_backend_with_moe(self):
-    #     world_size = 2
-    #     port = get_available_port()
-    #     mp.spawn(test_moe, nprocs=world_size, args=(world_size, port, 2))
+    def test_sglang_backend_with_moe(self):
+        world_size = 2
+        port = get_available_port()
+        mp.spawn(test_moe, nprocs=world_size, args=(world_size, port, 2))
     
-    # def test_sglang_backend_with_vlm(self):
-    #     world_size = 4
-    #     port = get_available_port()
-    #     mp.spawn(test_vlm, nprocs=world_size, args=(world_size, port, 4))
+    def test_sglang_backend_with_vlm(self):
+        world_size = 4
+        port = get_available_port()
+        mp.spawn(test_vlm, nprocs=world_size, args=(world_size, port, 4))
     
     def test_sglang_backend_with_vlm_multi_batch(self):
         world_size = 8

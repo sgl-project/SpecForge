@@ -153,7 +153,6 @@ def preprocess_conversations(
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
-    # import pdb; pdb.set_trace()
     for source, kwargs_item in zip(conversations, kwargs_list):
         if not source:
             # if the source is None, skip it
@@ -205,7 +204,6 @@ def preprocess_vlm_conversations(
 
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
-        # Remove leading "./" if present and prepend the base path
         source = examples["conversations"][i]
         messages = [{"role": "system", "content": system_prompt}]
         if not source:

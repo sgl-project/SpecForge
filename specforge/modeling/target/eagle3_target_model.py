@@ -19,7 +19,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoModelForCausalLM
-build_target_model
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
