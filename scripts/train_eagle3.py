@@ -4,6 +4,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
+from itertools import islice
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
@@ -413,13 +414,21 @@ def build_dataloaders(
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
     # convert to dataloader
-    cache_params_string = (
+    train_cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
     )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    train_cache_key = hashlib.md5(train_cache_params_string.encode()).hexdigest()
+    eval_cache_params_string = (
+        f"{args.eval_data_path}-"
+        f"{args.max_length}-"
+        f"{args.chat_template}-"
+        f"{args.target_model_path}"  # Tokenizer may also different
+    )
+    eval_cache_key = hashlib.md5(eval_cache_params_string.encode()).hexdigest()
+    cache_dir = os.path.join(args.cache_dir, "processed_dataset")
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
@@ -427,8 +436,8 @@ def build_dataloaders(
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
+            cache_dir=cache_dir,
+            cache_key=train_cache_key,
             is_vlm=args.is_vlm,
             is_preformatted=args.is_preformatted,
             processor=processor,
@@ -439,7 +448,7 @@ def build_dataloaders(
             target_vocab_size=draft_model_config.vocab_size,
             draft_vocab_size=draft_model_config.draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
+            cache_key=train_cache_key,
         )
 
         if args.train_hidden_states_path is not None:
@@ -467,6 +476,8 @@ def build_dataloaders(
                 tokenizer,
                 args.chat_template,
                 args.max_length,
+                cache_dir=cache_dir,
+                cache_key=eval_cache_key,
                 is_vlm=args.is_vlm,
                 processor=processor,
                 num_proc=args.build_dataset_num_proc,
@@ -768,8 +779,7 @@ def main():
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
 
-    # Calculate which batch index we should be at based on training state
-    target_batch_idx = global_step - (start_epoch * len(train_dataloader))
+    steps_to_skip = global_step - steps_per_epoch * start_epoch
 
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
@@ -778,16 +788,18 @@ def main():
 
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+                train_dataloader,
+                desc=f"Training Epoch {epoch}",
+                leave=True,
+                initial=steps_to_skip,
             )
         else:
             progress_bar = train_dataloader
 
-        for batch_idx, data in enumerate(progress_bar):
-            if batch_idx < target_batch_idx:
-                continue
-
-            target_batch_idx = 0  # reset for next epoch
+        for batch_idx, data in enumerate(
+            islice(progress_bar, steps_to_skip, None), start=steps_to_skip
+        ):
+            steps_to_skip = 0  # reset for next epoch
             global_step += 1
 
             # ================================================
