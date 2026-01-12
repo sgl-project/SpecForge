@@ -43,10 +43,10 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
+from datasets import load_dataset
 from specforge.args import SGLangBackendArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
