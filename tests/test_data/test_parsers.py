@@ -199,7 +199,7 @@ class TestTemplatePreprocessing(unittest.TestCase):
 
     def test_ling_flash_2_0(self):
         self._run_template_test("inclusionAI/Ling-flash-2.0", "ling-flash-2.0")
-        
+
     def test_qwen3_instruct_with_tools(self):
         self._run_template_test(
             "Qwen/Qwen3-0.6B", "qwen", messages=self.tool_use_messages
