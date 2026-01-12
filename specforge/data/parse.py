@@ -71,14 +71,26 @@ class GeneralParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            convroles = ["user", "assistant"]
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
-                if role != convroles[j % 2]:
-                    warnings.warn(
-                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
-                    )
-                    break
+                if j == 0:
+                    if role != "user":
+                        warnings.warn(
+                            f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
+                        )
+                        break
+                else:
+                    prev_role = conversation[j - 1]["role"]
+                    if role == "tool" and prev_role not in ["assistant", "tool"]:
+                        warnings.warn(
+                            f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        )
+                        break
+                    if role == "assistant" and prev_role not in ["user", "tool"]:
+                        warnings.warn(
+                            f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        )
+                        break
                 messages.append(sentence)
 
             try:
