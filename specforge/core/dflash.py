@@ -185,9 +185,8 @@ class OnlineDFlashModel(nn.Module):
         # Different blocks cannot see each other's noise.
 
         same_block = q_block_ids == k_block_ids
-        causal = indices.unsqueeze(0) >= indices.unsqueeze(1)  # j <= i
 
-        noise_mask = same_block & causal
+        noise_mask = same_block
 
         # Combine [Ctx_Mask, Noise_Mask]
         # Shape [L, 2L]
