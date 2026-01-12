@@ -18,8 +18,8 @@ class OnlineDFlashModel(nn.Module):
         draft_model: DFlashDraftModel,
         target_lm_head: nn.Module,
         target_embed_tokens: nn.Module,
+        mask_token_id: int,
         block_size: int = 16,
-        mask_token_id: int = 151666,
     ):
         super().__init__()
         self.draft_model = draft_model
