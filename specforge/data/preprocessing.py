@@ -205,9 +205,6 @@ def preprocess_vlm_conversations(
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         # Remove leading "./" if present and prepend the base path
-        if image.startswith("./"):
-            image = image[2:]
-        image = "/mnt/cephfs/user_xuanweifu/data/datasets/" + image
         source = examples["conversations"][i]
         messages = [{"role": "system", "content": system_prompt}]
         if not source:
