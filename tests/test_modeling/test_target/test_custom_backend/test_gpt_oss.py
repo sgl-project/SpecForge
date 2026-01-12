@@ -17,6 +17,7 @@ from tests.utils import get_available_port
 
 def test_gpt_oss_tp(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
