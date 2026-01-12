@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate.utils import set_seed
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
@@ -259,7 +258,7 @@ def build_target_model(
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.tp_size == 1
+            and args.target_model_backend == "costom"
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
 
@@ -529,8 +528,7 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    use_transformers = False
-    if args.is_vlm and use_transformers:
+    if args.is_vlm and args.target_model_backend == "costom":
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
@@ -558,16 +556,6 @@ def run_forward(
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
-            plosses, _, acces = eagle3_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                loss_mask=loss_mask,
-                target=target,
-                hidden_states=hidden_states,
-                image_grid_thw=image_grid_thw,
-                is_vlm=args.is_vlm,
-            )
-            return plosses, acces
         else:
             # we generate the logits using the hidden states loaded from disk
             input_ids = data["input_ids"].cuda()
@@ -578,13 +566,14 @@ def run_forward(
             input_ids, target, loss_mask = target_model.preprocess(
                 input_ids, target, loss_mask
             )
-
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
+            image_grid_thw=image_grid_thw,
+            is_vlm=args.is_vlm,
         )
     return plosses, acces
 
@@ -654,7 +643,7 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
-    init_mm_embedding_cache(1024 * 1024 * 512)
+    # init_mm_embedding_cache(1024 * 1024 * 1024 * 2)
     init_distributed(
         timeout=args.dist_timeout,
         tp_size=args.tp_size,
@@ -876,6 +865,7 @@ def main():
         # ================================================
         # 7.3 Save Checkpoints (at end of each epoch)
         # ================================================
+        print(f"Saving checkpoint-epoch-{epoch}")
         save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:

@@ -19,7 +19,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoModelForCausalLM
-
+build_target_model
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
@@ -27,7 +27,6 @@ from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_modul
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
 
 
-init_mm_embedding_cache(1024*1024*512)
 
 @dataclass
 class Eagle3TargetOutput:
@@ -266,6 +265,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         if not self.is_vlm:
             return
         
+        init_mm_embedding_cache(1024 * 1024 * 512)
         # Model type (e.g., "qwen2_5_vl", "qwen2_vl")
         self.model_type = getattr(self.hf_config, 'model_type', None)
         
