@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "torch==2.9.1"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -24,7 +24,7 @@ dependencies = [
     "pydantic",
     "sglang==0.5.6",
     "openai-harmony",
-    "flash-attn>=2.8.3",
+    "flash-attn @ git+https://github.com/Dao-AILab/flash-attention.git",
     "yunchang",
 ]
 
