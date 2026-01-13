@@ -65,6 +65,9 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
+        "--trust-remote-code", action="store_true", help="Trust remote code"
+    )
+    model_group.add_argument(
         "--draft-model-config",
         type=str,
         required=False,
@@ -282,6 +285,7 @@ def build_target_model(
                 device="cuda",
                 cache_dir=args.model_download_dir,
                 **target_model_kwargs,
+                trust_remote_code=args.trust_remote_code,
             )
 
         # set the aux hidden states layers
@@ -311,6 +315,7 @@ def build_target_model(
             model_path=args.target_model_path,
             lm_head_key=args.lm_head_key,
             cache_dir=args.model_download_dir,
+            trust_remote_code=args.trust_remote_code,
         )
         return target_head, None
 
@@ -392,7 +397,9 @@ def build_dataloaders(
     processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     # build dataloaders
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
 
     # convert to dataloader
     cache_params_string = (

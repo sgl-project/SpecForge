@@ -191,6 +191,9 @@ class TestTemplatePreprocessing(unittest.TestCase):
             "openai/gpt-oss-120b", "gpt-oss", messages=self.gpt_oss_messages
         )
 
+    def test_ling_flash_2_0(self):
+        self._run_template_test("inclusionAI/Ling-flash-2.0", "ling-flash-2.0")
+
     def test_qwen3_instruct_with_tools(self):
         self._run_template_test(
             "Qwen/Qwen3-0.6B", "qwen3-instruct", messages=self.tool_use_messages
