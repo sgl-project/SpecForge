@@ -258,7 +258,7 @@ def build_target_model(
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.target_model_backend == "costom"
+            and args.target_model_backend == "custom"
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
 

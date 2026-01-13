@@ -522,8 +522,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             image_grid_thw: List of image_grid_thw tensors, one per sample in batch
         """
 
-        # print(f"[extend_vlm_begin] pixel_values.shape: {len(pixel_values)}:{pixel_values[0].shape}")
-        # print(f"[extend_vlm_begin] image_grid_thw.shape: {len(image_grid_thw)}:{image_grid_thw[0].shape}")
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
 
@@ -535,13 +533,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             loss_mask = torch.split(loss_mask, 1, dim=0)
         else:
             batch_size = len(input_ids)
-
-        # Validate lengths match
-        # assert pixel_values.shape[0]== batch_size, \
-        #     f"pixel_values length ({len(pixel_values)}) must match batch_size ({batch_size})"
-        # assert image_grid_thw.shape[0] == batch_size, \
-        #     f"image_grid_thw length ({len(image_grid_thw)}) must match batch_size ({batch_size})"
-
         # Process image_grid_thw - convert to list if needed
         if image_grid_thw is None:
             image_grid_thw = [None] * batch_size
@@ -584,14 +575,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             # Compute mrope positions for VLM models (e.g., Qwen2.5-VL)
             input_id_flat = input_id_.view(-1)
             
-            # Debug: print shapes
-            # print(f"[extend_vlm] idx={idx}")
-            # print(f"[extend_vlm] input_id_flat shape: {input_id_flat.shape}")
-            # print(f"[extend_vlm] pixel_value_ shape: {pixel_value_.shape if pixel_value_ is not None else None}")
-            # print(f"[extend_vlm] num_patches for this sample: {num_patches}")
-            # print(f"[extend_vlm] image_grid_thw_ shape: {image_grid_thw_.shape if image_grid_thw_ is not None else None}")
-            # print(f"[extend_vlm] image_grid_thw_ value: {image_grid_thw_}")
-            
             # Count image tokens
             num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
             # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
@@ -606,10 +589,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 image_grid_thw=image_grid_thw_,
                 tokens_per_second=self.tokens_per_second,
             )
-            # print(f"[extend_vlm] mrope_positions shape: {mrope_positions.shape if mrope_positions is not None else None}")
             
             offset = BaseMultimodalProcessor.get_mm_items_offset(input_id_flat, self.image_token_id)
-            # print(f"[extend_vlm] offset: {offset}")
             mm_item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=pixel_value_,  # torch.Tensor: (num_patches, patch_dim)
@@ -665,8 +646,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 - loss_mask: (1, seq_len)
                 - target: (1, seq_len, vocab_size) or (1, seq_len, hidden_size)
                 - hidden_states: (1, seq_len, hidden_size)
-                - pixed_values: ()
-                - image_grid_thw ()
+                - pixel_values: (patch_len, patch_width)
+                - image_grid_thw (batch_size, 3)
         """
         if is_vlm:
             data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (

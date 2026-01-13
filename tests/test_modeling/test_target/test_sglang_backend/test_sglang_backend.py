@@ -186,7 +186,7 @@ def test_vlm(rank, world_size, port, tp_size):
     loss_mask = torch.cat(padded_loss_mask, dim=0).cuda()
     
     # pixel_values and image_grid_thw remain as lists (one per sample)
-    pixel_values = [pv.cuda() for pv in batch_pixel_values]
+    pixel_values = torch.cat(batch_pixel_values, dim=0).cuda()
     image_grid_thw = [thw.cuda() for thw in batch_image_grid_thw]
 
     sgl_target_model = SGLangEagle3TargetModel.from_pretrained(
@@ -350,7 +350,7 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
     loss_mask = torch.cat(padded_loss_mask, dim=0).cuda()
     
     # pixel_values and image_grid_thw remain as lists (one per sample)
-    pixel_values = [pv.cuda() for pv in batch_pixel_values]
+    pixel_values = torch.cat(batch_pixel_values, dim=0).cuda()sss
     image_grid_thw = [thw.cuda() for thw in batch_image_grid_thw]
 
     if rank == 0:
