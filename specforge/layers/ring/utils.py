@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 __all__ = ["update_out_and_lse", "RingComm"]
 
+
 @torch.jit.script
 def _update_out_and_lse(
     out: torch.Tensor,
@@ -13,7 +14,7 @@ def _update_out_and_lse(
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    
+
     block_out = block_out.to(torch.float32)
     block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
 

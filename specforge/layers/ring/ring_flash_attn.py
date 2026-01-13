@@ -1,6 +1,8 @@
 import torch
+from yunchang.kernels import AttnType, select_flash_attn_impl
+
 from .utils import RingComm, update_out_and_lse
-from yunchang.kernels import select_flash_attn_impl, AttnType
+
 
 def ring_flash_attn_forward(
     process_group,
@@ -31,7 +33,9 @@ def ring_flash_attn_forward(
             comm.commit()
 
         if not causal or step <= comm.rank:
-            fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
+            fn = select_flash_attn_impl(
+                attn_type, stage="fwd-only", attn_processor=attn_processor
+            )
             block_out, block_lse = fn(
                 q,
                 k,
@@ -219,7 +223,22 @@ class RingFlashAttnFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
             attn_type=ctx.attn_type,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def ring_flash_attn_qkvpacked_func(

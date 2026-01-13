@@ -35,8 +35,9 @@ from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
     get_draft_dp_group,
+    get_draft_sp_group,
     get_tp_group,
-    init_distributed, get_draft_sp_group,
+    init_distributed,
 )
 from specforge.modeling.target import (
     Eagle3TargetModel,
@@ -631,11 +632,6 @@ def record_metrcs(
     tracker.log(logdict, step=global_step)
 
 
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-
-
 def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Tensor:
     """
     Process: TP split -> Pad to Max Len -> SP gather.
@@ -657,7 +653,9 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
         local_seq_len = local_tp_shard.size(sp_dim)
 
         # Find global max sequence length in SP group
-        len_tensor = torch.tensor([local_seq_len], device=local_tp_shard.device, dtype=torch.long)
+        len_tensor = torch.tensor(
+            [local_seq_len], device=local_tp_shard.device, dtype=torch.long
+        )
         dist.all_reduce(len_tensor, op=dist.ReduceOp.MAX, group=sp_group)
         max_seq_len = len_tensor.item()
 
@@ -674,12 +672,16 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
             pad_config[pad_idx] = pad_size
 
             # Pad value: 0 is standard, ensure it matches your pad_token_id logic if needed
-            local_tp_shard_padded = F.pad(local_tp_shard, pad_config, value=0)
+            local_tp_shard_padded = nn.F.pad(local_tp_shard, pad_config, value=0)
         else:
             local_tp_shard_padded = local_tp_shard
 
-        gathered_shards = [torch.empty_like(local_tp_shard_padded) for _ in range(sp_world_size)]
-        dist.all_gather(gathered_shards, local_tp_shard_padded.contiguous(), group=sp_group)
+        gathered_shards = [
+            torch.empty_like(local_tp_shard_padded) for _ in range(sp_world_size)
+        ]
+        dist.all_gather(
+            gathered_shards, local_tp_shard_padded.contiguous(), group=sp_group
+        )
 
         return torch.cat(gathered_shards, dim=sp_dim)
 

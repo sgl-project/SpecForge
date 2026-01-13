@@ -8,11 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from flash_attn import flash_attn_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers import LlamaConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
-from yunchang import EXTRACT_FUNC_DICT
 from yunchang.comm import SeqAllToAll4D
 
 from specforge.modeling.draft.flex_attention import (
@@ -21,10 +19,10 @@ from specforge.modeling.draft.flex_attention import (
     generate_eagle3_mask,
 )
 from specforge.utils import print_with_rank
-from .base import Eagle3DraftModel
+
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from ...layers.ring import ring_flash_attn_func
-
+from .base import Eagle3DraftModel
 
 try:
     from flash_attn import flash_attn_func
@@ -973,6 +971,7 @@ class LlamaUSPFlashAttention(LlamaAttention):
     """
     LlamaUSPFlashAttention with Trainable Ring Attention & Correct Eagle3 Branch Merging.
     """
+
     def __init__(self, config):
         super().__init__(config)
         assert (
@@ -1008,19 +1007,35 @@ class LlamaUSPFlashAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         query_states = SeqAllToAll4D.apply(
-            self.ulysses_pg, query_states, self.scatter_idx, self.gather_idx, self.use_sync
+            self.ulysses_pg,
+            query_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
         )
 
         key_states = self.k_proj(hidden_states)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
         key_states = SeqAllToAll4D.apply(
-            self.ulysses_pg, key_states, self.scatter_idx, self.gather_idx, self.use_sync
+            self.ulysses_pg,
+            key_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
         )
 
         value_states = self.v_proj(hidden_states)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
         value_states = SeqAllToAll4D.apply(
-            self.ulysses_pg, value_states, self.scatter_idx, self.gather_idx, self.use_sync
+            self.ulysses_pg,
+            value_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
         )
 
         current_q_len = query_states.shape[1]
@@ -1034,9 +1049,13 @@ class LlamaUSPFlashAttention(LlamaAttention):
         # =============================================================
         if self.sp_ring_degree > 1:
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[self.ring_rank].clone()
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
+                    self.ring_rank
+                ].clone()
             else:
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[self.ring_rank].clone()
+                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
+                    self.ring_rank
+                ].clone()
 
         lck = 0 if cache_hidden is None else len(cache_hidden[0])
 
@@ -1044,7 +1063,12 @@ class LlamaUSPFlashAttention(LlamaAttention):
             cos, sin = self.rotary_emb(query_states, position_ids + lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             query_states, key_states = apply_multimodal_rotary_pos_emb(
-                query_states, key_states, cos, sin, self.config.rope_scaling["mrope_section"], unsqueeze_dim=2
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+                unsqueeze_dim=2,
             )
         else:
             cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
@@ -1087,8 +1111,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
         else:
             acc_lse = lse_ring
 
-        assert acc_lse.shape[1] == current_q_len, \
-            f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
+        assert (
+            acc_lse.shape[1] == current_q_len
+        ), f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
 
         acc_out = out_ring
 
@@ -1097,7 +1122,13 @@ class LlamaUSPFlashAttention(LlamaAttention):
             num_kv_heads_local = cache_k[0].shape[2]
             local_groups = local_num_heads // num_kv_heads_local
 
-            q_shape_expanded = (bsz, current_q_len, num_kv_heads_local, local_groups, self.head_dim)
+            q_shape_expanded = (
+                bsz,
+                current_q_len,
+                num_kv_heads_local,
+                local_groups,
+                self.head_dim,
+            )
             qi_reshaped = query_states.view(q_shape_expanded)  # [B, S, KV, G, D]
 
             for i in range(1, len(cache_k)):
@@ -1118,8 +1149,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
                 # Online Softmax Update
                 new_lse = torch.logaddexp(acc_lse, step_lse)
 
-                acc_out = acc_out * torch.exp(acc_lse - new_lse).unsqueeze(-1) + \
-                          step_out * torch.exp(step_lse - new_lse).unsqueeze(-1)
+                acc_out = acc_out * torch.exp(acc_lse - new_lse).unsqueeze(
+                    -1
+                ) + step_out * torch.exp(step_lse - new_lse).unsqueeze(-1)
 
                 acc_lse = new_lse
 
