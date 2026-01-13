@@ -17,7 +17,7 @@
   "rms_norm_eps": 1e-05,
   "tie_word_embeddings": false,
   "torch_dtype": "bfloat16",
-  "transformers_version": "4.51.1",
+  "transformers_version": "4.57.1",
   "use_cache": true,
   "vocab_size": 157184,
   "draft_vocab_size": 32000
