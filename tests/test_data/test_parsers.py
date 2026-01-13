@@ -24,7 +24,6 @@ class TestTemplatePreprocessing(unittest.TestCase):
         # 1. General model test data (Qwen, DeepSeek, etc.)
         cls.standard_messages = [
             [
-                {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Who are you?"},
                 {"role": "assistant", "content": "My name is Qwen2."},
                 {"role": "user", "content": "How old are you?"},
@@ -35,7 +34,6 @@ class TestTemplatePreprocessing(unittest.TestCase):
         # 2. GPT-OSS Dedicated Test Data (Including Analysis and Final Channel)
         cls.gpt_oss_messages = [
             [
-                {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Explain Quantum Physics."},
                 {
                     "role": "assistant_analysis",
@@ -53,10 +51,6 @@ class TestTemplatePreprocessing(unittest.TestCase):
         # 3. Tool-Use Test Data
         cls.tool_use_messages = [
             [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that can search the web and check the weather.",
-                },
                 {
                     "role": "user",
                     "content": "What's the weather like in Beijing today?",
@@ -202,7 +196,7 @@ class TestTemplatePreprocessing(unittest.TestCase):
 
     def test_qwen3_instruct_with_tools(self):
         self._run_template_test(
-            "Qwen/Qwen3-0.6B", "qwen", messages=self.tool_use_messages
+            "Qwen/Qwen3-0.6B", "qwen3-instruct", messages=self.tool_use_messages
         )
 
 
