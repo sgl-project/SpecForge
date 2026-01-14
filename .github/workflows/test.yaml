@@ -46,6 +46,7 @@ jobs:
             uv venv sf -p 3.11
           fi
           source sf/bin/activate
+          uv pip install setuptools
           uv pip install -v . --prerelease=allow --no-build-isolation
 
       - name: Run test
