@@ -1,4 +1,5 @@
 import math
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
@@ -22,6 +23,14 @@ from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
+
+try:
+    from flash_attn import flash_attn_func
+except:
+    warnings.warn(
+        "flash_attn is not found, please install flash_attn if you want to use the flash attention backend"
+    )
+    flash_attn_func = None
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -94,12 +103,12 @@ def rotate_half(x):
 
 
 @torch.compile(dynamic=True)
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -1170,6 +1179,120 @@ class LlamaFlexAttention(LlamaAttention):
         return attn_output
 
 
+class LlamaFlashAttention(LlamaAttention):
+    """
+    Attention layer implemented with flash attention. We keep the parameters consistent with LlamaAttention.
+    The used parameters are:
+        - hidden_states: input hidden states
+        - position_ids: position ids
+        - cache_hidden: manual cache used for storing past key and value states
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+
+        lck = 0 if cache_hidden is None else len(cache_hidden[0])
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+                unsqueeze_dim=2,
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+            )
+
+        if cache_hidden is not None:
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+
+            cache_k = cache_hidden[0]
+            cache_v = cache_hidden[1]
+        else:
+            cache_k = [key_states]
+            cache_v = [value_states]
+
+        k0 = cache_k[0]
+        v0 = cache_v[0]
+
+        assert (
+            flash_attn_func is not None
+        ), "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        attn_output, lse, _ = flash_attn_func(
+            query_states,
+            k0,
+            v0,
+            dropout_p=0.0,
+            softmax_scale=1.0 / math.sqrt(self.head_dim),
+            causal=True,
+            return_attn_probs=True,
+        )
+        lse = lse.transpose(1, 2)
+
+        lck = len(cache_k)
+        if lck > 1:
+            q_shape_expanded = (
+                bsz,
+                q_len,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+            )
+            attn_outputs = [attn_output.view(q_shape_expanded)]
+            lses = [lse.view(q_shape_expanded[:-1])]
+
+            for i in range(1, lck):
+                ki = cache_k[i].unsqueeze(-2)
+                qi = query_states.view(q_shape_expanded)
+                vi = cache_v[i].unsqueeze(-2)
+
+                attn_outputs.append(vi)
+                lses.append((qi * ki).sum(-1) / math.sqrt(self.head_dim))
+
+            lse = torch.logsumexp(torch.stack(lses, dim=-1), dim=-1)
+            attn_output = sum(
+                attn_outputi * torch.exp(lsei - lse).unsqueeze(-1)
+                for attn_outputi, lsei in zip(attn_outputs, lses)
+            )
+            # lse is fp32, downcast attn_output back
+            attn_output = attn_output.to(self.o_proj.weight.dtype)
+
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1245,6 +1368,8 @@ class LlamaDecoderLayer(nn.Module):
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
+        elif attention_backend == "fa":
+            self.self_attn = LlamaFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
