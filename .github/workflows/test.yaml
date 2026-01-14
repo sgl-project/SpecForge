@@ -55,6 +55,8 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
+          ls
+          python tests/test_utils/test_flash_attention.py
           python -m unittest discover -s ./tests -p "test_*.py" -v
 
       - name: Save cache
