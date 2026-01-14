@@ -9,6 +9,8 @@ import torch.distributed as dist
 from torch.distributed._tensor import DTensor, Shard, distribute_tensor
 from transformers import AutoConfig, PretrainedConfig
 
+from datasets import Dataset
+
 logger = logging.getLogger(__name__)
 
 
@@ -301,3 +303,14 @@ def shard_optimizer_state_with_dtensor(bf16_optimizer, device_mesh):
                 state[k] = distribute_tensor(
                     v.to(p.device), device_mesh=mesh, placements=placements
                 )
+
+
+def load_dataset_from_jsonl(data_path: str) -> Dataset:
+    data = []
+    with open(data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+    dataset = Dataset.from_list(data)
+    return dataset

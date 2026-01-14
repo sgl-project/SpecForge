@@ -17,7 +17,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
-from datasets import load_dataset
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -48,6 +47,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
+    load_dataset_from_jsonl,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
@@ -409,7 +409,7 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    train_dataset = load_dataset_from_jsonl(data_path=args.train_data_path)
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -450,7 +450,7 @@ def build_dataloaders(
 
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
-            eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+            eval_dataset = load_dataset_from_jsonl(data_path=args.eval_data_path)
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
