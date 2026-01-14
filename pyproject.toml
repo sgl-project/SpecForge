@@ -38,10 +38,8 @@ dev = [
     "pre-commit",
     "unittest"
 ]
-all = ["flash-attn"]
+fa = ["flash-attn"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
 description = {file = "README.md"}
-
-
