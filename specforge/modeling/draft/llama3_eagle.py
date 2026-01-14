@@ -1,4 +1,5 @@
 import math
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
@@ -12,7 +13,6 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 from yunchang import EXTRACT_FUNC_DICT
 from yunchang.comm import SeqAllToAll4D
-import warnings
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -27,7 +27,9 @@ from .base import Eagle3DraftModel
 try:
     from flash_attn import flash_attn_func
 except:
-    warnings.warn("flash_attn is not found, please install flash_attn if you want to use the flash attention backend")
+    warnings.warn(
+        "flash_attn is not found, please install flash_attn if you want to use the flash attention backend"
+    )
     flash_attn_func = None
 
 
@@ -1242,7 +1244,9 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
-        assert flash_attn_func is not None, "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        assert (
+            flash_attn_func is not None
+        ), "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
         attn_output, lse, _ = flash_attn_func(
             query_states,
             k0,
