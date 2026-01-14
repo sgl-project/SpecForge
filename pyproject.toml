@@ -24,7 +24,6 @@ dependencies = [
     "pydantic",
     "sglang==0.5.6",
     "openai-harmony",
-    "safetensors",
     "ninja",
     "packaging",
     "yunchang",
