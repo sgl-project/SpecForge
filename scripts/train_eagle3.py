@@ -648,8 +648,6 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
 
     if sp_group is not None and dist.get_world_size(sp_group) > 1:
         sp_world_size = dist.get_world_size(sp_group)
-
-        # --- Fix for Variable Sequence Lengths ---
         local_seq_len = local_tp_shard.size(sp_dim)
 
         # Find global max sequence length in SP group
@@ -660,12 +658,10 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
         max_seq_len = len_tensor.item()
 
         # Pad local tensor if necessary
-        # Assuming shape is [Batch, Seq, Hidden] or [Batch, Seq], and sp_dim=1
+        # Shape is [Batch, Seq, Hidden] or [Batch, Seq], and sp_dim=1
         if local_seq_len < max_seq_len:
             pad_size = max_seq_len - local_seq_len
 
-            # Construct pad tuple for F.pad (applies from last dim backwards)
-            # Initialize with all zeros (no padding for other dims)
             pad_config = [0] * (local_tp_shard.ndim * 2)
 
             pad_idx = (local_tp_shard.ndim - 1 - sp_dim) * 2 + 1
