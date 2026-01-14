@@ -24,13 +24,24 @@ dependencies = [
     "pydantic",
     "sglang==0.5.6",
     "openai-harmony",
-    "flash-attn>=2.8.3",
+    "ninja",
+    "packaging",
     "yunchang",
 ]
 
 [tool.setuptools]
 packages = ["specforge"]
 
+[project.optional-dependencies]
+# Moved pre-commit to a dev extra
+dev = [
+    "pre-commit",
+    "unittest"
+]
+all = ["flash-attn"]
+
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
 description = {file = "README.md"}
+
+
