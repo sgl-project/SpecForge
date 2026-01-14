@@ -167,17 +167,6 @@ TEMPLATE_REGISTRY.register(
 )
 
 
-# TEMPLATE_REGISTRY.register(
-#     name="gpt-oss-naive",
-#     template=ChatTemplate(
-#         assistant_header="<|start|>assistant<|channel|>final<|message|>",
-#         user_header="<|start|>user<|message|>",
-#         system_prompt=None,
-#         end_of_turn_token="<|end|>",
-#     ),
-# )
-
-
 TEMPLATE_REGISTRY.register(
     name="gpt-oss",
     template=ChatTemplate(
@@ -263,5 +252,27 @@ TEMPLATE_REGISTRY.register(
         user_header="<｜User｜>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="ling-flash-2.0",
+    template=ChatTemplate(
+        assistant_header="<role>ASSISTANT</role>",
+        user_header="<role>HUMAN</role>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|role_end|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v32",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt="",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="thinking",
+        enable_thinking=True,
     ),
 )

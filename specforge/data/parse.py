@@ -71,94 +71,96 @@ class GeneralParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            convroles = ["user", "assistant"]
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
-                if role != convroles[j % 2]:
-                    warnings.warn(
-                        f"Conversation truncated due to unexpected role '{role}'. Expected '{convroles[j % 2]}'."
-                    )
-                    break
+                if j == 0:
+                    if role != "user":
+                        warnings.warn(
+                            f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
+                        )
+                        break
+                else:
+                    prev_role = conversation[j - 1]["role"]
+                    if role == "tool" and prev_role not in ["assistant", "tool"]:
+                        warnings.warn(
+                            f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        )
+                        break
+                    if role == "assistant" and prev_role not in ["user", "tool"]:
+                        warnings.warn(
+                            f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        )
+                        break
                 messages.append(sentence)
 
-            conversation = self.apply_chat_template(messages, **kwargs)
+            try:
+                conversation = self.apply_chat_template(messages, **kwargs)
+            except (ValueError, TypeError):
+                # Fallback rendering for tokenizers without built-in chat_template
+                warnings.warn(
+                    "Tokenizer does not have a chat_template, using fallback rendering."
+                )
+                parts = []
+                bos_token = getattr(self.tokenizer, "bos_token", None)
+                user_header = self.chat_template.user_header or ""
+                assistant_header = self.chat_template.assistant_header or ""
+                end_of_turn = self.chat_template.end_of_turn_token or ""
+
+                # Add BOS token at the start
+                if bos_token:
+                    parts.append(bos_token)
+
+                for msg in messages:
+                    if msg["role"] == "system":
+                        parts.append(msg["content"])
+                    elif msg["role"] == "user":
+                        parts.append(f"{user_header}{msg['content']}")
+                    elif msg["role"] == "assistant":
+                        parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
+                conversation = "".join(parts)
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
-        assistant_pattern = f"{re.escape(self.assistant_message_separator)}(.*?(?:{re.escape(self.chat_template.end_of_turn_token)}|$))"
-        try:
-            # use fast tokenizer's offset mapping to create loss mask
-            encoding = self.tokenizer(
-                conversation,
-                return_offsets_mapping=True,
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-                add_special_tokens=False,
+        assistant_pattern = (
+            re.escape(self.assistant_message_separator)
+            + r"([\s\S]*?(?:"
+            + re.escape(self.chat_template.end_of_turn_token)
+            + "|$))"
+        )
+        # get input_ids
+        encoding = self.tokenizer(
+            conversation,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        input_ids = encoding.input_ids[0]
+        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+        for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+            content_start_char = match.start(1)
+            content_end_char = match.end(1)
+
+            # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
+            # Encode the text "assistant start", the length of which is the position of the starting token.
+            prefix_ids = self.tokenizer.encode(
+                conversation[:content_start_char], add_special_tokens=False
             )
-            input_ids = encoding.input_ids[0]
-            offsets = encoding.offset_mapping[0]
-            loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
-
-            for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
-                assistant_start_char = match.start(1)
-                assistant_end_char = match.end(1)
-
-                for idx, (token_start, token_end) in enumerate(offsets):
-                    # if token_end <= assistant_start_char:
-                    #     continue
-                    # if token_start > assistant_end_char:
-                    #     continue
-                    if (
-                        assistant_start_char
-                        <= token_start
-                        <= token_end
-                        <= assistant_end_char
-                    ):
-                        loss_mask[idx] = 1
-
-        except (NotImplementedError, TypeError, ValueError):
-            assistant_pattern = (
-                re.escape(self.assistant_message_separator)
-                + r"([\s\S]*?"
-                + re.escape(self.chat_template.end_of_turn_token)
-                + r")"  # 结束符现在被包含在 match.group(1) 中
+            # Encodes the text "assistant end", the length of which is the position of the end token.
+            full_ids = self.tokenizer.encode(
+                conversation[:content_end_char], add_special_tokens=False
             )
-            # get input_ids
-            encoding = self.tokenizer(
-                conversation,
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-            input_ids = encoding.input_ids[0]
-            loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
-            for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
-                content_start_char = match.start(1)
-                content_end_char = match.end(1)
 
-                # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
-                # Encode the text "assistant start", the length of which is the position of the starting token.
-                prefix_ids = self.tokenizer.encode(
-                    conversation[:content_start_char], add_special_tokens=False
-                )
-                # Encodes the text "assistant end", the length of which is the position of the end token.
-                full_ids = self.tokenizer.encode(
-                    conversation[:content_end_char], add_special_tokens=False
-                )
+            start_token_idx = len(prefix_ids)
+            end_token_idx = len(full_ids)
 
-                start_token_idx = len(prefix_ids)
-                end_token_idx = len(full_ids)
+            # Handling out-of-bounds errors caused by truncation
+            actual_start = min(start_token_idx, len(input_ids))
+            actual_end = min(end_token_idx, len(input_ids))
 
-                # Handling out-of-bounds errors caused by truncation
-                actual_start = min(start_token_idx, len(input_ids))
-                actual_end = min(end_token_idx, len(input_ids))
-
-                if actual_start < actual_end:
-                    loss_mask[actual_start:actual_end] = 1
-
+            if actual_start < actual_end:
+                loss_mask[actual_start:actual_end] = 1
         return input_ids, loss_mask
 
 
