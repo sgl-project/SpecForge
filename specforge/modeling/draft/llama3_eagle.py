@@ -5,7 +5,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import LlamaConfig
 from transformers.activations import ACT2FN
@@ -13,6 +12,7 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 from yunchang import EXTRACT_FUNC_DICT
 from yunchang.comm import SeqAllToAll4D
+import warnings
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -23,6 +23,12 @@ from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
+
+try:
+    from flash_attn import flash_attn_func
+except:
+    warnings.warn("flash_attn is not found, please install flash_attn if you want to use the flash attention backend")
+    flash_attn_func = None
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -1236,6 +1242,7 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
+        assert flash_attn_func is not None, "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
         attn_output, lse, _ = flash_attn_func(
             query_states,
             k0,

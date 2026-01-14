@@ -47,7 +47,7 @@ jobs:
           fi
           source sf/bin/activate
           uv pip install setuptools
-          MAX_JOBS=8 uv pip install -v . --prerelease=allow --no-build-isolation
+          MAX_JOBS=8 uv pip install -v ".[fa]" --prerelease=allow --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
