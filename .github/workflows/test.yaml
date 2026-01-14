@@ -51,6 +51,13 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        run: |
+          ls
+          source sf/bin/activate
+          python tests/test_utils/test_flash_attention.py
+      
+      - name: Run test
+        timeout-minutes: 30
         shell: bash
         run: |
           source sf/bin/activate
