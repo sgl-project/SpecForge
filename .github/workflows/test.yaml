@@ -54,7 +54,6 @@ jobs:
         shell: bash
         run: |
           source sf/bin/activate
-          export PYTHONPATH=$PWD
           uv pip list
           python tests/test_utils/test_flash_attention.py
 
