@@ -10,7 +10,6 @@ from specforge.modeling.draft.llama3_eagle import (
     prepare_decoder_attention_mask,
 )
 from specforge.utils import padding
-
 from tests.test_utils.utils import norm_tensor
 
 TTT_LENGTH = 7
