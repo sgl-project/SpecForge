@@ -11,7 +11,7 @@ from specforge.modeling.draft.llama3_eagle import (
 )
 from specforge.utils import padding
 
-from .utils import norm_tensor
+from tests.test_utils.utils import norm_tensor
 
 TTT_LENGTH = 7
 torch.manual_seed(0)
