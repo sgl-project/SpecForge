@@ -54,9 +54,8 @@ jobs:
         shell: bash
         run: |
           source sf/bin/activate
-          uv pip list
           export PYTHONPATH=$PWD
-          python tests/test_utils/test_flash_attention.py
+          python -m unittest discover -s ./tests -p "test_*.py" -v
 
       - name: Save cache
         run: |
