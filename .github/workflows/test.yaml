@@ -55,6 +55,7 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
+          uv pip list
           python tests/test_utils/test_flash_attention.py
 
       - name: Save cache

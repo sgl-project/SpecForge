@@ -34,7 +34,6 @@ dependencies = [
 packages = ["specforge"]
 
 [project.optional-dependencies]
-# Moved pre-commit to a dev extra
 dev = [
     "pre-commit",
     "unittest"
