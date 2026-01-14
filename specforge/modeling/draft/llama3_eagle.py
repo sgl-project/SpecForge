@@ -688,7 +688,7 @@ class LlamaAttention(nn.Module):
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids
+                    query_states, key_states, cos, sin, position_ids + lck
                 )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -1228,7 +1228,7 @@ class LlamaFlashAttention(LlamaAttention):
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids, unsqueeze_dim=2
+                query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
             )
 
         if cache_hidden is not None:
