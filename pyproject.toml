@@ -24,7 +24,7 @@ dependencies = [
     "pydantic",
     "sglang==0.5.6",
     "openai-harmony",
-    #"flash-attn>=2.8.3",
+    "flash-attn>=2.8.3",
     "yunchang",
 ]
 
@@ -34,6 +34,3 @@ packages = ["specforge"]
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
 description = {file = "README.md"}
-
-[tool.uv.extra-build-dependencies]
-flash-attn = ["torch==2.9.1"]
