@@ -310,18 +310,18 @@ def main():
     target_model, draft_model = build_models(args)
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
     # Get mask_token_id
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
-    elif hasattr(tokenizer, "mask_token_id") and tokenizer.mask_token_id is not None:
+    elif tokenizer.mask_token_id is not None:
         mask_token_id = tokenizer.mask_token_id
-    elif hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None:
-        mask_token_id = tokenizer.pad_token_id
     else:
-        mask_token_id = tokenizer.eos_token_id
+        tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
+        mask_token_id = tokenizer.mask_token_id
     print_on_rank0(f"Using mask_token_id: {mask_token_id}")
+
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch

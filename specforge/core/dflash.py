@@ -18,8 +18,8 @@ class OnlineDFlashModel(nn.Module):
         draft_model: DFlashDraftModel,
         target_lm_head: nn.Module,
         target_embed_tokens: nn.Module,
+        mask_token_id: int,
         block_size: int = 16,
-        mask_token_id: int = 151666,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -185,9 +185,8 @@ class OnlineDFlashModel(nn.Module):
         # Different blocks cannot see each other's noise.
 
         same_block = q_block_ids == k_block_ids
-        causal = indices.unsqueeze(0) >= indices.unsqueeze(1)  # j <= i
 
-        noise_mask = same_block & causal
+        noise_mask = same_block
 
         # Combine [Ctx_Mask, Noise_Mask]
         # Shape [L, 2L]
