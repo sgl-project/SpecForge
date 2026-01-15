@@ -92,8 +92,13 @@ class GeneralParser(Parser):
                             f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
                         break
-                if sentence["tool_calls"] is not None:
-                    sentence["tool_calls"] = json.loads(sentence["tool_calls"])
+                tool_calls = sentence.get("tool_calls")
+                if isinstance(tool_calls, str):
+                    try:
+                        sentence["tool_calls"] = json.loads(tool_calls)
+                    except json.JSONDecodeError:
+                        warnings.warn(f"Failed to parse tool_calls JSON: {tool_calls}")
+                        break
                 messages.append(sentence)
 
             try:

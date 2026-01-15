@@ -326,13 +326,13 @@ def safe_conversations_generator(file_path):
                         raw_convs = []
                     else:
                         # Edge case: 'conversations' is a plain string or non-iterable—skip this line
-                        print(
-                            f"⚠️ Line {i}: 'conversations' is not a list. Please check!"
+                        logger.warning(
+                            f"Line {i + 1}: 'conversations' is not a list. Please check!"
                         )
                         continue
 
                 cleaned_convs = []
-                for idx, msg in enumerate(raw_convs):
+                for msg in raw_convs:
                     # 2. Ensure each item in the list is a dictionary
                     if not isinstance(msg, dict):
                         # Skip if an element is not a dict (e.g., malformed like ["user", "hi"])
@@ -355,5 +355,5 @@ def safe_conversations_generator(file_path):
                 yield {"conversations": cleaned_convs}
 
             except Exception as e:
-                print(f"⚠️ Skipping line {i}: {e}")
+                logger.warning(f"Skipping line {i + 1}: {e}")
                 continue
