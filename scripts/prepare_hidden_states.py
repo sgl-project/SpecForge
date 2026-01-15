@@ -46,6 +46,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
+from datasets import Dataset
 from specforge.args import SGLangBackendArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
@@ -56,7 +57,11 @@ from specforge.distributed import (
     is_tp_rank_0,
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
-from specforge.utils import load_dataset_from_jsonl, print_with_rank, rank_0_priority
+from specforge.utils import (
+    print_with_rank,
+    rank_0_priority,
+    safe_conversations_generator,
+)
 
 
 @dataclass
@@ -573,7 +578,9 @@ def main():
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
-    dataset = load_dataset_from_jsonl(data_path=args.data_path)
+    dataset = Dataset.from_generator(
+        generator=safe_conversations_generator, gen_kwargs={"file_path": args.data_path}
+    )
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
 

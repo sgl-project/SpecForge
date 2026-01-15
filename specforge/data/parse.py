@@ -1,3 +1,4 @@
+import json
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -91,10 +92,14 @@ class GeneralParser(Parser):
                             f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
                         break
+                if sentence["tool_calls"] is not None:
+                    sentence["tool_calls"] = json.loads(sentence["tool_calls"])
                 messages.append(sentence)
 
             try:
-                conversation = self.apply_chat_template(messages, **kwargs)
+                conversation = self.apply_chat_template(
+                    messages, max_length=max_length, **kwargs
+                )
             except (ValueError, TypeError):
                 # Fallback rendering for tokenizers without built-in chat_template
                 warnings.warn(
