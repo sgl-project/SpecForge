@@ -77,8 +77,15 @@ class Eagle3TargetModel(ABC):
         Set the layers to capture the aux hidden states from the target model outputs.
         """
         if aux_hidden_states_layers is None:
+            # Check for num_hidden_layers in different config locations
+            # Text-only models: config.num_hidden_layers
+            # VLM models (Qwen3VL, etc.): config.text_config.num_hidden_layers
             if hasattr(self.model.config, "num_hidden_layers"):
                 num_layers = self.model.config.num_hidden_layers
+            elif hasattr(self.model.config, "text_config") and hasattr(
+                self.model.config.text_config, "num_hidden_layers"
+            ):
+                num_layers = self.model.config.text_config.num_hidden_layers
             else:
                 raise ValueError(
                     f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers"
