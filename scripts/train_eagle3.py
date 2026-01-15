@@ -320,16 +320,19 @@ def build_target_model(
             )
 
         # set the aux hidden states layers
-        if (
-            hasattr(draft_model_config, "eagle_config")
-            and draft_model_config.eagle_config is not None
-            and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
-        ):
-            target_model.set_aux_hidden_states_layers(
-                draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
-            )
-        else:
-            target_model.set_aux_hidden_states_layers()
+        # VLM models use QwenVLOnlineEagle3Model which has its own hidden state
+        # extraction in _prepare_data(), so we skip this call for VLM models
+        if not args.is_vlm:
+            if (
+                hasattr(draft_model_config, "eagle_config")
+                and draft_model_config.eagle_config is not None
+                and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
+            ):
+                target_model.set_aux_hidden_states_layers(
+                    draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
+                )
+            else:
+                target_model.set_aux_hidden_states_layers()
 
         if args.is_vlm:
             processor = AutoProcessor.from_pretrained(
