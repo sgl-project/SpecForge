@@ -6,25 +6,31 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, MultimodalDataItem, Modality, MultimodalInputs
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoModelForCausalLM
+
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
-
 
 
 @dataclass
@@ -248,7 +254,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         super().__init__()
         self.model_runner = model_runner
         self.hf_config = hf_config
-        
+
         # VLM-specific attributes (initialized from hf_config if available)
         self._init_vlm_attributes()
 
@@ -257,27 +263,29 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         if self.hf_config is None:
             self.is_vlm = False
             return
-            
+
         # Check if this is a VLM model by looking for vision_config
-        self.is_vlm = hasattr(self.hf_config, 'vision_config')
-        
+        self.is_vlm = hasattr(self.hf_config, "vision_config")
+
         if not self.is_vlm:
             return
-        
+
         init_mm_embedding_cache(1024 * 1024 * 512)
         # Model type (e.g., "qwen2_5_vl", "qwen2_vl")
-        self.model_type = getattr(self.hf_config, 'model_type', None)
-        
+        self.model_type = getattr(self.hf_config, "model_type", None)
+
         # Vision config attributes
         vision_config = self.hf_config.vision_config
-        self.spatial_merge_size = getattr(vision_config, 'spatial_merge_size', 2)
-        self.tokens_per_second = getattr(vision_config, 'tokens_per_second', None)
-        
+        self.spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
+        self.tokens_per_second = getattr(vision_config, "tokens_per_second", None)
+
         # Special token IDs from hf_config
-        self.image_token_id = getattr(self.hf_config, 'image_token_id', None)
-        self.video_token_id = getattr(self.hf_config, 'video_token_id', None)
-        self.vision_start_token_id = getattr(self.hf_config, 'vision_start_token_id', None)
-        self.vision_end_token_id = getattr(self.hf_config, 'vision_end_token_id', None)
+        self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+        self.video_token_id = getattr(self.hf_config, "video_token_id", None)
+        self.vision_start_token_id = getattr(
+            self.hf_config, "vision_start_token_id", None
+        )
+        self.vision_end_token_id = getattr(self.hf_config, "vision_end_token_id", None)
 
     @classmethod
     def from_pretrained(
@@ -320,10 +328,10 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         wrap_eagle3_logits_processors_in_module(
             model_runner.model, return_full_logits=False
         )
-        
+
         # Get hf_config from model_config for VLM attributes
-        hf_config = getattr(model_config, 'hf_config', None)
-        
+        hf_config = getattr(model_config, "hf_config", None)
+
         return cls(model_runner, hf_config=hf_config)
 
     def set_aux_hidden_states_layers(
@@ -468,26 +476,26 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Get M-RoPE position indices for VLM models like Qwen2.5-VL.
-        
+
         This is a wrapper around MRotaryEmbedding.get_rope_index that uses
         the VLM-specific attributes initialized from hf_config.
-        
+
         Args:
             input_ids: (batch_size, seq_len) input token IDs
             image_grid_thw: (num_images, 3) image grid dimensions (t, h, w)
             video_grid_thw: (num_videos, 3) video grid dimensions (t, h, w)
             second_per_grid_ts: Optional temporal information for videos
             attention_mask: (batch_size, seq_len) attention mask
-            
+
         Returns:
             position_ids: (3, batch_size, seq_len) M-RoPE position IDs
             rope_deltas: Optional position deltas for incremental decoding
         """
         if not self.is_vlm:
             raise ValueError("get_rope_index is only available for VLM models")
-        
+
         from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-        
+
         position_ids, rope_deltas = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.spatial_merge_size,
             image_token_id=self.image_token_id,
@@ -501,13 +509,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             attention_mask=attention_mask,
             tokens_per_second=self.tokens_per_second,
         )
-        
+
         return position_ids, rope_deltas
 
-    def extend_vlm(self, 
-        input_ids: torch.Tensor, 
-        attention_mask: torch.Tensor, 
-        loss_mask: torch.Tensor, 
+    def extend_vlm(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
         return_last_hidden_states: bool = False,
         return_logits: bool = True,
         pixel_values: Optional[List[torch.Tensor]] = None,
@@ -538,11 +547,10 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             image_grid_thw = [None] * batch_size
         elif not isinstance(image_grid_thw, (list, tuple)):
             image_grid_thw = [image_grid_thw]
-        
+
         # pixel_values is a single 2D tensor (total_patches, patch_dim) for Qwen2.5-VL
         # We need to track offset and slice it based on image_grid_thw for each sample
         pixel_values_offset = 0  # Track current offset in pixel_values
-
 
         for idx, (input_id_, attention_mask_, loss_mask_, image_grid_thw_) in enumerate(
             zip(
@@ -551,7 +559,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 loss_mask,
                 image_grid_thw,
             )
-        ): 
+        ):
             # Compute num_patches for this sample from image_grid_thw_
             # image_grid_thw_: (num_images, 3) where each row is (t, h, w)
             if image_grid_thw_ is not None:
@@ -559,14 +567,26 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 if image_grid_thw_.dim() == 1:
                     image_grid_thw_ = image_grid_thw_.unsqueeze(0)  # (3,) -> (1, 3)
                 elif image_grid_thw_.dim() == 0:
-                    raise ValueError(f"image_grid_thw_ is 0-dim tensor, expected at least 1D. Value: {image_grid_thw_}")
-                
+                    raise ValueError(
+                        f"image_grid_thw_ is 0-dim tensor, expected at least 1D. Value: {image_grid_thw_}"
+                    )
+
                 # Calculate num_patches for this sample: sum(t * h * w) for all images
-                num_patches = (image_grid_thw_[:, 0] * image_grid_thw_[:, 1] * image_grid_thw_[:, 2]).sum().item()
+                num_patches = (
+                    (
+                        image_grid_thw_[:, 0]
+                        * image_grid_thw_[:, 1]
+                        * image_grid_thw_[:, 2]
+                    )
+                    .sum()
+                    .item()
+                )
                 num_patches = int(num_patches)
-                
+
                 # Slice pixel_values for this sample
-                pixel_value_ = pixel_values[pixel_values_offset : pixel_values_offset + num_patches]
+                pixel_value_ = pixel_values[
+                    pixel_values_offset : pixel_values_offset + num_patches
+                ]
                 pixel_values_offset += num_patches
             else:
                 pixel_value_ = None
@@ -574,7 +594,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
             # Compute mrope positions for VLM models (e.g., Qwen2.5-VL)
             input_id_flat = input_id_.view(-1)
-            
+
             # Count image tokens
             num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
             # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
@@ -589,8 +609,10 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 image_grid_thw=image_grid_thw_,
                 tokens_per_second=self.tokens_per_second,
             )
-            
-            offset = BaseMultimodalProcessor.get_mm_items_offset(input_id_flat, self.image_token_id)
+
+            offset = BaseMultimodalProcessor.get_mm_items_offset(
+                input_id_flat, self.image_token_id
+            )
             mm_item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=pixel_value_,  # torch.Tensor: (num_patches, patch_dim)
@@ -603,7 +625,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 im_token_id=self.image_token_id,
                 im_start_id=self.vision_start_token_id,
                 im_end_id=self.vision_end_token_id,
-                mrope_positions=mrope_positions.squeeze(1) if mrope_positions is not None else None,
+                mrope_positions=(
+                    mrope_positions.squeeze(1) if mrope_positions is not None else None
+                ),
                 mrope_position_delta=mrope_position_delta,
             )
             req = Req(
@@ -627,7 +651,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         )
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
-        
+
     @torch.no_grad()
     def generate_eagle3_data(
         self,
@@ -636,7 +660,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         loss_mask: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
-        is_vlm: bool = False
+        is_vlm: bool = False,
     ) -> Eagle3TargetOutput:
         """
         return:
@@ -658,7 +682,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     return_last_hidden_states=False,
                     return_logits=True,
                     pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw   
+                    image_grid_thw=image_grid_thw,
                 )
             )
         else:

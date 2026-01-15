@@ -261,7 +261,9 @@ def preprocess_vlm_conversations(
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
-        pixel_values = encoding.pixel_values  # [total_patches, hidden_dim], no batch dim
+        pixel_values = (
+            encoding.pixel_values
+        )  # [total_patches, hidden_dim], no batch dim
         image_grid_thw = encoding.image_grid_thw  # [num_images, 3], no batch dim
 
         # get conversation with image info for loss mask generation

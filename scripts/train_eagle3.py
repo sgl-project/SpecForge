@@ -543,7 +543,11 @@ def run_forward(
             # we generate the eagle3 using the target model in an online fashion
             # Handle VLM data: pixel_values and image_grid_thw are lists
             # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
-            image_grid_thw = [thw.cuda().squeeze() for thw in data["image_grid_thw"]] if args.is_vlm else None
+            image_grid_thw = (
+                [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
+                if args.is_vlm
+                else None
+            )
             eagle3_data = target_model.generate_eagle3_data(
                 input_ids=data["input_ids"].cuda(),
                 attention_mask=data["attention_mask"].cuda(),

@@ -137,9 +137,10 @@ class OnlineEagle3Model(Eagle3Model):
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
             if is_vlm:
-                mrope_positions_ids, mrope_position_delta = self.target_model.get_rope_index(
-                    input_ids = input_ids,
-                    image_grid_thw=image_grid_thw
+                mrope_positions_ids, mrope_position_delta = (
+                    self.target_model.get_rope_index(
+                        input_ids=input_ids, image_grid_thw=image_grid_thw
+                    )
                 )
                 position_ids = mrope_positions_ids
             else:
