@@ -102,9 +102,7 @@ class GeneralParser(Parser):
                 messages.append(sentence)
 
             try:
-                conversation = self.apply_chat_template(
-                    messages, **kwargs
-                )
+                conversation = self.apply_chat_template(messages, **kwargs)
             except (ValueError, TypeError):
                 # Fallback rendering for tokenizers without built-in chat_template
                 warnings.warn(
@@ -155,11 +153,17 @@ class GeneralParser(Parser):
             # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
             # Encode the text "assistant start", the length of which is the position of the starting token.
             prefix_ids = self.tokenizer.encode(
-                conversation[:content_start_char], add_special_tokens=False, truncation=True, max_length=max_length,
+                conversation[:content_start_char],
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
             )
             # Encodes the text "assistant end", the length of which is the position of the end token.
             full_ids = self.tokenizer.encode(
-                conversation[:content_end_char], add_special_tokens=False, truncation=True, max_length=max_length,
+                conversation[:content_end_char],
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
             )
 
             start_token_idx = len(prefix_ids)
