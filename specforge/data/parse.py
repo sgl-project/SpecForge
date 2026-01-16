@@ -54,6 +54,7 @@ class GeneralParser(Parser):
         conversation: "Conversation",
         max_length: int,
         preformatted: bool = False,
+        train_only_last_turn: bool = False,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if not preformatted:
@@ -138,7 +139,12 @@ class GeneralParser(Parser):
         )
         input_ids = encoding.input_ids[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
-        for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+
+        matches = list(re.finditer(assistant_pattern, conversation, re.DOTALL))
+        if train_only_last_turn and matches:
+            matches = [matches[-1]]  # Only keep the last match
+
+        for match in matches:
             content_start_char = match.start(1)
             content_end_char = match.end(1)
 
@@ -200,7 +206,11 @@ class HarmonyParser(Parser):
         return prompt_text
 
     def parse(
-        self, conversation: "Conversation", max_length: int, preformatted: bool = False
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        train_only_last_turn: bool = False,
     ) -> List[torch.Tensor]:
         # conversation = process_harmony_conversations(conversation)
         if not preformatted:
@@ -243,7 +253,11 @@ class HarmonyParser(Parser):
         )
 
         # Find all matching segments
-        for match in pattern.finditer(conversation):
+        matches = list(pattern.finditer(conversation))
+        if train_only_last_turn and matches:
+            matches = [matches[-1]]  # Only keep the last match
+
+        for match in matches:
             # match.start(0) is the start index of the full match (including `<|start|>assistant`)
             # match.start(1) is the start index of the first capture group (excluding `<|start|>assistant`)
             # match.end(1) is the end index of the content
@@ -288,10 +302,13 @@ class ThinkingParser(GeneralParser):
         conversation: "Conversation",
         max_length: int,
         preformatted: bool = False,
+        train_only_last_turn: bool = False,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if self.chat_template.enable_thinking:
             kwargs["enable_thinking"] = True
         else:
             pass
-        return super().parse(conversation, max_length, preformatted, **kwargs)
+        return super().parse(
+            conversation, max_length, preformatted, train_only_last_turn, **kwargs
+        )

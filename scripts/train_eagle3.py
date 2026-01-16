@@ -109,6 +109,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         action="store_true",
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
     )
+    dataset_group.add_argument(
+        "--train-only-last-turn",
+        action="store_true",
+        help="If set, only the last assistant turn in each conversation contributes to the loss. "
+        "Useful for thinking models where conversation history may lack thought processes.",
+    )
     dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
     dataset_group.add_argument(
         "--dataloader-num-workers",
@@ -422,6 +428,7 @@ def build_dataloaders(
             is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
+            train_only_last_turn=args.train_only_last_turn,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -462,6 +469,7 @@ def build_dataloaders(
                 processor=processor,
                 num_proc=args.build_dataset_num_proc,
                 is_preformatted=args.is_preformatted,
+                train_only_last_turn=args.train_only_last_turn,
             )
         elif args.eval_hidden_states_path is not None:
             eval_eagle3_dataset = build_offline_eagle3_dataset(
