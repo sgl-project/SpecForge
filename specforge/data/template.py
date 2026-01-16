@@ -276,3 +276,14 @@ TEMPLATE_REGISTRY.register(
         enable_thinking=True,
     ),
 )
+
+
+TEMPLATE_REGISTRY.register(
+    name="repo-wiki",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
