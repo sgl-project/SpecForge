@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -402,6 +403,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         # TODO: can we not clear?
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
+        mm_utils.embedding_cache.clear()
         return logits, aux_hidden_states_list, last_hidden_states
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
@@ -530,7 +532,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             pixel_values: List of pixel_values tensors, one per sample in batch
             image_grid_thw: List of image_grid_thw tensors, one per sample in batch
         """
-
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
 

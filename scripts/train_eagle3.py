@@ -440,7 +440,7 @@ def build_dataloaders(
         ),
         is_vlm=args.is_vlm,
     )
-
+    # ForkedPdb().set_trace()
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
             eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
@@ -530,7 +530,7 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    if args.is_vlm and args.target_model_backend == "costom":
+    if args.is_vlm and args.target_model_backend == "custom":
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
@@ -700,6 +700,7 @@ def main():
         args.is_vlm
         and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
         and args.tp_size == 1
+        and args.target_model_backend != "sglang"
     ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
