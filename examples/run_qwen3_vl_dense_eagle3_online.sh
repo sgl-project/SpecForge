@@ -5,16 +5,17 @@ ROOT_DIR=$(dirname $SCRIPT_DIR)
 
 # support tp1 train eagle3 for Qwen3-VL-8B-Instruct
 NUM_GPUS=${1:-1}
+BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-0}
 
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
-    $ROOT_DIR/scripts/train_eagle3_online.py \
+    $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path Qwen/Qwen3-VL-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/qwen3-vl-8b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/allava4v_train.jsonl \
     --output-dir $ROOT_DIR/outputs/Qwen3-VL-8B-eagle3 \
-    --build-dataset-num-proc 0 \
+    --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --num-epochs 10 \
     --batch-size 1 \
     --learning-rate 1e-4 \
