@@ -129,7 +129,15 @@ class Qwen3DFlashAttention(nn.Module):
         cos, sin = position_embeddings
         q = q.transpose(1, 2)  # [bsz, num_heads, q_len, head_dim]
         k = k.transpose(1, 2)  # [bsz, num_kv_heads, ctx_len+q_len, head_dim]
+        v = v.transpose(1, 2)  # [bsz, num_kv_heads, ctx_len+q_len, head_dim]
         q, k = apply_rotary_pos_emb_dflash(q, k, cos, sin)
+
+        # Update KV cache if needed (for inference)
+        if past_key_values is not None:
+            # For DFlash, we cache the concatenated [K_ctx, K_noise]
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            # After cache update: k, v are [bsz, num_kv_heads, total_seq_len, head_dim]
 
         # Use Flash Attention if available, otherwise fallback to SDPA
         if flash_attn_func is not None:
@@ -137,14 +145,13 @@ class Qwen3DFlashAttention(nn.Module):
             attn_output = flash_attn_func(
                 q.transpose(1, 2),
                 k.transpose(1, 2),
-                v,
+                v.transpose(1, 2),
                 dropout_p=0.0,
                 softmax_scale=1.0 / math.sqrt(self.head_dim),
                 causal=False,
             )
         else:
             # SDPA expects [bsz, num_heads, seq_len, head_dim]
-            v = v.transpose(1, 2)
             k = repeat_kv(k, self.num_key_value_groups)
             v = repeat_kv(v, self.num_key_value_groups)
             attn_output = torch.nn.functional.scaled_dot_product_attention(
