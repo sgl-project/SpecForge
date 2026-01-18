@@ -30,4 +30,4 @@ torchrun \
     --is-vlm \
     --torch-dtype bfloat16 \
     --min-pixels 200704 \
-    --max-pixels 1003520
+    --max-pixels 1003520 
