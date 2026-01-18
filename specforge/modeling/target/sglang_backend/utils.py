@@ -45,6 +45,11 @@ def replaced_logits_processor_forward_for_eagle3(
     if isinstance(logits_metadata, ForwardBatch):
         logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
+    # Handle qwen3_vl that return (hidden_states, aux_hidden_states) tuple
+    if isinstance(hidden_states, tuple):
+        aux_hidden_states = hidden_states[1]
+        hidden_states = hidden_states[0]
+
     # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
     multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
     if multi_item_delimiter is not None and logits_metadata.is_prefill_only:

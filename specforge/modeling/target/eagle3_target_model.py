@@ -1,16 +1,26 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
+import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -241,9 +251,42 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
 class SGLangEagle3TargetModel(Eagle3TargetModel):
 
-    def __init__(self, model_runner: SGLangRunner):
+    def __init__(self, model_runner: SGLangRunner, hf_config=None):
         super().__init__()
         self.model_runner = model_runner
+        self.hf_config = hf_config
+
+        # VLM-specific attributes (initialized from hf_config if available)
+        self._init_vlm_attributes()
+
+    def _init_vlm_attributes(self):
+        """Initialize VLM-specific attributes from hf_config for models like Qwen2.5-VL"""
+        if self.hf_config is None:
+            self.is_vlm = False
+            return
+
+        # Check if this is a VLM model by looking for vision_config
+        self.is_vlm = hasattr(self.hf_config, "vision_config")
+
+        if not self.is_vlm:
+            return
+
+        init_mm_embedding_cache(1024 * 1024 * 512)
+        # Model type (e.g., "qwen2_5_vl", "qwen2_vl")
+        self.model_type = getattr(self.hf_config, "model_type", None)
+
+        # Vision config attributes
+        vision_config = self.hf_config.vision_config
+        self.spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
+        self.tokens_per_second = getattr(vision_config, "tokens_per_second", None)
+
+        # Special token IDs from hf_config
+        self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+        self.video_token_id = getattr(self.hf_config, "video_token_id", None)
+        self.vision_start_token_id = getattr(
+            self.hf_config, "vision_start_token_id", None
+        )
+        self.vision_end_token_id = getattr(self.hf_config, "vision_end_token_id", None)
 
     @classmethod
     def from_pretrained(
@@ -286,7 +329,11 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         wrap_eagle3_logits_processors_in_module(
             model_runner.model, return_full_logits=False
         )
-        return cls(model_runner)
+
+        # Get hf_config from model_config for VLM attributes
+        hf_config = getattr(model_config, "hf_config", None)
+
+        return cls(model_runner, hf_config=hf_config)
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -356,6 +403,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         # TODO: can we not clear?
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
+        mm_utils.embedding_cache.clear()
         return logits, aux_hidden_states_list, last_hidden_states
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
@@ -420,12 +468,202 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
 
+    def get_rope_index(
+        self,
+        input_ids: torch.Tensor,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Get M-RoPE position indices for VLM models like Qwen2.5-VL.
+
+        This is a wrapper around MRotaryEmbedding.get_rope_index that uses
+        the VLM-specific attributes initialized from hf_config.
+
+        Args:
+            input_ids: (batch_size, seq_len) input token IDs
+            image_grid_thw: (num_images, 3) image grid dimensions (t, h, w)
+            video_grid_thw: (num_videos, 3) video grid dimensions (t, h, w)
+            second_per_grid_ts: Optional temporal information for videos
+            attention_mask: (batch_size, seq_len) attention mask
+
+        Returns:
+            position_ids: (3, batch_size, seq_len) M-RoPE position IDs
+            rope_deltas: Optional position deltas for incremental decoding
+        """
+        if not self.is_vlm:
+            raise ValueError("get_rope_index is only available for VLM models")
+
+        from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+
+        position_ids, rope_deltas = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.spatial_merge_size,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            attention_mask=attention_mask,
+            tokens_per_second=self.tokens_per_second,
+        )
+
+        return position_ids, rope_deltas
+
+    def extend_vlm(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = True,
+        pixel_values: Optional[List[torch.Tensor]] = None,
+        image_grid_thw: Optional[List[torch.Tensor]] = None,
+    ):
+        """
+        Args:
+            input_ids: (batch_size, seq_len) or List of (1, seq_len) tensors
+            attention_mask: (batch_size, seq_len) or List of (1, seq_len) tensors
+            loss_mask: (batch_size, seq_len) or List of (1, seq_len) tensors
+            pixel_values: List of pixel_values tensors, one per sample in batch
+            image_grid_thw: List of image_grid_thw tensors, one per sample in batch
+        """
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
+        reqs, data_cache = [], []
+
+        # Split tensors if needed
+        if isinstance(input_ids, torch.Tensor):
+            batch_size = input_ids.shape[0]
+            input_ids = torch.split(input_ids, 1, dim=0)
+            attention_mask = torch.split(attention_mask, 1, dim=0)
+            loss_mask = torch.split(loss_mask, 1, dim=0)
+        else:
+            batch_size = len(input_ids)
+        # Process image_grid_thw - convert to list if needed
+        if image_grid_thw is None:
+            image_grid_thw = [None] * batch_size
+        elif not isinstance(image_grid_thw, (list, tuple)):
+            image_grid_thw = [image_grid_thw]
+
+        # pixel_values is a single 2D tensor (total_patches, patch_dim) for Qwen2.5-VL
+        # We need to track offset and slice it based on image_grid_thw for each sample
+        pixel_values_offset = 0  # Track current offset in pixel_values
+
+        for idx, (input_id_, attention_mask_, loss_mask_, image_grid_thw_) in enumerate(
+            zip(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                image_grid_thw,
+            )
+        ):
+            # Compute num_patches for this sample from image_grid_thw_
+            # image_grid_thw_: (num_images, 3) where each row is (t, h, w)
+            if image_grid_thw_ is not None:
+                # Ensure image_grid_thw_ is 2D: (num_images, 3)
+                if image_grid_thw_.dim() == 1:
+                    image_grid_thw_ = image_grid_thw_.unsqueeze(0)  # (3,) -> (1, 3)
+                elif image_grid_thw_.dim() == 0:
+                    raise ValueError(
+                        f"image_grid_thw_ is 0-dim tensor, expected at least 1D. Value: {image_grid_thw_}"
+                    )
+
+                # Calculate num_patches for this sample: sum(t * h * w) for all images
+                num_patches = (
+                    (
+                        image_grid_thw_[:, 0]
+                        * image_grid_thw_[:, 1]
+                        * image_grid_thw_[:, 2]
+                    )
+                    .sum()
+                    .item()
+                )
+                num_patches = int(num_patches)
+
+                # Slice pixel_values for this sample
+                pixel_value_ = pixel_values[
+                    pixel_values_offset : pixel_values_offset + num_patches
+                ]
+                pixel_values_offset += num_patches
+            else:
+                pixel_value_ = None
+                num_patches = 0
+
+            # Compute mrope positions for VLM models (e.g., Qwen2.5-VL)
+            input_id_flat = input_id_.view(-1)
+
+            # Count image tokens
+            num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
+            # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
+
+            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+                spatial_merge_size=self.spatial_merge_size,
+                image_token_id=self.image_token_id,
+                video_token_id=self.video_token_id,
+                vision_start_token_id=self.vision_start_token_id,
+                model_type=self.model_type,
+                input_ids=input_id_flat.unsqueeze(0),
+                image_grid_thw=(
+                    image_grid_thw_.cpu() if image_grid_thw_ is not None else None
+                ),
+                tokens_per_second=self.tokens_per_second,
+            )
+
+            offset = BaseMultimodalProcessor.get_mm_items_offset(
+                input_id_flat, self.image_token_id
+            )
+            mm_item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=pixel_value_,  # torch.Tensor: (num_patches, patch_dim)
+                pad_value=self.image_token_id,  # Required for placeholder tensor creation
+                offsets=offset,  # List of (start, end) tuples
+            )
+            mm_item.set("image_grid_thw", image_grid_thw_.cpu())
+            mm_inputs = MultimodalInputs(
+                mm_items=[mm_item],
+                im_token_id=self.image_token_id,
+                im_start_id=self.vision_start_token_id,
+                im_end_id=self.vision_end_token_id,
+                mrope_positions=(
+                    mrope_positions.squeeze(1) if mrope_positions is not None else None
+                ),
+                mrope_position_delta=mrope_position_delta,
+            )
+            req = Req(
+                rid=str(idx),
+                origin_input_text="",
+                origin_input_ids=input_id_.view(-1).tolist(),
+                sampling_params=sampling_params,
+            )
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.multimodal_inputs = mm_inputs
+            data_cache.append([input_id_, attention_mask_, loss_mask_])
+            reqs.append(req)
+
+        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
+            reqs,
+            capture_aux_hidden_states=True,
+            return_last_hidden_states=return_last_hidden_states,
+            return_logits=return_logits,
+        )
+
+        return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+
     @torch.no_grad()
     def generate_eagle3_data(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        is_vlm: bool = False,
     ) -> Eagle3TargetOutput:
         """
         return:
@@ -435,16 +673,31 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 - loss_mask: (1, seq_len)
                 - target: (1, seq_len, vocab_size) or (1, seq_len, hidden_size)
                 - hidden_states: (1, seq_len, hidden_size)
+                - pixel_values: (patch_len, patch_width)
+                - image_grid_thw (batch_size, 3)
         """
-        data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            self.extend(
-                input_ids,
-                attention_mask,
-                loss_mask,
-                return_last_hidden_states=False,
-                return_logits=True,
+        if is_vlm:
+            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
+                self.extend_vlm(
+                    input_ids,
+                    attention_mask,
+                    loss_mask,
+                    return_last_hidden_states=False,
+                    return_logits=True,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                )
             )
-        )
+        else:
+            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
+                self.extend(
+                    input_ids,
+                    attention_mask,
+                    loss_mask,
+                    return_last_hidden_states=False,
+                    return_logits=True,
+                )
+            )
         aux_hidden_states_out = []
         target_out = []
         loss_mask_out = []
