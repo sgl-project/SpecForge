@@ -268,7 +268,7 @@ def build_target_model(
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.target_model_backend == "custom"
+            and args.tp_size == 1
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
 
@@ -456,6 +456,7 @@ def build_dataloaders(
         ),
         is_vlm=args.is_vlm,
     )
+
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
             eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
@@ -546,7 +547,7 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    if args.is_vlm and args.target_model_backend == "custom":
+    if args.is_vlm:
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
@@ -557,20 +558,10 @@ def run_forward(
     else:
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
-            # Handle VLM data: pixel_values and image_grid_thw are lists
-            # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
-            image_grid_thw = (
-                [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
-                if args.is_vlm
-                else None
-            )
             eagle3_data = target_model.generate_eagle3_data(
                 input_ids=data["input_ids"].cuda(),
                 attention_mask=data["attention_mask"].cuda(),
                 loss_mask=data["loss_mask"].cuda(),
-                is_vlm=args.is_vlm,
-                pixel_values=data["pixel_values"].cuda(),
-                image_grid_thw=image_grid_thw,
             )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
@@ -588,14 +579,13 @@ def run_forward(
             input_ids, target, loss_mask = target_model.preprocess(
                 input_ids, target, loss_mask
             )
+
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
-            image_grid_thw=image_grid_thw,
-            is_vlm=args.is_vlm,
         )
     return plosses, acces
 
@@ -757,8 +747,6 @@ def main():
     if (
         args.is_vlm
         and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
-        and args.tp_size == 1
-        and args.target_model_backend != "sglang"
     ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
@@ -769,7 +757,6 @@ def main():
         )
     else:
         eagle3_model = OnlineEagle3Model(
-            target_model=target_model,
             draft_model=draft_model,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
@@ -923,6 +910,7 @@ def main():
                     tracker,
                     mode="eval",
                 )
+
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
@@ -935,6 +923,7 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+
     # Save final checkpoint if training ended without saving
     if global_step % args.save_interval != 0:
         print_on_rank0(

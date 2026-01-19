@@ -59,7 +59,6 @@ class OnlineEagle3Model(Eagle3Model):
         draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
-        target_model: Optional[Eagle3Model] = None,
     ):
         """
         Args:
@@ -71,7 +70,6 @@ class OnlineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
-        self.target_model = target_model
 
         if self.attention_backend == "usp":
             self.extract_func = EXTRACT_FUNC_DICT["basic"]
@@ -100,8 +98,6 @@ class OnlineEagle3Model(Eagle3Model):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        is_vlm: bool = False,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -136,22 +132,14 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            if is_vlm:
-                mrope_positions_ids, mrope_position_delta = (
-                    self.target_model.get_rope_index(
-                        input_ids=input_ids, image_grid_thw=image_grid_thw
-                    )
-                )
-                position_ids = mrope_positions_ids
-            else:
-                device = hidden_states.device
-                position_ids = torch.arange(
-                    past_key_values_length,
-                    seq_length + past_key_values_length,
-                    dtype=torch.long,
-                    device=device,
-                )
-                position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            device = hidden_states.device
+            position_ids = torch.arange(
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=device,
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
