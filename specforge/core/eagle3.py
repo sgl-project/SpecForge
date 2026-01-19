@@ -327,7 +327,11 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         # remove optional None entries to avoid unexpected kwargs errors
         filtered_target_kwargs = {}
         for key, value in target_kwargs.items():
-            if key in {"input_ids", "attention_mask", "output_hidden_states", "use_cache"} or value is not None:
+            if (
+                key
+                in {"input_ids", "attention_mask", "output_hidden_states", "use_cache"}
+                or value is not None
+            ):
                 filtered_target_kwargs[key] = value
 
         outputs = self.target_model(**filtered_target_kwargs)
@@ -354,7 +358,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         else:
             # Qwen3VL uses deepstack at decoder layers 0, 1, 2
             # Start at layer 3 to avoid capture timing mismatch with sglang
-            first_layer = 3 if self.target_model_type in ("qwen3_vl", "qwen3_vl_moe") else 1
+            first_layer = (
+                3 if self.target_model_type in ("qwen3_vl", "qwen3_vl_moe") else 1
+            )
             aux_layer_ids = [first_layer, num_layers // 2 - 1, num_layers - 4]
 
         low_aux_layer = aux_layer_ids[0] + offset
@@ -511,16 +517,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             if rope_deltas is not None:
                 self.rope_deltas = rope_deltas
             full_attention_mask = (
-                base_attention_mask.clone()
-                if base_attention_mask is not None
-                else None
+                base_attention_mask.clone() if base_attention_mask is not None else None
             )
         else:
             position_ids = position_ids
             full_attention_mask = (
-                base_attention_mask.clone()
-                if base_attention_mask is not None
-                else None
+                base_attention_mask.clone() if base_attention_mask is not None else None
             )
 
         # Step 4: handle attention mask
@@ -611,10 +613,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                         seq_length=seq_length,
                         past_key_values_length=past_key_values_length,
                     )
-                elif (
-                    attention_mask is not None
-                    and self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}
-                ):
+                elif attention_mask is not None and self.target_model_type in {
+                    "qwen3_vl",
+                    "qwen3_vl_moe",
+                }:
                     # qwen3 path carries the un-expanded 2D causal mask directly.
                     attention_mask = padding(attention_mask, left=False)
 

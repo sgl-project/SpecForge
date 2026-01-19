@@ -579,13 +579,25 @@ class LlamaInterleavedMultiRotaryEmbedding(LlamaRotaryEmbedding):
         # if position_ids.ndim == 2:
         #     position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+        )
         position_ids_expanded = position_ids[:, :, None, :].float()
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32 for precision
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(
+            device_type=device_type, enabled=False
+        ):  # Force float32 for precision
             # Calculate base frequencies: (3, bs, seq_len, head_dim/2)
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(2, 3)
             interleaved_freqs = self._apply_interleaved_mrope(freqs)
             emb = torch.cat((interleaved_freqs, interleaved_freqs), dim=-1)
             cos = emb.cos() * self.scaling_factor
@@ -676,18 +688,21 @@ class LlamaAttention(nn.Module):
                     orig_max_position=rope_get("original_max_position_embeddings"),
                 )
             elif scaling_type in ["mrope", "default"]:
-                is_interleaved = getattr(self.config.rope_scaling, "mrope_interleaved", False)
+                is_interleaved = getattr(
+                    self.config.rope_scaling, "mrope_interleaved", False
+                )
                 rope_theta = getattr(self.config, "rope_theta", 10000)
 
                 if is_interleaved:
                     self.rotary_emb = LlamaInterleavedMultiRotaryEmbedding(
                         self.head_dim,
                         max_position_embeddings=self.max_position_embeddings,
-                        base=rope_theta
+                        base=rope_theta,
                     )
                 else:
                     self.rotary_emb = LlamaMutiRotaryEmbedding(
-                        self.head_dim, max_position_embeddings=self.max_position_embeddings
+                        self.head_dim,
+                        max_position_embeddings=self.max_position_embeddings,
                     )
             elif scaling_type == "yarn":
                 self.rotary_emb = LlamaYarnRotaryEmbedding(

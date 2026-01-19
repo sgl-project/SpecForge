@@ -326,7 +326,8 @@ def build_target_model(
             if (
                 hasattr(draft_model_config, "eagle_config")
                 and draft_model_config.eagle_config is not None
-                and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
+                and "eagle_aux_hidden_state_layer_ids"
+                in draft_model_config.eagle_config
             ):
                 target_model.set_aux_hidden_states_layers(
                     draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
@@ -769,15 +770,11 @@ def main():
     # ================================================
     # 4. Build Eagle3 model
     # ================================================
-    if (
-        args.is_vlm
-        and getattr(draft_model_config, "target_model_type", None)
-        in {
-            "qwen2_5_vl",
-            "qwen3_vl",
-            "qwen3_vl_moe",
-        }
-    ):
+    if args.is_vlm and getattr(draft_model_config, "target_model_type", None) in {
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    }:
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
