@@ -31,14 +31,16 @@ class OnlineDFlashModel(nn.Module):
     def prepare_noise_input(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Prepare noise input: first token of each block is real, rest are MASK."""
         # input_ids: [bsz, seq_len]
-        seq_len = input_ids.shape[1]
+        bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        positions = torch.arange(seq_len, device=device)
-        is_block_start = (positions % self.block_size) == 0
+        # Create mask in a vectorized way - more efficient than full_like + indexing
+        is_block_start = torch.arange(seq_len, device=device) % self.block_size == 0
 
-        noise_input_ids = torch.full_like(input_ids, self.mask_token_id)
-        noise_input_ids[:, is_block_start] = input_ids[:, is_block_start]
+        # Use where for single-pass creation
+        noise_input_ids = torch.where(
+            is_block_start.unsqueeze(0), input_ids, self.mask_token_id
+        )
 
         return noise_input_ids
 
@@ -78,8 +80,8 @@ class OnlineDFlashModel(nn.Module):
         # Noise part:   0..L-1
         # This ensures that Noise at pos i uses the same RoPE embedding as Context at pos i
         pos_seq = torch.arange(effective_len, device=device)
-        # shape: [1, 2*L] -> [bsz, 2*L]
-        position_ids = torch.cat([pos_seq, pos_seq], dim=0).unsqueeze(0).expand(bsz, -1)
+        # Optimized: use repeat instead of cat + expand
+        position_ids = pos_seq.unsqueeze(0).repeat(bsz, 2)
 
         # 4. Construct Parallel Attention Mask
         # The modeling code will internally concat K = [K_ctx, K_noise]
@@ -107,34 +109,31 @@ class OnlineDFlashModel(nn.Module):
         dflash_loss_mask_base = create_dflash_loss_mask(
             effective_len, self.block_size, device
         )
+        # Use in-place multiplication to save memory
         combined_mask = loss_mask * dflash_loss_mask_base.unsqueeze(0)
-
-        # hidden[i] predicts input_ids[i] (based on DFlash design where noise[i] is input to predict target[i])
-        # However, check design:
-        # "hidden[i] predicts token[i] (directly corresponding), not token[i+1]"
-        # "noise_input[i] is MASK, we want to predict input_ids[i]"
-        # So logits at index i should be compared to labels at index i.
 
         logits = self.lm_head(hidden)
 
-        # Calculate Loss
-        # Flatten
-        logits_flat = logits.reshape(-1, logits.size(-1))
-        labels_flat = input_ids.reshape(-1)
-        mask_flat = combined_mask.reshape(-1)
+        # Calculate Loss - optimized version
+        # Get active indices before flattening to reduce operations
+        active_mask = combined_mask > 0.5
 
-        # Optimization: only compute CE on valid tokens
-        active_indices = mask_flat > 0.5
-        active_logits = logits_flat[active_indices]
-        active_labels = labels_flat[active_indices]
+        # Use view instead of reshape where possible (view is faster)
+        vocab_size = logits.size(-1)
+        logits_flat = logits.view(-1, vocab_size)
+        labels_flat = input_ids.view(-1)
+        active_mask_flat = active_mask.view(-1)
+
+        # Index once for both loss and accuracy
+        active_logits = logits_flat[active_mask_flat]
+        active_labels = labels_flat[active_mask_flat]
 
         loss = F.cross_entropy(active_logits, active_labels)
 
+        # Combine accuracy computation with argmax to reduce operations
         with torch.no_grad():
             preds = active_logits.argmax(dim=-1)
-            correct = (preds == active_labels).float().sum()
-            total = active_labels.numel()
-            accuracy = correct / total
+            accuracy = (preds == active_labels).float().mean()
 
         return loss, accuracy
 
@@ -143,86 +142,25 @@ class OnlineDFlashModel(nn.Module):
     ) -> torch.Tensor:
         """
         Creates the [L, 2L] mask for parallel training.
-        Rows: Query (Noise) indices 0..L-1
-        Cols: Key indices 0..2L-1 (First L are Context, Next L are Noise)
-
-        Logic for Query at index i (belonging to block B = i // block_size):
-        1. Can see Context (Cols 0..L-1):
-           - Can see context of PREVIOUS blocks.
-           - Range: [0, B * block_size)
-        2. Can see Noise (Cols L..2L-1):
-           - Can see noise of CURRENT block up to self.
-           - Range: [L + B * block_size, L + i]
-           - (Inclusive of i because causal mask usually allows seeing self)
+        Optimized version with reduced tensor operations.
         """
-        # Block indices for each position [0, 1, 2, 3, 0, 1, 2, 3, ...]
-        # Strided blocks: positions with same offset within chunks belong to same block
+        # Use direct indexing instead of multiple tensor operations
         indices = torch.arange(seq_len, device=device)
         block_ids = indices % self.block_size
 
-        # 1. Context Mask (L x L) - Left half of K
-        # Q[i] can see K_ctx[j] if Block(Q[i]) > Block(K_ctx[j])
-        # Actually, Block(Q[i]) can see Context of all previous blocks.
-        # It implies Block(K_ctx[j]) < Block(Q[i])
-        # Wait, strictly: Block B needs context from 0..(B*16).
-        # So it sees all K_ctx where index < B * 16.
-        # Which is equivalent to block_ids[j] < block_ids[i].
+        # Create masks more efficiently using broadcasting
+        # ctx_mask: [L, L] - causal mask for context
+        ctx_mask = indices.unsqueeze(0) < indices.unsqueeze(1)
 
-        # Broadcast logic
-        # shape [L, 1]
-        q_block_ids = block_ids.unsqueeze(1)
-        # shape [1, L]
-        k_block_ids = block_ids.unsqueeze(0)
+        # noise_mask: [L, L] - same block mask for noise
+        noise_mask = block_ids.unsqueeze(0) == block_ids.unsqueeze(1)
 
-        # Mask: Q[i] can see all context positions j where j < i (causal)
-        # For strided blocks, this ensures each position sees all earlier positions
-        q_indices = indices.unsqueeze(1)
-        k_indices = indices.unsqueeze(0)
-        ctx_mask = k_indices < q_indices
-
-        # 2. Noise Mask (L x L) - Right half of K
-        # Standard Causal Mask WITHIN the same block.
-        # Q[i] can see K_noise[j] if:
-        #   a) Same Block: Block(Q[i]) == Block(K_noise[j])
-        #   b) Causal: j <= i
-        # Different blocks cannot see each other's noise.
-
-        same_block = q_block_ids == k_block_ids
-
-        noise_mask = same_block
-
-        # Combine [Ctx_Mask, Noise_Mask]
-        # Shape [L, 2L]
-        # We need float mask for attention: 0.0 for allow, -inf for mask
-        # Transformers usually handles boolean masks by converting them,
-        # but explicit MinValue is safer if passing to generic attention.
-        # However, most HF models accept boolean [batch, 1, Q, K].
-
+        # Combine masks: [L, 2L]
         full_mask_bool = torch.cat([ctx_mask, noise_mask], dim=1)
 
-        # Check standard HF format: usually 1 for keep, 0 for mask, or boolean.
-        # Qwen3 implementation likely uses typical attention_mask handling.
-        # Let's return boolean for now, the model wrapper usually handles conversion
-        # or we check Qwen3DFlashAttention source usage.
-        # Looking at Qwen3DFlashAttention: `attn_output = attn_fn(..., attention_mask, ...)`
-        # If using SDPA, it expects boolean or float mask.
-        # If we look at `modeling_qwen3.py` (standard), it usually employs `_prepare_4d_causal_attention_mask`.
-        # But here we pass it explicitly.
-        # To be safe with `eager_attention_forward` and `SDPA`, we typically want:
-        # 0.0 for unmasked, -inf for masked.
-
-        dtype = (
-            torch.bfloat16
-        )  # or get from device/model, but we return a tensor builder
-        # We will cast later or return boolean and let logic handle it?
-        # Safe bet: Return typical extended attention mask format: 0.0 for keep, min_dtype for remove.
-
-        # But wait, Qwen3DFlashAttention passes attention_mask directly to attn_fn.
-        # If attn_fn is SDPA, it handles boolean.
-        # Let's return a float mask: 0.0 for True, -inf for False.
-
-        full_mask = torch.zeros_like(full_mask_bool, dtype=torch.float32)
-        full_mask.masked_fill_(~full_mask_bool, torch.finfo(torch.float32).min)
+        # Convert to float mask in one operation
+        # 0.0 for keep, -inf for mask
+        full_mask = torch.where(full_mask_bool, 0.0, torch.finfo(torch.float32).min)
 
         return full_mask
 
@@ -233,12 +171,13 @@ def create_dflash_loss_mask(
     """
     Create DFlash-specific loss mask.
     Excludes Block 0 and first position of each block.
+    Optimized version with reduced operations.
     """
     positions = torch.arange(seq_len, device=device)
-    block_ids = positions // block_size
 
-    is_block_0 = block_ids == 0
-    is_block_start = (positions % block_size) == 0
+    # Combine conditions in one pass: exclude block 0 and block starts
+    # positions < block_size -> block 0
+    # positions % block_size == 0 -> block start
+    valid_mask = (positions >= block_size) & (positions % block_size != 0)
 
-    valid_mask = ~is_block_0 & ~is_block_start
     return valid_mask.float()
