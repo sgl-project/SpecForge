@@ -57,6 +57,13 @@ def parse_args():
         default=None,
         help="MASK token ID. If not provided, auto-detect from tokenizer.",
     )
+    model_group.add_argument(
+        "--attention-backend",
+        type=str,
+        default="flex_attention",
+        choices=["eager", "sdpa", "flex_attention"],
+        help="Attention backend for draft model.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -132,6 +139,10 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
+
+    # Set attention implementation based on backend
+    draft_config._attn_implementation = args.attention_backend
+    print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
     draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
@@ -344,6 +355,7 @@ def main():
         target_embed_tokens=target_components.embed_tokens,
         block_size=draft_model.block_size,
         mask_token_id=mask_token_id,
+        attention_backend=args.attention_backend,
     )
 
     dflash_model = FSDP(
@@ -436,6 +448,7 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "iter_time": f"{elapsed:.2f}s",
                     }
                 )
 
