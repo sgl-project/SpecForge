@@ -625,12 +625,17 @@ class LlamaAttention(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        if hasattr(self, "apply_qk_norm"):
+            assert hasattr(self, "q_norm") and hasattr(self, "k_norm")
+            query_states = self.apply_qk_norm(query_states, self.q_norm)
+            key_states = self.apply_qk_norm(key_states, self.k_norm)
 
         query_states = query_states.view(
             bsz, q_len, self.num_heads, self.head_dim
@@ -762,6 +767,7 @@ class LlamaFlexAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -772,6 +778,10 @@ class LlamaFlexAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        if hasattr(self, "apply_qk_norm"):
+            assert hasattr(self, "q_norm") and hasattr(self, "k_norm")
+            query_states = self.apply_qk_norm(query_states, self.q_norm)
+            key_states = self.apply_qk_norm(key_states, self.k_norm)
 
         query_states = query_states.view(
             bsz, q_len, self.num_heads, self.head_dim
@@ -871,12 +881,17 @@ class LlamaFlashAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        if hasattr(self, "apply_qk_norm"):
+            assert hasattr(self, "q_norm") and hasattr(self, "k_norm")
+            query_states = self.apply_qk_norm(query_states, self.q_norm)
+            key_states = self.apply_qk_norm(key_states, self.k_norm)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(
@@ -996,6 +1011,7 @@ class LlamaUSPFlashAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
         bsz, q_len, _ = hidden_states.size()
@@ -1005,6 +1021,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
         # 1. Projections & Ulysses Scatter
         # =============================================================
         query_states = self.q_proj(hidden_states)
+        if hasattr(self, "apply_qk_norm"):
+            assert hasattr(self, "q_norm")
+            query_states = self.apply_qk_norm(query_states, self.q_norm)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         query_states = SeqAllToAll4D.apply(
             self.ulysses_pg,
@@ -1015,6 +1034,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
         )
 
         key_states = self.k_proj(hidden_states)
+        if hasattr(self, "apply_qk_norm"):
+            assert hasattr(self, "k_norm")
+            key_states = self.apply_qk_norm(key_states, self.k_norm)
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
