@@ -25,11 +25,13 @@ from specforge import (
     QwenVLOnlineEagle3Model,
 )
 from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.remote_backend_args import RemoteBackendArgsMixin
 from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
+    PrefetchingDataLoader,
 )
 from specforge.distributed import (
     destroy_distributed,
@@ -93,7 +95,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--target-model-backend",
         type=str,
         default="sglang",
-        choices=["sglang", "hf", "custom"],
+        choices=["sglang", "hf", "custom", "remote"],
         help="The backend of the target model",
     )
 
@@ -217,6 +219,10 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     sglang_group = parser.add_argument_group("sglang target model backend")
     SGLangBackendArgs.add_args(sglang_group)
 
+    # remote target model backend related args
+    remote_group = parser.add_argument_group("remote target model backend")
+    RemoteBackendArgsMixin.add_args(remote_group)
+
     # tracker related args
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
@@ -277,6 +283,8 @@ def build_target_model(
         else:
             if args.target_model_backend == "sglang":
                 target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+            elif args.target_model_backend == "remote":
+                target_model_kwargs = RemoteBackendArgsMixin.from_args(args).to_kwargs()
             else:
                 target_model_kwargs = {}
             target_model = get_eagle3_target_model(
@@ -538,7 +546,15 @@ def run_forward(
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
+    eagle3_data=None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Run forward pass on the eagle3 model.
+    
+    Args:
+        eagle3_data: Pre-fetched eagle3 data for remote backend prefetching.
+                    If provided, skips target model inference.
+    """
     if args.is_vlm:
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
@@ -549,12 +565,12 @@ def run_forward(
         )
     else:
         if is_online:
-            # we generate the eagle3 using the target model in an online fashion
-            eagle3_data = target_model.generate_eagle3_data(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
-            )
+            if eagle3_data is None:
+                eagle3_data = target_model.generate_eagle3_data(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
             attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
@@ -562,7 +578,6 @@ def run_forward(
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
         else:
-            # we generate the logits using the hidden states loaded from disk
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
@@ -684,12 +699,30 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
     return local_tp_shard
 
 
+def setup_single_process_distributed():
+    """Set environment variables for single-process distributed training."""
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+    if "WORLD_SIZE" not in os.environ:
+        os.environ["WORLD_SIZE"] = "1"
+    if "LOCAL_RANK" not in os.environ:
+        os.environ["LOCAL_RANK"] = "0"
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
+
+
 def main():
     # ================================================
     # 1. Initialize
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
+
+    if args.target_model_backend == "remote" and "RANK" not in os.environ:
+        setup_single_process_distributed()
+
     init_distributed(
         timeout=args.dist_timeout,
         tp_size=args.tp_size,
@@ -793,19 +826,42 @@ def main():
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
 
+    use_remote_prefetch = (
+        args.target_model_backend == "remote"
+        and is_online
+        and args.prefetch_depth > 0
+    )
+
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
 
-        if dist.get_rank() == 0:
-            progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+        if use_remote_prefetch:
+            data_iterator = PrefetchingDataLoader(
+                train_dataloader,
+                target_model,
+                prefetch_depth=args.prefetch_depth,
+                low_watermark=max(1, args.prefetch_depth // 2),
+                refill_batch_size=args.prefetch_depth,
             )
         else:
-            progress_bar = train_dataloader
+            data_iterator = train_dataloader
 
-        for data in progress_bar:
+        if dist.get_rank() == 0:
+            progress_bar = tqdm(
+                data_iterator, desc=f"Training Epoch {epoch}", leave=True
+            )
+        else:
+            progress_bar = data_iterator
+
+        for item in progress_bar:
+            if use_remote_prefetch:
+                data, eagle3_data = item
+            else:
+                data = item
+                eagle3_data = None
+                
             global_step += 1
 
             # ================================================
@@ -837,7 +893,7 @@ def main():
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
+                args, eagle3_model, data, target_model, is_online, eagle3_data
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
@@ -881,7 +937,7 @@ def main():
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
                         plosses, acces = run_forward(
-                            args, eagle3_model, data, target_model, is_online
+                            args, eagle3_model, data, target_model, is_online, None
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))

@@ -6,8 +6,9 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # support tp8 train eagle3 for Qwen3-4B/8B/32B up to tp_size = 8
 NUM_GPUS=${1:-1}
-TP_SIZE=${2:-1}
+TP_SIZE=${1:-1}
 BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 torchrun \
     --standalone \
@@ -26,4 +27,5 @@ torchrun \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
     --tp-size $TP_SIZE \
-    --target-model-backend sglang
+    --target-model-backend sglang \
+    --attention-backend fa

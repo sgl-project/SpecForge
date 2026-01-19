@@ -266,7 +266,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             pp_size=1,
             **kwargs,
         )
-
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
@@ -586,6 +585,16 @@ def get_eagle3_target_model(
         )
     elif backend == "custom":
         return CustomEagle3TargetModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+    elif backend == "remote":
+        from .remote_backend import RemoteEagle3TargetModel
+
+        return RemoteEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
