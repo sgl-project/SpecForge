@@ -86,7 +86,9 @@ class TaskNotification:
     mooncake_key: Optional[str] = None
     error_message: Optional[str] = None
     tensor_shapes: Optional[dict] = None
+    tensor_dtypes: Optional[dict] = None
     data_size: int = 0
+    use_tensor_api: bool = False
 
     def serialize(self) -> bytes:
         return pickle.dumps(self)

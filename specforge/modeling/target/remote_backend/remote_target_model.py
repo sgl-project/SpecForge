@@ -31,7 +31,6 @@ from .task_queue import (
     QueueConfig,
     TaskProducer,
 )
-from .zero_copy import Eagle3ZeroCopyReader
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +44,6 @@ class RemoteBackendConfig:
     task_timeout: float = 300.0
     retry_count: int = 3
     retry_delay: float = 1.0
-    use_zero_copy: bool = True
-    zero_copy_buffer_size: int = 2 * 1024**3
-    zero_copy_pool_size: int = 4
     dp_rank: int = 0
     dp_size: int = 1
     mooncake_config: MooncakeConfig = None
@@ -86,7 +82,6 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         self.task_producer: Optional[TaskProducer] = None
         self.notification_sub: Optional[NotificationSubscriber] = None
         self.mooncake_store: Optional[EagleMooncakeStore] = None
-        self.zero_copy_reader: Optional[Eagle3ZeroCopyReader] = None
 
         self._connected = False
 
@@ -155,15 +150,6 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         self.mooncake_store = EagleMooncakeStore(self.config.mooncake_config)
         self.mooncake_store.setup()
 
-        if self.config.use_zero_copy:
-            self.zero_copy_reader = Eagle3ZeroCopyReader(
-                device=self.device,
-                buffer_size=self.config.zero_copy_buffer_size,
-                pool_size=self.config.zero_copy_pool_size,
-            )
-            self.zero_copy_reader.initialize(self.mooncake_store)
-            logger.info("Zero-copy reader initialized with GPU buffers")
-
         self._connected = True
         logger.info("RemoteEagle3TargetModel connected to remote infrastructure")
 
@@ -176,10 +162,6 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         if self.notification_sub is not None:
             self.notification_sub.close()
             self.notification_sub = None
-
-        if self.zero_copy_reader is not None:
-            self.zero_copy_reader.shutdown()
-            self.zero_copy_reader = None
 
         if self.mooncake_store is not None:
             self.mooncake_store.close()
@@ -269,7 +251,7 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
             mooncake_key = notification.mooncake_key or task_id
             output = self._retrieve_output(notification, input_ids.device)
 
-            self.mooncake_store.remove(mooncake_key)
+            self._cleanup_mooncake_data(notification)
 
             logger.debug(f"Retrieved results for task {task_id}")
             return output
@@ -282,38 +264,31 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         notification: TaskNotification,
         device: torch.device,
     ) -> Eagle3TargetOutput:
-        """Retrieve output from Mooncake, using zero-copy if enabled."""
+        """Retrieve output from Mooncake, using tensor API or legacy path."""
         mooncake_key = notification.mooncake_key or notification.task_id
 
-        if (
-            self.config.use_zero_copy
-            and self.zero_copy_reader is not None
-            and notification.tensor_shapes is not None
-        ):
-            if self.zero_copy_reader._registered:
-                output = self.zero_copy_reader.unpack_rdma_to_gpu(
-                    mooncake_key,
-                    notification.tensor_shapes,
-                    self.mooncake_store,
-                )
-                logger.debug(f"Retrieved via RDMA: {mooncake_key}")
-            else:
-                raw_data = self.mooncake_store.get_raw(mooncake_key)
-                output = self.zero_copy_reader.unpack_to_gpu(
-                    raw_data, notification.tensor_shapes
-                )
-
-            if output.hidden_states.device != device:
-                output.hidden_states = output.hidden_states.to(device)
-                output.target = output.target.to(device)
-                output.loss_mask = output.loss_mask.to(device)
-                output.input_ids = output.input_ids.to(device)
-                output.attention_mask = output.attention_mask.to(device)
-                if output.last_hidden_states is not None:
-                    output.last_hidden_states = output.last_hidden_states.to(device)
+        if notification.use_tensor_api and notification.tensor_shapes is not None:
+            dtypes = notification.tensor_dtypes or {}
+            output = self.mooncake_store.get_eagle3_tensors_into(
+                key=mooncake_key,
+                shapes=notification.tensor_shapes,
+                dtypes=dtypes,
+                device=device,
+            )
+            logger.debug(f"Retrieved via batch_get_tensor_into: {mooncake_key}")
             return output
         else:
             return self.mooncake_store.get_eagle3_output(mooncake_key, device=device)
+
+    def _cleanup_mooncake_data(self, notification: TaskNotification) -> None:
+        """Remove data from Mooncake after retrieval."""
+        mooncake_key = notification.mooncake_key or notification.task_id
+
+        if notification.use_tensor_api:
+            has_lhs = "last_hidden_states" in (notification.tensor_shapes or {})
+            self.mooncake_store.remove_eagle3_tensors(mooncake_key, has_lhs)
+        else:
+            self.mooncake_store.remove(mooncake_key)
 
     def submit_task(
         self,
@@ -391,7 +366,7 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
 
             mooncake_key = notification.mooncake_key or task_id
             output = self._retrieve_output(notification, device)
-            self.mooncake_store.remove(mooncake_key)
+            self._cleanup_mooncake_data(notification)
 
             logger.debug(f"Retrieved results for task {task_id}")
             return output

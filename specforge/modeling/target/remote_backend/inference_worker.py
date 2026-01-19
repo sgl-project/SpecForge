@@ -27,12 +27,11 @@ import torch.distributed as dist
 from ..eagle3_target_model import SGLangEagle3TargetModel
 from ..sglang_backend import SGLangBackendArgs
 from .messages import (
-    Eagle3OutputData,
     InferenceTask,
     TaskNotification,
     TaskStatus,
 )
-from .mooncake_client import EagleMooncakeStore, MooncakeConfig, Eagle3HostBufferWriter
+from .mooncake_client import EagleMooncakeStore, MooncakeConfig
 from .task_queue import (
     NotificationPublisher,
     QueueConfig,
@@ -56,8 +55,6 @@ class InferenceWorkerConfig:
 
     num_workers: int = 1
     worker_id: int = 0
-
-    use_zero_copy: bool = True
 
     mooncake_config: MooncakeConfig = None
     queue_config: QueueConfig = None
@@ -97,7 +94,6 @@ class InferenceWorker:
         self.task_consumer: Optional[TaskConsumer] = None
         self.notification_pub: Optional[NotificationPublisher] = None
         self.mooncake_store: Optional[EagleMooncakeStore] = None
-        self.host_buffer_writer: Optional[Eagle3HostBufferWriter] = None
 
         self._running = False
         self._shutdown_event = threading.Event()
@@ -116,12 +112,6 @@ class InferenceWorker:
             self._setup_notification()
             print(f"[SETUP] Setting up mooncake...", flush=True)
             self._setup_mooncake()
-
-            if self.config.use_zero_copy:
-                self.host_buffer_writer = Eagle3HostBufferWriter(
-                    max_buffer_size=4 * 1024**3,
-                )
-                print("[SETUP] Host buffer writer initialized", flush=True)
 
         print("[SETUP] InferenceWorker setup complete", flush=True)
 
@@ -258,36 +248,20 @@ class InferenceWorker:
             target = output.target
             last_hidden_states = output.last_hidden_states
 
-            if self.config.use_zero_copy and self.host_buffer_writer is not None:
-                host_buffer, data_size, shapes = self.host_buffer_writer.pack_eagle3_output(
-                    hidden_states=hidden_states,
-                    target=target,
-                    loss_mask=loss_mask,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    last_hidden_states=last_hidden_states,
-                )
-                self.mooncake_store.put_from_host_buffer(task.task_id, host_buffer, data_size)
-            else:
-                output_data = Eagle3OutputData.from_tensors(
-                    hidden_states=hidden_states,
-                    target=target,
-                    loss_mask=loss_mask,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    last_hidden_states=last_hidden_states,
-                )
-                self.mooncake_store.put_eagle3_output_data(task.task_id, output_data)
-                shapes = {
-                    "hidden_states": tuple(hidden_states.shape),
-                    "target": tuple(target.shape) if target is not None else None,
-                    "loss_mask": tuple(loss_mask.shape),
-                    "input_ids": tuple(input_ids.shape),
-                    "attention_mask": tuple(attention_mask.shape),
-                }
-                if last_hidden_states is not None:
-                    shapes["last_hidden_states"] = tuple(last_hidden_states.shape)
-                data_size = 0
+            shapes = self.mooncake_store.put_eagle3_tensors(
+                key=task.task_id,
+                hidden_states=hidden_states,
+                target=target,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                last_hidden_states=last_hidden_states,
+            )
+
+            dtypes = {
+                "hidden_states": hidden_states.dtype,
+                "target": target.dtype if target is not None else torch.bfloat16,
+            }
 
             self.notification_pub.publish(
                 TaskNotification(
@@ -295,7 +269,8 @@ class InferenceWorker:
                     status=TaskStatus.READY,
                     mooncake_key=task.task_id,
                     tensor_shapes=shapes,
-                    data_size=data_size,
+                    tensor_dtypes=dtypes,
+                    use_tensor_api=True,
                 )
             )
 

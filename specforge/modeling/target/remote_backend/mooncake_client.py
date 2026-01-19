@@ -229,6 +229,7 @@ class Eagle3HostBufferWriter:
             else 0
         )
 
+        # TODO: revisit this to see if we can reduce some buffer size.
         estimated_size = (
             HEADER_SIZE + hs_size + tgt_size + lm_size + ids_size + am_size + lhs_size
             + 6 * TENSOR_ALIGNMENT + PAGE_SIZE
@@ -429,7 +430,16 @@ class MooncakeHiddenStateStore(ABC):
             return True
 
         try:
-            if hasattr(self._store, "registerLocalMemory"):
+            if hasattr(self._store, "register_buffer"):
+                result = self._store.register_buffer(buffer_ptr, size)
+                if result == 0:
+                    self._registered_buffers[buffer_ptr] = size
+                    logger.debug(f"Registered GPU buffer at {buffer_ptr:#x}, size={size}")
+                    return True
+                else:
+                    logger.warning(f"register_buffer returned error code: {result}")
+                    return False
+            elif hasattr(self._store, "registerLocalMemory"):
                 self._store.registerLocalMemory(buffer_ptr, size)
                 self._registered_buffers[buffer_ptr] = size
                 logger.debug(f"Registered GPU buffer at {buffer_ptr:#x}, size={size}")
@@ -480,23 +490,198 @@ class MooncakeHiddenStateStore(ABC):
             if not self.register_gpu_buffer_tensor(gpu_buffer):
                 raise RuntimeError("Failed to register GPU buffer for RDMA")
 
+        buffer_size = gpu_buffer.numel() * gpu_buffer.element_size()
+        return self.get_into(key, ptr + offset, buffer_size - offset)
+
+    def get_into(self, key: str, buffer_ptr: int, size: int) -> int:
+        """
+        Retrieve data directly into a pre-registered buffer (zero-copy).
+        
+        Uses Mooncake's get_into API for zero-copy RDMA transfer.
+        
+        Args:
+            key: Key of the data to retrieve
+            buffer_ptr: Memory address of the pre-registered buffer
+            size: Size of the buffer in bytes
+            
+        Returns:
+            Number of bytes transferred (positive = success, negative = error)
+        """
+        self._ensure_initialized()
+
         try:
-            if hasattr(self._store, "get_into_buffer"):
-                return self._store.get_into_buffer(key, ptr + offset)
-            elif hasattr(self._store, "get"):
+            if hasattr(self._store, "get_into"):
+                return self._store.get_into(key, buffer_ptr, size)
+            else:
                 data = self._store.get(key)
                 if data is None:
                     raise KeyError(f"Key not found: {key}")
                 data_tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-                gpu_buffer.view(torch.uint8)[offset : offset + len(data)].copy_(
-                    data_tensor.cuda()
+                target = torch.tensor([], dtype=torch.uint8)
+                target.set_(
+                    torch.Storage._new_shared_cuda(buffer_ptr, size),
+                    storage_offset=0,
+                    size=(min(len(data), size),),
+                    stride=(1,),
                 )
+                target[: len(data)].copy_(data_tensor.cuda())
                 return len(data)
         except Exception as e:
-            logger.error(f"Failed to get data into GPU buffer: {e}")
+            logger.error(f"Failed to get data into buffer: {e}")
             raise
 
-        return 0
+    def batch_get_into(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[int],
+        sizes: List[int],
+    ) -> List[int]:
+        """
+        Retrieve multiple objects directly into pre-registered buffers (zero-copy).
+        
+        Uses Mooncake's batch_get_into API for efficient batch transfers.
+        
+        Args:
+            keys: List of keys to retrieve
+            buffer_ptrs: List of memory addresses for each key
+            sizes: List of buffer sizes for each key
+            
+        Returns:
+            List of bytes read for each operation (positive = success, negative = error)
+        """
+        self._ensure_initialized()
+
+        try:
+            if hasattr(self._store, "batch_get_into"):
+                return self._store.batch_get_into(keys, buffer_ptrs, sizes)
+            else:
+                results = []
+                for key, ptr, size in zip(keys, buffer_ptrs, sizes):
+                    result = self.get_into(key, ptr, size)
+                    results.append(result)
+                return results
+        except Exception as e:
+            logger.error(f"Failed batch_get_into: {e}")
+            raise
+
+    def put_tensor(self, key: str, tensor: torch.Tensor) -> int:
+        """
+        Store a PyTorch tensor in Mooncake Store.
+        
+        Args:
+            key: Unique key for this tensor
+            tensor: PyTorch tensor to store
+            
+        Returns:
+            Status code (0 = success, negative = error)
+        """
+        self._ensure_initialized()
+
+        try:
+            if hasattr(self._store, "put_tensor"):
+                return self._store.put_tensor(key, tensor)
+            else:
+                data = tensor.cpu().numpy().tobytes()
+                self._store.put(key, data)
+                return 0
+        except Exception as e:
+            logger.error(f"Failed put_tensor for key {key}: {e}")
+            raise
+
+    def batch_put_tensor(
+        self,
+        keys: List[str],
+        tensors: List[torch.Tensor],
+    ) -> List[int]:
+        """
+        Store multiple PyTorch tensors in Mooncake Store.
+        
+        Args:
+            keys: List of unique keys
+            tensors: List of PyTorch tensors to store
+            
+        Returns:
+            List of status codes (0 = success, negative = error)
+        """
+        self._ensure_initialized()
+
+        try:
+            if hasattr(self._store, "batch_put_tensor"):
+                return self._store.batch_put_tensor(keys, tensors)
+            else:
+                results = []
+                for key, tensor in zip(keys, tensors):
+                    result = self.put_tensor(key, tensor)
+                    results.append(result)
+                return results
+        except Exception as e:
+            logger.error(f"Failed batch_put_tensor: {e}")
+            raise
+
+    def get_tensor_into(
+        self,
+        key: str,
+        tensor: torch.Tensor,
+    ) -> int:
+        """
+        Retrieve a tensor directly into a pre-allocated tensor (zero-copy).
+        
+        The destination tensor must be pre-allocated with the correct shape and dtype.
+        Its underlying buffer should be registered with Mooncake for true zero-copy.
+        
+        Args:
+            key: Key of the tensor to retrieve
+            tensor: Pre-allocated destination tensor
+            
+        Returns:
+            Number of bytes read (positive = success, negative = error)
+        """
+        self._ensure_initialized()
+
+        try:
+            if hasattr(self._store, "get_tensor_into"):
+                return self._store.get_tensor_into(key, tensor)
+            else:
+                ptr = tensor.data_ptr()
+                size = tensor.numel() * tensor.element_size()
+                if ptr not in self._registered_buffers:
+                    self.register_gpu_buffer(ptr, size)
+                return self.get_into(key, ptr, size)
+        except Exception as e:
+            logger.error(f"Failed get_tensor_into for key {key}: {e}")
+            raise
+
+    def batch_get_tensor_into(
+        self,
+        keys: List[str],
+        tensors: List[torch.Tensor],
+    ) -> List[int]:
+        """
+        Retrieve multiple tensors directly into pre-allocated tensors (zero-copy).
+        
+        Uses Mooncake's batch_get_tensor_into for efficient batch transfers.
+        
+        Args:
+            keys: List of keys to retrieve
+            tensors: List of pre-allocated destination tensors
+            
+        Returns:
+            List of bytes read for each operation (positive = success, negative = error)
+        """
+        self._ensure_initialized()
+
+        try:
+            if hasattr(self._store, "batch_get_tensor_into"):
+                return self._store.batch_get_tensor_into(keys, tensors)
+            else:
+                results = []
+                for key, tensor in zip(keys, tensors):
+                    result = self.get_tensor_into(key, tensor)
+                    results.append(result)
+                return results
+        except Exception as e:
+            logger.error(f"Failed batch_get_tensor_into: {e}")
+            raise
 
     def put_raw(self, key: str, data: bytes) -> None:
         """Store raw bytes in Mooncake Store."""
@@ -695,6 +880,170 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         (host_buffer, size, shapes).
         """
         self.put_from_host_buffer(key, host_buffer, size)
+
+    TENSOR_SUFFIXES = ["_hs", "_tgt", "_lm", "_ids", "_am", "_lhs"]
+
+    def put_eagle3_tensors(
+        self,
+        key: str,
+        hidden_states: torch.Tensor,
+        target: torch.Tensor,
+        loss_mask: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Tuple[int, ...]]:
+        """
+        Store Eagle3 output tensors using batch_put_tensor.
+        
+        Each tensor is stored under a separate key with a suffix:
+        - {key}_hs: hidden_states
+        - {key}_tgt: target
+        - {key}_lm: loss_mask
+        - {key}_ids: input_ids
+        - {key}_am: attention_mask
+        - {key}_lhs: last_hidden_states (if present)
+        
+        Args:
+            key: Base key (typically task_id)
+            hidden_states: Concatenated auxiliary hidden states
+            target: Target logits
+            loss_mask: Loss mask tensor
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            last_hidden_states: Optional last hidden states
+            
+        Returns:
+            Dictionary of tensor shapes for reconstruction
+        """
+        self._ensure_initialized()
+
+        keys = [
+            f"{key}_hs",
+            f"{key}_tgt",
+            f"{key}_lm",
+            f"{key}_ids",
+            f"{key}_am",
+        ]
+        tensors = [
+            hidden_states.contiguous(),
+            target.contiguous(),
+            loss_mask.contiguous(),
+            input_ids.contiguous(),
+            attention_mask.contiguous(),
+        ]
+
+        if last_hidden_states is not None:
+            keys.append(f"{key}_lhs")
+            tensors.append(last_hidden_states.contiguous())
+
+        results = self.batch_put_tensor(keys, tensors)
+
+        for k, r in zip(keys, results):
+            if r != 0:
+                raise RuntimeError(f"batch_put_tensor failed for {k} with code: {r}")
+
+        shapes = {
+            "hidden_states": tuple(hidden_states.shape),
+            "target": tuple(target.shape),
+            "loss_mask": tuple(loss_mask.shape),
+            "input_ids": tuple(input_ids.shape),
+            "attention_mask": tuple(attention_mask.shape),
+        }
+        if last_hidden_states is not None:
+            shapes["last_hidden_states"] = tuple(last_hidden_states.shape)
+
+        logger.debug(f"Stored Eagle3 tensors with base key: {key}")
+        return shapes
+
+    def get_eagle3_tensors_into(
+        self,
+        key: str,
+        shapes: Dict[str, Tuple[int, ...]],
+        dtypes: Dict[str, torch.dtype],
+        device: torch.device,
+    ) -> "Eagle3TargetOutput":
+        """
+        Retrieve Eagle3 tensors directly into pre-allocated GPU tensors (zero-copy).
+        
+        Uses batch_get_tensor_into for efficient batch retrieval.
+        
+        Args:
+            key: Base key used when storing
+            shapes: Dictionary of tensor shapes
+            dtypes: Dictionary of tensor dtypes
+            device: Device to allocate tensors on
+            
+        Returns:
+            Eagle3TargetOutput with tensors on the specified device
+        """
+        from specforge.modeling.target.eagle3_target_model import Eagle3TargetOutput
+
+        self._ensure_initialized()
+
+        hidden_states = torch.empty(shapes["hidden_states"], dtype=dtypes.get("hidden_states", torch.bfloat16), device=device)
+        target = torch.empty(shapes["target"], dtype=dtypes.get("target", torch.bfloat16), device=device)
+        loss_mask = torch.empty(shapes["loss_mask"], dtype=torch.bool, device=device)
+        input_ids = torch.empty(shapes["input_ids"], dtype=torch.int64, device=device)
+        attention_mask = torch.empty(shapes["attention_mask"], dtype=torch.int64, device=device)
+
+        keys = [
+            f"{key}_hs",
+            f"{key}_tgt",
+            f"{key}_lm",
+            f"{key}_ids",
+            f"{key}_am",
+        ]
+        tensors = [hidden_states, target, loss_mask, input_ids, attention_mask]
+
+        last_hidden_states = None
+        if "last_hidden_states" in shapes:
+            last_hidden_states = torch.empty(
+                shapes["last_hidden_states"],
+                dtype=dtypes.get("hidden_states", torch.bfloat16),
+                device=device,
+            )
+            keys.append(f"{key}_lhs")
+            tensors.append(last_hidden_states)
+
+        results = self.batch_get_tensor_into(keys, tensors)
+
+        for k, r in zip(keys, results):
+            if r < 0:
+                raise RuntimeError(f"batch_get_tensor_into failed for {k} with code: {r}")
+
+        logger.debug(f"Retrieved Eagle3 tensors with base key: {key}")
+
+        return Eagle3TargetOutput(
+            hidden_states=hidden_states,
+            target=target,
+            loss_mask=loss_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            last_hidden_states=last_hidden_states,
+        )
+
+    def remove_eagle3_tensors(self, key: str, has_last_hidden_states: bool = False) -> None:
+        """
+        Remove all tensors associated with an Eagle3 output.
+        
+        Args:
+            key: Base key used when storing
+            has_last_hidden_states: Whether last_hidden_states was stored
+        """
+        self._ensure_initialized()
+
+        keys = [f"{key}{suffix}" for suffix in self.TENSOR_SUFFIXES[:5]]
+        if has_last_hidden_states:
+            keys.append(f"{key}_lhs")
+
+        for k in keys:
+            try:
+                self._store.remove(k)
+            except Exception as e:
+                logger.warning(f"Failed to remove key {k}: {e}")
+
+        logger.debug(f"Removed Eagle3 tensors with base key: {key}")
 
 
 StoreT = TypeVar("StoreT", bound=MooncakeHiddenStateStore)

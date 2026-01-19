@@ -604,12 +604,15 @@ class Eagle3ZeroCopyReader:
         self.buffer_pool.initialize()
         self._mooncake_store = mooncake_store
         if mooncake_store is not None:
+            registered_count = 0
             for buffer in self.buffer_pool._buffers:
-                if mooncake_store.register_gpu_buffer(buffer.buffer, buffer.size):
-                    self._registered = True
-            if self._registered:
+                if mooncake_store.register_gpu_buffer(buffer.data_ptr, buffer.size):
+                    buffer._registered = True
+                    registered_count += 1
+            if registered_count > 0:
+                self._registered = True
                 logger.info(
-                    f"Registered {len(self.buffer_pool._buffers)} GPU buffers for RDMA"
+                    f"Registered {registered_count}/{len(self.buffer_pool._buffers)} GPU buffers for RDMA"
                 )
 
     def unpack_rdma_to_gpu(
@@ -644,6 +647,133 @@ class Eagle3ZeroCopyReader:
         try:
             nbytes = store.get_into_gpu_buffer(key, buffer.buffer)
             logger.debug(f"RDMA transferred {nbytes} bytes to GPU")
+
+            header_bytes = buffer.buffer[:HEADER_SIZE].cpu().numpy().tobytes()
+            header_data = header_bytes[:struct.calcsize("!6Q4s4sQ")]
+            (
+                hs_size,
+                tgt_size,
+                lm_size,
+                ids_size,
+                am_size,
+                lhs_size,
+                hs_dtype_bytes,
+                tgt_dtype_bytes,
+                total_size,
+            ) = struct.unpack("!6Q4s4sQ", header_data)
+
+            hs_dtype = TensorMetadata.bytes_to_dtype(hs_dtype_bytes)
+            tgt_dtype = TensorMetadata.bytes_to_dtype(tgt_dtype_bytes)
+
+            offset = HEADER_SIZE
+            hs_offset = align_up(offset)
+            offset = hs_offset + hs_size
+
+            tgt_offset = align_up(offset)
+            offset = tgt_offset + tgt_size
+
+            lm_offset = align_up(offset)
+            offset = lm_offset + lm_size
+
+            ids_offset = align_up(offset)
+            offset = ids_offset + ids_size
+
+            am_offset = align_up(offset)
+            offset = am_offset + am_size
+
+            lhs_offset = align_up(offset) if lhs_size > 0 else 0
+
+            hidden_states = (
+                buffer.buffer[hs_offset : hs_offset + hs_size]
+                .view(hs_dtype)
+                .view(shapes["hidden_states"])
+                .clone()
+            )
+
+            target = (
+                buffer.buffer[tgt_offset : tgt_offset + tgt_size]
+                .view(tgt_dtype)
+                .view(shapes["target"])
+                .clone()
+            )
+
+            loss_mask = (
+                buffer.buffer[lm_offset : lm_offset + lm_size]
+                .view(torch.bool)
+                .view(shapes["loss_mask"])
+                .clone()
+            )
+
+            input_ids = (
+                buffer.buffer[ids_offset : ids_offset + ids_size]
+                .view(torch.int64)
+                .view(shapes["input_ids"])
+                .clone()
+            )
+
+            attention_mask = (
+                buffer.buffer[am_offset : am_offset + am_size]
+                .view(torch.int64)
+                .view(shapes["attention_mask"])
+                .clone()
+            )
+
+            last_hidden_states = None
+            if lhs_size > 0 and "last_hidden_states" in shapes:
+                last_hidden_states = (
+                    buffer.buffer[lhs_offset : lhs_offset + lhs_size]
+                    .view(hs_dtype)
+                    .view(shapes["last_hidden_states"])
+                    .clone()
+                )
+
+            return Eagle3TargetOutput(
+                hidden_states=hidden_states,
+                target=target,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                last_hidden_states=last_hidden_states,
+            )
+
+        finally:
+            self.buffer_pool.release(buffer)
+
+    def unpack_get_into_to_gpu(
+        self,
+        key: str,
+        shapes: Dict[str, Tuple[int, ...]],
+        mooncake_store=None,
+    ) -> "Eagle3TargetOutput":
+        """
+        Transfer data directly from Mooncake to GPU buffer pool using get_into API.
+        
+        This uses Mooncake's get_into for zero-copy RDMA transfer into a pre-registered
+        GPU buffer, then unpacks the tensors from that buffer.
+        
+        Args:
+            key: Mooncake key to retrieve
+            shapes: Dictionary of tensor shapes
+            mooncake_store: MooncakeHiddenStateStore instance
+            
+        Returns:
+            Eagle3TargetOutput with tensors on GPU
+        """
+        from specforge.modeling.target.eagle3_target_model import Eagle3TargetOutput
+
+        store = mooncake_store or self._mooncake_store
+        if store is None:
+            raise ValueError("No mooncake_store provided")
+
+        buffer = self.buffer_pool.acquire(timeout=30.0)
+        if buffer is None:
+            raise RuntimeError("Failed to acquire GPU buffer from pool")
+
+        try:
+            nbytes = store.get_into(key, buffer.data_ptr, buffer.size)
+            if nbytes < 0:
+                raise RuntimeError(f"get_into failed with error code: {nbytes}")
+            logger.debug(f"get_into transferred {nbytes} bytes to GPU buffer")
 
             header_bytes = buffer.buffer[:HEADER_SIZE].cpu().numpy().tobytes()
             header_data = header_bytes[:struct.calcsize("!6Q4s4sQ")]

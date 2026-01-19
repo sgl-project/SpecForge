@@ -26,7 +26,7 @@ def main():
         master_server_address="127.0.0.1:50051",
         global_segment_size=512 * 1024 * 1024,
         local_buffer_size=128 * 1024 * 1024,
-        protocol="tcp",
+        protocol="rdma",
         device_name="",
     )
 
