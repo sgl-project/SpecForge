@@ -281,6 +281,9 @@ def build_target_model(
         ):
             from transformers import Qwen3VLForConditionalGeneration
 
+            # If you're using torch==2.9.1, please ensure you have cuDNN >= 9.15 installed to avoid a performance
+            # regression with Conv3D. You can run `pip install nvidia-cudnn-cu12==9.16.0.29` to immediately fix it.
+
             target_model = (
                 Qwen3VLForConditionalGeneration.from_pretrained(
                     pretrained_model_name_or_path=args.target_model_path,
@@ -295,6 +298,9 @@ def build_target_model(
             and args.tp_size == 1
         ):
             from transformers import Qwen3VLMoeForConditionalGeneration
+
+            # If you're using torch==2.9.1, please ensure you have cuDNN >= 9.15 installed to avoid a performance
+            # regression with Conv3D. You can run `pip install nvidia-cudnn-cu12==9.16.0.29` to immediately fix it.
 
             target_model = (
                 Qwen3VLMoeForConditionalGeneration.from_pretrained(
