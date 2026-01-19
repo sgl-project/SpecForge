@@ -23,13 +23,18 @@ from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
-from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
+from specforge.data import (
+    build_eagle3_dataset,
+    build_offline_dflash_dataset,
+    prepare_dp_dataloaders,
+)
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
 )
+from specforge.modeling.target.target_head import TargetHead
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -67,7 +72,11 @@ def parse_args():
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-hidden-states-path", type=str, default=None,
+        help="Path to pre-computed hidden states for offline training")
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None,
+        help="Path to pre-computed hidden states for offline evaluation")
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
@@ -75,6 +84,13 @@ def parse_args():
         "--build-dataset-num-proc",
         type=int,
         default=int(os.environ.get("SPECFORGE_DATA_NUM_PROC", 8)),
+    )
+
+    model_group.add_argument(
+        "--lm-head-key",
+        type=str,
+        default="lm_head.weight",
+        help="The key of the lm head weight to load from the target model (for offline training)",
     )
 
     training_group = parser.add_argument_group("training")
@@ -108,26 +124,39 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
-    """Build target model (backend wrapper) and draft model."""
-    print_on_rank0(
-        f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
-    )
+def build_target_model(args, draft_model: DFlashDraftModel, is_online: bool = True):
+    """Build target model based on training mode.
+    
+    For online training: Build full target model wrapper.
+    For offline training: Build only TargetHead (lm_head weights).
+    """
+    if is_online:
+        print_on_rank0(
+            f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
+        )
+        target_model_kwargs = {}
+        if args.target_model_backend == "sglang":
+            target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
 
-    # 1. Build Target Model Wrapper
-    target_model_kwargs = {}
-    if args.target_model_backend == "sglang":
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+        target_model = get_dflash_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend=args.target_model_backend,
+            torch_dtype=torch.bfloat16,
+            device="cuda" if args.target_model_backend == "hf" else None,
+            **target_model_kwargs,
+        )
+        # Set capture layers for target model based on draft model config
+        target_model.set_capture_layers(draft_model.target_layer_ids)
+        return target_model
+    else:
+        # For offline training, we don't need the full target model
+        # Hidden states are already pre-computed
+        print_on_rank0("Offline mode: Skipping target model loading (using pre-computed hidden states)")
+        return None
 
-    target_model = get_dflash_target_model(
-        pretrained_model_name_or_path=args.target_model_path,
-        backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
-        device="cuda" if args.target_model_backend == "hf" else None,
-        **target_model_kwargs,
-    )
 
-    # 2. Build Draft Model
+def build_draft_model(args) -> DFlashDraftModel:
+    """Build draft model."""
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
@@ -146,9 +175,6 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
 
     draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
-    # Set capture layers for target model based on draft model config
-    target_model.set_capture_layers(draft_model.target_layer_ids)
-
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
@@ -158,46 +184,60 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
 
-    return target_model, draft_model
+    return draft_model
 
 
-def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """Build train and eval dataloaders."""
+def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoader, Optional[DataLoader]]:
+    """Build train and eval dataloaders.
+    
+    For online training: Build from conversation data.
+    For offline training: Build from pre-computed hidden states.
+    """
     import hashlib
 
-    # convert to dataloader
-    cache_params_string = (
-        f"{args.train_data_path}-"
-        f"{args.max_length}-"
-        f"{args.chat_template}-"
-        f"{args.target_model_path}"
-    )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    if is_online:
+        # Online mode: Build from conversation data
+        cache_params_string = (
+            f"{args.train_data_path}-"
+            f"{args.max_length}-"
+            f"{args.chat_template}-"
+            f"{args.target_model_path}"
+        )
+        cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_eagle3_dataset = build_eagle3_dataset(
-        dataset=train_dataset,
-        tokenizer=tokenizer,
-        chat_template=args.chat_template,
-        max_length=args.max_length,
-        is_preformatted=args.is_preformatted,
-        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-        cache_key=cache_key,
-        num_proc=args.build_dataset_num_proc,
-    )
+        train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+        train_dflash_dataset = build_eagle3_dataset(
+            dataset=train_dataset,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            is_preformatted=args.is_preformatted,
+            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
+        )
 
-    # Filter out samples with too few loss tokens (DFlash requires >= 2 * block_size)
-    min_loss_tokens = 2 * args.block_size
-    original_size = len(train_eagle3_dataset)
-    train_eagle3_dataset = train_eagle3_dataset.filter(
-        lambda x: x["loss_mask"].sum() >= min_loss_tokens
-    )
-    print_on_rank0(
-        f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
-    )
+        # Filter out samples with too few loss tokens (DFlash requires >= 2 * block_size)
+        min_loss_tokens = 2 * args.block_size
+        original_size = len(train_dflash_dataset)
+        train_dflash_dataset = train_dflash_dataset.filter(
+            lambda x: x["loss_mask"].sum() >= min_loss_tokens
+        )
+        print_on_rank0(
+            f"Filtered train dataset: {original_size} -> {len(train_dflash_dataset)} samples"
+        )
+    else:
+        # Offline mode: Build from pre-computed hidden states
+        print_on_rank0(f"Loading offline train dataset from {args.train_hidden_states_path}")
+        train_dflash_dataset = build_offline_dflash_dataset(
+            hidden_states_path=args.train_hidden_states_path,
+            max_len=args.max_length,
+            block_size=args.block_size,
+        )
+        print_on_rank0(f"Loaded {len(train_dflash_dataset)} samples for offline training")
 
     train_dataloader = prepare_dp_dataloaders(
-        train_eagle3_dataset,
+        train_dflash_dataset,
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
@@ -205,9 +245,9 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     )
 
     eval_dataloader = None
-    if args.eval_data_path:
+    if is_online and args.eval_data_path:
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
-        eval_eagle3_dataset = build_eagle3_dataset(
+        eval_dflash_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
@@ -215,7 +255,21 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             is_preformatted=args.is_preformatted,
         )
         eval_dataloader = prepare_dp_dataloaders(
-            eval_eagle3_dataset,
+            eval_dflash_dataset,
+            args.batch_size,
+            num_workers=args.dataloader_num_workers,
+            shuffle=False,
+            process_group=get_dp_group(),
+        )
+    elif not is_online and args.eval_hidden_states_path:
+        print_on_rank0(f"Loading offline eval dataset from {args.eval_hidden_states_path}")
+        eval_dflash_dataset = build_offline_dflash_dataset(
+            hidden_states_path=args.eval_hidden_states_path,
+            max_len=args.max_length,
+            block_size=args.block_size,
+        )
+        eval_dataloader = prepare_dp_dataloaders(
+            eval_dflash_dataset,
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
@@ -318,7 +372,15 @@ def main():
     init_distributed(timeout=args.dist_timeout)
     print_with_rank("Initialized distributed")
 
-    target_model, draft_model = build_models(args)
+    # Determine training mode
+    is_online = args.train_hidden_states_path is None
+    print_on_rank0(f"Training mode: {'online' if is_online else 'offline'}")
+
+    # Build draft model first (needed for target model layer config)
+    draft_model = build_draft_model(args)
+
+    # Build target model (None for offline mode)
+    target_model = build_target_model(args, draft_model, is_online)
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
@@ -332,7 +394,7 @@ def main():
         mask_token_id = tokenizer.mask_token_id
     print_on_rank0(f"Using mask_token_id: {mask_token_id}")
 
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer, is_online)
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
@@ -345,7 +407,7 @@ def main():
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
-        lm_head_key="lm_head.weight",
+        lm_head_key=args.lm_head_key,
         device="cuda",
     )
 
@@ -402,12 +464,15 @@ def main():
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
 
-            # Generate context from Target Model (SGLang or HF)
-            # This calls the backend to get hidden states
-            target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            if is_online:
+                # Online mode: Generate hidden states from target model
+                target_output = target_model.generate_dflash_data(
+                    input_ids, attention_mask, loss_mask
+                )
+                hidden_states = target_output.hidden_states.cuda()
+            else:
+                # Offline mode: Load pre-computed hidden states from dataset
+                hidden_states = data["hidden_state"].cuda()
 
             # Forward pass (Parallel Training)
             loss, accuracy = dflash_model(
