@@ -155,9 +155,10 @@ class OnlineDFlashModel(nn.Module):
            - Range: [L + B * block_size, L + i]
            - (Inclusive of i because causal mask usually allows seeing self)
         """
-        # Block indices for each position [0, 0, ..., 1, 1, ...]
+        # Block indices for each position [0, 1, 2, 3, 0, 1, 2, 3, ...]
+        # Strided blocks: positions with same offset within chunks belong to same block
         indices = torch.arange(seq_len, device=device)
-        block_ids = indices // self.block_size
+        block_ids = indices % self.block_size
 
         # 1. Context Mask (L x L) - Left half of K
         # Q[i] can see K_ctx[j] if Block(Q[i]) > Block(K_ctx[j])
@@ -173,9 +174,11 @@ class OnlineDFlashModel(nn.Module):
         # shape [1, L]
         k_block_ids = block_ids.unsqueeze(0)
 
-        # Mask: 1 if K's block is strictly less than Q's block
-        # This gives access to all PREVIOUS blocks' context.
-        ctx_mask = k_block_ids < q_block_ids
+        # Mask: Q[i] can see all context positions j where j < i (causal)
+        # For strided blocks, this ensures each position sees all earlier positions
+        q_indices = indices.unsqueeze(1)
+        k_indices = indices.unsqueeze(0)
+        ctx_mask = k_indices < q_indices
 
         # 2. Noise Mask (L x L) - Right half of K
         # Standard Causal Mask WITHIN the same block.
