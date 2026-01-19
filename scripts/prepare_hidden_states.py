@@ -6,9 +6,10 @@ By generating hidden states in advance, we can avoid:
 
 Optimized for lower memory usage and higher efficiency.
 
-Usage:
+Usage (Eagle3):
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
+    --model-type eagle3 \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --enable-aux-hidden-states \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
@@ -16,20 +17,20 @@ torchrun --nproc_per_node=8 \
     --chat-template llama3 \
     --max-length 2048 \
     --tp-size 1 \
-    --batch-size 32 \
-    --num-samples 1000 \
-    --output-path ./cache/hidden_states
+    --batch-size 32
 
-For pre-formatted data (with chat template already applied), add --is-preformatted:
+Usage (DFlash):
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
+    --model-type dflash \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --enable-aux-hidden-states \
-    --data-path ./cache/dataset/preformatted_data.jsonl \
-    --output-path ./cache/hidden_states \
+    --data-path ./cache/dataset/sharegpt_train.jsonl \
+    --output-path ./cache/hidden_states/dflash_train \
     --chat-template llama3 \
-    --is-preformatted \
-    --max-length 2048
+    --max-length 2048 \
+    --num-draft-layers 5
+
+For pre-formatted data (with chat template already applied), add --is-preformatted.
 """
 
 import argparse
@@ -57,6 +58,10 @@ from specforge.distributed import (
     is_tp_rank_0,
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
+from specforge.modeling.target.dflash_target_model import (
+    DFlashTargetModel,
+    get_dflash_target_model,
+)
 from specforge.utils import print_with_rank, rank_0_priority
 
 
@@ -75,6 +80,13 @@ def parse_args():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
+        "--model-type",
+        type=str,
+        default="eagle3",
+        choices=["eagle3", "dflash"],
+        help="Model type: 'eagle3' or 'dflash'",
+    )
+    model_group.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading models",
@@ -84,6 +96,19 @@ def parse_args():
     )
     model_group.add_argument("--enable-aux-hidden-states", action="store_true")
     model_group.add_argument("--aux-hidden-states-layers", type=str, default=None)
+    # DFlash-specific arguments
+    model_group.add_argument(
+        "--num-draft-layers",
+        type=int,
+        default=5,
+        help="Number of draft layers for DFlash model",
+    )
+    model_group.add_argument(
+        "--target-layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of target layer indices to capture for DFlash (e.g., '0,8,16,24'). If not specified, will be computed from num-draft-layers.",
+    )
 
     data_group = parser.add_argument_group("data")
     data_group.add_argument("--data-path", type=str, required=True)
@@ -192,6 +217,50 @@ def build_target_model(
         processor = None
 
     return target_model, processor
+
+
+def build_dflash_target_model(
+    args: argparse.Namespace, model_config: AutoConfig
+) -> Tuple[DFlashTargetModel, List[int]]:
+    """
+    Build the DFlash target model according to the arguments.
+
+    Returns:
+        Tuple of (target_model, target_layer_ids)
+    """
+    # Compute target layer IDs
+    if args.target_layers is not None:
+        target_layer_ids = [int(x) for x in args.target_layers.split(",")]
+    else:
+        # Compute automatically based on num_draft_layers
+        num_target_layers = model_config.num_hidden_layers
+        num_draft_layers = args.num_draft_layers
+        # Evenly distribute layers to capture
+        target_layer_ids = [
+            int(i * num_target_layers / (num_draft_layers + 1))
+            for i in range(1, num_draft_layers + 1)
+        ]
+    
+    print_with_rank(f"DFlash target layer IDs: {target_layer_ids}")
+
+    target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+    target_model = get_dflash_target_model(
+        pretrained_model_name_or_path=args.target_model_path,
+        backend="hf",  # Use HF backend for hidden states generation
+        torch_dtype=(
+            model_config.dtype
+            if hasattr(model_config, "dtype")
+            else model_config.torch_dtype
+        ),
+        device="cuda",
+        cache_dir=args.model_download_dir,
+        **target_model_kwargs,
+    )
+    
+    # Set which layers to capture
+    target_model.set_capture_layers(target_layer_ids)
+
+    return target_model, target_layer_ids
 
 
 class HiddenStatesGenerator:
@@ -544,6 +613,156 @@ class HiddenStatesGenerator:
         dist.barrier()
 
 
+class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
+    """
+    Generator for DFlash hidden states. 
+    Extends HiddenStatesGenerator but uses DFlash target model's generate_dflash_data method.
+    """
+
+    def __init__(
+        self,
+        target_model: DFlashTargetModel,
+        num_io_threads: int = 4,
+        io_queue_size: int = 50,
+        file_group_size: int = 2000,
+    ):
+        # Note: DFlash doesn't use aux_hidden_states in the same way
+        super().__init__(
+            target_model,
+            enable_aux_hidden_states=False,
+            num_io_threads=num_io_threads,
+            io_queue_size=io_queue_size,
+            file_group_size=file_group_size,
+        )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        data_loader: torch.utils.data.DataLoader,
+        output_path: str,
+        start_idx: int = 0,
+        samples_per_dp: int = 0,
+    ):
+        """
+        Generate DFlash hidden states using the target model.
+        DFlash captures hidden states from specific target layers.
+        """
+        self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
+
+        tp_group = get_tp_group()
+        tp_group_ranks = dist.get_process_group_ranks(tp_group)
+        tp_rank_0_global = tp_group_ranks[0]
+        global_idx = start_idx
+
+        progress_bar = tqdm(
+            data_loader,
+            disable=(not self.show_progress),
+            desc="Generating DFlash Hidden States",
+            position=dist.get_rank(get_dp_group()),
+            leave=True,
+        )
+
+        total_skipped, total_processed = 0, 0
+
+        for batch_idx, batch in enumerate(progress_bar):
+            batch_size = batch["input_ids"].size(0)
+            current_batch_indices = list(range(global_idx, global_idx + batch_size))
+
+            # Check which files already exist
+            if is_tp_rank_0():
+                exists_list = self._check_existing_files_batch(
+                    output_path, current_batch_indices
+                )
+                exists_tensor = torch.tensor(
+                    exists_list, dtype=torch.bool, device="cuda"
+                )
+            else:
+                exists_tensor = torch.tensor(
+                    [False] * batch_size, dtype=torch.bool, device="cuda"
+                )
+            dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
+
+            valid_indices_in_batch = [
+                i for i, exists in enumerate(exists_tensor) if not exists
+            ]
+            sample_global_indices = [
+                current_batch_indices[i] for i in valid_indices_in_batch
+            ]
+            num_valid = len(valid_indices_in_batch)
+            total_skipped += batch_size - num_valid
+
+            global_idx += batch_size
+            
+            if num_valid == 0:
+                if self.show_progress:
+                    progress_bar.set_postfix({
+                        "processed": total_processed,
+                        "skipped": total_skipped,
+                    })
+                continue
+
+            # Filter batch
+            filtered_batch = {
+                "input_ids": batch["input_ids"][valid_indices_in_batch],
+                "attention_mask": batch["attention_mask"][valid_indices_in_batch],
+                "loss_mask": batch["loss_mask"][valid_indices_in_batch],
+            }
+            del batch
+
+            # Move to GPU and generate DFlash data
+            filtered_batch_gpu = {
+                k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
+            }
+
+            # Use DFlash target model
+            dflash_output = self.model.generate_dflash_data(
+                input_ids=filtered_batch_gpu["input_ids"],
+                attention_mask=filtered_batch_gpu["attention_mask"],
+                loss_mask=filtered_batch_gpu["loss_mask"],
+            )
+
+            del filtered_batch_gpu
+
+            if is_tp_rank_0():
+                # Process each sample
+                for i, current_global_idx in enumerate(sample_global_indices):
+                    # Extract single sample hidden states
+                    hidden_states = dflash_output.hidden_states[i].cpu().clone()
+                    
+                    data_point = DataPoint(
+                        input_ids=filtered_batch["input_ids"][i].clone(),
+                        loss_mask=filtered_batch["loss_mask"][i].clone(),
+                        hidden_state=hidden_states.unsqueeze(0),
+                        aux_hidden_state=None,
+                    )
+
+                    output_file = self._get_file_path(output_path, current_global_idx)
+                    self._save_tensor_async(data_point, output_file)
+
+                    del hidden_states
+
+                total_processed += len(sample_global_indices)
+
+            del dflash_output, filtered_batch
+
+            if batch_idx % 5 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            if self.show_progress:
+                progress_bar.set_postfix({
+                    "processed": total_processed,
+                    "skipped": total_skipped,
+                    "pending_io": len(self.pending_futures) if is_tp_rank_0() else 0,
+                })
+
+        if self.show_progress:
+            print(
+                f"\nDFlash generation loop finished. Processed: {total_processed}, Skipped: {total_skipped}"
+            )
+        dist.barrier()
+
+
 def main():
     args = parse_args()
     if args.aux_hidden_states_layers is not None:
@@ -558,7 +777,14 @@ def main():
     target_model_config = AutoConfig.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    target_model, processor = build_target_model(args, target_model_config)
+
+    print_with_rank(f"Model type: {args.model_type}")
+
+    if args.model_type == "eagle3":
+        target_model, processor = build_target_model(args, target_model_config)
+    else:  # dflash
+        target_model, target_layer_ids = build_dflash_target_model(args, target_model_config)
+        processor = None
 
     print_with_rank(
         f"DP Rank {dist.get_rank(get_dp_group())}, TP Rank {dist.get_rank(get_tp_group())}, "
@@ -640,23 +866,35 @@ def main():
 
     # Generate hidden states
     try:
-        # Pass configurable arguments from args if needed
-        with HiddenStatesGenerator(
-            target_model,
-            args.enable_aux_hidden_states,
-            num_io_threads=args.num_io_threads,
-            io_queue_size=args.io_queue_size,
-            file_group_size=args.file_group_size,
-            # Other params like io_queue_size can also be added to argparse
-        ) as hidden_states_generator:
-
-            # Generate hidden states
-            hidden_states_generator.generate(
-                data_loader,
-                output_path=args.output_path,
-                start_idx=start_idx,
-                samples_per_dp=samples_per_dp,
-            )
+        if args.model_type == "eagle3":
+            # Use Eagle3 generator
+            with HiddenStatesGenerator(
+                target_model,
+                args.enable_aux_hidden_states,
+                num_io_threads=args.num_io_threads,
+                io_queue_size=args.io_queue_size,
+                file_group_size=args.file_group_size,
+            ) as hidden_states_generator:
+                hidden_states_generator.generate(
+                    data_loader,
+                    output_path=args.output_path,
+                    start_idx=start_idx,
+                    samples_per_dp=samples_per_dp,
+                )
+        else:  # dflash
+            # Use DFlash generator
+            with DFlashHiddenStatesGenerator(
+                target_model,
+                num_io_threads=args.num_io_threads,
+                io_queue_size=args.io_queue_size,
+                file_group_size=args.file_group_size,
+            ) as hidden_states_generator:
+                hidden_states_generator.generate(
+                    data_loader,
+                    output_path=args.output_path,
+                    start_idx=start_idx,
+                    samples_per_dp=samples_per_dp,
+                )
 
     finally:
         # The finally block ensures destroy_distributed is always called
@@ -666,3 +904,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
