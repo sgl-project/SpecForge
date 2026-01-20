@@ -194,6 +194,9 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
     For offline training: Build from pre-computed hidden states.
     """
     import hashlib
+    
+    # Common filtering threshold: DFlash requires >= 2 * block_size loss tokens
+    min_loss_tokens = 2 * args.block_size
 
     if is_online:
         # Online mode: Build from conversation data
@@ -217,8 +220,7 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
             num_proc=args.build_dataset_num_proc,
         )
 
-        # Filter out samples with too few loss tokens (DFlash requires >= 2 * block_size)
-        min_loss_tokens = 2 * args.block_size
+        # Filter out samples with too few loss tokens
         original_size = len(train_dflash_dataset)
         train_dflash_dataset = train_dflash_dataset.filter(
             lambda x: x["loss_mask"].sum() >= min_loss_tokens
@@ -234,7 +236,16 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
             max_len=args.max_length,
             block_size=args.block_size,
         )
-        print_on_rank0(f"Loaded {len(train_dflash_dataset)} samples for offline training")
+        
+        # Filter out samples with too few loss tokens
+        original_size = len(train_dflash_dataset)
+        train_dflash_dataset = [
+            sample for sample in train_dflash_dataset 
+            if sample["loss_mask"].sum() >= min_loss_tokens
+        ]
+        print_on_rank0(
+            f"Filtered offline train dataset: {original_size} -> {len(train_dflash_dataset)} samples"
+        )
 
     train_dataloader = prepare_dp_dataloaders(
         train_dflash_dataset,
