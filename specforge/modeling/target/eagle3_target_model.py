@@ -8,7 +8,10 @@ import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    init_mm_embedding_cache,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -623,6 +626,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 offsets=offset,  # List of (start, end) tuples
             )
             mm_item.set("image_grid_thw", image_grid_thw_.cpu())
+            mm_item.set_pad_value()
             mm_inputs = MultimodalInputs(
                 mm_items=[mm_item],
                 im_token_id=self.image_token_id,
@@ -633,10 +637,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 ),
                 mrope_position_delta=mrope_position_delta,
             )
+            pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+            input_id_list = pattern.pad_input_tokens(
+                input_id_.view(-1).tolist(), mm_inputs
+            )
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=input_id_.view(-1).tolist(),
+                origin_input_ids=input_id_list,
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
