@@ -23,7 +23,7 @@ class PrefetchingDataLoader:
         for data, eagle3_data in dataloader:
             # data: the original batch from the dataloader
             # eagle3_data: the pre-computed inference result
-            plosses, acces = run_forward(args, eagle3_model, data, eagle3_data=eagle3_data)
+            plosses, acces = run_forward(args, eagle3_model, data)
     """
     
     def __init__(

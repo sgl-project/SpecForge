@@ -3,8 +3,16 @@ import hashlib
 import math
 import os
 import time
+import warnings
 from argparse import ArgumentParser, Namespace
+from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
+
+
+class TrainingMethod(Enum):
+    ONLINE = auto()
+    OFFLINE = auto()
+    DISAGG = auto()
 
 import torch
 import torch.distributed as dist
@@ -31,6 +39,7 @@ from specforge.data import (
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
+    PrefetchingDataLoader,
 )
 from specforge.distributed import (
     destroy_distributed,
@@ -160,6 +169,22 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--training-method",
+        type=str,
+        default=None,
+        choices=["online", "offline", "disagg"],
+        help="Training method: 'online' for synchronous target inference, "
+        "'offline' for pre-computed hidden states, 'disagg' for disaggregated async inference. "
+        "If not set, will be inferred from other arguments.",
+    )
+    training_group.add_argument(
+        "--is-online",
+        action="store_true",
+        default=None,
+        help="[DEPRECATED] Use --training-method instead. "
+        "If set, forces online training mode (ignored if --training-method is specified).",
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -251,7 +276,9 @@ def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
 
 
 def build_target_model(
-    args: Namespace, draft_model_config: AutoDraftModelConfig, is_online: bool = True
+    args: Namespace,
+    draft_model_config: AutoDraftModelConfig,
+    training_method: TrainingMethod = TrainingMethod.ONLINE,
 ) -> Tuple[Union[Eagle3TargetModel, TargetHead], Optional[AutoProcessor]]:
     """
     Build the target model according to the arguments.
@@ -263,7 +290,18 @@ def build_target_model(
     Returns:
         The target model.
     """
-    if is_online:
+    if training_method == TrainingMethod.DISAGG:
+        target_model_kwargs = RemoteBackendArgsMixin.from_args(args).to_kwargs()
+        target_model = get_eagle3_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend="remote",
+            torch_dtype=torch.bfloat16,
+            device="cuda",
+            cache_dir=args.model_download_dir,
+            **target_model_kwargs,
+            trust_remote_code=args.trust_remote_code,
+        )
+    elif training_method == TrainingMethod.ONLINE:
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
@@ -295,29 +333,6 @@ def build_target_model(
                 **target_model_kwargs,
                 trust_remote_code=args.trust_remote_code,
             )
-
-        # set the aux hidden states layers
-        if (
-            hasattr(draft_model_config, "eagle_config")
-            and draft_model_config.eagle_config is not None
-            and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
-        ):
-            target_model.set_aux_hidden_states_layers(
-                draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
-            )
-        else:
-            target_model.set_aux_hidden_states_layers()
-
-        if args.is_vlm:
-            processor = AutoProcessor.from_pretrained(
-                args.target_model_path,
-                min_pixels=args.min_pixels,
-                max_pixels=args.max_pixels,
-            )
-        else:
-            processor = None
-
-        return target_model, processor
     else:
         target_head = TargetHead.from_pretrained(
             model_path=args.target_model_path,
@@ -326,6 +341,28 @@ def build_target_model(
             trust_remote_code=args.trust_remote_code,
         )
         return target_head, None
+
+    if (
+        hasattr(draft_model_config, "eagle_config")
+        and draft_model_config.eagle_config is not None
+        and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
+    ):
+        target_model.set_aux_hidden_states_layers(
+            draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
+        )
+    else:
+        target_model.set_aux_hidden_states_layers()
+
+    if args.is_vlm:
+        processor = AutoProcessor.from_pretrained(
+            args.target_model_path,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+        )
+    else:
+        processor = None
+
+    return target_model, processor
 
 
 def sanity_check(args: Namespace) -> None:
@@ -398,25 +435,22 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 def build_dataloaders(
     args: Namespace,
     draft_model_config: AutoDraftModelConfig,
+    training_method: TrainingMethod,
     processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
-    # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
 
-    # convert to dataloader
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"  # Tokenizer may also different
+        f"{args.target_model_path}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    is_online = (
-        args.train_data_path is not None and args.train_hidden_states_path is None
-    )
+
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -438,12 +472,13 @@ def build_dataloaders(
             cache_key=cache_key,
         )
 
-        if not is_online:
+        if training_method == TrainingMethod.OFFLINE:
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
             )
 
+    is_offline = training_method == TrainingMethod.OFFLINE
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
@@ -451,7 +486,7 @@ def build_dataloaders(
         shuffle=True,
         process_group=(
             get_draft_dp_group()
-            if args.attention_backend == "usp" and not is_online
+            if args.attention_backend == "usp" and is_offline
             else get_dp_group()
         ),
         is_vlm=args.is_vlm,
@@ -482,7 +517,7 @@ def build_dataloaders(
             shuffle=False,
             process_group=(
                 get_draft_dp_group()
-                if args.attention_backend == "usp" and not is_online
+                if args.attention_backend == "usp" and is_offline
                 else get_dp_group()
             ),
             is_vlm=args.is_vlm,
@@ -544,7 +579,8 @@ def run_forward(
     eagle3_model: nn.Module,
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
-    is_online: bool = True,
+    training_method: TrainingMethod = TrainingMethod.ONLINE,
+    prefetched_data=None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if args.is_vlm:
         plosses, _, acces = eagle3_model(
@@ -555,7 +591,7 @@ def run_forward(
             image_grid_thw=data["image_grid_thw"].cuda(),
         )
     else:
-        if is_online:
+        if training_method == TrainingMethod.ONLINE:
             target_data = target_model.generate_eagle3_data(
                 input_ids=data["input_ids"].cuda(),
                 attention_mask=data["attention_mask"].cuda(),
@@ -567,6 +603,12 @@ def run_forward(
             loss_mask = get_dp_data_shard_from_tp(target_data.loss_mask)
             target = get_dp_data_shard_from_tp(target_data.target)
             hidden_states = get_dp_data_shard_from_tp(target_data.hidden_states)
+        elif training_method == TrainingMethod.DISAGG:
+            input_ids = get_dp_data_shard_from_tp(prefetched_data.input_ids)
+            attention_mask = get_dp_data_shard_from_tp(prefetched_data.attention_mask)
+            loss_mask = get_dp_data_shard_from_tp(prefetched_data.loss_mask)
+            target = get_dp_data_shard_from_tp(prefetched_data.target)
+            hidden_states = get_dp_data_shard_from_tp(prefetched_data.hidden_states)
         else:
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
@@ -689,20 +731,6 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
     return local_tp_shard
 
 
-def setup_single_process_distributed():
-    """Set environment variables for single-process distributed training."""
-    if "RANK" not in os.environ:
-        os.environ["RANK"] = "0"
-    if "WORLD_SIZE" not in os.environ:
-        os.environ["WORLD_SIZE"] = "1"
-    if "LOCAL_RANK" not in os.environ:
-        os.environ["LOCAL_RANK"] = "0"
-    if "MASTER_ADDR" not in os.environ:
-        os.environ["MASTER_ADDR"] = "localhost"
-    if "MASTER_PORT" not in os.environ:
-        os.environ["MASTER_PORT"] = "29500"
-
-
 def main():
     # ================================================
     # 1. Initialize
@@ -710,34 +738,53 @@ def main():
     parser, args = parse_args()
     set_seed(args.seed)
 
-    if args.target_model_backend == "remote" and "RANK" not in os.environ:
-        setup_single_process_distributed()
-
     init_distributed(
         timeout=args.dist_timeout,
         tp_size=args.tp_size,
         sp_ring_size=args.sp_ring_size,
         sp_ulysses_size=args.sp_ulysses_size,
     )
-    is_online = (
-        args.train_data_path is not None and args.train_hidden_states_path is None
-    )
+
+    if args.training_method is not None:
+        training_method = TrainingMethod[args.training_method.upper()]
+    elif args.is_online is not None:
+        warnings.warn(
+            "--is-online is deprecated and will be removed in a future version. "
+            "Use --training-method instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if args.is_online:
+            training_method = TrainingMethod.ONLINE
+        else:
+            training_method = TrainingMethod.OFFLINE
+    else:
+        if args.train_hidden_states_path is not None:
+            training_method = TrainingMethod.OFFLINE
+        else:
+            training_method = TrainingMethod.ONLINE
+
+    if training_method == TrainingMethod.DISAGG and args.target_model_backend != "remote":
+        print_on_rank0(
+            f"WARNING: --target-model-backend={args.target_model_backend} is ignored in DISAGG mode. "
+            "The target model backend should be specified when launching the inference worker."
+        )
 
     sanity_check(args)
     print_args_with_dots(args)
-    print_with_rank("Initialized distributed environment")
+    print_with_rank(f"Initialized distributed environment, training method: {training_method.name}")
 
     # ================================================
     # 2. Build models
     # ================================================
     draft_model_config, draft_model = build_draft_model(args)
-    target_model, processor = build_target_model(args, draft_model_config, is_online)
+    target_model, processor = build_target_model(args, draft_model_config, training_method)
 
     # ================================================
     # 3. Build dataloader
     # ================================================
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
-        args, draft_model_config, processor
+        args, draft_model_config, training_method, processor
     )
 
     # we load the vocab mapping then
@@ -821,14 +868,30 @@ def main():
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
 
-        if dist.get_rank() == 0:
-            progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+        if training_method == TrainingMethod.DISAGG:
+            data_iterator = PrefetchingDataLoader(
+                train_dataloader,
+                target_model,
+                prefetch_depth=args.prefetch_depth,
+                low_watermark=max(1, args.prefetch_depth // 2),
+                refill_batch_size=args.prefetch_depth,
             )
         else:
-            progress_bar = train_dataloader
+            data_iterator = train_dataloader
 
-        for data in progress_bar:
+        if dist.get_rank() == 0:
+            progress_bar = tqdm(
+                data_iterator, desc=f"Training Epoch {epoch}", leave=True
+            )
+        else:
+            progress_bar = data_iterator
+
+        for item in progress_bar:
+            if training_method == TrainingMethod.DISAGG:
+                data, prefetched_data = item
+            else:
+                data = item
+                prefetched_data = None
             global_step += 1
 
             # ================================================
@@ -860,7 +923,7 @@ def main():
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
+                args, eagle3_model, data, target_model, training_method, prefetched_data
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
@@ -893,7 +956,7 @@ def main():
             # 7.2 Evaluation Step
             # ================================================
             if (
-                args.eval_data_path is not None
+                eval_dataloader is not None
                 and global_step % args.eval_interval == 0
             ):
                 # Run evaluation
@@ -901,10 +964,15 @@ def main():
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
+                eval_method = (
+                    TrainingMethod.ONLINE
+                    if training_method == TrainingMethod.DISAGG
+                    else training_method
+                )
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
                         plosses, acces = run_forward(
-                            args, eagle3_model, data, target_model, is_online
+                            args, eagle3_model, data, target_model, eval_method
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))

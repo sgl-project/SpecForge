@@ -65,6 +65,8 @@ class RemoteBackendConfig:
                 task_queue_addr=self.task_queue_addr,
                 notify_addr=self.notify_addr,
             )
+        if self.target_model_path is None:
+            raise ValueError("target_model_path is required so we can compute logits locally!")
 
 
 class RemoteEagle3TargetModel(Eagle3TargetModel):
@@ -276,7 +278,6 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
                     f"Unexpected task status for {task_id}: {notification.status}"
                 )
 
-            mooncake_key = notification.mooncake_key or task_id
             output = self._retrieve_output(notification, input_ids.device)
 
             self._cleanup_mooncake_data(notification)
@@ -307,7 +308,7 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
                 dtypes=dtypes,
                 device=device,
             )
-            logger.debug(f"Retrieved via batch_get_tensor_into: {mooncake_key}")
+            logger.debug(f"Retrieved tensors from Mooncake: {mooncake_key}")
 
             if output.target is None and output.last_hidden_states is not None:
                 if self.target_head is None:
@@ -315,6 +316,9 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
                         "Received last_hidden_states without target, but TargetHead is not initialized. "
                         "Please ensure target_model_path is set in RemoteBackendConfig."
                     )
+                if output.last_hidden_states.device == "cpu":
+                    logger.info(f"Moving last_hidden_states to device {device}")
+                    output.last_hidden_states = output.last_hidden_states.to(device)
                 target = self.target_head(output.last_hidden_states)
                 output.target = padding(target, left=False)
                 logger.debug("Computed logits from last_hidden_states using TargetHead")

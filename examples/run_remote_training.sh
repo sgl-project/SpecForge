@@ -47,5 +47,5 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPU torchrun \
     --task-queue-addr $TASK_QUEUE_ADDR \
     --notify-addr $NOTIFY_ADDR \
     --mooncake-master-addr $MOONCAKE_MASTER \
-    --prefetch-depth 4 \
-    --use-zero-copy true
+    --training-method disagg \
+    --prefetch-depth 4

@@ -244,25 +244,21 @@ class InferenceWorker:
             if not self._is_main_rank():
                 return
 
-            hidden_states = output.hidden_states
-            target = output.target
-            last_hidden_states = output.last_hidden_states
-
             shapes = self.mooncake_store.put_eagle3_tensors(
                 key=task.task_id,
-                hidden_states=hidden_states,
-                target=target,
-                loss_mask=loss_mask,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                last_hidden_states=last_hidden_states,
+                hidden_states=output.hidden_states,
+                target=output.target,
+                loss_mask=output.loss_mask,
+                input_ids=output.input_ids,
+                attention_mask=output.attention_mask,
+                last_hidden_states=output.last_hidden_states,
             )
 
             dtypes = {
-                "hidden_states": hidden_states.dtype,
+                "hidden_states": output.hidden_states.dtype,
             }
-            if target is not None:
-                dtypes["target"] = target.dtype
+            if output.target is not None:
+                dtypes["target"] = output.target.dtype
 
             self.notification_pub.publish(
                 TaskNotification(

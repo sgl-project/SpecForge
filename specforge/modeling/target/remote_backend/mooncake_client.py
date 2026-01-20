@@ -108,6 +108,87 @@ class HostBufferPool:
         self._buffers.clear()
 
 
+class GPUBuffer:
+    """
+    RDMA-registered GPU buffer for GPU Direct RDMA transfers.
+    
+    Allocates contiguous GPU memory that can be registered with Mooncake
+    for direct RDMA transfers without CPU involvement.
+    """
+
+    def __init__(self, size: int, device: torch.device = None):
+        self.size = size
+        self.device = device or torch.device("cuda")
+        self._tensor = torch.empty(size, dtype=torch.uint8, device=self.device)
+        self._ptr = self._tensor.data_ptr()
+
+    @property
+    def ptr(self) -> int:
+        return self._ptr
+
+    def get_slice(self, offset: int, size: int) -> torch.Tensor:
+        """Get a slice of the buffer as a tensor view."""
+        return self._tensor[offset:offset + size]
+
+    def free(self) -> None:
+        if self._tensor is not None:
+            del self._tensor
+            self._tensor = None
+            self._ptr = 0
+
+    def __del__(self):
+        self.free()
+
+
+class GPUBufferPool:
+    """
+    Pool of RDMA-registered GPU buffers for receiving tensors via GPU Direct RDMA.
+    """
+
+    def __init__(
+        self,
+        buffer_size: int = 2 * 1024**3,
+        pool_size: int = 2,
+        device: torch.device = None,
+    ):
+        self.buffer_size = buffer_size
+        self.pool_size = pool_size
+        self.device = device or torch.device("cuda")
+        self._buffers: List[GPUBuffer] = []
+        self._current_idx = 0
+        self._initialized = False
+
+    def initialize(self) -> None:
+        """Pre-allocate all GPU buffers."""
+        if self._initialized:
+            return
+        for _ in range(self.pool_size):
+            self._buffers.append(GPUBuffer(self.buffer_size, self.device))
+        self._initialized = True
+        logger.info(
+            f"Initialized GPU buffer pool: {self.pool_size} x {self.buffer_size / (1024**3):.1f}GB "
+            f"on {self.device}"
+        )
+
+    def get_buffer(self) -> GPUBuffer:
+        """Get the next buffer (round-robin)."""
+        if not self._buffers:
+            self.initialize()
+        buf = self._buffers[self._current_idx]
+        self._current_idx = (self._current_idx + 1) % len(self._buffers)
+        return buf
+
+    def get_buffer_ptrs(self) -> List[int]:
+        """Get data pointers of all buffers for registration."""
+        return [buf.ptr for buf in self._buffers]
+
+    def shutdown(self) -> None:
+        for buf in self._buffers:
+            buf.free()
+        self._buffers.clear()
+        self._initialized = False
+
+
 @dataclass
 class MooncakeConfig:
     """
@@ -138,6 +219,9 @@ class MooncakeConfig:
     enable_soft_pin: bool = False
     host_buffer_size: int = 4 * 1024 * 1024 * 1024
     host_buffer_pool_size: int = 2
+    gpu_buffer_size: int = 2 * 1024 * 1024 * 1024
+    gpu_buffer_pool_size: int = 2
+    enable_gpu_direct_rdma: bool = True
 
     @classmethod
     def from_env(cls) -> "MooncakeConfig":
@@ -205,7 +289,7 @@ class MooncakeHiddenStateStore(ABC):
     Base class for Mooncake Store wrapper to store hidden states from target model.
     
     Uses RDMA-registered host buffers (MooncakeHostMemAllocator) and put_from
-    for zero-copy transfers.
+    for zero-copy transfers. Optionally uses GPU Direct RDMA for receiving.
     """
 
     def __init__(self, config: MooncakeConfig):
@@ -214,8 +298,10 @@ class MooncakeHiddenStateStore(ABC):
         self._initialized = False
         self._registered_buffers: Dict[int, int] = {}
         self._host_buffer_pool: Optional[HostBufferPool] = None
+        self._gpu_buffer_pool: Optional[GPUBufferPool] = None
+        self._gpu_direct_available = False
 
-    def setup(self) -> None:
+    def setup(self, device: torch.device = None) -> None:
         """Initialize the Mooncake Store client."""
         if self._initialized:
             return
@@ -240,10 +326,48 @@ class MooncakeHiddenStateStore(ABC):
         for buf in self._host_buffer_pool._buffers:
             self._register_buffer(buf.ptr, buf.size)
 
+        if self.config.enable_gpu_direct_rdma and torch.cuda.is_available():
+            self._setup_gpu_direct(device)
+
         self._initialized = True
         logger.info(
-            f"Mooncake Store client initialized (protocol={self.config.protocol})"
+            f"Mooncake Store client initialized (protocol={self.config.protocol}, "
+            f"gpu_direct={self._gpu_direct_available})"
         )
+
+    def _setup_gpu_direct(self, device: torch.device = None) -> None:
+        """Initialize GPU buffer pool and register for GPU Direct RDMA."""
+        try:
+            self._gpu_buffer_pool = GPUBufferPool(
+                buffer_size=self.config.gpu_buffer_size,
+                pool_size=self.config.gpu_buffer_pool_size,
+                device=device,
+            )
+            self._gpu_buffer_pool.initialize()
+
+            success_count = 0
+            for buf in self._gpu_buffer_pool._buffers:
+                if self._register_buffer(buf.ptr, buf.size):
+                    success_count += 1
+
+            if success_count == len(self._gpu_buffer_pool._buffers):
+                self._gpu_direct_available = True
+                logger.info(
+                    f"GPU Direct RDMA enabled: registered {success_count} GPU buffers"
+                )
+            else:
+                logger.warning(
+                    f"GPU Direct RDMA partially available: {success_count}/"
+                    f"{len(self._gpu_buffer_pool._buffers)} buffers registered"
+                )
+                self._gpu_direct_available = success_count > 0
+
+        except Exception as e:
+            logger.warning(f"Failed to setup GPU Direct RDMA: {e}")
+            self._gpu_direct_available = False
+            if self._gpu_buffer_pool is not None:
+                self._gpu_buffer_pool.shutdown()
+                self._gpu_buffer_pool = None
 
     def _ensure_initialized(self) -> None:
         """Ensure the store is initialized."""
@@ -270,180 +394,14 @@ class MooncakeHiddenStateStore(ABC):
 
         return False
 
-    def put_from(self, key: str, buffer_ptr: int, size: int) -> int:
-        """
-        Store data from a pre-registered buffer (zero-copy).
-        
-        Args:
-            key: Unique key for this data
-            buffer_ptr: Pointer to RDMA-registered buffer
-            size: Number of bytes to store
-            
-        Returns:
-            Status code (0 = success, negative = error)
-        """
-        self._ensure_initialized()
-
-        try:
-            if hasattr(self._store, "put_from"):
-                return self._store.put_from(key, buffer_ptr, size)
-            else:
-                c_type = ctypes.c_byte * size
-                c_array = c_type.from_address(buffer_ptr)
-                data = bytes(c_array)
-                self._store.put(key, data)
-                return 0
-        except Exception as e:
-            logger.error(f"Failed put_from for key {key}: {e}")
-            raise
-
-    def put_tensor(self, key: str, tensor: torch.Tensor) -> int:
-        """
-        Store a PyTorch tensor using RDMA-registered host buffer.
-        
-        Copies tensor to host buffer, then uses put_from for zero-copy transfer.
-        
-        Args:
-            key: Unique key for this tensor
-            tensor: PyTorch tensor to store
-            
-        Returns:
-            Status code (0 = success, negative = error)
-        """
-        self._ensure_initialized()
-
-        try:
-            host_buf = self._host_buffer_pool.get_buffer()
-            nbytes = host_buf.copy_from_tensor(tensor, offset=0)
-            return self.put_from(key, host_buf.ptr, nbytes)
-        except Exception as e:
-            logger.error(f"Failed put_tensor for key {key}: {e}")
-            raise
-
-    def batch_put_tensor(
-        self,
-        keys: List[str],
-        tensors: List[torch.Tensor],
-    ) -> List[int]:
-        """
-        Store multiple PyTorch tensors using RDMA-registered host buffer.
-        
-        Packs all tensors into a host buffer, then stores each one.
-        
-        Args:
-            keys: List of unique keys
-            tensors: List of PyTorch tensors to store
-            
-        Returns:
-            List of status codes (0 = success, negative = error)
-        """
-        self._ensure_initialized()
-
-        try:
-            host_buf = self._host_buffer_pool.get_buffer()
-            results = []
-            offset = 0
-            
-            offsets_and_sizes = []
-            for tensor in tensors:
-                nbytes = host_buf.copy_from_tensor(tensor, offset=offset)
-                offsets_and_sizes.append((offset, nbytes))
-                offset += nbytes
-
-            for key, (off, size) in zip(keys, offsets_and_sizes):
-                result = self.put_from(key, host_buf.ptr + off, size)
-                results.append(result)
-
-            return results
-        except Exception as e:
-            logger.error(f"Failed batch_put_tensor: {e}")
-            raise
-
-    def get_tensor_into(
-        self,
-        key: str,
-        tensor: torch.Tensor,
-    ) -> int:
-        """
-        Retrieve a tensor directly into a pre-allocated tensor.
-        
-        Args:
-            key: Key of the tensor to retrieve
-            tensor: Pre-allocated destination tensor
-            
-        Returns:
-            Number of bytes read (positive = success, negative = error)
-        """
-        self._ensure_initialized()
-
-        try:
-            ptr = tensor.data_ptr()
-            size = tensor.numel() * tensor.element_size()
-            if ptr not in self._registered_buffers:
-                self._register_buffer(ptr, size)
-            if hasattr(self._store, "get_into"):
-                return self._store.get_into(key, ptr, size)
-            else:
-                data = self._store.get(key)
-                if data is None:
-                    raise KeyError(f"Key not found: {key}")
-                data_tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-                tensor.view(torch.uint8).view(-1).copy_(data_tensor.to(tensor.device))
-                return len(data)
-        except Exception as e:
-            logger.error(f"Failed get_tensor_into for key {key}: {e}")
-            raise
-
-    def batch_get_tensor_into(
-        self,
-        keys: List[str],
-        tensors: List[torch.Tensor],
-    ) -> List[int]:
-        """
-        Retrieve multiple tensors directly into pre-allocated tensors.
-        
-        Args:
-            keys: List of keys to retrieve
-            tensors: List of pre-allocated destination tensors
-            
-        Returns:
-            List of bytes read for each operation (positive = success, negative = error)
-        """
-        self._ensure_initialized()
-
-        try:
-            buffer_ptrs = []
-            sizes = []
-            for tensor in tensors:
-                ptr = tensor.data_ptr()
-                size = tensor.numel() * tensor.element_size()
-                if ptr not in self._registered_buffers:
-                    self._register_buffer(ptr, size)
-                buffer_ptrs.append(ptr)
-                sizes.append(size)
-
-            if hasattr(self._store, "batch_get_into"):
-                return self._store.batch_get_into(keys, buffer_ptrs, sizes)
-            else:
-                results = []
-                for key, tensor in zip(keys, tensors):
-                    result = self.get_tensor_into(key, tensor)
-                    results.append(result)
-                return results
-        except Exception as e:
-            logger.error(f"Failed batch_get_tensor_into: {e}")
-            raise
 
     def remove(self, key: str) -> None:
         """Remove data from Mooncake Store."""
-        self._ensure_initialized()
         self._store.remove(key)
         logger.debug(f"Removed data with key: {key}")
 
     def exists(self, key: str) -> bool:
         """Check if a key exists in the store."""
-        self._ensure_initialized()
-
         try:
             data = self._store.get(key)
             return data is not None
@@ -452,12 +410,16 @@ class MooncakeHiddenStateStore(ABC):
 
     def close(self) -> None:
         """Close the Mooncake Store client."""
+        if self._gpu_buffer_pool is not None:
+            self._gpu_buffer_pool.shutdown()
+            self._gpu_buffer_pool = None
         if self._host_buffer_pool is not None:
             self._host_buffer_pool.shutdown()
             self._host_buffer_pool = None
         if self._store is not None and hasattr(self._store, "close"):
             self._store.close()
         self._initialized = False
+        self._gpu_direct_available = False
 
 
 class EagleMooncakeStore(MooncakeHiddenStateStore):
@@ -480,35 +442,14 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         self,
         key: str,
         hidden_states: torch.Tensor,
-        target: Optional[torch.Tensor],
         loss_mask: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        last_hidden_states: Optional[torch.Tensor] = None,
+        last_hidden_states: Optional[torch.Tensor],
+        target: Optional[torch.Tensor] = None,
     ) -> Dict[str, Tuple[int, ...]]:
-        """
-        Store Eagle3 output tensors using RDMA-registered host buffer.
-        
-        Args:
-            key: Base key (typically task_id)
-            hidden_states: Concatenated auxiliary hidden states
-            target: Target logits
-            loss_mask: Loss mask tensor
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            last_hidden_states: Optional last hidden states
-            
-        Returns:
-            Dictionary of tensor shapes for reconstruction
-        """
-        self._ensure_initialized()
-
-        keys = [
-            f"{key}_hs",
-            f"{key}_lm",
-            f"{key}_ids",
-            f"{key}_am",
-        ]
+        """Store Eagle3 output tensors using zero-copy batch_put_from."""
+        keys = [f"{key}_hs", f"{key}_lm", f"{key}_ids", f"{key}_am"]
         tensors = [hidden_states, loss_mask, input_ids, attention_mask]
 
         if target is not None:
@@ -519,11 +460,22 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             keys.append(f"{key}_lhs")
             tensors.append(last_hidden_states)
 
-        results = self.batch_put_tensor(keys, tensors)
+        host_buf = self._host_buffer_pool.get_buffer()
+        buffer_ptrs = []
+        sizes = []
+        offset = 0
+
+        for tensor in tensors:
+            nbytes = host_buf.copy_from_tensor(tensor, offset=offset)
+            buffer_ptrs.append(host_buf.ptr + offset)
+            sizes.append(nbytes)
+            offset += nbytes
+
+        results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
 
         for k, r in zip(keys, results):
             if r != 0:
-                raise RuntimeError(f"batch_put_tensor failed for {k} with code: {r}")
+                raise RuntimeError(f"batch_put_from failed for {k} with code: {r}")
 
         shapes = {
             "hidden_states": tuple(hidden_states.shape),
@@ -547,66 +499,157 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         device: torch.device,
     ) -> "Eagle3TargetOutput":
         """
-        Retrieve Eagle3 tensors directly into pre-allocated GPU tensors.
+        Retrieve Eagle3 tensors into GPU memory.
         
-        Args:
-            key: Base key used when storing
-            shapes: Dictionary of tensor shapes
-            dtypes: Dictionary of tensor dtypes
-            device: Device to allocate tensors on
-            
-        Returns:
-            Eagle3TargetOutput with tensors on the specified device
+        For RDMA/InfiniBand: Uses GPUDirect RDMA (batch_get_into directly into GPU).
+        For TCP: Uses batch_get_buffer to host buffer, then copies to GPU.
+        
+        Automatically falls back to host buffer path if GPUDirect fails.
         """
         from specforge.modeling.target.eagle3_target_model import Eagle3TargetOutput
 
-        self._ensure_initialized()
-
-        hidden_states = torch.empty(shapes["hidden_states"], dtype=dtypes.get("hidden_states", torch.bfloat16), device=device)
-        loss_mask = torch.empty(shapes["loss_mask"], dtype=torch.bool, device=device)
-        input_ids = torch.empty(shapes["input_ids"], dtype=torch.int64, device=device)
-        attention_mask = torch.empty(shapes["attention_mask"], dtype=torch.int64, device=device)
-
-        keys = [
-            f"{key}_hs",
-            f"{key}_lm",
-            f"{key}_ids",
-            f"{key}_am",
+        keys = [f"{key}_hs", f"{key}_lm", f"{key}_ids", f"{key}_am"]
+        tensor_specs = [
+            ("hidden_states", shapes["hidden_states"], dtypes.get("hidden_states", torch.bfloat16)),
+            ("loss_mask", shapes["loss_mask"], torch.bool),
+            ("input_ids", shapes["input_ids"], torch.int64),
+            ("attention_mask", shapes["attention_mask"], torch.int64),
         ]
-        tensors = [hidden_states, loss_mask, input_ids, attention_mask]
 
-        target = None
         if "target" in shapes:
-            target = torch.empty(shapes["target"], dtype=dtypes.get("target", torch.bfloat16), device=device)
             keys.append(f"{key}_tgt")
-            tensors.append(target)
+            tensor_specs.append(("target", shapes["target"], dtypes.get("target", torch.bfloat16)))
 
-        last_hidden_states = None
         if "last_hidden_states" in shapes:
-            last_hidden_states = torch.empty(
-                shapes["last_hidden_states"],
-                dtype=dtypes.get("hidden_states", torch.bfloat16),
-                device=device,
-            )
             keys.append(f"{key}_lhs")
-            tensors.append(last_hidden_states)
+            tensor_specs.append(("last_hidden_states", shapes["last_hidden_states"], dtypes.get("hidden_states", torch.bfloat16)))
 
-        results = self.batch_get_tensor_into(keys, tensors)
-
-        for k, r in zip(keys, results):
-            if r < 0:
-                raise RuntimeError(f"batch_get_tensor_into failed for {k} with code: {r}")
+        tensor_map = self._get_tensors_gpu_direct(keys, tensor_specs, device)
+        if tensor_map is None:
+            logger.debug("GPUDirect RDMA not available, using host buffer path (TCP)")
+            tensor_map = self._get_tensors_via_host_buffer(keys, tensor_specs, device)
 
         logger.debug(f"Retrieved Eagle3 tensors with base key: {key}")
 
         return Eagle3TargetOutput(
-            hidden_states=hidden_states,
-            target=target,
-            loss_mask=loss_mask,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            last_hidden_states=last_hidden_states,
+            hidden_states=tensor_map["hidden_states"],
+            target=tensor_map.get("target"),
+            loss_mask=tensor_map["loss_mask"],
+            input_ids=tensor_map["input_ids"],
+            attention_mask=tensor_map["attention_mask"],
+            last_hidden_states=tensor_map.get("last_hidden_states"),
         )
+
+    def _get_tensors_gpu_direct(
+        self,
+        keys: List[str],
+        tensor_specs: List[Tuple[str, Tuple[int, ...], torch.dtype]],
+        device: torch.device,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Transfer directly into GPU memory using batch_get_into (GPUDirect RDMA).
+        
+        Uses pre-registered GPU buffer pool for RDMA transfers, then copies to
+        output tensors. Returns None if transfer fails, allowing caller to fall
+        back to host buffer path.
+        """
+        if not self._gpu_direct_available or self._gpu_buffer_pool is None:
+            return None
+
+        total_size = sum(
+            self._compute_tensor_size(shape, dtype)
+            for _, shape, dtype in tensor_specs
+        )
+
+        gpu_buf = self._gpu_buffer_pool.get_buffer()
+        if total_size > gpu_buf.size:
+            logger.warning(
+                f"GPU buffer too small: need {total_size}, have {gpu_buf.size}"
+            )
+            return None
+
+        buffer_ptrs = []
+        sizes = []
+        offset = 0
+        offsets = []
+
+        for name, shape, dtype in tensor_specs:
+            size = self._compute_tensor_size(shape, dtype)
+            buffer_ptrs.append(gpu_buf.ptr + offset)
+            sizes.append(size)
+            offsets.append(offset)
+            offset += size
+
+        try:
+            results = self._store.batch_get_into(keys, buffer_ptrs, sizes)
+            for i, (k, r) in enumerate(zip(keys, results)):
+                if r < 0:
+                    logger.warning(f"batch_get_into failed for {k} with error code: {r}")
+                    return None
+                elif r != 0 and r != sizes[i]:
+                    logger.warning(
+                        f"batch_get_into for {k}: unexpected return {r} (expected 0 or {sizes[i]})"
+                    )
+        except Exception as e:
+            logger.warning(f"batch_get_into exception: {e}")
+            return None
+
+        tensor_map = {}
+        for i, (name, shape, dtype) in enumerate(tensor_specs):
+            numel = 1
+            for dim in shape:
+                numel *= dim
+
+            buf_slice = gpu_buf.get_slice(offsets[i], sizes[i])
+            tensor = buf_slice.view(dtype)[:numel].reshape(shape).clone()
+            tensor_map[name] = tensor
+
+        logger.debug(f"GPU Direct RDMA transfer successful for {len(keys)} tensors")
+        return tensor_map
+
+    def _compute_tensor_size(self, shape: Tuple[int, ...], dtype: torch.dtype) -> int:
+        """Compute the byte size of a tensor with given shape and dtype."""
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        return numel * element_size
+
+    def _get_tensors_via_host_buffer(
+        self,
+        keys: List[str],
+        tensor_specs: List[Tuple[str, Tuple[int, ...], torch.dtype]],
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Transfer via Mooncake's registered host buffer, then copy to device."""
+        buffers = self._store.batch_get_buffer(keys)
+
+        tensor_map = {}
+        for i, ((name, shape, dtype), buf) in enumerate(zip(tensor_specs, buffers)):
+            if buf is None:
+                raise RuntimeError(
+                    f"batch_get_buffer returned None for key '{keys[i]}' (tensor: {name}). "
+                    f"This may indicate the key doesn't exist or RDMA transfer failed."
+                )
+
+            numel = 1
+            for dim in shape:
+                numel *= dim
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            expected_size = numel * element_size
+
+            buf_size = buf.size()
+            if buf_size != expected_size:
+                raise RuntimeError(
+                    f"Size mismatch for {name}: got {buf_size} bytes, expected {expected_size} bytes"
+                )
+
+            c_array = (ctypes.c_byte * buf_size).from_address(buf.ptr())
+            host_tensor = torch.frombuffer(c_array, dtype=dtype, count=numel).reshape(shape)
+
+            tensor_map[name] = host_tensor.to(device)
+
+        return tensor_map
 
     def remove_eagle3_tensors(
         self,
@@ -622,8 +665,6 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             has_last_hidden_states: Whether last_hidden_states was stored
             has_target: Whether target (logits) was stored
         """
-        self._ensure_initialized()
-
         keys = [f"{key}_hs", f"{key}_lm", f"{key}_ids", f"{key}_am"]
         if has_target:
             keys.append(f"{key}_tgt")
@@ -638,76 +679,3 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         logger.debug(f"Removed Eagle3 tensors with base key: {key}")
 
-    def get_eagle3_output(self, key: str, device: str = "cuda") -> "Eagle3TargetOutput":
-        """
-        Retrieve Eagle3 output from Mooncake Store (legacy serialization path).
-        
-        This is kept for backwards compatibility with older workers that use
-        pickle serialization instead of the tensor API.
-        
-        Args:
-            key: Key used when storing the data
-            device: Device to move tensors to
-            
-        Returns:
-            Eagle3TargetOutput with tensors on the specified device
-        """
-        from .messages import Eagle3OutputData
-
-        self._ensure_initialized()
-
-        data = self._store.get(key)
-        if data is None:
-            raise KeyError(f"Key not found in Mooncake Store: {key}")
-
-        output_data = Eagle3OutputData.deserialize(data)
-        return output_data.to_eagle3_output(device=device)
-
-
-StoreT = TypeVar("StoreT", bound=MooncakeHiddenStateStore)
-
-
-class MooncakeHiddenStateStorePool(Generic[StoreT]):
-    """
-    Pool of Mooncake Store clients for concurrent access.
-    
-    Useful when multiple threads need to access Mooncake Store simultaneously.
-    """
-
-    def __init__(
-        self,
-        config: MooncakeConfig,
-        pool_size: int = 4,
-        store_class: type[StoreT] = EagleMooncakeStore,
-    ):
-        self.config = config
-        self.pool_size = pool_size
-        self._store_class = store_class
-        self._stores: List[StoreT] = []
-        self._initialized = False
-
-    def setup(self) -> None:
-        """Initialize the pool of Mooncake Store clients."""
-        if self._initialized:
-            return
-
-        for i in range(self.pool_size):
-            store = self._store_class(self.config)
-            store.setup()
-            self._stores.append(store)
-
-        self._initialized = True
-        logger.info(f"Mooncake Store pool initialized with {self.pool_size} clients")
-
-    def get_store(self) -> StoreT:
-        """Get a store from the pool (random selection for load balancing)."""
-        if not self._initialized:
-            self.setup()
-        return random.choice(self._stores)
-
-    def close(self) -> None:
-        """Close all stores in the pool."""
-        for store in self._stores:
-            store.close()
-        self._stores.clear()
-        self._initialized = False

@@ -21,13 +21,13 @@ logging.basicConfig(level=logging.INFO)
 
 def main():
     mooncake_config = MooncakeConfig(
-        local_hostname="localhost",
+        local_hostname="10.173.2.69",
         metadata_server="http://localhost:8090/metadata",
         master_server_address="127.0.0.1:50051",
         global_segment_size=512 * 1024 * 1024,
         local_buffer_size=128 * 1024 * 1024,
         protocol="rdma",
-        device_name="",
+        device_name="mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_12,mlx5_13",
     )
 
     config = RemoteBackendConfig(
@@ -35,6 +35,7 @@ def main():
         notify_addr="tcp://127.0.0.1:5556",
         task_timeout=300.0,
         mooncake_config=mooncake_config,
+        target_model_path="Qwen/Qwen3-8B",
     )
 
     model = RemoteEagle3TargetModel(config=config)
@@ -42,10 +43,9 @@ def main():
 
     batch_size = 1
     seq_len = 128
-    input_ids = torch.randint(0, 32000, (batch_size, seq_len), dtype=torch.long)
-    attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long)
-    loss_mask = torch.ones((batch_size, seq_len), dtype=torch.bool)
-    loss_mask[:, :10] = False
+    input_ids = torch.randint(0, 32000, (batch_size, seq_len), dtype=torch.long, device="cuda")
+    attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device="cuda")
+    loss_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device="cuda")
 
     print(f"Submitting task with input shape: {input_ids.shape}")
 
@@ -60,8 +60,8 @@ def main():
     print(f"  - target: {output.target.shape}")
     print(f"  - loss_mask: {output.loss_mask.shape}")
     print(f"  - input_ids: {output.input_ids.shape}")
-    # Print first 10 elements of hidden_states
-    print(f"  - hidden_states[0]: {output.hidden_states[0][:10]}")
+
+    
 
     model.disconnect()
     print("Done!")

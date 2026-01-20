@@ -28,7 +28,6 @@ from .mooncake_client import (
     EagleMooncakeStore,
     MooncakeConfig,
     MooncakeHiddenStateStore,
-    MooncakeHiddenStateStorePool,
 )
 from .remote_target_model import (
     RemoteBackendConfig,
@@ -56,7 +55,6 @@ __all__ = [
     "NotificationBroker",
     "MooncakeConfig",
     "MooncakeHiddenStateStore",
-    "MooncakeHiddenStateStorePool",
     "EagleMooncakeStore",
     "RemoteBackendConfig",
     "RemoteEagle3TargetModel",

@@ -9,13 +9,14 @@ This module provides a distributed inference backend that separates training and
 │                              Training Nodes (DP)                                │
 │  ┌─────────────────────────────────────────────────────────────────────────┐   │
 │  │  RemoteEagle3TargetModel                                                │   │
-│  │  ┌─────────────────┐  ┌─────────────────────┐  ┌────────────────────┐   │   │
-│  │  │  TaskProducer   │  │NotificationSubscriber│  │Eagle3ZeroCopyReader│  │   │
-│  │  │  (ZMQ PUSH)     │  │ (ZMQ SUB)           │  │ (GPUBufferPool)    │   │   │
-│  │  └────────┬────────┘  └──────────▲──────────┘  └─────────▲──────────┘   │   │
-│  │           │connect              │connect                 │              │   │
+│  │  ┌─────────────────┐  ┌─────────────────────┐                           │   │
+│  │  │  TaskProducer   │  │NotificationSubscriber│                          │   │
+│  │  │  (ZMQ PUSH)     │  │ (ZMQ SUB)           │                           │   │
+│  │  └────────┬────────┘  └──────────▲──────────┘                           │   │
+│  │           │connect              │connect                                │   │
 │  │  ┌────────┴───────────────────────────────────────────────────────────┐│   │
 │  │  │                        EagleMooncakeStore                          ││   │
+│  │  │                       (get tensor data)                            ││   │
 │  │  └────────────────────────────────────────────────────────────────────┘│   │
 │  └───────────│──────────────────────│───────────────────────│──────────────┘   │
 └──────────────│──────────────────────│───────────────────────│──────────────────┘
@@ -39,13 +40,14 @@ This module provides a distributed inference backend that separates training and
 │                           Inference Workers (TP)                               │
 │  ┌─────────────────────────────────────────────────────────────────────────┐   │
 │  │  InferenceWorker                                                        │   │
-│  │  ┌─────────────────┐  ┌─────────────────────┐  ┌────────────────────┐   │   │
-│  │  │  TaskConsumer   │  │NotificationPublisher│  │Eagle3HostBuffer    │   │   │
-│  │  │  (ZMQ PULL)     │  │ (ZMQ PUB)           │  │Writer (Pack→Host)  │   │   │
-│  │  │  bind           │  │ bind                │  └────────────────────┘   │   │
+│  │  ┌─────────────────┐  ┌─────────────────────┐                           │   │
+│  │  │  TaskConsumer   │  │NotificationPublisher│                           │   │
+│  │  │  (ZMQ PULL)     │  │ (ZMQ PUB)           │                           │   │
+│  │  │  bind           │  │ bind                │                           │   │
 │  │  └─────────────────┘  └─────────────────────┘                           │   │
 │  │  ┌────────────────────────────────────────────────────────────────────┐ │   │
 │  │  │                        EagleMooncakeStore                          │ │   │
+│  │  │                       (batch_put_tensor)                           │ │   │
 │  │  └────────────────────────────────────────────────────────────────────┘ │   │
 │  │  ┌─────────────────────────────────────────────────────────────────┐   │   │
 │  │  │  SGLangEagle3TargetModel (SGLang Runtime)                       │   │   │
@@ -65,7 +67,6 @@ This module provides a distributed inference backend that separates training and
 | `RemoteEagle3TargetModel` | Implements `Eagle3TargetModel` interface by delegating to remote workers. Supports both sync (`generate_eagle3_data`) and async (`submit_task`/`get_result`) modes. |
 | `TaskProducer` | ZeroMQ PUSH socket that connects to worker's PULL socket. |
 | `NotificationSubscriber` | ZeroMQ SUB socket with background listener thread for receiving completion notifications filtered by task_id. |
-| `Eagle3ZeroCopyReader` | Manages `GPUBufferPool` and unpacks results from Mooncake directly into GPU memory via RDMA. |
 | `EagleMooncakeStore` | Client wrapper for retrieving hidden states from Mooncake Store. |
 
 ### Inference Side (`inference_worker.py`)
@@ -76,8 +77,7 @@ This module provides a distributed inference backend that separates training and
 | `InferenceWorkerManager` | Manages multiple workers in a single process (for testing or single-node multi-GPU setups). |
 | `TaskConsumer` | ZeroMQ PULL socket that binds to address (workers bind, trainers connect). |
 | `NotificationPublisher` | ZeroMQ PUB socket that binds to address for broadcasting task completion with task_id as topic. |
-| `Eagle3HostBufferWriter` | Packs Eagle3 output into RDMA-registered host memory buffer (`HostBuffer`) for zero-copy storage. |
-| `EagleMooncakeStore` | Client wrapper for storing hidden states in Mooncake Store. |
+| `EagleMooncakeStore` | Client wrapper for storing hidden states in Mooncake Store via `batch_put_tensor`. |
 | `SGLangEagle3TargetModel` | The actual inference backend using SGLang Runtime. |
 
 ### Communication (`task_queue.py`, `messages.py`)
@@ -90,17 +90,14 @@ This module provides a distributed inference backend that separates training and
 | `NotificationBroker` | Optional broker for notifications. Worker PUB → Broker XSUB/XPUB → Training SUB. |
 | `QueueConfig` | Configuration for task queue and notification addresses, timeouts, HWM. |
 
-### Storage (`mooncake_client.py`, `zero_copy.py`)
+### Storage (`mooncake_client.py`)
 
 | Component | Description |
 |-----------|-------------|
-| `EagleMooncakeStore` | Specialized store for Eagle3 outputs. Extends `MooncakeHiddenStateStore` with put/get methods for Eagle3TargetOutput. |
-| `MooncakeHiddenStateStore` | Base client wrapper for Mooncake Store. Handles raw bytes, GPU buffer registration for RDMA. |
-| `HostBuffer` | Pre-allocated host buffer using `MooncakeHostTensorAllocator` for RDMA-compatible memory. Used by inference workers to pack outputs. |
-| `Eagle3HostBufferWriter` | Helper for inference workers to write outputs into host buffers without serialization overhead. |
-| `GPUBuffer` | Pre-allocated GPU buffer that can be registered with Mooncake for RDMA transfers. Used by training nodes. |
-| `GPUBufferPool` | Pool of GPU buffers for concurrent zero-copy reads on training side. |
-| `Eagle3ZeroCopyReader` | Helper for training nodes to read outputs via RDMA directly into GPU buffers. |
+| `EagleMooncakeStore` | Specialized store for Eagle3 outputs. Stores each tensor separately with key suffixes (`_hs`, `_tgt`, `_lm`, `_ids`, `_am`, `_lhs`). |
+| `MooncakeHiddenStateStore` | Base client wrapper for Mooncake Store. Handles tensor storage via RDMA-registered host buffers. |
+| `HostBuffer` | Pre-allocated host buffer using `MooncakeHostMemAllocator` for RDMA-compatible memory. |
+| `HostBufferPool` | Pool of RDMA-registered host buffers for tensor storage. |
 | `MooncakeConfig` | Configuration for Mooncake Store connection (master address, segment sizes, protocol). |
 
 ## Data Flow
@@ -109,43 +106,14 @@ This module provides a distributed inference backend that separates training and
 
 2. **Task Processing**: Inference worker's `TaskConsumer` pulls task (rank 0 broadcasts to other TP ranks), deserializes tensors, runs forward pass via `SGLangEagle3TargetModel.extend()`.
 
-3. **Result Storage**: Worker packs `Eagle3TargetOutput` (aux_hidden_states, target logits, loss_mask, input_ids, attention_mask) into `HostBuffer` via `Eagle3HostBufferWriter`, then stores in Mooncake via `put_from_host_buffer()` using task_id as key.
+3. **Result Storage**: Worker stores each tensor separately via `EagleMooncakeStore.put_eagle3_tensors()` using task_id as the base key. Each tensor gets a suffix: `{task_id}_hs`, `{task_id}_tgt`, etc.
 
-4. **Completion Notification**: Worker publishes `TaskNotification` with task_id as ZMQ topic, including status, mooncake_key, tensor_shapes, and data_size.
+4. **Completion Notification**: Worker publishes `TaskNotification` with task_id as ZMQ topic, including status, mooncake_key, tensor_shapes, and dtypes.
 
-5. **Result Retrieval**: Training node's `NotificationSubscriber` receives notification, then either:
-   - **Zero-copy path**: `Eagle3ZeroCopyReader.unpack_rdma_to_gpu()` transfers data directly to GPU buffer via RDMA
-   - **Fallback path**: `EagleMooncakeStore.get_eagle3_output()` deserializes via pickle
-
-## Zero-Copy Transfer
-
-The system supports two data transfer modes:
-
-### Serialized Mode (Default Fallback)
-- Uses pickle to serialize/deserialize tensors via `Eagle3OutputData`
-- Data flow: GPU → CPU → Pickle → Mooncake → Unpickle → CPU → GPU
-
-### Zero-Copy Mode (Recommended)
-- Packs tensors into aligned contiguous host buffer (`HostBuffer` via `MooncakeHostTensorAllocator`)
-- Memory layout: `[Header 64B] [pad] [hidden_states] [pad] [target] [pad] [loss_mask] [pad] [input_ids] [pad] [attention_mask] [pad] [last_hidden_states?]`
-- Each tensor aligned to 64 bytes for optimal RDMA
-- Header contains tensor sizes (6 × uint64), dtypes (2 × 4B), and total_size
-
-**Data flow:**
-```
-Inference Worker:
-  GPU tensors → Eagle3HostBufferWriter.pack_eagle3_output()
-             → HostBuffer (RDMA-registered host memory)
-             → EagleMooncakeStore.put_from_host_buffer()
-
-Training Node:
-  EagleMooncakeStore.get_into_gpu_buffer() → GPUBuffer (RDMA to GPU)
-             → Eagle3ZeroCopyReader.unpack_rdma_to_gpu()
-             → Eagle3TargetOutput tensors on GPU
-```
-
-- With RDMA: Remote Host Memory → RDMA → Local GPU (bypasses local CPU)
-- Without RDMA: Remote Host Memory → TCP → Local GPU buffer → Clone
+5. **Result Retrieval**: Training node's `NotificationSubscriber` receives notification, then calls `EagleMooncakeStore.get_eagle3_tensors_into()` which:
+   - Retrieves each tensor from the store
+   - Copies tensors to the target device (GPU)
+   - Returns `Eagle3TargetOutput` with tensors on the specified device
 
 ## Usage
 
@@ -157,8 +125,7 @@ python -m specforge.modeling.target.remote_backend \
     --tp-size 4 \
     --task-queue-addr tcp://broker:5555 \
     --notify-addr tcp://broker:5556 \
-    --mooncake-master-addr mooncake-master:50051 \
-    --use-zero-copy true
+    --mooncake-master-addr mooncake-master:50051
 ```
 
 ### Training Side Integration
@@ -173,7 +140,6 @@ from specforge.modeling.target.remote_backend import (
 config = RemoteBackendConfig(
     task_queue_addr="tcp://broker:5555",
     notify_addr="tcp://broker:5556",
-    use_zero_copy=True,
     mooncake_config=MooncakeConfig(
         master_server_address="mooncake-master:50051",
     ),
@@ -233,7 +199,6 @@ to control how many batches are submitted ahead of time (default: 4).
 | `task_queue_addr` | `tcp://localhost:5555` | ZeroMQ task queue address |
 | `notify_addr` | `tcp://localhost:5556` | ZeroMQ notification address |
 | `task_timeout` | 300.0 | Timeout in seconds for task completion |
-| `zero_copy_pool_size` | 4 | Number of GPU buffers in pool |
 | `dp_rank` | 0 | Data parallel rank (for task ID uniqueness) |
 
 ### MooncakeConfig
@@ -289,5 +254,3 @@ The broker-based topology is recommended for:
 - Dynamic scaling of workers
 - Centralized connection management
 - Multi-node deployments where direct connectivity is complex
-# 1. Send a message, receive the tensor, run inference
-
