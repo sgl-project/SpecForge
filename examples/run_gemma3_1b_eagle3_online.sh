@@ -10,7 +10,7 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --target-model-path google/gemma-3-1b-it \
     --draft-model-config $ROOT_DIR/configs/gemma3-1b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --output-dir $ROOT_DIR/outputs/gemma3-1b-eagle3-sharegpt \
