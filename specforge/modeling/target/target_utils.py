@@ -38,9 +38,7 @@ class TargetEmbeddingsAndHead(nn.Module):
 
         # 1. Load Config
         config = AutoConfig.from_pretrained(
-            model_path, 
-            cache_dir=cache_dir, 
-            trust_remote_code=trust_remote_code
+            model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
         )
         instance = cls(config)
 

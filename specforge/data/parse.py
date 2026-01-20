@@ -55,7 +55,9 @@ class GeneralParser(Parser):
             self.assistant_pattern = (
                 re.escape(chat_template.assistant_header)
                 + r"(.*?)(?="
-                + re.escape("[Round ") + r"\d+" + re.escape("] USER:")
+                + re.escape("[Round ")
+                + r"\d+"
+                + re.escape("] USER:")
                 + "|$)"
             )
         else:
@@ -65,7 +67,6 @@ class GeneralParser(Parser):
                 + re.escape(self.user_message_separator)
                 + "|$)"
             )
-
 
     def parse(
         self,
