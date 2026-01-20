@@ -31,7 +31,6 @@ from specforge.data import (
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
-    PrefetchingDataLoader,
 )
 from specforge.distributed import (
     destroy_distributed,
@@ -546,15 +545,7 @@ def run_forward(
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
-    eagle3_data=None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """
-    Run forward pass on the eagle3 model.
-    
-    Args:
-        eagle3_data: Pre-fetched eagle3 data for remote backend prefetching.
-                    If provided, skips target model inference.
-    """
     if args.is_vlm:
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
@@ -565,18 +556,17 @@ def run_forward(
         )
     else:
         if is_online:
-            if eagle3_data is None:
-                eagle3_data = target_model.generate_eagle3_data(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
+            target_data = target_model.generate_eagle3_data(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+            )
 
-            input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
-            attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
-            loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-            target = get_dp_data_shard_from_tp(eagle3_data.target)
-            hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            input_ids = get_dp_data_shard_from_tp(target_data.input_ids)
+            attention_mask = get_dp_data_shard_from_tp(target_data.attention_mask)
+            loss_mask = get_dp_data_shard_from_tp(target_data.loss_mask)
+            target = get_dp_data_shard_from_tp(target_data.target)
+            hidden_states = get_dp_data_shard_from_tp(target_data.hidden_states)
         else:
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
@@ -826,42 +816,19 @@ def main():
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
 
-    use_remote_prefetch = (
-        args.target_model_backend == "remote"
-        and is_online
-        and args.prefetch_depth > 0
-    )
-
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
 
-        if use_remote_prefetch:
-            data_iterator = PrefetchingDataLoader(
-                train_dataloader,
-                target_model,
-                prefetch_depth=args.prefetch_depth,
-                low_watermark=max(1, args.prefetch_depth // 2),
-                refill_batch_size=args.prefetch_depth,
-            )
-        else:
-            data_iterator = train_dataloader
-
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                data_iterator, desc=f"Training Epoch {epoch}", leave=True
+                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
             )
         else:
-            progress_bar = data_iterator
+            progress_bar = train_dataloader
 
-        for item in progress_bar:
-            if use_remote_prefetch:
-                data, eagle3_data = item
-            else:
-                data = item
-                eagle3_data = None
-                
+        for data in progress_bar:
             global_step += 1
 
             # ================================================
@@ -893,7 +860,7 @@ def main():
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online, eagle3_data
+                args, eagle3_model, data, target_model, is_online
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
@@ -937,7 +904,7 @@ def main():
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
                         plosses, acces = run_forward(
-                            args, eagle3_model, data, target_model, is_online, None
+                            args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))
