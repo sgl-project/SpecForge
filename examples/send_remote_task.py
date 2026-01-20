@@ -34,7 +34,6 @@ def main():
         task_queue_addr="tcp://127.0.0.1:5555",
         notify_addr="tcp://127.0.0.1:5556",
         task_timeout=300.0,
-        use_zero_copy=True,
         mooncake_config=mooncake_config,
     )
 

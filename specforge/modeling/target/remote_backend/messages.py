@@ -34,8 +34,8 @@ class InferenceTask:
     attention_mask: bytes
     loss_mask: bytes
     aux_hidden_states_layers: List[int] = field(default_factory=lambda: [1, -1, -4])
-    return_last_hidden_states: bool = False
-    return_logits: bool = True
+    return_last_hidden_states: bool = True
+    return_logits: bool = False
 
     @classmethod
     def create(
@@ -200,7 +200,7 @@ if __name__ == "__main__":
         attention_mask=torch.randint(0, 1, (16, 1000)),
         loss_mask=torch.randint(0, 1, (16, 1000)),
         aux_hidden_states_layers=[1, -1, -4],
-        return_last_hidden_states=False,
-        return_logits=True,
+        return_last_hidden_states=True,
+        return_logits=False,
     )
     print(task.get_input_ids())

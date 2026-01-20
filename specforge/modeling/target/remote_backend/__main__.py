@@ -131,7 +131,6 @@ def main():
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
         worker_id=args.worker_id,
-        use_zero_copy=args.use_zero_copy,
         mooncake_config=mooncake_config,
         queue_config=queue_config,
         sglang_backend_args=sglang_backend_args,
@@ -140,7 +139,6 @@ def main():
     logging.info(f"Starting inference worker {args.worker_id}")
     logging.info(f"Model: {args.model_path}")
     logging.info(f"Task queue: {args.task_queue_addr}")
-    logging.info(f"Zero-copy: {args.use_zero_copy}")
 
     run_worker(config)
 

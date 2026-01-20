@@ -17,9 +17,6 @@ class RemoteBackendArgsMixin:
     notify_addr: str = "tcp://localhost:5556"
     task_timeout: float = 300.0
     prefetch_depth: int = 4
-    use_zero_copy: bool = True
-    zero_copy_buffer_size: str = "2GB"
-    zero_copy_pool_size: int = 4
     dp_rank: int = 0
     dp_size: int = 1
 
@@ -173,9 +170,6 @@ class RemoteBackendArgsMixin:
             notify_addr=getattr(args, "notify_addr", "tcp://localhost:5556"),
             task_timeout=getattr(args, "task_timeout", 300.0),
             prefetch_depth=getattr(args, "prefetch_depth", 4),
-            use_zero_copy=getattr(args, "use_zero_copy", True),
-            zero_copy_buffer_size=getattr(args, "zero_copy_buffer_size", "2GB"),
-            zero_copy_pool_size=getattr(args, "zero_copy_pool_size", 4),
             dp_rank=dp_rank,
             dp_size=dp_size,
             mooncake_local_hostname=getattr(
@@ -222,9 +216,6 @@ class RemoteBackendArgsMixin:
                 task_queue_addr=self.task_queue_addr,
                 notify_addr=self.notify_addr,
                 task_timeout=self.task_timeout,
-                use_zero_copy=self.use_zero_copy,
-                zero_copy_buffer_size=MooncakeConfig.parse_size(self.zero_copy_buffer_size),
-                zero_copy_pool_size=self.zero_copy_pool_size,
                 dp_rank=self.dp_rank,
                 dp_size=self.dp_size,
                 mooncake_config=mooncake_config,

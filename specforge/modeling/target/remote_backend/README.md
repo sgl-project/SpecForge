@@ -233,8 +233,6 @@ to control how many batches are submitted ahead of time (default: 4).
 | `task_queue_addr` | `tcp://localhost:5555` | ZeroMQ task queue address |
 | `notify_addr` | `tcp://localhost:5556` | ZeroMQ notification address |
 | `task_timeout` | 300.0 | Timeout in seconds for task completion |
-| `use_zero_copy` | True | Enable zero-copy GPU transfers |
-| `zero_copy_buffer_size` | 2GB | Size of each GPU buffer for zero-copy |
 | `zero_copy_pool_size` | 4 | Number of GPU buffers in pool |
 | `dp_rank` | 0 | Data parallel rank (for task ID uniqueness) |
 
@@ -260,7 +258,6 @@ to control how many batches are submitted ahead of time (default: 4).
 | `mem_fraction_static` | 0.8 | GPU memory fraction for KV cache |
 | `attention_backend` | `flashinfer` | Attention backend |
 | `disable_cuda_graph` | False | Disable CUDA graph optimization |
-| `use_zero_copy` | True | Enable zero-copy packing |
 
 ## Network Topology
 

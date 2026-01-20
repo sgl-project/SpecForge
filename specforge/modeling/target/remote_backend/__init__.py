@@ -40,14 +40,6 @@ from .inference_worker import (
     InferenceWorkerManager,
     run_worker,
 )
-from .zero_copy import (
-    Eagle3BufferLayout,
-    Eagle3ZeroCopyReader,
-    Eagle3ZeroCopyWriter,
-    GPUBuffer,
-    GPUBufferPool,
-    estimate_buffer_size,
-)
 
 __all__ = [
     "InferenceTask",
@@ -72,10 +64,4 @@ __all__ = [
     "InferenceWorkerConfig",
     "InferenceWorkerManager",
     "run_worker",
-    "GPUBuffer",
-    "GPUBufferPool",
-    "Eagle3BufferLayout",
-    "Eagle3ZeroCopyWriter",
-    "Eagle3ZeroCopyReader",
-    "estimate_buffer_size",
 ]

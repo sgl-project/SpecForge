@@ -11,6 +11,9 @@ The model supports both synchronous and asynchronous operation modes:
 
 Prefetching should be implemented in the training loop by submitting tasks
 a few steps ahead of when results are needed.
+
+To reduce network bandwidth, inference workers send last_hidden_states instead
+of logits. The trainer computes logits locally using the lm_head weights.
 """
 
 import logging
@@ -23,6 +26,8 @@ from specforge.modeling.target.eagle3_target_model import (
     Eagle3TargetModel,
     Eagle3TargetOutput,
 )
+from specforge.modeling.target.target_head import TargetHead
+from specforge.utils import padding
 
 from .messages import InferenceTask, TaskNotification, TaskStatus, generate_task_id
 from .mooncake_client import EagleMooncakeStore, MooncakeConfig
@@ -48,6 +53,9 @@ class RemoteBackendConfig:
     dp_size: int = 1
     mooncake_config: MooncakeConfig = None
     queue_config: QueueConfig = None
+    target_model_path: Optional[str] = None
+    lm_head_key: str = "lm_head.weight"
+    trust_remote_code: bool = False
 
     def __post_init__(self):
         if self.mooncake_config is None:
@@ -82,6 +90,7 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         self.task_producer: Optional[TaskProducer] = None
         self.notification_sub: Optional[NotificationSubscriber] = None
         self.mooncake_store: Optional[EagleMooncakeStore] = None
+        self.target_head: Optional[TargetHead] = None
 
         self._connected = False
 
@@ -97,8 +106,9 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         """
         Create a RemoteEagle3TargetModel from configuration.
         
-        Note: Unlike local backends, this doesn't load the model locally.
-        The model is loaded on remote inference workers.
+        Note: Unlike local backends, this doesn't load the full model locally.
+        The model is loaded on remote inference workers. Only the lm_head is
+        loaded locally to compute logits from last_hidden_states.
         """
         config = kwargs.get("remote_config")
         if config is None:
@@ -106,6 +116,9 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
                 task_queue_addr=kwargs.get("task_queue_addr", "tcp://localhost:5555"),
                 notify_addr=kwargs.get("notify_addr", "tcp://localhost:5556"),
                 task_timeout=kwargs.get("task_timeout", 300.0),
+                target_model_path=pretrained_model_name_or_path,
+                lm_head_key=kwargs.get("lm_head_key", "lm_head.weight"),
+                trust_remote_code=kwargs.get("trust_remote_code", False),
             )
 
             mooncake_config = MooncakeConfig(
@@ -126,6 +139,9 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
                 device_name=kwargs.get("mooncake_device_name", ""),
             )
             config.mooncake_config = mooncake_config
+        else:
+            if config.target_model_path is None:
+                config.target_model_path = pretrained_model_name_or_path
 
         aux_hidden_states_layers = kwargs.get("aux_hidden_states_layers")
         return cls(config=config, aux_hidden_states_layers=aux_hidden_states_layers)
@@ -150,6 +166,14 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         self.mooncake_store = EagleMooncakeStore(self.config.mooncake_config)
         self.mooncake_store.setup()
 
+        if self.config.target_model_path is not None:
+            self.target_head = TargetHead.from_pretrained(
+                model_path=self.config.target_model_path,
+                lm_head_key=self.config.lm_head_key,
+                trust_remote_code=self.config.trust_remote_code,
+            )
+            logger.info(f"Loaded TargetHead from {self.config.target_model_path}")
+
         self._connected = True
         logger.info("RemoteEagle3TargetModel connected to remote infrastructure")
 
@@ -166,6 +190,9 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         if self.mooncake_store is not None:
             self.mooncake_store.close()
             self.mooncake_store = None
+
+        if self.target_head is not None:
+            self.target_head = None
 
         self._connected = False
         logger.info("RemoteEagle3TargetModel disconnected")
@@ -207,6 +234,7 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         1. Submits an inference task to the task queue
         2. Waits for completion notification
         3. Retrieves results from Mooncake Store (using zero-copy if enabled)
+        4. Computes logits locally from last_hidden_states using TargetHead
         """
         if not self._connected:
             self.connect()
@@ -218,8 +246,8 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             aux_hidden_states_layers=self.aux_hidden_states_layers,
-            return_last_hidden_states=False,
-            return_logits=True,
+            return_last_hidden_states=True,
+            return_logits=False,
             task_id=task_id,
         )
 
@@ -264,7 +292,11 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         notification: TaskNotification,
         device: torch.device,
     ) -> Eagle3TargetOutput:
-        """Retrieve output from Mooncake, using tensor API or legacy path."""
+        """Retrieve output from Mooncake, using tensor API or legacy path.
+        
+        If target (logits) is not present but last_hidden_states is, compute
+        logits locally using the TargetHead to save network bandwidth.
+        """
         mooncake_key = notification.mooncake_key or notification.task_id
 
         if notification.use_tensor_api and notification.tensor_shapes is not None:
@@ -276,6 +308,17 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
                 device=device,
             )
             logger.debug(f"Retrieved via batch_get_tensor_into: {mooncake_key}")
+
+            if output.target is None and output.last_hidden_states is not None:
+                if self.target_head is None:
+                    raise RuntimeError(
+                        "Received last_hidden_states without target, but TargetHead is not initialized. "
+                        "Please ensure target_model_path is set in RemoteBackendConfig."
+                    )
+                target = self.target_head(output.last_hidden_states)
+                output.target = padding(target, left=False)
+                logger.debug("Computed logits from last_hidden_states using TargetHead")
+
             return output
         else:
             return self.mooncake_store.get_eagle3_output(mooncake_key, device=device)
@@ -285,8 +328,14 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         mooncake_key = notification.mooncake_key or notification.task_id
 
         if notification.use_tensor_api:
-            has_lhs = "last_hidden_states" in (notification.tensor_shapes or {})
-            self.mooncake_store.remove_eagle3_tensors(mooncake_key, has_lhs)
+            shapes = notification.tensor_shapes or {}
+            has_lhs = "last_hidden_states" in shapes
+            has_target = "target" in shapes
+            self.mooncake_store.remove_eagle3_tensors(
+                mooncake_key,
+                has_last_hidden_states=has_lhs,
+                has_target=has_target,
+            )
         else:
             self.mooncake_store.remove(mooncake_key)
 
@@ -312,8 +361,8 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             aux_hidden_states_layers=self.aux_hidden_states_layers,
-            return_last_hidden_states=False,
-            return_logits=True,
+            return_last_hidden_states=True,
+            return_logits=False,
             task_id=task_id,
         )
 

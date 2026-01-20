@@ -260,8 +260,9 @@ class InferenceWorker:
 
             dtypes = {
                 "hidden_states": hidden_states.dtype,
-                "target": target.dtype if target is not None else torch.bfloat16,
             }
+            if target is not None:
+                dtypes["target"] = target.dtype
 
             self.notification_pub.publish(
                 TaskNotification(
@@ -354,6 +355,7 @@ class InferenceWorker:
 
         if target_out[0] is not None:
             target_out = torch.cat(target_out, dim=0)
+            target_out = padding(target_out, left=False)
         else:
             target_out = None
 
@@ -362,7 +364,6 @@ class InferenceWorker:
         else:
             last_hidden_states_out = None
 
-        target_out = padding(target_out, left=False)
         input_ids_out = padding(input_ids_out, left=False)
         loss_mask_out = loss_mask_out[..., None]
 
