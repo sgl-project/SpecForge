@@ -108,9 +108,9 @@ class HostBufferPool:
         self._buffers.clear()
 
 
-class GPUBuffer:
+class GPUReceiveBuffer:
     """
-    RDMA-registered GPU buffer for GPU Direct RDMA transfers.
+    Single RDMA-registered GPU buffer for receiving tensors via GPU Direct RDMA.
     
     Allocates contiguous GPU memory that can be registered with Mooncake
     for direct RDMA transfers without CPU involvement.
@@ -119,8 +119,20 @@ class GPUBuffer:
     def __init__(self, size: int, device: torch.device = None):
         self.size = size
         self.device = device or torch.device("cuda")
-        self._tensor = torch.empty(size, dtype=torch.uint8, device=self.device)
+        self._tensor: Optional[torch.Tensor] = None
+        self._ptr: int = 0
+        self._initialized = False
+
+    def initialize(self) -> None:
+        """Allocate the GPU buffer."""
+        if self._initialized:
+            return
+        self._tensor = torch.empty(self.size, dtype=torch.uint8, device=self.device)
         self._ptr = self._tensor.data_ptr()
+        self._initialized = True
+        logger.info(
+            f"Initialized GPU receive buffer: {self.size / (1024**2):.1f}MB on {self.device}"
+        )
 
     @property
     def ptr(self) -> int:
@@ -128,6 +140,8 @@ class GPUBuffer:
 
     def get_slice(self, offset: int, size: int) -> torch.Tensor:
         """Get a slice of the buffer as a tensor view."""
+        if not self._initialized:
+            raise RuntimeError("GPU buffer not initialized")
         return self._tensor[offset:offset + size]
 
     def free(self) -> None:
@@ -135,58 +149,69 @@ class GPUBuffer:
             del self._tensor
             self._tensor = None
             self._ptr = 0
+            self._initialized = False
 
     def __del__(self):
         self.free()
 
 
-class GPUBufferPool:
+def calculate_eagle3_buffer_size(
+    max_seq_len: int,
+    batch_size: int,
+    hidden_dim: int,
+    num_aux_layers: int = 3,
+    include_last_hidden_states: bool = True,
+    safety_margin: float = 1.1,
+) -> int:
     """
-    Pool of RDMA-registered GPU buffers for receiving tensors via GPU Direct RDMA.
+    Calculate the required GPU buffer size for receiving Eagle3 output tensors.
+    
+    Tensors transferred via RDMA:
+    - hidden_states: (batch, seq, hidden_dim * num_aux_layers), bfloat16
+    - loss_mask: (batch, seq, 1), bool
+    - input_ids: (batch, seq), int64
+    - attention_mask: (batch, seq), int64
+    - last_hidden_states: (batch, seq, hidden_dim), bfloat16 (optional)
+    
+    Note: target/logits are computed locally from last_hidden_states, not transferred.
+    
+    Args:
+        max_seq_len: Maximum sequence length
+        batch_size: Batch size
+        hidden_dim: Model hidden dimension (e.g., 4096 for Qwen3-8B)
+        num_aux_layers: Number of auxiliary hidden state layers (default 3 for Eagle3)
+        include_last_hidden_states: Whether last_hidden_states will be transferred
+        safety_margin: Multiplier for safety margin (default 1.1 = 10% extra)
+    
+    Returns:
+        Required buffer size in bytes
     """
-
-    def __init__(
-        self,
-        buffer_size: int = 2 * 1024**3,
-        pool_size: int = 2,
-        device: torch.device = None,
-    ):
-        self.buffer_size = buffer_size
-        self.pool_size = pool_size
-        self.device = device or torch.device("cuda")
-        self._buffers: List[GPUBuffer] = []
-        self._current_idx = 0
-        self._initialized = False
-
-    def initialize(self) -> None:
-        """Pre-allocate all GPU buffers."""
-        if self._initialized:
-            return
-        for _ in range(self.pool_size):
-            self._buffers.append(GPUBuffer(self.buffer_size, self.device))
-        self._initialized = True
-        logger.info(
-            f"Initialized GPU buffer pool: {self.pool_size} x {self.buffer_size / (1024**3):.1f}GB "
-            f"on {self.device}"
-        )
-
-    def get_buffer(self) -> GPUBuffer:
-        """Get the next buffer (round-robin)."""
-        if not self._buffers:
-            self.initialize()
-        buf = self._buffers[self._current_idx]
-        self._current_idx = (self._current_idx + 1) % len(self._buffers)
-        return buf
-
-    def get_buffer_ptrs(self) -> List[int]:
-        """Get data pointers of all buffers for registration."""
-        return [buf.ptr for buf in self._buffers]
-
-    def shutdown(self) -> None:
-        for buf in self._buffers:
-            buf.free()
-        self._buffers.clear()
-        self._initialized = False
+    bfloat16_size = 2
+    int64_size = 8
+    bool_size = 1
+    
+    hidden_states_size = batch_size * max_seq_len * hidden_dim * num_aux_layers * bfloat16_size
+    loss_mask_size = batch_size * max_seq_len * 1 * bool_size
+    input_ids_size = batch_size * max_seq_len * int64_size
+    attention_mask_size = batch_size * max_seq_len * int64_size
+    
+    total = hidden_states_size + loss_mask_size + input_ids_size + attention_mask_size
+    
+    if include_last_hidden_states:
+        last_hidden_states_size = batch_size * max_seq_len * hidden_dim * bfloat16_size
+        total += last_hidden_states_size
+    
+    total_with_margin = int(total * safety_margin)
+    
+    alignment = 256
+    aligned_size = ((total_with_margin + alignment - 1) // alignment) * alignment
+    
+    logger.debug(
+        f"Calculated Eagle3 buffer size: {aligned_size / (1024**2):.1f}MB "
+        f"(seq={max_seq_len}, batch={batch_size}, hidden={hidden_dim})"
+    )
+    
+    return aligned_size
 
 
 @dataclass
@@ -219,9 +244,22 @@ class MooncakeConfig:
     enable_soft_pin: bool = False
     host_buffer_size: int = 4 * 1024 * 1024 * 1024
     host_buffer_pool_size: int = 2
-    gpu_buffer_size: int = 2 * 1024 * 1024 * 1024
-    gpu_buffer_pool_size: int = 2
     enable_gpu_direct_rdma: bool = True
+    
+    max_seq_len: int = 8192
+    max_batch_size: int = 1
+    hidden_dim: int = 4096
+    gpu_buffer_size: Optional[int] = None
+
+    def get_gpu_buffer_size(self) -> int:
+        """Get GPU buffer size, calculating if not explicitly set."""
+        if self.gpu_buffer_size is not None:
+            return self.gpu_buffer_size
+        return calculate_eagle3_buffer_size(
+            max_seq_len=self.max_seq_len,
+            batch_size=self.max_batch_size,
+            hidden_dim=self.hidden_dim,
+        )
 
     @classmethod
     def from_env(cls) -> "MooncakeConfig":
@@ -298,7 +336,7 @@ class MooncakeHiddenStateStore(ABC):
         self._initialized = False
         self._registered_buffers: Dict[int, int] = {}
         self._host_buffer_pool: Optional[HostBufferPool] = None
-        self._gpu_buffer_pool: Optional[GPUBufferPool] = None
+        self._gpu_receive_buffer: Optional[GPUReceiveBuffer] = None
         self._gpu_direct_available = False
 
     def setup(self, device: torch.device = None) -> None:
@@ -336,38 +374,31 @@ class MooncakeHiddenStateStore(ABC):
         )
 
     def _setup_gpu_direct(self, device: torch.device = None) -> None:
-        """Initialize GPU buffer pool and register for GPU Direct RDMA."""
+        """Initialize GPU receive buffer and register for GPU Direct RDMA."""
         try:
-            self._gpu_buffer_pool = GPUBufferPool(
-                buffer_size=self.config.gpu_buffer_size,
-                pool_size=self.config.gpu_buffer_pool_size,
+            buffer_size = self.config.get_gpu_buffer_size()
+            self._gpu_receive_buffer = GPUReceiveBuffer(
+                size=buffer_size,
                 device=device,
             )
-            self._gpu_buffer_pool.initialize()
+            self._gpu_receive_buffer.initialize()
 
-            success_count = 0
-            for buf in self._gpu_buffer_pool._buffers:
-                if self._register_buffer(buf.ptr, buf.size):
-                    success_count += 1
-
-            if success_count == len(self._gpu_buffer_pool._buffers):
+            if self._register_buffer(self._gpu_receive_buffer.ptr, self._gpu_receive_buffer.size):
                 self._gpu_direct_available = True
                 logger.info(
-                    f"GPU Direct RDMA enabled: registered {success_count} GPU buffers"
+                    f"GPU Direct RDMA enabled: registered {buffer_size / (1024**2):.1f}MB GPU buffer"
                 )
             else:
-                logger.warning(
-                    f"GPU Direct RDMA partially available: {success_count}/"
-                    f"{len(self._gpu_buffer_pool._buffers)} buffers registered"
-                )
-                self._gpu_direct_available = success_count > 0
+                logger.warning("Failed to register GPU buffer with Mooncake")
+                self._gpu_receive_buffer.free()
+                self._gpu_receive_buffer = None
 
         except Exception as e:
             logger.warning(f"Failed to setup GPU Direct RDMA: {e}")
             self._gpu_direct_available = False
-            if self._gpu_buffer_pool is not None:
-                self._gpu_buffer_pool.shutdown()
-                self._gpu_buffer_pool = None
+            if self._gpu_receive_buffer is not None:
+                self._gpu_receive_buffer.free()
+                self._gpu_receive_buffer = None
 
     def _ensure_initialized(self) -> None:
         """Ensure the store is initialized."""
@@ -410,9 +441,9 @@ class MooncakeHiddenStateStore(ABC):
 
     def close(self) -> None:
         """Close the Mooncake Store client."""
-        if self._gpu_buffer_pool is not None:
-            self._gpu_buffer_pool.shutdown()
-            self._gpu_buffer_pool = None
+        if self._gpu_receive_buffer is not None:
+            self._gpu_receive_buffer.free()
+            self._gpu_receive_buffer = None
         if self._host_buffer_pool is not None:
             self._host_buffer_pool.shutdown()
             self._host_buffer_pool = None
@@ -549,11 +580,11 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         """
         Transfer directly into GPU memory using batch_get_into (GPUDirect RDMA).
         
-        Uses pre-registered GPU buffer pool for RDMA transfers, then copies to
-        output tensors. Returns None if transfer fails, allowing caller to fall
+        Uses pre-registered GPU buffer for RDMA transfers, then creates tensor
+        views/copies. Returns None if transfer fails, allowing caller to fall
         back to host buffer path.
         """
-        if not self._gpu_direct_available or self._gpu_buffer_pool is None:
+        if not self._gpu_direct_available or self._gpu_receive_buffer is None:
             return None
 
         total_size = sum(
@@ -561,10 +592,11 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             for _, shape, dtype in tensor_specs
         )
 
-        gpu_buf = self._gpu_buffer_pool.get_buffer()
-        if total_size > gpu_buf.size:
+        if total_size > self._gpu_receive_buffer.size:
             logger.warning(
-                f"GPU buffer too small: need {total_size}, have {gpu_buf.size}"
+                f"GPU buffer too small: need {total_size / (1024**2):.1f}MB, "
+                f"have {self._gpu_receive_buffer.size / (1024**2):.1f}MB. "
+                f"Increase max_seq_len, max_batch_size, or hidden_dim in MooncakeConfig."
             )
             return None
 
@@ -575,7 +607,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         for name, shape, dtype in tensor_specs:
             size = self._compute_tensor_size(shape, dtype)
-            buffer_ptrs.append(gpu_buf.ptr + offset)
+            buffer_ptrs.append(self._gpu_receive_buffer.ptr + offset)
             sizes.append(size)
             offsets.append(offset)
             offset += size
@@ -600,7 +632,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             for dim in shape:
                 numel *= dim
 
-            buf_slice = gpu_buf.get_slice(offsets[i], sizes[i])
+            buf_slice = self._gpu_receive_buffer.get_slice(offsets[i], sizes[i])
             tensor = buf_slice.view(dtype)[:numel].reshape(shape).clone()
             tensor_map[name] = tensor
 

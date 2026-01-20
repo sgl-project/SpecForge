@@ -61,8 +61,6 @@ def main():
     print(f"  - loss_mask: {output.loss_mask.shape}")
     print(f"  - input_ids: {output.input_ids.shape}")
 
-    
-
     model.disconnect()
     print("Done!")
 
