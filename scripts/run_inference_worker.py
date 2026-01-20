@@ -34,13 +34,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from specforge.modeling.target.remote_backend import (
-    InferenceWorker,
     InferenceWorkerConfig,
     MooncakeConfig,
     QueueConfig,
     run_worker,
 )
 from specforge.modeling.target.sglang_backend import SGLangBackendArgs
+from specforge.modeling.utils import parse_mooncake_device_name
 
 
 def parse_args():
@@ -139,7 +139,11 @@ def parse_args():
         "--mooncake-device-name",
         type=str,
         default="",
-        help="Device name for RDMA (e.g., 'mlx5_0')",
+        help=(
+            "RDMA device name. Supports: "
+            "1) Simple format: 'mlx5_0,mlx5_1' (same for all GPUs), "
+            "2) JSON file: '/path/to/mapping.json' (per-GPU mapping)"
+        ),
     )
 
     worker_group = parser.add_argument_group("Worker")
@@ -211,6 +215,9 @@ def build_config_from_args(args) -> InferenceWorkerConfig:
         master_host = args.mooncake_master_addr.split(":")[0]
         metadata_server = f"http://{master_host}:{args.mooncake_metadata_port}/metadata"
 
+    # Parse device name - supports simple string or JSON file with per-GPU mapping
+    device_name = parse_mooncake_device_name(args.mooncake_device_name, args.worker_id)
+
     mooncake_config = MooncakeConfig(
         local_hostname=local_hostname,
         metadata_server=metadata_server,
@@ -218,7 +225,7 @@ def build_config_from_args(args) -> InferenceWorkerConfig:
         global_segment_size=parse_size(args.mooncake_global_segment_size),
         local_buffer_size=parse_size(args.mooncake_local_buffer_size),
         protocol=args.mooncake_protocol,
-        device_name=args.mooncake_device_name,
+        device_name=device_name,
     )
 
     queue_config = QueueConfig(
@@ -257,12 +264,8 @@ def build_config_from_json(config_path: str) -> InferenceWorkerConfig:
         master_server_address=mooncake_dict.get(
             "master_server_address", "localhost:50051"
         ),
-        global_segment_size=parse_size(
-            mooncake_dict.get("global_segment_size", "4GB")
-        ),
-        local_buffer_size=parse_size(
-            mooncake_dict.get("local_buffer_size", "512MB")
-        ),
+        global_segment_size=parse_size(mooncake_dict.get("global_segment_size", "4GB")),
+        local_buffer_size=parse_size(mooncake_dict.get("local_buffer_size", "512MB")),
         protocol=mooncake_dict.get("protocol", "tcp"),
         device_name=mooncake_dict.get("device_name", ""),
     )
@@ -283,9 +286,15 @@ def build_config_from_json(config_path: str) -> InferenceWorkerConfig:
         sglang_disable_cuda_graph=sglang_dict.get("disable_cuda_graph", True),
         sglang_enable_dp_attention=sglang_dict.get("enable_dp_attention", False),
         sglang_enable_dp_lm_head=sglang_dict.get("enable_dp_lm_head", False),
-        sglang_enable_piecewise_cuda_graph=sglang_dict.get("enable_piecewise_cuda_graph", False),
-        sglang_piecewise_cuda_graph_max_tokens=sglang_dict.get("piecewise_cuda_graph_max_tokens", 4096),
-        sglang_piecewise_cuda_graph_tokens=sglang_dict.get("piecewise_cuda_graph_tokens"),
+        sglang_enable_piecewise_cuda_graph=sglang_dict.get(
+            "enable_piecewise_cuda_graph", False
+        ),
+        sglang_piecewise_cuda_graph_max_tokens=sglang_dict.get(
+            "piecewise_cuda_graph_max_tokens", 4096
+        ),
+        sglang_piecewise_cuda_graph_tokens=sglang_dict.get(
+            "piecewise_cuda_graph_tokens"
+        ),
         sglang_ep_size=sglang_dict.get("ep_size", 1),
         sglang_max_running_requests=sglang_dict.get("max_running_requests"),
         sglang_max_total_tokens=sglang_dict.get("max_total_tokens"),
@@ -324,6 +333,7 @@ def main():
         logger.info(f"Loading config from: {args.config}")
         if args.config.startswith("{"):
             import io
+
             config_dict = json.load(io.StringIO(args.config))
             with open("/tmp/worker_config.json", "w") as f:
                 json.dump(config_dict, f)
