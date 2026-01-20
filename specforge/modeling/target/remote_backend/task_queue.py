@@ -35,7 +35,7 @@ class QueueConfig:
 class TaskProducer:
     """
     PUSH socket for submitting inference tasks.
-    
+
     Training ranks use this to send tasks to inference workers.
     When multiple workers are available, ZMQ load-balances across them.
     """
@@ -75,7 +75,7 @@ class TaskProducer:
 class TaskConsumer:
     """
     PULL socket for receiving inference tasks.
-    
+
     Inference workers use this to pull tasks from the queue.
     Multiple workers can pull from the same address for load balancing.
     """
@@ -95,6 +95,7 @@ class TaskConsumer:
         addr = addr or self.config.task_queue_addr
         self._socket = self._ctx.socket(zmq.PULL)
         self._socket.set_hwm(self.config.hwm)
+        self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.bind(addr)
         self._bound = True
         logger.debug(f"TaskConsumer bound to {addr}")
@@ -116,7 +117,9 @@ class TaskConsumer:
         if self._socket is None:
             raise RuntimeError("TaskConsumer not bound or connected")
 
-        timeout_ms = timeout_ms if timeout_ms is not None else self.config.task_timeout_ms
+        timeout_ms = (
+            timeout_ms if timeout_ms is not None else self.config.task_timeout_ms
+        )
 
         if self._socket.poll(timeout_ms):
             data = self._socket.recv()
@@ -135,7 +138,7 @@ class TaskConsumer:
 class NotificationPublisher:
     """
     PUB socket for broadcasting task completion notifications.
-    
+
     Inference workers publish notifications with task_id as the topic.
     Training ranks subscribe to specific task_ids they care about.
     """
@@ -192,7 +195,7 @@ class NotificationPublisher:
 class NotificationSubscriber:
     """
     SUB socket for receiving task completion notifications.
-    
+
     Training ranks subscribe to specific task_ids and wait for notifications.
     Supports both synchronous receive() and async wait_for() with background listener.
     """
@@ -345,10 +348,10 @@ class NotificationSubscriber:
 class TaskQueueBroker:
     """
     Optional broker for task distribution (PULL/PUSH pattern).
-    
+
     Use when you want to decouple training nodes from worker addresses.
     Training nodes PUSH to broker, workers PULL from broker.
-    
+
     Training ──PUSH──► Broker ──PUSH──► Workers (PULL)
     """
 
@@ -419,10 +422,10 @@ class TaskQueueBroker:
 class NotificationBroker:
     """
     Optional broker for notifications (XSUB/XPUB pattern).
-    
+
     Use when workers and training nodes can't directly connect.
     Workers PUB to broker, training nodes SUB from broker.
-    
+
     Workers (PUB) ──► Broker (XSUB/XPUB) ──► Training (SUB)
     """
 

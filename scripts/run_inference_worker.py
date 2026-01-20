@@ -193,14 +193,19 @@ def get_local_hostname():
 def parse_size(size_str: str) -> int:
     """Parse size string like '4GB' to bytes."""
     size_str = size_str.upper().strip()
-    multipliers = {
-        "B": 1,
-        "KB": 1024,
-        "MB": 1024 * 1024,
-        "GB": 1024 * 1024 * 1024,
-        "TB": 1024 * 1024 * 1024 * 1024,
-    }
-    for suffix, multiplier in multipliers.items():
+    # Ordered by suffix length (longest first) to avoid "4GB" matching "B" before "GB"
+    multipliers = [
+        ("TB", 1024 * 1024 * 1024 * 1024),
+        ("GB", 1024 * 1024 * 1024),
+        ("MB", 1024 * 1024),
+        ("KB", 1024),
+        ("T", 1024 * 1024 * 1024 * 1024),
+        ("G", 1024 * 1024 * 1024),
+        ("M", 1024 * 1024),
+        ("K", 1024),
+        ("B", 1),
+    ]
+    for suffix, multiplier in multipliers:
         if size_str.endswith(suffix):
             return int(float(size_str[: -len(suffix)]) * multiplier)
     return int(size_str)
