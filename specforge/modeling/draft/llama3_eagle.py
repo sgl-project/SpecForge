@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
@@ -26,9 +25,10 @@ from .base import Eagle3DraftModel
 
 try:
     from flash_attn import flash_attn_func
-except:
+except ImportError:
     warnings.warn(
-        "flash_attn is not found, please install flash_attn if you want to use the flash attention backend"
+        "flash_attn is not found, falling back to flex_attention. "
+        "Please install flash_attn if you want to use the flash attention backend."
     )
     flash_attn_func = None
 

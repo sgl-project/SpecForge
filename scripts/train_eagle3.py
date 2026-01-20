@@ -109,6 +109,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         action="store_true",
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
     )
+    dataset_group.add_argument(
+        "--train-only-last-turn",
+        action="store_true",
+        help="If set, only the last assistant turn in each conversation contributes to the loss. "
+        "Useful for thinking models where conversation history may lack thought processes.",
+    )
     dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
     dataset_group.add_argument(
         "--dataloader-num-workers",
@@ -262,7 +268,7 @@ def build_target_model(
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.tp_size == 1
+            and args.target_model_backend == "custom"
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
 
@@ -462,6 +468,7 @@ def build_dataloaders(
             is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
+            train_only_last_turn=args.train_only_last_turn,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -489,7 +496,6 @@ def build_dataloaders(
         ),
         is_vlm=args.is_vlm,
     )
-
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
             eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
@@ -502,6 +508,7 @@ def build_dataloaders(
                 processor=processor,
                 num_proc=args.build_dataset_num_proc,
                 is_preformatted=args.is_preformatted,
+                train_only_last_turn=args.train_only_last_turn,
             )
         elif args.eval_hidden_states_path is not None:
             eval_eagle3_dataset = build_offline_eagle3_dataset(
@@ -579,7 +586,7 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    if args.is_vlm:
+    if args.is_vlm and args.target_model_backend == "custom":
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
@@ -588,13 +595,32 @@ def run_forward(
             image_grid_thw=data["image_grid_thw"].cuda(),
         )
     else:
+        image_grid_thw = None
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
-            eagle3_data = target_model.generate_eagle3_data(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
-            )
+            # Handle VLM data: pixel_values and image_grid_thw are lists
+            # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
+            if args.is_vlm:
+                image_grid_thw = (
+                    [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
+                    if args.is_vlm
+                    else None
+                )
+                pixel_values = data["pixel_values"].cuda()
+                eagle3_data = target_model.generate_eagle3_data(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                    is_vlm=args.is_vlm,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                )
+            else:
+                eagle3_data = target_model.generate_eagle3_data(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
             attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
@@ -611,13 +637,14 @@ def run_forward(
             input_ids, target, loss_mask = target_model.preprocess(
                 input_ids, target, loss_mask
             )
-
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
+            image_grid_thw=image_grid_thw,
+            is_vlm=args.is_vlm,
         )
     return plosses, acces
 
@@ -796,12 +823,20 @@ def main():
             target_model_type=getattr(draft_model_config, "target_model_type", None),
         )
     else:
-        eagle3_model = OnlineEagle3Model(
-            draft_model=draft_model,
-            length=args.ttt_length,
-            attention_backend=args.attention_backend,
-        )
-
+        if is_online:
+            eagle3_model = OnlineEagle3Model(
+                target_model=target_model,
+                draft_model=draft_model,
+                length=args.ttt_length,
+                attention_backend=args.attention_backend,
+            )
+        else:
+            # offline: the target_model is TargetHead not a model
+            eagle3_model = OnlineEagle3Model(
+                draft_model=draft_model,
+                length=args.ttt_length,
+                attention_backend=args.attention_backend,
+            )
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -950,7 +985,6 @@ def main():
                     tracker,
                     mode="eval",
                 )
-
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
@@ -963,7 +997,6 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
-
     # Save final checkpoint if training ended without saving
     if global_step % args.save_interval != 0:
         print_on_rank0(
