@@ -18,7 +18,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -132,9 +132,7 @@ class InferenceWorker:
             trust_remote_code=self.config.trust_remote_code,
             **sglang_kwargs,
         )
-        self.target_model.set_aux_hidden_states_layers(
-            self.config.aux_hidden_states_layers
-        )
+        self.target_model.set_aux_hidden_states_layers()
 
         logger.info(f"SGLangEagle3TargetModel initialized with model: {self.config.model_path}")
     

@@ -350,6 +350,8 @@ def build_target_model(
         target_model.set_aux_hidden_states_layers(
             draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
         )
+    elif training_method == TrainingMethod.DISAGG:
+        print_on_rank0("Aux hidden states layers are set through inference worker for disaggregated training")
     else:
         target_model.set_aux_hidden_states_layers()
 

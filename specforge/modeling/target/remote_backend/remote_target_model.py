@@ -18,7 +18,7 @@ of logits. The trainer computes logits locally using the lm_head weights.
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 
@@ -86,7 +86,8 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
     ):
         super().__init__()
         self.config = config
-        self.aux_hidden_states_layers = aux_hidden_states_layers or [1, -1, -4]
+        self._user_aux_hidden_states_layers = aux_hidden_states_layers
+        self.aux_hidden_states_layers = None
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.task_producer: Optional[TaskProducer] = None
@@ -176,6 +177,17 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
             )
             logger.info(f"Loaded TargetHead from {self.config.target_model_path}")
 
+            num_layers = self.target_head.config.num_hidden_layers
+            if self._user_aux_hidden_states_layers is not None:
+                self.aux_hidden_states_layers = self._user_aux_hidden_states_layers
+            else:
+                self.aux_hidden_states_layers = [
+                    1,
+                    num_layers // 2 - 1,
+                    num_layers - 4,
+                ]
+            logger.info(f"aux_hidden_states_layers set to {self.aux_hidden_states_layers} (num_layers={num_layers})")
+
         self._connected = True
         logger.info("RemoteEagle3TargetModel connected to remote infrastructure")
 
@@ -205,22 +217,19 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         """
         Set the layers to capture the aux hidden states from the target model outputs.
         """
-        if aux_hidden_states_layers is None:
-            if hasattr(self.model.config, "num_hidden_layers"):
-                num_layers = self.model.config.num_hidden_layers
-            else:
-                raise ValueError(
-                    f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers"
-                )
-            aux_hidden_states_layers = [
+        if aux_hidden_states_layers is not None:
+            self.aux_hidden_states_layers = aux_hidden_states_layers
+        elif self.aux_hidden_states_layers is None and self.target_head is not None:
+            num_layers = self.target_head.config.num_hidden_layers
+            self.aux_hidden_states_layers = [
                 1,
                 num_layers // 2 - 1,
                 num_layers - 4,
             ]
-        self.aux_hidden_states_layers = aux_hidden_states_layers
-        assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
+        if self.aux_hidden_states_layers is not None:
+            assert (
+                len(self.aux_hidden_states_layers) == 3
+            ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
 
     @torch.no_grad()
     def generate_eagle3_data(
@@ -325,7 +334,10 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
 
             return output
         else:
-            return self.mooncake_store.get_eagle3_output(mooncake_key, device=device)
+            raise RuntimeError(
+                f"Notification for {notification.task_id} missing tensor_shapes. "
+                "Ensure inference worker uses tensor API (use_tensor_api=True)."
+            )
 
     def _cleanup_mooncake_data(self, notification: TaskNotification) -> None:
         """Remove data from Mooncake after retrieval."""

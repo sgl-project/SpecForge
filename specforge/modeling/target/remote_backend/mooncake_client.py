@@ -11,10 +11,9 @@ for zero-copy transfers.
 import ctypes
 import logging
 import os
-import random
 from abc import ABC
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Generic, List, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -168,7 +167,7 @@ def calculate_eagle3_buffer_size(
     
     Tensors transferred via RDMA:
     - hidden_states: (batch, seq, hidden_dim * num_aux_layers), bfloat16
-    - loss_mask: (batch, seq, 1), bool
+    - loss_mask: (batch, seq, 1), int64
     - input_ids: (batch, seq), int64
     - attention_mask: (batch, seq), int64
     - last_hidden_states: (batch, seq, hidden_dim), bfloat16 (optional)
@@ -188,10 +187,9 @@ def calculate_eagle3_buffer_size(
     """
     bfloat16_size = 2
     int64_size = 8
-    bool_size = 1
     
     hidden_states_size = batch_size * max_seq_len * hidden_dim * num_aux_layers * bfloat16_size
-    loss_mask_size = batch_size * max_seq_len * 1 * bool_size
+    loss_mask_size = batch_size * max_seq_len * 1 * int64_size
     input_ids_size = batch_size * max_seq_len * int64_size
     attention_mask_size = batch_size * max_seq_len * int64_size
     
@@ -242,10 +240,9 @@ class MooncakeConfig:
     device_name: str = ""
     replica_num: int = 1
     enable_soft_pin: bool = False
-    host_buffer_size: int = 4 * 1024 * 1024 * 1024
-    host_buffer_pool_size: int = 2
+    host_buffer_size: int = 4 * 1024 * 1024 * 1024 # 
+    host_buffer_pool_size: int = 1
     enable_gpu_direct_rdma: bool = True
-    
     max_seq_len: int = 8192
     max_batch_size: int = 1
     hidden_dim: int = 4096
@@ -345,7 +342,11 @@ class MooncakeHiddenStateStore(ABC):
             return
 
         self._store = MooncakeDistributedStore()
-        self._store.setup(
+        logger.info(
+            f"Connecting to Mooncake master at {self.config.master_server_address}, "
+            f"metadata server at {self.config.metadata_server}"
+        )
+        result = self._store.setup(
             local_hostname=self.config.local_hostname,
             metadata_server=self.config.metadata_server,
             global_segment_size=self.config.global_segment_size,
@@ -354,6 +355,12 @@ class MooncakeHiddenStateStore(ABC):
             rdma_devices=self.config.device_name,
             master_server_addr=self.config.master_server_address,
         )
+        if result is not None and result != 0:
+            raise RuntimeError(
+                f"Failed to initialize Mooncake client (error={result}). "
+                f"Check that Mooncake master is running at {self.config.master_server_address} "
+                f"and metadata server is available at {self.config.metadata_server}"
+            )
 
         self._host_buffer_pool = HostBufferPool(
             buffer_size=self.config.host_buffer_size,
@@ -542,7 +549,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         keys = [f"{key}_hs", f"{key}_lm", f"{key}_ids", f"{key}_am"]
         tensor_specs = [
             ("hidden_states", shapes["hidden_states"], dtypes.get("hidden_states", torch.bfloat16)),
-            ("loss_mask", shapes["loss_mask"], torch.bool),
+            ("loss_mask", shapes["loss_mask"], torch.int64),
             ("input_ids", shapes["input_ids"], torch.int64),
             ("attention_mask", shapes["attention_mask"], torch.int64),
         ]
@@ -555,13 +562,13 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             keys.append(f"{key}_lhs")
             tensor_specs.append(("last_hidden_states", shapes["last_hidden_states"], dtypes.get("hidden_states", torch.bfloat16)))
 
-        tensor_map = self._get_tensors_gpu_direct(keys, tensor_specs, device)
-        if tensor_map is None:
-            logger.debug("GPUDirect RDMA not available, using host buffer path (TCP)")
+
+        if self._gpu_direct_available and self._gpu_receive_buffer is not None:
+            tensor_map = self._get_tensors_gpu_direct(keys, tensor_specs, device)
+        else:
             tensor_map = self._get_tensors_via_host_buffer(keys, tensor_specs, device)
-
-        logger.debug(f"Retrieved Eagle3 tensors with base key: {key}")
-
+            logger.debug("GPUDirect RDMA not available, using host buffer path (TCP)")
+        logger.info(f"Retrieved Eagle3 tensors with base key: {key}")
         return Eagle3TargetOutput(
             hidden_states=tensor_map["hidden_states"],
             target=tensor_map.get("target"),
@@ -584,8 +591,6 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         views/copies. Returns None if transfer fails, allowing caller to fall
         back to host buffer path.
         """
-        if not self._gpu_direct_available or self._gpu_receive_buffer is None:
-            return None
 
         total_size = sum(
             self._compute_tensor_size(shape, dtype)
@@ -633,6 +638,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 numel *= dim
 
             buf_slice = self._gpu_receive_buffer.get_slice(offsets[i], sizes[i])
+            # Creating new tensor from the buffer.
+            print(f"name: {name}, dtype: {dtype}, shape: {shape}, numel: {numel}")
             tensor = buf_slice.view(dtype)[:numel].reshape(shape).clone()
             tensor_map[name] = tensor
 

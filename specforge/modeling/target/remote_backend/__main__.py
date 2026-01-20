@@ -9,7 +9,6 @@ Usage:
 import argparse
 import logging
 import os
-import sys
 
 from .inference_worker import InferenceWorkerConfig, run_worker
 from .mooncake_client import MooncakeConfig

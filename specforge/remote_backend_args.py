@@ -13,6 +13,7 @@ class RemoteBackendArgsMixin:
     server URL will be automatically derived (same host, port 8080).
     """
 
+    target_model_path: str = None
     task_queue_addr: str = "tcp://localhost:5555"
     notify_addr: str = "tcp://localhost:5556"
     task_timeout: float = 300.0
@@ -166,6 +167,7 @@ class RemoteBackendArgsMixin:
             dp_size = cls._get_dp_size()
 
         return cls(
+            target_model_path=getattr(args, "target_model_path", None),
             task_queue_addr=getattr(args, "task_queue_addr", "tcp://localhost:5555"),
             notify_addr=getattr(args, "notify_addr", "tcp://localhost:5556"),
             task_timeout=getattr(args, "task_timeout", 300.0),
@@ -219,6 +221,7 @@ class RemoteBackendArgsMixin:
                 dp_rank=self.dp_rank,
                 dp_size=self.dp_size,
                 mooncake_config=mooncake_config,
+                target_model_path=self.target_model_path,
             ),
             prefetch_depth=self.prefetch_depth,
         )
