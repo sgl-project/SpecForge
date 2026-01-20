@@ -777,13 +777,20 @@ def main():
             attention_backend=args.attention_backend,
         )
     else:
-        eagle3_model = OnlineEagle3Model(
-            target_model=target_model,
-            draft_model=draft_model,
-            length=args.ttt_length,
-            attention_backend=args.attention_backend,
-        )
-
+        if is_online:
+            eagle3_model = OnlineEagle3Model(
+                target_model=target_model,
+                draft_model=draft_model,
+                length=args.ttt_length,
+                attention_backend=args.attention_backend,
+            )
+        else:
+            # offline: the target_model is TargetHead not a model
+            eagle3_model = OnlineEagle3Model(
+                draft_model=draft_model,
+                length=args.ttt_length,
+                attention_backend=args.attention_backend,
+            )
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
