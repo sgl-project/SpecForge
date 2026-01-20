@@ -776,11 +776,17 @@ def main():
     # ================================================
     # 4. Build Eagle3 model
     # ================================================
-    if args.is_vlm and getattr(draft_model_config, "target_model_type", None) in {
-        "qwen2_5_vl",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-    }:
+    if (
+        args.is_vlm
+        and getattr(draft_model_config, "target_model_type", None)
+        in {
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        }
+        and args.tp_size == 1
+        and args.target_model_backend != "sglang"
+    ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
