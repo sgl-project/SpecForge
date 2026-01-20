@@ -58,6 +58,7 @@ from specforge.distributed import (
     is_tp_rank_0,
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
+from specforge.modeling.draft import build_target_layer_ids
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
@@ -232,18 +233,17 @@ def build_dflash_target_model(
     if args.target_layers is not None:
         target_layer_ids = [int(x) for x in args.target_layers.split(",")]
     else:
-        # Compute automatically based on num_draft_layers
+        # Mirror draft model's layer selection logic for offline hidden states.
         num_target_layers = model_config.num_hidden_layers
         num_draft_layers = args.num_draft_layers
-        # Evenly distribute layers to capture
-        target_layer_ids = [
-            int(i * num_target_layers / (num_draft_layers + 1))
-            for i in range(1, num_draft_layers + 1)
-        ]
+        target_layer_ids = build_target_layer_ids(
+            num_target_layers=num_target_layers,
+            num_draft_layers=num_draft_layers,
+        )
     
     print_with_rank(f"DFlash target layer IDs: {target_layer_ids}")
 
-    target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+    target_model_kwargs = {}
     target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
         backend="hf",  # Use HF backend for hidden states generation
@@ -904,4 +904,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
