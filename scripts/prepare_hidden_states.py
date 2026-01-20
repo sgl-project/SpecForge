@@ -243,10 +243,10 @@ def build_dflash_target_model(
     
     print_with_rank(f"DFlash target layer IDs: {target_layer_ids}")
 
-    target_model_kwargs = {}
+    target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
     target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
-        backend="hf",  # Use HF backend for hidden states generation
+        backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
         torch_dtype=(
             model_config.dtype
             if hasattr(model_config, "dtype")
