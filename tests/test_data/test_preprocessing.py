@@ -164,7 +164,7 @@ class TestPreprocessing(unittest.TestCase):
         )
 
         # Exact match for the complete assistant text from both turns
-        expected_assistant_text = "The answer is 4.<|im_end|><think>\n\n</think>\n\nYes, I'm certain.<|im_end|>\n"
+        expected_assistant_text = "The answer is 4.<|im_end|>\n<think>\n\n</think>\n\nYes, I'm certain.<|im_end|>\n"
         self.assertEqual(
             assistant_text,
             expected_assistant_text,

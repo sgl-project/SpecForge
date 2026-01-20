@@ -16,7 +16,7 @@ from specforge.modeling.target.custom_backend.qwen3_moe import (
 from tests.utils import get_available_port
 
 
-def test_qwen3_moe_tp(rank, world_size, temp_dir, port):
+def test_qwen3_moe_tp(rank, world_size, temp_dir, port, num_heads, num_kv_heads):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -33,8 +33,8 @@ def test_qwen3_moe_tp(rank, world_size, temp_dir, port):
             moe_intermediate_size=512,
             num_hidden_layers=2,
             max_position_embeddings=1024,
-            num_attention_heads=8,
-            num_key_value_heads=4,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
             num_experts=64,
             num_experts_per_tok=8,
             hidden_act="silu",
@@ -93,10 +93,14 @@ class TestQwen3MoeTP(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_qwen3_moe_tp(self):
+    def test_qwen3_moe_tp_no_kv_head_replicas(self):
         # Set to 2 as only 2 GPU avaialble in CI
         port = get_available_port()
-        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port, 8, 4))
+
+    def test_qwen3_moe_tp_kv_head_replicas(self):
+        port = get_available_port()
+        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port, 8, 1))
 
 
 if __name__ == "__main__":

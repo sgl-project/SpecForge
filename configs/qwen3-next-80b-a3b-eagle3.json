@@ -2,13 +2,6 @@
     "architectures": [
       "LlamaForCausalLMEagle3"
     ],
-    "eagle_config": {
-        "eagle_aux_hidden_state_layer_ids": [
-            1,
-            23,
-            45
-        ]
-    },
     "attention_dropout": 0.0,
     "bos_token_id": 151643,
     "decoder_sparse_step": 1,

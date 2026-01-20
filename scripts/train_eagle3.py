@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate.utils import set_seed
-from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.optim import Optimizer
@@ -18,6 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
+from datasets import load_dataset
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -34,6 +34,8 @@ from specforge.data import (
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
+    get_draft_dp_group,
+    get_draft_sp_group,
     get_tp_group,
     init_distributed,
 )
@@ -47,6 +49,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
+    print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
@@ -62,6 +65,9 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     # add model-related arguments
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
+    model_group.add_argument(
+        "--trust-remote-code", action="store_true", help="Trust remote code"
+    )
     model_group.add_argument(
         "--draft-model-config",
         type=str,
@@ -103,8 +109,19 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         action="store_true",
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
     )
+    dataset_group.add_argument(
+        "--train-only-last-turn",
+        action="store_true",
+        help="If set, only the last assistant turn in each conversation contributes to the loss. "
+        "Useful for thinking models where conversation history may lack thought processes.",
+    )
     dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
-
+    dataset_group.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=4,
+        help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+    )
     # training hyper params
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=10)
@@ -157,6 +174,9 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=1,
         help="The size of the tensor parallel for the target model",
     )
+    # distributed training
+    optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
+    optimization_group.add_argument("--sp-ring-size", type=int, default=1)
     optimization_group.add_argument(
         "--attention-backend",
         type=str,
@@ -248,7 +268,7 @@ def build_target_model(
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.tp_size == 1
+            and args.target_model_backend == "custom"
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
 
@@ -272,6 +292,7 @@ def build_target_model(
                 device="cuda",
                 cache_dir=args.model_download_dir,
                 **target_model_kwargs,
+                trust_remote_code=args.trust_remote_code,
             )
 
         # set the aux hidden states layers
@@ -301,6 +322,7 @@ def build_target_model(
             model_path=args.target_model_path,
             lm_head_key=args.lm_head_key,
             cache_dir=args.model_download_dir,
+            trust_remote_code=args.trust_remote_code,
         )
         return target_head, None
 
@@ -317,6 +339,9 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    args.draft_accumulation_steps = (
+        args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
+    )
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -335,7 +360,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     draft_model_last_checkpoint = None
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
-            draft_model_config = os.path.join(args.ckpt_dir, "config.json")
+            draft_model_config = AutoDraftModelConfig.from_file(
+                os.path.join(args.ckpt_dir, "config.json")
+            )
             draft_model_last_checkpoint = args.ckpt_dir
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
         else:
@@ -373,7 +400,9 @@ def build_dataloaders(
     processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     # build dataloaders
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
 
     # convert to dataloader
     cache_params_string = (
@@ -384,6 +413,9 @@ def build_dataloaders(
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    is_online = (
+        args.train_data_path is not None and args.train_hidden_states_path is None
+    )
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -396,6 +428,7 @@ def build_dataloaders(
             is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
+            train_only_last_turn=args.train_only_last_turn,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -405,7 +438,7 @@ def build_dataloaders(
             cache_key=cache_key,
         )
 
-        if args.train_hidden_states_path is not None:
+        if not is_online:
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
@@ -414,12 +447,15 @@ def build_dataloaders(
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
-        num_workers=4,
+        num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=(
+            get_draft_dp_group()
+            if args.attention_backend == "usp" and not is_online
+            else get_dp_group()
+        ),
         is_vlm=args.is_vlm,
     )
-
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
             eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
@@ -432,6 +468,7 @@ def build_dataloaders(
                 processor=processor,
                 num_proc=args.build_dataset_num_proc,
                 is_preformatted=args.is_preformatted,
+                train_only_last_turn=args.train_only_last_turn,
             )
         elif args.eval_hidden_states_path is not None:
             eval_eagle3_dataset = build_offline_eagle3_dataset(
@@ -441,9 +478,13 @@ def build_dataloaders(
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.target_batch_size,
-            num_workers=4,
+            num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=(
+                get_draft_dp_group()
+                if args.attention_backend == "usp" and not is_online
+                else get_dp_group()
+            ),
             is_vlm=args.is_vlm,
         )
         print_with_rank("Initialized eval dataloader")
@@ -505,7 +546,7 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    if args.is_vlm:
+    if args.is_vlm and args.target_model_backend == "custom":
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
@@ -514,13 +555,32 @@ def run_forward(
             image_grid_thw=data["image_grid_thw"].cuda(),
         )
     else:
+        image_grid_thw = None
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
-            eagle3_data = target_model.generate_eagle3_data(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
-            )
+            # Handle VLM data: pixel_values and image_grid_thw are lists
+            # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
+            if args.is_vlm:
+                image_grid_thw = (
+                    [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
+                    if args.is_vlm
+                    else None
+                )
+                pixel_values = data["pixel_values"].cuda()
+                eagle3_data = target_model.generate_eagle3_data(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                    is_vlm=args.is_vlm,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                )
+            else:
+                eagle3_data = target_model.generate_eagle3_data(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
             attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
@@ -537,13 +597,14 @@ def run_forward(
             input_ids, target, loss_mask = target_model.preprocess(
                 input_ids, target, loss_mask
             )
-
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
+            image_grid_thw=image_grid_thw,
+            is_vlm=args.is_vlm,
         )
     return plosses, acces
 
@@ -598,13 +659,56 @@ def record_metrcs(
     tracker.log(logdict, step=global_step)
 
 
-def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
+def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Tensor:
     """
-    Get the data shard from the tensor.
+    Process: TP split -> Pad to Max Len -> SP gather.
     """
-    tp_size = dist.get_world_size(get_tp_group())
-    tp_rank = dist.get_rank(get_tp_group())
-    return tensor.chunk(tp_size, dim=0)[tp_rank]
+    # 1. TP: Slice the tensor along the batch dimension
+    tp_group = get_tp_group()
+    tp_size = dist.get_world_size(tp_group)
+    tp_rank = dist.get_rank(tp_group)
+
+    local_tp_shard = tensor.chunk(tp_size, dim=0)[tp_rank]
+
+    # 2. SP: Handle dynamic sequence lengths and Gather
+    sp_group = get_draft_sp_group()
+
+    if sp_group is not None and dist.get_world_size(sp_group) > 1:
+        sp_world_size = dist.get_world_size(sp_group)
+        local_seq_len = local_tp_shard.size(sp_dim)
+
+        # Find global max sequence length in SP group
+        len_tensor = torch.tensor(
+            [local_seq_len], device=local_tp_shard.device, dtype=torch.long
+        )
+        dist.all_reduce(len_tensor, op=dist.ReduceOp.MAX, group=sp_group)
+        max_seq_len = len_tensor.item()
+
+        # Pad local tensor if necessary
+        # Shape is [Batch, Seq, Hidden] or [Batch, Seq], and sp_dim=1
+        if local_seq_len < max_seq_len:
+            pad_size = max_seq_len - local_seq_len
+
+            pad_config = [0] * (local_tp_shard.ndim * 2)
+
+            pad_idx = (local_tp_shard.ndim - 1 - sp_dim) * 2 + 1
+            pad_config[pad_idx] = pad_size
+
+            # Pad value: 0 is standard, ensure it matches your pad_token_id logic if needed
+            local_tp_shard_padded = nn.F.pad(local_tp_shard, pad_config, value=0)
+        else:
+            local_tp_shard_padded = local_tp_shard
+
+        gathered_shards = [
+            torch.empty_like(local_tp_shard_padded) for _ in range(sp_world_size)
+        ]
+        dist.all_gather(
+            gathered_shards, local_tp_shard_padded.contiguous(), group=sp_group
+        )
+
+        return torch.cat(gathered_shards, dim=sp_dim)
+
+    return local_tp_shard
 
 
 def main():
@@ -613,12 +717,18 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(
+        timeout=args.dist_timeout,
+        tp_size=args.tp_size,
+        sp_ring_size=args.sp_ring_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+    )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
 
     sanity_check(args)
+    print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
     # ================================================
@@ -656,6 +766,8 @@ def main():
     if (
         args.is_vlm
         and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
+        and args.tp_size == 1
+        and args.target_model_backend != "sglang"
     ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
@@ -665,12 +777,20 @@ def main():
             attention_backend=args.attention_backend,
         )
     else:
-        eagle3_model = OnlineEagle3Model(
-            draft_model=draft_model,
-            length=args.ttt_length,
-            attention_backend=args.attention_backend,
-        )
-
+        if is_online:
+            eagle3_model = OnlineEagle3Model(
+                target_model=target_model,
+                draft_model=draft_model,
+                length=args.ttt_length,
+                attention_backend=args.attention_backend,
+            )
+        else:
+            # offline: the target_model is TargetHead not a model
+            eagle3_model = OnlineEagle3Model(
+                draft_model=draft_model,
+                length=args.ttt_length,
+                attention_backend=args.attention_backend,
+            )
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -759,9 +879,15 @@ def main():
             run_backward_and_update(args, plosses, optimizer, global_step)
 
             # log training metrics
-            if global_step % args.log_interval == 0:
+            if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
                 record_metrcs(
-                    args, acces, plosses, global_step, tracker, optimizer, mode="train"
+                    args,
+                    acces,
+                    plosses,
+                    global_step // args.draft_accumulation_steps,
+                    tracker,
+                    optimizer,
+                    mode="train",
                 )
 
             if dist.get_rank() == 0:
@@ -813,7 +939,6 @@ def main():
                     tracker,
                     mode="eval",
                 )
-
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
@@ -826,6 +951,12 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+    # Save final checkpoint if training ended without saving
+    if global_step % args.save_interval != 0:
+        print_on_rank0(
+            f"Training completed at step {global_step}, saving final checkpoint..."
+        )
+        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
     # Close the tracker
     tracker.close()

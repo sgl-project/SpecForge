@@ -26,8 +26,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
+from yunchang import EXTRACT_FUNC_DICT
 
 from specforge.core.loss import LogSoftmaxLoss
+from specforge.distributed import (
+    gather_outputs_and_unpad,
+    get_sp_ring_group,
+    get_sp_ulysses_group,
+)
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -53,6 +59,7 @@ class OnlineEagle3Model(Eagle3Model):
         draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
+        target_model: Optional[Eagle3Model] = None,
     ):
         """
         Args:
@@ -64,6 +71,25 @@ class OnlineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
+        self.target_model = target_model
+
+        if self.attention_backend == "usp":
+            self.extract_func = EXTRACT_FUNC_DICT["basic"]
+            self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
+            self.sp_ulysses_degree = torch.distributed.get_world_size(
+                get_sp_ulysses_group()
+            )
+            self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
+            self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
+
+    @torch.compile()
+    def prepare_usp_input(self, full_input):
+        shared_input = self.extract_func(
+            full_input,
+            rank=self.sp_rank,
+            world_size=self.sp_world_size,
+        ).clone()
+        return shared_input
 
     def forward(
         self,
@@ -74,6 +100,8 @@ class OnlineEagle3Model(Eagle3Model):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        is_vlm: bool = False,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -108,14 +136,22 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            device = hidden_states.device
-            position_ids = torch.arange(
-                past_key_values_length,
-                seq_length + past_key_values_length,
-                dtype=torch.long,
-                device=device,
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            if is_vlm:
+                mrope_positions_ids, mrope_position_delta = (
+                    self.target_model.get_rope_index(
+                        input_ids=input_ids, image_grid_thw=image_grid_thw
+                    )
+                )
+                position_ids = mrope_positions_ids
+            else:
+                device = hidden_states.device
+                position_ids = torch.arange(
+                    past_key_values_length,
+                    seq_length + past_key_values_length,
+                    dtype=torch.long,
+                    device=device,
+                )
+                position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
@@ -126,7 +162,7 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
+        if self.attention_backend in ("sdpa", "usp"):
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -139,15 +175,28 @@ class OnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
+        # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
+        global_input_ids = input_ids
+        if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        elif self.attention_backend == "usp":
+            cache_hidden = [[], []]
+            past_key_values = None
+            hidden_states = self.prepare_usp_input(hidden_states)
+        else:
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
+            if self.attention_backend == "usp":
+                input_ids = self.prepare_usp_input(global_input_ids)
+            else:
+                input_ids = global_input_ids
+
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -170,7 +219,7 @@ class OnlineEagle3Model(Eagle3Model):
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
-
+            logits = gather_outputs_and_unpad(logits, gather_dim=1)
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
                 acces.append(
@@ -188,94 +237,11 @@ class OnlineEagle3Model(Eagle3Model):
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
-                input_ids = padding(input_ids, left=False)
+                global_input_ids = padding(global_input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
-
-
-class OfflineEagle3Model(OnlineEagle3Model):
-    """
-    In sgl-spec, we implement offline/online training.
-    Offline training means we have the target hidden_states available before training.
-    """
-
-    def __init__(
-        self,
-        target_head,
-        draft_model,
-        length: int = 7,
-        attention_backend="sdpa",
-    ):
-        """
-        Args:
-            target_head: the target head to process the target hidden states.
-            draft_model: the draft model to be trained.
-            length: TTT length, it means how many turns to unroll during TTT.
-        """
-        super().__init__(
-            draft_model=draft_model,
-            length=length,
-            attention_backend=attention_backend,
-        )
-        self.target_head = target_head
-
-    @torch.no_grad()
-    def _prepare_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        device: Optional[torch.device] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_states = kwargs["hidden_states"]
-        target = kwargs["target"]
-        target = self.target_head(target)
-        return hidden_states, target, loss_mask, input_ids
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        target: torch.Tensor,
-        loss_mask: torch.Tensor,
-        hidden_states: torch.Tensor,
-        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Forward pass for the offline Eagle3 model.
-        Args:
-            input_ids: (batch, seq_len)
-            attention_mask: (batch, seq_len)
-            loss_mask: (batch, seq_len, 1)
-            target: (batch, seq_len, hidden_size)
-            hidden_states: (batch, seq_len, 3*hidden_size)
-            past_key_values: We dont use this past_key_values in eagle3, but keep it
-                for compatibility. We control kvcache by cache_hidden.
-            position_ids: (batch, seq_len)
-
-        Returns:
-            plosses: List of losses for each TTT step.
-            vlosses: List of validation losses (not used in this implementation).
-            acces: List of accuracies for each TTT step.
-        """
-        with torch.no_grad():
-            target = self.target_head(target)
-
-        return super().forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            loss_mask=loss_mask,
-            target=target,
-            hidden_states=hidden_states,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-            **kwargs,
-        )
 
 
 class QwenVLOnlineEagle3Model(Eagle3Model):
@@ -512,12 +478,14 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
+        if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        else:
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()

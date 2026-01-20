@@ -79,8 +79,10 @@ class ColumnParallelLinear(nn.Module):
         bias=True,
         device=None,
         dtype=None,
-        kv_head_replicas=False,
         layout_type: str = "normal",
+        kv_head_replicas=False,
+        kv_head_idx=None,
+        total_num_kv_heads=None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -91,7 +93,10 @@ class ColumnParallelLinear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        if kv_head_replicas:
+        self.kv_head_replicas = kv_head_replicas
+        self.kv_head_idx = kv_head_idx
+        self.total_num_kv_heads = total_num_kv_heads
+        if self.kv_head_replicas:
             self.out_features_per_shard = out_features
         else:
             self.out_features_per_shard = out_features // self.tp_size
@@ -113,14 +118,33 @@ class ColumnParallelLinear(nn.Module):
         """
         This is a state dict hook to be triggered before loading the state dict. This will shard the weights and biases according to the layout type.
         """
-        if self.layout_type == "normal":
-            self.handle_normal_layout(state_dict, *args)
-        elif self.layout_type == "merged_qkv":
-            self.handle_merged_qkv(state_dict, *args)
-        elif self.layout_type == "gate_up":
-            self.handle_gate_up_layout(state_dict, *args)
+        if self.kv_head_replicas:
+            assert self.kv_head_idx is not None
+            assert self.layout_type == "normal"
+            self.handle_kv_head_replicas(state_dict, *args)
         else:
-            raise ValueError(f"Invalid layout type: {self.layout_type}")
+            if self.layout_type == "normal":
+                self.handle_normal_layout(state_dict, *args)
+            elif self.layout_type == "merged_qkv":
+                self.handle_merged_qkv(state_dict, *args)
+            elif self.layout_type == "gate_up":
+                self.handle_gate_up_layout(state_dict, *args)
+            else:
+                raise ValueError(f"Invalid layout type: {self.layout_type}")
+
+    def handle_kv_head_replicas(self, state_dict, *args):
+        """
+        This is a special case for GQA where the key/value are split according to the number of kv heads and the head which belongs to this rank.
+        As the TP size is larger than the number of kv heads, we only keep one kv head per rank.
+        """
+        if "weight" in state_dict:
+            state_dict["weight"] = state_dict["weight"].chunk(
+                self.total_num_kv_heads, dim=0
+            )[self.kv_head_idx]
+        if "bias" in state_dict and state_dict["bias"] is not None:
+            state_dict["bias"] = state_dict["bias"].chunk(
+                self.total_num_kv_heads, dim=0
+            )[self.kv_head_idx]
 
     def handle_normal_layout(self, state_dict, *args):
         """

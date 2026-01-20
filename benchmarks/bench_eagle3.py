@@ -51,11 +51,7 @@ from typing import List
 import requests
 from benchmarker import BENCHMARKS
 from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    kill_process_tree,
-    popen_launch_server,
-)
+from sglang.test.test_utils import kill_process_tree, popen_launch_server
 from sglang.utils import wait_for_server
 
 
@@ -69,10 +65,17 @@ def parse_args():
     benchmark_group.add_argument(
         "--skip-launch-server", action="store_true", default=False
     )
+    benchmark_group.add_argument("--timeout-for-server-launch", type=int, default=600)
     benchmark_group.add_argument("--num-prompts", type=int, default=80)
     benchmark_group.add_argument("--output-dir", type=str, default="./results")
     benchmark_group.add_argument(
         "--config-list", type=str, nargs="+", default=["1,0,0,0", "1,3,1,4"]
+    )
+    benchmark_group.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="name of this benchmark run, if provided, will be added to the output file name",
     )
     benchmark_group.add_argument(
         "--benchmark-list",
@@ -84,7 +87,6 @@ def parse_args():
             "humaneval:200",
             "math500:200",
             "ceval:200",
-            "cmmlu:200",
         ],
         help=f"The list of benchmarks to run. The format is <benchmark-name>:<num-prompts>:<subset>,<subset>. We support the following benchmarks: {', '.join(BENCHMARKS.benchmarks.keys())}",
     )
@@ -96,18 +98,6 @@ def parse_args():
     return parser.parse_args()
 
 
-# def get_cmmlu_conversations(num_prompts: int):
-#     dataset = load_dataset("zhaode/cmmlu")["train"]
-#     prompts = [q["instruction"] for q in dataset][:num_prompts]
-#     bench_name = "ceval"
-#     bench_conversations = {bench_name: []}
-#     for i in range(len(prompts)):
-#         bench_conversations[bench_name].append(
-#             [{"role": "user", "content": prompts[i]}]
-#         )
-#     return bench_conversations
-
-
 def launch_sglang_server(
     server_args: ServerArgs,
     base_url: str,
@@ -115,6 +105,7 @@ def launch_sglang_server(
     steps: int,
     topk: int,
     num_draft_tokens: int,
+    timeout: int,
 ):
     """
     This function launches the SGLang server with the given server arguments.
@@ -170,7 +161,7 @@ def launch_sglang_server(
     process = popen_launch_server(
         server_args.model_path,
         base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        timeout=timeout,
         other_args=sglang_args,
         env={
             "SGLANG_RECORD_STEP_TIME": "1",
@@ -247,15 +238,25 @@ def main():
         # we itearate over each config from args
         for batch_size, steps, topk, num_draft_tokens in configs:
             process = launch_sglang_server(
-                server_args, base_url, batch_size, steps, topk, num_draft_tokens
+                server_args,
+                base_url,
+                batch_size,
+                steps,
+                topk,
+                num_draft_tokens,
+                args.timeout_for_server_launch,
             )
             wait_for_server(base_url)
             run_benchmarks(batch_size, steps, topk, num_draft_tokens)
             kill_process_tree(process.pid)
+            process.wait()
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_file = os.path.join(args.output_dir, f"results_{timestamp}.jsonl")
+    result_file = os.path.join(
+        args.output_dir,
+        f"{args.name + '_' if args.name else ''}results_{timestamp}.jsonl",
+    )
     with open(result_file, "w") as f:
         json.dump(results, f, indent=4)
     print(f"Results saved to {result_file}")

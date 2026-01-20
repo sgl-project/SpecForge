@@ -5,6 +5,7 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 # train eagle3 for qwen3-coder
 NUM_GPUS=${1:-8}
 TP_SIZE=${2:-8}
+BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
 torchrun \
     --standalone \
@@ -14,6 +15,7 @@ torchrun \
     --draft-model-config $ROOT_DIR/configs/qwen3-coder-480B-A35B-instruct-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/opc.jsonl \
     --train-hidden-states-path $ROOT_DIR/cache/hidden_states \
+    --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/Qwen3-Coder-480B-A35B-Instruct \
     --num-epochs 10 \
     --draft-micro-batch-size 1 \

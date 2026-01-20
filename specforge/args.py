@@ -87,6 +87,8 @@ class SGLangBackendArgs:
     sglang_piecewise_cuda_graph_max_tokens: int = 4096
     sglang_piecewise_cuda_graph_tokens: List[int] = None
     sglang_ep_size: int = 1
+    sglang_max_running_requests: int = None  # assign based on batch size
+    sglang_max_total_tokens: int = None  # assign based on batch size and seq length
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
@@ -175,6 +177,14 @@ class SGLangBackendArgs:
             sglang_piecewise_cuda_graph_max_tokens=args.sglang_piecewise_cuda_graph_max_tokens,
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
+            sglang_max_running_requests=(
+                args.target_batch_size if hasattr(args, "target_batch_size") else None
+            ),
+            sglang_max_total_tokens=(
+                args.target_batch_size * args.max_length
+                if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
+                else None
+            ),
         )
 
     def to_kwargs(self) -> Dict[str, Any]:
@@ -191,4 +201,6 @@ class SGLangBackendArgs:
             piecewise_cuda_graph_max_tokens=self.sglang_piecewise_cuda_graph_max_tokens,
             piecewise_cuda_graph_tokens=self.sglang_piecewise_cuda_graph_tokens,
             ep_size=self.sglang_ep_size,
+            max_running_requests=self.sglang_max_running_requests,
+            max_total_tokens=self.sglang_max_total_tokens,
         )
