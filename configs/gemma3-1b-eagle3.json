@@ -1,0 +1,32 @@
+{
+  "architectures": [
+    "LlamaForCausalLMEagle3"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 2,
+  "eos_token_id": 1,
+  "pad_token_id": 0,
+  "head_dim": 256,
+  "hidden_act": "silu",
+  "hidden_size": 1152,
+  "initializer_range": 0.02,
+  "intermediate_size": 6912,
+  "max_position_embeddings": 32768,
+  "model_type": "llama",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 1,
+  "num_key_value_heads": 1,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": null,
+  "rope_theta": 1000000,
+  "sliding_window": 512,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.50.0",
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 262145,
+  "draft_vocab_size": 32000,
+  "target_model_type": "gemma3_text"
+}

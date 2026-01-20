@@ -196,3 +196,13 @@ TEMPLATE_REGISTRY.register(
         system_prompt=None,
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="gemma",
+    template=ChatTemplate(
+        assistant_header="<start_of_turn>model\n",
+        user_header="<start_of_turn>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<end_of_turn>\n",
+    ),
+)
