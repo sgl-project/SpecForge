@@ -10,7 +10,7 @@ import argparse
 import logging
 import os
 
-from specforge.modeling.utils import parse_mooncake_device_name
+from specforge.utils import parse_mooncake_device_name
 
 from ..sglang_backend import SGLangBackendArgs
 from .inference_worker import InferenceWorkerConfig, run_worker

@@ -18,9 +18,8 @@ MOONCAKE_MASTER=127.0.0.1:50051
 
 
 # GPU Direct RDMA configuration
-LOCAL_HOSTNAME=${LOCAL_HOSTNAME:-10.173.2.69}
-RDMA_DEVICES="mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_12,mlx5_13"
-export MOONCAKE_DEVICE='{"0": "mlx5_6", "1": "mlx5_7", "2": "mlx5_12", "3": "mlx5_13", "4": "mlx5_0", "5": "mlx5_1", "6": "mlx5_2", "7": "mlx5_3"}'
+# If LOCAL_HOSTNAME is not set, the Python code will auto-detect the local IP
+# LOCAL_HOSTNAME=${LOCAL_HOSTNAME:-10.173.2.69}  # Uncomment to manually set IP
 
 cleanup() {
     echo "Cleaning up..."
@@ -51,8 +50,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPU torchrun \
     --notify-addr $NOTIFY_ADDR \
     --mooncake-master-addr $MOONCAKE_MASTER \
     --mooncake-metadata-port 8090 \
-    --mooncake-local-hostname $LOCAL_HOSTNAME \
+    #--mooncake-local-hostname $LOCAL_HOSTNAME \
     --mooncake-protocol rdma \
-    --mooncake-device-name $RDMA_DEVICES \
     --training-method disagg \
     --prefetch-depth 4

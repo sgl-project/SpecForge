@@ -40,7 +40,7 @@ from specforge.modeling.target.remote_backend import (
     run_worker,
 )
 from specforge.modeling.target.sglang_backend import SGLangBackendArgs
-from specforge.modeling.utils import parse_mooncake_device_name
+from specforge.utils import parse_mooncake_device_name
 
 
 def parse_args():

@@ -12,7 +12,6 @@ NOTIFY_ADDR=${NOTIFY_ADDR:-tcp://0.0.0.0:5556}
 MOONCAKE_MASTER=${MOONCAKE_MASTER:-127.0.0.1:50051}
 MOONCAKE_METADATA_PORT=${MOONCAKE_METADATA_PORT:-8090}
 MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-tcp}
-MOONCAKE_DEVICE_NAME=${MOONCAKE_DEVICE_NAME:-"mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_12,mlx5_13"}
 DTYPE=${DTYPE:-bfloat16}
 
 cleanup() {
@@ -36,5 +35,4 @@ CUDA_VISIBLE_DEVICES=$INFERENCE_GPUS torchrun \
     --mooncake-master-addr $MOONCAKE_MASTER \
     --mooncake-metadata-port $MOONCAKE_METADATA_PORT \
     --mooncake-protocol $MOONCAKE_PROTOCOL \
-    --mooncake-device-name "$MOONCAKE_DEVICE_NAME"
     --dtype $DTYPE

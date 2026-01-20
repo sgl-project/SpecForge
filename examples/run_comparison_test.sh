@@ -28,7 +28,6 @@ MOONCAKE_LOCAL_HOSTNAME=${MOONCAKE_LOCAL_HOSTNAME:-10.173.2.69}
 MOONCAKE_METADATA_SERVER=${MOONCAKE_METADATA_SERVER:-http://localhost:8090/metadata}
 MOONCAKE_MASTER_ADDR=${MOONCAKE_MASTER_ADDR:-127.0.0.1:50051}
 MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-rdma}
-MOONCAKE_DEVICE_NAME=${MOONCAKE_DEVICE_NAME:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_12,mlx5_13}
 
 echo "=============================================="
 echo "Local vs Remote Inference Comparison Test"
@@ -42,7 +41,7 @@ echo "Notify address: $NOTIFY_ADDR"
 echo "Mooncake protocol: $MOONCAKE_PROTOCOL"
 echo "=============================================="
 
-CUDA_VISIBLE_DEVICES=$LOCAL_GPU python $ROOT_DIR/examples/compare_local_remote_inference.py \
+CUDA_VISIBLE_DEVICES=$LOCAL_GPU python $ROOT_DIR/tests/test_modeling/test_target/test_remote_backend/compare_local_remote_inference.py \
     --model-path $MODEL_PATH \
     --batch-size $BATCH_SIZE \
     --seq-len $SEQ_LEN \
@@ -51,5 +50,4 @@ CUDA_VISIBLE_DEVICES=$LOCAL_GPU python $ROOT_DIR/examples/compare_local_remote_i
     --mooncake-local-hostname $MOONCAKE_LOCAL_HOSTNAME \
     --mooncake-metadata-server $MOONCAKE_METADATA_SERVER \
     --mooncake-master-addr $MOONCAKE_MASTER_ADDR \
-    --mooncake-protocol $MOONCAKE_PROTOCOL \
-    --mooncake-device-name "$MOONCAKE_DEVICE_NAME"
+    --mooncake-protocol $MOONCAKE_PROTOCOL

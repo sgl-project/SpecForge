@@ -1,13 +1,16 @@
 import argparse
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+from specforge.utils import get_local_ip_address
+
 
 @dataclass
 class RemoteBackendArgsMixin:
     """
     Arguments for remote inference backend using ZeroMQ and Mooncake Store.
-    
+
     Note: The metadata server defaults to the Mooncake Master's built-in HTTP
     metadata server. If you only specify --mooncake-master-addr, the metadata
     server URL will be automatically derived (same host, port 8080).
@@ -89,8 +92,8 @@ class RemoteBackendArgsMixin:
         parser.add_argument(
             "--mooncake-local-hostname",
             type=str,
-            default="localhost",
-            help="Local hostname for Mooncake Store client",
+            default=None,
+            help="Local hostname for Mooncake Store client (auto-detected if not set, especially for RDMA)",
         )
         parser.add_argument(
             "--mooncake-master-addr",
@@ -166,6 +169,12 @@ class RemoteBackendArgsMixin:
         if dp_size is None:
             dp_size = cls._get_dp_size()
 
+        # Auto-detect local hostname if not specified
+        mooncake_local_hostname = getattr(args, "mooncake_local_hostname", None)
+        if mooncake_local_hostname is None or mooncake_local_hostname == "localhost":
+            # Auto-detect IP, especially useful for RDMA
+            mooncake_local_hostname = get_local_ip_address()
+
         return cls(
             target_model_path=getattr(args, "target_model_path", None),
             task_queue_addr=getattr(args, "task_queue_addr", "tcp://localhost:5555"),
@@ -174,9 +183,7 @@ class RemoteBackendArgsMixin:
             prefetch_depth=getattr(args, "prefetch_depth", 4),
             dp_rank=dp_rank,
             dp_size=dp_size,
-            mooncake_local_hostname=getattr(
-                args, "mooncake_local_hostname", "localhost"
-            ),
+            mooncake_local_hostname=mooncake_local_hostname,
             mooncake_master_addr=master_addr,
             mooncake_metadata_server=metadata_server,
             mooncake_metadata_port=metadata_port,
@@ -199,7 +206,9 @@ class RemoteBackendArgsMixin:
         metadata_server = self.mooncake_metadata_server
         if metadata_server is None:
             master_host = self.mooncake_master_addr.split(":")[0]
-            metadata_server = f"http://{master_host}:{self.mooncake_metadata_port}/metadata"
+            metadata_server = (
+                f"http://{master_host}:{self.mooncake_metadata_port}/metadata"
+            )
 
         mooncake_config = MooncakeConfig(
             local_hostname=self.mooncake_local_hostname,
@@ -208,7 +217,9 @@ class RemoteBackendArgsMixin:
             global_segment_size=MooncakeConfig.parse_size(
                 self.mooncake_global_segment_size
             ),
-            local_buffer_size=MooncakeConfig.parse_size(self.mooncake_local_buffer_size),
+            local_buffer_size=MooncakeConfig.parse_size(
+                self.mooncake_local_buffer_size
+            ),
             protocol=self.mooncake_protocol,
             device_name=self.mooncake_device_name,
         )
