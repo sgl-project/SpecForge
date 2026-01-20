@@ -84,6 +84,7 @@ class Qwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         embeds, residual = self.layer_communicator.prepare_attn(
             embeds, residual, forward_batch
         )
+        residual = hidden_states
         # Copy and Paste from Qwen3MoeDecoderLayer, This line is the only difference
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
@@ -248,7 +249,25 @@ class Qwen3MoEForCausalLMEagle3(Qwen3MoeForCausalLM):
         if not hasattr(self, "_cached_params_dict"):
             self._cached_params_dict = dict(self.named_parameters())
 
+        new_weights = {}
+        hard_coded_mapping = {
+            "down_weight": "down_proj.weight",
+            "gate_weight": "gate_proj.weight",
+            "up_weight": "up_proj.weight",
+        }
         for name, loaded_weight in weights:
+            for specforge_key, hf_key in hard_coded_mapping.items():
+                if specforge_key in name:
+                    for expert_id in range(self.config.num_experts):
+                        new_name = name.replace(
+                            specforge_key, f"experts.{expert_id}.{hf_key}"
+                        )
+                        new_weights[new_name] = loaded_weight[expert_id]
+                    break
+            else:
+                new_weights[name] = loaded_weight
+        weights = new_weights
+        for name, loaded_weight in weights.items():
             print("load weight from ", name, loaded_weight.shape)
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
