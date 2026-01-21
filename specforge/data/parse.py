@@ -63,9 +63,9 @@ class GeneralParser(Parser):
         else:
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
-                + r"(.*?)(?="
-                + re.escape(self.user_message_separator)
-                + "|$)"
+                + r"([\s\S]*?(?:"
+                + re.escape(self.chat_template.end_of_turn_token)
+                + "|$))"
             )
 
     def parse(
