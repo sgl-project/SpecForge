@@ -71,7 +71,8 @@ def parse_args():
     )
 
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-data-path", type=str, default=None,
+        help="Path to training data (required for online mode)")
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None,
         help="Path to pre-computed hidden states for offline training")
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -244,6 +245,7 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
+        requires_target=False,
     )
 
     eval_dataloader = None
@@ -262,6 +264,7 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
             num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=get_dp_group(),
+            requires_target=False,
         )
     elif not is_online and args.eval_hidden_states_path:
         print_on_rank0(f"Loading offline eval dataset from {args.eval_hidden_states_path}")
@@ -276,6 +279,7 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
             num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=get_dp_group(),
+            requires_target=False,
         )
 
     return train_dataloader, eval_dataloader
@@ -374,9 +378,16 @@ def main():
     init_distributed(timeout=args.dist_timeout)
     print_with_rank("Initialized distributed")
 
-    # Determine training mode
+    # Determine training mode and validate required arguments
     is_online = args.train_hidden_states_path is None
     print_on_rank0(f"Training mode: {'online' if is_online else 'offline'}")
+
+    if is_online:
+        if args.train_data_path is None:
+            raise ValueError("--train-data-path is required for online training mode")
+    else:
+        if not os.path.exists(args.train_hidden_states_path):
+            raise ValueError(f"Hidden states path not found: {args.train_hidden_states_path}")
 
     # Build draft model first (needed for target model layer config)
     draft_model = build_draft_model(args)

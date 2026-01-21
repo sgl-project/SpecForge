@@ -34,8 +34,16 @@ class DataCollatorWithPadding:
     Datacollator that will dynamically pad the inputs for batching.
     """
 
-    def __init__(self):
+    def __init__(self, requires_target: bool = True):
+        """Initialize DataCollator.
+        
+        Args:
+            requires_target: If True, requires 'target' field when 'hidden_state' is present.
+                           Set to False for DFlash (only needs hidden_state).
+                           Set to True for Eagle3 (needs both hidden_state and target).
+        """
         self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
+        self.requires_target = requires_target
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -120,9 +128,12 @@ class DataCollatorWithPadding:
                     for item in features
                 ]
             )
-            # target is optional for DFlash (only hidden_state is needed)
-            # but required for Eagle3 (both hidden_state and target are needed)
-            if all("target" in item for item in features):
+            if self.requires_target:
+                if not all("target" in item for item in features):
+                    raise ValueError(
+                        "requires_target=True but 'target' field missing in some features. "
+                        "Use requires_target=False for DFlash training."
+                    )
                 batch["target"] = torch.cat(
                     [self.paddingtensor(item["target"], max_length) for item in features]
                 )
@@ -237,6 +248,7 @@ def prepare_dp_dataloaders(
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    requires_target: bool = True,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
@@ -250,6 +262,8 @@ def prepare_dp_dataloaders(
         pin_memory: Whether to pin memory for data loading.
         shuffle: Whether to shuffle the dataset.
         is_vlm: Whether the dataset is a vision-language model dataset.
+        requires_target: Whether 'target' field is required when 'hidden_state' is present.
+                        Set to False for DFlash, True for Eagle3.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
@@ -275,7 +289,7 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=datacollator_cls(requires_target=requires_target),
         drop_last=True,
         **dataloader_kwargs,
     )

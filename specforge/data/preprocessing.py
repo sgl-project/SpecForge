@@ -514,27 +514,18 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def process_data(data, max_len, block_size=16, transform=None):
-        new_data = {}
-        # DFlash uses concatenated layer hidden states directly
-        # hidden_state contains the target layer outputs concatenated
+        """Only apply max_len truncation. Block-size truncation and loss_mask
+        processing are handled by OnlineDFlashModel.forward() to align with online mode."""
         hidden_state = data["hidden_state"].squeeze(0)[:max_len]
-
         input_ids = data["input_ids"][:max_len]
         loss_mask = data["loss_mask"][:max_len]
 
-        # Truncate to multiple of block_size for DFlash
-        seq_len = len(input_ids)
-        effective_len = (seq_len // block_size) * block_size
-
-        hidden_state = hidden_state[:effective_len][None, :]
-        input_ids = input_ids[:effective_len][None, :]
-        loss_mask = loss_mask[:effective_len][None, :]
-        loss_mask[0, -1] = 0
-
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["hidden_state"] = hidden_state  # DFlash uses hidden_states key
-        new_data["input_ids"] = input_ids
+        new_data = {
+            "hidden_state": hidden_state[None, :],
+            "input_ids": input_ids[None, :],
+            "loss_mask": loss_mask[None, :],
+            "attention_mask": torch.ones(1, len(input_ids), dtype=torch.long),
+        }
         if transform:
             new_data = transform(new_data)
         return new_data
