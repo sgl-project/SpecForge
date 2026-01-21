@@ -110,6 +110,12 @@ def parse_args():
         default=None,
         help="Comma-separated list of target layer indices to capture for DFlash (e.g., '0,8,16,24'). If not specified, will be computed from num-draft-layers.",
     )
+    model_group.add_argument(
+        "--block-size",
+        type=int,
+        default=16,
+        help="Block size for DFlash. Samples with fewer than 2*block_size loss tokens will be filtered out.",
+    )
 
     data_group = parser.add_argument_group("data")
     data_group.add_argument("--data-path", type=str, required=True)
@@ -625,7 +631,19 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
         num_io_threads: int = 4,
         io_queue_size: int = 50,
         file_group_size: int = 2000,
+        block_size: int = 16,
+        min_loss_tokens: Optional[int] = None,
     ):
+        """
+        Args:
+            target_model: The DFlash target model for inference.
+            num_io_threads: Number of threads for async I/O.
+            io_queue_size: Max number of pending I/O futures before cleanup.
+            file_group_size: Number of files per subdirectory.
+            block_size: Block size for DFlash (used for filtering).
+            min_loss_tokens: Minimum number of loss tokens required. 
+                           If None, defaults to 2 * block_size.
+        """
         # Note: DFlash doesn't use aux_hidden_states in the same way
         super().__init__(
             target_model,
@@ -634,6 +652,8 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
             io_queue_size=io_queue_size,
             file_group_size=file_group_size,
         )
+        self.block_size = block_size
+        self.min_loss_tokens = min_loss_tokens if min_loss_tokens is not None else 2 * block_size
 
     @torch.no_grad()
     def generate(
@@ -725,13 +745,34 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
 
             if is_tp_rank_0():
                 # Process each sample
+                samples_saved = 0
+                samples_filtered = 0
                 for i, current_global_idx in enumerate(sample_global_indices):
+                    loss_mask = filtered_batch["loss_mask"][i]
+                    input_ids = filtered_batch["input_ids"][i]
+                    
+                    # Calculate effective length after block_size truncation
+                    seq_len = len(input_ids)
+                    effective_len = (seq_len // self.block_size) * self.block_size
+                    
+                    # Check if sample has enough loss tokens in the effective region
+                    if effective_len > 0:
+                        effective_loss_mask = loss_mask[:effective_len]
+                        loss_token_count = effective_loss_mask.sum().item()
+                    else:
+                        loss_token_count = 0
+                    
+                    # Skip samples that don't meet the minimum loss token requirement
+                    if loss_token_count < self.min_loss_tokens:
+                        samples_filtered += 1
+                        continue
+                    
                     # Extract single sample hidden states
                     hidden_states = dflash_output.hidden_states[i].cpu().clone()
                     
                     data_point = DataPoint(
-                        input_ids=filtered_batch["input_ids"][i].clone(),
-                        loss_mask=filtered_batch["loss_mask"][i].clone(),
+                        input_ids=input_ids.clone(),
+                        loss_mask=loss_mask.clone(),
                         hidden_state=hidden_states.unsqueeze(0),
                         aux_hidden_state=None,
                     )
@@ -740,8 +781,10 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
                     self._save_tensor_async(data_point, output_file)
 
                     del hidden_states
+                    samples_saved += 1
 
-                total_processed += len(sample_global_indices)
+                total_processed += samples_saved
+                total_skipped += samples_filtered
 
             del dflash_output, filtered_batch
 
@@ -882,12 +925,15 @@ def main():
                     samples_per_dp=samples_per_dp,
                 )
         else:  # dflash
-            # Use DFlash generator
+            # Use DFlash generator with filtering support
+            # block_size is used to calculate min_loss_tokens (2 * block_size)
+            # Samples with fewer than 2*block_size loss tokens will be filtered out
             with DFlashHiddenStatesGenerator(
                 target_model,
                 num_io_threads=args.num_io_threads,
                 io_queue_size=args.io_queue_size,
                 file_group_size=args.file_group_size,
+                block_size=args.block_size,
             ) as hidden_states_generator:
                 hidden_states_generator.generate(
                     data_loader,

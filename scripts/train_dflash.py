@@ -230,21 +230,12 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
         )
     else:
         # Offline mode: Build from pre-computed hidden states
+        # Note: Filtering is already done in prepare_hidden_states.py, no need to filter here
         print_on_rank0(f"Loading offline train dataset from {args.train_hidden_states_path}")
         train_dflash_dataset = build_offline_dflash_dataset(
             hidden_states_path=args.train_hidden_states_path,
             max_len=args.max_length,
             block_size=args.block_size,
-        )
-        
-        # Filter out samples with too few loss tokens
-        original_size = len(train_dflash_dataset)
-        train_dflash_dataset = [
-            sample for sample in train_dflash_dataset 
-            if sample["loss_mask"].sum() >= min_loss_tokens
-        ]
-        print_on_rank0(
-            f"Filtered offline train dataset: {original_size} -> {len(train_dflash_dataset)} samples"
         )
 
     train_dataloader = prepare_dp_dataloaders(
