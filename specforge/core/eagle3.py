@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import DynamicCache
 from yunchang import EXTRACT_FUNC_DICT
 
@@ -176,6 +177,24 @@ class OnlineEagle3Model(Eagle3Model):
                 past_key_values_length=past_key_values_length,
             )
 
+        def compute_loss_and_acc_checkpointed(hs, tgt_p, pos_mask, l_mask):
+            # 1. Compute Logits(The part that consumes the most VRAM.)
+            logits_ = self.draft_model.compute_logits(hs)
+            logits = gather_outputs_and_unpad(logits_, gather_dim=1)
+
+            # 2. Compute Loss
+            loss_val = LogSoftmaxLoss.apply(logits, tgt_p, pos_mask)
+
+            # 3. Compute Accuracy
+            with torch.no_grad():
+                acc_val = _compute_metric_acc(
+                    logits=logits,
+                    target_p=tgt_p,
+                    position_mask=pos_mask,
+                    loss_mask=l_mask,
+                )
+            return loss_val, acc_val
+
         # Step 5: run TTT
         plosses = []
         vlosses = []
@@ -218,26 +237,22 @@ class OnlineEagle3Model(Eagle3Model):
             # update hidden states for next step
             hidden_states = hidden_states_out
 
-            # Step 5.4: get logits
-            logits_ = self.draft_model.compute_logits(hidden_states)
-            logits = gather_outputs_and_unpad(logits_, gather_dim=1)
-            del logits_
-            torch.cuda.empty_cache()
-            # Step 5.5: record metrics first as we in-place modify logits
-            with torch.no_grad():
-                acces.append(
-                    _compute_metric_acc(
-                        logits=logits,
-                        target_p=target_p,
-                        position_mask=position_mask,
-                        loss_mask=loss_mask,
-                    )
+            if hidden_states.requires_grad:
+                loss, acc = checkpoint(
+                    compute_loss_and_acc_checkpointed,
+                    hidden_states,
+                    target_p,
+                    position_mask,
+                    loss_mask,
+                    use_reentrant=False,
+                )
+            else:
+                loss, acc = compute_loss_and_acc_checkpointed(
+                    hidden_states, target_p, position_mask, loss_mask
                 )
 
-            # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
             plosses.append(loss)
-
+            acces.append(acc)
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 global_input_ids = padding(global_input_ids, left=False)
