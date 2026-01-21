@@ -57,8 +57,8 @@ from specforge.distributed import (
     init_distributed,
     is_tp_rank_0,
 )
-from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.modeling.draft import build_target_layer_ids
+from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
@@ -246,7 +246,7 @@ def build_dflash_target_model(
             num_target_layers=num_target_layers,
             num_draft_layers=num_draft_layers,
         )
-    
+
     print_with_rank(f"DFlash target layer IDs: {target_layer_ids}")
 
     target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -262,7 +262,7 @@ def build_dflash_target_model(
         cache_dir=args.model_download_dir,
         **target_model_kwargs,
     )
-    
+
     # Set which layers to capture
     target_model.set_capture_layers(target_layer_ids)
 
@@ -621,7 +621,7 @@ class HiddenStatesGenerator:
 
 class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
     """
-    Generator for DFlash hidden states. 
+    Generator for DFlash hidden states.
     Extends HiddenStatesGenerator but uses DFlash target model's generate_dflash_data method.
     """
 
@@ -641,7 +641,7 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
             block_size: Block size for DFlash (used for filtering).
-            min_loss_tokens: Minimum number of loss tokens required. 
+            min_loss_tokens: Minimum number of loss tokens required.
                            If None, defaults to 2 * block_size.
         """
         # Note: DFlash doesn't use aux_hidden_states in the same way
@@ -653,7 +653,9 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
             file_group_size=file_group_size,
         )
         self.block_size = block_size
-        self.min_loss_tokens = min_loss_tokens if min_loss_tokens is not None else 2 * block_size
+        self.min_loss_tokens = (
+            min_loss_tokens if min_loss_tokens is not None else 2 * block_size
+        )
 
     @torch.no_grad()
     def generate(
@@ -712,13 +714,15 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
             total_skipped += batch_size - num_valid
 
             global_idx += batch_size
-            
+
             if num_valid == 0:
                 if self.show_progress:
-                    progress_bar.set_postfix({
-                        "processed": total_processed,
-                        "skipped": total_skipped,
-                    })
+                    progress_bar.set_postfix(
+                        {
+                            "processed": total_processed,
+                            "skipped": total_skipped,
+                        }
+                    )
                 continue
 
             # Filter batch
@@ -750,26 +754,26 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
                 for i, current_global_idx in enumerate(sample_global_indices):
                     loss_mask = filtered_batch["loss_mask"][i]
                     input_ids = filtered_batch["input_ids"][i]
-                    
+
                     # Calculate effective length after block_size truncation
                     seq_len = len(input_ids)
                     effective_len = (seq_len // self.block_size) * self.block_size
-                    
+
                     # Check if sample has enough loss tokens in the effective region
                     if effective_len > 0:
                         effective_loss_mask = loss_mask[:effective_len]
                         loss_token_count = effective_loss_mask.sum().item()
                     else:
                         loss_token_count = 0
-                    
+
                     # Skip samples that don't meet the minimum loss token requirement
                     if loss_token_count < self.min_loss_tokens:
                         samples_filtered += 1
                         continue
-                    
+
                     # Extract single sample hidden states
                     hidden_states = dflash_output.hidden_states[i].cpu().clone()
-                    
+
                     data_point = DataPoint(
                         input_ids=input_ids.clone(),
                         loss_mask=loss_mask.clone(),
@@ -793,11 +797,15 @@ class DFlashHiddenStatesGenerator(HiddenStatesGenerator):
                 gc.collect()
 
             if self.show_progress:
-                progress_bar.set_postfix({
-                    "processed": total_processed,
-                    "skipped": total_skipped,
-                    "pending_io": len(self.pending_futures) if is_tp_rank_0() else 0,
-                })
+                progress_bar.set_postfix(
+                    {
+                        "processed": total_processed,
+                        "skipped": total_skipped,
+                        "pending_io": (
+                            len(self.pending_futures) if is_tp_rank_0() else 0
+                        ),
+                    }
+                )
 
         if self.show_progress:
             print(
@@ -826,7 +834,9 @@ def main():
     if args.model_type == "eagle3":
         target_model, processor = build_target_model(args, target_model_config)
     else:  # dflash
-        target_model, target_layer_ids = build_dflash_target_model(args, target_model_config)
+        target_model, target_layer_ids = build_dflash_target_model(
+            args, target_model_config
+        )
         processor = None
 
     print_with_rank(

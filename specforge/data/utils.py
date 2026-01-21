@@ -36,7 +36,7 @@ class DataCollatorWithPadding:
 
     def __init__(self, requires_target: bool = True):
         """Initialize DataCollator.
-        
+
         Args:
             requires_target: If True, requires 'target' field when 'hidden_state' is present.
                            Set to False for DFlash (only needs hidden_state).
@@ -135,7 +135,10 @@ class DataCollatorWithPadding:
                         "Use requires_target=False for DFlash training."
                     )
                 batch["target"] = torch.cat(
-                    [self.paddingtensor(item["target"], max_length) for item in features]
+                    [
+                        self.paddingtensor(item["target"], max_length)
+                        for item in features
+                    ]
                 )
         return batch
 
@@ -234,7 +237,10 @@ class VlmDataCollatorWithPadding:
             # but required for Eagle3 (both hidden_state and target are needed)
             if all("target" in item for item in features):
                 batch["target"] = torch.cat(
-                    [self.paddingtensor(item["target"], max_length) for item in features]
+                    [
+                        self.paddingtensor(item["target"], max_length)
+                        for item in features
+                    ]
                 )
         return batch
 

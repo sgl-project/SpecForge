@@ -30,11 +30,7 @@ from specforge.data import (
 )
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.target.dflash_target_model import (
-    DFlashTargetModel,
-    get_dflash_target_model,
-)
-from specforge.modeling.target.target_head import TargetHead
+from specforge.modeling.target.dflash_target_model import get_dflash_target_model
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -71,13 +67,25 @@ def parse_args():
     )
 
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, default=None,
-        help="Path to training data (required for online mode)")
-    dataset_group.add_argument("--train-hidden-states-path", type=str, default=None,
-        help="Path to pre-computed hidden states for offline training")
+    dataset_group.add_argument(
+        "--train-data-path",
+        type=str,
+        default=None,
+        help="Path to training data (required for online mode)",
+    )
+    dataset_group.add_argument(
+        "--train-hidden-states-path",
+        type=str,
+        default=None,
+        help="Path to pre-computed hidden states for offline training",
+    )
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
-    dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None,
-        help="Path to pre-computed hidden states for offline evaluation")
+    dataset_group.add_argument(
+        "--eval-hidden-states-path",
+        type=str,
+        default=None,
+        help="Path to pre-computed hidden states for offline evaluation",
+    )
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
@@ -127,7 +135,7 @@ def parse_args():
 
 def build_target_model(args, draft_model: DFlashDraftModel, is_online: bool = True):
     """Build target model based on training mode.
-    
+
     For online training: Build full target model wrapper.
     For offline training: Build only TargetHead (lm_head weights).
     """
@@ -152,7 +160,9 @@ def build_target_model(args, draft_model: DFlashDraftModel, is_online: bool = Tr
     else:
         # For offline training, we don't need the full target model
         # Hidden states are already pre-computed
-        print_on_rank0("Offline mode: Skipping target model loading (using pre-computed hidden states)")
+        print_on_rank0(
+            "Offline mode: Skipping target model loading (using pre-computed hidden states)"
+        )
         return None
 
 
@@ -188,14 +198,16 @@ def build_draft_model(args) -> DFlashDraftModel:
     return draft_model
 
 
-def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoader, Optional[DataLoader]]:
+def build_dataloader(
+    args, tokenizer, is_online: bool = True
+) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders.
-    
+
     For online training: Build from conversation data.
     For offline training: Build from pre-computed hidden states.
     """
     import hashlib
-    
+
     # Common filtering threshold: DFlash requires >= 2 * block_size loss tokens
     min_loss_tokens = 2 * args.block_size
 
@@ -232,7 +244,9 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
     else:
         # Offline mode: Build from pre-computed hidden states
         # Note: Filtering is already done in prepare_hidden_states.py, no need to filter here
-        print_on_rank0(f"Loading offline train dataset from {args.train_hidden_states_path}")
+        print_on_rank0(
+            f"Loading offline train dataset from {args.train_hidden_states_path}"
+        )
         train_dflash_dataset = build_offline_dflash_dataset(
             hidden_states_path=args.train_hidden_states_path,
             max_len=args.max_length,
@@ -267,7 +281,9 @@ def build_dataloader(args, tokenizer, is_online: bool = True) -> Tuple[DataLoade
             requires_target=False,
         )
     elif not is_online and args.eval_hidden_states_path:
-        print_on_rank0(f"Loading offline eval dataset from {args.eval_hidden_states_path}")
+        print_on_rank0(
+            f"Loading offline eval dataset from {args.eval_hidden_states_path}"
+        )
         eval_dflash_dataset = build_offline_dflash_dataset(
             hidden_states_path=args.eval_hidden_states_path,
             max_len=args.max_length,
@@ -387,7 +403,9 @@ def main():
             raise ValueError("--train-data-path is required for online training mode")
     else:
         if not os.path.exists(args.train_hidden_states_path):
-            raise ValueError(f"Hidden states path not found: {args.train_hidden_states_path}")
+            raise ValueError(
+                f"Hidden states path not found: {args.train_hidden_states_path}"
+            )
 
     # Build draft model first (needed for target model layer config)
     draft_model = build_draft_model(args)

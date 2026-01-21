@@ -515,7 +515,8 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
     @staticmethod
     def process_data(data, max_len, block_size=16, transform=None):
         """Only apply max_len truncation. Block-size truncation and loss_mask
-        processing are handled by OnlineDFlashModel.forward() to align with online mode."""
+        processing are handled by OnlineDFlashModel.forward() to align with online mode.
+        """
         hidden_state = data["hidden_state"].squeeze(0)[:max_len]
         input_ids = data["input_ids"][:max_len]
         loss_mask = data["loss_mask"][:max_len]
