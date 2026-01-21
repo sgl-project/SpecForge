@@ -20,6 +20,7 @@ class ChatTemplate(BaseModel):
     system_prompt: str | None
     end_of_turn_token: str | None
     parser_type: str = "general"
+    assistant_pattern_type: str = "general"
     enable_thinking: bool = False
 
 
@@ -277,13 +278,23 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+TEMPLATE_REGISTRY.register(
+    name="longcat",
+    template=ChatTemplate(
+        assistant_header=" ASSISTANT:",
+        user_header=" USER:",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="</longcat_s>",
+        assistant_pattern_type="longcat",
+    ),
+)
 
 TEMPLATE_REGISTRY.register(
-    name="repo-wiki",
+    name="longcat_xml",
     template=ChatTemplate(
-        assistant_header="<|im_start|>assistant\n",
-        user_header="<|im_start|>user\n",
-        system_prompt="",
-        end_of_turn_token="<|im_end|>\n",
+        assistant_header="<longcat_assistant>",
+        user_header="<longcat_user>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="</longcat_s>",
     ),
 )

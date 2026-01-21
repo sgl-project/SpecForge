@@ -57,6 +57,16 @@ def parse_args():
         default=None,
         help="MASK token ID. If not provided, auto-detect from tokenizer.",
     )
+    model_group.add_argument(
+        "--attention-backend",
+        type=str,
+        default="flex_attention",
+        choices=["eager", "sdpa", "flex_attention"],
+        help="Attention backend for draft model.",
+    )
+    model_group.add_argument(
+        "--trust-remote-code", action="store_true", help="Trust remote code"
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -88,6 +98,14 @@ def parse_args():
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
 
+    optimization_group = parser.add_argument_group("optimization")
+    optimization_group.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="The size of the tensor parallel for the target model",
+    )
+
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
@@ -117,6 +135,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         backend=args.target_model_backend,
         torch_dtype=torch.bfloat16,
         device="cuda" if args.target_model_backend == "hf" else None,
+        trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
 
@@ -132,6 +151,10 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
+
+    # Set attention implementation based on backend
+    draft_config._attn_implementation = args.attention_backend
+    print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
     draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
@@ -304,24 +327,24 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    init_distributed(timeout=args.dist_timeout)
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
     target_model, draft_model = build_models(args)
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
     # Get mask_token_id
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
-    elif hasattr(tokenizer, "mask_token_id") and tokenizer.mask_token_id is not None:
+    elif tokenizer.mask_token_id is not None:
         mask_token_id = tokenizer.mask_token_id
-    elif hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None:
-        mask_token_id = tokenizer.pad_token_id
     else:
-        mask_token_id = tokenizer.eos_token_id
+        tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
+        mask_token_id = tokenizer.mask_token_id
     print_on_rank0(f"Using mask_token_id: {mask_token_id}")
+
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
@@ -336,6 +359,7 @@ def main():
         embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
         lm_head_key="lm_head.weight",
         device="cuda",
+        trust_remote_code=args.trust_remote_code,
     )
 
     dflash_model = OnlineDFlashModel(
@@ -344,6 +368,7 @@ def main():
         target_embed_tokens=target_components.embed_tokens,
         block_size=draft_model.block_size,
         mask_token_id=mask_token_id,
+        attention_backend=args.attention_backend,
     )
 
     dflash_model = FSDP(
@@ -436,6 +461,7 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "iter_time": f"{elapsed:.2f}s",
                     }
                 )
 

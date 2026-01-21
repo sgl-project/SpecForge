@@ -43,6 +43,7 @@ class GeneralParser(Parser):
         self.system_prompt = chat_template.system_prompt
         self.user_message_separator = f"{chat_template.end_of_turn_token}"
         self.assistant_message_separator = f"{chat_template.assistant_header}"
+        self.set_assistant_pattern(chat_template)
 
     def apply_chat_template(self, messages, **kwargs) -> str:
         conversation = self.tokenizer.apply_chat_template(
@@ -50,11 +51,30 @@ class GeneralParser(Parser):
         )
         return conversation
 
+    def set_assistant_pattern(self, chat_template: ChatTemplate):
+        if chat_template.assistant_pattern_type == "longcat":
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"([\s\S]*?(?:"
+                + re.escape("[Round ")
+                + r"\d+"
+                + re.escape("] USER:")
+                + "|$))"
+            )
+        else:
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"([\s\S]*?(?:"
+                + re.escape(self.chat_template.end_of_turn_token)
+                + "|$))"
+            )
+
     def parse(
         self,
         conversation: "Conversation",
         max_length: int,
         preformatted: bool = False,
+        train_only_last_turn: bool = False,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if not preformatted:
@@ -130,12 +150,6 @@ class GeneralParser(Parser):
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
-        assistant_pattern = (
-            re.escape(self.assistant_message_separator)
-            + r"([\s\S]*?(?:"
-            + re.escape(self.chat_template.end_of_turn_token)
-            + "|$))"
-        )
         # get input_ids
         encoding = self.tokenizer(
             conversation,
@@ -146,7 +160,12 @@ class GeneralParser(Parser):
         )
         input_ids = encoding.input_ids[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
-        for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+
+        matches = list(re.finditer(self.assistant_pattern, conversation, re.DOTALL))
+        if train_only_last_turn and matches:
+            matches = [matches[-1]]  # Only keep the last match
+
+        for match in matches:
             content_start_char = match.start(1)
             content_end_char = match.end(1)
 
@@ -214,7 +233,11 @@ class HarmonyParser(Parser):
         return prompt_text
 
     def parse(
-        self, conversation: "Conversation", max_length: int, preformatted: bool = False
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        train_only_last_turn: bool = False,
     ) -> List[torch.Tensor]:
         # conversation = process_harmony_conversations(conversation)
         if not preformatted:
@@ -257,7 +280,11 @@ class HarmonyParser(Parser):
         )
 
         # Find all matching segments
-        for match in pattern.finditer(conversation):
+        matches = list(pattern.finditer(conversation))
+        if train_only_last_turn and matches:
+            matches = [matches[-1]]  # Only keep the last match
+
+        for match in matches:
             # match.start(0) is the start index of the full match (including `<|start|>assistant`)
             # match.start(1) is the start index of the first capture group (excluding `<|start|>assistant`)
             # match.end(1) is the end index of the content
@@ -302,10 +329,13 @@ class ThinkingParser(GeneralParser):
         conversation: "Conversation",
         max_length: int,
         preformatted: bool = False,
+        train_only_last_turn: bool = False,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if self.chat_template.enable_thinking:
             kwargs["enable_thinking"] = True
         else:
             pass
-        return super().parse(conversation, max_length, preformatted, **kwargs)
+        return super().parse(
+            conversation, max_length, preformatted, train_only_last_turn, **kwargs
+        )
