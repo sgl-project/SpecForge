@@ -118,6 +118,7 @@ class OnlineEagle3Model(Eagle3Model):
             length=self.length,
         )
         del target
+        torch.cuda.empty_cache()
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -150,7 +151,7 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend in ("sdpa", "usp"):
+        if self.attention_backend == "sdpa":
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -206,8 +207,12 @@ class OnlineEagle3Model(Eagle3Model):
             hidden_states = hidden_states_out
 
             # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
-            logits = gather_outputs_and_unpad(logits, gather_dim=1)
+            logits_ = self.draft_model.compute_logits(hidden_states)
+            # from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
+            logits = gather_outputs_and_unpad(logits_, gather_dim=1)
+            del logits_
+            torch.cuda.empty_cache()
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
                 acces.append(

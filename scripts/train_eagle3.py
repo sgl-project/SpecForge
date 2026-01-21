@@ -546,6 +546,7 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    print(data["input_ids"].shape)
     if args.is_vlm:
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
@@ -570,15 +571,16 @@ def run_forward(
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
         else:
             # we generate the logits using the hidden states loaded from disk
-            input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
             hidden_states = data["hidden_state"].cuda()
-            target = target_model(data["target"].cuda())
             input_ids, target, loss_mask = target_model.preprocess(
-                input_ids, target, loss_mask
+                data["input_ids"], data["target"], data["loss_mask"]
             )
-
+            input_ids = input_ids.cuda()
+            target = target_model(
+                target.cuda()
+            )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
+            loss_mask = loss_mask.cuda()
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
