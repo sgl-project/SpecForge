@@ -532,10 +532,8 @@ def generate_vocab_mapping_file(
 
     # we first count the frequency of effectiev tokens in the dataset
     token_dict = Counter()
-    all_input_ids = dataset["input_ids"]
-    all_loss_mask = dataset["loss_mask"]
     for input_ids, loss_mask in tqdm(
-        zip(all_input_ids, all_loss_mask),
+        zip(dataset["input_ids"], dataset["loss_mask"]),
         total=len(dataset),
         desc="Counting tokens for vocab mapping",
     ):
