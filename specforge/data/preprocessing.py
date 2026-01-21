@@ -525,9 +525,6 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
         # Truncate to multiple of block_size for DFlash
         seq_len = len(input_ids)
         effective_len = (seq_len // block_size) * block_size
-        if effective_len < 2 * block_size:
-            # Need at least 2 blocks for DFlash training
-            effective_len = min(seq_len, 2 * block_size)
 
         hidden_state = hidden_state[:effective_len][None, :]
         input_ids = input_ids[:effective_len][None, :]
