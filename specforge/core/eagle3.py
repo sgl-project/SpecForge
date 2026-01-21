@@ -220,8 +220,6 @@ class OnlineEagle3Model(Eagle3Model):
 
             # Step 5.4: get logits
             logits_ = self.draft_model.compute_logits(hidden_states)
-            # from .forkedpdb import ForkedPdb
-            # ForkedPdb().set_trace()
             logits = gather_outputs_and_unpad(logits_, gather_dim=1)
             del logits_
             torch.cuda.empty_cache()
