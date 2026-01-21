@@ -20,6 +20,7 @@ class ChatTemplate(BaseModel):
     system_prompt: str | None
     end_of_turn_token: str | None
     parser_type: str = "general"
+    assistant_pattern_type: str = "general"
     enable_thinking: bool = False
 
 
@@ -284,5 +285,22 @@ TEMPLATE_REGISTRY.register(
         user_header="<start_of_turn>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<end_of_turn>\n",
+    name="longcat",
+    template=ChatTemplate(
+        assistant_header=" ASSISTANT:",
+        user_header=" USER:",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="</longcat_s>",
+        assistant_pattern_type="longcat",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="longcat_xml",
+    template=ChatTemplate(
+        assistant_header="<longcat_assistant>",
+        user_header="<longcat_user>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="</longcat_s>",
     ),
 )

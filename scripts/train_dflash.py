@@ -64,6 +64,9 @@ def parse_args():
         choices=["eager", "sdpa", "flex_attention"],
         help="Attention backend for draft model.",
     )
+    model_group.add_argument(
+        "--trust-remote-code", action="store_true", help="Trust remote code"
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -95,6 +98,14 @@ def parse_args():
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
 
+    optimization_group = parser.add_argument_group("optimization")
+    optimization_group.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="The size of the tensor parallel for the target model",
+    )
+
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
@@ -124,6 +135,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         backend=args.target_model_backend,
         torch_dtype=torch.bfloat16,
         device="cuda" if args.target_model_backend == "hf" else None,
+        trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
 
@@ -315,7 +327,7 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    init_distributed(timeout=args.dist_timeout)
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
     target_model, draft_model = build_models(args)
@@ -347,6 +359,7 @@ def main():
         embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
         lm_head_key="lm_head.weight",
         device="cuda",
+        trust_remote_code=args.trust_remote_code,
     )
 
     dflash_model = OnlineDFlashModel(

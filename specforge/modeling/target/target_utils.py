@@ -33,10 +33,13 @@ class TargetEmbeddingsAndHead(nn.Module):
         cache_dir: Optional[str] = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        trust_remote_code: bool = False,
     ) -> "TargetEmbeddingsAndHead":
 
         # 1. Load Config
-        config = AutoConfig.from_pretrained(model_path, cache_dir=cache_dir)
+        config = AutoConfig.from_pretrained(
+            model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
+        )
         instance = cls(config)
 
         # 2. Resolve Model Path (Handle Hub)
