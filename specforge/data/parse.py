@@ -53,12 +53,12 @@ class GeneralParser(Parser):
     def set_assistant_pattern(self, chat_template: ChatTemplate):
         if chat_template.assistant_pattern_type == "longcat":
             self.assistant_pattern = (
-                re.escape(chat_template.assistant_header)
-                + r"(.*?)(?="
+                re.escape(self.assistant_message_separator)
+                + r"([\s\S]*?(?:"
                 + re.escape("[Round ")
                 + r"\d+"
                 + re.escape("] USER:")
-                + "|$)"
+                + "|$))"
             )
         else:
             self.assistant_pattern = (
