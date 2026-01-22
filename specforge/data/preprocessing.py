@@ -40,7 +40,6 @@ except ImportError:
     HAS_QWEN_VL_UTILS = False
     process_vision_info = None
 
-from specforge.utils import padding
 
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
