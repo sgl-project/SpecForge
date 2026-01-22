@@ -129,6 +129,10 @@ class OnlineEagle3Model(Eagle3Model):
         past_key_values_length = 0
 
         # Step 2: project the concatenated hidden states to the target hidden size
+        if self.attention_backend == "usp":
+            # NOTE: Split first for USP to parallelize computation and ensure
+            # gradient consistency without redundant full-sequence projection.
+            hidden_states = self.prepare_usp_input(hidden_states)
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
@@ -177,16 +181,12 @@ class OnlineEagle3Model(Eagle3Model):
         acces = []
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
-        if self.attention_backend in ["sdpa", "fa"]:
+        if self.attention_backend in ["sdpa", "fa", "usp"]:
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
-        elif self.attention_backend == "usp":
-            cache_hidden = [[], []]
-            past_key_values = None
-            hidden_states = self.prepare_usp_input(hidden_states)
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
