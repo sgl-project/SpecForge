@@ -464,9 +464,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
         new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
         new_data["loss_mask"] = loss_mask
-        new_data["target"] = padding(target, left=False)
+        new_data["target"] = target
         new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = padding(input_ids, left=False)
+        new_data["input_ids"] = input_ids
         if transform:
             new_data = transform(new_data)
         return new_data
