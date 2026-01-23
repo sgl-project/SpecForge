@@ -40,7 +40,6 @@ except ImportError:
     HAS_QWEN_VL_UTILS = False
     process_vision_info = None
 
-from specforge.utils import padding
 
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
@@ -117,6 +116,7 @@ def preprocess_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
     is_preformatted: bool = False,
+    train_only_last_turn: bool = False,
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -129,6 +129,7 @@ def preprocess_conversations(
         chat_template: The chat template to use for formatting/identifying spans.
         max_length: The maximum length of the tokenized input.
         is_preformatted: Whether the input is already formatted text strings.
+        train_only_last_turn: If True, only the last assistant turn contributes to the loss.
 
     Returns:
         A dictionary containing:
@@ -158,7 +159,11 @@ def preprocess_conversations(
             # if the source is None, skip it
             continue
         input_ids, loss_mask = parser.parse(
-            source, max_length, preformatted=is_preformatted, **kwargs_item
+            source,
+            max_length,
+            preformatted=is_preformatted,
+            train_only_last_turn=train_only_last_turn,
+            **kwargs_item,
         )
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
@@ -294,6 +299,7 @@ def build_eagle3_dataset(
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
+    train_only_last_turn: Optional[bool] = False,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -319,6 +325,8 @@ def build_eagle3_dataset(
                         the assistant spans for loss mask generation.
                         If True, expects "text" column with ready-to-train text.
                         If False, expects "conversations" column with ShareGPT format.
+        train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+                             Useful for thinking models where history may not contain thoughts.
 
     Returns:
         The processed HF dataset.
@@ -360,6 +368,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=True,
+                train_only_last_turn=train_only_last_turn,
             )
         else:
             # Handle ShareGPT conversations
@@ -376,6 +385,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=False,
+                train_only_last_turn=train_only_last_turn,
                 **examples,
             )
 
@@ -453,9 +463,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
         new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
         new_data["loss_mask"] = loss_mask
-        new_data["target"] = padding(target, left=False)
+        new_data["target"] = target
         new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = padding(input_ids, left=False)
+        new_data["input_ids"] = input_ids
         if transform:
             new_data = transform(new_data)
         return new_data
@@ -521,9 +531,11 @@ def generate_vocab_mapping_file(
 
     # we first count the frequency of effectiev tokens in the dataset
     token_dict = Counter()
-    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
-        input_ids = item["input_ids"]
-        loss_mask = item["loss_mask"]
+    for input_ids, loss_mask in tqdm(
+        zip(dataset["input_ids"], dataset["loss_mask"]),
+        total=len(dataset),
+        desc="Counting tokens for vocab mapping",
+    ):
         masked_ids = input_ids[loss_mask == 1]
         unique_ids, counts = masked_ids.unique(return_counts=True)
         batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))

@@ -6,6 +6,8 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 export SPECFORGE_DATA_NUM_PROC=32
 NUM_GPUS=${1:-1}
 
+ATTENTION_BACKEND=${2:-flex_attention}
+
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
@@ -19,6 +21,7 @@ torchrun \
     --learning-rate 1e-4 \
     --max-length 2048 \
     --chat-template qwen \
+    --attention-backend $ATTENTION_BACKEND \
     --log-interval 50 \
     --save-interval 1000 \
     --report-to wandb \
