@@ -913,10 +913,11 @@ def main():
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
-            if (
+            should_evaluate = (
                 args.eval_data_path is not None
                 or args.eval_hidden_states_path is not None
-            ) and global_step % args.eval_interval == 0:
+            )
+            if should_evaluate and global_step % args.eval_interval == 0:
                 # Run evaluation
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
