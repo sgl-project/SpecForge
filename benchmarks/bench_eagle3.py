@@ -201,7 +201,9 @@ def main():
     assert len(benchmark_list) != 0, "the number of benchmark list is 0"
 
     base_url = f"http://localhost:{args.port}"
+
     results = {}
+    results["model"] = server_args.speculative_draft_model_path
 
     def run_benchmarks(batch_size: int, steps: int, topk: int, num_draft_tokens: int):
         for benchmark_name, num_prompts, subset in benchmark_list:

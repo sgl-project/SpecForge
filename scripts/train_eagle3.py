@@ -343,6 +343,13 @@ def sanity_check(args: Namespace) -> None:
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
 
+    if args.eval_data_path is not None and args.eval_hidden_states_path is not None:
+        raise ValueError(
+            "Cannot set both eval_data_path and eval_hidden_states_path. "
+            "For online mode, set only eval_data_path. "
+            "For offline mode, set only eval_hidden_states_path."
+        )
+
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # Handle draft model config
@@ -906,9 +913,14 @@ def main():
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
-            if (
+            should_evaluate = (
                 args.eval_data_path is not None
-                and global_step % args.eval_interval == 0
+                or args.eval_hidden_states_path is not None
+            )
+            if (
+                should_evaluate
+                and global_step % (args.eval_interval * args.draft_accumulation_steps)
+                == 0
             ):
                 # Run evaluation
                 draft_model.eval()
@@ -935,7 +947,7 @@ def main():
                     args,
                     eval_acces,
                     eval_plosses,
-                    global_step,
+                    global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
                 )
