@@ -499,6 +499,78 @@ def build_offline_eagle3_dataset(
 
 
 # ==============================
+# Offline DFlash Dataset
+# ==============================
+class OfflineDFlashDataset(torch.utils.data.Dataset):
+    """Offline dataset for DFlash training from pre-computed hidden states."""
+
+    def __init__(self, datapath, transform=None, max_len=2048, block_size=16):
+        self.datapaths = datapath
+        self.transform = transform
+        self._epoch = 0
+        self.max_len = max_len
+        self.block_size = block_size
+
+    @staticmethod
+    def process_data(data, max_len, block_size=16, transform=None):
+        """Only apply max_len truncation. Block-size truncation and loss_mask
+        processing are handled by OnlineDFlashModel.forward() to align with online mode.
+        """
+        hidden_state = data["hidden_state"].squeeze(0)[:max_len]
+        input_ids = data["input_ids"][:max_len]
+        loss_mask = data["loss_mask"][:max_len]
+
+        new_data = {
+            "hidden_state": hidden_state[None, :],
+            "input_ids": input_ids[None, :],
+            "loss_mask": loss_mask[None, :],
+            "attention_mask": torch.ones(1, len(input_ids), dtype=torch.long),
+        }
+        if transform:
+            new_data = transform(new_data)
+        return new_data
+
+    def __len__(self):
+        return len(self.datapaths)
+
+    def _open_file(self, index):
+        return torch.load(self.datapaths[index], weights_only=False)
+
+    def __getitem__(self, index):
+        try:
+            data = self._open_file(index)
+        except Exception as e:
+            print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
+            data = self._open_file(0)
+        return self.process_data(data, self.max_len, self.block_size, self.transform)
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+
+
+def build_offline_dflash_dataset(
+    hidden_states_path: str,
+    max_len: int = 2048,
+    block_size: int = 16,
+) -> torch.utils.data.Dataset:
+    """Build offline DFlash dataset from pre-computed hidden states.
+
+    Args:
+        hidden_states_path: Path to directory containing hidden state files.
+        max_len: Maximum sequence length.
+        block_size: Block size for DFlash (for truncation).
+
+    Returns:
+        OfflineDFlashDataset instance.
+    """
+    return OfflineDFlashDataset(
+        list_local_files(hidden_states_path),
+        max_len=max_len,
+        block_size=block_size,
+    )
+
+
+# ==============================
 # Vocab Mapping
 # ==============================
 def generate_vocab_mapping_file(
