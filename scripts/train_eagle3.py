@@ -4,7 +4,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -15,12 +15,13 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 
 from datasets import Dataset
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
+    MiniCPMVLOnlineEagle3Model,
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
@@ -29,7 +30,12 @@ from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
+    generate_vocab_mapping_for_vlm,
     prepare_dp_dataloaders,
+    # New VLM Template architecture
+    build_vlm_dataset_with_template,
+    get_vlm_template,
+    prepare_vlm_dataloader,
 )
 from specforge.distributed import (
     destroy_distributed,
@@ -159,6 +165,11 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
     training_group.add_argument(
+        "--save-per-epoch",
+        action="store_true",
+        help="Save checkpoint at the end of each epoch",
+    )
+    training_group.add_argument(
         "--log-interval",
         type=int,
         default=50,
@@ -191,6 +202,11 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     other_group.add_argument("--cache-dir", type=str, default="./cache")
     other_group.add_argument("--output-dir", type=str, required=True)
     other_group.add_argument("--verbose", action="store_true")
+    other_group.add_argument(
+        "--debug-first-sample",
+        action="store_true",
+        help="Print first training sample details for debugging",
+    )
     other_group.add_argument(
         "--dist-timeout",
         type=int,
@@ -254,7 +270,7 @@ def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
 
 def build_target_model(
     args: Namespace, draft_model_config: AutoDraftModelConfig, is_online: bool = True
-) -> Tuple[Union[Eagle3TargetModel, TargetHead], Optional[AutoProcessor]]:
+) -> Tuple[Union[Eagle3TargetModel, TargetHead], Optional[Any]]:
     """
     Build the target model according to the arguments.
 
@@ -269,7 +285,7 @@ def build_target_model(
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.target_model_backend == "custom"
+            and args.tp_size == 1
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
 
@@ -277,6 +293,22 @@ def build_target_model(
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     pretrained_model_name_or_path=args.target_model_path,
                     torch_dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
+            )
+        elif (
+            args.is_vlm
+            and draft_model_config.target_model_type == "minicpm_v_4"
+            and args.tp_size == 1
+        ):
+            from transformers import AutoModel
+
+            target_model = (
+                AutoModel.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
                 )
                 .eval()
                 .cuda()
@@ -296,26 +328,30 @@ def build_target_model(
                 trust_remote_code=args.trust_remote_code,
             )
 
-        # set the aux hidden states layers
-        if (
-            hasattr(draft_model_config, "eagle_config")
-            and draft_model_config.eagle_config is not None
-            and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
-        ):
-            target_model.set_aux_hidden_states_layers(
-                draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
-            )
-        else:
-            target_model.set_aux_hidden_states_layers()
+        # set the aux hidden states layers (not needed for MiniCPM-V which handles it internally)
+        if draft_model_config.target_model_type != "minicpm_v_4":
+            if (
+                hasattr(draft_model_config, "eagle_config")
+                and draft_model_config.eagle_config is not None
+                and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
+            ):
+                target_model.set_aux_hidden_states_layers(
+                    draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
+                )
+            else:
+                target_model.set_aux_hidden_states_layers()
 
+        # Load processor for MiniCPM-V (needed by MiniCPMVLOnlineEagle3Model)
+        processor = None
         if args.is_vlm:
+            from transformers import AutoProcessor
+            trust_remote_code = draft_model_config.target_model_type == "minicpm_v_4"
             processor = AutoProcessor.from_pretrained(
                 args.target_model_path,
                 min_pixels=args.min_pixels,
                 max_pixels=args.max_pixels,
+                trust_remote_code=trust_remote_code,
             )
-        else:
-            processor = None
 
         return target_model, processor
     else:
@@ -405,7 +441,6 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 def build_dataloaders(
     args: Namespace,
     draft_model_config: AutoDraftModelConfig,
-    processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
@@ -427,80 +462,150 @@ def build_dataloaders(
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
-    with rank_0_priority():
-        train_eagle3_dataset = build_eagle3_dataset(
-            dataset=train_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            is_vlm=args.is_vlm,
-            is_preformatted=args.is_preformatted,
-            processor=processor,
-            num_proc=args.build_dataset_num_proc,
-            train_only_last_turn=args.train_only_last_turn,
-        )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
-        )
-
-        if not is_online:
-            train_eagle3_dataset = build_offline_eagle3_dataset(
-                args.train_hidden_states_path,
-                args.max_length,
-            )
-
-    train_dataloader = prepare_dp_dataloaders(
-        train_eagle3_dataset,
-        args.target_batch_size,
-        num_workers=args.dataloader_num_workers,
-        shuffle=True,
-        process_group=(
-            get_draft_dp_group()
-            if args.attention_backend == "usp" and not is_online
-            else get_dp_group()
-        ),
-        is_vlm=args.is_vlm,
-    )
-    if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
-        if args.eval_data_path is not None:
-            eval_dataset = Dataset.from_generator(
-                generator=safe_conversations_generator,
-                gen_kwargs={"file_path": args.eval_data_path},
-            )
-            eval_eagle3_dataset = build_eagle3_dataset(
-                eval_dataset,
-                tokenizer,
-                args.chat_template,
-                args.max_length,
-                is_vlm=args.is_vlm,
-                processor=processor,
+    
+    vlm_type = getattr(draft_model_config, "target_model_type", None)
+    vlm_template = None
+    
+    if args.is_vlm:
+        # VLM: Use VLM Template architecture
+        print_with_rank(f"Using VLM Template architecture for {vlm_type}")
+        
+        # Generate vocab mapping FIRST using text-only processing (fast)
+        with rank_0_priority():
+            vocab_mapping_path = generate_vocab_mapping_for_vlm(
+                hf_dataset=train_dataset,
+                tokenizer_path=args.target_model_path,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
                 num_proc=args.build_dataset_num_proc,
-                is_preformatted=args.is_preformatted,
-                train_only_last_turn=args.train_only_last_turn,
             )
-        elif args.eval_hidden_states_path is not None:
-            eval_eagle3_dataset = build_offline_eagle3_dataset(
-                args.eval_hidden_states_path,
-                args.max_length,
-            )
-        eval_dataloader = prepare_dp_dataloaders(
-            eval_eagle3_dataset,
+        
+        # Then create VLM dataset with full image processing
+        vlm_template = get_vlm_template(
+            vlm_type=vlm_type,
+            processor_path=args.target_model_path,
+            max_length=args.max_length,
+        )
+        train_eagle3_dataset = build_vlm_dataset_with_template(
+            dataset=train_dataset,
+            vlm_template=vlm_template,
+            shuffle_seed=42,
+            num_proc=args.build_dataset_num_proc,
+        )
+        
+        train_dataloader = prepare_vlm_dataloader(
+            train_eagle3_dataset,
+            vlm_template,
             args.target_batch_size,
-            num_workers=args.dataloader_num_workers,
-            shuffle=False,
+            num_workers=0,  # Must be 0 for VLM Template
+            shuffle=True,
             process_group=(
                 get_draft_dp_group()
                 if args.attention_backend == "usp" and not is_online
                 else get_dp_group()
             ),
-            is_vlm=args.is_vlm,
         )
+    else:
+        # LLM: Use original preprocessing
+        with rank_0_priority():
+            train_eagle3_dataset = build_eagle3_dataset(
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                cache_key=cache_key,
+                is_preformatted=args.is_preformatted,
+                num_proc=args.build_dataset_num_proc,
+                train_only_last_turn=args.train_only_last_turn,
+            )
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+            )
+
+            if not is_online:
+                train_eagle3_dataset = build_offline_eagle3_dataset(
+                    args.train_hidden_states_path,
+                    args.max_length,
+                )
+
+        train_dataloader = prepare_dp_dataloaders(
+            train_eagle3_dataset,
+            args.target_batch_size,
+            num_workers=args.dataloader_num_workers,
+            shuffle=True,
+            process_group=(
+                get_draft_dp_group()
+                if args.attention_backend == "usp" and not is_online
+                else get_dp_group()
+            ),
+        )
+
+    if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
+        if args.eval_data_path is not None:
+            eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+            if args.is_vlm:
+                eval_eagle3_dataset = build_vlm_dataset_with_template(
+                    dataset=eval_dataset,
+                    vlm_template=vlm_template,
+                    shuffle_seed=42,
+                    num_proc=args.build_dataset_num_proc,
+                )
+                eval_dataloader = prepare_vlm_dataloader(
+                    eval_eagle3_dataset,
+                    vlm_template,
+                    args.target_batch_size,
+                    num_workers=0,
+                    shuffle=False,
+                    process_group=(
+                        get_draft_dp_group()
+                        if args.attention_backend == "usp" and not is_online
+                        else get_dp_group()
+                    ),
+                )
+            else:
+                eval_eagle3_dataset = build_eagle3_dataset(
+                    eval_dataset,
+                    tokenizer,
+                    args.chat_template,
+                    args.max_length,
+                    num_proc=args.build_dataset_num_proc,
+                    is_preformatted=args.is_preformatted,
+                    train_only_last_turn=args.train_only_last_turn,
+                )
+                eval_dataloader = prepare_dp_dataloaders(
+                    eval_eagle3_dataset,
+                    args.target_batch_size,
+                    num_workers=args.dataloader_num_workers,
+                    shuffle=False,
+                    process_group=(
+                        get_draft_dp_group()
+                        if args.attention_backend == "usp" and not is_online
+                        else get_dp_group()
+                    ),
+                )
+        elif args.eval_hidden_states_path is not None:
+            eval_eagle3_dataset = build_offline_eagle3_dataset(
+                args.eval_hidden_states_path,
+                args.max_length,
+            )
+            eval_dataloader = prepare_dp_dataloaders(
+                eval_eagle3_dataset,
+                args.target_batch_size,
+                num_workers=args.dataloader_num_workers,
+                shuffle=False,
+                process_group=(
+                    get_draft_dp_group()
+                    if args.attention_backend == "usp" and not is_online
+                    else get_dp_group()
+                ),
+            )
         print_with_rank("Initialized eval dataloader")
     else:
         eval_dataloader = None
@@ -559,42 +664,49 @@ def run_forward(
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
+    vlm_type: Optional[str] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    if args.is_vlm and args.target_model_backend == "custom":
-        plosses, _, acces = eagle3_model(
-            input_ids=data["input_ids"].cuda(),
-            attention_mask=data["attention_mask"].cuda(),
-            loss_mask=data["loss_mask"].cuda(),
-            pixel_values=data["pixel_values"].cuda(),
-            image_grid_thw=data["image_grid_thw"].cuda(),
-        )
+    if args.is_vlm:
+        if vlm_type == "minicpm_v_4":
+            # MiniCPM-V: pixel_values is nested list [[tensor, ...], ...], move tensors to cuda
+            def move_to_cuda(item):
+                if item is None:
+                    return None
+                if isinstance(item, torch.Tensor):
+                    return item.cuda()
+                if isinstance(item, list):
+                    return [move_to_cuda(x) for x in item]
+                return item
+            
+            pixel_values = move_to_cuda(data["pixel_values"])
+            tgt_sizes = move_to_cuda(data["tgt_sizes"])
+            image_bound = move_to_cuda(data["image_bound"])
+            plosses, _, acces = eagle3_model(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+                pixel_values=pixel_values,
+                tgt_sizes=tgt_sizes,
+                image_bound=image_bound,
+                position_ids=data["position_ids"].cuda() if "position_ids" in data else None,
+            )
+        else:
+            # Qwen2.5-VL
+            plosses, _, acces = eagle3_model(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+                pixel_values=data["pixel_values"].cuda(),
+                image_grid_thw=data["image_grid_thw"].cuda(),
+            )
     else:
-        image_grid_thw = None
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
-            # Handle VLM data: pixel_values and image_grid_thw are lists
-            # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
-            if args.is_vlm:
-                image_grid_thw = (
-                    [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
-                    if args.is_vlm
-                    else None
-                )
-                pixel_values = data["pixel_values"].cuda()
-                eagle3_data = target_model.generate_eagle3_data(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                    is_vlm=args.is_vlm,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                )
-            else:
-                eagle3_data = target_model.generate_eagle3_data(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
-                )
+            eagle3_data = target_model.generate_eagle3_data(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+            )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
             attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
@@ -619,8 +731,6 @@ def run_forward(
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
-            image_grid_thw=image_grid_thw,
-            is_vlm=args.is_vlm,
         )
     return plosses, acces
 
@@ -757,7 +867,7 @@ def main():
     # 3. Build dataloader
     # ================================================
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
-        args, draft_model_config, processor
+        args, draft_model_config
     )
 
     # we load the vocab mapping then
@@ -779,12 +889,8 @@ def main():
     # ================================================
     # 4. Build Eagle3 model
     # ================================================
-    if (
-        args.is_vlm
-        and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
-        and args.tp_size == 1
-        and args.target_model_backend != "sglang"
-    ):
+    target_model_type = getattr(draft_model_config, "target_model_type", None)
+    if args.is_vlm and target_model_type == "qwen2_5_vl":
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
@@ -792,21 +898,21 @@ def main():
             length=args.ttt_length,
             attention_backend=args.attention_backend,
         )
+    elif args.is_vlm and target_model_type == "minicpm_v_4":
+        eagle3_model = MiniCPMVLOnlineEagle3Model(
+            target_model=target_model,
+            draft_model=draft_model,
+            processor=processor,
+            length=args.ttt_length,
+            attention_backend=args.attention_backend,
+        )
     else:
-        if is_online:
-            eagle3_model = OnlineEagle3Model(
-                target_model=target_model,
-                draft_model=draft_model,
-                length=args.ttt_length,
-                attention_backend=args.attention_backend,
-            )
-        else:
-            # offline: the target_model is TargetHead not a model
-            eagle3_model = OnlineEagle3Model(
-                draft_model=draft_model,
-                length=args.ttt_length,
-                attention_backend=args.attention_backend,
-            )
+        eagle3_model = OnlineEagle3Model(
+            draft_model=draft_model,
+            length=args.ttt_length,
+            attention_backend=args.attention_backend,
+        )
+
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -846,6 +952,31 @@ def main():
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
 
+    # Print first training sample for debugging (use --debug-first-sample to enable)
+    if args.debug_first_sample and dist.get_rank() == 0:
+        first_sample = next(iter(train_dataloader))
+        # Get tokenizer from processor or directly
+        _tokenizer = processor.tokenizer if processor is not None else tokenizer
+        
+        print("\n" + "=" * 60)
+        print("First Training Sample")
+        print("=" * 60)
+        
+        # Input tokens
+        input_ids = first_sample['input_ids'][0]
+        print(f"[INPUT_IDS] shape: {first_sample['input_ids'].shape}")
+        print(f"[INPUT_IDS] {input_ids.tolist()}")
+        print(f"[INPUT_TEXT] {_tokenizer.decode(input_ids, skip_special_tokens=False)}")
+        
+        # Label tokens (tokens that contribute to loss)
+        mask_indices = (first_sample['loss_mask'][0] == 1).nonzero(as_tuple=True)[0]
+        if len(mask_indices) > 0:
+            label_ids = input_ids[mask_indices]
+            print(f"[LABEL_IDS] count: {len(mask_indices)}, ids: {label_ids.tolist()}")
+            print(f"[LABEL_TEXT] {_tokenizer.decode(label_ids, skip_special_tokens=False)}")
+        
+        print("=" * 60 + "\n")
+
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -859,6 +990,10 @@ def main():
             progress_bar = train_dataloader
 
         for data in progress_bar:
+            # Skip empty batches (all samples were invalid)
+            if data is None:
+                continue
+            
             global_step += 1
 
             # ================================================
@@ -890,7 +1025,8 @@ def main():
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
+                args, eagle3_model, data, target_model, is_online,
+                vlm_type=getattr(draft_model_config, "target_model_type", None),
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
@@ -939,7 +1075,8 @@ def main():
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
                         plosses, acces = run_forward(
-                            args, eagle3_model, data, target_model, is_online
+                            args, eagle3_model, data, target_model, is_online,
+                            vlm_type=getattr(draft_model_config, "target_model_type", None),
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))
@@ -960,6 +1097,7 @@ def main():
                     tracker,
                     mode="eval",
                 )
+
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
@@ -972,6 +1110,12 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+
+        # Save checkpoint at end of epoch if requested
+        if args.save_per_epoch:
+            print_on_rank0(f"Epoch {epoch} completed, saving checkpoint...")
+            save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+
     # Save final checkpoint if training ended without saving
     if global_step % args.save_interval != 0:
         print_on_rank0(

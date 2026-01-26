@@ -60,7 +60,6 @@ class OnlineEagle3Model(Eagle3Model):
         draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
-        target_model: Optional[Eagle3Model] = None,
     ):
         """
         Args:
@@ -72,7 +71,6 @@ class OnlineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
-        self.target_model = target_model
 
         if self.attention_backend == "usp":
             self.extract_func = EXTRACT_FUNC_DICT["basic"]
@@ -101,8 +99,6 @@ class OnlineEagle3Model(Eagle3Model):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        is_vlm: bool = False,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -142,22 +138,14 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            if is_vlm:
-                mrope_positions_ids, mrope_position_delta = (
-                    self.target_model.get_rope_index(
-                        input_ids=input_ids, image_grid_thw=image_grid_thw
-                    )
-                )
-                position_ids = mrope_positions_ids
-            else:
-                device = hidden_states.device
-                position_ids = torch.arange(
-                    past_key_values_length,
-                    seq_length + past_key_values_length,
-                    dtype=torch.long,
-                    device=device,
-                )
-                position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            device = hidden_states.device
+            position_ids = torch.arange(
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=device,
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
@@ -552,6 +540,284 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
+        return plosses, vlosses, acces
+
+
+class MiniCPMVLOnlineEagle3Model(Eagle3Model):
+    """
+    Online Eagle3 training model for MiniCPM-V-4.0.
+    
+    MiniCPM-V-4.0 has a different architecture from Qwen2.5-VL:
+    - Uses LlamaForCausalLM as the LLM backbone
+    - Uses slice-based image encoding (pixel_values, tgt_sizes, image_bound)
+    - Provides get_vllm_embedding() method for vision embedding extraction
+    
+    This class reuses the official MiniCPM-V implementation for target model inference.
+    """
+
+    def __init__(
+        self,
+        target_model,
+        draft_model: Eagle3DraftModel,
+        processor,
+        length: int = 7,
+        attention_backend: str = "sdpa",
+    ):
+        """
+        Args:
+            target_model: MiniCPMV model for extracting hidden states.
+            draft_model: Eagle3 draft model to be trained.
+            processor: MiniCPM-V processor for image processing.
+            length: TTT length (number of unroll steps).
+            attention_backend: Attention implementation ("sdpa", "fa", "flex_attention").
+        """
+        super().__init__()
+        self.target_model = target_model
+        self.draft_model = draft_model
+        self.processor = processor
+        self.length = length
+        self.attention_backend = attention_backend
+
+    @torch.no_grad()
+    def _prepare_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        pixel_values=None,
+        tgt_sizes=None,
+        image_bound=None,
+        position_ids: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract hidden states from MiniCPM-V target model.
+        
+        Uses the official get_vllm_embedding() method to process vision inputs,
+        then extracts hidden states from the LLM backbone.
+        
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len)
+            loss_mask: (batch, seq_len)
+            pixel_values: List of pixel value tensors for each image slice
+            tgt_sizes: Target sizes for each slice
+            image_bound: Image token boundaries in the sequence
+            position_ids: (batch, seq_len) or None
+            device: Target device for computation
+            
+        Returns:
+            hidden_states: (batch, seq_len, 3*hidden_size) - concatenated aux layer outputs
+            target: (batch, seq_len, vocab_size) - logits from target model
+            loss_mask: (batch, seq_len)
+            input_ids: (batch, seq_len)
+        """
+        if device is None:
+            device = input_ids.device
+
+        # Construct data dict for MiniCPM-V's get_vllm_embedding
+        data = {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "tgt_sizes": tgt_sizes,
+            "image_bound": image_bound,
+        }
+
+        # Get vision embedding using official method
+        vllm_embedding, _ = self.target_model.get_vllm_embedding(data)
+
+        # Generate position_ids if not provided
+        if position_ids is None:
+            seq_len = input_ids.shape[1]
+            position_ids = torch.arange(seq_len, device=device, dtype=torch.long)
+            position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
+
+        # Run the LLM backbone to get hidden states
+        outputs = self.target_model.llm(
+            input_ids=None,
+            inputs_embeds=vllm_embedding,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
+        # Extract aux hidden states
+        # MiniCPM-V uses 32 layers, hidden_states includes embedding layer
+        num_hidden_states = len(outputs.hidden_states)
+        offset = 1  # hidden_states[0] is embedding output
+        num_layers = num_hidden_states - 1  # 32 layers
+
+        # Eagle3 standard: layer 1, num_layers//2-1, num_layers-4
+        low_aux_layer = 1 + offset      # layer 1 -> index 2
+        mid_aux_layer = num_layers // 2 - 1 + offset  # layer 15 -> index 16
+        last_aux_layer = num_layers - 4 + offset      # layer 28 -> index 29
+
+        hidden_states0 = outputs.hidden_states[low_aux_layer]
+        hidden_states1 = outputs.hidden_states[mid_aux_layer]
+        hidden_states2 = outputs.hidden_states[last_aux_layer]
+
+        # Concatenate to form (batch, seq_len, 3*hidden_size)
+        hidden_states = torch.cat(
+            (hidden_states0, hidden_states1, hidden_states2), dim=-1
+        )
+
+        # Apply padding for TTT
+        target = outputs.logits
+        target = padding(target, left=False)
+        input_ids = padding(input_ids, left=False)
+
+        if target is not None:
+            target = target.to(device)
+            loss_mask = loss_mask[..., None]
+            loss_mask = loss_mask.to(device)
+
+        return hidden_states, target, loss_mask, input_ids
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        pixel_values=None,
+        tgt_sizes=None,
+        image_bound=None,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Forward pass for MiniCPM-V Eagle3 training.
+        
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len)
+            loss_mask: (batch, seq_len)
+            past_key_values: Not used, kept for compatibility
+            position_ids: (batch, seq_len) or None
+            pixel_values: MiniCPM-V pixel values (list of slice tensors)
+            tgt_sizes: Target sizes for image slices
+            image_bound: Image token boundaries
+            
+        Returns:
+            plosses: List of policy losses for each TTT step
+            vlosses: List of value losses (empty for Eagle3)
+            acces: List of accuracy metrics for each TTT step
+        """
+        # Step 0: Prepare data with target model
+        hidden_states, target, loss_mask, input_ids = self._prepare_data(
+            input_ids, attention_mask, loss_mask,
+            pixel_values=pixel_values,
+            tgt_sizes=tgt_sizes,
+            image_bound=image_bound,
+            position_ids=position_ids,
+        )
+
+        # Step 1: Handle vocab mapping
+        target_p_padded, position_mask = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
+
+        # Basic info
+        batch_size, seq_length, _ = hidden_states.shape
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+
+        # Step 2: Project concatenated hidden states
+        hidden_states = self.draft_model.project_hidden_states(hidden_states)
+
+        # Step 3: Handle position_ids
+        if position_ids is None:
+            device = hidden_states.device
+            position_ids = torch.arange(
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=device,
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.view(-1, seq_length).long()
+
+        # Step 4: Handle attention mask
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length_with_past),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+        if self.attention_backend == "sdpa":
+            attention_mask = self.draft_model.prepare_decoder_attention_mask(
+                attention_mask=attention_mask,
+                hidden_states=hidden_states,
+                batch_size=batch_size,
+                seq_length=seq_length,
+                past_key_values_length=past_key_values_length,
+            )
+
+        # Step 5: Run TTT
+        plosses = []
+        vlosses = []
+        acces = []
+        
+        if self.attention_backend in ["sdpa", "fa"]:
+            cache_hidden = [[], []]
+            past_key_values = None
+        elif self.attention_backend == "flex_attention":
+            cache_hidden = None
+            past_key_values = DynamicCache()
+        else:
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
+
+        for idx in range(self.length):
+            target_p = target_p_padded[:, idx:idx + seq_length, :].contiguous()
+            is_last = idx == self.length - 1
+
+            # Step 5.1: Embed input ids
+            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+            inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+
+            # Step 5.2: Run draft model backbone
+            hidden_states_out = self.draft_model.backbone(
+                input_embeds=inputs_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+
+            # Update hidden states
+            hidden_states = hidden_states_out
+
+            # Step 5.4: Get logits
+            logits = self.draft_model.compute_logits(hidden_states)
+
+            # Step 5.5: Record metrics
+            with torch.no_grad():
+                acces.append(
+                    _compute_metric_acc(
+                        logits=logits,
+                        target_p=target_p,
+                        position_mask=position_mask,
+                        loss_mask=loss_mask,
+                    )
+                )
+
+            # Step 5.6: Calculate loss
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            plosses.append(loss)
+
+            if not is_last:
+                # Step 5.7: Update masks for next step
+                input_ids = padding(input_ids, left=False)
+                position_mask = padding(position_mask, left=False)
+                loss_mask = padding(loss_mask, left=False)
+
         return plosses, vlosses, acces
 
 
