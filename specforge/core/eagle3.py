@@ -59,6 +59,7 @@ class OnlineEagle3Model(Eagle3Model):
         draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
+        target_model: Optional[Eagle3Model] = None,
     ):
         """
         Args:
@@ -70,6 +71,7 @@ class OnlineEagle3Model(Eagle3Model):
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
+        self.target_model = target_model
 
         if self.attention_backend == "usp":
             self.extract_func = EXTRACT_FUNC_DICT["basic"]
@@ -98,6 +100,8 @@ class OnlineEagle3Model(Eagle3Model):
         hidden_states: torch.Tensor,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        is_vlm: bool = False,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -126,6 +130,10 @@ class OnlineEagle3Model(Eagle3Model):
         draft_num_hidden_layers = self.draft_model.num_hidden_layers
 
         # Step 2: project the concatenated hidden states to the target hidden size
+        if self.attention_backend == "usp":
+            # NOTE: Split first for USP to parallelize computation and ensure
+            # gradient consistency without redundant full-sequence projection.
+            hidden_states = self.prepare_usp_input(hidden_states)
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
@@ -133,14 +141,22 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            device = hidden_states.device
-            position_ids = torch.arange(
-                past_key_values_length,
-                seq_length + past_key_values_length,
-                dtype=torch.long,
-                device=device,
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            if is_vlm:
+                mrope_positions_ids, mrope_position_delta = (
+                    self.target_model.get_rope_index(
+                        input_ids=input_ids, image_grid_thw=image_grid_thw
+                    )
+                )
+                position_ids = mrope_positions_ids
+            else:
+                device = hidden_states.device
+                position_ids = torch.arange(
+                    past_key_values_length,
+                    seq_length + past_key_values_length,
+                    dtype=torch.long,
+                    device=device,
+                )
+                position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
@@ -166,16 +182,12 @@ class OnlineEagle3Model(Eagle3Model):
         acces = []
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
-        if self.attention_backend in ["sdpa", "fa"]:
+        if self.attention_backend in ["sdpa", "fa", "usp"]:
             caches_hidden = [[[], []] for _ in range(draft_num_hidden_layers)]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             caches_hidden = None
             past_key_values = [DynamicCache() for _ in range(draft_num_hidden_layers)]
-        elif self.attention_backend == "usp":
-            caches_hidden = [[[], []] for _ in range(draft_num_hidden_layers)]
-            past_key_values = None
-            hidden_states = self.prepare_usp_input(hidden_states)
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 

@@ -25,9 +25,10 @@ from .base import Eagle3DraftModel
 
 try:
     from flash_attn import flash_attn_func
-except:
+except ImportError:
     warnings.warn(
-        "flash_attn is not found, please install flash_attn if you want to use the flash attention backend"
+        "flash_attn is not found, falling back to flex_attention. "
+        "Please install flash_attn if you want to use the flash attention backend."
     )
     flash_attn_func = None
 
