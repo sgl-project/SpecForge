@@ -26,7 +26,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 
 from datasets import Dataset
-from specforge.distributed import get_draft_sp_group
+from specforge.distributed import get_draft_sp_group, get_sp_ulysses_group
 
 
 class DataCollatorWithPadding:
@@ -36,6 +36,7 @@ class DataCollatorWithPadding:
 
     def __init__(self):
         self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
+        self.ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -90,10 +91,14 @@ class DataCollatorWithPadding:
                 - loss_mask: torch.Tensor of shape (B, N)
         """
         max_length = max(item["input_ids"].shape[1] for item in features)
+
         # pad for sequence parrel
         max_length = (
             (max_length + self.sp_degree - 1) // self.sp_degree
         ) * self.sp_degree
+        # position max len, ulysses do not need chuck position ids
+        position_max_len = max_length * self.ulysses_degree
+
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
         )
@@ -106,6 +111,15 @@ class DataCollatorWithPadding:
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
         )
+        if "position_ids" in features[0]:
+            batch_position_ids = torch.cat(
+                [
+                    self.paddingtensor2D(item["position_ids"], position_max_len)
+                    for item in features
+                ]
+            )
+        else:
+            batch_position_ids = None
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
@@ -113,16 +127,23 @@ class DataCollatorWithPadding:
             "hidden_state": None,
             "target": None,
         }
+        if batch_position_ids is not None:
+            batch["position_ids"] = batch_position_ids
         if all("hidden_state" in item for item in features):
             assert all(
                 "target" in item for item in features
             ), "target is required when hidden_state is provided"
-            batch["hidden_state"] = torch.cat(
-                [
-                    self.paddingtensor(item["hidden_state"], max_length)
-                    for item in features
-                ]
-            )
+            if self.sp_degree > 1:  # USP mode
+                batch["hidden_state"] = torch.cat(
+                    [item["hidden_state"] for item in features]
+                )
+            else:
+                batch["hidden_state"] = torch.cat(
+                    [
+                        self.paddingtensor(item["hidden_state"], max_length)
+                        for item in features
+                    ]
+                )
             batch["target"] = torch.cat(
                 [self.paddingtensor(item["target"], max_length) for item in features]
             )
