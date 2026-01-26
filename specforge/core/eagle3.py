@@ -83,7 +83,7 @@ class OnlineEagle3Model(Eagle3Model):
             self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
             self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
 
-    @torch.compile()
+    @torch.compile(dynamic=True)
     def prepare_usp_input(self, full_input):
         shared_input = self.extract_func(
             full_input,
@@ -127,14 +127,11 @@ class OnlineEagle3Model(Eagle3Model):
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
+        global_seq_length = input_ids.shape[1]
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
         # Step 2: project the concatenated hidden states to the target hidden size
-        if self.attention_backend == "usp":
-            # NOTE: Split first for USP to parallelize computation and ensure
-            # gradient consistency without redundant full-sequence projection.
-            hidden_states = self.prepare_usp_input(hidden_states)
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
@@ -151,13 +148,27 @@ class OnlineEagle3Model(Eagle3Model):
                 position_ids = mrope_positions_ids
             else:
                 device = hidden_states.device
-                position_ids = torch.arange(
-                    past_key_values_length,
-                    seq_length + past_key_values_length,
-                    dtype=torch.long,
-                    device=device,
-                )
-                position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+                if self.attention_backend == "usp":
+                    global_len = input_ids.shape[1]
+                    sp_world_size = self.sp_world_size
+                    sp_rank = self.sp_rank
+                    chunk_size = (global_len + sp_world_size - 1) // sp_world_size
+                    start = sp_rank * chunk_size + past_key_values_length
+                    position_ids = torch.arange(
+                        start,
+                        start + chunk_size,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    position_ids = position_ids.unsqueeze(0)
+                else:
+                    position_ids = torch.arange(
+                        past_key_values_length,
+                        seq_length + past_key_values_length,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
@@ -211,7 +222,11 @@ class OnlineEagle3Model(Eagle3Model):
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
-            target_p = target_p_padded[:, idx : idx + seq_length, :]
+            if self.attention_backend == "usp":
+                target_slice_len = global_seq_length
+            else:
+                target_slice_len = seq_length
+            target_p = target_p_padded[:, idx : idx + target_slice_len, :]
             if self.attention_backend == "usp":
                 input_ids = self.prepare_usp_input(global_input_ids)
             else:

@@ -27,10 +27,13 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
 from datasets import Dataset as HFDataset
+
+from ..distributed import get_draft_sp_group
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -445,53 +448,159 @@ def list_local_files(path, suffixes=[".ckpt"]):
 
 class OfflineEagle3Dataset(torch.utils.data.Dataset):
     def __init__(self, datapath, transform=None, max_len=2048):
+        """
+        Args:
+            datapath: List of file paths.
+            transform: Optional transform to apply.
+            max_len: Maximum sequence length to load.
+            sp_rank: Current Sequence Parallel rank (0 to sp_size-1).
+            sp_size: Total Sequence Parallel size (world size).
+        """
         self.datapaths = datapath
         self.transform = transform
         self._epoch = 0
         self.max_len = max_len
-
-    @staticmethod
-    def process_data(data, max_len, transform=None):
-        new_data = {}
-        # Squeeze due to our data generation script adding a batch dimension
-        hidden_state = data["aux_hidden_state"].squeeze(0)[:max_len][None, :]
-        target = data["hidden_state"].squeeze(0)[:max_len][None, :]
-
-        input_ids = data["input_ids"][:max_len][None, :]
-        loss_mask = data["loss_mask"][:max_len][None, :]
-        loss_mask[0, -1] = 0
-
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["target"] = target
-        new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = input_ids
-        if transform:
-            new_data = transform(new_data)
-        return new_data
-
-    def __len__(self):
-        return len(self.datapaths)
+        sp_group = get_draft_sp_group()
+        if sp_group:
+            self.sp_rank = torch.distributed.get_rank(sp_group)
+            self.sp_size = torch.distributed.get_world_size(sp_group)
+        else:
+            self.sp_rank = 0
+            self.sp_size = 1
 
     def _open_file(self, index):
-        return torch.load(self.datapaths[index], weights_only=False)
+        """
+        Opens the file with memory mapping.
+        This operation is virtually instant and consumes negligible RAM
+        because no data is actually read from disk yet.
+        """
+        return torch.load(self.datapaths[index], weights_only=False, mmap=True)
+
+    @staticmethod
+    def process_data(data, max_len, transform=None, sp_rank=0, sp_size=1):
+        """
+        Static method to process data with mixed sharding strategy.
+        - Hidden States: Sharded by sp_rank (to save VRAM/RAM).
+        - Input IDs/Masks: Kept full length (for context/positional embeddings).
+        """
+        new_data = {}
+
+        # -------------------------------------------------------
+        # Helper 1: Get Sharded Chunk (for heavy hidden states)
+        # -------------------------------------------------------
+        def get_sharded_sequence(tensor):
+            # Keep batch dim for DataCollator (expects [1, Seq, ...])
+            if tensor.ndim == 2:
+                tensor = tensor.unsqueeze(0)
+            if tensor.size(0) != 1:
+                raise ValueError(
+                    f"Expected batch=1 for hidden states, got shape {tuple(tensor.shape)}"
+                )
+
+            # Truncate to max_len (Virtual slice on mmap)
+            tensor = tensor[:, :max_len]
+            # Shard if needed (Virtual slice) along sequence dim=1
+            if sp_size > 1:
+                global_len = tensor.shape[1]
+                chunk_size = (global_len + sp_size - 1) // sp_size
+                padded_len = chunk_size * sp_size
+                if padded_len > global_len:
+                    pad_len = padded_len - global_len
+                    tensor = F.pad(tensor, (0, 0, 0, pad_len))
+                tensor = tensor.chunk(sp_size, dim=1)[sp_rank]
+
+            # Trigger actual Disk I/O -> RAM copy
+            return tensor.contiguous()
+
+        # -------------------------------------------------------
+        # Helper 2: Get Full Sequence (for lightweight inputs)
+        # -------------------------------------------------------
+        def get_full_sequence(tensor):
+            # Keep batch dim for DataCollator (expects [1, Seq, ...])
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            if tensor.size(0) != 1:
+                raise ValueError(
+                    f"Expected batch=1 for sequence data, got shape {tuple(tensor.shape)}"
+                )
+
+            # Only truncate, do not shard
+            tensor = tensor[:, :max_len]
+
+            # Trigger actual Disk I/O
+            return tensor.contiguous()
+
+        # --- A. Heavy Tensors: Apply SP Sharding ---
+        # Data shape: [Batch, Seq, Hidden] -> [Seq/sp_size, Hidden]
+        if "aux_hidden_state" not in data or data["aux_hidden_state"] is None:
+            raise KeyError("aux_hidden_state is required for OfflineEagle3Dataset")
+        new_data["hidden_state"] = get_sharded_sequence(data["aux_hidden_state"])
+        # --- B. Target Hidden States: Keep Full Sequence ---
+        # Data shape: [Batch, Seq, Hidden] -> [Seq, Hidden]
+        new_data["target"] = get_full_sequence(data["hidden_state"])
+
+        # --- C. Light Tensors: Keep Full Sequence ---
+        # Data shape: [Batch, Seq] -> [Seq]
+        new_data["input_ids"] = get_full_sequence(data["input_ids"])
+
+        # --- D. Loss Mask Handling ---
+        # We need the full mask, but need to ensure the very last token is ignored
+        full_loss_mask = data["loss_mask"]
+        if full_loss_mask.ndim == 1:
+            full_loss_mask = full_loss_mask.unsqueeze(0)
+        if full_loss_mask.size(0) != 1:
+            raise ValueError(
+                f"Expected batch=1 for loss_mask, got shape {tuple(full_loss_mask.shape)}"
+            )
+
+        # Slice and clone to ensure we can modify it safely without affecting mmap source
+        full_loss_mask = full_loss_mask[:, :max_len].clone()
+
+        # Mask out the last token of the global sequence
+        if full_loss_mask.numel() > 0:
+            full_loss_mask[0, -1] = 0
+
+        new_data["loss_mask"] = full_loss_mask.contiguous()
+
+        # Generate Attention Mask (Full Length)
+        new_data["attention_mask"] = torch.ones_like(
+            new_data["loss_mask"], dtype=torch.long
+        )
+
+        if transform:
+            new_data = transform(new_data)
+
+        return new_data
 
     def __getitem__(self, index):
         try:
+            # 1. Open file handle (metadata only)
             data = self._open_file(index)
         except Exception as e:
             print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
+            # Fallback to the first file if loading fails
             data = self._open_file(0)
-        return self.process_data(data, self.max_len, self.transform)
+
+        # 2. Read only specific bytes from disk
+        return self.process_data(
+            data,
+            self.max_len,
+            self.transform,
+            sp_rank=self.sp_rank,
+            sp_size=self.sp_size,
+        )
+
+    def __len__(self):
+        return len(self.datapaths)
 
     def set_epoch(self, epoch):
         self._epoch = epoch
 
 
 def build_offline_eagle3_dataset(
-    hidden_states_path: str,
-    max_len: int = 2048,
+    hidden_states_path: str, max_len: int = 2048
 ) -> torch.utils.data.Dataset:
+
     return OfflineEagle3Dataset(
         list_local_files(hidden_states_path),
         max_len=max_len,

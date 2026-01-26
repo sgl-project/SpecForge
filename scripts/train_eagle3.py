@@ -343,6 +343,17 @@ def sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
+    if args.attention_backend == "usp" and args.batch_size != 1:
+        raise ValueError(
+            f"USP only supports batch_size=1, got batch_size={args.batch_size}"
+        )
+    if args.attention_backend == "usp" and (
+        args.sp_ring_size * args.sp_ulysses_size <= 1
+    ):
+        raise ValueError(
+            "USP requires sp_ring_size * sp_ulysses_size > 1. "
+            f"Got sp_ring_size={args.sp_ring_size}, sp_ulysses_size={args.sp_ulysses_size}."
+        )
 
     if args.eval_data_path is not None and args.eval_hidden_states_path is not None:
         raise ValueError(
@@ -890,7 +901,11 @@ def main():
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
+                args,
+                eagle3_model,
+                data,
+                target_model,
+                is_online,
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
