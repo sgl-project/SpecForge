@@ -917,7 +917,11 @@ def main():
                 args.eval_data_path is not None
                 or args.eval_hidden_states_path is not None
             )
-            if should_evaluate and global_step % args.eval_interval == 0:
+            if (
+                should_evaluate
+                and global_step % (args.eval_interval * args.draft_accumulation_steps)
+                == 0
+            ):
                 # Run evaluation
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
@@ -943,7 +947,7 @@ def main():
                     args,
                     eval_acces,
                     eval_plosses,
-                    global_step,
+                    global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
                 )
