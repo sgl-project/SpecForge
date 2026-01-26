@@ -211,7 +211,9 @@ class TensorboardTracker(Tracker):
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
         if self.rank == 0:
-            log_dir = os.path.join(output_dir, "runs")
+            # Use logging_dir if provided, otherwise default to output_dir/runs
+            log_dir = getattr(args, "logging_dir", None) or os.path.join(output_dir, "runs")
+            os.makedirs(log_dir, exist_ok=True)
             self.writer = SummaryWriter(log_dir=log_dir)
             self.is_initialized = True
 

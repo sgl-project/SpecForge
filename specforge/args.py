@@ -29,6 +29,12 @@ class TrackerArgs:
             choices=["wandb", "tensorboard", "swanlab", "mlflow", "none"],
             help="The integration to report results and logs to.",
         )
+        parser.add_argument(
+            "--logging-dir",
+            type=str,
+            default=None,
+            help="Directory for tensorboard/swanlab logs. Defaults to output_dir if not set.",
+        )
         # wandb-specific args
         parser.add_argument("--wandb-project", type=str, default=None)
         parser.add_argument("--wandb-name", type=str, default=None)

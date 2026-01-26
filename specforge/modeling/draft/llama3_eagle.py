@@ -27,8 +27,7 @@ try:
     from flash_attn import flash_attn_func
 except ImportError:
     warnings.warn(
-        "flash_attn is not found, falling back to flex_attention. "
-        "Please install flash_attn if you want to use the flash attention backend."
+        "flash_attn is not found, please install flash_attn if you want to use the flash attention backend"
     )
     flash_attn_func = None
 
@@ -508,6 +507,73 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
         )
 
 
+class LlamaLongRopeRotaryEmbedding(LlamaRotaryEmbedding):
+    """LlamaRotaryEmbedding extended with LongRoPE scaling.
+    
+    LongRoPE uses different scaling factors for short and long sequences.
+    Based on: https://github.com/microsoft/LongRoPE
+    """
+
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        long_factor=None,
+        short_factor=None,
+        original_max_position_embeddings=None,
+        attention_factor=None,
+    ):
+        self.long_factor = long_factor
+        self.short_factor = short_factor
+        self.original_max_position_embeddings = original_max_position_embeddings or max_position_embeddings
+        
+        # Compute attention factor if not provided
+        if attention_factor is None:
+            factor = max_position_embeddings / self.original_max_position_embeddings
+            if factor <= 1.0:
+                self.attention_factor = 1.0
+            else:
+                self.attention_factor = math.sqrt(
+                    1 + math.log(factor) / math.log(self.original_max_position_embeddings)
+                )
+        else:
+            self.attention_factor = attention_factor
+        
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        
+        # Select factor based on sequence length
+        if seq_len > self.original_max_position_embeddings:
+            ext_factors = torch.tensor(self.long_factor, dtype=torch.float32, device=device)
+        else:
+            ext_factors = torch.tensor(self.short_factor, dtype=torch.float32, device=device)
+        
+        # Compute inverse frequencies with scaling factors
+        inv_freq_shape = torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim
+        inv_freq = 1.0 / (ext_factors * self.base ** inv_freq_shape)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # Apply attention factor scaling
+        self.register_buffer(
+            "cos_cached",
+            (emb.cos() * self.attention_factor)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cached",
+            (emb.sin() * self.attention_factor)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -605,6 +671,19 @@ class LlamaAttention(nn.Module):
                     beta_slow=rope_get("beta_slow"),
                     mscale=rope_get("mscale"),
                     mscale_all_dim=rope_get("mscale_all_dim"),
+                )
+            elif scaling_type == "longrope":
+                self.rotary_emb = LlamaLongRopeRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                    device=None,
+                    long_factor=rope_get("long_factor"),
+                    short_factor=rope_get("short_factor"),
+                    original_max_position_embeddings=rope_get(
+                        "original_max_position_embeddings"
+                    ),
+                    attention_factor=rope_get("attention_factor"),
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")

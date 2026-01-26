@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import re
 import warnings
@@ -40,12 +41,27 @@ except ImportError:
     HAS_QWEN_VL_UTILS = False
     process_vision_info = None
 
+from specforge.utils import padding
 
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
 Conversation = List[Dict[str, str]]
+
+# Module-level processor cache for multiprocessing (MiniCPM-V)
+_MINICPM_PROCESSOR_CACHE = {}
+
+
+def _load_minicpm_processor(processor_path: str):
+    """Load MiniCPM-V processor in worker process to avoid pickle issues."""
+    global _MINICPM_PROCESSOR_CACHE
+    if processor_path not in _MINICPM_PROCESSOR_CACHE:
+        from transformers import AutoProcessor
+        _MINICPM_PROCESSOR_CACHE[processor_path] = AutoProcessor.from_pretrained(
+            processor_path, trust_remote_code=True
+        )
+    return _MINICPM_PROCESSOR_CACHE[processor_path]
 
 
 # ==============================
@@ -287,6 +303,247 @@ def preprocess_vlm_conversations(
     return results
 
 
+def preprocess_minicpm_vlm_conversations(
+    processor: Optional[ImageProcessingMixin],
+    examples: List[Conversation],
+    chat_template: ChatTemplate,
+    max_length: int = 2048,
+    processor_path: Optional[str] = None,
+) -> Dict[str, List[torch.Tensor]]:
+    """
+    Preprocess a batch of ShareGPT style conversations for MiniCPM-V-4.0.
+
+    This function handles MiniCPM-V's unique image processing:
+    - Uses slice-based image encoding instead of grid
+    - Outputs pixel_values, tgt_sizes, image_bound instead of image_grid_thw
+    - Supports single image or multiple images per example
+    - Supports standard <image> placeholder (auto-converted to MiniCPM-V format)
+    - Supports lazy loading of processor via processor_path for multiprocessing
+
+    Args:
+        processor: The MiniCPM-V processor for processing images.
+        examples: A list of examples, where each example is a dictionary containing:
+            - image: Single image path/PIL.Image or list of image paths/PIL.Images
+            - conversations: A list of conversations. For multi-image, use
+              <image> placeholder to specify image positions in content.
+        chat_template: The chat template to use for formatting.
+        max_length: The maximum length of the tokenized input.
+
+    Returns:
+        A dictionary containing:
+            - input_ids: List of tokenized input IDs.
+            - loss_mask: List of loss masks.
+            - attention_mask: List of attention masks.
+            - pixel_values: List of pixel values (list of slice tensors per image).
+            - tgt_sizes: List of target sizes for each slice.
+            - image_bound: List of image token boundaries in the sequence.
+            - position_ids: List of position IDs.
+
+    Example data formats:
+        Single image (auto-add placeholder):
+        {
+            "image": "path/to/image.jpg",
+            "conversations": [
+                {"role": "user", "content": "描述这张图片"},
+                {"role": "assistant", "content": "这是..."}
+            ]
+        }
+
+        Multiple images (use <image> to specify positions):
+        {
+            "image": ["path/to/img1.jpg", "path/to/img2.jpg"],
+            "conversations": [
+                {"role": "user", "content": "<image>第一张图\n<image>第二张图\n请比较这两张图片"},
+                {"role": "assistant", "content": "第一张图片...第二张图片..."}
+            ]
+        }
+
+    Note:
+        The standard <image> placeholder will be automatically converted to
+        MiniCPM-V's internal format (<image>./</image>).
+    """
+    from PIL import Image
+
+    # Lazy load processor if not provided but path is given (for multiprocessing)
+    if processor is None and processor_path is not None:
+        processor = _load_minicpm_processor(processor_path)
+    elif processor is None:
+        raise ValueError("Either processor or processor_path must be provided")
+
+    system_prompt = chat_template.system_prompt
+    STANDARD_PLACEHOLDER = "<image>"            # 行业标准格式
+    MINICPM_PLACEHOLDER = "(<image>./</image>)"  # MiniCPM-V 内部格式
+
+    # prepare result
+    results = {
+        "input_ids": [],
+        "loss_mask": [],
+        "attention_mask": [],
+        "pixel_values": [],
+        "tgt_sizes": [],
+        "image_bound": [],
+        "position_ids": [],
+    }
+
+    for i, image_input in enumerate(examples["image"]):
+        source = examples["conversations"][i]
+
+        if not source:
+            continue
+
+        if source[0]["role"] != "user":
+            source = source[1:]
+
+        # Normalize image input to list
+        if image_input is None:
+            image_list = []
+        elif isinstance(image_input, list):
+            image_list = image_input
+        else:
+            image_list = [image_input]
+
+        # Load all images
+        images = []
+        for img in image_list:
+            if isinstance(img, str):
+                loaded_img = Image.open(img).convert("RGB")
+            elif isinstance(img, Image.Image):
+                loaded_img = img.convert("RGB")
+            else:
+                loaded_img = img
+            images.append(loaded_img)
+
+        # Build messages in MiniCPM-V format
+        messages = []
+        
+        # Check if content already has image placeholders (standard or MiniCPM format)
+        first_user_content = source[0]["content"] if source else ""
+        has_standard = STANDARD_PLACEHOLDER in first_user_content
+        has_minicpm = MINICPM_PLACEHOLDER in first_user_content
+        has_placeholder = has_standard or has_minicpm
+
+        for j, sentence in enumerate(source):
+            role = sentence["role"]
+            content = sentence["content"]
+
+            # Convert standard placeholder to MiniCPM-V format
+            if STANDARD_PLACEHOLDER in content:
+                content = content.replace(STANDARD_PLACEHOLDER, MINICPM_PLACEHOLDER)
+
+            if role == "user" and j == 0 and images and not has_placeholder:
+                # First user message: add image placeholders if not already present
+                # Add one placeholder per image
+                placeholders = "\n".join([MINICPM_PLACEHOLDER] * len(images))
+                content = f"{placeholders}\n{content}"
+
+            messages.append({"role": role, "content": content})
+
+        # Apply chat template using processor's tokenizer
+        if system_prompt:
+            sys_msg = {"role": "system", "content": system_prompt}
+            messages = [sys_msg] + messages
+
+        # Format conversation text
+        conversation = processor.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+
+        # Process with MiniCPM-V processor
+        # Note: MiniCPM-V processor has a bug where images=None causes UnboundLocalError
+        # Pass [[]] (empty list) instead of None when no images
+        try:
+            encoding = processor(
+                text=[conversation],
+                images=[images] if images else [[]],
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+            )
+        except RuntimeError as e:
+            # Skip samples that cause errors (e.g., truncation causing mismatched image bounds)
+            logging.warning(f"Skipping sample {i} due to processor error: {e}")
+            continue
+
+        input_ids = encoding.input_ids[0]
+        offsets = encoding.offset_mapping[0] if hasattr(encoding, "offset_mapping") else None
+
+        # Extract MiniCPM-V specific fields
+        pixel_values = encoding.pixel_values if hasattr(encoding, "pixel_values") else None
+        tgt_sizes = encoding.tgt_sizes if hasattr(encoding, "tgt_sizes") else None
+        image_bound = encoding.image_bound if hasattr(encoding, "image_bound") else None
+        position_ids = encoding.position_ids if hasattr(encoding, "position_ids") else None
+
+        # Generate loss mask based on token IDs (MiniCPM-V doesn't support offset_mapping)
+        # Pattern: <|im_start|> assistant \n ... <|im_end|>
+        IM_START = 73441  # <|im_start|>
+        IM_END = 73440    # <|im_end|>
+        ASSISTANT = 16434  # assistant
+        NEWLINE = 5        # \n
+        
+        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+        is_truncated = False
+        idx = 0
+        while idx < len(input_ids) - 2:
+            # Check for <|im_start|> assistant \n sequence
+            if (input_ids[idx] == IM_START and 
+                input_ids[idx + 1] == ASSISTANT and 
+                input_ids[idx + 2] == NEWLINE):
+                # Found assistant header, content starts at idx+3
+                start = idx + 3
+                # Find ending <|im_end|>
+                end = start
+                while end < len(input_ids) and input_ids[end] != IM_END:
+                    end += 1
+                # Check if truncated (no <|im_end|> found)
+                if end >= len(input_ids):
+                    is_truncated = True
+                    break
+                # Mark assistant response tokens (including <|im_end|> for EOS learning)
+                loss_mask[start:end+1] = 1
+                idx = end + 1
+            else:
+                idx += 1
+
+        # Skip truncated samples (assistant response cut off)
+        if is_truncated:
+            logging.warning(f"Skipping sample {i}: assistant response truncated")
+            continue
+
+        # Skip samples with no assistant response
+        if loss_mask.sum() == 0:
+            logging.warning(f"Skipping sample {i}: no assistant response found")
+            continue
+
+        results["input_ids"].append(input_ids[None, :])
+        results["loss_mask"].append(loss_mask[None, :])
+        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        # Remove batch dimension from processor outputs (take first element)
+        # pixel_values: [[[tensor], ...]] -> [[tensor], ...] -> list of tensors per image
+        if pixel_values is not None and len(pixel_values) > 0:
+            # pixel_values[0] is the first (and only) batch item
+            results["pixel_values"].append(pixel_values[0])
+        else:
+            results["pixel_values"].append([])
+        if tgt_sizes is not None and len(tgt_sizes) > 0:
+            results["tgt_sizes"].append(tgt_sizes[0])
+        else:
+            results["tgt_sizes"].append(None)
+        if image_bound is not None and len(image_bound) > 0:
+            results["image_bound"].append(image_bound[0])
+        else:
+            results["image_bound"].append(None)
+        if position_ids is not None:
+            results["position_ids"].append(position_ids)
+        else:
+            # Generate position_ids if not provided
+            results["position_ids"].append(
+                torch.arange(len(input_ids), dtype=torch.long)[None, :]
+            )
+
+    return results
+
+
 def build_eagle3_dataset(
     dataset: HFDataset,
     tokenizer: PreTrainedTokenizer,
@@ -296,43 +553,29 @@ def build_eagle3_dataset(
     num_proc: Optional[int] = 8,
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
-    is_vlm: Optional[bool] = False,
-    processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
 ) -> HFDataset:
     """
-    build eagle3 dataset
+    Build eagle3 dataset for LLM models.
+    
+    Note: For VLM models, use build_vlm_dataset_with_template() instead.
 
     Args:
         dataset: HF dataset to process.
         tokenizer: The tokenizer to use for tokenization.
         chat_template: The chat template to use for formatting conversations.
-                        This includes the system prompt and user/assistant tokens
-                        required to delineate different parts of the conversation
-                        for loss mask generation.
         max_length: The maximum length of the tokenized input.
         shuffle_seed: The seed for shuffling the dataset.
         num_proc: The number of processes to use for multiprocessing.
         cache_dir: The directory to use for caching the processed dataset.
         cache_key: The key to use for caching the processed dataset.
-        is_vlm: Whether the dataset is for VLM models.
-        processor: The image processor to use for processing images.
-        is_preformatted: Whether the dataset contains preformatted text of the conversation
-                        (e.g. includes system prompt, user and assistant start and end tokens)
-                        and doesn't need to have the chat template applied.
-                        Note that the chat_template still needs to be specified to determine
-                        the assistant spans for loss mask generation.
-                        If True, expects "text" column with ready-to-train text.
-                        If False, expects "conversations" column with ShareGPT format.
+        is_preformatted: Whether the dataset contains preformatted text.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
-                             Useful for thinking models where history may not contain thoughts.
 
     Returns:
         The processed HF dataset.
     """
-    if is_vlm:
-        assert processor is not None, "processor must be provided when is_vlm is True"
 
     # Validate chat_template requirement
     if chat_template is None:
@@ -349,14 +592,7 @@ def build_eagle3_dataset(
 
     def preprocess_function(examples):
         # Handle different dataset formats
-        if is_vlm:
-            processed = preprocess_vlm_conversations(
-                processor,
-                examples,
-                template,
-                max_length,
-            )
-        elif is_preformatted:
+        if is_preformatted:
             # Handle pre-formatted text (should be in "text" column)
             if "text" not in examples:
                 raise ValueError(
@@ -406,20 +642,14 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
-    # adjust batch size based on dataset type
-    if is_vlm:
-        batch_size = (
-            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
-        )
-    else:
-        batch_size = 1000  # default for conversations
+    batch_size = 1000  # default for conversations
+    
     dataset = dataset.map(
         preprocess_function,
         batched=True,
         num_proc=num_proc,
         batch_size=batch_size,
         remove_columns=original_cols,
-        # keep_in_memory=True,
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
@@ -463,9 +693,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
         new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
         new_data["loss_mask"] = loss_mask
-        new_data["target"] = target
+        new_data["target"] = padding(target, left=False)
         new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = input_ids
+        new_data["input_ids"] = padding(input_ids, left=False)
         if transform:
             new_data = transform(new_data)
         return new_data
@@ -501,6 +731,94 @@ def build_offline_eagle3_dataset(
 # ==============================
 # Vocab Mapping
 # ==============================
+def generate_vocab_mapping_for_vlm(
+    hf_dataset: HFDataset,
+    tokenizer_path: str,
+    target_vocab_size: int,
+    draft_vocab_size: int,
+    cache_dir: str = "./cache/vocab_mapping",
+    cache_key: str = "vocab_mapping",
+    num_proc: int = 32,
+) -> str:
+    """
+    Generate vocab mapping for VLM dataset using TEXT-ONLY processing.
+    
+    Simply extracts assistant response text, tokenizes it, and counts token frequencies.
+    Much faster than processing images.
+    
+    Args:
+        hf_dataset: Raw HuggingFace dataset with 'conversations' column.
+        tokenizer_path: Path to load tokenizer from.
+        target_vocab_size: The target model vocabulary size.
+        draft_vocab_size: The draft model vocabulary size.
+        cache_dir: Directory for caching.
+        cache_key: Cache key for the vocab mapping file.
+        num_proc: Number of processes for tokenization.
+    
+    Returns:
+        Path to the vocab mapping file.
+    """
+    from transformers import AutoTokenizer
+    
+    os.makedirs(cache_dir, exist_ok=True)
+    vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")
+    
+    if os.path.exists(vocab_mapping_path):
+        print(f"Loading vocab mapping from cached file: {vocab_mapping_path}")
+        return vocab_mapping_path
+    
+    print("Generating vocab mapping (text-only, fast mode)...")
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    
+    def tokenize_assistant_responses(examples):
+        """Extract and tokenize assistant responses only."""
+        all_token_ids = []
+        
+        for conversations in examples["conversations"]:
+            if not conversations:
+                continue
+            
+            # Simply collect all assistant response text
+            for conv in conversations:
+                if conv["role"] == "assistant":
+                    try:
+                        # Tokenize assistant response directly
+                        tokens = tokenizer.encode(conv["content"], add_special_tokens=False)
+                        all_token_ids.extend(tokens)
+                    except Exception:
+                        continue
+        
+        return {"assistant_tokens": [all_token_ids]}
+    
+    # Process dataset with multiprocessing
+    print(f"Tokenizing assistant responses with {num_proc} processes...")
+    processed = hf_dataset.map(
+        tokenize_assistant_responses,
+        batched=True,
+        batch_size=1000,
+        num_proc=num_proc,
+        remove_columns=hf_dataset.column_names,
+    )
+    
+    # Count token frequencies
+    token_dict = Counter()
+    for item in tqdm(processed, desc="Counting token frequencies"):
+        token_dict.update(item["assistant_tokens"])
+    
+    # Generate mappings
+    d2t, t2d = process_token_dict_to_mappings(
+        token_dict, draft_vocab_size, target_vocab_size
+    )
+    
+    vocab_mapping = {"d2t": d2t, "t2d": t2d}
+    torch.save(vocab_mapping, vocab_mapping_path)
+    print(f"Saved vocab mapping to: {vocab_mapping_path}")
+    
+    return vocab_mapping_path
+
+
 def generate_vocab_mapping_file(
     dataset: HFDataset,
     target_vocab_size: int,
@@ -529,14 +847,27 @@ def generate_vocab_mapping_file(
         print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
         return vocab_mapping_path
 
-    # we first count the frequency of effectiev tokens in the dataset
+    # we first count the frequency of effective tokens in the dataset
     token_dict = Counter()
-    for input_ids, loss_mask in tqdm(
-        zip(dataset["input_ids"], dataset["loss_mask"]),
-        total=len(dataset),
-        desc="Counting tokens for vocab mapping",
-    ):
+    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
+        # Skip None items (VLMDataset may return None for invalid samples)
+        if item is None:
+            continue
+        
+        input_ids = item["input_ids"]
+        loss_mask = item["loss_mask"]
+        
+        # Handle different tensor shapes:
+        # - HF dataset: (seq_len,) or (1, seq_len)
+        # - VLMDataset: (1, seq_len)
+        if input_ids.dim() == 2:
+            input_ids = input_ids.squeeze(0)
+        if loss_mask.dim() == 2:
+            loss_mask = loss_mask.squeeze(0)
+        
         masked_ids = input_ids[loss_mask == 1]
+        if len(masked_ids) == 0:
+            continue
         unique_ids, counts = masked_ids.unique(return_counts=True)
         batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
         token_dict.update(batch_token_dict)
@@ -606,3 +937,84 @@ def process_token_dict_to_mappings(
     t2d = torch.tensor(t2d)
 
     return d2t, t2d
+
+
+# ==============================
+# VLM Template-based Dataset Building
+# ==============================
+def build_vlm_dataset_with_template(
+    dataset: HFDataset,
+    vlm_template,
+    shuffle_seed: Optional[int] = 42,
+    num_proc: Optional[int] = 32,
+):
+    """
+    Build VLM dataset using the new Template architecture.
+    
+    This function uses VLMDataset wrapper which applies template encoding
+    on-the-fly during DataLoader iteration. The dataset.map() phase only
+    does basic formatting (multiprocessing-safe).
+    
+    Args:
+        dataset: HuggingFace dataset with 'image' and 'conversations' columns
+        vlm_template: VLMTemplate instance (MiniCPMVTemplate, QwenVLTemplate, etc.)
+        shuffle_seed: Seed for shuffling
+        num_proc: Number of processes for formatting (not used for encoding)
+    
+    Returns:
+        VLMDataset wrapper ready for DataLoader
+    """
+    from .dataset import VLMDataset
+    
+    # Shuffle dataset
+    dataset = dataset.shuffle(seed=shuffle_seed)
+    
+    # Basic format validation (can be done with multiprocessing)
+    def validate_format(example):
+        """Validate that example has required fields."""
+        has_image = "image" in example and example["image"] is not None
+        has_conversations = "conversations" in example and example["conversations"]
+        return {"valid": has_image and has_conversations}
+    
+    # Optional: filter invalid samples (this can use multiprocessing)
+    # dataset = dataset.map(validate_format, num_proc=num_proc)
+    # dataset = dataset.filter(lambda x: x["valid"])
+    
+    # Wrap with VLMDataset - encoding happens in __getitem__
+    return VLMDataset(dataset, vlm_template)
+
+
+def get_vlm_template(
+    vlm_type: str,
+    processor_path: str,
+    max_length: int = 2048,
+    system_prompt: Optional[str] = None,
+):
+    """
+    Get VLM template by type.
+    
+    Args:
+        vlm_type: Type of VLM ("minicpm_v_4", "qwen2_5_vl")
+        processor_path: Path to processor/model
+        max_length: Maximum sequence length
+        system_prompt: Optional system prompt
+    
+    Returns:
+        VLMTemplate instance
+    """
+    from .vlm_template import MiniCPMVTemplate, QwenVLTemplate
+    
+    if vlm_type == "minicpm_v_4":
+        return MiniCPMVTemplate(
+            processor_path=processor_path,
+            max_length=max_length,
+            system_prompt=system_prompt or "You are a helpful assistant.",
+        )
+    elif vlm_type in ("qwen2_5_vl", "qwen2_vl"):
+        return QwenVLTemplate(
+            processor_path=processor_path,
+            max_length=max_length,
+            system_prompt=system_prompt or "You are a helpful assistant.",
+        )
+    else:
+        raise ValueError(f"Unknown VLM type: {vlm_type}. Supported: minicpm_v_4, qwen2_5_vl")
