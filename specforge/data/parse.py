@@ -1,3 +1,4 @@
+import json
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -111,6 +112,13 @@ class GeneralParser(Parser):
                             f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
                         break
+                tool_calls = sentence.get("tool_calls")
+                if isinstance(tool_calls, str):
+                    try:
+                        sentence["tool_calls"] = json.loads(tool_calls)
+                    except json.JSONDecodeError:
+                        warnings.warn(f"Failed to parse tool_calls JSON: {tool_calls}")
+                        break
                 messages.append(sentence)
 
             try:
@@ -164,11 +172,17 @@ class GeneralParser(Parser):
             # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
             # Encode the text "assistant start", the length of which is the position of the starting token.
             prefix_ids = self.tokenizer.encode(
-                conversation[:content_start_char], add_special_tokens=False
+                conversation[:content_start_char],
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
             )
             # Encodes the text "assistant end", the length of which is the position of the end token.
             full_ids = self.tokenizer.encode(
-                conversation[:content_end_char], add_special_tokens=False
+                conversation[:content_end_char],
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
             )
 
             start_token_idx = len(prefix_ids)
