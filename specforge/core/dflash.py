@@ -43,7 +43,6 @@ class OnlineDFlashModel(nn.Module):
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
-        self._cached_num_heads: Optional[int] = None
 
     def prepare_noise_input(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Prepare noise input: first token of each block is real, rest are MASK."""
@@ -59,14 +58,13 @@ class OnlineDFlashModel(nn.Module):
         return noise_input_ids
 
     def _get_or_create_block_mask(
-        self, bsz: int, num_heads: int, q_len: int, kv_len: int, device: torch.device
+        self, bsz: int, q_len: int, kv_len: int, device: torch.device
     ) -> "BlockMask":
         """Get cached BlockMask or create a new one."""
         if (
             self._cached_block_mask is not None
             and self._cached_seq_len == q_len
             and self._cached_bsz == bsz
-            and self._cached_num_heads == num_heads
         ):
             return self._cached_block_mask
 
@@ -85,7 +83,7 @@ class OnlineDFlashModel(nn.Module):
         block_mask = create_block_mask(
             dflash_mask_fn,
             B=bsz,
-            H=num_heads,
+            H=1,
             Q_LEN=q_len,
             KV_LEN=kv_len,
             device=device,
@@ -94,7 +92,6 @@ class OnlineDFlashModel(nn.Module):
         self._cached_block_mask = block_mask
         self._cached_seq_len = q_len
         self._cached_bsz = bsz
-        self._cached_num_heads = num_heads
 
         return block_mask
 
@@ -154,10 +151,8 @@ class OnlineDFlashModel(nn.Module):
             and FLEX_ATTENTION_AVAILABLE
             and create_block_mask is not None
         ):
-            num_heads = self.draft_model.config.num_attention_heads
             dflash_attn_mask = self._get_or_create_block_mask(
                 bsz=bsz,
-                num_heads=num_heads,
                 q_len=effective_len,
                 kv_len=effective_len * 2,
                 device=device,
