@@ -46,7 +46,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import Dataset
 from specforge.args import SGLangBackendArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
@@ -57,7 +57,11 @@ from specforge.distributed import (
     is_tp_rank_0,
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
-from specforge.utils import print_with_rank, rank_0_priority
+from specforge.utils import (
+    print_with_rank,
+    rank_0_priority,
+    safe_conversations_generator,
+)
 
 
 @dataclass
@@ -469,7 +473,6 @@ class HiddenStatesGenerator:
             filtered_batch_gpu = {
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
-
             _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
                 **filtered_batch_gpu,
                 return_last_hidden_states=True,
@@ -574,10 +577,17 @@ def main():
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
-    dataset = load_dataset("json", data_files=args.data_path)["train"]
+    dataset = Dataset.from_generator(
+        generator=safe_conversations_generator,
+        gen_kwargs={"file_path": args.data_path},
+        cache_dir=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "cache",
+            "hf_dataset",
+        ),
+    )
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
-
     # Tokenizer and cache key
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=True
@@ -643,7 +653,7 @@ def main():
         # Pass configurable arguments from args if needed
         with HiddenStatesGenerator(
             target_model,
-            args.enable_aux_hidden_states,
+            enable_aux_hidden_states=args.enable_aux_hidden_states,
             num_io_threads=args.num_io_threads,
             io_queue_size=args.io_queue_size,
             file_group_size=args.file_group_size,
