@@ -117,15 +117,24 @@ class DataCollatorWithPadding:
             assert all(
                 "target" in item for item in features
             ), "target is required when hidden_state is provided"
-            batch["hidden_state"] = torch.cat(
-                [
-                    self.paddingtensor(item["hidden_state"], max_length)
-                    for item in features
-                ]
-            )
-            batch["target"] = torch.cat(
-                [self.paddingtensor(item["target"], max_length) for item in features]
-            )
+            if self.sp_degree > 1:
+                batch["hidden_state"] = torch.cat(
+                    [item["hidden_state"] for item in features]
+                )
+                batch["target"] = torch.cat([item["target"] for item in features])
+            else:
+                batch["hidden_state"] = torch.cat(
+                    [
+                        self.paddingtensor(item["hidden_state"], max_length)
+                        for item in features
+                    ]
+                )
+                batch["target"] = torch.cat(
+                    [
+                        self.paddingtensor(item["target"], max_length)
+                        for item in features
+                    ]
+                )
         return batch
 
 

@@ -1049,13 +1049,15 @@ class LlamaUSPFlashAttention(LlamaAttention):
         # =============================================================
         if self.sp_ring_degree > 1:
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
-                    self.ring_rank
-                ].clone()
+                if position_ids.shape[2] != q_len:
+                    position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
+                        self.ring_rank
+                    ].clone()
             else:
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
-                    self.ring_rank
-                ].clone()
+                if position_ids.shape[1] != q_len:
+                    position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
+                        self.ring_rank
+                    ].clone()
 
         lck = 0 if cache_hidden is None else len(cache_hidden[0])
 
