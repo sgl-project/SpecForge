@@ -1,4 +1,4 @@
-﻿"""
+"""
 This script will re-generate the dataset from target model,
 which better aligns the draft model with the target model’s output distribution.
 
@@ -29,6 +29,7 @@ python scripts/regenerate_train_data.py \
 
 import argparse
 import json
+import os
 import random
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
@@ -112,6 +113,11 @@ def parse_arguments():
         type=int,
         default=None,
         help="The number of samples to regenerate, if not provided, all samples will be regenerated",
+    )
+    data_group.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing output file, skip already processed samples",
     )
 
     # sglang server
@@ -252,8 +258,28 @@ def main():
     print(f"  API URL: {args.server_address}")
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")
+    print(f"  Resume mode: {args.resume}")
     print("-" * 50)
     total_lines = sum(1 for _ in open(args.input_file_path))
+
+    skip_lines = 0
+    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+
+    if args.resume and os.path.exists(args.output_file_path):
+        existing_success = sum(1 for _ in open(args.output_file_path))
+        existing_error = 0
+        if os.path.exists(error_file_path):
+            existing_error = sum(1 for _ in open(error_file_path))
+        skip_lines = existing_success + existing_error
+        print(f"Resume mode enabled:")
+        print(f"  Found {existing_success} successful samples in output file")
+        print(f"  Found {existing_error} error samples in error file")
+        print(f"  Skipping first {skip_lines} input samples")
+        print("-" * 50)
+
+        if skip_lines >= total_lines:
+            print(f"All {total_lines} samples already processed. Nothing to do.")
+            return
 
     # test all server addresses
     valid_server_addresses = []
@@ -279,10 +305,13 @@ def main():
     )
     print("-" * 50)
 
-    # create error file path if not exists
-    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+    # Determine file open mode based on resume flag
+    file_mode = "a" if (args.resume and skip_lines > 0) else "w"
     print(
         f"Regenerating dataset and saving the output to {args.output_file_path} and error log to {error_file_path}"
+    )
+    print(
+        f"File open mode: {file_mode} ({'append' if file_mode == 'a' else 'overwrite'})"
     )
     print("-" * 50)
     context_token_sum = 0
@@ -294,8 +323,8 @@ def main():
     # Create progress bar
     with (
         open(args.input_file_path, "r") as input_file,
-        open(args.output_file_path, "w") as output_file_handle,
-        open(error_file_path, "w") as error_file_handle,
+        open(args.output_file_path, file_mode) as output_file_handle,
+        open(error_file_path, file_mode) as error_file_handle,
     ):
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
@@ -303,8 +332,14 @@ def main():
         waiting_queue = {
             server_address: [] for server_address in valid_server_addresses
         }
-        pbar = tqdm(total=total_lines, desc="Processing")
+        pbar = tqdm(total=total_lines, desc="Processing", initial=skip_lines)
         start_server_index = 0
+
+        if skip_lines > 0:
+            print(f"Skipping {skip_lines} already processed samples...")
+            for _ in range(skip_lines):
+                next(input_file, None)
+            print(f"Resuming from sample {skip_lines + 1}")
 
         for line in input_file:
             if (
@@ -398,9 +433,18 @@ def main():
     else:
         print("No successful examples to compute context length statistics.")
 
-    print(
-        f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed."
-    )
+    total_processed = success_samples + error_samples
+    if skip_lines > 0:
+        print(f"\nResume processing completed!")
+        print(f"  Previously processed: {skip_lines}")
+        print(
+            f"  Newly processed: {total_processed} ({success_samples} success, {error_samples} failed)"
+        )
+        print(f"  Total: {skip_lines + total_processed}")
+    else:
+        print(
+            f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed."
+        )
 
 
 if __name__ == "__main__":
