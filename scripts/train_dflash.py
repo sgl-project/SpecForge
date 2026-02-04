@@ -140,23 +140,45 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     )
 
     # 2. Build Draft Model
-    if args.draft_config_path:
-        draft_config = AutoConfig.from_pretrained(args.draft_config_path)
-        print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
+    # Handle checkpoint resumption
+    draft_model_last_checkpoint = None
+    if args.resume and os.path.isdir(args.output_dir):
+        from specforge.utils import get_last_checkpoint
+        print_on_rank0(args.output_dir)
+        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
+        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
+    if draft_model_last_checkpoint:
+        # Load config from checkpoint
+        draft_config = AutoConfig.from_pretrained(draft_model_last_checkpoint)
+        print_on_rank0(f"Loaded draft config from checkpoint: {draft_model_last_checkpoint}")
+
+        # Load draft model from checkpoint
+        draft_model = DFlashDraftModel.from_pretrained(
+            draft_model_last_checkpoint,
+            config=draft_config,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
+        print_on_rank0(f"Resumed draft model from checkpoint: {draft_model_last_checkpoint}")
     else:
-        # Load config from HF (needed for structure info even if backend is sglang)
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config.num_hidden_layers = args.num_draft_layers
-        draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers
-        print_on_rank0("Auto-generated draft config from target model")
+        # Build draft model from scratch or provided config
+        if args.draft_config_path:
+            draft_config = AutoConfig.from_pretrained(args.draft_config_path)
+            print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
+        else:
+            # Load config from HF (needed for structure info even if backend is sglang)
+            target_config = AutoConfig.from_pretrained(args.target_model_path)
+            draft_config = AutoConfig.from_pretrained(args.target_model_path)
+            draft_config.num_hidden_layers = args.num_draft_layers
+            draft_config.block_size = args.block_size
+            draft_config.num_target_layers = target_config.num_hidden_layers
+            print_on_rank0("Auto-generated draft config from target model")
 
-    # Set attention implementation based on backend
-    draft_config._attn_implementation = args.attention_backend
-    print_on_rank0(f"Using attention backend: {args.attention_backend}")
+        # Set attention implementation based on backend
+        draft_config._attn_implementation = args.attention_backend
+        print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
+        draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
     # Set capture layers for target model based on draft model config
     target_model.set_capture_layers(draft_model.target_layer_ids)
