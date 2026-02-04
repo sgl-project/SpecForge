@@ -143,6 +143,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_model_last_checkpoint = None
     if args.resume and os.path.isdir(args.output_dir):
         from specforge.utils import get_last_checkpoint
+
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
@@ -150,7 +151,9 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if draft_model_last_checkpoint:
         # Load config from checkpoint
         draft_config = AutoConfig.from_pretrained(draft_model_last_checkpoint)
-        print_on_rank0(f"Loaded draft config from checkpoint: {draft_model_last_checkpoint}")
+        print_on_rank0(
+            f"Loaded draft config from checkpoint: {draft_model_last_checkpoint}"
+        )
 
         # Set attention implementation based on backend
         draft_config._attn_implementation = args.attention_backend
@@ -162,7 +165,9 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
             config=draft_config,
             torch_dtype=torch.bfloat16,
         ).cuda()
-        print_on_rank0(f"Resumed draft model from checkpoint: {draft_model_last_checkpoint}")
+        print_on_rank0(
+            f"Resumed draft model from checkpoint: {draft_model_last_checkpoint}"
+        )
     else:
         # Build draft model from scratch or provided config
         if args.draft_config_path:
@@ -493,9 +498,7 @@ def main():
                 )
 
         # Save checkpoint after each epoch
-        save_checkpoint(
-            args, epoch, global_step, dflash_model, draft_model, optimizer
-        )
+        save_checkpoint(args, epoch, global_step, dflash_model, draft_model, optimizer)
 
     # Final checkpoint
     save_checkpoint(
