@@ -6,6 +6,7 @@ import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
+    Glm4MoeLiteConfig,
     GptOssConfig,
     Llama4Config,
     Llama4TextConfig,
@@ -20,6 +21,7 @@ from transformers import (
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.custom_backend import (
+    Glm4MoeLiteForCausalLM,
     GptOssForCausalLM,
     Llama4ForCausalLM,
     LlamaForCausalLM,
@@ -86,6 +88,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
+        Glm4MoeLiteConfig: [Glm4MoeLiteForCausalLM],
         Llama4TextConfig: [Llama4ForCausalLM],
         Qwen3MoeConfig: [Qwen3MoeForCausalLM],
         Qwen2Config: [Qwen2ForCausalLM],
@@ -171,5 +174,9 @@ class AutoDraftModelConfig:
         # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
         if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
             config["draft_vocab_size"] = config.get("vocab_size", None)
+
+        # Ensure rope_scaling is None if not explicitly set, to avoid "default" type errors
+        if "rope_scaling" not in config:
+            config["rope_scaling"] = None
 
         return cls._config_mapping[architecture].from_dict(config)

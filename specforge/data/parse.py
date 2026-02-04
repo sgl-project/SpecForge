@@ -121,6 +121,12 @@ class GeneralParser(Parser):
                         break
                 messages.append(sentence)
 
+            # Check if we have any actual content to train on (not just system prompt)
+            has_assistant = any(m["role"] == "assistant" for m in messages)
+            if not has_assistant:
+                # No assistant response to train on - skip this sample
+                return None
+
             try:
                 conversation = self.apply_chat_template(messages, **kwargs)
             except (ValueError, TypeError):
