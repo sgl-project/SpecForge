@@ -129,105 +129,6 @@ class DataCollatorWithPadding:
         return batch
 
 
-class VlmDataCollatorWithPadding:
-    """
-    Datacollator that will dynamically pad the inputs for batching.
-    """
-
-    def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
-        """
-        Pad to the longest sequence in the batch.
-
-        Args:
-            intensors: (B, n, S)
-            N: the length to pad to, N >= n
-
-        Returns:
-            outtensors: (B, N, S)
-        """
-        B, n, S = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
-        outtensors = torch.cat((intensors, padding_tensor), dim=1)
-        return outtensors
-
-    def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
-        """
-        Pad 2D tensor to the longest sequence in the batch.
-
-        Args:
-            intensors: (B, n)
-            N: the length to pad to, N >= n
-
-        Returns:
-            outtensors: (B, N)
-        """
-        B, n = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
-        outtensors = torch.cat((intensors, padding_tensor), dim=1)
-        return outtensors
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Collate a batch of features.
-
-        Args:
-            features: A list of features, where each feature is a dictionary containing:
-                - input_ids: torch.Tensor of shape (n,)
-                - attention_mask: torch.Tensor of shape (n,)
-                - loss_mask: torch.Tensor of shape (n,)
-                - pixel_values: torch.Tensor of shape (grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size)
-                - image_grid_thw: torch.Tensor of shape (3,)
-
-        Returns:
-            A dictionary containing:
-                - input_ids: torch.Tensor of shape (B, N)
-                - attention_mask: torch.Tensor of shape (B, N)
-                - loss_mask: torch.Tensor of shape (B, N)
-        """
-        max_length = max(item["input_ids"].shape[1] for item in features)
-        batch_input_ids = torch.cat(
-            [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
-        )
-        batch_attention_mask = torch.cat(
-            [
-                self.paddingtensor2D(item["attention_mask"], max_length)
-                for item in features
-            ]
-        )
-        batch_loss_mask = torch.cat(
-            [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
-        )
-        batch_pixel_values = torch.cat(
-            [item["pixel_values"] for item in features], dim=0
-        )
-        batch_image_grid_thw = torch.cat(
-            [item["image_grid_thw"] for item in features], dim=0
-        )
-        batch = {
-            "input_ids": batch_input_ids,
-            "attention_mask": batch_attention_mask,
-            "loss_mask": batch_loss_mask,
-            "pixel_values": batch_pixel_values,
-            "image_grid_thw": batch_image_grid_thw,
-            "hidden_state": None,
-            "target": None,
-        }
-        if all("hidden_state" in item for item in features):
-            assert all(
-                "target" in item for item in features
-            ), "target is required when hidden_state is provided"
-            batch["hidden_state"] = torch.cat(
-                [
-                    self.paddingtensor(item["hidden_state"], max_length)
-                    for item in features
-                ]
-            )
-            batch["target"] = torch.cat(
-                [self.paddingtensor(item["target"], max_length) for item in features]
-            )
-        return batch
-
-
 def prepare_dp_dataloaders(
     dataset: Dataset,
     batch_size: int,
@@ -235,12 +136,13 @@ def prepare_dp_dataloaders(
     process_group: Optional[dist.ProcessGroup] = None,
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
-    is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
-    Prepare dataloader for distributed data parallel training.
+    Prepare dataloader for distributed data parallel training (LLM only).
+    
+    Note: For VLM models, use prepare_vlm_dataloader() instead.
 
     Args:
         dataset: The dataset to load data from.
@@ -249,7 +151,6 @@ def prepare_dp_dataloaders(
         process_group: The process group for distributed training.
         pin_memory: Whether to pin memory for data loading.
         shuffle: Whether to shuffle the dataset.
-        is_vlm: Whether the dataset is a vision-language model dataset.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
@@ -260,10 +161,7 @@ def prepare_dp_dataloaders(
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
     )
-    if is_vlm:
-        datacollator_cls = VlmDataCollatorWithPadding
-    else:
-        datacollator_cls = DataCollatorWithPadding
+    collate_fn = DataCollatorWithPadding()
 
     if num_workers == 0:
         prefetch_factor = None
@@ -275,7 +173,64 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=collate_fn,
+        drop_last=True,
+        **dataloader_kwargs,
+    )
+    return dataloader
+
+
+def prepare_vlm_dataloader(
+    dataset,
+    vlm_template,
+    batch_size: int,
+    num_workers: int = 0,
+    process_group: Optional[dist.ProcessGroup] = None,
+    pin_memory: Optional[bool] = False,
+    shuffle: Optional[bool] = False,
+    prefetch_factor: Optional[int] = None,
+    **dataloader_kwargs,
+) -> DataLoader:
+    """
+    Prepare dataloader for VLM dataset with Template architecture.
+    
+    This function uses the VLMTemplate's collate method as collate_fn.
+    Note: num_workers should be 0 because encoding happens in __getitem__.
+    
+    Args:
+        dataset: VLMDataset instance
+        vlm_template: VLMTemplate instance (same as used in dataset)
+        batch_size: Batch size per GPU
+        num_workers: Number of workers (recommend 0 for VLM)
+        process_group: Process group for distributed training
+        pin_memory: Whether to pin memory
+        shuffle: Whether to shuffle
+        prefetch_factor: Prefetch factor
+        **dataloader_kwargs: Additional DataLoader kwargs
+    
+    Returns:
+        DataLoader instance
+    """
+    world_size = dist.get_world_size(process_group)
+    rank = dist.get_rank(process_group)
+    sampler = DistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
+    )
+    
+    # Use template's collate method
+    collate_fn = vlm_template.collate
+    
+    if num_workers == 0:
+        prefetch_factor = None
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        collate_fn=collate_fn,
         drop_last=True,
         **dataloader_kwargs,
     )
