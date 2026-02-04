@@ -12,6 +12,7 @@ torchrun \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --target-model-backend custom \
     --draft-model-config $ROOT_DIR/configs/qwen3-vl-30b-a3b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/allava4v_train.jsonl \
     --output-dir $ROOT_DIR/outputs/Qwen3-VL-30B-A3B-eagle3 \
