@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import Dataset
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -53,6 +53,7 @@ from specforge.utils import (
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
+    safe_conversations_generator,
 )
 
 
@@ -343,6 +344,13 @@ def sanity_check(args: Namespace) -> None:
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
 
+    if args.eval_data_path is not None and args.eval_hidden_states_path is not None:
+        raise ValueError(
+            "Cannot set both eval_data_path and eval_hidden_states_path. "
+            "For online mode, set only eval_data_path. "
+            "For offline mode, set only eval_hidden_states_path."
+        )
+
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # Handle draft model config
@@ -412,7 +420,10 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    train_dataset = Dataset.from_generator(
+        generator=safe_conversations_generator,
+        gen_kwargs={"file_path": args.train_data_path},
+    )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
@@ -458,7 +469,10 @@ def build_dataloaders(
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
-            eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+            eval_dataset = Dataset.from_generator(
+                generator=safe_conversations_generator,
+                gen_kwargs={"file_path": args.eval_data_path},
+            )
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
@@ -589,14 +603,16 @@ def run_forward(
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
         else:
             # we generate the logits using the hidden states loaded from disk
-            input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
             hidden_states = data["hidden_state"].cuda()
-            target = target_model(data["target"].cuda())
             input_ids, target, loss_mask = target_model.preprocess(
-                input_ids, target, loss_mask
+                data["input_ids"], data["target"], data["loss_mask"]
             )
+            input_ids = input_ids.cuda()
+            target = target_model(
+                target.cuda()
+            )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
+            loss_mask = loss_mask.cuda()
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -906,9 +922,14 @@ def main():
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
-            if (
+            should_evaluate = (
                 args.eval_data_path is not None
-                and global_step % args.eval_interval == 0
+                or args.eval_hidden_states_path is not None
+            )
+            if (
+                should_evaluate
+                and global_step % (args.eval_interval * args.draft_accumulation_steps)
+                == 0
             ):
                 # Run evaluation
                 draft_model.eval()
@@ -935,7 +956,7 @@ def main():
                     args,
                     eval_acces,
                     eval_plosses,
-                    global_step,
+                    global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
                 )

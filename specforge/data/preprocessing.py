@@ -40,7 +40,6 @@ except ImportError:
     HAS_QWEN_VL_UTILS = False
     process_vision_info = None
 
-from specforge.utils import padding
 
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
@@ -464,9 +463,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
         new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
         new_data["loss_mask"] = loss_mask
-        new_data["target"] = padding(target, left=False)
+        new_data["target"] = target
         new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = padding(input_ids, left=False)
+        new_data["input_ids"] = input_ids
         if transform:
             new_data = transform(new_data)
         return new_data
@@ -532,9 +531,11 @@ def generate_vocab_mapping_file(
 
     # we first count the frequency of effectiev tokens in the dataset
     token_dict = Counter()
-    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
-        input_ids = item["input_ids"]
-        loss_mask = item["loss_mask"]
+    for input_ids, loss_mask in tqdm(
+        zip(dataset["input_ids"], dataset["loss_mask"]),
+        total=len(dataset),
+        desc="Counting tokens for vocab mapping",
+    ):
         masked_ids = input_ids[loss_mask == 1]
         unique_ids, counts = masked_ids.unique(return_counts=True)
         batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))

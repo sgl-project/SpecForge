@@ -89,5 +89,4 @@ class TargetHead(nn.Module):
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)
         loss_mask = loss_mask[..., None]
-        loss_mask = loss_mask.to(target.device)
         return input_ids, target, loss_mask
