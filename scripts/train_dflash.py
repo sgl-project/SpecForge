@@ -96,7 +96,6 @@ def parse_args():
     output_group.add_argument("--cache-dir", type=str, default="./cache")
     output_group.add_argument("--log-interval", type=int, default=50)
     output_group.add_argument("--eval-interval", type=int, default=1000)
-    output_group.add_argument("--save-interval", type=int, default=1000)
 
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
@@ -152,6 +151,10 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         # Load config from checkpoint
         draft_config = AutoConfig.from_pretrained(draft_model_last_checkpoint)
         print_on_rank0(f"Loaded draft config from checkpoint: {draft_model_last_checkpoint}")
+
+        # Set attention implementation based on backend
+        draft_config._attn_implementation = args.attention_backend
+        print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
         # Load draft model from checkpoint
         draft_model = DFlashDraftModel.from_pretrained(
@@ -261,7 +264,9 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
 
 def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
     """Save checkpoint."""
-    save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
+    # Use naming convention that get_last_checkpoint can detect
+    save_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
+
     if dist.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
@@ -487,11 +492,12 @@ def main():
                     }
                 )
 
-            if global_step % args.save_interval == 0:
-                save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
-                )
+        # Save checkpoint after each epoch
+        save_checkpoint(
+            args, epoch, global_step, dflash_model, draft_model, optimizer
+        )
 
+    # Final checkpoint
     save_checkpoint(
         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
     )
