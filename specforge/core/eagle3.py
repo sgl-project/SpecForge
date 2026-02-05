@@ -25,16 +25,10 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import DynamicCache
-from yunchang import EXTRACT_FUNC_DICT
 
+from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
 from specforge.core.loss import LogSoftmaxLoss
-from specforge.distributed import (
-    gather_outputs_and_unpad,
-    get_sp_ring_group,
-    get_sp_ulysses_group,
-)
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -74,23 +68,66 @@ class OnlineEagle3Model(Eagle3Model):
         self.attention_backend = attention_backend
         self.target_model = target_model
 
+    def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
-            self.extract_func = EXTRACT_FUNC_DICT["basic"]
-            self.sp_ring_degree = torch.distributed.get_world_size(get_sp_ring_group())
-            self.sp_ulysses_degree = torch.distributed.get_world_size(
-                get_sp_ulysses_group()
-            )
-            self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
-            self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
+            return UspAdapter(self)
+        return SdpaLikeAdapter(self)
 
-    @torch.compile()
-    def prepare_usp_input(self, full_input):
-        shared_input = self.extract_func(
-            full_input,
-            rank=self.sp_rank,
-            world_size=self.sp_world_size,
-        ).clone()
-        return shared_input
+    def _acc_and_loss(
+        self,
+        *,
+        logits: torch.Tensor,
+        target_p: torch.Tensor,
+        position_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        adapter: BackendAdapter,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            local_correct = (
+                (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
+            ).sum()
+            local_denom = loss_mask.sum().clamp_min(1e-6)
+            local_correct, local_denom = adapter.reduce_metrics(
+                local_correct=local_correct, local_denom=local_denom
+            )
+            acc = local_correct / local_denom
+
+        loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        loss = adapter.reduce_loss(loss)
+        return acc, loss
+
+    def _prepare_position_ids(
+        self,
+        position_ids: Optional[torch.Tensor],
+        *,
+        seq_length: int,
+        past_key_values_length: int,
+        device: torch.device,
+        is_vlm: bool,
+        input_ids: torch.Tensor,
+        image_grid_thw: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.attention_backend == "usp":
+            return position_ids
+        if position_ids is None:
+            if is_vlm:
+                mrope_positions_ids, _ = self.target_model.get_rope_index(
+                    input_ids=input_ids, image_grid_thw=image_grid_thw
+                )
+                return mrope_positions_ids
+            return (
+                torch.arange(
+                    past_key_values_length,
+                    seq_length + past_key_values_length,
+                    dtype=torch.long,
+                    device=device,
+                )
+                .unsqueeze(0)
+                .view(-1, seq_length)
+            )
+
+        position_ids = position_ids.long()
+        return position_ids.view(-1, seq_length)
 
     def forward(
         self,
@@ -131,35 +168,21 @@ class OnlineEagle3Model(Eagle3Model):
         past_key_values_length = 0
 
         # Step 2: project the concatenated hidden states to the target hidden size
-        if self.attention_backend == "usp":
-            # NOTE: Split first for USP to parallelize computation and ensure
-            # gradient consistency without redundant full-sequence projection.
-            hidden_states = self.prepare_usp_input(hidden_states)
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
-        if position_ids is None:
-            if is_vlm:
-                mrope_positions_ids, mrope_position_delta = (
-                    self.target_model.get_rope_index(
-                        input_ids=input_ids, image_grid_thw=image_grid_thw
-                    )
-                )
-                position_ids = mrope_positions_ids
-            else:
-                device = hidden_states.device
-                position_ids = torch.arange(
-                    past_key_values_length,
-                    seq_length + past_key_values_length,
-                    dtype=torch.long,
-                    device=device,
-                )
-                position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
+        position_ids = self._prepare_position_ids(
+            position_ids=position_ids,
+            seq_length=seq_length,
+            past_key_values_length=past_key_values_length,
+            device=hidden_states.device,
+            is_vlm=is_vlm,
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+        )
 
         # Step 4: handle attention mask
         if attention_mask is None:
@@ -177,28 +200,11 @@ class OnlineEagle3Model(Eagle3Model):
                 past_key_values_length=past_key_values_length,
             )
 
-        def compute_loss_and_acc_checkpointed(hs, tgt_p, pos_mask, l_mask):
-            # 1. Compute Logits(The part that consumes the most VRAM.)
-            logits_ = self.draft_model.compute_logits(hs)
-            logits = gather_outputs_and_unpad(logits_, gather_dim=1)
-
-            # 2. Compute Loss
-            loss_val = LogSoftmaxLoss.apply(logits, tgt_p, pos_mask)
-
-            # 3. Compute Accuracy
-            with torch.no_grad():
-                acc_val = _compute_metric_acc(
-                    logits=logits,
-                    target_p=tgt_p,
-                    position_mask=pos_mask,
-                    loss_mask=l_mask,
-                )
-            return loss_val, acc_val
-
         # Step 5: run TTT
         plosses = []
         vlosses = []
         acces = []
+        adapter = self._make_adapter()
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa", "usp"]:
@@ -211,25 +217,31 @@ class OnlineEagle3Model(Eagle3Model):
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
-            target_p = target_p_padded[:, idx : idx + seq_length, :]
-            if self.attention_backend == "usp":
-                input_ids = self.prepare_usp_input(global_input_ids)
-            else:
-                input_ids = global_input_ids
-
+            state = adapter.step_view(
+                idx=idx,
+                ttt_length=self.length,
+                global_input_ids=global_input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                target_p_padded=target_p_padded,
+                position_mask=position_mask,
+                seq_length=seq_length,
+            )
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+            inputs_embeds = self.draft_model.embed_input_ids(state.input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
-                hidden_states=hidden_states,
+                hidden_states=state.hidden_states,
                 cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+                attention_mask=state.attention_mask,
+                position_ids=state.position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
@@ -237,22 +249,20 @@ class OnlineEagle3Model(Eagle3Model):
             # update hidden states for next step
             hidden_states = hidden_states_out
 
-            if hidden_states.requires_grad:
-                loss, acc = checkpoint(
-                    compute_loss_and_acc_checkpointed,
-                    hidden_states,
-                    target_p,
-                    position_mask,
-                    loss_mask,
-                    use_reentrant=False,
-                )
-            else:
-                loss, acc = compute_loss_and_acc_checkpointed(
-                    hidden_states, target_p, position_mask, loss_mask
-                )
+            # Step 5.4: get logits
+            logits = self.draft_model.compute_logits(hidden_states)
 
-            plosses.append(loss)
+            # Step 5.5 + 5.6: metric and loss
+            acc, loss = self._acc_and_loss(
+                logits=logits,
+                target_p=state.target_p,
+                position_mask=state.position_mask,
+                loss_mask=state.loss_mask,
+                adapter=adapter,
+            )
             acces.append(acc)
+            plosses.append(loss)
+
             if not is_last:
                 # Step 5.7: we need to update the loss mask
                 global_input_ids = padding(global_input_ids, left=False)
