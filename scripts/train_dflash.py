@@ -96,6 +96,7 @@ def parse_args():
     output_group.add_argument("--cache-dir", type=str, default="./cache")
     output_group.add_argument("--log-interval", type=int, default=50)
     output_group.add_argument("--eval-interval", type=int, default=1000)
+    output_group.add_argument("--save-interval", type=int, default=1000)
 
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
