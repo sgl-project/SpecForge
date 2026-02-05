@@ -301,3 +301,59 @@ def shard_optimizer_state_with_dtensor(bf16_optimizer, device_mesh):
                 state[k] = distribute_tensor(
                     v.to(p.device), device_mesh=mesh, placements=placements
                 )
+
+
+def safe_conversations_generator(file_path):
+    """
+    Generator that:
+    1. Extracts the 'conversations' field.
+    2. Preserves all original fields within each message.
+    3. [Key step] Converts all list/dict-type field values to strings to resolve mixed-type conflicts (e.g., for Arrow compatibility).
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                raw_convs = row.get("conversations", [])
+
+                # 1. Ensure 'conversations' is a list
+                if not isinstance(raw_convs, list):
+                    # If it's None or some unexpected type, treat as empty or skip
+                    if raw_convs is None:
+                        raw_convs = []
+                    else:
+                        # Edge case: 'conversations' is a plain string or non-iterable—skip this line
+                        logger.warning(
+                            f"Line {i + 1}: 'conversations' is not a list. Please check!"
+                        )
+                        continue
+
+                cleaned_convs = []
+                for msg in raw_convs:
+                    # 2. Ensure each item in the list is a dictionary
+                    if not isinstance(msg, dict):
+                        # Skip if an element is not a dict (e.g., malformed like ["user", "hi"])
+                        continue
+
+                    # 3. [Core logic] Iterate over all fields in the message (role, content, tools, etc.)
+                    new_msg = {}
+                    for k, v in msg.items():
+                        # If the value is a list or dict, serialize it to a JSON string
+                        # This ensures Arrow treats the column as string type instead of list/struct
+                        if isinstance(v, (list, dict)):
+                            new_msg[k] = json.dumps(v, ensure_ascii=False)
+                        else:
+                            # Keep primitive types (str, int, float, bool, None) unchanged
+                            new_msg[k] = v
+
+                    cleaned_convs.append(new_msg)
+
+                # Yield only the processed 'conversations'
+                yield {"conversations": cleaned_convs}
+
+            except Exception as e:
+                logger.warning(f"Skipping line {i + 1}: {e}")
+                continue
