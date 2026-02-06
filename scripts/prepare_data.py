@@ -297,7 +297,7 @@ def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
 
 def process_codealpaca_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     """Process a row from the CodeAlpaca-20k dataset.
-    
+
     The function expects a row with the following schema:
     {
         "instruction": str,
@@ -316,9 +316,11 @@ def process_codealpaca_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, i
     return processed_row, 0
 
 
-def process_opencodeinstruct_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+def process_opencodeinstruct_row(
+    row: Dict, dataset_name: str = None
+) -> Tuple[Dict, int]:
     """Process a row from the nvidia/OpenCodeInstruct dataset.
-    
+
     The function expects a row with the following schema:
     {
         "id": str,
@@ -336,7 +338,7 @@ def process_opencodeinstruct_row(row: Dict, dataset_name: str = None) -> Tuple[D
     row_id = row.get("id")
     if row_id is None:
         row_id = hashlib.md5((row["input"] + row["output"]).encode()).hexdigest()
-    
+
     processed_row = {
         "id": row_id,
         "conversations": [
@@ -347,9 +349,11 @@ def process_opencodeinstruct_row(row: Dict, dataset_name: str = None) -> Tuple[D
     return processed_row, 0
 
 
-def process_magicoder_evol_instruct_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+def process_magicoder_evol_instruct_row(
+    row: Dict, dataset_name: str = None
+) -> Tuple[Dict, int]:
     """Process a row from the ise-uiuc/Magicoder-Evol-Instruct-110K dataset.
-    
+
     The function expects a row with the following schema:
     {
         "instruction": str,
@@ -369,7 +373,7 @@ def process_magicoder_evol_instruct_row(row: Dict, dataset_name: str = None) -> 
 
 def process_gsm8k_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     """Process a row from the gsm8k dataset.
-    
+
     The function expects a row with the following schema:
     {
         "question": str,
@@ -389,7 +393,7 @@ def process_gsm8k_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
 
 def process_hendrycks_math_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     """Process a row from the hendrycks_math dataset.
-    
+
     The function expects a row with the following schema:
     {
         "problem": str,
@@ -411,7 +415,7 @@ def process_hendrycks_math_row(row: Dict, dataset_name: str = None) -> Tuple[Dic
 
 def process_math_qa_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     """Process a row from the allenai/math_qa dataset.
-    
+
     The function expects a row with the following schema:
     {
         "Problem": str,
@@ -427,10 +431,10 @@ def process_math_qa_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]
     problem = row["Problem"]
     options = row["options"]
     user_content = f"{problem}\n{options}"
-    
+
     # Use Rationale as assistant response
     rationale = row["Rationale"]
-    
+
     row_id = hashlib.md5((user_content + rationale).encode()).hexdigest()
     processed_row = {
         "id": row_id,
@@ -444,7 +448,7 @@ def process_math_qa_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]
 
 def process_sciq_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     """Process a row from the allenai/sciq dataset.
-    
+
     The function expects a row with the following schema:
     {
         "question": str,
@@ -461,29 +465,29 @@ def process_sciq_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     distractor2 = row["distractor2"]
     distractor3 = row["distractor3"]
     support = row["support"]
-    
+
     # Create a list of all answers and randomly shuffle them
     answers_list = [distractor3, distractor1, distractor2, correct_answer]
     random.shuffle(answers_list)
-    
+
     # Assign shuffled answers to labels a, b, c, d
     labels = ["a", "b", "c", "d"]
     options_list = [(labels[i], answers_list[i]) for i in range(4)]
-    
+
     # Find the correct answer label after shuffling
     correct_label = None
     for label, answer in options_list:
         if answer == correct_answer:
             correct_label = label
             break
-    
+
     # Format options as a string
     options_text = "\n".join([f"{label}) {answer}" for label, answer in options_list])
     user_content = f"{question}\n{options_text}"
-    
+
     # Combine support with answer
     assistant_content = f"{support}\nanswer: {correct_label}) {correct_answer}"
-    
+
     row_id = hashlib.md5((user_content + assistant_content).encode()).hexdigest()
     processed_row = {
         "id": row_id,
@@ -497,7 +501,7 @@ def process_sciq_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
 
 def process_camel_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     """Process a row from the camel-ai dataset.
-    
+
     The function expects a row with the following schema:
     {
         "message_1": str,  # user message
@@ -506,7 +510,7 @@ def process_camel_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     """
     message_1 = row["message_1"]
     message_2 = row["message_2"]
-    
+
     row_id = hashlib.md5((message_1 + message_2).encode()).hexdigest()
     processed_row = {
         "id": row_id,
@@ -628,7 +632,9 @@ def main():
         ds = load_dataset("nvidia/OpenCodeInstruct", trust_remote_code=True)["train"]
         proc_fn = process_opencodeinstruct_row
     elif args.dataset == "magicoder-evol-instruct":
-        ds = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K", trust_remote_code=True)["train"]
+        ds = load_dataset(
+            "ise-uiuc/Magicoder-Evol-Instruct-110K", trust_remote_code=True
+        )["train"]
         proc_fn = process_magicoder_evol_instruct_row
     elif args.dataset == "sciq":
         ds = load_dataset("allenai/sciq", trust_remote_code=True)["train"]
