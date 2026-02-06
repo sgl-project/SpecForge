@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 import subprocess
 from pathlib import Path
 from typing import Dict, Tuple
@@ -49,6 +50,14 @@ def parse_args():
             "sharegpt4v",
             "allava4v",
             "opc",
+            "gsm8k",
+            "hendrycks_math",
+            "math_qa",
+            "codealpaca-20k",
+            "opencodeinstruct",
+            "magicoder-evol-instruct",
+            "sciq",
+            "camel",
         ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
@@ -286,6 +295,229 @@ def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
     return processed_row, 0
 
 
+def process_codealpaca_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the CodeAlpaca-20k dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "instruction": str,
+        "input": str,
+        "output": str
+    }
+    """
+    row_id = hashlib.md5((row["instruction"] + row["output"]).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["instruction"]},
+            {"role": "assistant", "content": row["output"]},
+        ],
+    }
+    return processed_row, 0
+
+
+def process_opencodeinstruct_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the nvidia/OpenCodeInstruct dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "id": str,
+        "input": str,
+        "output": str,
+        "domain": str,
+        "generation_algorithm": str,
+        "llm_judgement": str,
+        "unit_tests": str,
+        "tests_execution_status": str,
+        "average_test_score": float
+    }
+    """
+    # Use the existing id if available, otherwise generate one
+    row_id = row.get("id")
+    if row_id is None:
+        row_id = hashlib.md5((row["input"] + row["output"]).encode()).hexdigest()
+    
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["input"]},
+            {"role": "assistant", "content": row["output"]},
+        ],
+    }
+    return processed_row, 0
+
+
+def process_magicoder_evol_instruct_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the ise-uiuc/Magicoder-Evol-Instruct-110K dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "instruction": str,
+        "response": str
+    }
+    """
+    row_id = hashlib.md5((row["instruction"] + row["response"]).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["instruction"]},
+            {"role": "assistant", "content": row["response"]},
+        ],
+    }
+    return processed_row, 0
+
+
+def process_gsm8k_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the gsm8k dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "question": str,
+        "answer": str
+    }
+    """
+    row_id = hashlib.md5((row["question"] + row["answer"]).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["question"]},
+            {"role": "assistant", "content": row["answer"]},
+        ],
+    }
+    return processed_row, 0
+
+
+def process_hendrycks_math_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the hendrycks_math dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "problem": str,
+        "solution": str,
+        "level": str,
+        "type": str
+    }
+    """
+    row_id = hashlib.md5((row["problem"] + row["solution"]).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": row["problem"]},
+            {"role": "assistant", "content": row["solution"]},
+        ],
+    }
+    return processed_row, 0
+
+
+def process_math_qa_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the allenai/math_qa dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "Problem": str,
+        "Rationale": str,
+        "options": str,  # format: "a) option1 b) option2 c) option3 d) option4"
+        "correct": str,
+        "annotated_formula": str,
+        "linear_formula": str,
+        "category": str
+    }
+    """
+    # Combine Problem and options as user input
+    problem = row["Problem"]
+    options = row["options"]
+    user_content = f"{problem}\n{options}"
+    
+    # Use Rationale as assistant response
+    rationale = row["Rationale"]
+    
+    row_id = hashlib.md5((user_content + rationale).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": rationale},
+        ],
+    }
+    return processed_row, 0
+
+
+def process_sciq_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the allenai/sciq dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "question": str,
+        "distractor3": str,
+        "distractor1": str,
+        "distractor2": str,
+        "correct_answer": str,
+        "support": str
+    }
+    """
+    question = row["question"]
+    correct_answer = row["correct_answer"]
+    distractor1 = row["distractor1"]
+    distractor2 = row["distractor2"]
+    distractor3 = row["distractor3"]
+    support = row["support"]
+    
+    # Create a list of all answers and randomly shuffle them
+    answers_list = [distractor3, distractor1, distractor2, correct_answer]
+    random.shuffle(answers_list)
+    
+    # Assign shuffled answers to labels a, b, c, d
+    labels = ["a", "b", "c", "d"]
+    options_list = [(labels[i], answers_list[i]) for i in range(4)]
+    
+    # Find the correct answer label after shuffling
+    correct_label = None
+    for label, answer in options_list:
+        if answer == correct_answer:
+            correct_label = label
+            break
+    
+    # Format options as a string
+    options_text = "\n".join([f"{label}) {answer}" for label, answer in options_list])
+    user_content = f"{question}\n{options_text}"
+    
+    # Combine support with answer
+    assistant_content = f"{support}\nanswer: {correct_label}) {correct_answer}"
+    
+    row_id = hashlib.md5((user_content + assistant_content).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content},
+        ],
+    }
+    return processed_row, 0
+
+
+def process_camel_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the camel-ai dataset.
+    
+    The function expects a row with the following schema:
+    {
+        "message_1": str,  # user message
+        "message_2": str,  # assistant message
+    }
+    """
+    message_1 = row["message_1"]
+    message_2 = row["message_2"]
+    
+    row_id = hashlib.md5((message_1 + message_2).encode()).hexdigest()
+    processed_row = {
+        "id": row_id,
+        "conversations": [
+            {"role": "user", "content": message_1},
+            {"role": "assistant", "content": message_2},
+        ],
+    }
+    return processed_row, 0
+
+
 def add_index(row, idx) -> Dict:
     row["id"] = idx
     return row
@@ -306,7 +538,7 @@ def main():
         proc_fn = process_sharegpt_row
     elif args.dataset == "eaglechat":
         ds = load_dataset("zhaode/EagleChat")["train"]
-        proc_fn = lambda row: (row, 0)
+        proc_fn = lambda row, name: (row, 0)
     elif args.dataset == "perfectblend":
         ds = load_dataset("mlabonne/open-perfectblend")["train"]
         ds = ds.map(add_index, with_indices=True)
@@ -366,9 +598,53 @@ def main():
         else:
             ds = load_dataset("OpenCoder-LLM/opc-sft-stage1", args.opc_subset)["train"]
         proc_fn = process_opc_sft_stage1
+    elif args.dataset == "gsm8k":
+        ds = load_dataset("openai/gsm8k", "main")["train"]
+        proc_fn = process_gsm8k_row
+    elif args.dataset == "hendrycks_math":
+        # Load all subjects and concatenate them
+        subjects = [
+            "algebra",
+            "counting_and_probability",
+            "geometry",
+            "intermediate_algebra",
+            "number_theory",
+            "prealgebra",
+            "precalculus",
+        ]
+        datasets_list = [
+            load_dataset("EleutherAI/hendrycks_math", subject)["train"]
+            for subject in subjects
+        ]
+        ds = concatenate_datasets(datasets_list)
+        proc_fn = process_hendrycks_math_row
+    elif args.dataset == "math_qa":
+        ds = load_dataset("allenai/math_qa", trust_remote_code=True)["train"]
+        proc_fn = process_math_qa_row
+    elif args.dataset == "codealpaca-20k":
+        ds = load_dataset("sahil2801/CodeAlpaca-20k", trust_remote_code=True)["train"]
+        proc_fn = process_codealpaca_row
+    elif args.dataset == "opencodeinstruct":
+        ds = load_dataset("nvidia/OpenCodeInstruct", trust_remote_code=True)["train"]
+        proc_fn = process_opencodeinstruct_row
+    elif args.dataset == "magicoder-evol-instruct":
+        ds = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K", trust_remote_code=True)["train"]
+        proc_fn = process_magicoder_evol_instruct_row
+    elif args.dataset == "sciq":
+        ds = load_dataset("allenai/sciq", trust_remote_code=True)["train"]
+        proc_fn = process_sciq_row
+    elif args.dataset == "camel":
+        # Load all three camel-ai datasets and concatenate them
+        camel_datasets = [
+            load_dataset("camel-ai/biology", split="train"),
+            load_dataset("camel-ai/chemistry", split="train"),
+            load_dataset("camel-ai/physics", split="train"),
+        ]
+        ds = concatenate_datasets(camel_datasets)
+        proc_fn = process_camel_row
     else:
         raise ValueError(
-            f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
+            f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, gsm8k, hendrycks_math, math_qa, codealpaca-20k, opencodeinstruct, magicoder-evol-instruct, sciq, camel, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
     # filter and split dataset
     if args.sample_size is not None and args.sample_size < len(ds):
