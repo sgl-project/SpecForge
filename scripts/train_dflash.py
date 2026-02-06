@@ -67,6 +67,24 @@ def parse_args():
     model_group.add_argument(
         "--trust-remote-code", action="store_true", help="Trust remote code"
     )
+    model_group.add_argument(
+        "--random-anchor",
+        action="store_true",
+        help="Enable random anchor sampling for block construction (paper Sec 4.2).",
+    )
+    model_group.add_argument(
+        "--num-anchors",
+        type=int,
+        default=512,
+        help="Number of anchor positions per sequence when --random-anchor is set.",
+    )
+    model_group.add_argument(
+        "--loss-decay-gamma",
+        type=float,
+        default=None,
+        help="Gamma for exponential loss decay weighting (paper Eq.4). "
+        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -81,11 +99,11 @@ def parse_args():
     )
 
     training_group = parser.add_argument_group("training")
-    training_group.add_argument("--num-epochs", type=int, default=3)
+    training_group.add_argument("--num-epochs", type=int, default=6)
     training_group.add_argument("--batch-size", type=int, default=1)
-    training_group.add_argument("--learning-rate", type=float, default=1e-4)
-    training_group.add_argument("--max-length", type=int, default=2048)
-    training_group.add_argument("--warmup-ratio", type=float, default=0.01)
+    training_group.add_argument("--learning-rate", type=float, default=6e-4)
+    training_group.add_argument("--max-length", type=int, default=3072)
+    training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
@@ -151,6 +169,10 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
+
+    # Ensure dflash_config exists in config (for target_layer_ids / mask_token_id)
+    if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
+        draft_config.dflash_config = {}
 
     # Set attention implementation based on backend
     draft_config._attn_implementation = args.attention_backend
@@ -265,7 +287,7 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
 
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
-            # Copy modeling_dflash.py for inference compatibility
+            # Copy dflash.py for inference compatibility (matches auto_map in config)
             modeling_src = os.path.join(
                 os.path.dirname(__file__),
                 "..",
@@ -274,7 +296,7 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
                 "draft",
                 "dflash.py",
             )
-            modeling_dst = os.path.join(save_dir, "modeling_dflash.py")
+            modeling_dst = os.path.join(save_dir, "dflash.py")
             if os.path.exists(modeling_src):
                 shutil.copy(modeling_src, modeling_dst)
 
@@ -344,6 +366,14 @@ def main():
         mask_token_id = tokenizer.mask_token_id
     print_on_rank0(f"Using mask_token_id: {mask_token_id}")
 
+    # Write mask_token_id and target_layer_ids into draft config so that
+    # save_pretrained produces a config.json compatible with the official
+    # dflash inference code (which reads from config.dflash_config).
+    draft_model.mask_token_id = mask_token_id
+    draft_model.config.dflash_config["mask_token_id"] = mask_token_id
+    draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
+    print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
+
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
@@ -369,6 +399,9 @@ def main():
         block_size=draft_model.block_size,
         mask_token_id=mask_token_id,
         attention_backend=args.attention_backend,
+        random_anchor=args.random_anchor,
+        num_anchors=args.num_anchors,
+        loss_decay_gamma=args.loss_decay_gamma,
     )
 
     dflash_model = FSDP(
