@@ -1309,19 +1309,20 @@ class BasicDecoderLayer(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+    def __init__(self, config, attention_backend: str = "sdpa", fused_input=True):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.fused_input = fused_input
 
         if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
+            self.self_attn = LlamaAttention(config=config, fused_input=self.fused_input)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = LlamaFlexAttention(config=config)
+            self.self_attn = LlamaFlexAttention(config=config, fused_input=self.fused_input)
         elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
+            self.self_attn = LlamaFlashAttention(config=config, fused_input=self.fused_input)
         elif attention_backend == "usp":
-            self.self_attn = LlamaUSPFlashAttention(config=config)
+            self.self_attn = LlamaUSPFlashAttention(config=config, fused_input=self.fused_input)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -1329,7 +1330,8 @@ class LlamaDecoderLayer(nn.Module):
         self.mlp = LlamaMLP(config)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.fused_input:
+          self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # if self.index!=0:
 
         self.post_attention_layernorm = LlamaRMSNorm(
@@ -1338,8 +1340,8 @@ class LlamaDecoderLayer(nn.Module):
 
     def forward(
         self,
-        input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
+        input_emb: Optional[torch.Tensor] = None,
         cache_hidden: List[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1366,9 +1368,11 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
 
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        if self.fused_input:
+          input_emb = self.input_layernorm(input_emb)
+          hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+
         # Self Attention
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
@@ -1405,7 +1409,7 @@ class LlamaMultiLayerDecoder(nn.Module):
         if self.num_additional_layers > 0:
           self.additional_layers = nn.ModuleList(
               [
-                  BasicDecoderLayer(config, attention_backend=attention_backend)
+                  LlamaDecoderLayer(config, attention_backend=attention_backend, fused_input=False)
                   for _ in range(self.num_additional_layers)
               ]
           )
