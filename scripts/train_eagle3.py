@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import Dataset
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -35,7 +35,6 @@ from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
     get_draft_dp_group,
-    get_draft_sp_group,
     get_tp_group,
     init_distributed,
 )
@@ -53,6 +52,7 @@ from specforge.utils import (
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
+    safe_conversations_generator,
 )
 
 
@@ -339,9 +339,31 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    if args.attention_backend == "usp":
+        sp_sanity_check(args)
+
+
+def sp_sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
+    assert (
+        args.batch_size == 1
+    ), f"USP only supports batch_size=1, got batch_size={args.batch_size}"
+
+    assert args.sp_ring_size * args.sp_ulysses_size > 1, (
+        f"USP requires sp_ring_size * sp_ulysses_size > 1. "
+        f"Got sp_ring_size={args.sp_ring_size}, sp_ulysses_size={args.sp_ulysses_size}."
+    )
+
+    assert args.train_hidden_states_path is not None, f"USP only support offline mode"
+
+    if args.eval_data_path is not None and args.eval_hidden_states_path is not None:
+        raise ValueError(
+            "Cannot set both eval_data_path and eval_hidden_states_path. "
+            "For online mode, set only eval_data_path. "
+            "For offline mode, set only eval_hidden_states_path."
+        )
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -412,7 +434,10 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    train_dataset = Dataset.from_generator(
+        generator=safe_conversations_generator,
+        gen_kwargs={"file_path": args.train_data_path},
+    )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
@@ -442,6 +467,8 @@ def build_dataloaders(
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
+                ttt_length=args.ttt_length,
+                use_usp_preprocess=(args.attention_backend == "usp"),
             )
 
     train_dataloader = prepare_dp_dataloaders(
@@ -458,7 +485,10 @@ def build_dataloaders(
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
-            eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+            eval_dataset = Dataset.from_generator(
+                generator=safe_conversations_generator,
+                gen_kwargs={"file_path": args.eval_data_path},
+            )
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
@@ -474,6 +504,8 @@ def build_dataloaders(
             eval_eagle3_dataset = build_offline_eagle3_dataset(
                 args.eval_hidden_states_path,
                 args.max_length,
+                ttt_length=args.ttt_length,
+                use_usp_preprocess=(args.attention_backend == "usp"),
             )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -589,20 +621,25 @@ def run_forward(
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
         else:
             # we generate the logits using the hidden states loaded from disk
-            input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
             hidden_states = data["hidden_state"].cuda()
-            target = target_model(data["target"].cuda())
             input_ids, target, loss_mask = target_model.preprocess(
-                input_ids, target, loss_mask
+                data["input_ids"], data["target"], data["loss_mask"]
             )
+            input_ids = input_ids.cuda()
+            target = target_model(
+                target.cuda()
+            )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
+            loss_mask = loss_mask.cuda()
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
+            position_ids=(
+                data["position_ids"].cuda() if "position_ids" in data else None
+            ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
         )
@@ -659,56 +696,13 @@ def record_metrcs(
     tracker.log(logdict, step=global_step)
 
 
-def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Tensor:
+def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Process: TP split -> Pad to Max Len -> SP gather.
+    Get the data shard from the tensor.
     """
-    # 1. TP: Slice the tensor along the batch dimension
-    tp_group = get_tp_group()
-    tp_size = dist.get_world_size(tp_group)
-    tp_rank = dist.get_rank(tp_group)
-
-    local_tp_shard = tensor.chunk(tp_size, dim=0)[tp_rank]
-
-    # 2. SP: Handle dynamic sequence lengths and Gather
-    sp_group = get_draft_sp_group()
-
-    if sp_group is not None and dist.get_world_size(sp_group) > 1:
-        sp_world_size = dist.get_world_size(sp_group)
-        local_seq_len = local_tp_shard.size(sp_dim)
-
-        # Find global max sequence length in SP group
-        len_tensor = torch.tensor(
-            [local_seq_len], device=local_tp_shard.device, dtype=torch.long
-        )
-        dist.all_reduce(len_tensor, op=dist.ReduceOp.MAX, group=sp_group)
-        max_seq_len = len_tensor.item()
-
-        # Pad local tensor if necessary
-        # Shape is [Batch, Seq, Hidden] or [Batch, Seq], and sp_dim=1
-        if local_seq_len < max_seq_len:
-            pad_size = max_seq_len - local_seq_len
-
-            pad_config = [0] * (local_tp_shard.ndim * 2)
-
-            pad_idx = (local_tp_shard.ndim - 1 - sp_dim) * 2 + 1
-            pad_config[pad_idx] = pad_size
-
-            # Pad value: 0 is standard, ensure it matches your pad_token_id logic if needed
-            local_tp_shard_padded = nn.F.pad(local_tp_shard, pad_config, value=0)
-        else:
-            local_tp_shard_padded = local_tp_shard
-
-        gathered_shards = [
-            torch.empty_like(local_tp_shard_padded) for _ in range(sp_world_size)
-        ]
-        dist.all_gather(
-            gathered_shards, local_tp_shard_padded.contiguous(), group=sp_group
-        )
-
-        return torch.cat(gathered_shards, dim=sp_dim)
-
-    return local_tp_shard
+    tp_size = dist.get_world_size(get_tp_group())
+    tp_rank = dist.get_rank(get_tp_group())
+    return tensor.chunk(tp_size, dim=0)[tp_rank]
 
 
 def main():
@@ -874,7 +868,11 @@ def main():
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
+                args,
+                eagle3_model,
+                data,
+                target_model,
+                is_online,
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
@@ -906,9 +904,14 @@ def main():
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
-            if (
+            should_evaluate = (
                 args.eval_data_path is not None
-                and global_step % args.eval_interval == 0
+                or args.eval_hidden_states_path is not None
+            )
+            if (
+                should_evaluate
+                and global_step % (args.eval_interval * args.draft_accumulation_steps)
+                == 0
             ):
                 # Run evaluation
                 draft_model.eval()
@@ -935,7 +938,7 @@ def main():
                     args,
                     eval_acces,
                     eval_plosses,
-                    global_step,
+                    global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
                 )
