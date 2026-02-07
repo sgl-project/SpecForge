@@ -115,14 +115,11 @@ class OnlineDFlashModel(nn.Module):
         )
         block_loss_mask = torch.gather(loss_mask, 1, gather_idx)
 
-        # Zero out loss for padding blocks
         token_keep = block_keep_mask.repeat_interleave(bs, dim=1)
         block_loss_mask = block_loss_mask * token_keep.to(block_loss_mask.dtype)
 
-        # Mark padding blocks with -1 so attention mask can isolate them
         block_ids = torch.arange(n, device=device).repeat_interleave(bs)
         pad_token_mask = (~block_keep_mask).repeat_interleave(bs, dim=1)
-        # Use per-sample block_ids: [bsz, n*bs]
         block_ids = block_ids.unsqueeze(0).expand(bsz, -1).clone()
         block_ids[pad_token_mask] = -1
 
@@ -136,7 +133,6 @@ class OnlineDFlashModel(nn.Module):
         device = input_ids.device
 
         if block_ids is not None:
-            # block_ids: [bsz, seq_len], per-sample
             is_block_start = torch.ones(bsz, seq_len, dtype=torch.bool, device=device)
             is_block_start[:, 1:] = block_ids[:, 1:] != block_ids[:, :-1]
         else:
@@ -168,7 +164,6 @@ class OnlineDFlashModel(nn.Module):
         block_size = self.block_size
 
         if block_ids is not None:
-            # block_ids: [bsz, q_len], -1 marks padding blocks
             _block_ids = block_ids
 
             def dflash_mask_fn(b, h, q_idx, kv_idx):
@@ -222,7 +217,6 @@ class OnlineDFlashModel(nn.Module):
         """Create [bsz, L, 2L] attention mask for parallel training."""
         if block_ids is None:
             ids = torch.arange(seq_len, device=device) // self.block_size
-            # Uniform: shared across batch, [1, L, 2L]
             q_ids = ids.unsqueeze(1)
             k_ids = ids.unsqueeze(0)
             ctx_mask = k_ids < q_ids
@@ -232,9 +226,8 @@ class OnlineDFlashModel(nn.Module):
             full_mask.masked_fill_(~full_mask_bool, torch.finfo(torch.float32).min)
             return full_mask.unsqueeze(0).expand(bsz, -1, -1)
 
-        # Per-sample block_ids: [bsz, seq_len], -1 = padding
-        q_ids = block_ids.unsqueeze(2)  # [bsz, L, 1]
-        k_ids = block_ids.unsqueeze(1)  # [bsz, 1, L]
+        q_ids = block_ids.unsqueeze(2)
+        k_ids = block_ids.unsqueeze(1)
         q_valid = q_ids >= 0
         k_valid = k_ids >= 0
         ctx_mask = q_valid & k_valid & (k_ids < q_ids)
@@ -304,7 +297,6 @@ class OnlineDFlashModel(nn.Module):
                 bsz, effective_len, device, block_ids
             )
             dflash_attn_mask = dflash_attn_mask.to(dtype=hidden_states.dtype)
-            # [bsz, L, 2L] -> [bsz, 1, L, 2L]
             dflash_attn_mask = dflash_attn_mask.unsqueeze(1)
 
         hidden = self.draft_model(
@@ -321,12 +313,52 @@ class OnlineDFlashModel(nn.Module):
             gamma=self.loss_decay_gamma,
             block_ids=block_ids,
         )
-        # block_ids is None -> [seq_len], broadcast; per-sample -> [bsz, seq_len]
         if block_ids is None:
             dflash_loss_weights = dflash_loss_weights.unsqueeze(0)
         combined_mask = loss_mask * dflash_loss_weights
 
         logits = self.lm_head(hidden)
+
+        # Compute inference-aligned acceptance rate (completion tokens only)
+        with torch.no_grad():
+            preds_all = logits.argmax(dim=-1)
+            correct_all = (preds_all == input_ids).float()
+
+            bs = self.block_size
+            n_blocks = effective_len // bs
+
+            try:
+                if block_ids is not None:
+                    correct_blocks = correct_all.reshape(bsz, n_blocks, bs)
+                    loss_mask_blocks = loss_mask.reshape(bsz, n_blocks, bs)
+                else:
+                    if n_blocks > 1:
+                        correct_blocks = correct_all[:, bs:].reshape(
+                            bsz, n_blocks - 1, bs
+                        )
+                        loss_mask_blocks = loss_mask[:, bs:].reshape(
+                            bsz, n_blocks - 1, bs
+                        )
+                    else:
+                        raise ValueError("Only one block")
+
+                correct_pred = correct_blocks[:, :, 1:]
+                loss_mask_pred = loss_mask_blocks[:, :, 1:]
+
+                block_valid = (loss_mask_pred.sum(dim=2) == (bs - 1)).float()
+                correct_pred = correct_pred * loss_mask_pred
+                cumulative_correct = correct_pred.cumprod(dim=2)
+
+                acceptance_lengths = cumulative_correct.sum(dim=2)
+                acceptance_lengths = (acceptance_lengths * block_valid).sum(dim=1)
+                total_blocks_sum = block_valid.sum(dim=1).sum().clamp_min(1)
+                avg_accept_length = acceptance_lengths.sum() / total_blocks_sum
+                accuracy = avg_accept_length / (bs - 1)
+            except Exception:
+                valid_mask = (loss_mask > 0.5).reshape(-1)
+                correct_flat = correct_all.reshape(-1)[valid_mask]
+                accuracy = correct_flat.mean() if correct_flat.numel() > 0 else 0.0
+
         logits_flat = logits.reshape(-1, logits.size(-1))
         labels_flat = input_ids.reshape(-1)
         mask_flat = combined_mask.reshape(-1)
@@ -343,12 +375,6 @@ class OnlineDFlashModel(nn.Module):
             loss = (per_token_loss * active_weights).sum() / active_weights.sum()
         else:
             loss = F.cross_entropy(active_logits, active_labels)
-
-        with torch.no_grad():
-            preds = active_logits.argmax(dim=-1)
-            correct = (preds == active_labels).float().sum()
-            total = active_labels.numel()
-            accuracy = correct / total
 
         return loss, accuracy
 
@@ -368,11 +394,10 @@ def create_dflash_loss_mask(
     pos_in_block = positions % block_size
 
     if block_ids is not None:
-        # block_ids: [bsz, seq_len], -1 = padding (already loss-masked)
         is_block_start = torch.ones_like(block_ids, dtype=torch.bool)
         is_block_start[:, 1:] = block_ids[:, 1:] != block_ids[:, :-1]
         valid_mask = ~is_block_start & (block_ids >= 0)
-        pos_in_block = pos_in_block.unsqueeze(0)  # broadcast to [bsz, seq_len]
+        pos_in_block = pos_in_block.unsqueeze(0)
     else:
         is_block_start = (positions % block_size) == 0
         is_first_block = (positions // block_size) == 0
