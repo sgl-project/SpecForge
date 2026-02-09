@@ -1244,7 +1244,7 @@ class LlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class LlamaDecoderLayer(nn.Module):
+class Eagle3LlamaDecoderLayer(nn.Module):
     def __init__(self, config, attention_backend: str = "sdpa", fused_input=True):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1357,7 +1357,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # Multi-layer decoder for Eagle3 draft model
         # First being the embeds + hidden_states fuse layer
-        self.fuse_layer = LlamaDecoderLayer(
+        self.fuse_layer = Eagle3LlamaDecoderLayer(
             config, attention_backend=attention_backend, fused_input=True
         )
         # the rests are the traditional decoder layers with only hidden_states as inputs
@@ -1365,7 +1365,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         if self.num_hidden_layers > 1:
             self.additional_layers = nn.ModuleList(
                 [
-                    LlamaDecoderLayer(
+                    Eagle3LlamaDecoderLayer(
                         config, attention_backend=attention_backend, fused_input=False
                     )
                     for _ in range(self.num_hidden_layers - 1)
