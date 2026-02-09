@@ -5,10 +5,14 @@
     "attention_bias": false,
     "attention_dropout": 0.0,
     "auto_map": {
-      "AutoModel": "modeling_dflash.DFlashDraftModel"
+      "AutoModel": "dflash.DFlashDraftModel"
     },
     "block_size": 16,
     "bos_token_id": 1,
+    "dflash_config": {
+      "mask_token_id": 2,
+      "target_layer_ids": [1, 7, 13, 19, 25]
+    },
     "dtype": "bfloat16",
     "eos_token_id": 2,
     "head_dim": 128,
