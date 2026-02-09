@@ -259,6 +259,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
         torch_dtype: torch.dtype = None,
         device: str = None,
         cache_dir: Optional[str] = None,
+        trust_remote_code: bool = True,
         **kwargs,
     ) -> "HFDFlashTargetModel":
 
@@ -267,7 +268,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
             torch_dtype=torch_dtype,
             cache_dir=cache_dir,
             output_hidden_states=True,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             **kwargs,
         ).eval()
 

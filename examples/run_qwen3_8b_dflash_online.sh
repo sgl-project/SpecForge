@@ -16,12 +16,17 @@ torchrun \
     --draft-config-path $ROOT_DIR/configs/qwen3-8b-dflash.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --output-dir $ROOT_DIR/outputs/qwen3-8b-dflash-sharegpt \
-    --num-epochs 20 \
+    --num-epochs 6 \
     --batch-size 4 \
-    --learning-rate 1e-4 \
-    --max-length 2048 \
+    --learning-rate 6e-4 \
+    --warmup-ratio 0.04 \
+    --max-grad-norm 1.0 \
+    --max-length 3072 \
     --chat-template qwen \
     --attention-backend $ATTENTION_BACKEND \
+    --random-anchor \
+    --num-anchors 512 \
+    --loss-decay-gamma 7.0 \
     --log-interval 50 \
     --save-interval 1000 \
     --report-to wandb \
