@@ -511,7 +511,7 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, fused_input=True):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -524,14 +524,19 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
+        if fused_input:
+            in_features_size = self.hidden_size * 2
+        else:
+            in_features_size = self.hidden_size
+
         self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+            in_features_size, self.num_heads * self.head_dim, bias=False
         )
         self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            in_features_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            in_features_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
@@ -972,8 +977,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
     LlamaUSPFlashAttention with Trainable Ring Attention & Correct Eagle3 Branch Merging.
     """
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, fused_input=True):
+        super().__init__(config, fused_input=fused_input)
         assert (
             dist.is_initialized()
         ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
@@ -1220,20 +1225,27 @@ class LlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+class Eagle3LlamaDecoderLayer(nn.Module):
+    def __init__(self, config, attention_backend: str = "sdpa", fused_input=True):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.fused_input = fused_input
 
         if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
+            self.self_attn = LlamaAttention(config=config, fused_input=self.fused_input)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = LlamaFlexAttention(config=config)
+            self.self_attn = LlamaFlexAttention(
+                config=config, fused_input=self.fused_input
+            )
         elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
+            self.self_attn = LlamaFlashAttention(
+                config=config, fused_input=self.fused_input
+            )
         elif attention_backend == "usp":
-            self.self_attn = LlamaUSPFlashAttention(config=config)
+            self.self_attn = LlamaUSPFlashAttention(
+                config=config, fused_input=self.fused_input
+            )
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -1241,7 +1253,10 @@ class LlamaDecoderLayer(nn.Module):
         self.mlp = LlamaMLP(config)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.fused_input:
+            self.input_layernorm = LlamaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         # if self.index!=0:
 
         self.post_attention_layernorm = LlamaRMSNorm(
@@ -1250,8 +1265,8 @@ class LlamaDecoderLayer(nn.Module):
 
     def forward(
         self,
-        input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
+        input_emb: Optional[torch.Tensor] = None,
         cache_hidden: List[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1278,9 +1293,11 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
 
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        if self.fused_input:
+            input_emb = self.input_layernorm(input_emb)
+            hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+
         # Self Attention
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
@@ -1318,12 +1335,23 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.num_hidden_layers = config.num_hidden_layers
-        self.midlayers = nn.ModuleList(
-            [
-                LlamaDecoderLayer(config, attention_backend=attention_backend)
-                for _ in range(self.num_hidden_layers)
-            ]
+
+        # Multi-layer decoder for Eagle3 draft model
+        # First being the embeds + hidden_states fuse layer
+        self.fuse_layer = Eagle3LlamaDecoderLayer(
+            config, attention_backend=attention_backend, fused_input=True
         )
+        # the rests are the traditional decoder layers with only hidden_states as inputs
+        self.additional_layers = None
+        if self.num_hidden_layers > 1:
+            self.additional_layers = nn.ModuleList(
+                [
+                    Eagle3LlamaDecoderLayer(
+                        config, attention_backend=attention_backend, fused_input=False
+                    )
+                    for _ in range(self.num_hidden_layers - 1)
+                ]
+            )
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -1427,17 +1455,30 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         past_key_values: Optional[List[Cache]] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        for i, layer in enumerate(self.midlayers):
-            hidden_states = layer(
-                input_emb=input_embeds,
-                hidden_states=hidden_states,
-                cache_hidden=caches_hidden[i] if caches_hidden is not None else None,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=(
-                    past_key_values[i] if past_key_values is not None else None
-                ),
-                output_attentions=False,
-                use_cache=False,
-            )
+        hidden_states = self.fuse_layer(
+            input_emb=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=caches_hidden[0] if caches_hidden is not None else None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=(
+                past_key_values[0] if past_key_values is not None else None
+            ),
+            output_attentions=False,
+            use_cache=False,
+        )
+
+        if self.num_hidden_layers > 1:
+            for i, layer in enumerate(self.additional_layers):
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=(
+                        past_key_values[i + 1] if past_key_values is not None else None
+                    ),
+                    output_attentions=False,
+                    use_cache=False,
+                )
+
         return hidden_states
