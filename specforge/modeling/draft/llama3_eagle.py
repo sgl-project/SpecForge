@@ -1406,78 +1406,6 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
-class LlamaMultiLayerDecoder(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
-        super().__init__()
-        self.config = config
-        self.num_additional_layers = config.num_hidden_layers - 1
-        # initialize the fuse layer
-        self.fuselayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
-
-        # initialize additional decoder layers
-
-        self.additional_layers = None
-        self.final_layernorm = None
-        if self.num_additional_layers > 0:
-            self.additional_layers = nn.ModuleList(
-                [
-                    LlamaDecoderLayer(
-                        config, attention_backend=attention_backend, fused_input=False
-                    )
-                    for _ in range(self.num_additional_layers)
-                ]
-            )
-
-            self.final_layernorm = LlamaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-
-    def forward(
-        self,
-        input_emb: torch.Tensor,
-        hidden_states: torch.Tensor,
-        caches_hidden: Optional[List[List[List[torch.Tensor]]]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-    ) -> Tuple[
-        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
-        """
-        Forward of multi-layer decoder.
-        """
-        hidden_states = self.fuselayer(
-            input_emb=input_emb,
-            hidden_states=hidden_states,
-            cache_hidden=caches_hidden[0] if caches_hidden is not None else None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=(
-                past_key_values[0] if past_key_values is not None else None
-            ),
-            output_attentions=False,
-            use_cache=False,
-        )
-
-        if self.num_additional_layers > 0:
-            for i, layer in enumerate(self.additional_layers):
-                hidden_states = layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=(
-                        past_key_values[i + 1] if past_key_values is not None else None
-                    ),
-                    use_cache=use_cache,
-                )
-
-            hidden_states = self.final_layernorm(hidden_states)
-
-        return hidden_states
-
-
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
@@ -1494,7 +1422,22 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.midlayers = LlamaMultiLayerDecoder(config)
+        # Multi-layer decoder for Eagle3 draft model
+        # First being the embeds + hidden_states fuse layer
+        self.fuse_layer = LlamaDecoderLayer(
+            config, attention_backend=attention_backend, fused_input=True
+        )
+        # the rests are the traditional decoder layers with only hidden_states as inputs
+        self.additional_layers = None
+        if self.num_hidden_layers > 1:
+            self.additional_layers = nn.ModuleList(
+                [
+                    LlamaDecoderLayer(
+                        config, attention_backend=attention_backend, fused_input=False
+                    )
+                    for _ in range(self.num_hidden_layers - 1)
+                ]
+            )
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -1598,14 +1541,30 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         past_key_values: Optional[List[Cache]] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-
-        return self.midlayers(
+        hidden_states = self.fuse_layer(
             input_emb=input_embeds,
             hidden_states=hidden_states,
-            caches_hidden=caches_hidden,
+            cache_hidden=caches_hidden[0] if caches_hidden is not None else None,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            past_key_values=(
+                past_key_values[0] if past_key_values is not None else None
+            ),
             output_attentions=False,
             use_cache=False,
         )
+
+        if self.num_hidden_layers > 1:
+            for i, layer in enumerate(self.additional_layers):
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=(
+                        past_key_values[i + 1] if past_key_values is not None else None
+                    ),
+                    output_attentions=False,
+                    use_cache=False,
+                )
+
+        return hidden_states
