@@ -34,6 +34,7 @@ torchrun --nproc_per_node=8 \
 
 import argparse
 import gc
+import gzip
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -46,7 +47,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import Dataset
 from specforge.args import SGLangBackendArgs
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import (
@@ -57,7 +58,12 @@ from specforge.distributed import (
     is_tp_rank_0,
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
-from specforge.utils import print_with_rank, rank_0_priority
+from specforge.utils import (
+    print_args_with_dots,
+    print_with_rank,
+    rank_0_priority,
+    safe_conversations_generator,
+)
 
 
 @dataclass
@@ -119,8 +125,8 @@ def parse_args():
     others_group.add_argument(
         "--num-io-threads",
         type=int,
-        default=4,
-        help="Number of threads for async I/O operations",
+        default=None,
+        help="Number of threads for async I/O operations (default: all of CPU cores).",
     )
     others_group.add_argument(
         "--num-workers", type=int, default=4, help="Number of workers for DataLoader"
@@ -136,6 +142,17 @@ def parse_args():
         type=int,
         default=2000,
         help="Number of files per subdirectory.",
+    )
+    others_group.add_argument(
+        "--compress",
+        action="store_true",
+        help="Compress hidden state files on disk (gzip).",
+    )
+    others_group.add_argument(
+        "--compression-level",
+        type=int,
+        default=6,
+        help="Gzip compression level (1-9).",
     )
 
     sglang_group = parser.add_argument_group("sglang")
@@ -211,6 +228,8 @@ class HiddenStatesGenerator:
         num_io_threads: int = 4,
         io_queue_size: int = 50,
         file_group_size: int = 2000,
+        compress: bool = False,
+        compression_level: int = 6,
     ):
         """
         Args:
@@ -227,6 +246,9 @@ class HiddenStatesGenerator:
         self.num_io_threads = num_io_threads
         self.io_queue_size = io_queue_size
         self.file_group_size = file_group_size
+        self.compress = compress
+        self.compression_level = compression_level
+        self.file_extension = ".ckpt.gz" if self.compress else ".ckpt"
 
         # progress bar should only shown on TP rank = 0
         self.show_progress = dist.get_rank(get_tp_group()) == 0
@@ -278,7 +300,13 @@ class HiddenStatesGenerator:
             )
             return
 
-        torch.save(asdict(data_point), output_file)
+        if self.compress:
+            with gzip.open(
+                output_file, "wb", compresslevel=self.compression_level
+            ) as f:
+                torch.save(asdict(data_point), f)
+        else:
+            torch.save(asdict(data_point), output_file)
 
     def _save_tensor_async(self, data_point: DataPoint, output_file: str) -> None:
         """
@@ -361,14 +389,22 @@ class HiddenStatesGenerator:
             return [False] * len(global_indices)
 
         def check_single_file(idx):
-            return os.path.exists(self._get_file_path(output_path, idx))
+            if os.path.exists(self._get_file_path(output_path, idx)):
+                return True
+            legacy_ckpt = self._get_file_path(output_path, idx, extension=".ckpt")
+            compressed_ckpt = self._get_file_path(
+                output_path, idx, extension=".ckpt.gz"
+            )
+            return os.path.exists(legacy_ckpt) or os.path.exists(compressed_ckpt)
 
         # Parallel file existence check
         with ThreadPoolExecutor(max_workers=self.num_io_threads) as executor:
             exists = list(executor.map(check_single_file, global_indices))
         return exists
 
-    def _get_file_path(self, output_path: str, idx: int) -> str:
+    def _get_file_path(
+        self, output_path: str, idx: int, extension: Optional[str] = None
+    ) -> str:
         """
         A helper function to get the standard file path for the data point with the given index.
 
@@ -379,9 +415,10 @@ class HiddenStatesGenerator:
         Returns:
             str: The file path for the data point.
         """
+        ext = self.file_extension if extension is None else extension
         group_idx = (idx // self.file_group_size) * self.file_group_size
         grouped_subdir = f"rows_{group_idx}-{group_idx + self.file_group_size}"
-        return os.path.join(output_path, grouped_subdir, f"data_{idx}.ckpt")
+        return os.path.join(output_path, grouped_subdir, f"data_{idx}{ext}")
 
     @torch.no_grad()
     def generate(
@@ -469,7 +506,6 @@ class HiddenStatesGenerator:
             filtered_batch_gpu = {
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
-
             _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
                 **filtered_batch_gpu,
                 return_last_hidden_states=True,
@@ -550,9 +586,12 @@ def main():
         args.aux_hidden_states_layers = [
             int(x) for x in args.aux_hidden_states_layers.split(",")
         ]
-
+    if args.num_io_threads is None:
+        cpu_cores = os.cpu_count() or 1
+        args.num_io_threads = max(1, cpu_cores)
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    print_args_with_dots(args)
 
     # Build target model (with TP)
     target_model_config = AutoConfig.from_pretrained(
@@ -574,10 +613,17 @@ def main():
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
-    dataset = load_dataset("json", data_files=args.data_path)["train"]
+    dataset = Dataset.from_generator(
+        generator=safe_conversations_generator,
+        gen_kwargs={"file_path": args.data_path},
+        cache_dir=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "cache",
+            "hf_dataset",
+        ),
+    )
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
-
     # Tokenizer and cache key
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=True
@@ -643,10 +689,12 @@ def main():
         # Pass configurable arguments from args if needed
         with HiddenStatesGenerator(
             target_model,
-            args.enable_aux_hidden_states,
+            enable_aux_hidden_states=args.enable_aux_hidden_states,
             num_io_threads=args.num_io_threads,
             io_queue_size=args.io_queue_size,
             file_group_size=args.file_group_size,
+            compress=args.compress,
+            compression_level=args.compression_level,
             # Other params like io_queue_size can also be added to argparse
         ) as hidden_states_generator:
 
