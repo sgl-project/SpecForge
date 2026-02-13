@@ -31,4 +31,7 @@ torchrun \
     --save-interval 1000 \
     --report-to wandb \
     --wandb-project specforge-qwen3-8b-dflash \
+    --target-model-backend sglang \
+    --block-size 16 \
+    --num-anchors 512 \
     --wandb-name qwen3-8b-dflash-perfectblend

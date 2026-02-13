@@ -128,6 +128,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         # For now, let's assume we capture what's needed.
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
+            print(self.model_runner.model.model.layers_to_capture)
 
     @torch.no_grad
     def _extend(self, reqs):
@@ -234,10 +235,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
-
-        # Padding might be needed if batching varied lengths (but usually fixed length training)
-        hidden_states = padding(hidden_states, left=False)
-        input_ids = padding(input_ids, left=False)
 
         return DFlashTargetOutput(
             hidden_states=hidden_states,
