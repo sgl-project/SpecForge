@@ -13,6 +13,8 @@ torchrun \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_dflash.py \
     --target-model-path Qwen/Qwen3-8B \
+    --target-model-backend sglang \
+    --sglang-mem-fraction-static 0.2 \
     --draft-config-path $ROOT_DIR/configs/qwen3-8b-dflash.json \
     --train-data-path $ROOT_DIR/cache/dataset/perfectblend_qwen3-8b_regen.jsonl \
     --output-dir $ROOT_DIR/outputs/qwen3-8b-perfectblend \

@@ -151,6 +151,8 @@ class OnlineDFlashModel(nn.Module):
         kv_len: int,
         device: torch.device,
         block_ids: Optional[torch.Tensor] = None,
+        orig_positions: Optional[torch.Tensor] = None,
+        token_anchor_pos: Optional[torch.Tensor] = None,
     ) -> "BlockMask":
         """Get cached BlockMask or create a new one."""
         if block_ids is None:
@@ -164,18 +166,24 @@ class OnlineDFlashModel(nn.Module):
         block_size = self.block_size
 
         if block_ids is not None:
+            assert orig_positions is not None
+            assert token_anchor_pos is not None
             _block_ids = block_ids
+            _orig_pos = orig_positions
+            _anchor_pos = token_anchor_pos
 
             def dflash_mask_fn(b, h, q_idx, kv_idx):
                 L = q_len
                 is_ctx = kv_idx < L
                 q_b = _block_ids[b, q_idx]
-                k_ctx = _block_ids[b, kv_idx.clamp(max=L - 1)]
+                k_ctx_id = _block_ids[b, kv_idx.clamp(max=L - 1)]
                 k_noise = _block_ids[b, (kv_idx - L).clamp(min=0, max=L - 1)]
                 q_valid = q_b >= 0
-                k_ctx_valid = k_ctx >= 0
+                k_ctx_valid = k_ctx_id >= 0
                 k_noise_valid = k_noise >= 0
-                ctx_visible = is_ctx & q_valid & k_ctx_valid & (k_ctx < q_b)
+                kv_orig = _orig_pos[b, kv_idx.clamp(max=L - 1)]
+                q_anchor = _anchor_pos[b, q_idx]
+                ctx_visible = is_ctx & q_valid & k_ctx_valid & (kv_orig < q_anchor)
                 noise_visible = (~is_ctx) & q_valid & k_noise_valid & (k_noise == q_b)
                 return ctx_visible | noise_visible
 
@@ -213,6 +221,8 @@ class OnlineDFlashModel(nn.Module):
         seq_len: int,
         device: torch.device,
         block_ids: Optional[torch.Tensor] = None,
+        orig_positions: Optional[torch.Tensor] = None,
+        token_anchor_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Create [bsz, L, 2L] attention mask for parallel training."""
         if block_ids is None:
@@ -226,11 +236,15 @@ class OnlineDFlashModel(nn.Module):
             full_mask.masked_fill_(~full_mask_bool, torch.finfo(torch.float32).min)
             return full_mask.unsqueeze(0).expand(bsz, -1, -1)
 
+        assert orig_positions is not None
+        assert token_anchor_pos is not None
+        q_anchor = token_anchor_pos.unsqueeze(2)
+        k_orig = orig_positions.unsqueeze(1)
         q_ids = block_ids.unsqueeze(2)
         k_ids = block_ids.unsqueeze(1)
         q_valid = q_ids >= 0
         k_valid = k_ids >= 0
-        ctx_mask = q_valid & k_valid & (k_ids < q_ids)
+        ctx_mask = q_valid & k_valid & (k_orig < q_anchor)
         noise_mask = q_valid & k_valid & (k_ids == q_ids)
         full_mask_bool = torch.cat([ctx_mask, noise_mask], dim=2)
         full_mask = torch.zeros_like(full_mask_bool, dtype=torch.float32)
@@ -248,6 +262,8 @@ class OnlineDFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         block_ids = None
+        orig_positions = None
+        token_anchor_pos = None
 
         if self.random_anchor and self.training:
             anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -264,6 +280,10 @@ class OnlineDFlashModel(nn.Module):
             )
             effective_len = input_ids.shape[1]
             base_positions = block_positions
+            orig_positions = block_positions
+            token_anchor_pos = anchor_positions.repeat_interleave(
+                self.block_size, dim=1
+            )
         else:
             n_blocks = seq_len // self.block_size
             effective_len = n_blocks * self.block_size
@@ -291,10 +311,12 @@ class OnlineDFlashModel(nn.Module):
                 kv_len=effective_len * 2,
                 device=device,
                 block_ids=block_ids,
+                orig_positions=orig_positions,
+                token_anchor_pos=token_anchor_pos,
             )
         else:
             dflash_attn_mask = self._create_parallel_attention_mask(
-                bsz, effective_len, device, block_ids
+                bsz, effective_len, device, block_ids, orig_positions, token_anchor_pos
             )
             dflash_attn_mask = dflash_attn_mask.to(dtype=hidden_states.dtype)
             dflash_attn_mask = dflash_attn_mask.unsqueeze(1)

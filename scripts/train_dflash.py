@@ -44,7 +44,7 @@ def parse_args():
     model_group.add_argument(
         "--target-model-backend",
         type=str,
-        default="hf",
+        default="sglang",
         choices=["sglang", "hf"],
         help="Backend for target model: 'sglang' (service) or 'hf' (local)",
     )

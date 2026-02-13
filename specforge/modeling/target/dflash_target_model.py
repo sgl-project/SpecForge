@@ -18,7 +18,6 @@ from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
-from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner
 
@@ -234,10 +233,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
-
-        # Padding might be needed if batching varied lengths (but usually fixed length training)
-        hidden_states = padding(hidden_states, left=False)
-        input_ids = padding(input_ids, left=False)
 
         return DFlashTargetOutput(
             hidden_states=hidden_states,
