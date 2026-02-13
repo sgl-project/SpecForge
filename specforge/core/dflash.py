@@ -330,9 +330,10 @@ class OnlineDFlashModel(nn.Module):
         # =================================================================
 
         # 6. Construct Labels (Ground Truth)
-        # We need to predict block_size tokens after the anchor
-        # Label offset: 1, 2, ..., block_size
-        label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
+        # Same-position prediction: position k in a block predicts token at anchor+k.
+        # This aligns with inference where hidden[k] -> lm_head -> token at anchor+k.
+        # Position 0 (the anchor itself) is excluded from loss since it's already known.
+        label_offsets = torch.arange(0, self.block_size, device=device).view(
             1, 1, -1
         )  # [1, 1, bs]
 
@@ -355,12 +356,17 @@ class OnlineDFlashModel(nn.Module):
         # A. Block validity (block_keep_mask)
         # B. Indices within bounds (valid_label_mask)
         # C. Original loss_mask (corresponding positions are not padding)
+        # D. Exclude position 0 (anchor token, already known, no need to predict)
 
         # [bsz, n_blocks, 1] -> [bsz, n_blocks, block_size]
         weight_mask = (
             block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         )
         weight_mask = weight_mask * valid_label_mask.float()
+
+        # Exclude position 0 (anchor) from loss — it's the known input, not a prediction target
+        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        weight_mask = weight_mask * (pos_in_block > 0).float()
 
         # Gather loss mask of original data
         original_loss_mask_gathered = torch.gather(
@@ -373,15 +379,16 @@ class OnlineDFlashModel(nn.Module):
         binary_eval_mask = weight_mask.view(-1)
 
         # 8. Apply Loss Decay (if configured)
-        # Here k corresponds to 0 to block_size-1 (i.e., the 1st to Nth predicted tokens)
-        # Earlier tokens have higher weights
+        # With same-position labels, k=0 is the anchor (masked out), k=1 is the 1st
+        # predicted token, k=2 is the 2nd, etc. Use (k-1) so that the 1st predicted
+        # token (k=1) gets decay weight exp(0)=1.0, matching the paper's convention.
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             k = torch.arange(self.block_size, device=device).view(
                 1, 1, -1
             )  # [0, 1, ..., bs-1]
             decay_weights = torch.exp(
-                -k / self.loss_decay_gamma
-            )  # exp(-(k)/gamma) vs paper k-1 logic
+                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
+            )  # k=0 masked anyway; k=1->exp(0)=1.0, k=2->exp(-1/γ), ...
             weight_mask = weight_mask * decay_weights
         # 9. Compute Cross Entropy
         # Flatten for loss computation

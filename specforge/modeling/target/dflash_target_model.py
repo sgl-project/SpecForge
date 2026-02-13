@@ -18,7 +18,6 @@ from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
-from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner
 
