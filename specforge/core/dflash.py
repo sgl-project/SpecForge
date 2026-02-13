@@ -173,19 +173,6 @@ class OnlineDFlashModel(nn.Module):
 
         return anchors, keep_mask
 
-    def _build_target_context_feature_from_anchors(
-        self,
-        hidden_states: torch.Tensor,
-        anchor_positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """Gather fixed-size blocks; padding blocks get block_id=-1 and loss=0."""
-        n = anchor_positions.shape[1]
-
-        # hidden states b, s, d (s: prompt + response) 1, 787, 12800 -> 1, 787*n, 12800
-        hidden_repeated = hidden_states.unsqueeze(1).repeat(1, n, 1, 1)
-
-        return hidden_repeated
-
     def prepare_noise_input(
         self, input_ids: torch.Tensor, block_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -294,8 +281,6 @@ class OnlineDFlashModel(nn.Module):
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device
         )
-        # anchor_positions = torch.tensor([[13]],device=device,dtype=torch.long)
-        # block_keep_mask = torch.tensor([[True]],device=device,dtype=torch.bool)
 
         # 2. Prepare input Embedding (Noise) and Position IDs
         # noise_embedding: [bsz, n_blocks * block_size, hidden_dim]
@@ -338,7 +323,6 @@ class OnlineDFlashModel(nn.Module):
 
         # 5. Compute Logits
         # logits: [bsz, n_blocks * block_size, vocab_size]
-        print(output_hidden)
         logits = self.lm_head(output_hidden)
 
         # =================================================================
@@ -386,7 +370,6 @@ class OnlineDFlashModel(nn.Module):
         )
         weight_mask = weight_mask * original_loss_mask_gathered
 
-
         binary_eval_mask = weight_mask.view(-1)
 
         # 8. Apply Loss Decay (if configured)
@@ -418,7 +401,7 @@ class OnlineDFlashModel(nn.Module):
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            
+
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 

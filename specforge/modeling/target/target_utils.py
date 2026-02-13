@@ -10,6 +10,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+
 class TargetEmbeddingsAndHead(nn.Module):
     """
     Efficiently loads only the embedding layer and lm_head from a pretrained model.
@@ -19,11 +20,11 @@ class TargetEmbeddingsAndHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        
+
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
         )
-        
+
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     @classmethod
@@ -54,9 +55,9 @@ class TargetEmbeddingsAndHead(nn.Module):
         if not os.path.exists(local_model_path):
             try:
                 local_model_path = snapshot_download(
-                    repo_id=model_path, 
+                    repo_id=model_path,
                     cache_dir=cache_dir,
-                    allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model"]
+                    allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model"],
                 )
             except Exception as e:
                 print(f"Warning: Snapshot download failed or path check failed: {e}")
@@ -74,7 +75,9 @@ class TargetEmbeddingsAndHead(nn.Module):
 
         return instance
 
-    def _load_weights(self, model_path: str, embed_key: str, lm_head_key: str, tie_weights: bool):
+    def _load_weights(
+        self, model_path: str, embed_key: str, lm_head_key: str, tie_weights: bool
+    ):
         index_files = glob.glob(os.path.join(model_path, "*.index.json"))
         weight_map = {}
         files_to_load = {}
@@ -87,27 +90,31 @@ class TargetEmbeddingsAndHead(nn.Module):
             if embed_key in weight_map:
                 files_to_load[embed_key] = weight_map[embed_key]
             else:
-                raise ValueError(f"Embedding key '{embed_key}' not found in weight map.")
+                raise ValueError(
+                    f"Embedding key '{embed_key}' not found in weight map."
+                )
 
             if not tie_weights:
                 if lm_head_key in weight_map:
                     files_to_load[lm_head_key] = weight_map[lm_head_key]
                 else:
-                    print(f"Warning: {lm_head_key} not found. Ensure model doesn't use tied weights manually.")
+                    print(
+                        f"Warning: {lm_head_key} not found. Ensure model doesn't use tied weights manually."
+                    )
         else:
             safetensors = glob.glob(os.path.join(model_path, "*.safetensors"))
             bins = glob.glob(os.path.join(model_path, "*.bin"))
             target_file = safetensors[0] if safetensors else (bins[0] if bins else None)
-            
+
             if not target_file:
                 raise FileNotFoundError("No checkpoint found.")
-            
+
             files_to_load[embed_key] = os.path.basename(target_file)
             if not tie_weights:
                 files_to_load[lm_head_key] = os.path.basename(target_file)
 
         loaded_keys = set()
-        
+
         file_to_keys_map = {}
         for key, filename in files_to_load.items():
             full_path = os.path.join(model_path, filename)
@@ -120,28 +127,39 @@ class TargetEmbeddingsAndHead(nn.Module):
             loaded_keys.update(keys)
 
         if tie_weights:
-            print("Weight tying detected: Sharing weights between Embeddings and LM Head.")
+            print(
+                "Weight tying detected: Sharing weights between Embeddings and LM Head."
+            )
             self.lm_head.weight = self.embed_tokens.weight
-        
+
         if embed_key not in loaded_keys:
-             raise RuntimeError("Failed to load embeddings.")
+            raise RuntimeError("Failed to load embeddings.")
         if not tie_weights and lm_head_key not in loaded_keys:
-             print("Warning: LM Head weights were not found (and tie_weights is False). Head is random.")
+            print(
+                "Warning: LM Head weights were not found (and tie_weights is False). Head is random."
+            )
 
-
-    def _load_file_content(self, file_path: str, keys_to_extract: list, target_embed_key: str, target_head_key: str):
+    def _load_file_content(
+        self,
+        file_path: str,
+        keys_to_extract: list,
+        target_embed_key: str,
+        target_head_key: str,
+    ):
         """Helper to load specific keys from a file"""
         print(f"Loading {keys_to_extract} from {os.path.basename(file_path)}...")
-        
+
         state_dict_part = {}
-        
+
         if file_path.endswith(".safetensors"):
             with safe_open(file_path, framework="pt") as f:
                 for k in keys_to_extract:
                     if k in f.keys():
                         state_dict_part[k] = f.get_tensor(k)
         else:
-            print(f"Warning: Loading .bin file {os.path.basename(file_path)} into RAM. Convert to safetensors for efficiency.")
+            print(
+                f"Warning: Loading .bin file {os.path.basename(file_path)} into RAM. Convert to safetensors for efficiency."
+            )
             full_state = torch.load(file_path, map_location="cpu")
             for k in keys_to_extract:
                 if k in full_state:
@@ -158,4 +176,6 @@ class TargetEmbeddingsAndHead(nn.Module):
                     self.lm_head.weight.data.copy_(tensor)
                     print(" -> Loaded LM Head")
                 else:
-                    print(f"Error: Shape mismatch for {k}. Expected {self.lm_head.weight.shape}, got {tensor.shape}")
+                    raise RuntimeError(
+                        f"Shape mismatch for {k}. Expected {self.lm_head.weight.shape}, got {tensor.shape}"
+                    )
