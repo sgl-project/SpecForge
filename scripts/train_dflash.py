@@ -149,7 +149,6 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
     )
 
-    # 1. Build Target Model Wrapper
     target_model_kwargs = {}
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -163,7 +162,6 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         **target_model_kwargs,
     )
 
-    # 2. Build Draft Model
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
