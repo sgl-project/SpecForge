@@ -35,7 +35,6 @@ from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import (
     get_last_checkpoint,
-    padding,
     print_on_rank0,
     print_with_rank,
 )
@@ -485,7 +484,6 @@ def main():
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
-            input_ids = padding(input_ids, left=True)
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
