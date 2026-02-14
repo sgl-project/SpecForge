@@ -18,7 +18,6 @@ from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
-from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner
 
@@ -113,25 +112,12 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
-        # Note: We need to ensure SGLang supports custom capture layers.
-        # Eagle3 implementation uses `set_eagle3_layers_to_capture`.
-        # For DFlash, we might need to rely on `output_hidden_states=True` returning all layers
-        # and then filtering, OR implementing `set_custom_layers_to_capture` in SGLang patch.
-        # Assuming we can use the same mechanism or general mechanism if available.
-        # If SGLang doesn't support selective capture easily, we might get all and select later.
-        # But for memory efficiency, selective capture is better.
-
-        # Checking Eagle3 implementation again: it calls `model.set_eagle3_layers_to_capture`.
-        # This implies SGLang model wrapper has this method patched.
-        # We will try to use a similar approach or assume we get full hidden states.
-
-        # For now, let's assume we capture what's needed.
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
+            print(self.model_runner.model.model.layers_to_capture)
 
     @torch.no_grad
     def _extend(self, reqs):
-        # Similar to Eagle3 _extend but simplified for just hidden states
         cache_params = CacheInitParams(
             disable=False,
             req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -174,13 +160,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
         output, _ = self.model_runner.forward(forward_batch)
 
-        # Eagle3 output has aux_hidden_states.
-        # We need to check what SGLang returns. Typically it returns 'hidden_states' or 'aux_hidden_states'.
-        # Assuming it aligns with Eagle3 patch.
-
         input_lens = [len(req.origin_input_ids) for req in reqs]
-
-        # Split per request
         if (
             hasattr(output, "aux_hidden_states")
             and output.aux_hidden_states is not None
@@ -235,10 +215,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
 
-        # Padding might be needed if batching varied lengths (but usually fixed length training)
-        hidden_states = padding(hidden_states, left=False)
-        input_ids = padding(input_ids, left=False)
-
         return DFlashTargetOutput(
             hidden_states=hidden_states,
             input_ids=input_ids,
@@ -291,12 +267,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
             use_cache=False,
         )
 
-        # Extract selected layers
-        # outputs.hidden_states is a tuple of (L+1) tensors
-        # Indices in self.capture_layer_ids correspond to 0-based index of transformer layers.
-        # outputs.hidden_states[0] is embedding output (usually).
-        # Typically hidden_states[i+1] is output of layer i.
-
+        # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
         offset = 1
         selected = []
         if self.capture_layer_ids is not None:
@@ -304,7 +275,6 @@ class HFDFlashTargetModel(DFlashTargetModel):
                 selected.append(outputs.hidden_states[idx + offset])
             hidden_states = torch.cat(selected, dim=-1)
         else:
-            # Fallback if no layers specified (maybe return last?)
             hidden_states = outputs.hidden_states[-1]
 
         return DFlashTargetOutput(

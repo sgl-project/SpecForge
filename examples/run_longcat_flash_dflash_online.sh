@@ -33,7 +33,6 @@ torchrun \
     --max-grad-norm 1.0 \
     --max-length 3072 \
     --chat-template longcat \
-    --random-anchor \
     --num-anchors 512 \
     --loss-decay-gamma 7.0 \
     --log-interval 50 \

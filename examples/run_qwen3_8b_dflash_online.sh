@@ -24,11 +24,13 @@ torchrun \
     --max-length 3072 \
     --chat-template qwen \
     --attention-backend $ATTENTION_BACKEND \
-    --random-anchor \
     --num-anchors 512 \
     --loss-decay-gamma 7.0 \
     --log-interval 50 \
     --save-interval 1000 \
     --report-to wandb \
     --wandb-project specforge-qwen3-8b-dflash \
+    --target-model-backend sglang \
+    --block-size 16 \
+    --num-anchors 512 \
     --wandb-name qwen3-8b-dflash-perfectblend

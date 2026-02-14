@@ -33,7 +33,11 @@ from specforge.modeling.target.dflash_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+from specforge.utils import (
+    get_last_checkpoint,
+    print_on_rank0,
+    print_with_rank,
+)
 
 
 def parse_args():
@@ -68,15 +72,10 @@ def parse_args():
         "--trust-remote-code", action="store_true", help="Trust remote code"
     )
     model_group.add_argument(
-        "--random-anchor",
-        action="store_true",
-        help="Enable random anchor sampling for block construction (paper Sec 4.2).",
-    )
-    model_group.add_argument(
         "--num-anchors",
         type=int,
         default=512,
-        help="Number of anchor positions per sequence when --random-anchor is set.",
+        help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
         "--loss-decay-gamma",
@@ -149,7 +148,6 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
     )
 
-    # 1. Build Target Model Wrapper
     target_model_kwargs = {}
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -163,7 +161,6 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         **target_model_kwargs,
     )
 
-    # 2. Build Draft Model
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
@@ -425,7 +422,6 @@ def main():
         block_size=draft_model.block_size,
         mask_token_id=mask_token_id,
         attention_backend=args.attention_backend,
-        random_anchor=args.random_anchor,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
     )
@@ -486,7 +482,6 @@ def main():
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
-
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
@@ -494,7 +489,6 @@ def main():
 
             loss, accuracy = dflash_model(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
             )
