@@ -280,6 +280,42 @@ def build_target_model(
                 .eval()
                 .cuda()
             )
+        elif (
+            args.is_vlm
+            and draft_model_config.target_model_type == "qwen3_vl"
+            and args.tp_size == 1
+        ):
+            from transformers import Qwen3VLForConditionalGeneration
+
+            # If you're using torch==2.9.1, please ensure you have cuDNN >= 9.15 installed to avoid a performance
+            # regression with Conv3D. You can run `pip install nvidia-cudnn-cu12==9.16.0.29` to immediately fix it.
+
+            target_model = (
+                Qwen3VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
+            )
+        elif (
+            args.is_vlm
+            and draft_model_config.target_model_type == "qwen3_vl_moe"
+            and args.tp_size == 1
+        ):
+            from transformers import Qwen3VLMoeForConditionalGeneration
+
+            # If you're using torch==2.9.1, please ensure you have cuDNN >= 9.15 installed to avoid a performance
+            # regression with Conv3D. You can run `pip install nvidia-cudnn-cu12==9.16.0.29` to immediately fix it.
+
+            target_model = (
+                Qwen3VLMoeForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
+            )
         else:
             if args.target_model_backend == "sglang":
                 target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -296,16 +332,20 @@ def build_target_model(
             )
 
         # set the aux hidden states layers
-        if (
-            hasattr(draft_model_config, "eagle_config")
-            and draft_model_config.eagle_config is not None
-            and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
-        ):
-            target_model.set_aux_hidden_states_layers(
-                draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
-            )
-        else:
-            target_model.set_aux_hidden_states_layers()
+        # VLM models use QwenVLOnlineEagle3Model which has its own hidden state
+        # extraction in _prepare_data(), so we skip this call for VLM models
+        if not args.is_vlm:
+            if (
+                hasattr(draft_model_config, "eagle_config")
+                and draft_model_config.eagle_config is not None
+                and "eagle_aux_hidden_state_layer_ids"
+                in draft_model_config.eagle_config
+            ):
+                target_model.set_aux_hidden_states_layers(
+                    draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
+                )
+            else:
+                target_model.set_aux_hidden_states_layers()
 
         if args.is_vlm:
             processor = AutoProcessor.from_pretrained(
@@ -759,7 +799,12 @@ def main():
     # ================================================
     if (
         args.is_vlm
-        and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
+        and getattr(draft_model_config, "target_model_type", None)
+        in {
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        }
         and args.tp_size == 1
         and args.target_model_backend != "sglang"
     ):
@@ -769,6 +814,7 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            target_model_type=getattr(draft_model_config, "target_model_type", None),
         )
     else:
         if is_online:
