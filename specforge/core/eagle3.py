@@ -585,7 +585,7 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
         return target_p_padded, position_mask
 
 
-@torch.compile(dynamic=None)
+# @torch.compile(dynamic=None)
 def _compute_target_p(target, t2d, loss_mask):
     target_head = target
     target_max_token = target_head.argmax(-1)
@@ -599,7 +599,7 @@ def _compute_target_p(target, t2d, loss_mask):
     return target_p, position_mask
 
 
-@torch.compile(dynamic=None)
+# @torch.compile(dynamic=None)
 def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
     return (
         (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
