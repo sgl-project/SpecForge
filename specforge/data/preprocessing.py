@@ -451,6 +451,7 @@ def list_local_files(path, suffixes=None):
             for f_name in datapaths
             if any(f_name.endswith(suffix) for suffix in suffixes)
         ]
+    datapaths.sort()  # Sort to ensure deterministic order across ranks
     return datapaths
 
 
