@@ -102,7 +102,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True)
+# @torch.compile(dynamic=True)
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
@@ -272,7 +272,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len and seq_len > self.max_seq_len_cached:
@@ -1211,7 +1211,7 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -1338,6 +1338,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+        self.save_idx = 1
 
     def forward(
         self,
@@ -1392,6 +1393,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # norm
         hidden_states = self.norm(hidden_states)
+        self.save_idx += 1
+        save_path = f"./router/{self.save_idx}.pt"
+        # 2. 保存张量（转CPU避免GPU张量依赖，detach解耦计算图）
+        torch.save(hidden_states.detach().cpu(), save_path)
+        if self.save_idx >= 16:
+            exit(0)
 
         return hidden_states
 
@@ -1427,3 +1434,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=False,
             use_cache=False,
         )
+
+#
