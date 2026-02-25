@@ -243,7 +243,7 @@ class OnlineEagle3Model(Eagle3Model):
                 attention_mask=state.attention_mask,
                 position_ids=state.position_ids,
                 past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=False,
             )
 
             # update hidden states for next step
@@ -532,7 +532,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=False,
             )
 
             # update hidden states for next step
