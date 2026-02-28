@@ -280,8 +280,6 @@ def build_models(
     ):
         from transformers import Qwen3VLForConditionalGeneration
 
-        # If you're using torch==2.9.1, please ensure you have cuDNN >= 9.15 installed to avoid a performance
-        # regression with Conv3D. You can run `pip install nvidia-cudnn-cu12==9.16.0.29` to immediately fix it.
         target_model = HFDFlashTargetModel(
             Qwen3VLForConditionalGeneration.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
@@ -300,8 +298,6 @@ def build_models(
     ):
         from transformers import Qwen3VLMoeForConditionalGeneration
 
-        # If you're using torch==2.9.1, please ensure you have cuDNN >= 9.15 installed to avoid a performance
-        # regression with Conv3D. You can run `pip install nvidia-cudnn-cu12==9.16.0.29` to immediately fix it.
         target_model = HFDFlashTargetModel(
             Qwen3VLMoeForConditionalGeneration.from_pretrained(
                 pretrained_model_name_or_path=args.target_model_path,
@@ -416,20 +412,55 @@ def build_dataloader(
         f"{args.target_model_path}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    cache_dir = os.path.join(args.cache_dir, "processed_dataset")
+    dist_enabled = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if dist_enabled else 0
+    world_size = dist.get_world_size() if dist_enabled else 1
 
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_eagle3_dataset = build_eagle3_dataset(
-        dataset=train_dataset,
-        tokenizer=tokenizer,
-        chat_template=args.chat_template,
-        max_length=args.max_length,
-        is_preformatted=args.is_preformatted,
-        is_vlm=is_vlm,
-        processor=processor,
-        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-        cache_key=cache_key,
-        num_proc=args.build_dataset_num_proc,
-    )
+    if world_size > 1:
+        if rank == 0:
+            train_eagle3_dataset = build_eagle3_dataset(
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                is_preformatted=args.is_preformatted,
+                is_vlm=is_vlm,
+                processor=processor,
+                cache_dir=cache_dir,
+                cache_key=cache_key,
+                num_proc=args.build_dataset_num_proc,
+            )
+            dist.barrier()
+        else:
+            dist.barrier()
+            train_eagle3_dataset = build_eagle3_dataset(
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                is_preformatted=args.is_preformatted,
+                is_vlm=is_vlm,
+                processor=processor,
+                cache_dir=cache_dir,
+                cache_key=cache_key,
+                # Rank 0 has finished preprocessing at this point; other ranks only need cache reads.
+                num_proc=1,
+            )
+    else:
+        train_eagle3_dataset = build_eagle3_dataset(
+            dataset=train_dataset,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            is_preformatted=args.is_preformatted,
+            is_vlm=is_vlm,
+            processor=processor,
+            cache_dir=cache_dir,
+            cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
+        )
 
     min_loss_tokens = 2 * args.block_size
     original_size = len(train_eagle3_dataset)
