@@ -21,13 +21,13 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/allava4v-mix-20k_train.localimg_regen.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --min-pixels 50176 \
-    --max-pixels 1003520 \
+    --max-pixels 802816 \
     --output-dir $ROOT_DIR/outputs/qwen3-vl-8b-allava4v20k-dflash \
     --cache-dir $ROOT_DIR/cache \
     --num-epochs 6 \
     --batch-size 2 \
-    --learning-rate 6e-4 \
-    --warmup-ratio 0.04 \
+    --learning-rate 1e-4 \
+    --warmup-ratio 0.08 \
     --max-grad-norm 1.0 \
     --max-length 4096 \
     --num-draft-layers 5 \
