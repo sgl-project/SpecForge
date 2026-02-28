@@ -136,7 +136,7 @@ class OnlineEagle3Model(Eagle3Model):
         target: torch.Tensor,
         loss_mask: torch.Tensor,
         hidden_states: torch.Tensor,
-        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         position_ids: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
@@ -166,6 +166,7 @@ class OnlineEagle3Model(Eagle3Model):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
+        draft_num_hidden_layers = self.draft_model.num_hidden_layers
 
         # Step 2: project the concatenated hidden states to the target hidden size
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
@@ -208,11 +209,11 @@ class OnlineEagle3Model(Eagle3Model):
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa", "usp"]:
-            cache_hidden = [[], []]
+            caches_hidden = [[[], []] for _ in range(draft_num_hidden_layers)]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
-            cache_hidden = None
-            past_key_values = DynamicCache()
+            caches_hidden = None
+            past_key_values = [DynamicCache() for _ in range(draft_num_hidden_layers)]
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
@@ -239,7 +240,7 @@ class OnlineEagle3Model(Eagle3Model):
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=state.hidden_states,
-                cache_hidden=cache_hidden,
+                caches_hidden=caches_hidden,
                 attention_mask=state.attention_mask,
                 position_ids=state.position_ids,
                 past_key_values=past_key_values,
@@ -416,7 +417,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         position_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
@@ -451,13 +452,14 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
+        draft_num_hidden_layers = self.draft_model.num_hidden_layers
 
         # Step 2: project the concatenated hidden states to the target hidden size
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
+            past_key_values_length = past_key_values[0][0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
         if position_ids is None:
@@ -507,11 +509,11 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         vlosses = []
         acces = []
         if self.attention_backend in ["sdpa", "fa"]:
-            cache_hidden = [[], []]
+            caches_hidden = [[[], []] for _ in range(draft_num_hidden_layers)]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
-            past_key_values = DynamicCache()
+            past_key_values = [DynamicCache() for _ in range(draft_num_hidden_layers)]
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
@@ -528,7 +530,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
-                cache_hidden=cache_hidden,
+                caches_hidden=caches_hidden,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,

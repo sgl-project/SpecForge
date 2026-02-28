@@ -33,11 +33,7 @@ from specforge.modeling.target.dflash_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import (
-    get_last_checkpoint,
-    print_on_rank0,
-    print_with_rank,
-)
+from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
 
 def parse_args():
