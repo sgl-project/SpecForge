@@ -30,6 +30,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
@@ -45,6 +47,7 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    pre_sharded_target: bool = False
 
 
 class Eagle3TargetModel(ABC):
@@ -379,7 +382,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        eagle3_output, _ = self.model_runner.forward(forward_batch)
+        model_output = self.model_runner.forward(forward_batch)
+        eagle3_output = model_output.logits_output
+        self._logits_are_tp_sharded = getattr(eagle3_output, 'logits_are_tp_sharded', False)
 
         aux_hidden_states_list = None
         input_lens = [len(req.origin_input_ids) for req in reqs]
@@ -712,6 +717,20 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         input_ids_out = []
         last_hidden_states_out = []
 
+        # Determine this TP rank's shard indices to avoid materializing
+        # the full [batch, seq, vocab] target tensor which can OOM for
+        # large vocabularies (e.g., 163840 for Kimi-K2.5).
+        tp_rank = dist.get_rank(get_tp_group())
+        tp_size = dist.get_world_size(get_tp_group())
+        num_seqs = len(data_cache)
+        chunk_size = max(1, num_seqs // tp_size)
+        shard_start = tp_rank * chunk_size
+        shard_end = min(shard_start + chunk_size, num_seqs)
+
+        # Check if logits are TP-sharded (need per-sequence all_gather)
+        logits_are_tp_sharded = getattr(self, '_logits_are_tp_sharded', False)
+        vocab_size = self.model_runner.model_config.vocab_size if logits_are_tp_sharded else None
+
         for idx, (data, logits, aux_hidden_states, last_hidden_states) in enumerate(
             zip(
                 data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
@@ -721,12 +740,37 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             loss_mask_out.append(data[2])
             input_ids_out.append(data[0])
 
-            # when generating hidden states for offline training, we don't compute logits and only keep the last_hidden_states
-            # when training online, we don't keep the last_hidden_states and only keep the logits
             if logits is not None:
-                target_out.append(logits.unsqueeze(0))
+                if logits_are_tp_sharded:
+                    # Logits are TP-sharded [seq_len, vocab_size/tp]. All-gather
+                    # per-sequence in chunks to limit peak memory. All TP ranks
+                    # must participate in every all_gather (collective op).
+                    seq_len = logits.shape[0]
+                    if shard_start <= idx < shard_end:
+                        full_logits = torch.empty(
+                            seq_len, vocab_size, dtype=logits.dtype, device=logits.device
+                        )
+                        ag_chunk = 2048
+                        for start in range(0, seq_len, ag_chunk):
+                            end = min(start + ag_chunk, seq_len)
+                            gathered = tensor_model_parallel_all_gather(logits[start:end])
+                            full_logits[start:end] = gathered[:, :vocab_size]
+                            del gathered
+                        target_out.append(full_logits.unsqueeze(0))
+                    else:
+                        # Participate in collective but discard results
+                        ag_chunk = 2048
+                        for start in range(0, seq_len, ag_chunk):
+                            end = min(start + ag_chunk, seq_len)
+                            gathered = tensor_model_parallel_all_gather(logits[start:end])
+                            del gathered
+                else:
+                    # Logits already have full vocab (no TP or tp_size=1)
+                    if shard_start <= idx < shard_end:
+                        target_out.append(logits.unsqueeze(0))
             else:
-                target_out.append(None)
+                if shard_start <= idx < shard_end:
+                    target_out.append(None)
 
             if last_hidden_states is not None:
                 last_hidden_states_out.append(last_hidden_states.unsqueeze(0))
@@ -738,7 +782,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         loss_mask_out = torch.cat(loss_mask_out, dim=0)
         input_ids_out = torch.cat(input_ids_out, dim=0)
 
-        if target_out[0] is not None:
+        if target_out and target_out[0] is not None:
             target_out = torch.cat(target_out, dim=0)
         else:
             target_out = None
@@ -759,6 +803,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             input_ids=input_ids_out,
             attention_mask=attention_mask,
             last_hidden_states=last_hidden_states_out,
+            pre_sharded_target=True,
         )
 
 

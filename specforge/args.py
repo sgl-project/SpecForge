@@ -80,7 +80,7 @@ class SGLangBackendArgs:
     sglang_context_length: int = None
     sglang_enable_nccl_nvls: bool = False
     sglang_enable_symm_mem: bool = False
-    sglang_enable_torch_compile: bool = True
+    sglang_enable_torch_compile: bool = False
     sglang_enable_dp_attention: bool = False
     sglang_enable_dp_lm_head: bool = False
     sglang_enable_piecewise_cuda_graph: bool = False

@@ -237,6 +237,18 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="kimi-k25-thinking",
+    template=ChatTemplate(
+        assistant_header="<|im_assistant|>assistant<|im_middle|>",
+        user_header="<|im_user|>user<|im_middle|>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="kimi-k2-instruct",
     template=ChatTemplate(
         assistant_header="<|im_assistant|>assistant<|im_middle|>",
