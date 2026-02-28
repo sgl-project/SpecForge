@@ -19,6 +19,50 @@ except ImportError:
     create_block_mask = None
 
 
+def create_dflash_block_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    S: int,
+    block_size: int,
+    device: torch.device,
+):
+    """Construct Flex Attention BlockMask for DFlash training.
+
+    KV: [Context (S tokens) | Block_0 | Block_1 | ... | Block_{n-1}]
+    Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
+
+    Rules:
+      1. Each block sees context strictly before its anchor (kv_idx < anchor_pos).
+      2. Intra-block attention is bidirectional.
+      3. Different blocks are invisible to each other.
+      4. Invalid blocks (block_keep_mask=False) see nothing.
+    """
+
+    def dflash_mask_mod(b, h, q_idx, kv_idx):
+        q_block_id = q_idx // block_size
+        anchor_pos = anchor_positions[b, q_block_id]
+
+        is_context = kv_idx < S
+        # Strictly less than: matches inference where target_hidden[anchor_pos]
+        # is not available as context.
+        mask_context = is_context & (kv_idx < anchor_pos)
+
+        is_draft = kv_idx >= S
+        kv_block_id = (kv_idx - S) // block_size
+        mask_draft = is_draft & (q_block_id == kv_block_id)
+
+        is_valid_block = block_keep_mask[b, q_block_id]
+        return (mask_context | mask_draft) & is_valid_block
+
+    B, N = anchor_positions.shape
+    Q_LEN = N * block_size
+    KV_LEN = S + N * block_size
+
+    return create_block_mask(
+        dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
+    )
+
+
 class OnlineDFlashModel(nn.Module):
     """DFlash online training wrapper with block-wise CE loss."""
 
@@ -30,6 +74,8 @@ class OnlineDFlashModel(nn.Module):
         mask_token_id: int,
         block_size: int = 16,
         attention_backend: str = "flex_attention",
+        num_anchors: int = 512,
+        loss_decay_gamma: Optional[float] = None,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -38,90 +84,106 @@ class OnlineDFlashModel(nn.Module):
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
+        self.num_anchors = num_anchors
+        self.loss_decay_gamma = loss_decay_gamma
 
-        # Cache for BlockMask
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
-    def prepare_noise_input(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Prepare noise input: first token of each block is real, rest are MASK."""
-        seq_len = input_ids.shape[1]
-        device = input_ids.device
+    def _sample_anchor_positions(
+        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
+        bs = self.block_size
+        bsz = loss_mask.shape[0]
+        max_anchor = max(seq_len - bs, 0)
 
-        positions = torch.arange(seq_len, device=device)
-        is_block_start = (positions % self.block_size) == 0
+        valid = loss_mask[:, : max_anchor + 1] > 0.5
+        valid_counts = valid.sum(dim=1)
+        max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
-        noise_input_ids = torch.full_like(input_ids, self.mask_token_id)
-        noise_input_ids[:, is_block_start] = input_ids[:, is_block_start]
+        if max_n <= 0:
+            raise ValueError("should preprocess the data.")
 
-        return noise_input_ids
-
-    def _get_or_create_block_mask(
-        self, bsz: int, q_len: int, kv_len: int, device: torch.device
-    ) -> "BlockMask":
-        """Get cached BlockMask or create a new one."""
-        if (
-            self._cached_block_mask is not None
-            and self._cached_seq_len == q_len
-            and self._cached_bsz == bsz
-        ):
-            return self._cached_block_mask
-
-        block_size = self.block_size
-
-        def dflash_mask_fn(b, h, q_idx, kv_idx):
-            L = q_len
-            is_ctx = kv_idx < L
-            q_block = q_idx // block_size
-            k_block_ctx = kv_idx // block_size
-            k_block_noise = (kv_idx - L) // block_size
-            ctx_visible = is_ctx & (k_block_ctx < q_block)
-            noise_visible = (~is_ctx) & (k_block_noise == q_block)
-            return ctx_visible | noise_visible
-
-        block_mask = create_block_mask(
-            dflash_mask_fn,
-            B=bsz,
-            H=1,
-            Q_LEN=q_len,
-            KV_LEN=kv_len,
-            device=device,
+        indices = (
+            torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
+        )
+        masked_indices = torch.where(
+            valid, indices, torch.tensor(seq_len + 1, device=device)
         )
 
-        self._cached_block_mask = block_mask
-        self._cached_seq_len = q_len
-        self._cached_bsz = bsz
+        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
+        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
 
-        return block_mask
+        _, sorted_idx = random_vals.sort(dim=1)
+        gathered = torch.gather(masked_indices, 1, sorted_idx)
+        anchors = gathered[:, :max_n].sort(dim=1).values
 
-    def _create_parallel_attention_mask(
-        self, seq_len: int, device: torch.device
+        keep_mask = torch.arange(max_n, device=device).unsqueeze(
+            0
+        ) < valid_counts.unsqueeze(1).clamp(max=max_n)
+        anchors = torch.where(
+            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
+        )
+
+        return anchors, keep_mask
+
+    def prepare_noise_input(
+        self, input_ids: torch.Tensor, block_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Create [L, 2L] attention mask for parallel training.
-        - Left half (ctx): Q can see K_ctx if K's block < Q's block
-        - Right half (noise): Q can see K_noise if same block (bidirectional)
-        """
-        indices = torch.arange(seq_len, device=device)
-        block_ids = indices // self.block_size
+        """Prepare noise input: first token of each block is real, rest are MASK."""
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
 
-        q_block_ids = block_ids.unsqueeze(1)
-        k_block_ids = block_ids.unsqueeze(0)
+        if block_ids is not None:
+            is_block_start = torch.ones(bsz, seq_len, dtype=torch.bool, device=device)
+            is_block_start[:, 1:] = block_ids[:, 1:] != block_ids[:, :-1]
+        else:
+            positions = torch.arange(seq_len, device=device)
+            is_block_start = (positions % self.block_size) == 0
+            is_block_start = is_block_start.unsqueeze(0).expand(bsz, -1)
 
-        ctx_mask = k_block_ids < q_block_ids
-        noise_mask = q_block_ids == k_block_ids
+        noise_input_ids = torch.full_like(input_ids, self.mask_token_id)
+        noise_input_ids[is_block_start] = input_ids[is_block_start]
+        return noise_input_ids
 
-        full_mask_bool = torch.cat([ctx_mask, noise_mask], dim=1)
-        full_mask = torch.zeros_like(full_mask_bool, dtype=torch.float32)
-        full_mask.masked_fill_(~full_mask_bool, torch.finfo(torch.float32).min)
+    def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
+        """Create absolute position IDs for parallel draft blocks."""
+        bsz, n_blocks = anchor_positions.shape
+        device = anchor_positions.device
+        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        pos_ids = anchor_positions.unsqueeze(-1) + offsets
+        return pos_ids.view(bsz, -1)
 
-        return full_mask
+    def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
+        bsz, seq_len = input_ids.shape
+        n = anchor_positions.shape[1]
+        bs = self.block_size
+        device = input_ids.device
+
+        noise_ids = torch.full(
+            (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
+        )
+
+        block_starts = torch.arange(n, device=device) * bs
+        block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
+
+        valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
+        anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
+
+        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
+        noise_ids[flat_batch_idx, block_starts] = torch.where(
+            block_keep_mask,
+            anchor_tokens,
+            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+        )
+
+        return self.embed_tokens(noise_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -129,87 +191,89 @@ class OnlineDFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        # Truncate to multiple of block_size
-        n_blocks = seq_len // self.block_size
-        effective_len = n_blocks * self.block_size
-        input_ids = input_ids[:, :effective_len]
-        hidden_states = hidden_states[:, :effective_len, :]
-        loss_mask = loss_mask[:, :effective_len]
-        attention_mask = attention_mask[:, :effective_len]
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+            seq_len, loss_mask, device
+        )
 
-        # Prepare inputs
-        noise_input_ids = self.prepare_noise_input(input_ids)
-        noise_embedding = self.embed_tokens(noise_input_ids)
+        noise_embedding = self._create_noise_embed(
+            input_ids, anchor_positions, block_keep_mask
+        )
 
-        # Position IDs: [ctx_pos, noise_pos] both 0..L-1
-        pos_seq = torch.arange(effective_len, device=device)
-        position_ids = torch.cat([pos_seq, pos_seq], dim=0).unsqueeze(0).expand(bsz, -1)
+        context_position_ids = (
+            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        )
+        draft_position_ids = self._create_position_ids(anchor_positions)
+        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
-        # Construct attention mask
-        if (
-            self.attention_backend == "flex_attention"
-            and FLEX_ATTENTION_AVAILABLE
-            and create_block_mask is not None
-        ):
-            dflash_attn_mask = self._get_or_create_block_mask(
-                bsz=bsz,
-                q_len=effective_len,
-                kv_len=effective_len * 2,
-                device=device,
-            )
-        else:
-            dflash_attn_mask = self._create_parallel_attention_mask(
-                effective_len, device
-            )
-            dflash_attn_mask = dflash_attn_mask.to(dtype=hidden_states.dtype)
-            dflash_attn_mask = (
-                dflash_attn_mask.unsqueeze(0).unsqueeze(0).expand(bsz, -1, -1, -1)
-            )
+        dflash_attn_mask = create_dflash_block_mask(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            S=seq_len,
+            block_size=self.block_size,
+            device=device,
+        )
 
-        # Forward pass
-        hidden = self.draft_model(
-            position_ids=position_ids,
+        output_hidden = self.draft_model(
+            position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
         )
 
-        # Compute loss (skip block 0 and block starts)
-        dflash_loss_mask_base = create_dflash_loss_mask(
-            effective_len, self.block_size, device
+        logits = self.lm_head(output_hidden)
+
+        # --- Labels: same-position prediction (position k predicts token anchor+k) ---
+        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+        valid_label_mask = label_indices < seq_len
+        safe_label_indices = label_indices.clamp(max=seq_len - 1)
+
+        target_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            2,
+            safe_label_indices,
         )
-        combined_mask = loss_mask * dflash_loss_mask_base.unsqueeze(0)
 
-        logits = self.lm_head(hidden)
+        # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
+        weight_mask = (
+            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+        )
+        weight_mask = weight_mask * valid_label_mask.float()
 
-        logits_flat = logits.reshape(-1, logits.size(-1))
-        labels_flat = input_ids.reshape(-1)
-        mask_flat = combined_mask.reshape(-1)
+        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        weight_mask = weight_mask * (pos_in_block > 0).float()
 
-        active_indices = mask_flat > 0.5
-        active_logits = logits_flat[active_indices]
-        active_labels = labels_flat[active_indices]
+        original_loss_mask_gathered = torch.gather(
+            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            2,
+            safe_label_indices,
+        )
+        weight_mask = weight_mask * original_loss_mask_gathered
 
-        loss = F.cross_entropy(active_logits, active_labels)
+        binary_eval_mask = weight_mask.view(-1)
 
+        # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
+        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            decay_weights = torch.exp(
+                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
+            )
+            weight_mask = weight_mask * decay_weights
+
+        # --- Cross entropy ---
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_targets = target_ids.view(-1)
+        flat_weights = weight_mask.view(-1)
+
+        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        valid_token_count = flat_weights.sum() + 1e-6
+        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+
+        # --- Accuracy ---
         with torch.no_grad():
-            preds = active_logits.argmax(dim=-1)
-            correct = (preds == active_labels).float().sum()
-            total = active_labels.numel()
-            accuracy = correct / total
+            pred_ids = torch.argmax(flat_logits, dim=-1)
+            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+            actual_token_count = binary_eval_mask.sum() + 1e-6
+            accuracy = correct.sum().float() / actual_token_count
 
         return loss, accuracy
-
-
-def create_dflash_loss_mask(
-    seq_len: int, block_size: int, device: torch.device
-) -> torch.Tensor:
-    """Create DFlash loss mask: excludes block 0 and first position of each block."""
-    positions = torch.arange(seq_len, device=device)
-    block_ids = positions // block_size
-
-    is_block_0 = block_ids == 0
-    is_block_start = (positions % block_size) == 0
-
-    valid_mask = ~is_block_0 & ~is_block_start
-    return valid_mask.float()
