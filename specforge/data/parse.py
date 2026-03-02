@@ -80,6 +80,12 @@ class GeneralParser(Parser):
         if not preformatted:
             messages = []
 
+            if not conversation:
+                warnings.warn(
+                    "Empty conversation encountered, skipping."
+                )
+                return None
+
             if conversation[0]["role"] == "system":
                 warnings.warn(
                     f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
@@ -120,6 +126,14 @@ class GeneralParser(Parser):
                         warnings.warn(f"Failed to parse tool_calls JSON: {tool_calls}")
                         break
                 messages.append(sentence)
+
+            # Skip conversations with no user/assistant turns (only system prompt)
+            has_non_system = any(m["role"] != "system" for m in messages)
+            if not has_non_system:
+                warnings.warn(
+                    "Conversation has no user/assistant turns after validation, skipping."
+                )
+                return None
 
             try:
                 conversation = self.apply_chat_template(messages, **kwargs)

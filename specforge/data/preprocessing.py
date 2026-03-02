@@ -163,13 +163,17 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-        input_ids, loss_mask = parser.parse(
+        result = parser.parse(
             source,
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
             **kwargs_item,
         )
+        if result is None:
+            # parser returned None for invalid/empty conversations
+            continue
+        input_ids, loss_mask = result
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
