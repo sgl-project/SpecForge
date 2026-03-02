@@ -15,11 +15,15 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
 
 from .sglang_backend import SGLangRunner
+
+QWEN3_VL_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
+QWEN3_5_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
+VLM_MODEL_TYPES = QWEN3_VL_MODEL_TYPES | QWEN3_5_MODEL_TYPES
 
 
 @dataclass
@@ -28,6 +32,7 @@ class DFlashTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    position_ids: Optional[torch.Tensor] = None  # [batch, seq_len] or [3, batch, seq_len]
 
 
 class DFlashTargetModel(ABC):
@@ -56,6 +61,9 @@ class DFlashTargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
         """Generate context hidden states for DFlash training."""
 
@@ -112,7 +120,10 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
+        if hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+            self.model_runner.model.set_dflash_layers_to_capture(layer_ids)
+            print(self.model_runner.model.model.layers_to_capture)
+        elif hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
             print(self.model_runner.model.model.layers_to_capture)
 
@@ -184,7 +195,15 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
+        if pixel_values is not None or image_grid_thw is not None or video_grid_thw is not None:
+            raise NotImplementedError(
+                "SGLangDFlashTargetModel does not yet support multimodal inputs. "
+                "Use HF backend for real VLM DFlash training."
+            )
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
 
@@ -220,13 +239,15 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            position_ids=None,
         )
 
 
 class HFDFlashTargetModel(DFlashTargetModel):
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, model_type: Optional[str] = None):
         super().__init__()
         self.model = model
+        self.model_type = model_type
 
     @classmethod
     def from_pretrained(
@@ -238,20 +259,81 @@ class HFDFlashTargetModel(DFlashTargetModel):
         trust_remote_code: bool = True,
         **kwargs,
     ) -> "HFDFlashTargetModel":
-
-        target_model = AutoModelForCausalLM.from_pretrained(
+        hf_config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path,
-            torch_dtype=torch_dtype,
             cache_dir=cache_dir,
-            output_hidden_states=True,
             trust_remote_code=trust_remote_code,
-            **kwargs,
-        ).eval()
+        )
+        model_type = getattr(hf_config, "model_type", None)
 
-        if device:
+        if model_type in QWEN3_VL_MODEL_TYPES:
+            if model_type == "qwen3_vl":
+                try:
+                    from transformers import Qwen3VLForConditionalGeneration
+                except ImportError as exc:
+                    raise ImportError(
+                        "Qwen3VLForConditionalGeneration is unavailable. "
+                        "Please upgrade transformers to a version with qwen3_vl support."
+                    ) from exc
+                model_cls = Qwen3VLForConditionalGeneration
+            else:
+                try:
+                    from transformers import Qwen3VLMoeForConditionalGeneration
+                except ImportError as exc:
+                    raise ImportError(
+                        "Qwen3VLMoeForConditionalGeneration is unavailable. "
+                        "Please upgrade transformers to a version with qwen3_vl_moe support."
+                    ) from exc
+                model_cls = Qwen3VLMoeForConditionalGeneration
+
+            target_model = model_cls.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            ).eval()
+        elif model_type in QWEN3_5_MODEL_TYPES:
+            if model_type == "qwen3_5":
+                try:
+                    from transformers import Qwen3_5ForConditionalGeneration
+                except ImportError as exc:
+                    raise ImportError(
+                        "Qwen3_5ForConditionalGeneration is unavailable. "
+                        "Please upgrade transformers."
+                    ) from exc
+                model_cls = Qwen3_5ForConditionalGeneration
+            else:
+                try:
+                    from transformers import Qwen3_5MoeForConditionalGeneration
+                except ImportError as exc:
+                    raise ImportError(
+                        "Qwen3_5MoeForConditionalGeneration is unavailable. "
+                        "Please upgrade transformers."
+                    ) from exc
+                model_cls = Qwen3_5MoeForConditionalGeneration
+
+            target_model = model_cls.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            ).eval()
+        else:
+            target_model = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                output_hidden_states=True,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            ).eval()
+
+        if device and "device_map" not in kwargs:
             target_model = target_model.to(device)
 
-        return cls(target_model)
+        return cls(target_model, model_type=model_type)
 
     @torch.no_grad()
     def generate_dflash_data(
@@ -259,13 +341,45 @@ class HFDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        target_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if self.model_type in VLM_MODEL_TYPES:
+            target_kwargs.update(
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                    "video_grid_thw": video_grid_thw,
+                }
+            )
+
+        filtered_target_kwargs = {}
+        for key, value in target_kwargs.items():
+            if key in {
+                "input_ids",
+                "attention_mask",
+                "output_hidden_states",
+                "use_cache",
+            } or value is not None:
+                filtered_target_kwargs[key] = value
+
+        outputs = self.model(**filtered_target_kwargs)
+        if outputs.hidden_states is None:
+            raise ValueError(
+                "Target model did not return hidden states. Ensure output_hidden_states=True is supported."
+            )
+
+        position_ids = None
+        # get_rope_index requires vision inputs and mm_token_type_ids (text=0, image=1, video=2).
+        # For text-only mode (no image/video), skip; DFlash uses 1D position_ids from arange.
+        # For VLM with images: would need mm_token_type_ids from dataloader (not yet in API).
 
         # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
         offset = 1
@@ -282,6 +396,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            position_ids=position_ids,
         )
 
 
