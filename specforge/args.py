@@ -204,3 +204,59 @@ class SGLangBackendArgs:
             max_running_requests=self.sglang_max_running_requests,
             max_total_tokens=self.sglang_max_total_tokens,
         )
+
+
+@dataclass
+class SharedBackendArgs:
+    """Arguments for single-model speculative decoding with shared backend."""
+
+    num_draft_layers: int = 5
+    block_size: int = 16
+    ce_weight: float = 1.0
+    mse_weight: float = 0.1
+    freeze_target: bool = True
+
+    @staticmethod
+    def add_args(parser: argparse.ArgumentParser) -> None:
+        """Add shared backend specific arguments to parser."""
+        parser.add_argument(
+            "--num-draft-layers",
+            type=int,
+            default=5,
+            help="Number of trainable draft layers",
+        )
+        parser.add_argument(
+            "--block-size",
+            type=int,
+            default=16,
+            help="Block size for parallel training",
+        )
+        parser.add_argument(
+            "--ce-weight",
+            type=float,
+            default=1.0,
+            help="Weight for cross-entropy loss",
+        )
+        parser.add_argument(
+            "--mse-weight",
+            type=float,
+            default=0.1,
+            help="Weight for MSE loss between K/V pairs",
+        )
+        parser.add_argument(
+            "--freeze-target",
+            action="store_true",
+            default=True,
+            help="Freeze target model parameters",
+        )
+
+    @staticmethod
+    def from_args(args: argparse.Namespace) -> "SharedBackendArgs":
+        """Create SharedBackendArgs from parsed arguments."""
+        return SharedBackendArgs(
+            num_draft_layers=getattr(args, "num_draft_layers", 5),
+            block_size=getattr(args, "block_size", 16),
+            ce_weight=getattr(args, "ce_weight", 1.0),
+            mse_weight=getattr(args, "mse_weight", 0.1),
+            freeze_target=getattr(args, "freeze_target", True),
+        )

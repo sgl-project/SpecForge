@@ -19,6 +19,7 @@ from transformers import (
 )
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .draft.qwen3_shared import Qwen3SharedDraftModel
 from .target.custom_backend import (
     GptOssForCausalLM,
     Llama4ForCausalLM,
@@ -81,6 +82,70 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
             modeling_utils.logger.warning = original_warn
 
         return model
+
+
+class AutoQwen3SharedDraftModel:
+    """Factory class for creating Qwen3SharedDraftModel instances."""
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Qwen3Config,
+        num_draft_layers: int = 5,
+        block_size: int = 16,
+        torch_dtype=None,
+        **config_kwargs,
+    ):
+        """Create a Qwen3SharedDraftModel from a config.
+
+        Args:
+            config: Qwen3Config object
+            num_draft_layers: Number of trainable draft layers
+            block_size: Block size for parallel training
+            torch_dtype: Data type for model parameters
+            **config_kwargs: Additional config kwargs
+
+        Returns:
+            Qwen3SharedDraftModel instance
+        """
+        model = Qwen3SharedDraftModel(
+            config,
+            num_draft_layers=num_draft_layers,
+            block_size=block_size,
+        )
+
+        if torch_dtype is not None:
+            model = model.to(dtype=torch_dtype)
+        return model
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
+        num_draft_layers: int = 5,
+        block_size: int = 16,
+        torch_dtype=None,
+        **kwargs,
+    ):
+        """Create a Qwen3SharedDraftModel from a pretrained model.
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model
+            num_draft_layers: Number of trainable draft layers
+            block_size: Block size for parallel training
+            torch_dtype: Data type for model parameters
+            **kwargs: Additional kwargs
+
+        Returns:
+            Qwen3SharedDraftModel instance
+        """
+        config = Qwen3Config.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        return cls.from_config(
+            config,
+            num_draft_layers=num_draft_layers,
+            block_size=block_size,
+            torch_dtype=torch_dtype,
+        )
 
 
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
