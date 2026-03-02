@@ -43,7 +43,6 @@ from transformers.models.phi3.modeling_phi3 import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
 
 from specforge.distributed import get_tp_group
 from specforge.layers import (
@@ -284,7 +283,6 @@ class Phi3Model(Phi3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
     @auto_docstring
     def forward(
         self,
