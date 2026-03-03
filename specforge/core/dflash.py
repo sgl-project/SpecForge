@@ -97,7 +97,7 @@ class OnlineDFlashModel(nn.Module):
         """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
         bs = self.block_size
         bsz = loss_mask.shape[0]
-        max_anchor = max(seq_len - bs, 0)
+        max_anchor = max(seq_len - bs - 1, 0)
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
@@ -223,7 +223,7 @@ class OnlineDFlashModel(nn.Module):
         logits = self.lm_head(output_hidden)
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        label_offsets = torch.arange(1, self.block_size + 1, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
