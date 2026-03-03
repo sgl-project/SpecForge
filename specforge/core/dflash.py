@@ -222,7 +222,7 @@ class OnlineDFlashModel(nn.Module):
 
         logits = self.lm_head(output_hidden)
 
-        # --- Labels: same-position prediction (position k predicts token anchor+k) ---
+        # --- Labels: same-position prediction (position k predicts token anchor+k+1) ---
         label_offsets = torch.arange(1, self.block_size + 1, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
