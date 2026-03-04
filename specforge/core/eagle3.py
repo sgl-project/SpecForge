@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
+from specforge.core.lk_loss import combine_kl_and_lk_loss
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
@@ -55,18 +56,28 @@ class OnlineEagle3Model(Eagle3Model):
         length: int = 7,
         attention_backend="sdpa",
         target_model: Optional[Eagle3Model] = None,
+        lk_loss_type: Optional[str] = None,
+        kl_scale: float = 1.0,
+        kl_decay: float = 1.0,
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            lk_loss_type: LK loss objective type. One of {"lambda", "alpha"}.
+            kl_scale: Initial KL weight scale for lambda LK loss.
+            kl_decay: Decay factor for adaptive KL weight in lambda LK loss.
         """
         super().__init__()
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
         self.target_model = target_model
+        self.lk_loss_type = lk_loss_type
+        self.kl_scale = kl_scale
+        self.kl_decay = kl_decay
+        self.lk_eps = 1e-8
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -92,8 +103,22 @@ class OnlineEagle3Model(Eagle3Model):
             )
             acc = local_correct / local_denom
 
-        loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-        loss = adapter.reduce_loss(loss)
+        kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        kl_loss = adapter.reduce_loss(kl_loss)
+        if self.lk_loss_type is None:
+            loss = kl_loss
+        else:
+            loss = combine_kl_and_lk_loss(
+                logits=logits,
+                target_p=target_p,
+                position_mask=position_mask,
+                kl_loss=kl_loss,
+                lk_loss_type=self.lk_loss_type,
+                kl_scale=self.kl_scale,
+                kl_decay=self.kl_decay,
+                lk_eps=self.lk_eps,
+                reduce_fn=adapter.reduce_metrics,
+            )
         return acc, loss
 
     def _prepare_position_ids(
@@ -291,12 +316,18 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         processor,
         length: int = 7,
         attention_backend: str = "sdpa",
+        lk_loss_type: Optional[str] = None,
+        kl_scale: float = 1.0,
+        kl_decay: float = 1.0,
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            lk_loss_type: LK loss objective type. One of {"lambda", "alpha"}.
+            kl_scale: Initial KL weight scale for lambda LK loss.
+            kl_decay: Decay factor for adaptive KL weight in lambda LK loss.
         """
         super().__init__()
         self.target_model = target_model
@@ -304,6 +335,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.processor = processor
         self.length = length
         self.attention_backend = attention_backend
+        self.lk_loss_type = lk_loss_type
+        self.kl_scale = kl_scale
+        self.kl_decay = kl_decay
+        self.lk_eps = 1e-8
 
     @torch.no_grad()
     def _prepare_data(
@@ -553,7 +588,20 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            if self.lk_loss_type is None:
+                loss = kl_loss
+            else:
+                loss = combine_kl_and_lk_loss(
+                    logits=logits,
+                    target_p=target_p,
+                    position_mask=position_mask,
+                    kl_loss=kl_loss,
+                    lk_loss_type=self.lk_loss_type,
+                    kl_scale=self.kl_scale,
+                    kl_decay=self.kl_decay,
+                    lk_eps=self.lk_eps,
+                )
             plosses.append(loss)
 
             if not is_last:
