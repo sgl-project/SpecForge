@@ -66,43 +66,26 @@ def _is_multi_node(world_size: int, tp_size: int) -> bool:
     return world_size > tp_size
 
 
-def _has_mnnvl_ipc() -> bool:
-    """Check if MNNVL-backed CUDA IPC is available for cross-node GPU memory sharing.
-
-    On GB200 NVL72 racks, all GPUs are connected via NVSwitch. When IMEX
-    (Inter-process Memory Exchange) channels are available, CUDA IPC handles
-    can be shared across nodes via fabric memory, making cross-node
-    custom_all_reduce and FlashInfer allreduce fusion safe.
-
-    Returns True if IMEX channels are present (indicating MNNVL IPC support).
-    """
-    return os.path.isdir("/dev/nvidia-caps-imex-channels")
-
-
 def should_disable_ipc_optimizations(world_size: int, tp_size: int) -> bool:
     """Determine whether to disable CUDA IPC-based optimizations.
 
     CUDA IPC-based optimizations (custom_all_reduce, FlashInfer allreduce
-    fusion) assume GPU memory can be shared between processes. This works:
-    - On single-node: always (standard CUDA IPC)
-    - On multi-node with MNNVL: when IMEX channels are available (fabric memory)
-    - On multi-node without MNNVL: never (IPC handles can't cross nodes)
+    fusion) use cudaIpcGetMemHandle / cudaIpcOpenMemHandle which rely on
+    POSIX shared memory — they only work between processes on the same node.
 
-    Returns True if IPC optimizations should be disabled.
+    Even on MNNVL-connected racks (GB200 NVL72) with IMEX channels present,
+    FlashInfer's and SGLang's custom IPC code does NOT use the fabric-aware
+    CUDA APIs (cudaMallocFabric / multicast), so cross-node IPC still fails
+    with "CUDART error: invalid resource handle".
+
+    Returns True if IPC optimizations should be disabled (i.e. multi-node).
     """
-    multi_node = _is_multi_node(world_size, tp_size)
-    if not multi_node:
-        return False
-    if _has_mnnvl_ipc():
-        logger.info(
-            "Multi-node training detected with MNNVL IPC support "
-            "(IMEX channels available). Keeping IPC optimizations enabled."
-        )
+    if not _is_multi_node(world_size, tp_size):
         return False
     logger.info(
-        "Multi-node training detected without MNNVL IPC support. "
-        "Disabling custom_all_reduce and FlashInfer allreduce fusion "
-        "to avoid cross-node CUDA IPC failures."
+        "Multi-node training detected. Disabling custom_all_reduce and "
+        "FlashInfer allreduce fusion (CUDA IPC handles cannot cross node "
+        "boundaries)."
     )
     return True
 

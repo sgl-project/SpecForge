@@ -2,8 +2,8 @@
 
 The should_disable_ipc_optimizations gate controls whether CUDA IPC-based
 optimizations (custom_all_reduce, FlashInfer allreduce fusion) are disabled.
-These optimizations use IPC handles that cannot cross node boundaries
-unless MNNVL fabric memory (via IMEX channels) is available.
+These optimizations use cudaIpcGetMemHandle / cudaIpcOpenMemHandle which rely
+on POSIX shared memory and only work between processes on the same node.
 """
 
 import os
@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import patch
 
 from specforge.modeling.target.eagle3_target_model import (
-    _has_mnnvl_ipc,
     _is_multi_node,
     should_disable_ipc_optimizations,
 )
@@ -74,55 +73,31 @@ class TestIsMultiNode(unittest.TestCase):
 
 
 class TestShouldDisableIpcOptimizations(unittest.TestCase):
-    """Test the combined multi-node + MNNVL gate."""
+    """Test the multi-node IPC gate."""
 
     # --- Single-node: never disable ---
 
     @patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "4"})
-    @patch("specforge.modeling.target.eagle3_target_model._has_mnnvl_ipc", return_value=False)
-    def test_single_node_no_mnnvl(self, _):
-        """Single-node without MNNVL: keep optimizations."""
+    def test_single_node(self):
+        """Single-node: keep optimizations."""
         self.assertFalse(should_disable_ipc_optimizations(world_size=4, tp_size=4))
 
     @patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "8"})
-    @patch("specforge.modeling.target.eagle3_target_model._has_mnnvl_ipc", return_value=False)
-    def test_single_node_dp_no_mnnvl(self, _):
-        """Single-node DP without MNNVL: keep optimizations."""
+    def test_single_node_dp(self):
+        """Single-node DP: keep optimizations."""
         self.assertFalse(should_disable_ipc_optimizations(world_size=8, tp_size=4))
 
-    # --- Multi-node without MNNVL: disable ---
+    # --- Multi-node: always disable ---
 
     @patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "4"})
-    @patch("specforge.modeling.target.eagle3_target_model._has_mnnvl_ipc", return_value=False)
-    def test_multi_node_no_mnnvl(self, _):
-        """Multi-node without MNNVL: disable IPC optimizations."""
+    def test_multi_node(self):
+        """Multi-node: disable IPC optimizations."""
         self.assertTrue(should_disable_ipc_optimizations(world_size=8, tp_size=4))
 
-    # --- Multi-node with MNNVL (GB200 NVL72): keep ---
-
     @patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "4"})
-    @patch("specforge.modeling.target.eagle3_target_model._has_mnnvl_ipc", return_value=True)
-    def test_multi_node_with_mnnvl(self, _):
-        """Multi-node with MNNVL (e.g. GB200 NVL72): keep IPC optimizations."""
-        self.assertFalse(should_disable_ipc_optimizations(world_size=8, tp_size=4))
-
-    @patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "4"})
-    @patch("specforge.modeling.target.eagle3_target_model._has_mnnvl_ipc", return_value=True)
-    def test_multi_node_cross_node_tp_with_mnnvl(self, _):
-        """Cross-node TP with MNNVL: keep IPC optimizations."""
-        self.assertFalse(should_disable_ipc_optimizations(world_size=8, tp_size=8))
-
-
-class TestHasMnnvlIpc(unittest.TestCase):
-    """Test IMEX channel detection."""
-
-    @patch("os.path.isdir", return_value=True)
-    def test_imex_present(self, _):
-        self.assertTrue(_has_mnnvl_ipc())
-
-    @patch("os.path.isdir", return_value=False)
-    def test_imex_absent(self, _):
-        self.assertFalse(_has_mnnvl_ipc())
+    def test_multi_node_cross_node_tp(self):
+        """Cross-node TP: disable IPC optimizations."""
+        self.assertTrue(should_disable_ipc_optimizations(world_size=8, tp_size=8))
 
 
 if __name__ == "__main__":
