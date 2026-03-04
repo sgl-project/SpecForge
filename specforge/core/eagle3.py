@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
-from specforge.core.lk_loss import combine_kl_and_lk_loss, compute_acceptance_rate
+from specforge.core.lk_loss import compute_lk_loss, compute_acceptance_rate
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
@@ -114,7 +114,6 @@ class OnlineEagle3Model(Eagle3Model):
                     logits=logits,
                     target_probs=target_p_for_acceptance,
                     position_mask=position_mask,
-                    eps=self.lk_eps,
                     reduce_fn=adapter.reduce_metrics,
                 )
         else:
@@ -122,16 +121,14 @@ class OnlineEagle3Model(Eagle3Model):
                 logits=logits,
                 target_probs=target_p_for_acceptance,
                 position_mask=position_mask,
-                eps=self.lk_eps,
                 reduce_fn=adapter.reduce_metrics,
             )
-            loss = combine_kl_and_lk_loss(
+            loss = compute_lk_loss(
                 kl_loss=kl_loss,
                 acceptance_rate=acceptance_rate,
                 lk_loss_type=self.lk_loss_type,
                 kl_scale=self.kl_scale,
                 kl_decay=self.kl_decay,
-                lk_eps=self.lk_eps,
             )
         return acc, acceptance_rate.detach(), loss
 
@@ -355,7 +352,6 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.lk_loss_type = lk_loss_type
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
-        self.lk_eps = 1e-8
 
     @torch.no_grad()
     def _prepare_data(
@@ -620,22 +616,19 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                         logits=logits,
                         target_probs=target_p_for_acceptance,
                         position_mask=position_mask,
-                        eps=self.lk_eps,
                     )
             else:
                 acceptance_rate = compute_acceptance_rate(
                     logits=logits,
                     target_probs=target_p_for_acceptance,
                     position_mask=position_mask,
-                    eps=self.lk_eps,
                 )
-                loss = combine_kl_and_lk_loss(
+                loss = compute_lk_loss(
                     kl_loss=kl_loss,
                     acceptance_rate=acceptance_rate,
                     lk_loss_type=self.lk_loss_type,
                     kl_scale=self.kl_scale,
                     kl_decay=self.kl_decay,
-                    lk_eps=self.lk_eps,
                 )
             acceptance_rates.append(acceptance_rate.detach())
             plosses.append(loss)
