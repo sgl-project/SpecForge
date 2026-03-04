@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
-from specforge.core.lk_loss import combine_kl_and_lk_loss
+from specforge.core.lk_loss import combine_kl_and_lk_loss, compute_acceptance_rate
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
@@ -89,10 +89,11 @@ class OnlineEagle3Model(Eagle3Model):
         *,
         logits: torch.Tensor,
         target_p: torch.Tensor,
+        target_p_for_acceptance: torch.Tensor,
         position_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         adapter: BackendAdapter,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with torch.no_grad():
             local_correct = (
                 (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
@@ -105,21 +106,34 @@ class OnlineEagle3Model(Eagle3Model):
 
         kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
         kl_loss = adapter.reduce_loss(kl_loss)
+
         if self.lk_loss_type is None:
             loss = kl_loss
+            with torch.no_grad():
+                acceptance_rate = compute_acceptance_rate(
+                    logits=logits,
+                    target_probs=target_p_for_acceptance,
+                    position_mask=position_mask,
+                    eps=self.lk_eps,
+                    reduce_fn=adapter.reduce_metrics,
+                )
         else:
-            loss = combine_kl_and_lk_loss(
+            acceptance_rate = compute_acceptance_rate(
                 logits=logits,
-                target_p=target_p,
+                target_probs=target_p_for_acceptance,
                 position_mask=position_mask,
+                eps=self.lk_eps,
+                reduce_fn=adapter.reduce_metrics,
+            )
+            loss = combine_kl_and_lk_loss(
                 kl_loss=kl_loss,
+                acceptance_rate=acceptance_rate,
                 lk_loss_type=self.lk_loss_type,
                 kl_scale=self.kl_scale,
                 kl_decay=self.kl_decay,
                 lk_eps=self.lk_eps,
-                reduce_fn=adapter.reduce_metrics,
             )
-        return acc, loss
+        return acc, acceptance_rate.detach(), loss
 
     def _prepare_position_ids(
         self,
@@ -178,7 +192,7 @@ class OnlineEagle3Model(Eagle3Model):
             position_ids: (batch, seq_len)
         """
         # Step 1: handle vocab size
-        target_p_padded, position_mask = _compute_target_p_padded(
+        target_p_padded, target_p_for_acceptance_padded, position_mask = _compute_target_p_padded(
             target=target,
             t2d=self.draft_model.t2d,
             loss_mask=loss_mask,
@@ -227,7 +241,7 @@ class OnlineEagle3Model(Eagle3Model):
 
         # Step 5: run TTT
         plosses = []
-        vlosses = []
+        acceptance_rates = []
         acces = []
         adapter = self._make_adapter()
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
@@ -251,6 +265,7 @@ class OnlineEagle3Model(Eagle3Model):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 target_p_padded=target_p_padded,
+                target_p_for_acceptance_padded=target_p_for_acceptance_padded,
                 position_mask=position_mask,
                 seq_length=seq_length,
             )
@@ -278,14 +293,16 @@ class OnlineEagle3Model(Eagle3Model):
             logits = self.draft_model.compute_logits(hidden_states)
 
             # Step 5.5 + 5.6: metric and loss
-            acc, loss = self._acc_and_loss(
+            acc, acceptance_rate, loss = self._acc_and_loss(
                 logits=logits,
                 target_p=state.target_p,
+                target_p_for_acceptance=state.target_p_for_acceptance,
                 position_mask=state.position_mask,
                 loss_mask=state.loss_mask,
                 adapter=adapter,
             )
             acces.append(acc)
+            acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
 
             if not is_last:
@@ -294,7 +311,7 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
-        return plosses, vlosses, acces
+        return plosses, acceptance_rates, acces
 
 
 class QwenVLOnlineEagle3Model(Eagle3Model):
@@ -474,7 +491,11 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         )
 
         # Step 1: handle vocab size
-        target_p_padded, position_mask = _compute_target_p_padded(
+        (
+            target_p_padded,
+            target_p_for_acceptance_padded,
+            position_mask,
+        ) = _compute_target_p_padded(
             target=target,
             t2d=self.draft_model.t2d,
             loss_mask=loss_mask,
@@ -539,7 +560,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
         # Step 5: run TTT
         plosses = []
-        vlosses = []
+        acceptance_rates = []
         acces = []
         if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
@@ -552,6 +573,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
+            target_p_for_acceptance = target_p_for_acceptance_padded[
+                :, idx : idx + seq_length, :
+            ].contiguous()
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
@@ -591,17 +615,29 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
             if self.lk_loss_type is None:
                 loss = kl_loss
+                with torch.no_grad():
+                    acceptance_rate = compute_acceptance_rate(
+                        logits=logits,
+                        target_probs=target_p_for_acceptance,
+                        position_mask=position_mask,
+                        eps=self.lk_eps,
+                    )
             else:
-                loss = combine_kl_and_lk_loss(
+                acceptance_rate = compute_acceptance_rate(
                     logits=logits,
-                    target_p=target_p,
+                    target_probs=target_p_for_acceptance,
                     position_mask=position_mask,
+                    eps=self.lk_eps,
+                )
+                loss = combine_kl_and_lk_loss(
                     kl_loss=kl_loss,
+                    acceptance_rate=acceptance_rate,
                     lk_loss_type=self.lk_loss_type,
                     kl_scale=self.kl_scale,
                     kl_decay=self.kl_decay,
                     lk_eps=self.lk_eps,
                 )
+            acceptance_rates.append(acceptance_rate.detach())
             plosses.append(loss)
 
             if not is_last:
@@ -610,12 +646,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
-        return plosses, vlosses, acces
+        return plosses, acceptance_rates, acces
 
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():
-        target_p, position_mask = _compute_target_p(
+        target_p, target_p_for_acceptance, position_mask = _compute_target_p(
             target=target,
             t2d=t2d,
             loss_mask=loss_mask,
@@ -629,8 +665,14 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
             # For bitwise equality with previous code
             value=1 / target_p.shape[-1],
         )
+        target_p_for_acceptance_padded = F.pad(
+            target_p_for_acceptance,
+            pad=(0, 0, 0, length),
+            mode="constant",
+            value=0.0,
+        )
 
-        return target_p_padded, position_mask
+        return target_p_padded, target_p_for_acceptance_padded, position_mask
 
 
 @torch.compile(dynamic=None)
@@ -640,11 +682,14 @@ def _compute_target_p(target, t2d, loss_mask):
     target_mask = t2d[target_max_token]
     target_mask = target_mask[..., None].int()
     position_mask = target_mask * loss_mask
-    target_head = target_head[..., t2d]
     target_head = target_head.float()
-    target_p = nn.Softmax(dim=2)(target_head)
+    target_head_for_kl = target_head[..., t2d]
+    target_p = nn.Softmax(dim=2)(target_head_for_kl)
+    target_logsumexp = torch.logsumexp(target_head, dim=-1, keepdim=True)
+    target_p_for_acceptance = torch.exp(target_head_for_kl - target_logsumexp)
     target_p = target_p.detach()
-    return target_p, position_mask
+    target_p_for_acceptance = target_p_for_acceptance.detach()
+    return target_p, target_p_for_acceptance, position_mask
 
 
 @torch.compile(dynamic=None)

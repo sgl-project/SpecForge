@@ -40,38 +40,45 @@ def masked_mean(
     return numerator / denominator
 
 
-def combine_kl_and_lk_loss(
+def compute_acceptance_rate(
     *,
     logits: torch.Tensor,
-    target_p: torch.Tensor,
+    target_probs: torch.Tensor,
     position_mask: torch.Tensor,
-    kl_loss: torch.Tensor,
-    lk_loss_type: str,
-    kl_scale: float,
-    kl_decay: float,
-    lk_eps: float,
+    eps: float = 1e-8,
     reduce_fn: Optional[
         Callable[..., Tuple[torch.Tensor, torch.Tensor]]
     ] = None,
 ) -> torch.Tensor:
-    """Combine KL and LK objectives according to the selected LK loss type."""
-
-    draft_p = F.softmax(logits.to(torch.float32), dim=-1).to(target_p.dtype)
+    """Compute expected acceptance rate from draft logits and target probabilities."""
+    draft_p = F.softmax(logits.to(torch.float32), dim=-1).to(target_probs.dtype)
     acc_per_tok = expected_acceptance_rate_torch(
-        target_probs=target_p,
+        target_probs=target_probs,
         draft_probs=draft_p,
     )
-    acc = masked_mean(
+    return masked_mean(
         acc_per_tok,
         position_mask.squeeze(-1),
-        eps=lk_eps,
+        eps=eps,
         reduce_fn=reduce_fn,
     )
 
+
+def combine_kl_and_lk_loss(
+    *,
+    kl_loss: torch.Tensor,
+    acceptance_rate: torch.Tensor,
+    lk_loss_type: str,
+    kl_scale: float,
+    kl_decay: float,
+    lk_eps: float,
+) -> torch.Tensor:
+    """Combine KL and LK objectives according to the selected LK loss type."""
+
     if lk_loss_type == "alpha":
-        return -torch.log(acc.clamp_min(lk_eps))
+        return -torch.log(acceptance_rate.clamp_min(lk_eps))
     if lk_loss_type == "lambda":
-        lk_loss = 1.0 - acc
-        kl_weight = kl_scale * torch.exp(-kl_decay * acc)
+        lk_loss = 1.0 - acceptance_rate
+        kl_weight = kl_scale * torch.exp(-kl_decay * acceptance_rate)
         return kl_weight * kl_loss + (1.0 - kl_weight) * lk_loss
     raise ValueError(f"Unknown lk loss type: {lk_loss_type}")

@@ -603,9 +603,9 @@ def run_forward(
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
     if args.is_vlm and args.target_model_backend == "custom":
-        plosses, _, acces = eagle3_model(
+        plosses, acceptance_rates, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
             loss_mask=data["loss_mask"].cuda(),
@@ -657,7 +657,7 @@ def run_forward(
                 target.cuda()
             )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
-        plosses, _, acces = eagle3_model(
+        plosses, acceptance_rates, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
@@ -669,7 +669,7 @@ def run_forward(
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
         )
-    return plosses, acces
+    return plosses, acces, acceptance_rates
 
 
 def run_backward_and_update(
@@ -689,6 +689,7 @@ def run_backward_and_update(
 def record_metrcs(
     args: Namespace,
     accuracies: List[torch.Tensor],
+    acceptance_rates: List[torch.Tensor],
     plosses: List[torch.Tensor],
     global_step: int,
     tracker: Tracker,
@@ -710,6 +711,16 @@ def record_metrcs(
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
+        )
+
+    acceptance_rates = torch.stack(acceptance_rates)
+    assert acceptance_rates.shape[0] == args.ttt_length
+    dist.all_reduce(acceptance_rates, op=dist.ReduceOp.AVG)
+    acceptance_rates = acceptance_rates.cpu().tolist()
+    for i in range(len(acceptance_rates)):
+        logdict[f"{mode}/acceptance_rate_{i}"] = acceptance_rates[i]
+        print_on_rank0(
+            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acceptance Rate: {acceptance_rates[i]:.4f}"
         )
 
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
@@ -902,7 +913,7 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(
+            plosses, acces, acceptance_rates = run_forward(
                 args,
                 eagle3_model,
                 data,
@@ -916,6 +927,7 @@ def main():
                 record_metrcs(
                     args,
                     acces,
+                    acceptance_rates,
                     plosses,
                     global_step // args.draft_accumulation_steps,
                     tracker,
@@ -928,10 +940,14 @@ def main():
                 last_time = time.time()
                 avg_loss = sum(pl for pl in plosses) / len(plosses)
                 avg_acc = sum(acces) / len(acces)
+                avg_acceptance_rate = sum(ar for ar in acceptance_rates) / len(
+                    acceptance_rates
+                )
                 progress_bar.set_postfix(
                     {
                         "loss": f"{avg_loss:.2f}",
                         "acc": f"{avg_acc:.2f}",
+                        "acceptance_rate": f"{avg_acceptance_rate:.2f}",
                         "time": f"{time_per_step:.2f}s",
                     }
                 )
@@ -951,15 +967,20 @@ def main():
                 # Run evaluation
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
+                eval_acceptance_rates = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
-                        plosses, acces = run_forward(
+                        plosses, acces, acceptance_rates = run_forward(
                             args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))
+                        ]
+                        eval_acceptance_rates = [
+                            eval_acceptance_rates[i] + [acceptance_rates[i]]
+                            for i in range(len(acceptance_rates))
                         ]
                         eval_plosses = [
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
@@ -967,11 +988,15 @@ def main():
 
                 # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
+                eval_acceptance_rates = [
+                    torch.stack(ar).mean() for ar in eval_acceptance_rates
+                ]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
                 record_metrcs(
                     args,
                     eval_acces,
+                    eval_acceptance_rates,
                     eval_plosses,
                     global_step // args.draft_accumulation_steps,
                     tracker,

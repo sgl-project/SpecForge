@@ -17,6 +17,7 @@ class StepState:
     position_ids: torch.Tensor
     attention_mask: torch.Tensor
     target_p: torch.Tensor
+    target_p_for_acceptance: torch.Tensor
     position_mask: torch.Tensor
     loss_mask: torch.Tensor
 
@@ -36,6 +37,7 @@ class BackendAdapter:
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
+        target_p_for_acceptance_padded: torch.Tensor,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
@@ -62,16 +64,21 @@ class SdpaLikeAdapter(BackendAdapter):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
+        target_p_for_acceptance_padded: torch.Tensor,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
         target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
+        target_p_for_acceptance = target_p_for_acceptance_padded[
+            :, idx : idx + seq_length, :
+        ].contiguous()
         return StepState(
             input_ids=global_input_ids,
             hidden_states=hidden_states,
             position_ids=position_ids,
             attention_mask=attention_mask,
             target_p=target_p,
+            target_p_for_acceptance=target_p_for_acceptance,
             position_mask=position_mask,
             loss_mask=loss_mask,
         )
@@ -96,6 +103,7 @@ class UspAdapter(BackendAdapter):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
+        target_p_for_acceptance_padded: torch.Tensor,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
@@ -106,12 +114,16 @@ class UspAdapter(BackendAdapter):
                 f"ttt_length ({ttt_length})"
             )
         target_p = target_p_padded[:, idx : idx + usp_chunk_size, :]
+        target_p_for_acceptance = target_p_for_acceptance_padded[
+            :, idx : idx + usp_chunk_size, :
+        ]
         return StepState(
             input_ids=global_input_ids[:, :usp_chunk_size],
             hidden_states=hidden_states[:, :usp_chunk_size, :],
             position_ids=position_ids[:, : usp_chunk_size * self.sp_ulysses_degree],
             attention_mask=attention_mask[:, :usp_chunk_size],
             target_p=target_p,
+            target_p_for_acceptance=target_p_for_acceptance,
             position_mask=position_mask[:, :usp_chunk_size, :],
             loss_mask=loss_mask[:, :usp_chunk_size, :],
         )
