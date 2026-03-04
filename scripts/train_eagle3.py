@@ -184,7 +184,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     lk_group.add_argument(
         "--kl-decay",
         type=float,
-        default=1.0,
+        default=3.0,
         help="Decay for adaptive KL weight. Used when --lk-loss-type=lambda.",
     )
 

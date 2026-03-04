@@ -77,7 +77,6 @@ class OnlineEagle3Model(Eagle3Model):
         self.lk_loss_type = lk_loss_type
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
-        self.lk_eps = 1e-8
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -89,14 +88,19 @@ class OnlineEagle3Model(Eagle3Model):
         *,
         logits: torch.Tensor,
         target_p: torch.Tensor,
-        target_p_for_acceptance: torch.Tensor,
+        target_p_on_draft: torch.Tensor,
+        target_token_ids: torch.Tensor,
         position_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         adapter: BackendAdapter,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with torch.no_grad():
+            pred_draft_token_ids = logits.argmax(-1)
+            pred_target_token_ids = (
+                pred_draft_token_ids + self.draft_model.d2t[pred_draft_token_ids]
+            )
             local_correct = (
-                (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
+                (pred_target_token_ids == target_token_ids) * loss_mask.squeeze(-1)
             ).sum()
             local_denom = loss_mask.sum().clamp_min(1e-6)
             local_correct, local_denom = adapter.reduce_metrics(
@@ -112,14 +116,14 @@ class OnlineEagle3Model(Eagle3Model):
             with torch.no_grad():
                 acceptance_rate = compute_acceptance_rate(
                     logits=logits,
-                    target_probs=target_p_for_acceptance,
+                    target_probs=target_p_on_draft,
                     position_mask=position_mask,
                     reduce_fn=adapter.reduce_metrics,
                 )
         else:
             acceptance_rate = compute_acceptance_rate(
                 logits=logits,
-                target_probs=target_p_for_acceptance,
+                target_probs=target_p_on_draft,
                 position_mask=position_mask,
                 reduce_fn=adapter.reduce_metrics,
             )
@@ -189,7 +193,12 @@ class OnlineEagle3Model(Eagle3Model):
             position_ids: (batch, seq_len)
         """
         # Step 1: handle vocab size
-        target_p_padded, target_p_for_acceptance_padded, position_mask = _compute_target_p_padded(
+        (
+            target_p_padded,
+            target_p_on_draft_padded,
+            target_token_ids_padded,
+            position_mask,
+        ) = _compute_target_p_padded(
             target=target,
             t2d=self.draft_model.t2d,
             loss_mask=loss_mask,
@@ -262,7 +271,8 @@ class OnlineEagle3Model(Eagle3Model):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 target_p_padded=target_p_padded,
-                target_p_for_acceptance_padded=target_p_for_acceptance_padded,
+                target_p_on_draft_padded=target_p_on_draft_padded,
+                target_token_ids_padded=target_token_ids_padded,
                 position_mask=position_mask,
                 seq_length=seq_length,
             )
@@ -293,7 +303,8 @@ class OnlineEagle3Model(Eagle3Model):
             acc, acceptance_rate, loss = self._acc_and_loss(
                 logits=logits,
                 target_p=state.target_p,
-                target_p_for_acceptance=state.target_p_for_acceptance,
+                target_p_on_draft=state.target_p_on_draft,
+                target_token_ids=state.target_token_ids,
                 position_mask=state.position_mask,
                 loss_mask=state.loss_mask,
                 adapter=adapter,
@@ -489,7 +500,8 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         # Step 1: handle vocab size
         (
             target_p_padded,
-            target_p_for_acceptance_padded,
+            target_p_on_draft_padded,
+            target_token_ids_padded,
             position_mask,
         ) = _compute_target_p_padded(
             target=target,
@@ -569,8 +581,11 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
-            target_p_for_acceptance = target_p_for_acceptance_padded[
+            target_p_on_draft = target_p_on_draft_padded[
                 :, idx : idx + seq_length, :
+            ].contiguous()
+            target_token_ids = target_token_ids_padded[
+                :, idx : idx + seq_length
             ].contiguous()
             is_last = idx == self.length - 1
 
@@ -601,9 +616,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 acces.append(
                     _compute_metric_acc(
                         logits=logits,
-                        target_p=target_p,
-                        position_mask=position_mask,
+                        target_token_ids=target_token_ids,
                         loss_mask=loss_mask,
+                        d2t=self.draft_model.d2t,
                     )
                 )
 
@@ -614,13 +629,13 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 with torch.no_grad():
                     acceptance_rate = compute_acceptance_rate(
                         logits=logits,
-                        target_probs=target_p_for_acceptance,
+                        target_probs=target_p_on_draft,
                         position_mask=position_mask,
                     )
             else:
                 acceptance_rate = compute_acceptance_rate(
                     logits=logits,
-                    target_probs=target_p_for_acceptance,
+                    target_probs=target_p_on_draft,
                     position_mask=position_mask,
                 )
                 loss = compute_lk_loss(
@@ -644,7 +659,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():
-        target_p, target_p_for_acceptance, position_mask = _compute_target_p(
+        (
+            target_p,
+            target_p_on_draft,
+            target_token_ids,
+            position_mask,
+        ) = _compute_target_p(
             target=target,
             t2d=t2d,
             loss_mask=loss_mask,
@@ -658,35 +678,49 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
             # For bitwise equality with previous code
             value=1 / target_p.shape[-1],
         )
-        target_p_for_acceptance_padded = F.pad(
-            target_p_for_acceptance,
+        target_p_on_draft_padded = F.pad(
+            target_p_on_draft,
             pad=(0, 0, 0, length),
             mode="constant",
             value=0.0,
         )
+        target_token_ids_padded = F.pad(
+            target_token_ids,
+            pad=(0, length),
+            mode="constant",
+            value=0,
+        )
 
-        return target_p_padded, target_p_for_acceptance_padded, position_mask
+        return (
+            target_p_padded,
+            target_p_on_draft_padded,
+            target_token_ids_padded,
+            position_mask,
+        )
 
 
 @torch.compile(dynamic=None)
 def _compute_target_p(target, t2d, loss_mask):
-    target_head = target
-    target_max_token = target_head.argmax(-1)
-    target_mask = t2d[target_max_token]
+    target_head = target.float()
+    target_token_ids = target_head.argmax(-1)
+    target_mask = t2d[target_token_ids]
     target_mask = target_mask[..., None].int()
     position_mask = target_mask * loss_mask
     target_head = target_head.float()
-    target_head_for_kl = target_head[..., t2d]
-    target_p = nn.Softmax(dim=2)(target_head_for_kl)
+    draft_target_head = target_head[..., t2d]
+    target_p = nn.Softmax(dim=2)(draft_target_head)
     target_logsumexp = torch.logsumexp(target_head, dim=-1, keepdim=True)
-    target_p_for_acceptance = torch.exp(target_head_for_kl - target_logsumexp)
+    target_p_on_draft = torch.exp(draft_target_head - target_logsumexp)
     target_p = target_p.detach()
-    target_p_for_acceptance = target_p_for_acceptance.detach()
-    return target_p, target_p_for_acceptance, position_mask
+    target_p_on_draft = target_p_on_draft.detach()
+    target_token_ids = target_token_ids.detach()
+    return target_p, target_p_on_draft, target_token_ids, position_mask
 
 
 @torch.compile(dynamic=None)
-def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
+def _compute_metric_acc(logits, target_token_ids, loss_mask, d2t):
+    pred_draft_token_ids = logits.argmax(-1)
+    pred_target_token_ids = pred_draft_token_ids + d2t[pred_draft_token_ids]
     return (
-        (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
+        (pred_target_token_ids == target_token_ids) * loss_mask.squeeze(-1)
     ).sum() / loss_mask.sum().clamp_min(1e-6)

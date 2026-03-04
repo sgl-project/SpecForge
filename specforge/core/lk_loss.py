@@ -33,13 +33,11 @@ def compute_acceptance_rate(
         target_probs=target_probs,
         draft_probs=draft_p,
     )
-
     mask = position_mask.squeeze(-1)
     if mask.dtype == torch.bool:
         mask = mask.float()
     else:
         mask = mask.to(dtype=acceptance_rate_per_token.dtype)
-
     numerator = (acceptance_rate_per_token * mask).sum()
     denominator = mask.sum().clamp_min(eps)
     if reduce_fn is not None:
@@ -59,7 +57,6 @@ def compute_lk_loss(
     kl_decay: float,
 ) -> torch.Tensor:
     """Combine KL and LK objectives according to the selected LK loss type."""
-
     if lk_loss_type == "alpha":
         return -torch.log(acceptance_rate)
     if lk_loss_type == "lambda":
