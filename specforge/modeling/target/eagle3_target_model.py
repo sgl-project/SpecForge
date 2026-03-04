@@ -375,7 +375,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_config = ModelConfig.from_server_args(server_args)
         if disable_ipc:
             # Disable FlashInfer allreduce fusion which uses CUDA IPC handles
-            # that cannot cross node boundaries without MNNVL support.
+            # (cudaIpcGetMemHandle) that cannot cross node boundaries.
             # Must be set after ModelConfig.from_server_args() which auto-enables
             # it for MoE models (e.g. Qwen3MoeForCausalLM) on SM90/SM100 hardware.
             server_args.enable_flashinfer_allreduce_fusion = False
