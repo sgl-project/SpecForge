@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -38,8 +38,8 @@ class BackendAdapter:
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
-        target_p_on_draft_padded: torch.Tensor,
-        target_token_ids_padded: torch.Tensor,
+        target_p_on_draft_padded: Optional[torch.Tensor] = None,
+        target_token_ids_padded: Optional[torch.Tensor] = None,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
@@ -66,11 +66,15 @@ class SdpaLikeAdapter(BackendAdapter):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
-        target_p_on_draft_padded: torch.Tensor,
-        target_token_ids_padded: torch.Tensor,
+        target_p_on_draft_padded: Optional[torch.Tensor] = None,
+        target_token_ids_padded: Optional[torch.Tensor] = None,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
+        if target_p_on_draft_padded is None:
+            target_p_on_draft_padded = target_p_padded
+        if target_token_ids_padded is None:
+            target_token_ids_padded = target_p_padded.argmax(dim=-1)
         target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
         target_p_on_draft = target_p_on_draft_padded[
             :, idx : idx + seq_length, :
@@ -110,11 +114,15 @@ class UspAdapter(BackendAdapter):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
-        target_p_on_draft_padded: torch.Tensor,
-        target_token_ids_padded: torch.Tensor,
+        target_p_on_draft_padded: Optional[torch.Tensor] = None,
+        target_token_ids_padded: Optional[torch.Tensor] = None,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
+        if target_p_on_draft_padded is None:
+            target_p_on_draft_padded = target_p_padded
+        if target_token_ids_padded is None:
+            target_token_ids_padded = target_p_padded.argmax(dim=-1)
         usp_chunk_size = seq_length - ttt_length
         if usp_chunk_size <= 0:
             raise ValueError(

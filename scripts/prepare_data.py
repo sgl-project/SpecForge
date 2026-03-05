@@ -3,7 +3,6 @@ import json
 import os
 import random
 import subprocess
-import uuid
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -245,7 +244,7 @@ def process_nebius_infinity_instruct(
         {"role": "user", "content": conversation["content"]},
         {"role": "assistant", "content": generated_message["content"]},
     ]
-    row = {"id": uuid.uuid4().hex[:8], "conversations": formatted_conversations}
+    row = {"id": str(row["id"]), "conversations": formatted_conversations}
     return row, 0
 
 
@@ -599,6 +598,7 @@ def main():
         ds = load_dataset(
             "nebius/Llama-3.1-8B-Instruct-Infinity-Instruct-0625", split="train"
         )
+        ds = ds.map(add_index, with_indices=True)
         proc_fn = process_nebius_infinity_instruct
     elif args.dataset == "allava4v":
         ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
