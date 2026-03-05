@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import uuid
 import random
 import subprocess
 from pathlib import Path
@@ -58,6 +59,7 @@ def parse_args():
             "magicoder-evol-instruct",
             "sciq",
             "camel",
+            "nebius-llama31-8b-infinity-instruct",
         ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
@@ -232,6 +234,17 @@ def process_sharegpt4v_row(row, dataset_name: str = None) -> Dict:
 
     row = {"id": row["id"], "image": image, "conversations": formatted_conversations}
     return row, skipped_count
+
+
+def process_nebius_infinity_instruct(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    conversation = row["conversation"][0]
+    generated_message = row["generated_message"]
+    formatted_conversations = [
+        {"role": "user", "content": conversation["content"]},
+        {"role": "assistant", "content": generated_message["content"]},
+    ]
+    row = {"id": uuid.uuid4().hex[:8], "conversations": formatted_conversations}
+    return row, 0
 
 
 def load_dataset_from_path(data_path: Path):
@@ -580,6 +593,9 @@ def main():
         raise Exception("Not supported sharegpt4v now")
         download_vlm_dataset(args.dataset)
         proc_fn = process_sharegpt4v_row
+    elif args.dataset == "nebius-llama31-8b-infinity-instruct":
+        ds = load_dataset("nebius/Llama-3.1-8B-Instruct-Infinity-Instruct-0625", split="train")
+        proc_fn = process_nebius_infinity_instruct
     elif args.dataset == "allava4v":
         ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
             "instruct"

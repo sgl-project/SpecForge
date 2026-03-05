@@ -60,7 +60,7 @@ def compute_lk_loss(
     if lk_loss_type == "alpha":
         return -torch.log(acceptance_rate)
     if lk_loss_type == "lambda":
-        lk_loss = 1.0 - acceptance_rate
-        kl_weight = kl_scale * torch.exp(-kl_decay * acceptance_rate)
-        return kl_weight * kl_loss + (1.0 - kl_weight) * lk_loss
+        acc_det = acceptance_rate.detach()
+        kl_weight = kl_scale * torch.exp(-kl_decay * acc_det)
+        return kl_weight * kl_loss + (1 - kl_weight) * (1 - acceptance_rate)
     raise ValueError(f"Unknown lk loss type: {lk_loss_type}")
