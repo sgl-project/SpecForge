@@ -23,9 +23,7 @@ def compute_acceptance_rate(
     target_probs: torch.Tensor,
     position_mask: torch.Tensor,
     eps: float = 1e-8,
-    reduce_fn: Optional[
-        Callable[..., Tuple[torch.Tensor, torch.Tensor]]
-    ] = None,
+    reduce_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> torch.Tensor:
     """Compute expected acceptance rate from draft logits and target probabilities."""
     draft_p = F.softmax(logits.to(torch.float32), dim=-1).to(target_probs.dtype)

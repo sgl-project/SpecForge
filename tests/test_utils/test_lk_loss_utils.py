@@ -5,8 +5,8 @@ import torch
 import_error = None
 try:
     from specforge.core.lk_loss import (
-        compute_lk_loss,
         compute_acceptance_rate,
+        compute_lk_loss,
         expected_acceptance_rate,
     )
 except ModuleNotFoundError as exc:

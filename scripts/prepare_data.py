@@ -1,9 +1,9 @@
 import argparse
 import json
 import os
-import uuid
 import random
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -236,7 +236,9 @@ def process_sharegpt4v_row(row, dataset_name: str = None) -> Dict:
     return row, skipped_count
 
 
-def process_nebius_infinity_instruct(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+def process_nebius_infinity_instruct(
+    row: Dict, dataset_name: str = None
+) -> Tuple[Dict, int]:
     conversation = row["conversation"][0]
     generated_message = row["generated_message"]
     formatted_conversations = [
@@ -594,7 +596,9 @@ def main():
         download_vlm_dataset(args.dataset)
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "nebius-llama31-8b-infinity-instruct":
-        ds = load_dataset("nebius/Llama-3.1-8B-Instruct-Infinity-Instruct-0625", split="train")
+        ds = load_dataset(
+            "nebius/Llama-3.1-8B-Instruct-Infinity-Instruct-0625", split="train"
+        )
         proc_fn = process_nebius_infinity_instruct
     elif args.dataset == "allava4v":
         ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[

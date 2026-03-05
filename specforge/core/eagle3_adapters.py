@@ -122,9 +122,7 @@ class UspAdapter(BackendAdapter):
                 f"ttt_length ({ttt_length})"
             )
         target_p = target_p_padded[:, idx : idx + usp_chunk_size, :]
-        target_p_on_draft = target_p_on_draft_padded[
-            :, idx : idx + usp_chunk_size, :
-        ]
+        target_p_on_draft = target_p_on_draft_padded[:, idx : idx + usp_chunk_size, :]
         target_token_ids = target_token_ids_padded[:, idx : idx + usp_chunk_size]
         return StepState(
             input_ids=global_input_ids[:, :usp_chunk_size],
