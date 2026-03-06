@@ -6,7 +6,6 @@ import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
-    Glm4MoeLiteConfig,
     GptOssConfig,
     Llama4Config,
     Llama4TextConfig,
@@ -19,8 +18,16 @@ from transformers import (
     modeling_utils,
 )
 
+try:
+    from transformers import Glm4MoeLiteConfig
+    _GLM4_CONFIG_AVAILABLE = True
+except ImportError:
+    Glm4MoeLiteConfig = None
+    _GLM4_CONFIG_AVAILABLE = False
+
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.custom_backend import (
+    _GLM4_AVAILABLE,
     Glm4MoeLiteForCausalLM,
     GptOssForCausalLM,
     Llama4ForCausalLM,
@@ -88,7 +95,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
-        Glm4MoeLiteConfig: [Glm4MoeLiteForCausalLM],
+        **({Glm4MoeLiteConfig: [Glm4MoeLiteForCausalLM]} if _GLM4_CONFIG_AVAILABLE and _GLM4_AVAILABLE else {}),
         Llama4TextConfig: [Llama4ForCausalLM],
         Qwen3MoeConfig: [Qwen3MoeForCausalLM],
         Qwen2Config: [Qwen2ForCausalLM],

@@ -1,4 +1,10 @@
-from .glm4_moe_lite import Glm4MoeLiteForCausalLM
+try:
+    from .glm4_moe_lite import Glm4MoeLiteForCausalLM
+    _GLM4_AVAILABLE = True
+except ImportError:
+    Glm4MoeLiteForCausalLM = None
+    _GLM4_AVAILABLE = False
+
 from .gpt_oss import GptOssForCausalLM
 from .llama import LlamaForCausalLM
 from .llama4 import Llama4ForCausalLM
