@@ -54,7 +54,7 @@ def compute_lk_loss(
     kl_scale: float,
     kl_decay: float,
 ) -> torch.Tensor:
-    """Combine KL and LK objectives according to the selected LK loss type."""
+    """Compute LK loss from KL loss and acceptance rate."""
     if lk_loss_type == "alpha":
         return -torch.log(acceptance_rate)
     if lk_loss_type == "lambda":
