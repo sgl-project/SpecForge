@@ -18,8 +18,17 @@ from transformers import (
     modeling_utils,
 )
 
+try:
+    from transformers import Glm4MoeLiteConfig
+    _GLM4_CONFIG_AVAILABLE = True
+except ImportError:
+    Glm4MoeLiteConfig = None
+    _GLM4_CONFIG_AVAILABLE = False
+
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.custom_backend import (
+    _GLM4_AVAILABLE,
+    Glm4MoeLiteForCausalLM,
     GptOssForCausalLM,
     Llama4ForCausalLM,
     LlamaForCausalLM,
@@ -86,6 +95,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
+        **({Glm4MoeLiteConfig: [Glm4MoeLiteForCausalLM]} if _GLM4_CONFIG_AVAILABLE and _GLM4_AVAILABLE else {}),
         Llama4TextConfig: [Llama4ForCausalLM],
         Qwen3MoeConfig: [Qwen3MoeForCausalLM],
         Qwen2Config: [Qwen2ForCausalLM],
@@ -171,5 +181,9 @@ class AutoDraftModelConfig:
         # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
         if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
             config["draft_vocab_size"] = config.get("vocab_size", None)
+
+        # Ensure rope_scaling is None if not explicitly set, to avoid "default" type errors
+        if "rope_scaling" not in config:
+            config["rope_scaling"] = None
 
         return cls._config_mapping[architecture].from_dict(config)
