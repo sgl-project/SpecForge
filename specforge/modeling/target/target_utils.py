@@ -15,6 +15,7 @@ class TargetEmbeddingsAndHead(nn.Module):
     """
     Efficiently loads only the embedding layer and lm_head from a pretrained model.
     Handles safetensors slicing and Weight Tying correctly.
+    Supports VLM configs (Qwen3.5) where vocab_size/hidden_size live in text_config.
     """
 
     def __init__(self, config):
