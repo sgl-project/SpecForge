@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
@@ -42,7 +42,6 @@ from specforge.utils import (
     print_with_rank,
 )
 
-QWEN3_VL_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
 QWEN3_5_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
 
 
@@ -279,20 +278,6 @@ def parse_args():
         default=1,
         help="The size of the tensor parallel for the target model",
     )
-    optimization_group.add_argument(
-        "--device-map-auto",
-        action="store_true",
-        help="[HF backend only] Use device_map='auto' to distribute target model across visible GPUs. "
-        "Useful when single process has multiple GPUs (e.g. 1 process, 8 GPUs).",
-    )
-    optimization_group.add_argument(
-        "--fsdp-cpu-offload",
-        action="store_true",
-        help="Enable FSDP CPU offload: offload draft model params and optimizer states to CPU. "
-        "Reduces GPU memory at cost of ~20-30%% slower training. "
-        "Use --accumulation-steps 1 when enabling this.",
-    )
-
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
@@ -321,58 +306,15 @@ def build_models(
     target_model_type = getattr(target_config, "model_type", None)
 
     def _hf_target_load_kwargs():
-        kwargs = {
+        return {
             "torch_dtype": torch.bfloat16,
             "trust_remote_code": args.trust_remote_code,
         }
-        if getattr(args, "device_map_auto", False):
-            kwargs["device_map"] = "auto"
-            print_on_rank0(
-                "Using device_map='auto' for target model (distribute across GPUs)"
-            )
-        return kwargs
 
     def _hf_target_post_load(model):
-        model = model.eval()
-        if not getattr(args, "device_map_auto", False):
-            model = model.cuda()
-        return model
+        return model.eval().cuda()
 
     if (
-        args.target_model_backend == "hf"
-        and is_vlm
-        and target_model_type == "qwen3_vl"
-        and args.tp_size == 1
-    ):
-        from transformers import Qwen3VLForConditionalGeneration
-
-        target_model = HFDFlashTargetModel(
-            _hf_target_post_load(
-                Qwen3VLForConditionalGeneration.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    **_hf_target_load_kwargs(),
-                )
-            ),
-            model_type=target_model_type,
-        )
-    elif (
-        args.target_model_backend == "hf"
-        and is_vlm
-        and target_model_type == "qwen3_vl_moe"
-        and args.tp_size == 1
-    ):
-        from transformers import Qwen3VLMoeForConditionalGeneration
-
-        target_model = HFDFlashTargetModel(
-            _hf_target_post_load(
-                Qwen3VLMoeForConditionalGeneration.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    **_hf_target_load_kwargs(),
-                )
-            ),
-            model_type=target_model_type,
-        )
-    elif (
         args.target_model_backend == "hf"
         and is_vlm
         and target_model_type == "qwen3_5"
@@ -410,22 +352,12 @@ def build_models(
         target_model_kwargs = {}
         if args.target_model_backend == "sglang":
             target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-        elif args.target_model_backend == "hf" and getattr(
-            args, "device_map_auto", False
-        ):
-            target_model_kwargs["device_map"] = "auto"
-            print_on_rank0(
-                "Using device_map='auto' for target model (distribute across GPUs)"
-            )
 
         target_model = get_dflash_target_model(
             pretrained_model_name_or_path=args.target_model_path,
             backend=args.target_model_backend,
             torch_dtype=torch.bfloat16,
-            device="cuda"
-            if args.target_model_backend == "hf"
-            and not getattr(args, "device_map_auto", False)
-            else None,
+            device="cuda" if args.target_model_backend == "hf" else None,
             trust_remote_code=args.trust_remote_code,
             **target_model_kwargs,
         )
@@ -456,34 +388,7 @@ def build_models(
         draft_config.dflash_config = dict(draft_config.dflash_config)
 
     model_type = getattr(target_config, "model_type", None)
-    if model_type in QWEN3_VL_MODEL_TYPES:
-        recommended_layer_ids = _build_target_layer_ids(
-            num_target_layers=target_num_layers,
-            num_draft_layers=draft_config.num_hidden_layers,
-        )
-        if recommended_layer_ids and recommended_layer_ids[0] < 3:
-            recommended_layer_ids[0] = 3
-        if "target_layer_ids" not in draft_config.dflash_config:
-            draft_config.dflash_config["target_layer_ids"] = recommended_layer_ids
-            print_on_rank0(
-                "Qwen3-VL detected: default target_layer_ids set to "
-                f"{draft_config.dflash_config['target_layer_ids']} "
-                "(first layer forced to 3)."
-            )
-        elif (
-            draft_config.dflash_config["target_layer_ids"]
-            and draft_config.dflash_config["target_layer_ids"][0] < 3
-        ):
-            old_layer_ids = draft_config.dflash_config["target_layer_ids"]
-            new_layer_ids = list(old_layer_ids)
-            new_layer_ids[0] = 3
-            draft_config.dflash_config["target_layer_ids"] = new_layer_ids
-            print_on_rank0(
-                "Qwen3-VL detected: overriding first target layer "
-                f"{old_layer_ids} -> {new_layer_ids} "
-                "to avoid deepstack train/serve mismatch."
-            )
-    elif model_type in QWEN3_5_MODEL_TYPES:
+    if model_type in QWEN3_5_MODEL_TYPES:
         if "target_layer_ids" not in draft_config.dflash_config:
             recommended_layer_ids = _build_target_layer_ids(
                 num_target_layers=target_num_layers,
@@ -812,18 +717,6 @@ def main():
         ),
         "sharding_strategy": ShardingStrategy.SHARD_GRAD_OP,
     }
-    if getattr(args, "fsdp_cpu_offload", False):
-        fsdp_kwargs["cpu_offload"] = CPUOffload(
-            offload_params=True
-        )
-        print_on_rank0(
-            "FSDP CPU offload enabled (params + optimizer states -> CPU)"
-        )
-        if args.accumulation_steps > 1:
-            print_on_rank0(
-                "Warning: FSDP CPU offload with accumulation_steps>1 may cause issues. "
-                "Consider --accumulation-steps 1."
-            )
     dflash_model = FSDP(dflash_model, **fsdp_kwargs)
     print_with_rank("Initialized FSDP")
 

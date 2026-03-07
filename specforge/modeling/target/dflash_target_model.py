@@ -21,9 +21,8 @@ from specforge.distributed import get_tp_group
 
 from .sglang_backend import SGLangRunner
 
-QWEN3_VL_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
 QWEN3_5_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
-VLM_MODEL_TYPES = QWEN3_VL_MODEL_TYPES | QWEN3_5_MODEL_TYPES
+VLM_MODEL_TYPES = QWEN3_5_MODEL_TYPES
 
 
 @dataclass
@@ -266,34 +265,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
         )
         model_type = getattr(hf_config, "model_type", None)
 
-        if model_type in QWEN3_VL_MODEL_TYPES:
-            if model_type == "qwen3_vl":
-                try:
-                    from transformers import Qwen3VLForConditionalGeneration
-                except ImportError as exc:
-                    raise ImportError(
-                        "Qwen3VLForConditionalGeneration is unavailable. "
-                        "Please upgrade transformers to a version with qwen3_vl support."
-                    ) from exc
-                model_cls = Qwen3VLForConditionalGeneration
-            else:
-                try:
-                    from transformers import Qwen3VLMoeForConditionalGeneration
-                except ImportError as exc:
-                    raise ImportError(
-                        "Qwen3VLMoeForConditionalGeneration is unavailable. "
-                        "Please upgrade transformers to a version with qwen3_vl_moe support."
-                    ) from exc
-                model_cls = Qwen3VLMoeForConditionalGeneration
-
-            target_model = model_cls.from_pretrained(
-                pretrained_model_name_or_path,
-                torch_dtype=torch_dtype,
-                cache_dir=cache_dir,
-                trust_remote_code=trust_remote_code,
-                **kwargs,
-            ).eval()
-        elif model_type in QWEN3_5_MODEL_TYPES:
+        if model_type in QWEN3_5_MODEL_TYPES:
             if model_type == "qwen3_5":
                 try:
                     from transformers import Qwen3_5ForConditionalGeneration
