@@ -20,7 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,59 @@ from specforge.utils import padding
 
 class Eagle3Model(nn.Module):
     pass
+
+
+def _compute_loss_and_acceptance_rate(
+    *,
+    logits: torch.Tensor,
+    target_p: torch.Tensor,
+    target_p_on_draft: torch.Tensor,
+    position_mask: torch.Tensor,
+    lk_loss_type: Optional[str],
+    kl_scale: float,
+    kl_decay: float,
+    reduce_metrics_fn: Optional[
+        Callable[..., Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
+    reduce_loss_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute step loss and acceptance rate for KL/LK objectives.
+
+    Args:
+        logits: Draft model logits for current step.
+        target_p: Renormalized target distribution over draft-vocab tokens (for KL).
+        target_p_on_draft: Original target probabilities restricted to draft-vocab tokens (for acceptance terms).
+        position_mask: Mask indicating valid tokens for loss/metric aggregation.
+        lk_loss_type: LK objective mode (`None`, `"alpha"`, or `"lambda"`).
+        kl_scale: Scale factor for lambda LK mixing weight.
+        kl_decay: Decay factor for lambda LK mixing weight.
+        reduce_metrics_fn: Optional distributed reducer for metric numer/denom.
+        reduce_loss_fn: Optional distributed reducer for KL loss.
+    """
+    kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    if reduce_loss_fn is not None:
+        kl_loss = reduce_loss_fn(kl_loss)
+
+    with torch.set_grad_enabled(lk_loss_type is not None):
+        acceptance_rate, log_acceptance_rate = compute_acceptance_rate(
+            logits=logits,
+            target_probs=target_p_on_draft,
+            position_mask=position_mask,
+            reduce_fn=reduce_metrics_fn,
+        )
+
+    if lk_loss_type is None:
+        loss = kl_loss
+    else:
+        loss = compute_lk_loss(
+            kl_loss=kl_loss,
+            acceptance_rate=acceptance_rate,
+            log_acceptance_rate=log_acceptance_rate,
+            lk_loss_type=lk_loss_type,
+            kl_scale=kl_scale,
+            kl_decay=kl_decay,
+        )
+    return acceptance_rate.detach(), loss
 
 
 class OnlineEagle3Model(Eagle3Model):
@@ -108,33 +161,18 @@ class OnlineEagle3Model(Eagle3Model):
             )
             acc = local_correct / local_denom
 
-        kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-        kl_loss = adapter.reduce_loss(kl_loss)
-
-        if self.lk_loss_type is None:
-            loss = kl_loss
-            with torch.no_grad():
-                acceptance_rate = compute_acceptance_rate(
-                    logits=logits,
-                    target_probs=target_p_on_draft,
-                    position_mask=position_mask,
-                    reduce_fn=adapter.reduce_metrics,
-                )
-        else:
-            acceptance_rate = compute_acceptance_rate(
-                logits=logits,
-                target_probs=target_p_on_draft,
-                position_mask=position_mask,
-                reduce_fn=adapter.reduce_metrics,
-            )
-            loss = compute_lk_loss(
-                kl_loss=kl_loss,
-                acceptance_rate=acceptance_rate,
-                lk_loss_type=self.lk_loss_type,
-                kl_scale=self.kl_scale,
-                kl_decay=self.kl_decay,
-            )
-        return acc, acceptance_rate.detach(), loss
+        acceptance_rate, loss = _compute_loss_and_acceptance_rate(
+            logits=logits,
+            target_p=target_p,
+            target_p_on_draft=target_p_on_draft,
+            position_mask=position_mask,
+            lk_loss_type=self.lk_loss_type,
+            kl_scale=self.kl_scale,
+            kl_decay=self.kl_decay,
+            reduce_metrics_fn=adapter.reduce_metrics,
+            reduce_loss_fn=adapter.reduce_loss,
+        )
+        return acc, acceptance_rate, loss
 
     def _prepare_position_ids(
         self,
@@ -623,29 +661,16 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-            if self.lk_loss_type is None:
-                loss = kl_loss
-                with torch.no_grad():
-                    acceptance_rate = compute_acceptance_rate(
-                        logits=logits,
-                        target_probs=target_p_on_draft,
-                        position_mask=position_mask,
-                    )
-            else:
-                acceptance_rate = compute_acceptance_rate(
-                    logits=logits,
-                    target_probs=target_p_on_draft,
-                    position_mask=position_mask,
-                )
-                loss = compute_lk_loss(
-                    kl_loss=kl_loss,
-                    acceptance_rate=acceptance_rate,
-                    lk_loss_type=self.lk_loss_type,
-                    kl_scale=self.kl_scale,
-                    kl_decay=self.kl_decay,
-                )
-            acceptance_rates.append(acceptance_rate.detach())
+            acceptance_rate, loss = _compute_loss_and_acceptance_rate(
+                logits=logits,
+                target_p=target_p,
+                target_p_on_draft=target_p_on_draft,
+                position_mask=position_mask,
+                lk_loss_type=self.lk_loss_type,
+                kl_scale=self.kl_scale,
+                kl_decay=self.kl_decay,
+            )
+            acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
 
             if not is_last:
@@ -706,7 +731,6 @@ def _compute_target_p(target, t2d, loss_mask):
     target_mask = t2d[target_token_ids]
     target_mask = target_mask[..., None].int()
     position_mask = target_mask * loss_mask
-    target_head = target_head.float()
     draft_target_head = target_head[..., t2d]
     target_p = nn.Softmax(dim=2)(draft_target_head)
     target_logsumexp = torch.logsumexp(target_head, dim=-1, keepdim=True)
