@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -432,12 +432,20 @@ def build_dataloaders(
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
+        f"is_preformatted={args.is_preformatted}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.train_data_path},
-    )
+    if args.is_preformatted:
+        train_dataset = load_dataset(
+            "json",
+            data_files=args.train_data_path,
+            split="train",
+        )
+    else:
+        train_dataset = Dataset.from_generator(
+            generator=safe_conversations_generator,
+            gen_kwargs={"file_path": args.train_data_path},
+        )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
@@ -485,10 +493,17 @@ def build_dataloaders(
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
-            eval_dataset = Dataset.from_generator(
-                generator=safe_conversations_generator,
-                gen_kwargs={"file_path": args.eval_data_path},
-            )
+            if args.is_preformatted:
+                eval_dataset = load_dataset(
+                    "json",
+                    data_files=args.eval_data_path,
+                    split="train",
+                )
+            else:
+                eval_dataset = Dataset.from_generator(
+                    generator=safe_conversations_generator,
+        gen_kwargs={"file_path": args.eval_data_path},
+    )
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
