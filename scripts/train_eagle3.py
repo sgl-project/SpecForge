@@ -10,9 +10,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate.utils import set_seed
-from torch.distributed.checkpoint.state_dict import get_state_dict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -545,33 +544,34 @@ def save_checkpoints(
         os.makedirs(epoch_output_dir, exist_ok=True)
     dist.barrier()
 
-    model_state_dict = get_state_dict(eagle3_model)
-    state_to_save = {
-        "epoch": epoch,
-        "global_step": step,
-        "args": args,
-    }
-    state_to_save.update(get_state_dict(optimizer))
-    draft_model_state_dict = {
-        k.replace("draft_model.", ""): v
-        for k, v in model_state_dict.items()
-        if "draft_model." in k and "embed" not in k.lower()
-    }
+    with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+        model_state_dict = eagle3_model.state_dict()
+        state_to_save = {
+            "epoch": epoch,
+            "global_step": step,
+            "args": args,
+        }
+        state_to_save.update(optimizer.state_dict())
+        draft_model_state_dict = {
+            k.replace("draft_model.", ""): v
+            for k, v in model_state_dict.items()
+            if "draft_model." in k and "embed" not in k.lower()
+        }
 
-    if dist.get_rank() == 0:
-        torch.save(
-            state_to_save,
-            os.path.join(epoch_output_dir, "training_state.pt"),
-        )
-        print_on_rank0(
-            f"Saved full training state to {epoch_output_dir}/training_state.pt"
-        )
-        eagle3_model.draft_model.save_pretrained(
-            epoch_output_dir,
-            state_dict=draft_model_state_dict,
-        )
-        print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-    dist.barrier()
+        if dist.get_rank() == 0:
+            torch.save(
+                state_to_save,
+                os.path.join(epoch_output_dir, "training_state.pt"),
+            )
+            print_on_rank0(
+                f"Saved full training state to {epoch_output_dir}/training_state.pt"
+            )
+            eagle3_model.draft_model.save_pretrained(
+                epoch_output_dir,
+                state_dict=draft_model_state_dict,
+            )
+            print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+        dist.barrier()
 
 
 def run_forward(

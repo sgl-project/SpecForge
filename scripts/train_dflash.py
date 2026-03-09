@@ -14,9 +14,8 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
-from torch.distributed.checkpoint.state_dict import get_state_dict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
@@ -260,39 +259,40 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
 
-    state_dict = get_state_dict(dflash_model)
-    draft_state_dict = {
-        k.replace("draft_model.", ""): v
-        for k, v in state_dict.items()
-        if "draft_model." in k
-    }
+    with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
+        state_dict = dflash_model.state_dict()
+        draft_state_dict = {
+            k.replace("draft_model.", ""): v
+            for k, v in state_dict.items()
+            if "draft_model." in k
+        }
 
-    if dist.get_rank() == 0:
-        torch.save(
-            {
-                "epoch": epoch,
-                "global_step": step,
-                "args": args,
-                **optimizer.state_dict(),
-            },
-            os.path.join(save_dir, "training_state.pt"),
-        )
+        if dist.get_rank() == 0:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "global_step": step,
+                    "args": args,
+                    **optimizer.state_dict(),
+                },
+                os.path.join(save_dir, "training_state.pt"),
+            )
 
-        draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
+            draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
-        modeling_src = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "specforge",
-            "modeling",
-            "draft",
-            "dflash.py",
-        )
-        modeling_dst = os.path.join(save_dir, "dflash.py")
-        if os.path.exists(modeling_src):
-            shutil.copy(modeling_src, modeling_dst)
+            modeling_src = os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "specforge",
+                "modeling",
+                "draft",
+                "dflash.py",
+            )
+            modeling_dst = os.path.join(save_dir, "dflash.py")
+            if os.path.exists(modeling_src):
+                shutil.copy(modeling_src, modeling_dst)
 
-        print_on_rank0(f"Saved checkpoint to {save_dir}")
+            print_on_rank0(f"Saved checkpoint to {save_dir}")
 
     dist.barrier()
 
@@ -364,7 +364,7 @@ def main():
         loaded_model = DFlashDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
-        draft_model.load_state_dict(get_state_dict(loaded_model))
+        draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
         print_on_rank0("Loaded draft model weights from checkpoint")
 
