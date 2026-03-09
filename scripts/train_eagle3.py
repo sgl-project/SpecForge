@@ -10,8 +10,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate.utils import set_seed
+from torch.distributed.checkpoint.state_dict import get_state_dict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -367,6 +368,9 @@ def sp_sanity_check(args: Namespace) -> None:
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
+    # ckpt info(epoch, step)
+    ckpt_info = (0, 0)
+
     # Handle draft model config
     if args.draft_model_config is None:
         # Auto-generate and save config file
@@ -395,8 +399,8 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     # detecting last ckpt for draft model
     if args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
-        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
@@ -413,7 +417,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    return draft_model_config, draft_model
+    return draft_model_config, draft_model, ckpt_info
 
 
 def build_dataloaders(
@@ -541,34 +545,33 @@ def save_checkpoints(
         os.makedirs(epoch_output_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
-        model_state_dict = eagle3_model.state_dict()
-        state_to_save = {
-            "epoch": epoch,
-            "global_step": step,
-            "args": args,
-        }
-        state_to_save.update(optimizer.state_dict())
-        draft_model_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
-        }
+    model_state_dict = get_state_dict(eagle3_model)
+    state_to_save = {
+        "epoch": epoch,
+        "global_step": step,
+        "args": args,
+    }
+    state_to_save.update(get_state_dict(optimizer))
+    draft_model_state_dict = {
+        k.replace("draft_model.", ""): v
+        for k, v in model_state_dict.items()
+        if "draft_model." in k and "embed" not in k.lower()
+    }
 
-        if dist.get_rank() == 0:
-            torch.save(
-                state_to_save,
-                os.path.join(epoch_output_dir, "training_state.pt"),
-            )
-            print_on_rank0(
-                f"Saved full training state to {epoch_output_dir}/training_state.pt"
-            )
-            eagle3_model.draft_model.save_pretrained(
-                epoch_output_dir,
-                state_dict=draft_model_state_dict,
-            )
-            print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-        dist.barrier()
+    if dist.get_rank() == 0:
+        torch.save(
+            state_to_save,
+            os.path.join(epoch_output_dir, "training_state.pt"),
+        )
+        print_on_rank0(
+            f"Saved full training state to {epoch_output_dir}/training_state.pt"
+        )
+        eagle3_model.draft_model.save_pretrained(
+            epoch_output_dir,
+            state_dict=draft_model_state_dict,
+        )
+        print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+    dist.barrier()
 
 
 def run_forward(
@@ -728,7 +731,7 @@ def main():
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model = build_draft_model(args)
+    draft_model_config, draft_model, ckpt_info = build_draft_model(args)
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
@@ -813,8 +816,8 @@ def main():
     # 6. Build tracker
     # ================================================
     tracker = build_tracker(args, parser)
-    global_step = 0
-    start_epoch = 0
+    start_epoch = ckpt_info[0]
+    global_step = ckpt_info[1]
     dist.barrier()
 
     last_time = time.time()
@@ -822,7 +825,9 @@ def main():
     # ================================================
     # 7. Start training
     # ================================================
-    print_on_rank0(f"Starting training from epoch {start_epoch}")
+    print_on_rank0(
+        f"Starting training from epoch:{start_epoch}          step:{global_step}"
+    )
 
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
