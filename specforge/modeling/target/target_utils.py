@@ -40,9 +40,10 @@ class TargetEmbeddingsAndHead(nn.Module):
     ) -> "TargetEmbeddingsAndHead":
 
         # 1. Load Config
-        config = AutoConfig.from_pretrained(
+        full_config = AutoConfig.from_pretrained(
             model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
         )
+        config = cls._resolve_text_config(full_config)
         instance = cls(config)
 
         if embed_key is None:
@@ -63,7 +64,11 @@ class TargetEmbeddingsAndHead(nn.Module):
                 print(f"Warning: Snapshot download failed or path check failed: {e}")
 
         # 3. Handle Weight Tying
-        tie_weights = getattr(config, "tie_word_embeddings", False)
+        tie_weights = getattr(
+            full_config,
+            "tie_word_embeddings",
+            getattr(config, "tie_word_embeddings", False),
+        )
 
         # 4. Load Weights
         instance._load_weights(local_model_path, embed_key, lm_head_key, tie_weights)
@@ -75,28 +80,64 @@ class TargetEmbeddingsAndHead(nn.Module):
 
         return instance
 
+    @staticmethod
+    def _resolve_text_config(config):
+        if hasattr(config, "text_config") and hasattr(config.text_config, "hidden_size"):
+            return config.text_config
+        return config
+
+    @staticmethod
+    def _candidate_suffixes(key_type: str):
+        if key_type == "embed":
+            return (
+                "model.language_model.model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+                "language_model.embed_tokens.weight",
+                "embed_tokens.weight",
+            )
+        return ("lm_head.weight",)
+
+    def _resolve_weight_key(self, available_keys, preferred_key: str, key_type: str):
+        if preferred_key in available_keys:
+            return preferred_key
+
+        for suffix in self._candidate_suffixes(key_type):
+            matches = [k for k in available_keys if k.endswith(suffix)]
+            if matches:
+                # Prefer shortest full key for deterministic behavior.
+                return sorted(matches, key=len)[0]
+        return None
+
     def _load_weights(
         self, model_path: str, embed_key: str, lm_head_key: str, tie_weights: bool
     ):
         index_files = glob.glob(os.path.join(model_path, "*.index.json"))
         weight_map = {}
         files_to_load = {}
+        resolved_embed_key = embed_key
+        resolved_lm_head_key = lm_head_key if not tie_weights else None
 
         if index_files:
             with open(index_files[0], "r") as f:
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
 
-            if embed_key in weight_map:
-                files_to_load[embed_key] = weight_map[embed_key]
-            else:
+            resolved_embed_key = self._resolve_weight_key(
+                weight_map.keys(), embed_key, "embed"
+            )
+            if resolved_embed_key is None:
                 raise ValueError(
                     f"Embedding key '{embed_key}' not found in weight map."
                 )
+            files_to_load[resolved_embed_key] = weight_map[resolved_embed_key]
 
             if not tie_weights:
-                if lm_head_key in weight_map:
-                    files_to_load[lm_head_key] = weight_map[lm_head_key]
+                resolved_lm_head_key = self._resolve_weight_key(
+                    weight_map.keys(), lm_head_key, "lm_head"
+                )
+                if resolved_lm_head_key is not None:
+                    files_to_load[resolved_lm_head_key] = weight_map[resolved_lm_head_key]
                 else:
                     print(
                         f"Warning: {lm_head_key} not found. Ensure model doesn't use tied weights manually."
@@ -109,9 +150,33 @@ class TargetEmbeddingsAndHead(nn.Module):
             if not target_file:
                 raise FileNotFoundError("No checkpoint found.")
 
-            files_to_load[embed_key] = os.path.basename(target_file)
+            if target_file.endswith(".safetensors"):
+                with safe_open(target_file, framework="pt") as f:
+                    available_keys = list(f.keys())
+            else:
+                full_state = torch.load(target_file, map_location="cpu")
+                available_keys = list(full_state.keys())
+                del full_state
+                gc.collect()
+
+            resolved_embed_key = self._resolve_weight_key(
+                available_keys, embed_key, "embed"
+            )
+            if resolved_embed_key is None:
+                raise ValueError(
+                    f"Embedding key '{embed_key}' not found in checkpoint file."
+                )
+            files_to_load[resolved_embed_key] = os.path.basename(target_file)
             if not tie_weights:
-                files_to_load[lm_head_key] = os.path.basename(target_file)
+                resolved_lm_head_key = self._resolve_weight_key(
+                    available_keys, lm_head_key, "lm_head"
+                )
+                if resolved_lm_head_key is not None:
+                    files_to_load[resolved_lm_head_key] = os.path.basename(target_file)
+                else:
+                    print(
+                        f"Warning: {lm_head_key} not found. Ensure model doesn't use tied weights manually."
+                    )
 
         loaded_keys = set()
 
@@ -123,7 +188,9 @@ class TargetEmbeddingsAndHead(nn.Module):
             file_to_keys_map[full_path].append(key)
 
         for file_path, keys in file_to_keys_map.items():
-            self._load_file_content(file_path, keys, embed_key, lm_head_key)
+            self._load_file_content(
+                file_path, keys, resolved_embed_key, resolved_lm_head_key
+            )
             loaded_keys.update(keys)
 
         if tie_weights:
@@ -132,9 +199,13 @@ class TargetEmbeddingsAndHead(nn.Module):
             )
             self.lm_head.weight = self.embed_tokens.weight
 
-        if embed_key not in loaded_keys:
+        if resolved_embed_key not in loaded_keys:
             raise RuntimeError("Failed to load embeddings.")
-        if not tie_weights and lm_head_key not in loaded_keys:
+        if (
+            not tie_weights
+            and resolved_lm_head_key is not None
+            and resolved_lm_head_key not in loaded_keys
+        ):
             print(
                 "Warning: LM Head weights were not found (and tie_weights is False). Head is random."
             )
@@ -144,7 +215,7 @@ class TargetEmbeddingsAndHead(nn.Module):
         file_path: str,
         keys_to_extract: list,
         target_embed_key: str,
-        target_head_key: str,
+        target_head_key: Optional[str],
     ):
         """Helper to load specific keys from a file"""
         print(f"Loading {keys_to_extract} from {os.path.basename(file_path)}...")
@@ -171,7 +242,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             if k == target_embed_key:
                 self.embed_tokens.weight.data.copy_(tensor)
                 print(" -> Loaded Embeddings")
-            elif k == target_head_key:
+            elif target_head_key is not None and k == target_head_key:
                 if tensor.shape == self.lm_head.weight.data.shape:
                     self.lm_head.weight.data.copy_(tensor)
                     print(" -> Loaded LM Head")
