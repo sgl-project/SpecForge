@@ -617,7 +617,11 @@ def run_forward(
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
             attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-            target = get_dp_data_shard_from_tp(eagle3_data.target)
+            # Target may be pre-sharded to avoid OOM from large vocab models
+            if getattr(eagle3_data, "pre_sharded_target", False):
+                target = eagle3_data.target
+            else:
+                target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
         else:
             # we generate the logits using the hidden states loaded from disk

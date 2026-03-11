@@ -70,7 +70,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
-    torch_compile: Optional[bool] = None,
+    torch_compile: Optional[bool] = None,  # kept for API compat, not forwarded
 ) -> None:
     """
     Initialize model parallel groups.
@@ -130,7 +130,6 @@ def initialize_model_parallel(
         ),
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
-        torch_compile=torch_compile,
     )
 
     if duplicate_tp_group:
@@ -149,7 +148,6 @@ def initialize_model_parallel(
             ),
             group_name="pdmux_prefill_tp",
             pynccl_use_current_stream=True,
-            torch_compile=torch_compile,
         )
         parallel_state._TP.pynccl_comm.disabled = False
         parallel_state._PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
@@ -218,6 +216,16 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
     )
+
+    # Initialize groups added in sglang 0.5.9+ that are not set by the
+    # original SpecForge patch. Without DP attention / context parallelism,
+    # these default to the TP group.
+    if not hasattr(parallel_state, "_ATTN_TP") or parallel_state._ATTN_TP is None:
+        parallel_state._ATTN_TP = parallel_state._TP
+    if not hasattr(parallel_state, "_ATTN_CP") or parallel_state._ATTN_CP is None:
+        parallel_state._ATTN_CP = parallel_state._TP
+    if not hasattr(parallel_state, "_MOE_DP") or parallel_state._MOE_DP is None:
+        parallel_state._MOE_DP = parallel_state._TP
 
 
 def initialize_dp_attention(
