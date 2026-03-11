@@ -308,3 +308,13 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="</longcat_s>",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="glm4",
+    template=ChatTemplate(
+        assistant_header="<|assistant|></think>",
+        user_header="<|user|>",
+        system_prompt="",  # GLM tokenizer handles system prompts natively - don't duplicate
+        end_of_turn_token="<|endoftext|>",
+    ),
+)

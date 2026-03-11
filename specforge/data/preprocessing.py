@@ -84,9 +84,14 @@ def _apply_loss_mask_from_chat_template(
     )
 
     # Find spans of assistant responses using regex
+    # Match assistant header with OR without end_of_turn_token prefix
+    # (first response often lacks the prefix)
     assistant_pattern = (
-        re.escape(assistant_message_separator)
-        + r"(.*?)(?="
+        r"(?:"
+        + re.escape(assistant_message_separator)
+        + "|"
+        + re.escape(chat_template.assistant_header)
+        + r")(.*?)(?="
         + re.escape(user_message_separator)
         + "|$)"
     )
@@ -163,13 +168,17 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-        input_ids, loss_mask = parser.parse(
+        result = parser.parse(
             source,
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
             **kwargs_item,
         )
+        if result is None:
+            # Skip invalid conversations (e.g., no assistant response)
+            continue
+        input_ids, loss_mask = result
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
