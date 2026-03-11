@@ -24,7 +24,7 @@ import glob
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from huggingface_hub import snapshot_download
@@ -98,10 +98,10 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         self,
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: torch.Tensor,
+        caches_hidden: List[List[List[torch.Tensor]]],
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[List[Cache]] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         """
