@@ -411,6 +411,11 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
+    # Disable tokenizers internal parallelism when using multiprocessing to avoid
+    # deadlocks caused by forked Rust threads (see huggingface/tokenizers#1391).
+    if num_proc is not None and num_proc > 1:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
     # adjust batch size based on dataset type
     if is_vlm:
         batch_size = (
