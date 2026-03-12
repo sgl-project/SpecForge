@@ -231,6 +231,20 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     return parser, args
 
 
+def _load_dataset_from_path(data_path: str, is_preformatted: bool):
+    if is_preformatted:
+        return load_dataset(
+            "json",
+            data_files=data_path,
+            split="train",
+        )
+    else:
+        return Dataset.from_generator(
+            generator=safe_conversations_generator,
+            gen_kwargs={"file_path": data_path},
+        )
+
+
 def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
     """
     Build the experiment tracker according to the report_to argument.
@@ -435,17 +449,7 @@ def build_dataloaders(
         f"is_preformatted={args.is_preformatted}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    if args.is_preformatted:
-        train_dataset = load_dataset(
-            "json",
-            data_files=args.train_data_path,
-            split="train",
-        )
-    else:
-        train_dataset = Dataset.from_generator(
-            generator=safe_conversations_generator,
-            gen_kwargs={"file_path": args.train_data_path},
-        )
+    train_dataset = _load_dataset_from_path(args.train_data_path, args.is_preformatted)
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
@@ -493,17 +497,7 @@ def build_dataloaders(
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
-            if args.is_preformatted:
-                eval_dataset = load_dataset(
-                    "json",
-                    data_files=args.eval_data_path,
-                    split="train",
-                )
-            else:
-                eval_dataset = Dataset.from_generator(
-                    generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.eval_data_path},
-    )
+            eval_dataset = _load_dataset_from_path(args.eval_data_path, args.is_preformatted)
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
