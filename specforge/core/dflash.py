@@ -92,7 +92,11 @@ class OnlineDFlashModel(nn.Module):
         self._cached_bsz: Optional[int] = None
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
         bs = self.block_size
@@ -100,6 +104,8 @@ class OnlineDFlashModel(nn.Module):
         max_anchor = max(seq_len - bs, 0)
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
+        if attention_mask is not None:
+            valid = valid & (attention_mask[:, : max_anchor + 1] > 0)
         valid_counts = valid.sum(dim=1)
         max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
@@ -156,6 +162,43 @@ class OnlineDFlashModel(nn.Module):
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
+    def _create_position_ids_from_context(
+        self,
+        context_position_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """
+        Gather the draft block position ids from context position ids.
+        Supports both [B, S] and multimodal [3, B, S] position ids.
+        """
+        device = anchor_positions.device
+        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        gather_indices = (anchor_positions.unsqueeze(-1) + offsets).clamp(max=seq_len - 1)
+
+        if context_position_ids.ndim == 2:
+            bsz, n_blocks = anchor_positions.shape
+            gathered = torch.gather(
+                context_position_ids.unsqueeze(1).expand(-1, n_blocks, -1),
+                2,
+                gather_indices,
+            )
+            return gathered.reshape(bsz, -1)
+
+        if context_position_ids.ndim == 3:
+            _, bsz, _ = context_position_ids.shape
+            n_blocks = anchor_positions.shape[1]
+            expanded_context = context_position_ids.unsqueeze(2).expand(
+                -1, -1, n_blocks, -1
+            )
+            expanded_indices = gather_indices.unsqueeze(0).expand(3, -1, -1, -1)
+            gathered = torch.gather(expanded_context, 3, expanded_indices)
+            return gathered.reshape(3, bsz, -1)
+
+        raise ValueError(
+            f"Unsupported position_ids ndim={context_position_ids.ndim}; expected 2 or 3."
+        )
+
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
@@ -184,26 +227,62 @@ class OnlineDFlashModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len, loss_mask, device, attention_mask
         )
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
         )
 
-        context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        if position_ids is None:
+            context_position_ids = (
+                torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            )
+        else:
+            context_position_ids = position_ids.to(device=device).long()
+            if context_position_ids.ndim == 3 and context_position_ids.shape[0] != 3:
+                if context_position_ids.shape[1] == 3:
+                    context_position_ids = context_position_ids.permute(
+                        1, 0, 2
+                    ).contiguous()
+                else:
+                    raise ValueError(
+                        "Multimodal position_ids must have shape [3, B, S] or [B, 3, S]."
+                    )
+            if context_position_ids.ndim == 3 and not getattr(
+                self.draft_model, "use_interleaved_mrope", False
+            ):
+                context_position_ids = context_position_ids[0]
+            expected_seq_len = context_position_ids.shape[-1]
+            if expected_seq_len != seq_len:
+                raise ValueError(
+                    f"Position ids length mismatch: got {expected_seq_len}, expected {seq_len}"
+                )
+
+        draft_position_ids = self._create_position_ids_from_context(
+            context_position_ids=context_position_ids,
+            anchor_positions=anchor_positions,
+            seq_len=seq_len,
         )
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+
+        if context_position_ids.ndim == 2:
+            full_position_ids = torch.cat(
+                [context_position_ids, draft_position_ids], dim=1
+            )
+        else:
+            full_position_ids = torch.cat(
+                [context_position_ids, draft_position_ids], dim=2
+            )
 
         dflash_attn_mask = create_dflash_block_mask(
             anchor_positions=anchor_positions,
