@@ -1,3 +1,5 @@
+import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -35,6 +37,57 @@ from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+logger = logging.getLogger(__name__)
+
+
+def _is_multi_node(world_size: int, tp_size: int) -> bool:
+    """Detect whether training spans multiple physical nodes.
+
+    Uses LOCAL_WORLD_SIZE (set by torchrun / torch elastic) to determine
+    how many processes run on the current node and compares to the total
+    world size.  When LOCAL_WORLD_SIZE is not available (e.g. mp.spawn in
+    unit tests), falls back to ``world_size > tp_size``.
+
+    Note: the fallback cannot detect cross-node TP where
+    ``world_size == tp_size`` (e.g. TP=8 across 2×4-GPU nodes).  If your
+    launcher does not set LOCAL_WORLD_SIZE and you use cross-node TP,
+    set ``LOCAL_WORLD_SIZE`` explicitly in your environment.
+    """
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+    if local_world_size > 0:
+        return world_size > local_world_size
+    logger.warning(
+        "LOCAL_WORLD_SIZE not set; falling back to world_size > tp_size "
+        "for multi-node detection. This may misclassify single-node DP as "
+        "multi-node, or miss cross-node TP where world_size == tp_size. "
+        "Set LOCAL_WORLD_SIZE in your environment for accurate detection."
+    )
+    return world_size > tp_size
+
+
+def should_disable_ipc_optimizations(world_size: int, tp_size: int) -> bool:
+    """Determine whether to disable CUDA IPC-based optimizations.
+
+    CUDA IPC-based optimizations (custom_all_reduce, FlashInfer allreduce
+    fusion) use cudaIpcGetMemHandle / cudaIpcOpenMemHandle which rely on
+    POSIX shared memory — they only work between processes on the same node.
+
+    Even on MNNVL-connected racks (GB200 NVL72) with IMEX channels present,
+    FlashInfer's and SGLang's custom IPC code does NOT use the fabric-aware
+    CUDA APIs (cudaMallocFabric / multicast), so cross-node IPC still fails
+    with "CUDART error: invalid resource handle".
+
+    Returns True if IPC optimizations should be disabled (i.e. multi-node).
+    """
+    if not _is_multi_node(world_size, tp_size):
+        return False
+    logger.info(
+        "Multi-node training detected. Disabling custom_all_reduce and "
+        "FlashInfer allreduce fusion (CUDA IPC handles cannot cross node "
+        "boundaries)."
+    )
+    return True
 
 
 @dataclass
@@ -302,12 +355,16 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
         tp_size = dist.get_world_size(get_tp_group())
+        disable_ipc = should_disable_ipc_optimizations(
+            dist.get_world_size(), tp_size
+        )
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
             dtype=torch_dtype,
             enable_return_hidden_states=True,
             disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
+            disable_custom_all_reduce=disable_ipc,
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -316,6 +373,12 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
+        if disable_ipc:
+            # Disable FlashInfer allreduce fusion which uses CUDA IPC handles
+            # (cudaIpcGetMemHandle) that cannot cross node boundaries.
+            # Must be set after ModelConfig.from_server_args() which auto-enables
+            # it for MoE models (e.g. Qwen3MoeForCausalLM) on SM90/SM100 hardware.
+            server_args.enable_flashinfer_allreduce_fusion = False
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
