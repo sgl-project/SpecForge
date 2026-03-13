@@ -27,6 +27,7 @@ dependencies = [
     "ninja",
     "packaging",
     "yunchang",
+    "tensorboard",
 ]
 
 [tool.setuptools]
