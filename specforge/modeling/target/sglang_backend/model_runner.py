@@ -116,12 +116,26 @@ class SGLangRunner(ModelRunner):
                 rank=self.tp_size * self.pp_rank + self.tp_rank,
                 local_rank=self.gpu_id,
             )
+            # NOTE: Updated for sglang 0.5.9
+            # - Removed torch_compile parameter (no longer supported)
+            # - Added new parameters: attention_data_parallel_size, attention_context_model_parallel_size, moe_data_model_parallel_size
+
+            # Debug: Print the values
+            dp_size = getattr(self.server_args, "dp_size", 1)
+            attn_cp_size = getattr(self.server_args, "attn_cp_size", 1)
+            moe_dp_size = getattr(self.server_args, "moe_dp_size", 1)
+            print(
+                f"[DEBUG] tp_size={self.tp_size}, dp_size={dp_size}, attn_cp_size={attn_cp_size}, moe_dp_size={moe_dp_size}"
+            )
+
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                attention_data_parallel_size=dp_size,
+                attention_context_model_parallel_size=attn_cp_size,
+                moe_data_model_parallel_size=moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
-                torch_compile=self.server_args.enable_piecewise_cuda_graph,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
