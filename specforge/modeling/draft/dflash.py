@@ -50,32 +50,32 @@ class Qwen3DFlashAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
         self.q_proj = nn.Linear(
             config.hidden_size,
-            config.num_attention_heads * self.head_dim,
+            self.num_heads * self.head_dim,
             bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
             config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
+            self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
             config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
+            self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
+            self.num_heads * self.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
         )
@@ -120,6 +120,12 @@ class Qwen3DFlashAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        debug_capture = kwargs.pop("debug_capture", None)
+
+        def _capture(name: str, tensor: torch.Tensor):
+            if debug_capture is not None:
+                debug_capture[name] = tensor.detach().clone()
+
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
@@ -127,6 +133,11 @@ class Qwen3DFlashAttention(nn.Module):
         k_noise = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
         v_ctx = self.v_proj(target_hidden).view(bsz, ctx_len, -1, self.head_dim)
         v_noise = self.v_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+        _capture("q_proj", q)
+        _capture("k_ctx_proj", k_ctx)
+        _capture("k_noise_proj", k_noise)
+        _capture("v_ctx_proj", v_ctx)
+        _capture("v_noise_proj", v_noise)
 
         if self.use_usp:
             q = self._ulysses_scatter(q)
@@ -136,6 +147,11 @@ class Qwen3DFlashAttention(nn.Module):
             v_noise = self._ulysses_scatter(v_noise)
             q_len = q.shape[1]
             ctx_len = k_ctx.shape[1]
+            _capture("q_scattered", q)
+            _capture("k_ctx_scattered", k_ctx)
+            _capture("k_noise_scattered", k_noise)
+            _capture("v_ctx_scattered", v_ctx)
+            _capture("v_noise_scattered", v_noise)
 
         q = self.q_norm(q).transpose(1, 2)
         k = torch.cat([k_ctx, k_noise], dim=1)
@@ -144,6 +160,8 @@ class Qwen3DFlashAttention(nn.Module):
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        _capture("q_after_rope", q)
+        _capture("k_after_rope", k)
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
@@ -161,6 +179,7 @@ class Qwen3DFlashAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
+        _capture("attn_output_pre_gather", attn_output)
         if self.use_usp:
             attn_output = (
                 attn_output.transpose(1, 2)
@@ -177,7 +196,9 @@ class Qwen3DFlashAttention(nn.Module):
             attn_output = attn_output.reshape(bsz, -1, self.num_heads * self.head_dim)
         else:
             attn_output = attn_output.reshape(bsz, q_len, -1)
+        _capture("attn_output_final", attn_output)
         attn_output = self.o_proj(attn_output)
+        _capture("attn_output_projected", attn_output)
         return attn_output, attn_weights
 
 
@@ -303,11 +324,32 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if use_usp:
             ulysses_pg = get_sp_ulysses_group()
             world_size = dist.get_world_size(ulysses_pg)
-            gathered_position_ids = [
-                torch.empty_like(position_ids) for _ in range(world_size)
+            local_ctx_len = target_hidden.shape[1]
+            local_draft_len = hidden_states.shape[1]
+            context_position_ids = position_ids[:, :local_ctx_len].contiguous()
+            draft_position_ids = position_ids[
+                :, local_ctx_len : local_ctx_len + local_draft_len
+            ].contiguous()
+
+            gathered_context_position_ids = [
+                torch.empty_like(context_position_ids) for _ in range(world_size)
             ]
-            dist.all_gather(gathered_position_ids, position_ids, group=ulysses_pg)
-            rotary_position_ids = torch.cat(gathered_position_ids, dim=1)
+            gathered_draft_position_ids = [
+                torch.empty_like(draft_position_ids) for _ in range(world_size)
+            ]
+            dist.all_gather(
+                gathered_context_position_ids, context_position_ids, group=ulysses_pg
+            )
+            dist.all_gather(
+                gathered_draft_position_ids, draft_position_ids, group=ulysses_pg
+            )
+            rotary_position_ids = torch.cat(
+                [
+                    torch.cat(gathered_context_position_ids, dim=1),
+                    torch.cat(gathered_draft_position_ids, dim=1),
+                ],
+                dim=1,
+            )
         else:
             rotary_position_ids = position_ids
         position_embeddings = self.rotary_emb(hidden_states, rotary_position_ids)
