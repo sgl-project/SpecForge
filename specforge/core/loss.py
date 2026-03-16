@@ -12,7 +12,7 @@ import triton.language as tl
 
 
 # Reference implementation
-@torch.compile(dynamic=None)
+# @torch.compile(dynamic=None)
 def _compute_loss(logits, target_p, position_mask):
     logits = logits.float()
     out_logp = nn.LogSoftmax(dim=2)(logits)
@@ -30,7 +30,7 @@ def _calculate_settings(n):
         raise RuntimeError(
             f"Cannot launch Triton kernel since n = {n} exceeds the recommended Triton blocksize = {MAX_FUSED_SIZE}."
         )
-
+    BLOCK_SIZE = 2048
     num_warps = 4
     if BLOCK_SIZE >= 32768:
         num_warps = 32
