@@ -27,6 +27,7 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    real_context_len: Optional[int] = None,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -40,6 +41,9 @@ def create_dflash_block_mask(
       4. Invalid blocks (block_keep_mask=False) see nothing.
     """
 
+    if real_context_len is None:
+        real_context_len = S
+
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
         anchor_pos = anchor_positions[b, q_block_id]
@@ -47,7 +51,7 @@ def create_dflash_block_mask(
         is_context = kv_idx < S
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
-        mask_context = is_context & (kv_idx < anchor_pos)
+        mask_context = is_context & (kv_idx < anchor_pos) & (kv_idx < real_context_len)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
@@ -93,6 +97,26 @@ class OnlineDFlashModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _create_noise_embed_from_anchor_tokens(
+        self, anchor_tokens: torch.Tensor, block_keep_mask: torch.Tensor
+    ) -> torch.Tensor:
+        bsz, n = anchor_tokens.shape
+        bs = self.block_size
+        device = anchor_tokens.device
+
+        noise_ids = torch.full(
+            (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
+        )
+        block_starts = torch.arange(n, device=device) * bs
+        block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
+        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
+        noise_ids[flat_batch_idx, block_starts] = torch.where(
+            block_keep_mask,
+            anchor_tokens,
+            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+        )
+        return self.embed_tokens(noise_ids)
+
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -136,14 +160,8 @@ class OnlineDFlashModel(nn.Module):
         position_ids: torch.Tensor,
         loss_mask: torch.Tensor,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample one shared global anchor set per SP group.
-
-        Returns:
-            global_anchor_positions: [B, N] absolute positions
-            local_anchor_offsets: [B, N] local offsets for ranks owning each anchor
-            block_keep_mask: [B, N] whether this rank should execute the anchor block
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample one shared global anchor set per SP group and pad by SP size."""
         bsz, seq_len = loss_mask.shape
         if bsz != 1:
             raise ValueError("Offline DFlash USP currently requires batch_size=1")
@@ -153,7 +171,7 @@ class OnlineDFlashModel(nn.Module):
             local_anchor_positions, block_keep_mask = self._sample_anchor_positions(
                 seq_len, loss_mask, device
             )
-            return local_anchor_positions, local_anchor_positions, block_keep_mask
+            return local_anchor_positions, block_keep_mask
 
         bs = self.block_size
         max_anchor = max(seq_len - bs, 0)
@@ -187,19 +205,103 @@ class OnlineDFlashModel(nn.Module):
         global_anchor_positions = torch.tensor(
             anchor_payload[0], dtype=torch.long, device=device
         ).unsqueeze(0)
+        sp_world_size = dist.get_world_size(sp_group)
+        n_blocks = global_anchor_positions.shape[1]
+        padded_n = ((n_blocks + sp_world_size - 1) // sp_world_size) * sp_world_size
+        global_block_keep_mask = torch.zeros((1, padded_n), dtype=torch.bool, device=device)
+        global_block_keep_mask[:, :n_blocks] = True
+        if padded_n > n_blocks:
+            global_anchor_positions = F.pad(
+                global_anchor_positions, (0, padded_n - n_blocks), value=0
+            )
 
-        candidate_position_ids = position_ids[:, : max_anchor + 1]
-        anchor_matches = candidate_position_ids.unsqueeze(1) == global_anchor_positions.unsqueeze(-1)
-        anchor_matches = anchor_matches & valid.unsqueeze(1)
-        block_keep_mask = anchor_matches.any(dim=-1)
-        local_anchor_offsets = anchor_matches.to(torch.long).argmax(dim=-1)
-        local_anchor_offsets = torch.where(
-            block_keep_mask,
-            local_anchor_offsets,
-            torch.zeros_like(local_anchor_offsets),
+        return global_anchor_positions, global_block_keep_mask
+
+    def _get_global_context_lengths(
+        self,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[int, int]:
+        sp_group = get_draft_sp_group()
+        local_valid_len = int(attention_mask.sum(dim=1).max().item())
+        padded_context_len = position_ids.shape[1] * dist.get_world_size(sp_group)
+        if local_valid_len > 0:
+            local_real_end = int(position_ids[:, :local_valid_len].max().item()) + 1
+        else:
+            local_real_end = 0
+        real_context_len = torch.tensor(
+            [local_real_end], device=position_ids.device, dtype=torch.long
+        )
+        dist.all_reduce(real_context_len, op=dist.ReduceOp.MAX, group=sp_group)
+        return int(real_context_len.item()), padded_context_len
+
+    def _collect_global_values(
+        self,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sp_group = get_draft_sp_group()
+        device = input_ids.device
+        local_valid_len = int(attention_mask.sum(dim=1).max().item())
+        flat_positions = positions.view(-1)
+        valid_pos_mask = flat_positions >= 0
+        safe_positions = flat_positions.clamp(min=0)
+
+        local_tokens = torch.zeros_like(safe_positions, dtype=torch.long, device=device)
+        local_losses = torch.zeros_like(
+            safe_positions, dtype=loss_mask.dtype, device=device
+        )
+        local_presence = torch.zeros_like(
+            safe_positions, dtype=torch.long, device=device
         )
 
-        return global_anchor_positions, local_anchor_offsets, block_keep_mask
+        if local_valid_len > 0:
+            local_positions = position_ids[:, :local_valid_len]
+            local_start = int(local_positions[0, 0].item())
+            local_end = int(local_positions[0, local_valid_len - 1].item())
+            in_local_range = valid_pos_mask & (safe_positions >= local_start) & (
+                safe_positions <= local_end
+            )
+            if in_local_range.any():
+                local_offsets = safe_positions[in_local_range] - local_start
+                local_tokens[in_local_range] = input_ids[:, :local_valid_len].view(-1)[
+                    local_offsets
+                ]
+                local_losses[in_local_range] = loss_mask[:, :local_valid_len].view(-1)[
+                    local_offsets
+                ]
+                local_presence[in_local_range] = 1
+
+        dist.all_reduce(local_tokens, op=dist.ReduceOp.SUM, group=sp_group)
+        dist.all_reduce(local_losses, op=dist.ReduceOp.SUM, group=sp_group)
+        dist.all_reduce(
+            local_presence, op=dist.ReduceOp.SUM, group=sp_group
+        )
+
+        return (
+            local_tokens.view_as(positions),
+            local_losses.view_as(positions),
+            local_presence.view_as(positions).bool(),
+        )
+
+    def _slice_local_blocks(
+        self,
+        global_anchor_positions: torch.Tensor,
+        global_block_keep_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sp_group = get_draft_sp_group()
+        sp_world_size = dist.get_world_size(sp_group)
+        sp_rank = dist.get_rank(sp_group)
+        blocks_per_rank = global_anchor_positions.shape[1] // sp_world_size
+        start = sp_rank * blocks_per_rank
+        end = start + blocks_per_rank
+        return (
+            global_anchor_positions[:, start:end],
+            global_block_keep_mask[:, start:end],
+        )
 
     def prepare_noise_input(
         self, input_ids: torch.Tensor, block_ids: Optional[torch.Tensor] = None
@@ -259,6 +361,7 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
@@ -271,8 +374,24 @@ class OnlineDFlashModel(nn.Module):
             and dist.get_world_size(get_draft_sp_group()) > 1
         )
         if use_usp_sampling:
-            global_anchor_positions, anchor_positions, block_keep_mask = (
+            if attention_mask is None:
+                raise ValueError("USP DFlash forward requires attention_mask")
+            global_anchor_positions, global_block_keep_mask = (
                 self._sample_anchor_positions_usp(position_ids, loss_mask, device)
+            )
+            anchor_positions, block_keep_mask = self._slice_local_blocks(
+                global_anchor_positions, global_block_keep_mask
+            )
+            real_context_len, padded_context_len = self._get_global_context_lengths(
+                position_ids, attention_mask
+            )
+            anchor_tokens, _, anchor_presence = self._collect_global_values(
+                anchor_positions, input_ids, loss_mask, position_ids, attention_mask
+            )
+            if not bool((anchor_presence | ~block_keep_mask).all().item()):
+                raise ValueError("Failed to gather anchor tokens for USP DFlash")
+            noise_embedding = self._create_noise_embed_from_anchor_tokens(
+                anchor_tokens, block_keep_mask
             )
         else:
             anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -283,10 +402,12 @@ class OnlineDFlashModel(nn.Module):
                 if position_ids is not None
                 else anchor_positions
             )
-
-        noise_embedding = self._create_noise_embed(
-            input_ids, anchor_positions, block_keep_mask
-        )
+            global_block_keep_mask = block_keep_mask
+            real_context_len = seq_len
+            padded_context_len = seq_len
+            noise_embedding = self._create_noise_embed(
+                input_ids, anchor_positions, block_keep_mask
+            )
 
         if position_ids is not None:
             context_position_ids = position_ids[:, :seq_len].to(device=device)
@@ -294,15 +415,16 @@ class OnlineDFlashModel(nn.Module):
             context_position_ids = (
                 torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
             )
-        draft_position_ids = self._create_position_ids(global_anchor_positions)
+        draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
         dflash_attn_mask = create_dflash_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            S=seq_len,
+            anchor_positions=global_anchor_positions,
+            block_keep_mask=global_block_keep_mask,
+            S=padded_context_len,
             block_size=self.block_size,
             device=device,
+            real_context_len=real_context_len,
         )
 
         output_hidden = self.draft_model(
@@ -317,14 +439,29 @@ class OnlineDFlashModel(nn.Module):
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_label_indices = label_indices.clamp(max=seq_len - 1)
-
-        target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
-            2,
-            safe_label_indices,
-        )
+        if use_usp_sampling:
+            global_label_positions = anchor_positions.unsqueeze(-1) + label_offsets
+            valid_label_mask = global_label_positions < real_context_len
+            target_ids, original_loss_mask_gathered, _ = self._collect_global_values(
+                global_label_positions,
+                input_ids,
+                loss_mask,
+                position_ids,
+                attention_mask,
+            )
+        else:
+            valid_label_mask = label_indices < seq_len
+            safe_label_indices = label_indices.clamp(max=seq_len - 1)
+            target_ids = torch.gather(
+                input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+                2,
+                safe_label_indices,
+            )
+            original_loss_mask_gathered = torch.gather(
+                loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+                2,
+                safe_label_indices,
+            )
 
         # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
         weight_mask = (
@@ -334,12 +471,6 @@ class OnlineDFlashModel(nn.Module):
 
         pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
         weight_mask = weight_mask * (pos_in_block > 0).float()
-
-        original_loss_mask_gathered = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
-            2,
-            safe_label_indices,
-        )
         weight_mask = weight_mask * original_loss_mask_gathered
 
         binary_eval_mask = weight_mask.view(-1)
@@ -358,14 +489,24 @@ class OnlineDFlashModel(nn.Module):
         flat_weights = weight_mask.view(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        loss_numerator = (loss_per_token * flat_weights).sum()
+        valid_token_count = flat_weights.sum()
+        if use_usp_sampling:
+            sp_group = get_draft_sp_group()
+            dist.all_reduce(loss_numerator, op=dist.ReduceOp.SUM, group=sp_group)
+            dist.all_reduce(valid_token_count, op=dist.ReduceOp.SUM, group=sp_group)
+        loss = loss_numerator / (valid_token_count + 1e-6)
 
         # --- Accuracy ---
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
-            accuracy = correct.sum().float() / actual_token_count
+            correct_count = correct.sum().float()
+            actual_token_count = binary_eval_mask.sum().float()
+            if use_usp_sampling:
+                sp_group = get_draft_sp_group()
+                dist.all_reduce(correct_count, op=dist.ReduceOp.SUM, group=sp_group)
+                dist.all_reduce(actual_token_count, op=dist.ReduceOp.SUM, group=sp_group)
+            accuracy = correct_count / (actual_token_count + 1e-6)
 
         return loss, accuracy

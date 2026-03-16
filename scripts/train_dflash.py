@@ -67,7 +67,7 @@ def parse_args():
         "--attention-backend",
         type=str,
         default="flex_attention",
-        choices=["eager", "sdpa", "flex_attention"],
+        choices=["eager", "sdpa", "flex_attention", "usp"],
         help="Attention backend for draft model.",
     )
     model_group.add_argument(
@@ -220,7 +220,10 @@ def build_draft_model(args) -> DFlashDraftModel:
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
 
-    draft_config._attn_implementation = args.attention_backend
+    draft_config.dflash_config["attention_backend"] = args.attention_backend
+    draft_config._attn_implementation = (
+        "flex_attention" if args.attention_backend == "usp" else args.attention_backend
+    )
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
     draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
@@ -250,7 +253,7 @@ def build_dataloader(
     # Common filtering threshold: DFlash requires >= 2 * block_size loss tokens
     min_loss_tokens = 2 * args.block_size
 
-    use_usp_preprocess = args.sp_ulysses_size > 1 or args.sp_ring_size > 1
+    use_usp_preprocess = args.attention_backend == "usp"
     sampler_group = get_dp_group()
     if not is_online and use_usp_preprocess:
         sampler_group = get_draft_dp_group()
@@ -448,6 +451,8 @@ def main():
     if is_online:
         if args.train_data_path is None:
             raise ValueError("--train-data-path is required for online training mode")
+        if args.attention_backend == "usp":
+            raise ValueError("USP is currently supported for offline DFlash training only")
         if args.sp_ulysses_size != 1 or args.sp_ring_size != 1:
             raise ValueError("USP is currently supported for offline DFlash training only")
     else:
@@ -455,9 +460,15 @@ def main():
             raise ValueError(
                 f"Hidden states path not found: {args.train_hidden_states_path}"
             )
-        if (args.sp_ulysses_size > 1 or args.sp_ring_size > 1) and args.batch_size != 1:
+        if args.attention_backend == "usp" and args.sp_ulysses_size <= 1:
+            raise ValueError("Offline DFlash USP requires sp_ulysses_size > 1")
+        if args.attention_backend != "usp" and (
+            args.sp_ulysses_size > 1 or args.sp_ring_size > 1
+        ):
+            raise ValueError("Set --attention-backend usp to enable offline DFlash USP")
+        if args.attention_backend == "usp" and args.batch_size != 1:
             raise ValueError("Offline DFlash USP currently requires batch_size=1")
-        if args.sp_ring_size != 1:
+        if args.attention_backend == "usp" and args.sp_ring_size != 1:
             raise ValueError("Offline DFlash USP currently supports sp_ring_size=1 only")
 
     # Build draft model first (needed for target model layer config)
@@ -621,6 +632,7 @@ def main():
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
                 position_ids=position_ids,
+                attention_mask=attention_mask,
             )
 
             (loss / args.accumulation_steps).backward()

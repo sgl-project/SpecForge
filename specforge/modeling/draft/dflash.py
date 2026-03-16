@@ -1,6 +1,7 @@
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
@@ -17,7 +18,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
     eager_attention_forward,
     rotate_half,
 )
+from yunchang.comm import SeqAllToAll4D
 from typing_extensions import Tuple, Unpack
+
+from specforge.distributed import get_sp_ulysses_group
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -82,6 +86,29 @@ class Qwen3DFlashAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
+        dflash_config = getattr(config, "dflash_config", {}) or {}
+        self.attention_backend = dflash_config.get(
+            "attention_backend", config._attn_implementation
+        )
+        self.use_usp = self.attention_backend == "usp"
+        if self.use_usp:
+            assert (
+                dist.is_initialized()
+            ), "DFlash USP attention requires torch.distributed initialization."
+            self.ulysses_pg = get_sp_ulysses_group()
+            self.sp_ulysses_degree = dist.get_world_size(self.ulysses_pg)
+            self.scatter_idx = 2
+            self.gather_idx = 1
+            self.use_sync = False
+
+    def _ulysses_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
+        return SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            tensor,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
 
     def forward(
         self,
@@ -95,19 +122,24 @@ class Qwen3DFlashAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
-        q = self.q_proj(hidden_states)
-        q = q.view(bsz, q_len, -1, self.head_dim)
+        q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+        k_ctx = self.k_proj(target_hidden).view(bsz, ctx_len, -1, self.head_dim)
+        k_noise = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+        v_ctx = self.v_proj(target_hidden).view(bsz, ctx_len, -1, self.head_dim)
+        v_noise = self.v_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+
+        if self.use_usp:
+            q = self._ulysses_scatter(q)
+            k_ctx = self._ulysses_scatter(k_ctx)
+            k_noise = self._ulysses_scatter(k_noise)
+            v_ctx = self._ulysses_scatter(v_ctx)
+            v_noise = self._ulysses_scatter(v_noise)
+            q_len = q.shape[1]
+            ctx_len = k_ctx.shape[1]
+
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        v = torch.cat([v_ctx, v_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
+        k = torch.cat([k_ctx, k_noise], dim=1)
+        v = torch.cat([v_ctx, v_noise], dim=1)
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
@@ -129,7 +161,22 @@ class Qwen3DFlashAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+        if self.use_usp:
+            attn_output = (
+                attn_output.transpose(1, 2)
+                .contiguous()
+                .view(bsz, q_len, -1, self.head_dim)
+            )
+            attn_output = SeqAllToAll4D.apply(
+                self.ulysses_pg,
+                attn_output,
+                self.gather_idx,
+                self.scatter_idx,
+                self.use_sync,
+            )
+            attn_output = attn_output.reshape(bsz, -1, self.num_heads * self.head_dim)
+        else:
+            attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -251,7 +298,19 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        dflash_config = getattr(self.config, "dflash_config", {}) or {}
+        use_usp = dflash_config.get("attention_backend") == "usp"
+        if use_usp:
+            ulysses_pg = get_sp_ulysses_group()
+            world_size = dist.get_world_size(ulysses_pg)
+            gathered_position_ids = [
+                torch.empty_like(position_ids) for _ in range(world_size)
+            ]
+            dist.all_gather(gathered_position_ids, position_ids, group=ulysses_pg)
+            rotary_position_ids = torch.cat(gathered_position_ids, dim=1)
+        else:
+            rotary_position_ids = position_ids
+        position_embeddings = self.rotary_emb(hidden_states, rotary_position_ids)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
