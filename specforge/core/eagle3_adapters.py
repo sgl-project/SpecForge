@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -17,6 +17,8 @@ class StepState:
     position_ids: torch.Tensor
     attention_mask: torch.Tensor
     target_p: torch.Tensor
+    target_p_on_draft: torch.Tensor
+    target_token_ids: torch.Tensor
     position_mask: torch.Tensor
     loss_mask: torch.Tensor
 
@@ -36,6 +38,8 @@ class BackendAdapter:
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
+        target_p_on_draft_padded: Optional[torch.Tensor] = None,
+        target_token_ids_padded: Optional[torch.Tensor] = None,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
@@ -62,16 +66,30 @@ class SdpaLikeAdapter(BackendAdapter):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
+        target_p_on_draft_padded: Optional[torch.Tensor] = None,
+        target_token_ids_padded: Optional[torch.Tensor] = None,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
+        if target_p_on_draft_padded is None:
+            target_p_on_draft_padded = target_p_padded
+        if target_token_ids_padded is None:
+            target_token_ids_padded = target_p_padded.argmax(dim=-1)
         target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
+        target_p_on_draft = target_p_on_draft_padded[
+            :, idx : idx + seq_length, :
+        ].contiguous()
+        target_token_ids = target_token_ids_padded[
+            :, idx : idx + seq_length
+        ].contiguous()
         return StepState(
             input_ids=global_input_ids,
             hidden_states=hidden_states,
             position_ids=position_ids,
             attention_mask=attention_mask,
             target_p=target_p,
+            target_p_on_draft=target_p_on_draft,
+            target_token_ids=target_token_ids,
             position_mask=position_mask,
             loss_mask=loss_mask,
         )
@@ -96,9 +114,15 @@ class UspAdapter(BackendAdapter):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         target_p_padded: torch.Tensor,
+        target_p_on_draft_padded: Optional[torch.Tensor] = None,
+        target_token_ids_padded: Optional[torch.Tensor] = None,
         position_mask: torch.Tensor,
         seq_length: int,
     ) -> StepState:
+        if target_p_on_draft_padded is None:
+            target_p_on_draft_padded = target_p_padded
+        if target_token_ids_padded is None:
+            target_token_ids_padded = target_p_padded.argmax(dim=-1)
         usp_chunk_size = seq_length - ttt_length
         if usp_chunk_size <= 0:
             raise ValueError(
@@ -106,12 +130,16 @@ class UspAdapter(BackendAdapter):
                 f"ttt_length ({ttt_length})"
             )
         target_p = target_p_padded[:, idx : idx + usp_chunk_size, :]
+        target_p_on_draft = target_p_on_draft_padded[:, idx : idx + usp_chunk_size, :]
+        target_token_ids = target_token_ids_padded[:, idx : idx + usp_chunk_size]
         return StepState(
             input_ids=global_input_ids[:, :usp_chunk_size],
             hidden_states=hidden_states[:, :usp_chunk_size, :],
             position_ids=position_ids[:, : usp_chunk_size * self.sp_ulysses_degree],
             attention_mask=attention_mask[:, :usp_chunk_size],
             target_p=target_p,
+            target_p_on_draft=target_p_on_draft,
+            target_token_ids=target_token_ids,
             position_mask=position_mask[:, :usp_chunk_size, :],
             loss_mask=loss_mask[:, :usp_chunk_size, :],
         )
