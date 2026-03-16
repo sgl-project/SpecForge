@@ -556,7 +556,14 @@ class LlamaAttention(nn.Module):
             scaling_type = rope_get("rope_type", rope_get("type"))
             scaling_factor = rope_get("factor")
 
-            if scaling_type == "linear":
+            if scaling_type == "default":
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                )
+                return
+            elif scaling_type == "linear":
                 if scaling_factor is None:
                     raise ValueError(
                         "Linear RoPE scaling requires 'factor' in rope_scaling config."
