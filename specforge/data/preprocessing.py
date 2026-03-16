@@ -654,12 +654,27 @@ def build_offline_eagle3_dataset(
 class OfflineDFlashDataset(torch.utils.data.Dataset):
     """Offline dataset for DFlash training from pre-computed hidden states."""
 
-    def __init__(self, datapath, transform=None, max_len=2048, block_size=16):
+    def __init__(
+        self,
+        datapath,
+        transform=None,
+        max_len=2048,
+        block_size=16,
+        use_usp_preprocess=False,
+    ):
         self.datapaths = datapath
         self.transform = transform
         self._epoch = 0
         self.max_len = max_len
         self.block_size = block_size
+        self.use_usp_preprocess = use_usp_preprocess
+        if use_usp_preprocess:
+            sp_group = get_draft_sp_group()
+            self.sp_rank = torch.distributed.get_rank(sp_group)
+            self.sp_size = torch.distributed.get_world_size(sp_group)
+            ring_group = get_sp_ring_group()
+            self.ring_rank = torch.distributed.get_rank(ring_group)
+            self.sp_ring_size = torch.distributed.get_world_size(ring_group)
 
     @staticmethod
     def process_data(data, max_len, block_size=16, transform=None):
@@ -680,11 +695,76 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
             new_data = transform(new_data)
         return new_data
 
+    @staticmethod
+    def process_data_usp(
+        data,
+        max_len,
+        block_size=16,
+        transform=None,
+        sp_rank=0,
+        sp_size=1,
+        ring_rank=0,
+        sp_ring_size=1,
+    ):
+        new_data = {}
+
+        input_ids = data["input_ids"]
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        global_len = min(max_len, input_ids.shape[1])
+        chunk_size = (global_len + sp_size - 1) // sp_size
+        start = sp_rank * chunk_size
+        local_len = chunk_size
+        end = min(start + local_len, global_len)
+
+        def _slice_and_pad(tensor):
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            tensor = tensor[:, :global_len]
+            sliced = tensor[:, start:min(end, tensor.shape[1])]
+            valid_len = sliced.shape[1]
+            if valid_len < local_len:
+                pad_len = local_len - valid_len
+                if tensor.ndim == 2:
+                    sliced = F.pad(sliced, (0, pad_len))
+                else:
+                    sliced = F.pad(sliced, (0, 0, 0, pad_len))
+            return sliced.contiguous(), valid_len
+
+        new_data["hidden_state"], _ = _slice_and_pad(data["hidden_state"].squeeze(0))
+        new_data["input_ids"], valid_len = _slice_and_pad(input_ids)
+
+        full_loss_mask = data["loss_mask"]
+        if full_loss_mask.ndim == 1:
+            full_loss_mask = full_loss_mask.unsqueeze(0)
+        full_loss_mask = full_loss_mask[:, :global_len]
+        new_data["loss_mask"], _ = _slice_and_pad(full_loss_mask)
+
+        attention_mask = torch.zeros((1, local_len), dtype=torch.long)
+        attention_mask[:, :valid_len] = 1
+        new_data["attention_mask"] = attention_mask
+
+        position_ids = torch.zeros((1, local_len), dtype=torch.long)
+        if valid_len > 0:
+            position_ids[:, :valid_len] = torch.arange(
+                start, start + valid_len, dtype=torch.long
+            )
+        new_data["position_ids"] = position_ids
+
+        if transform:
+            new_data = transform(new_data)
+        return new_data
+
     def __len__(self):
         return len(self.datapaths)
 
     def _open_file(self, index):
-        return torch.load(self.datapaths[index], weights_only=False)
+        data_path = self.datapaths[index]
+        if data_path.endswith(".gz"):
+            with gzip.open(data_path, "rb") as f:
+                return torch.load(io.BytesIO(f.read()), weights_only=False)
+        return torch.load(data_path, weights_only=False, mmap=True)
 
     def __getitem__(self, index):
         try:
@@ -692,6 +772,17 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
             data = self._open_file(0)
+        if self.use_usp_preprocess:
+            return self.process_data_usp(
+                data,
+                self.max_len,
+                block_size=self.block_size,
+                transform=self.transform,
+                sp_rank=self.sp_rank,
+                sp_size=self.sp_size,
+                ring_rank=self.ring_rank,
+                sp_ring_size=self.sp_ring_size,
+            )
         return self.process_data(data, self.max_len, self.block_size, self.transform)
 
     def set_epoch(self, epoch):
@@ -702,6 +793,7 @@ def build_offline_dflash_dataset(
     hidden_states_path: str,
     max_len: int = 2048,
     block_size: int = 16,
+    use_usp_preprocess: bool = False,
 ) -> torch.utils.data.Dataset:
     """Build offline DFlash dataset from pre-computed hidden states.
 
@@ -717,6 +809,7 @@ def build_offline_dflash_dataset(
         list_local_files(hidden_states_path),
         max_len=max_len,
         block_size=block_size,
+        use_usp_preprocess=use_usp_preprocess,
     )
 
 

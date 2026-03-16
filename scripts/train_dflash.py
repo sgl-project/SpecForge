@@ -28,7 +28,12 @@ from specforge.data import (
     build_offline_dflash_dataset,
     prepare_dp_dataloaders,
 )
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_group,
+    get_draft_dp_group,
+    init_distributed,
+)
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import get_dflash_target_model
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
@@ -155,6 +160,8 @@ def parse_args():
 
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
+    dist_group.add_argument("--sp-ulysses-size", type=int, default=1)
+    dist_group.add_argument("--sp-ring-size", type=int, default=1)
 
     # SGLang specific args
     sglang_group = parser.add_argument_group("sglang backend")
@@ -243,6 +250,11 @@ def build_dataloader(
     # Common filtering threshold: DFlash requires >= 2 * block_size loss tokens
     min_loss_tokens = 2 * args.block_size
 
+    use_usp_preprocess = args.sp_ulysses_size > 1 or args.sp_ring_size > 1
+    sampler_group = get_dp_group()
+    if not is_online and use_usp_preprocess:
+        sampler_group = get_draft_dp_group()
+
     if is_online:
         # Online mode: Build from conversation data
         cache_params_string = (
@@ -283,6 +295,7 @@ def build_dataloader(
             hidden_states_path=args.train_hidden_states_path,
             max_len=args.max_length,
             block_size=args.block_size,
+            use_usp_preprocess=use_usp_preprocess,
         )
 
     train_dataloader = prepare_dp_dataloaders(
@@ -290,7 +303,7 @@ def build_dataloader(
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=sampler_group,
         requires_target=False,
     )
 
@@ -309,7 +322,7 @@ def build_dataloader(
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=sampler_group,
             requires_target=False,
         )
     elif not is_online and args.eval_hidden_states_path:
@@ -320,13 +333,14 @@ def build_dataloader(
             hidden_states_path=args.eval_hidden_states_path,
             max_len=args.max_length,
             block_size=args.block_size,
+            use_usp_preprocess=use_usp_preprocess,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_dflash_dataset,
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=sampler_group,
             requires_target=False,
         )
 
@@ -419,7 +433,12 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(
+        timeout=args.dist_timeout,
+        tp_size=args.tp_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+        sp_ring_size=args.sp_ring_size,
+    )
     print_with_rank("Initialized distributed")
 
     # Determine training mode and validate required arguments
@@ -429,11 +448,17 @@ def main():
     if is_online:
         if args.train_data_path is None:
             raise ValueError("--train-data-path is required for online training mode")
+        if args.sp_ulysses_size != 1 or args.sp_ring_size != 1:
+            raise ValueError("USP is currently supported for offline DFlash training only")
     else:
         if not os.path.exists(args.train_hidden_states_path):
             raise ValueError(
                 f"Hidden states path not found: {args.train_hidden_states_path}"
             )
+        if (args.sp_ulysses_size > 1 or args.sp_ring_size > 1) and args.batch_size != 1:
+            raise ValueError("Offline DFlash USP currently requires batch_size=1")
+        if args.sp_ring_size != 1:
+            raise ValueError("Offline DFlash USP currently supports sp_ring_size=1 only")
 
     # Build draft model first (needed for target model layer config)
     draft_model = build_draft_model(args)
@@ -576,6 +601,9 @@ def main():
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
+            position_ids = data.get("position_ids")
+            if position_ids is not None:
+                position_ids = position_ids.cuda()
 
             if is_online:
                 # Online mode: Generate hidden states from target model
@@ -590,9 +618,9 @@ def main():
             # Forward pass (Parallel Training)
             loss, accuracy = dflash_model(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                position_ids=position_ids,
             )
 
             (loss / args.accumulation_steps).backward()

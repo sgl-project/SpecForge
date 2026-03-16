@@ -4,9 +4,11 @@
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from specforge.distributed import get_draft_sp_group
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
 try:
@@ -129,6 +131,76 @@ class OnlineDFlashModel(nn.Module):
 
         return anchors, keep_mask
 
+    def _sample_anchor_positions_usp(
+        self,
+        position_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample one shared global anchor set per SP group.
+
+        Returns:
+            global_anchor_positions: [B, N] absolute positions
+            local_anchor_offsets: [B, N] local offsets for ranks owning each anchor
+            block_keep_mask: [B, N] whether this rank should execute the anchor block
+        """
+        bsz, seq_len = loss_mask.shape
+        if bsz != 1:
+            raise ValueError("Offline DFlash USP currently requires batch_size=1")
+
+        sp_group = get_draft_sp_group()
+        if sp_group is None or dist.get_world_size(sp_group) == 1:
+            local_anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device
+            )
+            return local_anchor_positions, local_anchor_positions, block_keep_mask
+
+        bs = self.block_size
+        max_anchor = max(seq_len - bs, 0)
+        valid = loss_mask[:, : max_anchor + 1] > 0.5
+        local_candidate_positions = position_ids[:, : max_anchor + 1].masked_select(valid)
+
+        gathered_candidates = [None] * dist.get_world_size(sp_group)
+        dist.all_gather_object(
+            gathered_candidates,
+            local_candidate_positions.detach().cpu().tolist(),
+            group=sp_group,
+        )
+
+        leader_rank = 0
+        anchor_payload = [None]
+        if dist.get_rank(sp_group) == leader_rank:
+            merged_candidates = []
+            for candidates in gathered_candidates:
+                merged_candidates.extend(candidates)
+            if not merged_candidates:
+                raise ValueError("should preprocess the data.")
+            global_candidates = torch.tensor(
+                merged_candidates, dtype=torch.long, device=device
+            )
+            sample_n = min(self.num_anchors, global_candidates.numel())
+            sampled_idx = torch.randperm(global_candidates.numel(), device=device)[:sample_n]
+            sampled_anchors = global_candidates[sampled_idx].sort().values
+            anchor_payload[0] = sampled_anchors.detach().cpu().tolist()
+        dist.broadcast_object_list(anchor_payload, src=leader_rank, group=sp_group)
+
+        global_anchor_positions = torch.tensor(
+            anchor_payload[0], dtype=torch.long, device=device
+        ).unsqueeze(0)
+
+        candidate_position_ids = position_ids[:, : max_anchor + 1]
+        anchor_matches = candidate_position_ids.unsqueeze(1) == global_anchor_positions.unsqueeze(-1)
+        anchor_matches = anchor_matches & valid.unsqueeze(1)
+        block_keep_mask = anchor_matches.any(dim=-1)
+        local_anchor_offsets = anchor_matches.to(torch.long).argmax(dim=-1)
+        local_anchor_offsets = torch.where(
+            block_keep_mask,
+            local_anchor_offsets,
+            torch.zeros_like(local_anchor_offsets),
+        )
+
+        return global_anchor_positions, local_anchor_offsets, block_keep_mask
+
     def prepare_noise_input(
         self, input_ids: torch.Tensor, block_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -186,23 +258,43 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+        use_usp_sampling = (
+            position_ids is not None
+            and dist.is_initialized()
+            and get_draft_sp_group() is not None
+            and dist.get_world_size(get_draft_sp_group()) > 1
         )
+        if use_usp_sampling:
+            global_anchor_positions, anchor_positions, block_keep_mask = (
+                self._sample_anchor_positions_usp(position_ids, loss_mask, device)
+            )
+        else:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device
+            )
+            global_anchor_positions = (
+                position_ids.gather(1, anchor_positions)
+                if position_ids is not None
+                else anchor_positions
+            )
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
         )
 
-        context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        )
-        draft_position_ids = self._create_position_ids(anchor_positions)
+        if position_ids is not None:
+            context_position_ids = position_ids[:, :seq_len].to(device=device)
+        else:
+            context_position_ids = (
+                torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            )
+        draft_position_ids = self._create_position_ids(global_anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
         dflash_attn_mask = create_dflash_block_mask(
