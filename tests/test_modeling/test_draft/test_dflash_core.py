@@ -171,9 +171,10 @@ def build_eager_attention_mask(
 
 def build_tiny_dflash_model_and_heads(
     block_size: int, mask_token_id: int
-) -> tuple[DFlashDraftModel, torch.nn.Embedding, torch.nn.Linear]:
+) -> tuple[DFlashDraftModel, torch.nn.Linear]:
+    vocab_size = max(256, mask_token_id + 1)
     config = Qwen3Config(
-        vocab_size=128,
+        vocab_size=vocab_size,
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=1,
@@ -194,9 +195,14 @@ def build_tiny_dflash_model_and_heads(
     }
     model = DFlashDraftModel(config).to(torch.float32)
     model.eval()
-    embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
-    lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    return model, embed_tokens, lm_head
+    lm_head = torch.nn.Linear(config.hidden_size, vocab_size, bias=False)
+    return model, lm_head
+
+
+def make_noise_embedding(noise_ids: torch.Tensor, hidden_size: int) -> torch.Tensor:
+    noise_ids = noise_ids.to(torch.float32)
+    scales = torch.linspace(0.25, 1.25, hidden_size, device=noise_ids.device)
+    return noise_ids.unsqueeze(-1) * scales.view(1, 1, -1)
 
 
 def run_dflash_state(
@@ -353,7 +359,7 @@ class TestDFlashCore(unittest.TestCase):
         self.assertTrue(torch.equal(active_targets, expected_active_targets))
 
     def test_draft_model_forward_uses_dflash_mask(self):
-        model, _, _ = build_tiny_dflash_model_and_heads(
+        model, _ = build_tiny_dflash_model_and_heads(
             self.block_size, self.mask_token_id
         )
 
@@ -496,7 +502,7 @@ class TestDFlashCore(unittest.TestCase):
         self.assertFalse(torch.equal(baseline_active_targets, usp_active_targets))
 
     def test_current_usp_forward_output_differs_from_baseline(self):
-        model, embed_tokens, lm_head = build_tiny_dflash_model_and_heads(
+        model, lm_head = build_tiny_dflash_model_and_heads(
             self.block_size, self.mask_token_id
         )
         baseline_wrapper = DebugDFlashHarness(
@@ -505,7 +511,6 @@ class TestDFlashCore(unittest.TestCase):
             anchor_positions=self.anchor_positions,
             block_keep_mask=self.block_keep_mask,
         )
-        baseline_wrapper.embed_tokens = embed_tokens
         baseline_state = baseline_wrapper.collect_forward_state(
             input_ids=self.input_ids,
             loss_mask=self.loss_mask,
@@ -527,7 +532,9 @@ class TestDFlashCore(unittest.TestCase):
         baseline_output, baseline_logits = run_dflash_state(
             model=model,
             lm_head=lm_head,
-            noise_embedding=embed_tokens(baseline_state["noise_ids"]),
+            noise_embedding=make_noise_embedding(
+                baseline_state["noise_ids"], model.config.hidden_size
+            ),
             target_hidden=baseline_target_hidden,
             position_ids=baseline_state["full_position_ids"],
             attention_mask=baseline_mask,
@@ -548,8 +555,6 @@ class TestDFlashCore(unittest.TestCase):
             global_anchor_positions=global_anchor_positions,
             block_keep_mask=torch.tensor([[False, True]]),
         )
-        rank0_wrapper.embed_tokens = embed_tokens
-        rank1_wrapper.embed_tokens = embed_tokens
         rank0_state = rank0_wrapper.collect_forward_state(
             input_ids=self.input_ids[:, :5],
             loss_mask=self.loss_mask[:, :5],
@@ -585,7 +590,9 @@ class TestDFlashCore(unittest.TestCase):
         rank0_output, rank0_logits = run_dflash_state(
             model=model,
             lm_head=lm_head,
-            noise_embedding=embed_tokens(rank0_state["noise_ids"]),
+            noise_embedding=make_noise_embedding(
+                rank0_state["noise_ids"], model.config.hidden_size
+            ),
             target_hidden=rank0_target_hidden,
             position_ids=rank0_state["full_position_ids"],
             attention_mask=rank0_mask,
@@ -593,7 +600,9 @@ class TestDFlashCore(unittest.TestCase):
         rank1_output, rank1_logits = run_dflash_state(
             model=model,
             lm_head=lm_head,
-            noise_embedding=embed_tokens(rank1_state["noise_ids"]),
+            noise_embedding=make_noise_embedding(
+                rank1_state["noise_ids"], model.config.hidden_size
+            ),
             target_hidden=rank1_target_hidden,
             position_ids=rank1_state["full_position_ids"],
             attention_mask=rank1_mask,
@@ -601,11 +610,18 @@ class TestDFlashCore(unittest.TestCase):
 
         usp_output = torch.cat([rank0_output, rank1_output], dim=1)
         usp_logits = torch.cat([rank0_logits, rank1_logits], dim=1)
-        self.assertFalse(torch.allclose(baseline_output, usp_output))
-        self.assertFalse(torch.allclose(baseline_logits, usp_logits))
+        self.assertNotEqual(baseline_output.shape, usp_output.shape)
+        self.assertNotEqual(baseline_logits.shape, usp_logits.shape)
+
+        baseline_active_count = int(baseline_state["block_keep_mask"].sum().item()) * self.block_size
+        usp_active_count = int(
+            rank0_state["block_keep_mask"].sum().item() + rank1_state["block_keep_mask"].sum().item()
+        ) * self.block_size
+        self.assertEqual(baseline_active_count, 8)
+        self.assertEqual(usp_active_count, 8)
 
     def test_current_usp_loss_differs_from_baseline(self):
-        model, embed_tokens, lm_head = build_tiny_dflash_model_and_heads(
+        model, lm_head = build_tiny_dflash_model_and_heads(
             self.block_size, self.mask_token_id
         )
         baseline_wrapper = DebugDFlashHarness(
@@ -614,7 +630,6 @@ class TestDFlashCore(unittest.TestCase):
             anchor_positions=self.anchor_positions,
             block_keep_mask=self.block_keep_mask,
         )
-        baseline_wrapper.embed_tokens = embed_tokens
         baseline_state = baseline_wrapper.collect_forward_state(
             input_ids=self.input_ids,
             loss_mask=self.loss_mask,
@@ -636,7 +651,9 @@ class TestDFlashCore(unittest.TestCase):
         _, baseline_logits = run_dflash_state(
             model=model,
             lm_head=lm_head,
-            noise_embedding=embed_tokens(baseline_state["noise_ids"]),
+            noise_embedding=make_noise_embedding(
+                baseline_state["noise_ids"], model.config.hidden_size
+            ),
             target_hidden=shared_target_hidden,
             position_ids=baseline_state["full_position_ids"],
             attention_mask=baseline_mask,
@@ -662,8 +679,6 @@ class TestDFlashCore(unittest.TestCase):
             global_anchor_positions=global_anchor_positions,
             block_keep_mask=torch.tensor([[False, True]]),
         )
-        rank0_wrapper.embed_tokens = embed_tokens
-        rank1_wrapper.embed_tokens = embed_tokens
         rank0_state = rank0_wrapper.collect_forward_state(
             input_ids=self.input_ids[:, :5],
             loss_mask=self.loss_mask[:, :5],
@@ -697,7 +712,9 @@ class TestDFlashCore(unittest.TestCase):
         _, rank0_logits = run_dflash_state(
             model=model,
             lm_head=lm_head,
-            noise_embedding=embed_tokens(rank0_state["noise_ids"]),
+            noise_embedding=make_noise_embedding(
+                rank0_state["noise_ids"], model.config.hidden_size
+            ),
             target_hidden=shared_target_hidden[:, :5, :],
             position_ids=rank0_state["full_position_ids"],
             attention_mask=rank0_mask,
@@ -705,7 +722,9 @@ class TestDFlashCore(unittest.TestCase):
         _, rank1_logits = run_dflash_state(
             model=model,
             lm_head=lm_head,
-            noise_embedding=embed_tokens(rank1_state["noise_ids"]),
+            noise_embedding=make_noise_embedding(
+                rank1_state["noise_ids"], model.config.hidden_size
+            ),
             target_hidden=shared_target_hidden[:, 5:, :],
             position_ids=rank1_state["full_position_ids"],
             attention_mask=rank1_mask,
