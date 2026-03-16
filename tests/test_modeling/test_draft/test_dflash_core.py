@@ -169,6 +169,69 @@ def build_eager_attention_mask(
     return additive_mask
 
 
+def build_tiny_dflash_model_and_heads(
+    block_size: int, mask_token_id: int
+) -> tuple[DFlashDraftModel, torch.nn.Embedding, torch.nn.Linear]:
+    config = Qwen3Config(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=128,
+        attention_dropout=0.0,
+        rms_norm_eps=1e-5,
+        block_size=block_size,
+        num_target_layers=1,
+        rope_theta=10000.0,
+        layer_types=["full_attention"],
+    )
+    config._attn_implementation = "eager"
+    config.dflash_config = {
+        "target_layer_ids": [0],
+        "mask_token_id": mask_token_id,
+    }
+    model = DFlashDraftModel(config).to(torch.float32)
+    model.eval()
+    embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+    lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    return model, embed_tokens, lm_head
+
+
+def run_dflash_state(
+    model: DFlashDraftModel,
+    lm_head: torch.nn.Module,
+    noise_embedding: torch.Tensor,
+    target_hidden: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        output_hidden = model(
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+        )
+        logits = lm_head(output_hidden)
+    return output_hidden, logits
+
+
+def compute_weighted_loss_from_logits(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    weight_mask: torch.Tensor,
+) -> torch.Tensor:
+    flat_logits = logits.view(-1, logits.size(-1))
+    flat_targets = target_ids.view(-1)
+    flat_weights = weight_mask.view(-1)
+    loss_per_token = torch.nn.functional.cross_entropy(
+        flat_logits, flat_targets, reduction="none"
+    )
+    return (loss_per_token * flat_weights).sum() / (flat_weights.sum() + 1e-6)
+
+
 class TestDFlashCore(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
@@ -290,34 +353,14 @@ class TestDFlashCore(unittest.TestCase):
         self.assertTrue(torch.equal(active_targets, expected_active_targets))
 
     def test_draft_model_forward_uses_dflash_mask(self):
-        config = Qwen3Config(
-            vocab_size=128,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            max_position_embeddings=128,
-            attention_dropout=0.0,
-            rms_norm_eps=1e-5,
-            block_size=self.block_size,
-            num_target_layers=1,
-            rope_theta=10000.0,
-            layer_types=["full_attention"],
+        model, _, _ = build_tiny_dflash_model_and_heads(
+            self.block_size, self.mask_token_id
         )
-        config._attn_implementation = "eager"
-        config.dflash_config = {
-            "target_layer_ids": [0],
-            "mask_token_id": self.mask_token_id,
-        }
-
-        model = DFlashDraftModel(config).to(torch.float32)
-        model.eval()
 
         noise_embedding = torch.randn(
-            1, self.anchor_positions.shape[1] * self.block_size, config.hidden_size
+            1, self.anchor_positions.shape[1] * self.block_size, model.config.hidden_size
         )
-        target_hidden = torch.randn(1, self.input_ids.shape[1], config.hidden_size)
+        target_hidden = torch.randn(1, self.input_ids.shape[1], model.config.hidden_size)
         draft_position_ids = self.wrapper._create_position_ids(self.anchor_positions)
         full_position_ids = torch.cat(
             [torch.arange(self.input_ids.shape[1]).unsqueeze(0), draft_position_ids],
@@ -355,7 +398,7 @@ class TestDFlashCore(unittest.TestCase):
                 target_hidden=target_hidden,
             )
 
-        self.assertEqual(output1.shape, (1, 8, config.hidden_size))
+        self.assertEqual(output1.shape, (1, 8, model.config.hidden_size))
         self.assertFalse(torch.isnan(output1).any())
         self.assertFalse(torch.isinf(output1).any())
         torch.testing.assert_close(output1, output2)
@@ -451,6 +494,241 @@ class TestDFlashCore(unittest.TestCase):
             ]
         )
         self.assertFalse(torch.equal(baseline_active_targets, usp_active_targets))
+
+    def test_current_usp_forward_output_differs_from_baseline(self):
+        model, embed_tokens, lm_head = build_tiny_dflash_model_and_heads(
+            self.block_size, self.mask_token_id
+        )
+        baseline_wrapper = DebugDFlashHarness(
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            anchor_positions=self.anchor_positions,
+            block_keep_mask=self.block_keep_mask,
+        )
+        baseline_wrapper.embed_tokens = embed_tokens
+        baseline_state = baseline_wrapper.collect_forward_state(
+            input_ids=self.input_ids,
+            loss_mask=self.loss_mask,
+            position_ids=None,
+            use_usp_sampling=False,
+        )
+        baseline_target_hidden = torch.randn(
+            1, self.input_ids.shape[1], model.config.hidden_size
+        )
+        baseline_mask = build_eager_attention_mask(
+            build_reference_bool_mask(
+                self.anchor_positions,
+                self.block_keep_mask,
+                context_len=self.input_ids.shape[1],
+                block_size=self.block_size,
+            ),
+            dtype=torch.float32,
+        )
+        baseline_output, baseline_logits = run_dflash_state(
+            model=model,
+            lm_head=lm_head,
+            noise_embedding=embed_tokens(baseline_state["noise_ids"]),
+            target_hidden=baseline_target_hidden,
+            position_ids=baseline_state["full_position_ids"],
+            attention_mask=baseline_mask,
+        )
+
+        global_anchor_positions = self.anchor_positions.clone()
+        rank0_wrapper = DebugDFlashHarness(
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            anchor_positions=torch.tensor([[2, 0]], dtype=torch.long),
+            global_anchor_positions=global_anchor_positions,
+            block_keep_mask=torch.tensor([[True, False]]),
+        )
+        rank1_wrapper = DebugDFlashHarness(
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            anchor_positions=torch.tensor([[0, 1]], dtype=torch.long),
+            global_anchor_positions=global_anchor_positions,
+            block_keep_mask=torch.tensor([[False, True]]),
+        )
+        rank0_wrapper.embed_tokens = embed_tokens
+        rank1_wrapper.embed_tokens = embed_tokens
+        rank0_state = rank0_wrapper.collect_forward_state(
+            input_ids=self.input_ids[:, :5],
+            loss_mask=self.loss_mask[:, :5],
+            position_ids=torch.arange(0, 5).unsqueeze(0),
+            use_usp_sampling=True,
+        )
+        rank1_state = rank1_wrapper.collect_forward_state(
+            input_ids=self.input_ids[:, 5:],
+            loss_mask=self.loss_mask[:, 5:],
+            position_ids=torch.arange(5, 10).unsqueeze(0),
+            use_usp_sampling=True,
+        )
+        rank0_mask = build_eager_attention_mask(
+            build_reference_bool_mask(
+                rank0_state["anchor_positions"],
+                rank0_state["block_keep_mask"],
+                context_len=5,
+                block_size=self.block_size,
+            ),
+            dtype=torch.float32,
+        )
+        rank1_mask = build_eager_attention_mask(
+            build_reference_bool_mask(
+                rank1_state["anchor_positions"],
+                rank1_state["block_keep_mask"],
+                context_len=5,
+                block_size=self.block_size,
+            ),
+            dtype=torch.float32,
+        )
+        rank0_target_hidden = baseline_target_hidden[:, :5, :].clone()
+        rank1_target_hidden = baseline_target_hidden[:, 5:, :].clone()
+        rank0_output, rank0_logits = run_dflash_state(
+            model=model,
+            lm_head=lm_head,
+            noise_embedding=embed_tokens(rank0_state["noise_ids"]),
+            target_hidden=rank0_target_hidden,
+            position_ids=rank0_state["full_position_ids"],
+            attention_mask=rank0_mask,
+        )
+        rank1_output, rank1_logits = run_dflash_state(
+            model=model,
+            lm_head=lm_head,
+            noise_embedding=embed_tokens(rank1_state["noise_ids"]),
+            target_hidden=rank1_target_hidden,
+            position_ids=rank1_state["full_position_ids"],
+            attention_mask=rank1_mask,
+        )
+
+        usp_output = torch.cat([rank0_output, rank1_output], dim=1)
+        usp_logits = torch.cat([rank0_logits, rank1_logits], dim=1)
+        self.assertFalse(torch.allclose(baseline_output, usp_output))
+        self.assertFalse(torch.allclose(baseline_logits, usp_logits))
+
+    def test_current_usp_loss_differs_from_baseline(self):
+        model, embed_tokens, lm_head = build_tiny_dflash_model_and_heads(
+            self.block_size, self.mask_token_id
+        )
+        baseline_wrapper = DebugDFlashHarness(
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            anchor_positions=self.anchor_positions,
+            block_keep_mask=self.block_keep_mask,
+        )
+        baseline_wrapper.embed_tokens = embed_tokens
+        baseline_state = baseline_wrapper.collect_forward_state(
+            input_ids=self.input_ids,
+            loss_mask=self.loss_mask,
+            position_ids=None,
+            use_usp_sampling=False,
+        )
+        shared_target_hidden = torch.randn(
+            1, self.input_ids.shape[1], model.config.hidden_size
+        )
+        baseline_mask = build_eager_attention_mask(
+            build_reference_bool_mask(
+                self.anchor_positions,
+                self.block_keep_mask,
+                context_len=self.input_ids.shape[1],
+                block_size=self.block_size,
+            ),
+            dtype=torch.float32,
+        )
+        _, baseline_logits = run_dflash_state(
+            model=model,
+            lm_head=lm_head,
+            noise_embedding=embed_tokens(baseline_state["noise_ids"]),
+            target_hidden=shared_target_hidden,
+            position_ids=baseline_state["full_position_ids"],
+            attention_mask=baseline_mask,
+        )
+        baseline_loss = compute_weighted_loss_from_logits(
+            baseline_logits,
+            baseline_state["target_ids"],
+            baseline_state["weight_mask"],
+        )
+
+        global_anchor_positions = self.anchor_positions.clone()
+        rank0_wrapper = DebugDFlashHarness(
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            anchor_positions=torch.tensor([[2, 0]], dtype=torch.long),
+            global_anchor_positions=global_anchor_positions,
+            block_keep_mask=torch.tensor([[True, False]]),
+        )
+        rank1_wrapper = DebugDFlashHarness(
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            anchor_positions=torch.tensor([[0, 1]], dtype=torch.long),
+            global_anchor_positions=global_anchor_positions,
+            block_keep_mask=torch.tensor([[False, True]]),
+        )
+        rank0_wrapper.embed_tokens = embed_tokens
+        rank1_wrapper.embed_tokens = embed_tokens
+        rank0_state = rank0_wrapper.collect_forward_state(
+            input_ids=self.input_ids[:, :5],
+            loss_mask=self.loss_mask[:, :5],
+            position_ids=torch.arange(0, 5).unsqueeze(0),
+            use_usp_sampling=True,
+        )
+        rank1_state = rank1_wrapper.collect_forward_state(
+            input_ids=self.input_ids[:, 5:],
+            loss_mask=self.loss_mask[:, 5:],
+            position_ids=torch.arange(5, 10).unsqueeze(0),
+            use_usp_sampling=True,
+        )
+        rank0_mask = build_eager_attention_mask(
+            build_reference_bool_mask(
+                rank0_state["anchor_positions"],
+                rank0_state["block_keep_mask"],
+                context_len=5,
+                block_size=self.block_size,
+            ),
+            dtype=torch.float32,
+        )
+        rank1_mask = build_eager_attention_mask(
+            build_reference_bool_mask(
+                rank1_state["anchor_positions"],
+                rank1_state["block_keep_mask"],
+                context_len=5,
+                block_size=self.block_size,
+            ),
+            dtype=torch.float32,
+        )
+        _, rank0_logits = run_dflash_state(
+            model=model,
+            lm_head=lm_head,
+            noise_embedding=embed_tokens(rank0_state["noise_ids"]),
+            target_hidden=shared_target_hidden[:, :5, :],
+            position_ids=rank0_state["full_position_ids"],
+            attention_mask=rank0_mask,
+        )
+        _, rank1_logits = run_dflash_state(
+            model=model,
+            lm_head=lm_head,
+            noise_embedding=embed_tokens(rank1_state["noise_ids"]),
+            target_hidden=shared_target_hidden[:, 5:, :],
+            position_ids=rank1_state["full_position_ids"],
+            attention_mask=rank1_mask,
+        )
+        rank0_loss_num = torch.nn.functional.cross_entropy(
+            rank0_logits.view(-1, rank0_logits.size(-1)),
+            rank0_state["target_ids"].view(-1),
+            reduction="none",
+        )
+        rank0_loss_num = (rank0_loss_num * rank0_state["weight_mask"].view(-1)).sum()
+        rank0_weight = rank0_state["weight_mask"].sum()
+        rank1_loss_num = torch.nn.functional.cross_entropy(
+            rank1_logits.view(-1, rank1_logits.size(-1)),
+            rank1_state["target_ids"].view(-1),
+            reduction="none",
+        )
+        rank1_loss_num = (rank1_loss_num * rank1_state["weight_mask"].view(-1)).sum()
+        rank1_weight = rank1_state["weight_mask"].sum()
+        usp_loss = (rank0_loss_num + rank1_loss_num) / (
+            rank0_weight + rank1_weight + 1e-6
+        )
+
+        self.assertFalse(torch.allclose(baseline_loss, usp_loss))
 
 
 if __name__ == "__main__":
