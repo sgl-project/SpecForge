@@ -15,11 +15,13 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
 
 from .sglang_backend import SGLangRunner
+
+QWEN3_VL_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
 
 
 @dataclass
@@ -28,6 +30,7 @@ class DFlashTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    position_ids: Optional[torch.Tensor] = None  # [batch, seq_len] or [3, batch, seq_len]
 
 
 class DFlashTargetModel(ABC):
@@ -56,6 +59,11 @@ class DFlashTargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
         """Generate context hidden states for DFlash training."""
 
@@ -184,7 +192,23 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
+        if (
+            pixel_values is not None
+            or pixel_values_videos is not None
+            or image_grid_thw is not None
+            or video_grid_thw is not None
+            or second_per_grid_ts is not None
+        ):
+            raise NotImplementedError(
+                "SGLangDFlashTargetModel does not yet support multimodal inputs. "
+                "Use HF backend for real VLM DFlash training."
+            )
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
 
@@ -220,13 +244,15 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            position_ids=None,
         )
 
 
 class HFDFlashTargetModel(DFlashTargetModel):
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, model_type: Optional[str] = None):
         super().__init__()
         self.model = model
+        self.model_type = model_type
 
     @classmethod
     def from_pretrained(
@@ -238,20 +264,55 @@ class HFDFlashTargetModel(DFlashTargetModel):
         trust_remote_code: bool = True,
         **kwargs,
     ) -> "HFDFlashTargetModel":
-
-        target_model = AutoModelForCausalLM.from_pretrained(
+        hf_config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path,
-            torch_dtype=torch_dtype,
             cache_dir=cache_dir,
-            output_hidden_states=True,
             trust_remote_code=trust_remote_code,
-            **kwargs,
-        ).eval()
+        )
+        model_type = getattr(hf_config, "model_type", None)
+
+        if model_type in QWEN3_VL_MODEL_TYPES:
+            if model_type == "qwen3_vl":
+                try:
+                    from transformers import Qwen3VLForConditionalGeneration
+                except ImportError as exc:
+                    raise ImportError(
+                        "Qwen3VLForConditionalGeneration is unavailable. "
+                        "Please upgrade transformers to a version with qwen3_vl support."
+                    ) from exc
+
+                model_cls = Qwen3VLForConditionalGeneration
+            else:
+                try:
+                    from transformers import Qwen3VLMoeForConditionalGeneration
+                except ImportError as exc:
+                    raise ImportError(
+                        "Qwen3VLMoeForConditionalGeneration is unavailable. "
+                        "Please upgrade transformers to a version with qwen3_vl_moe support."
+                    ) from exc
+
+                model_cls = Qwen3VLMoeForConditionalGeneration
+            target_model = model_cls.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            ).eval()
+        else:
+            target_model = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                output_hidden_states=True,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            ).eval()
 
         if device:
             target_model = target_model.to(device)
 
-        return cls(target_model)
+        return cls(target_model, model_type=model_type)
 
     @torch.no_grad()
     def generate_dflash_data(
@@ -259,13 +320,66 @@ class HFDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        target_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if self.model_type in QWEN3_VL_MODEL_TYPES:
+            target_kwargs.update(
+                {
+                    "pixel_values": pixel_values,
+                    "pixel_values_videos": pixel_values_videos,
+                    "image_grid_thw": image_grid_thw,
+                    "video_grid_thw": video_grid_thw,
+                }
+            )
+
+        filtered_target_kwargs = {}
+        for key, value in target_kwargs.items():
+            if key in {
+                "input_ids",
+                "attention_mask",
+                "output_hidden_states",
+                "use_cache",
+            } or value is not None:
+                filtered_target_kwargs[key] = value
+
+        outputs = self.model(**filtered_target_kwargs)
+        if outputs.hidden_states is None:
+            raise ValueError(
+                "Target model did not return hidden states. Ensure output_hidden_states=True is supported."
+            )
+
+        position_ids = None
+        if self.model_type in QWEN3_VL_MODEL_TYPES:
+            target_inner_model = getattr(self.model, "model", None)
+            if target_inner_model is not None and hasattr(
+                target_inner_model, "get_rope_index"
+            ):
+                rope_kwargs = {
+                    "input_ids": input_ids,
+                    "image_grid_thw": image_grid_thw,
+                    "attention_mask": attention_mask,
+                }
+                if video_grid_thw is not None:
+                    rope_kwargs["video_grid_thw"] = video_grid_thw
+                if second_per_grid_ts is not None:
+                    rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
+
+                filtered_rope_kwargs = {
+                    key: value for key, value in rope_kwargs.items() if value is not None
+                }
+                position_ids, _ = target_inner_model.get_rope_index(
+                    **filtered_rope_kwargs
+                )
 
         # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
         offset = 1
@@ -282,6 +396,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            position_ids=position_ids,
         )
 
 
