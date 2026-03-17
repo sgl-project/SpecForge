@@ -4,7 +4,7 @@ import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from specforge.core.dflash import OnlineDFlashModel, create_dflash_block_mask
-from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.dflash import DFlashDraftModel, apply_rotary_pos_emb
 
 
 class TokenIdEmbedding(torch.nn.Module):
@@ -212,6 +212,7 @@ def run_dflash_state(
     target_hidden: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    debug_capture: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         output_hidden = model(
@@ -219,6 +220,7 @@ def run_dflash_state(
             attention_mask=attention_mask,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
+            debug_capture=debug_capture,
         )
         logits = lm_head(output_hidden)
     return output_hidden, logits
@@ -409,6 +411,56 @@ class TestDFlashCore(unittest.TestCase):
         self.assertFalse(torch.isinf(output1).any())
         torch.testing.assert_close(output1, output2)
         self.assertFalse(torch.allclose(output1, output_relaxed))
+
+    def test_k_after_rope_concatenates_context_then_noise(self):
+        model, _ = build_tiny_dflash_model_and_heads(
+            self.block_size, self.mask_token_id
+        )
+
+        noise_embedding = torch.randn(
+            1, self.anchor_positions.shape[1] * self.block_size, model.config.hidden_size
+        )
+        target_hidden = torch.randn(1, self.input_ids.shape[1], model.config.hidden_size)
+        draft_position_ids = self.wrapper._create_position_ids(self.anchor_positions)
+        full_position_ids = torch.cat(
+            [torch.arange(self.input_ids.shape[1]).unsqueeze(0), draft_position_ids],
+            dim=1,
+        )
+
+        bool_mask = build_reference_bool_mask(
+            self.anchor_positions,
+            self.block_keep_mask,
+            context_len=self.input_ids.shape[1],
+            block_size=self.block_size,
+        )
+        restrictive_mask = build_eager_attention_mask(bool_mask, dtype=torch.float32)
+        debug_capture = {}
+        run_dflash_state(
+            model,
+            torch.nn.Identity(),
+            noise_embedding,
+            target_hidden,
+            full_position_ids,
+            restrictive_mask,
+            debug_capture=debug_capture,
+        )
+
+        attn = model.layers[0].self_attn
+        q = attn.q_norm(attn.q_proj(noise_embedding).view(1, noise_embedding.shape[1], -1, attn.head_dim)).transpose(1, 2)
+        k_ctx = attn.k_norm(attn.k_proj(target_hidden).view(1, target_hidden.shape[1], -1, attn.head_dim)).transpose(1, 2)
+        k_noise = attn.k_norm(attn.k_proj(noise_embedding).view(1, noise_embedding.shape[1], -1, attn.head_dim)).transpose(1, 2)
+        cos, sin = model.rotary_emb(noise_embedding, full_position_ids)
+        _, expected_k = apply_rotary_pos_emb(q, torch.cat([k_ctx, k_noise], dim=2), cos, sin)
+
+        torch.testing.assert_close(debug_capture["k_after_rope"], expected_k)
+        torch.testing.assert_close(
+            debug_capture["k_after_rope"][:, :, : target_hidden.shape[1], :],
+            expected_k[:, :, : target_hidden.shape[1], :],
+        )
+        torch.testing.assert_close(
+            debug_capture["k_after_rope"][:, :, target_hidden.shape[1] :, :],
+            expected_k[:, :, target_hidden.shape[1] :, :],
+        )
 
     def test_current_usp_core_state_differs_from_full_sequence_baseline(self):
         baseline_state = self.debug_wrapper.collect_forward_state(

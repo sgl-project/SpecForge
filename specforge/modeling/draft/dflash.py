@@ -139,29 +139,28 @@ class Qwen3DFlashAttention(nn.Module):
         _capture("v_ctx_proj", v_ctx)
         _capture("v_noise_proj", v_noise)
 
-        if self.use_usp:
-            q = self._ulysses_scatter(q)
-            k_ctx = self._ulysses_scatter(k_ctx)
-            k_noise = self._ulysses_scatter(k_noise)
-            v_ctx = self._ulysses_scatter(v_ctx)
-            v_noise = self._ulysses_scatter(v_noise)
-            q_len = q.shape[1]
-            ctx_len = k_ctx.shape[1]
-            _capture("q_scattered", q)
-            _capture("k_ctx_scattered", k_ctx)
-            _capture("k_noise_scattered", k_noise)
-            _capture("v_ctx_scattered", v_ctx)
-            _capture("v_noise_scattered", v_noise)
-
         q = self.q_norm(q).transpose(1, 2)
-        k = torch.cat([k_ctx, k_noise], dim=1)
-        v = torch.cat([v_ctx, v_noise], dim=1)
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
+        k_ctx = self.k_norm(k_ctx).transpose(1, 2)
+        k_noise = self.k_norm(k_noise).transpose(1, 2)
+        v_ctx = v_ctx.transpose(1, 2)
+        v_noise = v_noise.transpose(1, 2)
         cos, sin = position_embeddings
+        k = torch.cat([k_ctx, k_noise], dim=2)
+        v = torch.cat([v_ctx, v_noise], dim=2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         _capture("q_after_rope", q)
         _capture("k_after_rope", k)
+        if self.use_usp:
+            q = self._ulysses_scatter(q.transpose(1, 2)).transpose(1, 2)
+            k = self._ulysses_scatter(k.transpose(1, 2)).transpose(1, 2)
+            v = self._ulysses_scatter(v.transpose(1, 2)).transpose(1, 2)
+            q_len = q.shape[-2]
+            ctx_len = k.shape[-2] - q_len
+            _capture("q_scattered", q.transpose(1, 2))
+            _capture("k_ctx_scattered", k[:, :, :ctx_len, :].transpose(1, 2))
+            _capture("k_noise_scattered", k[:, :, ctx_len:, :].transpose(1, 2))
+            _capture("v_ctx_scattered", v[:, :, :ctx_len, :].transpose(1, 2))
+            _capture("v_noise_scattered", v[:, :, ctx_len:, :].transpose(1, 2))
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
@@ -319,40 +318,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        dflash_config = getattr(self.config, "dflash_config", {}) or {}
-        use_usp = dflash_config.get("attention_backend") == "usp"
-        if use_usp:
-            ulysses_pg = get_sp_ulysses_group()
-            world_size = dist.get_world_size(ulysses_pg)
-            local_ctx_len = target_hidden.shape[1]
-            local_draft_len = hidden_states.shape[1]
-            context_position_ids = position_ids[:, :local_ctx_len].contiguous()
-            draft_position_ids = position_ids[
-                :, local_ctx_len : local_ctx_len + local_draft_len
-            ].contiguous()
-
-            gathered_context_position_ids = [
-                torch.empty_like(context_position_ids) for _ in range(world_size)
-            ]
-            gathered_draft_position_ids = [
-                torch.empty_like(draft_position_ids) for _ in range(world_size)
-            ]
-            dist.all_gather(
-                gathered_context_position_ids, context_position_ids, group=ulysses_pg
-            )
-            dist.all_gather(
-                gathered_draft_position_ids, draft_position_ids, group=ulysses_pg
-            )
-            rotary_position_ids = torch.cat(
-                [
-                    torch.cat(gathered_context_position_ids, dim=1),
-                    torch.cat(gathered_draft_position_ids, dim=1),
-                ],
-                dim=1,
-            )
-        else:
-            rotary_position_ids = position_ids
-        position_embeddings = self.rotary_emb(hidden_states, rotary_position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
