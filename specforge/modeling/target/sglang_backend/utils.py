@@ -3,7 +3,7 @@ This file contains the wrapper for the SGL model.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -33,13 +33,17 @@ def replaced_logits_processor_forward_for_eagle3(
     hidden_states,
     lm_head,
     logits_metadata: Union[LogitsMetadata, ForwardBatch],
-    aux_hidden_states: Optional[torch.Tensor] = None,
+    aux_hidden_states: Optional[List[torch.Tensor]] = None,
+    hidden_states_before_norm: Optional[torch.Tensor] = None,
     return_last_hidden_states: bool = False,
     return_logits: bool = False,
 ) -> LogitsProcessorOutput:
     """
     This is a modified forward function for the SGLang's logits processor, adapted from https://github.com/sgl-project/sglang/blob/v0.5.4/python/sglang/srt/layers/logits_processor.py.
     The modification is to return the logits and aux hidden states instead of the last hidden states.
+
+    Updated for sglang 0.5.9:
+    - Added hidden_states_before_norm parameter for compatibility
     """
 
     if isinstance(logits_metadata, ForwardBatch):
@@ -61,6 +65,8 @@ def replaced_logits_processor_forward_for_eagle3(
         pruned_states = hidden_states
         if aux_hidden_states is not None:
             aux_pruned_states = [hidden for hidden in aux_hidden_states]
+        else:
+            aux_pruned_states = None
         sample_indices = None
         input_logprob_indices = None
     else:
@@ -137,6 +143,7 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
         lm_head,
         logits_metadata,
         aux_hidden_states: Optional[torch.Tensor] = None,
+        hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         logits_metadata.forward_mode = ForwardMode.DECODE
         ret = replaced_logits_processor_forward_for_eagle3(
@@ -146,6 +153,7 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
             lm_head,
             logits_metadata,
             aux_hidden_states,
+            hidden_states_before_norm,
             self.return_last_hidden_states,
             self.return_logits,
         )

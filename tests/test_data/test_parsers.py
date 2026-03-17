@@ -199,6 +199,11 @@ class TestTemplatePreprocessing(unittest.TestCase):
             "Qwen/Qwen3-0.6B", "qwen3-instruct", messages=self.tool_use_messages
         )
 
+    def test_qwen35_instruct(self):
+        self._run_template_test(
+            "/data/jiapingW/pretrained_models/Qwen3.5-35B-A3B", "qwen3.5"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
