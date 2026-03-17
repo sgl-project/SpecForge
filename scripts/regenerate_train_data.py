@@ -6,25 +6,28 @@ Usage:
 1. Set up one or more SGLang servers for the target model.
 
 python3 -m sglang.launch_server \
-	--model meta-llama/Llama-3.1-8B-Instruct \
-	--mem-fraction-static 0.75 \
-	--cuda-graph-max-bs 128 \
+	--model Qwen/Qwen3.5-35B-A3B \
+	--mem-fraction-static 0.7 \
 	--tp 1 \
 	--trust-remote-code \
+    --cuda-graph-max-bs 128 \
 	--host 0.0.0.0 \
 	--port 30000 \
-	--dtype bfloat16
+	--dtype bfloat16 \
+    --reasoning-parser qwen3
 
 
 2. Regenerate the dataset using the `regenerate_train_data.py` script.
 python scripts/regenerate_train_data.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
+    --model Qwen/Qwen3.5-35B-A3B \
     --concurrency 128 \
     --max-tokens 4096 \
-    --server-address localhost:30000 \
+    --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
     --temperature 0.8 \
-    --input-file-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
+    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
+    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
+    --resume \
+    --is-reasoning-model
 """
 
 import argparse

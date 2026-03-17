@@ -389,7 +389,6 @@ class ThinkingParser(GeneralParser):
         """Parse conversation, processing all assistant turns for loss mask."""
         if self.chat_template.enable_thinking:
             kwargs["enable_thinking"] = True
-
         return super().parse(
             conversation, max_length, preformatted, train_only_last_turn, tool, **kwargs
         )

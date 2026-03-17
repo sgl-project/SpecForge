@@ -80,6 +80,20 @@ def parse_args():
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
+    model_group.add_argument(
+        "--embedding-key",
+        type=str,
+        default=None,
+        help="Embedding weight key in the target model. "
+        "Default: 'model.embed_tokens.weight' for standard models, "
+        "'model.language_model.embed_tokens.weight' for multimodal models like Qwen3.5-A3B.",
+    )
+    model_group.add_argument(
+        "--lm-head-key",
+        type=str,
+        default=None,
+        help="LM head weight key in the target model. Default: 'lm_head.weight'.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -103,12 +117,6 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
-    training_group.add_argument(
-        "--ckpt-dir",
-        type=str,
-        default=None,
-        help="Directory of the checkpoint to resume training from",
-    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -160,6 +168,15 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
+        # Warn if command-line args differ from config
+        if (
+            hasattr(draft_config, "block_size")
+            and draft_config.block_size != args.block_size
+        ):
+            print_on_rank0(
+                f"Warning: checkpoint block_size ({draft_config.block_size}) differs from "
+                f"command-line arg ({args.block_size}). Using checkpoint value."
+            )
     else:
         target_config = AutoConfig.from_pretrained(args.target_model_path)
         draft_config = AutoConfig.from_pretrained(args.target_model_path)
@@ -341,23 +358,22 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
-    target_model, draft_model = build_models(args)
-
     draft_model_last_checkpoint = None
-    if args.ckpt_dir is not None:
-        if os.path.isdir(args.ckpt_dir):
-            draft_model_last_checkpoint = args.ckpt_dir
-            print_on_rank0(f"Using checkpoint: {draft_model_last_checkpoint}")
-        else:
-            raise ValueError(
-                f"Provided ckpt dir {args.ckpt_dir} is not a valid directory."
-            )
-
+    ckpt_info = (0, 0)
     if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
-            args.output_dir, prefix=r"epoch_\d+_step"
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
+    # If resuming, load config from checkpoint to ensure consistency
+    if draft_model_last_checkpoint:
+        checkpoint_config_path = os.path.join(
+            draft_model_last_checkpoint, "config.json"
         )
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        if os.path.exists(checkpoint_config_path):
+            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
+            args.draft_config_path = checkpoint_config_path
+
+    target_model, draft_model = build_models(args)
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -366,7 +382,7 @@ def main():
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
-        print_on_rank0("Loaded draft model weights from checkpoint")
+        print("Loaded draft model weights from checkpoint")
 
         training_state_path = os.path.join(
             draft_model_last_checkpoint, "training_state.pt"
@@ -375,7 +391,7 @@ def main():
             resume_state = torch.load(
                 training_state_path, map_location="cpu", weights_only=False
             )
-            print_on_rank0(
+            print(
                 f"Will resume from epoch {resume_state['epoch']}, "
                 f"step {resume_state['global_step']}"
             )
@@ -405,8 +421,8 @@ def main():
     print_on_rank0("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
-        embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
-        lm_head_key="lm_head.weight",
+        embed_key=args.embedding_key,
+        lm_head_key=args.lm_head_key,
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
@@ -436,23 +452,12 @@ def main():
     start_epoch = ckpt_info[0]
     global_step = ckpt_info[1]
 
-    # Calculate remaining steps for resuming training
-    # This ensures the learning rate schedule continues correctly from the checkpoint
-    if resume_state is not None:
-        remaining_steps = total_steps - global_step
-        print(
-            f"Resuming training: global_step={global_step}, "
-            f"total_steps={total_steps}, remaining_steps={remaining_steps}"
-        )
-    else:
-        remaining_steps = total_steps
-
     optimizer = BF16Optimizer(
         draft_model,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
-        total_steps=remaining_steps,
+        total_steps=total_steps,
     )
 
     if resume_state is not None:
@@ -460,7 +465,11 @@ def main():
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
-        print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
+        print_on_rank0(
+            f"Restored optimizer/scheduler state: "
+            f"epoch={start_epoch}, step={global_step}, "
+            f"lr={optimizer.get_learning_rate():.6f}"
+        )
 
     skip_steps = global_step - start_epoch * len(train_dataloader)
 

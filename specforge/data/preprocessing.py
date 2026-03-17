@@ -159,7 +159,6 @@ def preprocess_conversations(
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
-
     for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
         if not source:
             # if the source is None, skip it
@@ -389,7 +388,7 @@ def build_eagle3_dataset(
             if "tools" in examples:
                 tools = examples.pop("tools")
             else:
-                tools = [[]]
+                tools = [[] for _ in range(len(conversations))]
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
