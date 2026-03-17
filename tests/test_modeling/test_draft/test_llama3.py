@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import torch.nn as nn
 from transformers import LlamaConfig
 
 from specforge.modeling.draft.llama3_eagle import (
@@ -35,7 +36,7 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             "model_type": "llama",
             "num_attention_heads": 32,
             "num_key_value_heads": 8,
-            "num_hidden_layers": 1,
+            "num_hidden_layers": 3,
             "pad_token_id": 0,
             "rms_norm_eps": 1e-05,
             "tie_word_embeddings": False,
@@ -53,13 +54,15 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
     def test_model_initialization(self):
         model = LlamaForCausalLMEagle3(self.config)
-
-        self.assertIsInstance(model.midlayer.self_attn, LlamaAttention)
-        self.assertIsInstance(model.midlayer.mlp, LlamaMLP)
-        self.assertIsInstance(model.midlayer.hidden_norm, LlamaRMSNorm)
-        self.assertIsInstance(model.midlayer.input_layernorm, LlamaRMSNorm)
-        self.assertIsInstance(model.midlayer.post_attention_layernorm, LlamaRMSNorm)
-        self.assertEqual(model.midlayer.hidden_size, self.config.hidden_size)
+        self.assertEqual(model.num_hidden_layers, self.config.num_hidden_layers)
+        self.assertIsInstance(model.midlayers, nn.ModuleList)
+        for layer in model.midlayers:
+            self.assertIsInstance(layer.self_attn, LlamaAttention)
+            self.assertIsInstance(layer.mlp, LlamaMLP)
+            self.assertIsInstance(layer.hidden_norm, LlamaRMSNorm)
+            self.assertIsInstance(layer.input_layernorm, LlamaRMSNorm)
+            self.assertIsInstance(layer.post_attention_layernorm, LlamaRMSNorm)
+            self.assertEqual(layer.hidden_size, self.config.hidden_size)
 
     def test_save_pretrained(self):
         """Test the model's save_pretrained functionality."""
