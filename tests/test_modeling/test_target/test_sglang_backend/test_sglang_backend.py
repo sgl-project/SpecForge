@@ -12,11 +12,11 @@ from tests.utils import get_available_port
 
 @torch.no_grad()
 def test_dense(rank, world_size, port, tp_size):
-    # os.environ["RANK"] = str(rank)
-    # os.environ["LOCAL_RANK"] = str(rank)
-    # os.environ["WORLD_SIZE"] = str(world_size)
-    # os.environ["MASTER_ADDR"] = "localhost"
-    # os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
 
     init_distributed(tp_size=tp_size)
     set_seed(42)
