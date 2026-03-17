@@ -354,7 +354,7 @@ def main():
             )
 
     if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint = get_last_checkpoint(
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
             args.output_dir, prefix=r"epoch_\d+_step"
         )
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
@@ -441,8 +441,8 @@ def main():
         total_steps=total_steps,
     )
 
-    start_epoch = 0
-    global_step = 0
+    start_epoch = ckpt_info[0]
+    global_step = ckpt_info[1]
     if resume_state is not None:
         optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         start_epoch = resume_state["epoch"]

@@ -308,3 +308,16 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="</longcat_s>",
     ),
 )
+
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3.5",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n<think>\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
