@@ -127,6 +127,7 @@ class Qwen3DFlashAttention(nn.Module):
                 debug_capture[name] = tensor.detach().clone()
 
         bsz, q_len = hidden_states.shape[:-1]
+        local_q_len = q_len
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
         k_ctx = self.k_proj(target_hidden).view(bsz, ctx_len, -1, self.head_dim)
@@ -146,21 +147,29 @@ class Qwen3DFlashAttention(nn.Module):
         v_noise = v_noise.transpose(1, 2)
         cos, sin = position_embeddings
         k = torch.cat([k_ctx, k_noise], dim=2)
-        v = torch.cat([v_ctx, v_noise], dim=2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        k_ctx = k[:, :, :ctx_len, :]
+        k_noise = k[:, :, ctx_len:, :]
+        v = torch.cat([v_ctx, v_noise], dim=2)
         _capture("q_after_rope", q)
+        _capture("k_ctx_after_rope", k_ctx)
+        _capture("k_noise_after_rope", k_noise)
         _capture("k_after_rope", k)
         if self.use_usp:
             q = self._ulysses_scatter(q.transpose(1, 2)).transpose(1, 2)
-            k = self._ulysses_scatter(k.transpose(1, 2)).transpose(1, 2)
-            v = self._ulysses_scatter(v.transpose(1, 2)).transpose(1, 2)
+            k_ctx = self._ulysses_scatter(k_ctx.transpose(1, 2)).transpose(1, 2)
+            k_noise = self._ulysses_scatter(k_noise.transpose(1, 2)).transpose(1, 2)
+            v_ctx = self._ulysses_scatter(v_ctx.transpose(1, 2)).transpose(1, 2)
+            v_noise = self._ulysses_scatter(v_noise.transpose(1, 2)).transpose(1, 2)
             q_len = q.shape[-2]
-            ctx_len = k.shape[-2] - q_len
+            ctx_len = k_ctx.shape[-2]
+            k = torch.cat([k_ctx, k_noise], dim=2)
+            v = torch.cat([v_ctx, v_noise], dim=2)
             _capture("q_scattered", q.transpose(1, 2))
-            _capture("k_ctx_scattered", k[:, :, :ctx_len, :].transpose(1, 2))
-            _capture("k_noise_scattered", k[:, :, ctx_len:, :].transpose(1, 2))
-            _capture("v_ctx_scattered", v[:, :, :ctx_len, :].transpose(1, 2))
-            _capture("v_noise_scattered", v[:, :, ctx_len:, :].transpose(1, 2))
+            _capture("k_ctx_scattered", k_ctx.transpose(1, 2))
+            _capture("k_noise_scattered", k_noise.transpose(1, 2))
+            _capture("v_ctx_scattered", v_ctx.transpose(1, 2))
+            _capture("v_noise_scattered", v_noise.transpose(1, 2))
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
@@ -180,11 +189,6 @@ class Qwen3DFlashAttention(nn.Module):
         )
         _capture("attn_output_pre_gather", attn_output)
         if self.use_usp:
-            attn_output = (
-                attn_output.transpose(1, 2)
-                .contiguous()
-                .view(bsz, q_len, -1, self.head_dim)
-            )
             attn_output = SeqAllToAll4D.apply(
                 self.ulysses_pg,
                 attn_output,
@@ -192,7 +196,9 @@ class Qwen3DFlashAttention(nn.Module):
                 self.scatter_idx,
                 self.use_sync,
             )
-            attn_output = attn_output.reshape(bsz, -1, self.num_heads * self.head_dim)
+            attn_output = attn_output.reshape(
+                bsz, local_q_len, self.num_heads * self.head_dim
+            )
         else:
             attn_output = attn_output.reshape(bsz, q_len, -1)
         _capture("attn_output_final", attn_output)

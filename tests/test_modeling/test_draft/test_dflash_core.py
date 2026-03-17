@@ -446,9 +446,24 @@ class TestDFlashCore(unittest.TestCase):
         )
 
         attn = model.layers[0].self_attn
-        q = attn.q_norm(attn.q_proj(noise_embedding).view(1, noise_embedding.shape[1], -1, attn.head_dim)).transpose(1, 2)
-        k_ctx = attn.k_norm(attn.k_proj(target_hidden).view(1, target_hidden.shape[1], -1, attn.head_dim)).transpose(1, 2)
-        k_noise = attn.k_norm(attn.k_proj(noise_embedding).view(1, noise_embedding.shape[1], -1, attn.head_dim)).transpose(1, 2)
+        layer = model.layers[0]
+        attn_hidden_states = layer.input_layernorm(noise_embedding)
+        attn_target_hidden = model.hidden_norm(model.fc(target_hidden))
+        q = attn.q_norm(
+            attn.q_proj(attn_hidden_states).view(
+                1, attn_hidden_states.shape[1], -1, attn.head_dim
+            )
+        ).transpose(1, 2)
+        k_ctx = attn.k_norm(
+            attn.k_proj(attn_target_hidden).view(
+                1, attn_target_hidden.shape[1], -1, attn.head_dim
+            )
+        ).transpose(1, 2)
+        k_noise = attn.k_norm(
+            attn.k_proj(attn_hidden_states).view(
+                1, attn_hidden_states.shape[1], -1, attn.head_dim
+            )
+        ).transpose(1, 2)
         cos, sin = model.rotary_emb(noise_embedding, full_position_ids)
         _, expected_k = apply_rotary_pos_emb(q, torch.cat([k_ctx, k_noise], dim=2), cos, sin)
 

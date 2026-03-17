@@ -243,6 +243,28 @@ class OnlineDFlashModel(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lookup sparse global positions from sharded local inputs.
+
+        There are two reasonable ways to implement this sparse lookup in USP:
+
+        1. Leader-based gather:
+           - one rank (typically rank0) receives the sparse requests,
+           - owners send back the values for the requested global positions,
+           - the leader materializes the final sparse result and then broadcasts
+             or scatters it.
+
+        2. Symmetric group lookup:
+           - every rank receives the same sparse position list,
+           - each rank fills only the entries that fall into its local shard,
+           - the group combines these sparse partial results with collective ops.
+
+        We currently choose (2). The request set here is tiny: anchors plus
+        anchor-derived label positions (`num_anchors * block_size`), not the full
+        sequence. Keeping the same sparse request tensor on every rank makes the
+        implementation simpler and keeps the rest of the DFlash pipeline rank-
+        symmetric. We avoid gathering any dense hidden states; only sparse token-
+        level metadata is communicated.
+        """
         sp_group = get_draft_sp_group()
         device = input_ids.device
         local_valid_len = int(attention_mask.sum(dim=1).max().item())
@@ -266,6 +288,9 @@ class OnlineDFlashModel(nn.Module):
                 safe_positions <= local_end
             )
             if in_local_range.any():
+                # `position_ids` is a contiguous absolute-position shard, so once a
+                # requested global position falls into this shard we can convert it
+                # to a local offset with a single subtraction.
                 local_offsets = safe_positions[in_local_range] - local_start
                 local_tokens[in_local_range] = input_ids[:, :local_valid_len].view(-1)[
                     local_offsets
@@ -302,6 +327,15 @@ class OnlineDFlashModel(nn.Module):
             global_anchor_positions[:, start:end],
             global_block_keep_mask[:, start:end],
         )
+
+    def _slice_local_block_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        sp_group = get_draft_sp_group()
+        sp_world_size = dist.get_world_size(sp_group)
+        sp_rank = dist.get_rank(sp_group)
+        blocks_per_rank = tensor.shape[1] // sp_world_size
+        start = sp_rank * blocks_per_rank
+        end = start + blocks_per_rank
+        return tensor[:, start:end]
 
     def prepare_noise_input(
         self, input_ids: torch.Tensor, block_ids: Optional[torch.Tensor] = None
@@ -385,9 +419,19 @@ class OnlineDFlashModel(nn.Module):
             real_context_len, padded_context_len = self._get_global_context_lengths(
                 position_ids, attention_mask
             )
-            anchor_tokens, _, anchor_presence = self._collect_global_values(
-                anchor_positions, input_ids, loss_mask, position_ids, attention_mask
+            # Sparse lookup is done on the full global anchor list first so that
+            # every rank participates in the same collective with the same sparse
+            # request tensor. We slice the resulting sparse value table into local
+            # blocks only after the global lookup is complete.
+            global_anchor_tokens, _, global_anchor_presence = self._collect_global_values(
+                global_anchor_positions,
+                input_ids,
+                loss_mask,
+                position_ids,
+                attention_mask,
             )
+            anchor_tokens = self._slice_local_block_tensor(global_anchor_tokens)
+            anchor_presence = self._slice_local_block_tensor(global_anchor_presence)
             if not bool((anchor_presence | ~block_keep_mask).all().item()):
                 raise ValueError("Failed to gather anchor tokens for USP DFlash")
             noise_embedding = self._create_noise_embed_from_anchor_tokens(
@@ -440,14 +484,21 @@ class OnlineDFlashModel(nn.Module):
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         if use_usp_sampling:
-            global_label_positions = anchor_positions.unsqueeze(-1) + label_offsets
-            valid_label_mask = global_label_positions < real_context_len
-            target_ids, original_loss_mask_gathered, _ = self._collect_global_values(
+            # Same design as anchor-token lookup above: compute sparse global label
+            # values first, then slice to this rank's local block subset.
+            global_label_positions = global_anchor_positions.unsqueeze(-1) + label_offsets
+            global_valid_label_mask = global_label_positions < real_context_len
+            global_target_ids, global_original_loss_mask_gathered, _ = self._collect_global_values(
                 global_label_positions,
                 input_ids,
                 loss_mask,
                 position_ids,
                 attention_mask,
+            )
+            valid_label_mask = self._slice_local_block_tensor(global_valid_label_mask)
+            target_ids = self._slice_local_block_tensor(global_target_ids)
+            original_loss_mask_gathered = self._slice_local_block_tensor(
+                global_original_loss_mask_gathered
             )
         else:
             valid_label_mask = label_indices < seq_len
