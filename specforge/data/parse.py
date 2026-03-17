@@ -8,7 +8,6 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from .template import ChatTemplate
-from .tools import TOOLS
 
 __all__ = ["GeneralParser", "HarmonyParser", "ThinkingParser"]
 
@@ -22,7 +21,6 @@ class Parser(ABC):
     ):
         self.tokenizer = tokenizer
         self.chat_template = chat_template
-        self.tools = TOOLS
 
     @abstractmethod
     def parse(
@@ -55,12 +53,12 @@ class GeneralParser(Parser):
         self.assistant_message_separator = f"{chat_template.assistant_header}"
         self.set_assistant_pattern(chat_template)
 
-    def apply_chat_template(self, messages, **kwargs) -> str:
+    def apply_chat_template(self, messages, tool, **kwargs) -> str:
         conversation = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
-            tools=self.tools,
+            tools=tool,
             **kwargs,
         )
         return conversation
@@ -89,6 +87,7 @@ class GeneralParser(Parser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
+        tool: List[Dict] = [],
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if not preformatted:
@@ -136,7 +135,7 @@ class GeneralParser(Parser):
                 messages.append(sentence)
 
             try:
-                conversation = self.apply_chat_template(messages, **kwargs)
+                conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
             except (ValueError, TypeError):
                 # Fallback rendering for tokenizers without built-in chat_template
                 warnings.warn(
@@ -286,6 +285,7 @@ class HarmonyParser(Parser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
+        tool: List[Dict] = [],
     ) -> List[torch.Tensor]:
         # conversation = process_harmony_conversations(conversation)
         if not preformatted:
@@ -315,6 +315,7 @@ class HarmonyParser(Parser):
             truncation=True,
             return_tensors="pt",
             add_special_tokens=False,
+            tools=tool,
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
@@ -364,16 +365,14 @@ class ThinkingParser(GeneralParser):
     ):
         super().__init__(tokenizer, chat_template)
 
-    def apply_chat_template(self, messages, **kwargs) -> str:
+    def apply_chat_template(self, messages, tool, **kwargs) -> str:
         """Apply chat template to all messages, handling reasoning_content and tool_calls."""
-
-        # Apply template to all messages
         conversation = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
             add_special_tokens=False,
-            tools=self.tools,
+            tools=tool,
             **kwargs,
         )
         return conversation
@@ -384,6 +383,7 @@ class ThinkingParser(GeneralParser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
+        tool: List[Dict] = [],
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         """Parse conversation, processing all assistant turns for loss mask."""
@@ -391,5 +391,5 @@ class ThinkingParser(GeneralParser):
             kwargs["enable_thinking"] = True
 
         return super().parse(
-            conversation, max_length, preformatted, train_only_last_turn, **kwargs
+            conversation, max_length, preformatted, train_only_last_turn, tool, **kwargs
         )

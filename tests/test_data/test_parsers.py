@@ -329,7 +329,7 @@ class TestTemplatePreprocessing(unittest.TestCase):
 
     def test_qwen35_instruct(self):
         self._run_template_test(
-            "/data/jiapingW/pretrained_models/Qwen3.5-35B-A3B",
+            "Qwen/Qwen3.5-35B-A3B",
             "qwen3.5",
             messages=self.complete_reasoning_tool_conversation,
         )
