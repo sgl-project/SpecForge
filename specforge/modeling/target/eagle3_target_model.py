@@ -341,6 +341,18 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             model_runner.model, return_full_logits=False
         )
 
+        # Free CPU memory retained by glibc after loading safetensors files.
+        # Without this, each process retains hundreds of GB of malloc arenas
+        # (e.g. ~258 GB for a 480B model with 55 shards). With multiple
+        # processes per node, this can exceed system RAM and trigger OOM.
+        import gc
+        import ctypes
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass  # malloc_trim may not be available on all platforms
+
         # Get hf_config from model_config for VLM attributes
         hf_config = getattr(model_config, "hf_config", None)
 
