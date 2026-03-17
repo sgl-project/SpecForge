@@ -54,6 +54,12 @@ class TargetEmbeddingsAndHead(nn.Module):
         config = AutoConfig.from_pretrained(
             model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
         )
+
+        if hasattr(config, "text_config") and config.text_config is not None:
+            tc = config.text_config
+            for attr in ("vocab_size", "hidden_size", "pad_token_id"):
+                if getattr(config, attr, None) is None:
+                    setattr(config, attr, getattr(tc, attr, None))
         instance = cls(config)
 
         if embed_key is None:

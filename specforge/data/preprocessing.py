@@ -216,9 +216,50 @@ def preprocess_vlm_conversations(
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         source = examples["conversations"][i]
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = []
+        # messages = [{"role": "system", "content": system_prompt}]
         if not source:
             # if the source is None, skip it
+            continue
+
+        if not image:
+            text_messages = []
+            convroles = ["user", "assistant"]
+            for j, sentence in enumerate(source):
+                role = sentence["role"]
+                assert role == convroles[j % 2], f"unexpected role {role}"
+                text_messages.append({"role": role, "content": sentence["content"]})
+            conversation = processor.apply_chat_template(
+                text_messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            encoding = processor(
+                text=[conversation],
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+                add_special_tokens=False,
+            )
+
+            input_ids = encoding.input_ids[0]
+            offsets = encoding.offset_mapping[0]
+
+            # get conversation with image info for loss mask generation
+            decoded_conversation = processor.tokenizer.decode(
+                encoding.input_ids[0], skip_special_tokens=False
+            )
+
+            # Apply loss mask
+            loss_mask = _apply_loss_mask_from_chat_template(
+                decoded_conversation, offsets, chat_template
+            )
+            results["input_ids"].append(input_ids[None, :])
+            results["loss_mask"].append(loss_mask[None, :])
+            results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+            results["pixel_values"].append(torch.empty(0, 0).float())
+            results["image_grid_thw"].append([])
             continue
 
         if source[0]["role"] != "user":
@@ -226,23 +267,28 @@ def preprocess_vlm_conversations(
             source = source[1:]
 
         convroles = ["user", "assistant"]
+        has_added_image = False
         for j, sentence in enumerate(source):
             role = sentence["role"]
             assert role == convroles[j % 2], f"unexpected role {role}"
             if role == "user":
                 # if the message is from user and has image, process the image
-                messages.append(
-                    {
-                        "role": role,
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": image,
-                            },
-                            {"type": "text", "text": sentence["content"]},
-                        ],
-                    }
-                )
+                if not has_added_image:
+                    messages.append(
+                        {
+                            "role": role,
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "image": image,
+                                },
+                                {"type": "text", "text": sentence["content"]},
+                            ],
+                        }
+                    )
+                    has_added_image = True
+                else:
+                    messages.append({"role": role, "content": sentence["content"]})
             else:
                 messages.append({"role": role, "content": sentence["content"]})
 
