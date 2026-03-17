@@ -433,16 +433,28 @@ def main():
     )
     print_with_rank("Initialized FSDP")
 
+    start_epoch = ckpt_info[0]
+    global_step = ckpt_info[1]
+
+    # Calculate remaining steps for resuming training
+    # This ensures the learning rate schedule continues correctly from the checkpoint
+    if resume_state is not None:
+        remaining_steps = total_steps - global_step
+        print(
+            f"Resuming training: global_step={global_step}, "
+            f"total_steps={total_steps}, remaining_steps={remaining_steps}"
+        )
+    else:
+        remaining_steps = total_steps
+
     optimizer = BF16Optimizer(
         draft_model,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
-        total_steps=total_steps,
+        total_steps=remaining_steps,
     )
 
-    start_epoch = ckpt_info[0]
-    global_step = ckpt_info[1]
     if resume_state is not None:
         optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         start_epoch = resume_state["epoch"]

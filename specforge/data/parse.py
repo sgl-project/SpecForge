@@ -8,15 +8,21 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from .template import ChatTemplate
+from .tools import TOOLS
 
-__all__ = ["GeneralParser", "HarmonyParser"]
+__all__ = ["GeneralParser", "HarmonyParser", "ThinkingParser"]
 
 
 class Parser(ABC):
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chat_template: ChatTemplate,
+    ):
         self.tokenizer = tokenizer
         self.chat_template = chat_template
+        self.tools = TOOLS
 
     @abstractmethod
     def parse(
@@ -38,7 +44,11 @@ _harmony_encoding = None
 
 class GeneralParser(Parser):
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chat_template: ChatTemplate,
+    ):
         super().__init__(tokenizer, chat_template)
         self.system_prompt = chat_template.system_prompt
         self.user_message_separator = f"{chat_template.end_of_turn_token}"
@@ -47,7 +57,11 @@ class GeneralParser(Parser):
 
     def apply_chat_template(self, messages, **kwargs) -> str:
         conversation = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False, **kwargs
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            tools=self.tools,
+            **kwargs,
         )
         return conversation
 
@@ -194,6 +208,40 @@ class GeneralParser(Parser):
 
             if actual_start < actual_end:
                 loss_mask[actual_start:actual_end] = 1
+
+        # Zero out loss_mask for ignore_tokens
+        ignore_tokens = self.chat_template.ignore_token
+        if ignore_tokens:
+            for token_str in ignore_tokens:
+                start = 0
+                while True:
+                    idx = conversation.find(token_str, start)
+                    if idx == -1:
+                        break
+                    ignore_start_char = idx
+                    ignore_end_char = idx + len(token_str)
+
+                    prefix_ids = self.tokenizer.encode(
+                        conversation[:ignore_start_char],
+                        add_special_tokens=False,
+                        truncation=True,
+                        max_length=max_length,
+                    )
+                    full_ids = self.tokenizer.encode(
+                        conversation[:ignore_end_char],
+                        add_special_tokens=False,
+                        truncation=True,
+                        max_length=max_length,
+                    )
+
+                    start_token_idx = min(len(prefix_ids), len(input_ids))
+                    end_token_idx = min(len(full_ids), len(input_ids))
+
+                    if start_token_idx < end_token_idx:
+                        loss_mask[start_token_idx:end_token_idx] = 0
+
+                    start = ignore_end_char
+
         return input_ids, loss_mask
 
 
@@ -301,28 +349,34 @@ class HarmonyParser(Parser):
 
 
 class ThinkingParser(GeneralParser):
-    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+    """
+    Parser for thinking/reasoning models.
+
+    This parser processes the entire conversation (not just the last turn).
+    It handles reasoning_content and tool_calls in assistant messages.
+    The loss mask covers from assistant_header to end_of_turn_token (inclusive).
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chat_template: ChatTemplate,
+    ):
         super().__init__(tokenizer, chat_template)
 
     def apply_chat_template(self, messages, **kwargs) -> str:
-        if messages[-1]["role"] == "assistant":
-            conversation_history = self.tokenizer.apply_chat_template(
-                messages[:-1],
-                tokenize=False,
-                add_generation_prompt=True,
-                add_special_tokens=False,
-                **kwargs,
-            )
-            conversation = (
-                conversation_history
-                + messages[-1]["content"]
-                + self.chat_template.end_of_turn_token
-            )
-            return conversation
-        else:
-            raise Exception(
-                f"The last message is not assistant but {messages[-1]['role']}"
-            )
+        """Apply chat template to all messages, handling reasoning_content and tool_calls."""
+
+        # Apply template to all messages
+        conversation = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+            tools=self.tools,
+            **kwargs,
+        )
+        return conversation
 
     def parse(
         self,
@@ -332,10 +386,10 @@ class ThinkingParser(GeneralParser):
         train_only_last_turn: bool = False,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
+        """Parse conversation, processing all assistant turns for loss mask."""
         if self.chat_template.enable_thinking:
             kwargs["enable_thinking"] = True
-        else:
-            pass
+
         return super().parse(
             conversation, max_length, preformatted, train_only_last_turn, **kwargs
         )

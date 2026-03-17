@@ -228,7 +228,9 @@ def call_sglang(
                 "content": response_text,
             }
             if args.is_reasoning_model:
-                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
+                resp_msg["reasoning_content"] = resp.choices[
+                    0
+                ].message.reasoning_content
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
