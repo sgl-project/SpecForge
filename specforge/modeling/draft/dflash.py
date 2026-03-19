@@ -1,6 +1,7 @@
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
@@ -17,7 +18,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
     eager_attention_forward,
     rotate_half,
 )
+from yunchang.comm import SeqAllToAll4D
 from typing_extensions import Tuple, Unpack
+
+from specforge.distributed import get_sp_ulysses_group
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -46,32 +50,32 @@ class Qwen3DFlashAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
         self.q_proj = nn.Linear(
             config.hidden_size,
-            config.num_attention_heads * self.head_dim,
+            self.num_heads * self.head_dim,
             bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
             config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
+            self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
             config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
+            self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
+            self.num_heads * self.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
         )
@@ -81,6 +85,29 @@ class Qwen3DFlashAttention(nn.Module):
             config.sliding_window
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
+        )
+        dflash_config = getattr(config, "dflash_config", {}) or {}
+        self.attention_backend = dflash_config.get(
+            "attention_backend", config._attn_implementation
+        )
+        self.use_usp = self.attention_backend == "usp"
+        if self.use_usp:
+            assert (
+                dist.is_initialized()
+            ), "DFlash USP attention requires torch.distributed initialization."
+            self.ulysses_pg = get_sp_ulysses_group()
+            self.sp_ulysses_degree = dist.get_world_size(self.ulysses_pg)
+            self.scatter_idx = 2
+            self.gather_idx = 1
+            self.use_sync = False
+
+    def _ulysses_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
+        return SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            tensor,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
         )
 
     def forward(
@@ -93,25 +120,56 @@ class Qwen3DFlashAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        debug_capture = kwargs.pop("debug_capture", None)
+
+        def _capture(name: str, tensor: torch.Tensor):
+            if debug_capture is not None:
+                debug_capture[name] = tensor.detach().clone()
+
         bsz, q_len = hidden_states.shape[:-1]
+        local_q_len = q_len
         ctx_len = target_hidden.shape[1]
-        q = self.q_proj(hidden_states)
-        q = q.view(bsz, q_len, -1, self.head_dim)
+        q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+        k_ctx = self.k_proj(target_hidden).view(bsz, ctx_len, -1, self.head_dim)
+        k_noise = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+        v_ctx = self.v_proj(target_hidden).view(bsz, ctx_len, -1, self.head_dim)
+        v_noise = self.v_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+        _capture("q_proj", q)
+        _capture("k_ctx_proj", k_ctx)
+        _capture("k_noise_proj", k_noise)
+        _capture("v_ctx_proj", v_ctx)
+        _capture("v_noise_proj", v_noise)
+
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        v = torch.cat([v_ctx, v_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
+        k_ctx = self.k_norm(k_ctx).transpose(1, 2)
+        k_noise = self.k_norm(k_noise).transpose(1, 2)
+        v_ctx = v_ctx.transpose(1, 2)
+        v_noise = v_noise.transpose(1, 2)
         cos, sin = position_embeddings
+        k = torch.cat([k_ctx, k_noise], dim=2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        k_ctx = k[:, :, :ctx_len, :]
+        k_noise = k[:, :, ctx_len:, :]
+        v = torch.cat([v_ctx, v_noise], dim=2)
+        _capture("q_after_rope", q)
+        _capture("k_ctx_after_rope", k_ctx)
+        _capture("k_noise_after_rope", k_noise)
+        _capture("k_after_rope", k)
+        if self.use_usp:
+            q = self._ulysses_scatter(q.transpose(1, 2)).transpose(1, 2)
+            k_ctx = self._ulysses_scatter(k_ctx.transpose(1, 2)).transpose(1, 2)
+            k_noise = self._ulysses_scatter(k_noise.transpose(1, 2)).transpose(1, 2)
+            v_ctx = self._ulysses_scatter(v_ctx.transpose(1, 2)).transpose(1, 2)
+            v_noise = self._ulysses_scatter(v_noise.transpose(1, 2)).transpose(1, 2)
+            q_len = q.shape[-2]
+            ctx_len = k_ctx.shape[-2]
+            k = torch.cat([k_ctx, k_noise], dim=2)
+            v = torch.cat([v_ctx, v_noise], dim=2)
+            _capture("q_scattered", q.transpose(1, 2))
+            _capture("k_ctx_scattered", k_ctx.transpose(1, 2))
+            _capture("k_noise_scattered", k_noise.transpose(1, 2))
+            _capture("v_ctx_scattered", v_ctx.transpose(1, 2))
+            _capture("v_noise_scattered", v_noise.transpose(1, 2))
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
@@ -129,8 +187,23 @@ class Qwen3DFlashAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+        _capture("attn_output_pre_gather", attn_output)
+        if self.use_usp:
+            attn_output = SeqAllToAll4D.apply(
+                self.ulysses_pg,
+                attn_output,
+                self.gather_idx,
+                self.scatter_idx,
+                self.use_sync,
+            )
+            attn_output = attn_output.reshape(
+                bsz, local_q_len, self.num_heads * self.head_dim
+            )
+        else:
+            attn_output = attn_output.reshape(bsz, q_len, -1)
+        _capture("attn_output_final", attn_output)
         attn_output = self.o_proj(attn_output)
+        _capture("attn_output_projected", attn_output)
         return attn_output, attn_weights
 
 

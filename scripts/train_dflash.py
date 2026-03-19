@@ -9,6 +9,7 @@ import os
 import shutil
 import time
 import warnings
+from argparse import Namespace
 from typing import Optional, Tuple
 
 import torch
@@ -23,13 +24,20 @@ from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
-from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.target.dflash_target_model import (
-    DFlashTargetModel,
-    get_dflash_target_model,
+from specforge.data import (
+    build_eagle3_dataset,
+    build_offline_dflash_dataset,
+    prepare_dp_dataloaders,
 )
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_group,
+    get_draft_dp_group,
+    get_draft_sp_group,
+    init_distributed,
+)
+from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.target.dflash_target_model import get_dflash_target_model
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -61,7 +69,7 @@ def parse_args():
         "--attention-backend",
         type=str,
         default="flex_attention",
-        choices=["eager", "sdpa", "flex_attention"],
+        choices=["eager", "sdpa", "flex_attention", "usp"],
         help="Attention backend for draft model.",
     )
     model_group.add_argument(
@@ -82,8 +90,25 @@ def parse_args():
     )
 
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument(
+        "--train-data-path",
+        type=str,
+        default=None,
+        help="Path to training data (required for online mode)",
+    )
+    dataset_group.add_argument(
+        "--train-hidden-states-path",
+        type=str,
+        default=None,
+        help="Path to pre-computed hidden states for offline training",
+    )
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument(
+        "--eval-hidden-states-path",
+        type=str,
+        default=None,
+        help="Path to pre-computed hidden states for offline evaluation",
+    )
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
@@ -91,6 +116,13 @@ def parse_args():
         "--build-dataset-num-proc",
         type=int,
         default=int(os.environ.get("SPECFORGE_DATA_NUM_PROC", 8)),
+    )
+
+    model_group.add_argument(
+        "--lm-head-key",
+        type=str,
+        default="lm_head.weight",
+        help="The key of the lm head weight to load from the target model (for offline training)",
     )
 
     training_group = parser.add_argument_group("training")
@@ -130,6 +162,8 @@ def parse_args():
 
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
+    dist_group.add_argument("--sp-ulysses-size", type=int, default=1)
+    dist_group.add_argument("--sp-ring-size", type=int, default=1)
 
     # SGLang specific args
     sglang_group = parser.add_argument_group("sglang backend")
@@ -138,25 +172,42 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
-    """Build target model (backend wrapper) and draft model."""
-    print_on_rank0(
-        f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
-    )
+def build_target_model(args, draft_model: DFlashDraftModel, is_online: bool = True):
+    """Build target model based on training mode.
 
-    target_model_kwargs = {}
-    if args.target_model_backend == "sglang":
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+    For online training: Build full target model wrapper.
+    For offline training: Build only TargetHead (lm_head weights).
+    """
+    if is_online:
+        print_on_rank0(
+            f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
+        )
+        target_model_kwargs = {}
+        if args.target_model_backend == "sglang":
+            target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
 
-    target_model = get_dflash_target_model(
-        pretrained_model_name_or_path=args.target_model_path,
-        backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
-        device="cuda" if args.target_model_backend == "hf" else None,
-        trust_remote_code=args.trust_remote_code,
-        **target_model_kwargs,
-    )
+        target_model = get_dflash_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend=args.target_model_backend,
+            torch_dtype=torch.bfloat16,
+            device="cuda" if args.target_model_backend == "hf" else None,
+            trust_remote_code=args.trust_remote_code,
+            **target_model_kwargs,
+        )
+        # Set capture layers for target model based on draft model config
+        target_model.set_capture_layers(draft_model.target_layer_ids)
+        return target_model
+    else:
+        # For offline training, we don't need the full target model
+        # Hidden states are already pre-computed
+        print_on_rank0(
+            "Offline mode: Skipping target model loading (using pre-computed hidden states)"
+        )
+        return None
 
+
+def build_draft_model(args) -> DFlashDraftModel:
+    """Build draft model."""
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
@@ -171,12 +222,13 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
 
-    draft_config._attn_implementation = args.attention_backend
+    draft_config.dflash_config["attention_backend"] = args.attention_backend
+    draft_config._attn_implementation = (
+        "flex_attention" if args.attention_backend == "usp" else args.attention_backend
+    )
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
     draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
-
-    target_model.set_capture_layers(draft_model.target_layer_ids)
 
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
@@ -187,54 +239,83 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
 
-    return target_model, draft_model
+    return draft_model
 
 
-def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """Build train and eval dataloaders."""
+def build_dataloader(
+    args, tokenizer, is_online: bool = True
+) -> Tuple[DataLoader, Optional[DataLoader]]:
+    """Build train and eval dataloaders.
+
+    For online training: Build from conversation data.
+    For offline training: Build from pre-computed hidden states.
+    """
     import hashlib
 
-    cache_params_string = (
-        f"{args.train_data_path}-"
-        f"{args.max_length}-"
-        f"{args.chat_template}-"
-        f"{args.target_model_path}"
-    )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_eagle3_dataset = build_eagle3_dataset(
-        dataset=train_dataset,
-        tokenizer=tokenizer,
-        chat_template=args.chat_template,
-        max_length=args.max_length,
-        is_preformatted=args.is_preformatted,
-        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-        cache_key=cache_key,
-        num_proc=args.build_dataset_num_proc,
-    )
-
+    # Common filtering threshold: DFlash requires >= 2 * block_size loss tokens
     min_loss_tokens = 2 * args.block_size
-    original_size = len(train_eagle3_dataset)
-    train_eagle3_dataset = train_eagle3_dataset.filter(
-        lambda x: x["loss_mask"].sum() >= min_loss_tokens
-    )
-    print_on_rank0(
-        f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
-    )
+
+    use_usp_preprocess = args.attention_backend == "usp"
+    sampler_group = get_dp_group()
+    if not is_online and use_usp_preprocess:
+        sampler_group = get_draft_dp_group()
+
+    if is_online:
+        # Online mode: Build from conversation data
+        cache_params_string = (
+            f"{args.train_data_path}-"
+            f"{args.max_length}-"
+            f"{args.chat_template}-"
+            f"{args.target_model_path}"
+        )
+        cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+
+        train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+        train_dflash_dataset = build_eagle3_dataset(
+            dataset=train_dataset,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            is_preformatted=args.is_preformatted,
+            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
+        )
+
+        # Filter out samples with too few loss tokens
+        original_size = len(train_dflash_dataset)
+        train_dflash_dataset = train_dflash_dataset.filter(
+            lambda x: x["loss_mask"].sum() >= min_loss_tokens
+        )
+        print_on_rank0(
+            f"Filtered train dataset: {original_size} -> {len(train_dflash_dataset)} samples"
+        )
+    else:
+        # Offline mode: Build from pre-computed hidden states
+        # Note: Filtering is already done in prepare_hidden_states.py, no need to filter here
+        print_on_rank0(
+            f"Loading offline train dataset from {args.train_hidden_states_path}"
+        )
+        train_dflash_dataset = build_offline_dflash_dataset(
+            hidden_states_path=args.train_hidden_states_path,
+            max_len=args.max_length,
+            block_size=args.block_size,
+            use_usp_preprocess=use_usp_preprocess,
+        )
 
     train_dataloader = prepare_dp_dataloaders(
-        train_eagle3_dataset,
+        train_dflash_dataset,
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=sampler_group,
+        requires_target=False,
     )
 
     eval_dataloader = None
-    if args.eval_data_path:
+    if is_online and args.eval_data_path:
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
-        eval_eagle3_dataset = build_eagle3_dataset(
+        eval_dflash_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
@@ -242,15 +323,74 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             is_preformatted=args.is_preformatted,
         )
         eval_dataloader = prepare_dp_dataloaders(
-            eval_eagle3_dataset,
+            eval_dflash_dataset,
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=sampler_group,
+            requires_target=False,
+        )
+    elif not is_online and args.eval_hidden_states_path:
+        print_on_rank0(
+            f"Loading offline eval dataset from {args.eval_hidden_states_path}"
+        )
+        eval_dflash_dataset = build_offline_dflash_dataset(
+            hidden_states_path=args.eval_hidden_states_path,
+            max_len=args.max_length,
+            block_size=args.block_size,
+            use_usp_preprocess=use_usp_preprocess,
+        )
+        eval_dataloader = prepare_dp_dataloaders(
+            eval_dflash_dataset,
+            args.batch_size,
+            num_workers=args.dataloader_num_workers,
+            shuffle=False,
+            process_group=sampler_group,
+            requires_target=False,
         )
 
     return train_dataloader, eval_dataloader
 
+
+def sanity_check(args: Namespace) -> None:
+    """Validate runtime mode and USP constraints."""
+    is_online = args.train_hidden_states_path is None
+    if is_online:
+        if args.train_data_path is None:
+            raise ValueError("--train-data-path is required for online training mode")
+    else:
+        if not os.path.exists(args.train_hidden_states_path):
+            raise ValueError(f"Hidden states path not found: {args.train_hidden_states_path}")
+
+    if args.attention_backend == "usp":
+        sp_sanity_check(args)
+    elif args.sp_ulysses_size > 1 or args.sp_ring_size > 1:
+        raise ValueError("Set --attention-backend usp to enable offline DFlash USP")
+    return
+
+
+def sp_sanity_check(args: Namespace) -> None:
+    is_online = args.train_hidden_states_path is None
+    if is_online:
+        raise ValueError("USP is currently supported for offline DFlash training only")
+
+    if args.sp_ulysses_size <= 1:
+        raise ValueError("Offline DFlash USP requires sp_ulysses_size > 1")
+    if args.batch_size != 1:
+        raise ValueError("Offline DFlash USP currently requires batch_size=1")
+    if args.sp_ring_size != 1:
+        raise ValueError("Offline DFlash USP currently supports sp_ring_size=1 only")
+
+    draft_sp_group = get_draft_sp_group()
+    if draft_sp_group is None:
+        raise ValueError("Offline DFlash USP requires initialized draft SP group")
+    if dist.get_world_size(draft_sp_group) <= 1:
+        raise ValueError("Offline DFlash USP requires draft SP world size > 1")
+
+    # Compensate for the reduced draft-DP size under USP by increasing gradient
+    # accumulation proportionally to the SP degree.
+    args.accumulation_steps *= args.sp_ulysses_size * args.sp_ring_size
+    print_on_rank0(f"USP enabled: accumulation_steps = {args.accumulation_steps}")
 
 def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
     """Save checkpoint."""
@@ -322,6 +462,55 @@ def record_metrics(
     tracker.log(logdict, step=global_step)
 
 
+def should_skip_dflash_batch(
+    args: Namespace,
+    block_size: int,
+    loss_mask: torch.Tensor,
+    sample_index=None,
+    sample_path=None,
+) -> bool:
+    seq_len = loss_mask.shape[1]
+    max_anchor = max(seq_len - block_size, 0)
+    valid = loss_mask[:, : max_anchor + 1] > 0.5
+
+    if args.attention_backend == "usp":
+        local_valid_count = torch.tensor(
+            [int(valid.sum().item())], device=loss_mask.device, dtype=torch.long
+        )
+        draft_sp_group = get_draft_sp_group()
+        if draft_sp_group is not None and dist.get_world_size(draft_sp_group) > 1:
+            dist.all_reduce(local_valid_count, op=dist.ReduceOp.SUM, group=draft_sp_group)
+        local_should_skip = int(local_valid_count.item()) <= 1
+    else:
+        valid_counts = valid.sum(dim=1)
+        local_should_skip = int(valid_counts.max().item()) <= 1
+
+    skip_tensor = torch.tensor(
+        [1 if local_should_skip else 0], device=loss_mask.device, dtype=torch.long
+    )
+    dist.all_reduce(skip_tensor, op=dist.ReduceOp.MAX)
+    should_skip = bool(skip_tensor.item())
+    if not should_skip:
+        return False
+
+    local_bad_sample = None
+    if local_should_skip:
+        local_bad_sample = {
+            "rank": dist.get_rank(),
+            "sample_index": sample_index,
+            "sample_path": sample_path,
+        }
+    gathered_bad_samples = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered_bad_samples, local_bad_sample)
+    if dist.get_rank() == 0:
+        bad_samples = [sample for sample in gathered_bad_samples if sample is not None]
+        print_on_rank0(
+            "Skipping invalid DFlash batch with insufficient anchors: "
+            f"{bad_samples}"
+        )
+    return True
+
+
 def main():
 
     logging.basicConfig(
@@ -338,10 +527,23 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(
+        timeout=args.dist_timeout,
+        tp_size=args.tp_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+        sp_ring_size=args.sp_ring_size,
+    )
     print_with_rank("Initialized distributed")
 
-    target_model, draft_model = build_models(args)
+    sanity_check(args)
+    is_online = args.train_hidden_states_path is None
+    print_on_rank0(f"Training mode: {'online' if is_online else 'offline'}")
+
+    # Build draft model first (needed for target model layer config)
+    draft_model = build_draft_model(args)
+
+    # Build target model (None for offline mode)
+    target_model = build_target_model(args, draft_model, is_online)
 
     draft_model_last_checkpoint = None
     if args.ckpt_dir is not None:
@@ -396,7 +598,7 @@ def main():
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer, is_online)
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
@@ -406,7 +608,7 @@ def main():
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
-        lm_head_key="lm_head.weight",
+        lm_head_key=args.lm_head_key,
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
@@ -473,28 +675,52 @@ def main():
         for step_in_epoch, data in enumerate(progress_bar):
             if epoch == start_epoch and step_in_epoch < skip_steps:
                 continue
-            global_step += 1
 
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
-            target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            position_ids = data.get("position_ids")
+            if position_ids is not None:
+                position_ids = position_ids.cuda()
+            sample_index = data.get("sample_index", [None])[0]
+            sample_path = data.get("sample_path", [None])[0]
 
+            if is_online:
+                # Online mode: Generate hidden states from target model
+                target_output = target_model.generate_dflash_data(
+                    input_ids, attention_mask, loss_mask
+                )
+                hidden_states = target_output.hidden_states.cuda()
+            else:
+                # Offline mode: Load pre-computed hidden states from dataset
+                hidden_states = data["hidden_state"].cuda()
+
+            if should_skip_dflash_batch(
+                args,
+                draft_model.block_size,
+                loss_mask,
+                sample_index=sample_index,
+                sample_path=sample_path,
+            ):
+                continue
+
+            # Forward pass (Parallel Training)
             loss, accuracy = dflash_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
             )
+
+            global_step += 1
 
             (loss / args.accumulation_steps).backward()
 
             if global_step % args.accumulation_steps == 0:
                 optimizer.step()
 
-            if global_step % args.log_interval == 0:
+            if global_step % (args.log_interval * args.accumulation_steps) == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
                 dist.all_reduce(loss_log)
@@ -506,7 +732,7 @@ def main():
                     args,
                     loss_log.item(),
                     acc_log.item(),
-                    global_step,
+                    global_step // args.accumulation_steps,
                     tracker,
                     optimizer,
                     train_dataloader,

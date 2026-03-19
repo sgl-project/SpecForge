@@ -34,9 +34,16 @@ class DataCollatorWithPadding:
     Datacollator that will dynamically pad the inputs for batching.
     """
 
-    def __init__(self):
+    def __init__(self, requires_target: bool = True):
+        """Initialize DataCollator.
+
+        Args:
+            requires_target: If True, requires 'target' field when 'hidden_state' is
+                present. Set to False for DFlash and True for Eagle3.
+        """
         self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
         self.ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
+        self.requires_target = requires_target
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -96,8 +103,14 @@ class DataCollatorWithPadding:
         max_length = (
             (max_length + self.sp_degree - 1) // self.sp_degree
         ) * self.sp_degree
-        # position max len, ulysses do not need chuck position ids
-        position_max_len = max_length * self.ulysses_degree
+        # Eagle3 USP keeps a globally-expanded position_ids tensor because its
+        # attention path gathers rotary positions across Ulysses ranks. DFlash
+        # applies RoPE before SeqAllToAll4D, so its USP path only needs local
+        # absolute positions. `requires_target=False` is the DFlash collator mode.
+        if self.requires_target:
+            position_max_len = max_length * self.ulysses_degree
+        else:
+            position_max_len = max_length
 
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -127,15 +140,23 @@ class DataCollatorWithPadding:
             "hidden_state": None,
             "target": None,
         }
+        if all("sample_index" in item for item in features):
+            batch["sample_index"] = [int(item["sample_index"]) for item in features]
+        if all("sample_path" in item for item in features):
+            batch["sample_path"] = [item["sample_path"] for item in features]
         if batch_position_ids is not None:
             batch["position_ids"] = batch_position_ids
         if all("hidden_state" in item for item in features):
-            assert all(
-                "target" in item for item in features
-            ), "target is required when hidden_state is provided"
-            if self.sp_degree > 1:  # USP mode
+            if self.sp_degree > 1 and self.requires_target:  # Eagle3 USP mode
                 batch["hidden_state"] = torch.cat(
                     [item["hidden_state"] for item in features]
+                )
+            elif self.sp_degree > 1:  # DFlash USP mode
+                batch["hidden_state"] = torch.cat(
+                    [
+                        self.paddingtensor(item["hidden_state"], max_length)
+                        for item in features
+                    ]
                 )
             else:
                 batch["hidden_state"] = torch.cat(
@@ -144,9 +165,19 @@ class DataCollatorWithPadding:
                         for item in features
                     ]
                 )
-            batch["target"] = torch.cat(
-                [self.paddingtensor(item["target"], max_length) for item in features]
-            )
+            if self.requires_target:
+                if not all("target" in item for item in features):
+                    raise ValueError(
+                        "requires_target=True but 'target' field missing in some features. "
+                        "Use requires_target=False for DFlash training."
+                    )
+            if all("target" in item for item in features):
+                batch["target"] = torch.cat(
+                    [
+                        self.paddingtensor(item["target"], max_length)
+                        for item in features
+                    ]
+                )
         return batch
 
 
@@ -234,18 +265,21 @@ class VlmDataCollatorWithPadding:
             "target": None,
         }
         if all("hidden_state" in item for item in features):
-            assert all(
-                "target" in item for item in features
-            ), "target is required when hidden_state is provided"
             batch["hidden_state"] = torch.cat(
                 [
                     self.paddingtensor(item["hidden_state"], max_length)
                     for item in features
                 ]
             )
-            batch["target"] = torch.cat(
-                [self.paddingtensor(item["target"], max_length) for item in features]
-            )
+            # target is optional for DFlash (only hidden_state is needed)
+            # but required for Eagle3 (both hidden_state and target are needed)
+            if all("target" in item for item in features):
+                batch["target"] = torch.cat(
+                    [
+                        self.paddingtensor(item["target"], max_length)
+                        for item in features
+                    ]
+                )
         return batch
 
 
@@ -258,6 +292,7 @@ def prepare_dp_dataloaders(
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    requires_target: bool = True,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
@@ -271,6 +306,8 @@ def prepare_dp_dataloaders(
         pin_memory: Whether to pin memory for data loading.
         shuffle: Whether to shuffle the dataset.
         is_vlm: Whether the dataset is a vision-language model dataset.
+        requires_target: Whether 'target' field is required when 'hidden_state' is present.
+                        Set to False for DFlash, True for Eagle3.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
@@ -296,7 +333,7 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=datacollator_cls(requires_target=requires_target),
         drop_last=True,
         **dataloader_kwargs,
     )
