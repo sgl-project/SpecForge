@@ -9,6 +9,7 @@ import os
 import shutil
 import time
 import warnings
+from argparse import Namespace
 from typing import Optional, Tuple
 
 import torch
@@ -32,6 +33,7 @@ from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
     get_draft_dp_group,
+    get_draft_sp_group,
     init_distributed,
 )
 from specforge.modeling.draft.dflash import DFlashDraftModel
@@ -350,6 +352,46 @@ def build_dataloader(
     return train_dataloader, eval_dataloader
 
 
+def sanity_check(args: Namespace) -> None:
+    """Validate runtime mode and USP constraints."""
+    is_online = args.train_hidden_states_path is None
+    if is_online:
+        if args.train_data_path is None:
+            raise ValueError("--train-data-path is required for online training mode")
+    else:
+        if not os.path.exists(args.train_hidden_states_path):
+            raise ValueError(f"Hidden states path not found: {args.train_hidden_states_path}")
+
+    if args.attention_backend == "usp":
+        sp_sanity_check(args)
+    elif args.sp_ulysses_size > 1 or args.sp_ring_size > 1:
+        raise ValueError("Set --attention-backend usp to enable offline DFlash USP")
+    return
+
+
+def sp_sanity_check(args: Namespace) -> None:
+    is_online = args.train_hidden_states_path is None
+    if is_online:
+        raise ValueError("USP is currently supported for offline DFlash training only")
+
+    if args.sp_ulysses_size <= 1:
+        raise ValueError("Offline DFlash USP requires sp_ulysses_size > 1")
+    if args.batch_size != 1:
+        raise ValueError("Offline DFlash USP currently requires batch_size=1")
+    if args.sp_ring_size != 1:
+        raise ValueError("Offline DFlash USP currently supports sp_ring_size=1 only")
+
+    draft_sp_group = get_draft_sp_group()
+    if draft_sp_group is None:
+        raise ValueError("Offline DFlash USP requires initialized draft SP group")
+    if dist.get_world_size(draft_sp_group) <= 1:
+        raise ValueError("Offline DFlash USP requires draft SP world size > 1")
+
+    # Compensate for the reduced draft-DP size under USP by increasing gradient
+    # accumulation proportionally to the SP degree.
+    args.accumulation_steps *= args.sp_ulysses_size * args.sp_ring_size
+    print_on_rank0(f"USP enabled: accumulation_steps = {args.accumulation_steps}")
+
 def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
@@ -420,6 +462,55 @@ def record_metrics(
     tracker.log(logdict, step=global_step)
 
 
+def should_skip_dflash_batch(
+    args: Namespace,
+    block_size: int,
+    loss_mask: torch.Tensor,
+    sample_index=None,
+    sample_path=None,
+) -> bool:
+    seq_len = loss_mask.shape[1]
+    max_anchor = max(seq_len - block_size, 0)
+    valid = loss_mask[:, : max_anchor + 1] > 0.5
+
+    if args.attention_backend == "usp":
+        local_valid_count = torch.tensor(
+            [int(valid.sum().item())], device=loss_mask.device, dtype=torch.long
+        )
+        draft_sp_group = get_draft_sp_group()
+        if draft_sp_group is not None and dist.get_world_size(draft_sp_group) > 1:
+            dist.all_reduce(local_valid_count, op=dist.ReduceOp.SUM, group=draft_sp_group)
+        local_should_skip = int(local_valid_count.item()) <= 1
+    else:
+        valid_counts = valid.sum(dim=1)
+        local_should_skip = int(valid_counts.max().item()) <= 1
+
+    skip_tensor = torch.tensor(
+        [1 if local_should_skip else 0], device=loss_mask.device, dtype=torch.long
+    )
+    dist.all_reduce(skip_tensor, op=dist.ReduceOp.MAX)
+    should_skip = bool(skip_tensor.item())
+    if not should_skip:
+        return False
+
+    local_bad_sample = None
+    if local_should_skip:
+        local_bad_sample = {
+            "rank": dist.get_rank(),
+            "sample_index": sample_index,
+            "sample_path": sample_path,
+        }
+    gathered_bad_samples = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered_bad_samples, local_bad_sample)
+    if dist.get_rank() == 0:
+        bad_samples = [sample for sample in gathered_bad_samples if sample is not None]
+        print_on_rank0(
+            "Skipping invalid DFlash batch with insufficient anchors: "
+            f"{bad_samples}"
+        )
+    return True
+
+
 def main():
 
     logging.basicConfig(
@@ -444,32 +535,9 @@ def main():
     )
     print_with_rank("Initialized distributed")
 
-    # Determine training mode and validate required arguments
+    sanity_check(args)
     is_online = args.train_hidden_states_path is None
     print_on_rank0(f"Training mode: {'online' if is_online else 'offline'}")
-
-    if is_online:
-        if args.train_data_path is None:
-            raise ValueError("--train-data-path is required for online training mode")
-        if args.attention_backend == "usp":
-            raise ValueError("USP is currently supported for offline DFlash training only")
-        if args.sp_ulysses_size != 1 or args.sp_ring_size != 1:
-            raise ValueError("USP is currently supported for offline DFlash training only")
-    else:
-        if not os.path.exists(args.train_hidden_states_path):
-            raise ValueError(
-                f"Hidden states path not found: {args.train_hidden_states_path}"
-            )
-        if args.attention_backend == "usp" and args.sp_ulysses_size <= 1:
-            raise ValueError("Offline DFlash USP requires sp_ulysses_size > 1")
-        if args.attention_backend != "usp" and (
-            args.sp_ulysses_size > 1 or args.sp_ring_size > 1
-        ):
-            raise ValueError("Set --attention-backend usp to enable offline DFlash USP")
-        if args.attention_backend == "usp" and args.batch_size != 1:
-            raise ValueError("Offline DFlash USP currently requires batch_size=1")
-        if args.attention_backend == "usp" and args.sp_ring_size != 1:
-            raise ValueError("Offline DFlash USP currently supports sp_ring_size=1 only")
 
     # Build draft model first (needed for target model layer config)
     draft_model = build_draft_model(args)
@@ -607,7 +675,6 @@ def main():
         for step_in_epoch, data in enumerate(progress_bar):
             if epoch == start_epoch and step_in_epoch < skip_steps:
                 continue
-            global_step += 1
 
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
@@ -615,6 +682,8 @@ def main():
             position_ids = data.get("position_ids")
             if position_ids is not None:
                 position_ids = position_ids.cuda()
+            sample_index = data.get("sample_index", [None])[0]
+            sample_path = data.get("sample_path", [None])[0]
 
             if is_online:
                 # Online mode: Generate hidden states from target model
@@ -626,6 +695,15 @@ def main():
                 # Offline mode: Load pre-computed hidden states from dataset
                 hidden_states = data["hidden_state"].cuda()
 
+            if should_skip_dflash_batch(
+                args,
+                draft_model.block_size,
+                loss_mask,
+                sample_index=sample_index,
+                sample_path=sample_path,
+            ):
+                continue
+
             # Forward pass (Parallel Training)
             loss, accuracy = dflash_model(
                 input_ids=input_ids,
@@ -635,12 +713,14 @@ def main():
                 attention_mask=attention_mask,
             )
 
+            global_step += 1
+
             (loss / args.accumulation_steps).backward()
 
             if global_step % args.accumulation_steps == 0:
                 optimizer.step()
 
-            if global_step % args.log_interval == 0:
+            if global_step % (args.log_interval * args.accumulation_steps) == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
                 dist.all_reduce(loss_log)
@@ -652,7 +732,7 @@ def main():
                     args,
                     loss_log.item(),
                     acc_log.item(),
-                    global_step,
+                    global_step // args.accumulation_steps,
                     tracker,
                     optimizer,
                     train_dataloader,

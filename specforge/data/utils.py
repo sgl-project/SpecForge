@@ -103,8 +103,14 @@ class DataCollatorWithPadding:
         max_length = (
             (max_length + self.sp_degree - 1) // self.sp_degree
         ) * self.sp_degree
-        # position max len, ulysses do not need chuck position ids
-        position_max_len = max_length * self.ulysses_degree
+        # Eagle3 USP keeps a globally-expanded position_ids tensor because its
+        # attention path gathers rotary positions across Ulysses ranks. DFlash
+        # applies RoPE before SeqAllToAll4D, so its USP path only needs local
+        # absolute positions. `requires_target=False` is the DFlash collator mode.
+        if self.requires_target:
+            position_max_len = max_length * self.ulysses_degree
+        else:
+            position_max_len = max_length
 
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -134,12 +140,23 @@ class DataCollatorWithPadding:
             "hidden_state": None,
             "target": None,
         }
+        if all("sample_index" in item for item in features):
+            batch["sample_index"] = [int(item["sample_index"]) for item in features]
+        if all("sample_path" in item for item in features):
+            batch["sample_path"] = [item["sample_path"] for item in features]
         if batch_position_ids is not None:
             batch["position_ids"] = batch_position_ids
         if all("hidden_state" in item for item in features):
-            if self.sp_degree > 1:  # USP mode
+            if self.sp_degree > 1 and self.requires_target:  # Eagle3 USP mode
                 batch["hidden_state"] = torch.cat(
                     [item["hidden_state"] for item in features]
+                )
+            elif self.sp_degree > 1:  # DFlash USP mode
+                batch["hidden_state"] = torch.cat(
+                    [
+                        self.paddingtensor(item["hidden_state"], max_length)
+                        for item in features
+                    ]
                 )
             else:
                 batch["hidden_state"] = torch.cat(

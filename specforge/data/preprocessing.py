@@ -699,12 +699,9 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
     def process_data_usp(
         data,
         max_len,
-        block_size=16,
         transform=None,
         sp_rank=0,
         sp_size=1,
-        ring_rank=0,
-        sp_ring_size=1,
     ):
         new_data = {}
 
@@ -718,7 +715,7 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
         local_len = chunk_size
         end = min(start + local_len, global_len)
 
-        def _slice_and_pad(tensor):
+        def _slice_and_pad_1d(tensor):
             if tensor.ndim == 1:
                 tensor = tensor.unsqueeze(0)
             tensor = tensor[:, :global_len]
@@ -732,14 +729,27 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
                     sliced = F.pad(sliced, (0, 0, 0, pad_len))
             return sliced.contiguous(), valid_len
 
-        new_data["hidden_state"], _ = _slice_and_pad(data["hidden_state"].squeeze(0))
-        new_data["input_ids"], valid_len = _slice_and_pad(input_ids)
+        def _slice_and_pad_hidden(tensor):
+            # Offline DFlash stores hidden_state as [1, seq_len, hidden_size].
+            # USP shards only the sequence dimension and must keep hidden_size intact.
+            if tensor.ndim == 3:
+                tensor = tensor.squeeze(0)
+            tensor = tensor[:global_len]
+            sliced = tensor[start:min(end, tensor.shape[0])]
+            valid_len = sliced.shape[0]
+            if valid_len < local_len:
+                pad_len = local_len - valid_len
+                sliced = F.pad(sliced, (0, 0, 0, pad_len))
+            return sliced.unsqueeze(0).contiguous(), valid_len
+
+        new_data["hidden_state"], _ = _slice_and_pad_hidden(data["hidden_state"])
+        new_data["input_ids"], valid_len = _slice_and_pad_1d(input_ids)
 
         full_loss_mask = data["loss_mask"]
         if full_loss_mask.ndim == 1:
             full_loss_mask = full_loss_mask.unsqueeze(0)
         full_loss_mask = full_loss_mask[:, :global_len]
-        new_data["loss_mask"], _ = _slice_and_pad(full_loss_mask)
+        new_data["loss_mask"], _ = _slice_and_pad_1d(full_loss_mask)
 
         attention_mask = torch.zeros((1, local_len), dtype=torch.long)
         attention_mask[:, :valid_len] = 1
@@ -767,23 +777,36 @@ class OfflineDFlashDataset(torch.utils.data.Dataset):
         return torch.load(data_path, weights_only=False, mmap=True)
 
     def __getitem__(self, index):
-        try:
-            data = self._open_file(index)
-        except Exception as e:
-            print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
-            data = self._open_file(0)
-        if self.use_usp_preprocess:
-            return self.process_data_usp(
-                data,
-                self.max_len,
-                block_size=self.block_size,
-                transform=self.transform,
-                sp_rank=self.sp_rank,
-                sp_size=self.sp_size,
-                ring_rank=self.ring_rank,
-                sp_ring_size=self.sp_ring_size,
-            )
-        return self.process_data(data, self.max_len, self.block_size, self.transform)
+        for offset in range(len(self.datapaths)):
+            current_index = (index + offset) % len(self.datapaths)
+            current_path = self.datapaths[current_index]
+            try:
+                data = self._open_file(current_index)
+            except Exception as e:
+                print(
+                    f"ERROR Failed to load DFlash sample index={current_index} "
+                    f"path={current_path} error={e}"
+                )
+                continue
+
+            if self.use_usp_preprocess:
+                processed = self.process_data_usp(
+                    data,
+                    self.max_len,
+                    transform=self.transform,
+                    sp_rank=self.sp_rank,
+                    sp_size=self.sp_size,
+                )
+            else:
+                processed = self.process_data(
+                    data, self.max_len, self.block_size, self.transform
+                )
+
+            processed["sample_index"] = current_index
+            processed["sample_path"] = current_path
+            return processed
+
+        raise RuntimeError("No valid DFlash samples available after filtering corrupted entries.")
 
     def set_epoch(self, epoch):
         self._epoch = epoch
