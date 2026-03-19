@@ -98,7 +98,7 @@ def initialize_model_parallel(
         4 tensor model-parallel groups:
             [g0, g1], [g2, g3], [g4, g5], [g6, g7]
         2 pipeline model-parallel groups:
-            [g0, g2, g4, g6], [g1, g3, g5, g7]
+            [g0, g2, g4, g6], [b1, g3, g5, g7]
     Note that for efficiency, the caller should make sure adjacent ranks
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
