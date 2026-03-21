@@ -1,5 +1,5 @@
 # Adapted from: https://github.com/sgl-project/sglang/blob/main/python/sglang/lang/chat_template.py#L13
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -13,15 +13,17 @@ class ChatTemplate(BaseModel):
         user_header(str): The header for the user.
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
+        ignore_token(List[str]): The list of tokens to ignore when parsing the model output, e.g., for thinking token.
     """
 
-    assistant_header: str | None
-    user_header: str | None
-    system_prompt: str | None
-    end_of_turn_token: str | None
+    assistant_header: Optional[str] = None
+    user_header: Optional[str] = None
+    system_prompt: Optional[str] = None
+    end_of_turn_token: Optional[str] = None
     parser_type: str = "general"
     assistant_pattern_type: str = "general"
     enable_thinking: bool = False
+    ignore_token: Optional[List[str]] = None
 
 
 class TemplateRegistry:
@@ -205,10 +207,11 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="qwen3-instruct",
     template=ChatTemplate(
-        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n",
+        assistant_header="<|im_start|>assistant\n",
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
+        ignore_token=["<think>\n\n</think>\n\n"],
     ),
 )
 

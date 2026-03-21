@@ -625,7 +625,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 video_token_id=self.video_token_id,
                 vision_start_token_id=self.vision_start_token_id,
                 model_type=self.model_type,
-                input_ids=input_id_flat.unsqueeze(0),
+                input_ids=input_id_flat.unsqueeze(0).cpu(),
                 image_grid_thw=(
                     image_grid_thw_.cpu() if image_grid_thw_ is not None else None
                 ),
