@@ -315,7 +315,6 @@ class HarmonyParser(Parser):
             truncation=True,
             return_tensors="pt",
             add_special_tokens=False,
-            tools=tool,
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
