@@ -19,7 +19,7 @@ jobs:
     runs-on: [self-hosted]
     container:
       image: lmsysorg/sglang:v0.5.5 # we lock to this version to avoid repeated docker pull
-      options: --gpus all --shm-size=2g --rm -v /dev/shm
+      options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -48,6 +48,11 @@ jobs:
           source sf/bin/activate
           uv pip install setuptools
           MAX_JOBS=8 uv pip install -v ".[fa]" --prerelease=allow --no-build-isolation
+
+      - name: Kill GPU processes
+        shell: bash
+        run: |
+          bash .github/workflows/scripts/delete_gpu_process.sh
 
       - name: Run test
         timeout-minutes: 30
