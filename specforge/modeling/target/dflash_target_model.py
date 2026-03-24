@@ -1,16 +1,26 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
+import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+    ScheduleBatch,
+)
+from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -19,7 +29,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
 
-from .sglang_backend import SGLangRunner
+from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 
 QWEN3_VL_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
 
@@ -73,9 +83,32 @@ class DFlashTargetModel(ABC):
 
 
 class SGLangDFlashTargetModel(DFlashTargetModel):
-    def __init__(self, model_runner: SGLangRunner):
+    def __init__(self, model_runner: SGLangRunner, hf_config=None):
         super().__init__()
         self.model_runner = model_runner
+        self.hf_config = hf_config
+        self._init_vlm_attributes()
+
+    def _init_vlm_attributes(self):
+        if self.hf_config is None:
+            self.is_vlm = False
+            return
+
+        self.is_vlm = hasattr(self.hf_config, "vision_config")
+        if not self.is_vlm:
+            return
+
+        init_mm_embedding_cache(1024 * 1024 * 512)
+        self.model_type = getattr(self.hf_config, "model_type", None)
+        vision_config = self.hf_config.vision_config
+        self.spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
+        self.tokens_per_second = getattr(vision_config, "tokens_per_second", None)
+        self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+        self.video_token_id = getattr(self.hf_config, "video_token_id", None)
+        self.vision_start_token_id = getattr(
+            self.hf_config, "vision_start_token_id", None
+        )
+        self.vision_end_token_id = getattr(self.hf_config, "vision_end_token_id", None)
 
     @classmethod
     def from_pretrained(
@@ -88,10 +121,11 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         **kwargs,
     ) -> "SGLangDFlashTargetModel":
         tp_size = dist.get_world_size(get_tp_group())
+        dtype_arg = torch_dtype if torch_dtype is not None else "auto"
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
-            dtype=torch_dtype,
+            dtype=dtype_arg,
             enable_return_hidden_states=True,  # Critical for DFlash
             disable_cuda_graph=True,
             tp_size=tp_size,
@@ -115,14 +149,18 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             pp_size=1,
             server_args=server_args,
             nccl_port=None,
+            is_draft_worker=False,
         )
-        return cls(model_runner)
+        wrap_eagle3_logits_processors_in_module(
+            model_runner.model, return_full_logits=False
+        )
+        hf_config = getattr(model_config, "hf_config", None)
+        return cls(model_runner, hf_config=hf_config)
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(self.model_runner.model.model.layers_to_capture)
 
     @torch.no_grad
     def _extend(self, reqs):
@@ -146,15 +184,14 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         batch.prepare_for_extend()
 
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
+                attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
@@ -188,6 +225,235 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
         return hidden_states_list
 
+    @staticmethod
+    def _split_per_sample_tensor(
+        tensor: Optional[torch.Tensor], batch_size: int, name: str
+    ) -> List[Optional[torch.Tensor]]:
+        if tensor is None:
+            return [None] * batch_size
+        if isinstance(tensor, (list, tuple)):
+            return list(tensor)
+        if not isinstance(tensor, torch.Tensor):
+            return [tensor] * batch_size
+        if batch_size == 1:
+            return [tensor.squeeze(0) if tensor.dim() > 1 and tensor.shape[0] == 1 else tensor]
+        if tensor.dim() > 0 and tensor.shape[0] == batch_size:
+            return [x.squeeze(0) for x in torch.split(tensor, 1, dim=0)]
+        raise ValueError(
+            f"Cannot split {name} with shape {tuple(tensor.shape)} across batch size {batch_size}."
+        )
+
+    @staticmethod
+    def _normalize_grid_thw(
+        grid_thw: Optional[torch.Tensor], name: str
+    ) -> Optional[torch.Tensor]:
+        if grid_thw is None:
+            return None
+        if grid_thw.dim() == 1:
+            return grid_thw.unsqueeze(0)
+        if grid_thw.dim() == 2:
+            return grid_thw
+        raise ValueError(
+            f"{name} must be a 1D or 2D tensor, got shape {tuple(grid_thw.shape)}"
+        )
+
+    @staticmethod
+    def _count_mm_patches(grid_thw: Optional[torch.Tensor]) -> int:
+        if grid_thw is None:
+            return 0
+        return int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum().item())
+
+    def _build_mm_inputs(
+        self,
+        input_id_flat: torch.Tensor,
+        pixel_values: Optional[torch.Tensor],
+        pixel_values_videos: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.Tensor],
+        video_grid_thw: Optional[torch.Tensor],
+        second_per_grid_ts: Optional[torch.Tensor],
+    ) -> Tuple[Optional[MultimodalInputs], Optional[torch.Tensor]]:
+        mm_items = []
+
+        if pixel_values is not None:
+            image_offsets = BaseMultimodalProcessor.get_mm_items_offset(
+                input_id_flat, self.image_token_id
+            )
+            image_item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=pixel_values,
+                pad_value=self.image_token_id,
+                offsets=image_offsets,
+            )
+            if image_grid_thw is not None:
+                image_item.set("image_grid_thw", image_grid_thw.cpu())
+            image_item.set_pad_value()
+            mm_items.append(image_item)
+
+        if pixel_values_videos is not None:
+            video_offsets = BaseMultimodalProcessor.get_mm_items_offset(
+                input_id_flat, self.video_token_id
+            )
+            video_item = MultimodalDataItem(
+                modality=Modality.VIDEO,
+                feature=pixel_values_videos,
+                pad_value=self.video_token_id,
+                offsets=video_offsets,
+            )
+            if video_grid_thw is not None:
+                video_item.set("video_grid_thw", video_grid_thw.cpu())
+            if second_per_grid_ts is not None:
+                video_item.set("second_per_grid_ts", second_per_grid_ts.cpu())
+            video_item.set_pad_value()
+            mm_items.append(video_item)
+
+        if not mm_items:
+            return None, None
+
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.spatial_merge_size,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            input_ids=input_id_flat.unsqueeze(0).cpu(),
+            image_grid_thw=image_grid_thw.cpu() if image_grid_thw is not None else None,
+            video_grid_thw=video_grid_thw.cpu() if video_grid_thw is not None else None,
+            second_per_grid_ts=(
+                second_per_grid_ts.cpu() if second_per_grid_ts is not None else None
+            ),
+            tokens_per_second=self.tokens_per_second,
+        )
+        mm_inputs = MultimodalInputs(
+            mm_items=mm_items,
+            im_token_id=self.image_token_id,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            video_token_id=self.video_token_id,
+            mrope_positions=(
+                mrope_positions.squeeze(1) if mrope_positions is not None else None
+            ),
+            mrope_position_delta=mrope_position_delta,
+        )
+        return mm_inputs, mm_inputs.mrope_positions
+
+    @torch.no_grad()
+    def _extend_vlm(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], list, Optional[torch.Tensor]]:
+        mm_utils.embedding_cache.clear()
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
+        reqs, data_cache, position_ids_list = [], [], []
+
+        if isinstance(input_ids, torch.Tensor):
+            batch_size = input_ids.shape[0]
+            input_ids_list = torch.split(input_ids, 1, dim=0)
+            attn_mask_list = torch.split(attention_mask, 1, dim=0)
+            loss_mask_list = torch.split(loss_mask, 1, dim=0)
+        else:
+            batch_size = len(input_ids)
+            input_ids_list = input_ids
+            attn_mask_list = attention_mask
+            loss_mask_list = loss_mask
+
+        image_grid_thw_list = self._split_per_sample_tensor(
+            image_grid_thw, batch_size, "image_grid_thw"
+        )
+        video_grid_thw_list = self._split_per_sample_tensor(
+            video_grid_thw, batch_size, "video_grid_thw"
+        )
+        second_per_grid_ts_list = self._split_per_sample_tensor(
+            second_per_grid_ts, batch_size, "second_per_grid_ts"
+        )
+
+        image_offset = 0
+        video_offset = 0
+        pattern = None
+
+        for idx, (
+            curr_ids,
+            curr_attn,
+            curr_loss,
+            curr_image_grid,
+            curr_video_grid,
+            curr_second_per_grid,
+        ) in enumerate(
+            zip(
+                input_ids_list,
+                attn_mask_list,
+                loss_mask_list,
+                image_grid_thw_list,
+                video_grid_thw_list,
+                second_per_grid_ts_list,
+            )
+        ):
+            curr_image_grid = self._normalize_grid_thw(curr_image_grid, "image_grid_thw")
+            curr_video_grid = self._normalize_grid_thw(curr_video_grid, "video_grid_thw")
+
+            image_patches = self._count_mm_patches(curr_image_grid)
+            video_patches = self._count_mm_patches(curr_video_grid)
+
+            curr_pixel_values = None
+            if pixel_values is not None and image_patches > 0:
+                curr_pixel_values = pixel_values[image_offset : image_offset + image_patches]
+                image_offset += image_patches
+
+            curr_pixel_values_videos = None
+            if pixel_values_videos is not None and video_patches > 0:
+                curr_pixel_values_videos = pixel_values_videos[
+                    video_offset : video_offset + video_patches
+                ]
+                video_offset += video_patches
+
+            input_id_flat = curr_ids.view(-1)
+            mm_inputs, position_ids = self._build_mm_inputs(
+                input_id_flat=input_id_flat,
+                pixel_values=curr_pixel_values,
+                pixel_values_videos=curr_pixel_values_videos,
+                image_grid_thw=curr_image_grid,
+                video_grid_thw=curr_video_grid,
+                second_per_grid_ts=curr_second_per_grid,
+            )
+            input_id_list = input_id_flat.tolist()
+            if mm_inputs is not None:
+                if pattern is None:
+                    from sglang.srt.managers.mm_utils import (
+                        MultiModalityDataPaddingPatternMultimodalTokens,
+                    )
+
+                    pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+                input_id_list = pattern.pad_input_tokens(input_id_list, mm_inputs)
+
+            req = Req(
+                rid=str(idx),
+                origin_input_text="",
+                origin_input_ids=input_id_list,
+                sampling_params=sampling_params,
+            )
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            if mm_inputs is not None:
+                req.multimodal_inputs = mm_inputs
+
+            data_cache.append((curr_ids, curr_attn, curr_loss))
+            position_ids_list.append(position_ids)
+            reqs.append(req)
+
+        hidden_states_list = self._extend(reqs)
+
+        position_ids = None
+        if position_ids_list and all(pos is not None for pos in position_ids_list):
+            position_ids = torch.stack(position_ids_list, dim=1)
+
+        return hidden_states_list, data_cache, position_ids
+
     @torch.no_grad()
     def generate_dflash_data(
         self,
@@ -200,40 +466,57 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         video_grid_thw: Optional[torch.Tensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
-        if (
-            pixel_values is not None
-            or pixel_values_videos is not None
-            or image_grid_thw is not None
-            or video_grid_thw is not None
-            or second_per_grid_ts is not None
-        ):
-            raise NotImplementedError(
-                "SGLangDFlashTargetModel does not yet support multimodal inputs. "
-                "Use HF backend for real VLM DFlash training."
-            )
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
+        position_ids = None
 
-        if isinstance(input_ids, torch.Tensor):
-            input_ids_list = torch.split(input_ids, 1, dim=0)
-            attn_mask_list = torch.split(attention_mask, 1, dim=0)
-            loss_mask_list = torch.split(loss_mask, 1, dim=0)
-
-        for idx, (curr_ids, curr_attn, curr_loss) in enumerate(
-            zip(input_ids_list, attn_mask_list, loss_mask_list)
-        ):
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=curr_ids.view(-1).tolist(),
-                sampling_params=sampling_params,
+        use_multimodal = any(
+            item is not None
+            for item in (
+                pixel_values,
+                pixel_values_videos,
+                image_grid_thw,
+                video_grid_thw,
+                second_per_grid_ts,
             )
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            data_cache.append((curr_ids, curr_attn, curr_loss))
-            reqs.append(req)
+        )
 
-        hidden_states_list = self._extend(reqs)
+        if use_multimodal:
+            if not self.is_vlm:
+                raise ValueError(
+                    "Multimodal inputs were provided to a non-VLM SGLang target model."
+                )
+            hidden_states_list, data_cache, position_ids = self._extend_vlm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+            )
+        else:
+            if isinstance(input_ids, torch.Tensor):
+                input_ids_list = torch.split(input_ids, 1, dim=0)
+                attn_mask_list = torch.split(attention_mask, 1, dim=0)
+                loss_mask_list = torch.split(loss_mask, 1, dim=0)
+
+            for idx, (curr_ids, curr_attn, curr_loss) in enumerate(
+                zip(input_ids_list, attn_mask_list, loss_mask_list)
+            ):
+                req = Req(
+                    rid=str(idx),
+                    origin_input_text="",
+                    origin_input_ids=curr_ids.view(-1).tolist(),
+                    sampling_params=sampling_params,
+                )
+                req.fill_ids = req.origin_input_ids
+                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                data_cache.append((curr_ids, curr_attn, curr_loss))
+                reqs.append(req)
+
+            hidden_states_list = self._extend(reqs)
 
         # Stack back to batch
         hidden_states = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
@@ -246,7 +529,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
-            position_ids=None,
+            position_ids=position_ids,
         )
 
 

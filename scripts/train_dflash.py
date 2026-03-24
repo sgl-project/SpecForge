@@ -609,17 +609,8 @@ def main():
         print_on_rank0(
             "Detected Qwen3-VL target config; enabling VLM mode automatically."
         )
-    if is_vlm and args.target_model_backend != "hf":
-        raise ValueError(
-            "Real multimodal DFlash training currently supports only HF backend. "
-            "Please set --target-model-backend hf."
-        )
     print_on_rank0(
         f"Detected target model_type={getattr(target_config, 'model_type', None)}, is_vlm={is_vlm}"
-    )
-
-    target_model, draft_model, target_config = build_models(
-        args, target_config, is_vlm=is_vlm
     )
 
     draft_model_last_checkpoint = None
@@ -637,7 +628,9 @@ def main():
             print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
             args.draft_config_path = checkpoint_config_path
 
-    target_model, draft_model = build_models(args)
+    target_model, draft_model, target_config = build_models(
+        args, target_config, is_vlm=is_vlm
+    )
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -697,6 +690,20 @@ def main():
     total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
 
+    if (
+        getattr(target_config, "model_type", None) == "qwen3_vl"
+        and (args.embedding_key is None or args.lm_head_key is None)
+    ):
+        raise ValueError(
+            "Qwen3-VL DFlash training requires explicit --embedding-key and "
+            "--lm-head-key. Example: --embedding-key "
+            "model.language_model.embed_tokens.weight --lm-head-key "
+            "lm_head.weight"
+        )
+    print_on_rank0(
+        "Loading target embeddings/head with keys: "
+        f"embed='{args.embedding_key}', head='{args.lm_head_key}'"
+    )
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key=args.embedding_key,
@@ -706,7 +713,7 @@ def main():
     )
 
     dflash_model_cls = OnlineDFlashModel
-    if getattr(target_config, "model_type", None) == "qwen3_vl":
+    if getattr(target_config, "model_type", None) in QWEN3_VL_MODEL_TYPES:
         dflash_model_cls = QwenVLOnlineDFlashModel
     print_on_rank0(f"Using DFlash wrapper: {dflash_model_cls.__name__}")
     dflash_model = dflash_model_cls(

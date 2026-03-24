@@ -15,7 +15,7 @@ torchrun \
     $ROOT_DIR/scripts/train_dflash.py \
     --target-model-path Qwen/Qwen3-VL-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/qwen3-vl-8b-dflash.json \
-    --target-model-backend hf \
+    --target-model-backend sglang \
     --is-vlm \
     --trust-remote-code \
     --train-data-path $ROOT_DIR/cache/dataset/allava4v-mix-20k_train.localimg_regen.jsonl \
