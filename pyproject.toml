@@ -4,9 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specforge"
-dynamic = ["version", "description"]
+dynamic = ["version"]
 readme = "README.md"
 requires-python = ">=3.11"
+description = "SpecForge: Speculative Decoding Training Framework"
+authors = [{name = "SGLang Team"}]
+urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
 dependencies = [
     "pre-commit",
     "torch==2.9.1",
@@ -27,10 +30,11 @@ dependencies = [
     "ninja",
     "packaging",
     "yunchang",
+    "tensorboard",
 ]
 
-[tool.setuptools]
-packages = ["specforge"]
+[tool.setuptools.packages.find]
+exclude = ["configs*", "scripts*", "tests*"]
 
 [project.optional-dependencies]
 dev = [
@@ -41,4 +45,3 @@ fa = ["flash-attn"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
-description = {file = "README.md"}

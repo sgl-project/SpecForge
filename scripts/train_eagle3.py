@@ -383,6 +383,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     # Handle base ckpt, config file
     draft_model_last_checkpoint = None
+    is_resume_checkpoint = False
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             draft_model_config = AutoDraftModelConfig.from_file(
@@ -400,6 +401,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        is_resume_checkpoint = True
 
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
@@ -414,9 +416,24 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             torch_dtype=torch.bfloat16,
         ).cuda()
 
+    # Load training state (optimizer, scheduler, epoch, step) for true resume
+    resume_state = None
+    if is_resume_checkpoint and draft_model_last_checkpoint:
+        training_state_path = os.path.join(
+            draft_model_last_checkpoint, "training_state.pt"
+        )
+        if os.path.exists(training_state_path):
+            resume_state = torch.load(
+                training_state_path, map_location="cpu", weights_only=False
+            )
+            print_on_rank0(
+                f"Loaded training state from {training_state_path}: "
+                f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
+            )
+
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    return draft_model_config, draft_model, ckpt_info
+    return draft_model_config, draft_model, ckpt_info, resume_state
 
 
 def build_dataloaders(
@@ -731,7 +748,7 @@ def main():
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model, ckpt_info = build_draft_model(args)
+    draft_model_config, draft_model, ckpt_info, resume_state = build_draft_model(args)
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
@@ -812,12 +829,28 @@ def main():
     )
     print_with_rank("Initialized optimizer and scheduler")
 
+    # Restore optimizer/scheduler state for true resume
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state)
+        start_epoch = resume_state["epoch"]
+        global_step = resume_state["global_step"]
+        print_on_rank0(
+            f"Restored optimizer/scheduler state: "
+            f"epoch={start_epoch}, step={global_step}, "
+            f"lr={optimizer.get_learning_rate():.6f}"
+        )
+        del resume_state
+    else:
+        start_epoch = ckpt_info[0]
+        global_step = ckpt_info[1]
+
+    # Calculate how many steps to skip in the current epoch (for dataloader fast-forward)
+    skip_steps = global_step - start_epoch * len(train_dataloader)
+
     # ================================================
     # 6. Build tracker
     # ================================================
     tracker = build_tracker(args, parser)
-    start_epoch = ckpt_info[0]
-    global_step = ckpt_info[1]
     dist.barrier()
 
     last_time = time.time()
@@ -841,7 +874,11 @@ def main():
         else:
             progress_bar = train_dataloader
 
-        for data in progress_bar:
+        for step_in_epoch, data in enumerate(progress_bar):
+            # Skip steps already processed in the current epoch when resuming
+            if epoch == start_epoch and step_in_epoch < skip_steps:
+                continue
+
             global_step += 1
 
             # ================================================

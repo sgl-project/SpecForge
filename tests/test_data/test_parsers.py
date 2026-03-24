@@ -48,40 +48,152 @@ class TestTemplatePreprocessing(unittest.TestCase):
             ]
         ]
 
-        # 3. Tool-Use Test Data
+        # 3. Tool-use conversation
         cls.tool_use_messages = [
+            [
+                # First turn: User asks about weather
+                {"role": "user", "content": "我想知道今天北京和上海的天气怎么样？"},
+                # Assistant thinks and decides to call tools
+                {
+                    "role": "assistant",
+                    "content": "我来帮您查询北京和上海的天气情况。",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": {"location": "北京", "date": "today"},
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": {"location": "上海", "date": "today"},
+                            },
+                        },
+                    ],
+                },
+                # Tool responses
+                {
+                    "role": "tool",
+                    "content": '{"location": "北京", "temperature": 25, "condition": "晴朗", "humidity": "45%"}',
+                },
+                {
+                    "role": "tool",
+                    "content": '{"location": "上海", "temperature": 28, "condition": "多云", "humidity": "65%"}',
+                },
+                # Assistant summarizes with reasoning
+                {
+                    "role": "assistant",
+                    "content": "根据查询结果，北京今天晴朗，25°C；上海多云，28°C。两地都比较适合出行。",
+                },
+            ]
+        ]
+        # 4. Reasoning multi-turn conversation
+        cls.reasoning_multi_turn_messages = [
             [
                 {
                     "role": "user",
-                    "content": "What's the weather like in Beijing today?",
+                    "content": "Can you recommend a good restaurant in Shanghai?",
                 },
                 {
                     "role": "assistant",
-                    "content": "I'll check the current weather in Beijing for you.",
-                },
-                {
-                    "role": "tool",
-                    "content": '{"location": "Beijing", "temperature": 22, "condition": "Sunny"}',
-                },
-                {
-                    "role": "assistant",
-                    "content": "The current weather in Beijing is sunny with a temperature of 22°C.",
-                },
-                {
-                    "role": "tool",
-                    "content": '{"unit": "Celsius", "forecast": "Clear skies all day."}',
-                },
-                {
-                    "role": "tool",
-                    "content": '{"unit": "Celsius", "forecast": "Clear skies all day."}',
+                    "content": "Sure! I think I can help with that.",
+                    "reasoning_content": "If a user is looking for a restaurant in Shanghai, they can go to the Peace Hotel.",
                 },
                 {
                     "role": "user",
-                    "content": "Great! Can you also tell me if it will rain tomorrow?",
+                    "content": "Where is the Peace Hotel?",
                 },
                 {
                     "role": "assistant",
-                    "content": "Based on the forecast, there will be no rain tomorrow—expect clear skies all day.",
+                    "content": "The Peace Hotel is located at the intersection of Nanjing East Road and the Bund.",
+                    "reasoning_content": "Let me think. The Peace Hotel is located at the intersection of Nanjing East Road and the Bund.",
+                },
+            ]
+        ]
+
+        # 5. Complete multi-turn conversation with reasoning, tool_calls, and tool responses
+        cls.complete_reasoning_tool_conversation = [
+            [
+                # First turn: User asks about weather
+                {"role": "user", "content": "我想知道今天北京和上海的天气怎么样？"},
+                # Assistant thinks and decides to call tools
+                {
+                    "role": "assistant",
+                    "content": "我来帮您查询北京和上海的天气情况。",
+                    "reasoning_content": "用户想知道两个城市的天气：北京和上海。我需要分别调用 get_weather 工具两次，一次查询北京，一次查询上海。",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": {"location": "北京", "date": "today"},
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": {"location": "上海", "date": "today"},
+                            },
+                        },
+                    ],
+                },
+                # Tool responses
+                {
+                    "role": "tool",
+                    "content": '{"location": "北京", "temperature": 25, "condition": "晴朗", "humidity": "45%"}',
+                },
+                {
+                    "role": "tool",
+                    "content": '{"location": "上海", "temperature": 28, "condition": "多云", "humidity": "65%"}',
+                },
+                # Assistant summarizes with reasoning
+                {
+                    "role": "assistant",
+                    "content": "根据查询结果，北京今天晴朗，25°C；上海多云，28°C。两地都比较适合出行。",
+                    "reasoning_content": "我已经获取了两个城市的天气数据。北京天气更好，晴朗且温度适宜；上海稍微热一些且多云。我可以给用户一个简洁的总结。",
+                },
+                # Second turn: User asks follow-up question
+                {"role": "user", "content": "那明天呢？会下雨吗？"},
+                # Assistant checks forecast
+                {
+                    "role": "assistant",
+                    "content": "让我查询一下明天的天气预报。",
+                    "reasoning_content": "用户想知道明天是否会下雨，我需要查询两个城市的天气预报。",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather_forecast",
+                                "arguments": {"location": "北京", "days": 1},
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather_forecast",
+                                "arguments": {"location": "上海", "days": 1},
+                            },
+                        },
+                    ],
+                },
+                # Tool forecast responses
+                {
+                    "role": "tool",
+                    "content": '{"location": "北京", "tomorrow": {"condition": "小雨", "temperature": 22, "rain_probability": 70}}',
+                },
+                {
+                    "role": "tool",
+                    "content": '{"location": "上海", "tomorrow": {"condition": "晴", "temperature": 29, "rain_probability": 10}}',
+                },
+                # Final assistant response
+                {
+                    "role": "assistant",
+                    "content": "明天北京有小雨，记得带伞；上海晴天，适合外出。",
+                    "reasoning_content": "北京明天有70%概率下雨，需要提醒用户带伞；上海天气很好，不需要特别准备。",
                 },
             ]
         ]
@@ -106,6 +218,10 @@ class TestTemplatePreprocessing(unittest.TestCase):
             message_label = "gpt-oss"
         elif target_messages == self.tool_use_messages:
             message_label = "tool-use"
+        elif target_messages == self.reasoning_multi_turn_messages:
+            message_label = "reasoning-multi-turn"
+        elif target_messages == self.complete_reasoning_tool_conversation:
+            message_label = "multi-turn-tool-calls-with-reasoning"
         else:
             raise ValueError("Invalid message set")
         print(f"\n>>> Running: {template_key} ({model_name}) {message_label}")
@@ -167,7 +283,11 @@ class TestTemplatePreprocessing(unittest.TestCase):
         self._run_template_test("deepseek-ai/DeepSeek-V3.2", "deepseek-v32")
 
     def test_qwen3_thinking(self):
-        self._run_template_test("Qwen/Qwen3-0.6B", "qwen3-thinking")
+        self._run_template_test(
+            "Qwen/Qwen3-0.6B",
+            "qwen3-thinking",
+            messages=self.reasoning_multi_turn_messages,
+        )
 
     def test_qwen3_instruct(self):
         self._run_template_test("Qwen/Qwen3-0.6B", "qwen3-instruct")
@@ -176,14 +296,20 @@ class TestTemplatePreprocessing(unittest.TestCase):
         self._run_template_test("Qwen/Qwen3-Next-80B-A3B-Instruct", "qwen")
 
     def test_kimi_k2_thinking(self):
-        self._run_template_test("moonshotai/Kimi-K2-Thinking", "kimi-k2-thinking")
+        self._run_template_test(
+            "moonshotai/Kimi-K2-Thinking",
+            "kimi-k2-thinking",
+            messages=self.reasoning_multi_turn_messages,
+        )
 
     def test_kimi_k2_instruct(self):
         self._run_template_test("moonshotai/Kimi-K2-Instruct", "kimi-k2-instruct")
 
     def test_qwen3_next_thinking(self):
         self._run_template_test(
-            "Qwen/Qwen3-Next-80B-A3B-Thinking", "qwen3-next-thinking"
+            "Qwen/Qwen3-Next-80B-A3B-Thinking",
+            "qwen3-next-thinking",
+            messages=self.complete_reasoning_tool_conversation,
         )
 
     def test_gpt_oss(self):
@@ -196,12 +322,16 @@ class TestTemplatePreprocessing(unittest.TestCase):
 
     def test_qwen3_instruct_with_tools(self):
         self._run_template_test(
-            "Qwen/Qwen3-0.6B", "qwen3-instruct", messages=self.tool_use_messages
+            "Qwen/Qwen3-0.6B",
+            "qwen3-instruct",
+            messages=self.tool_use_messages,
         )
 
     def test_qwen35_instruct(self):
         self._run_template_test(
-            "/data/jiapingW/pretrained_models/Qwen3.5-35B-A3B", "qwen3.5"
+            "Qwen/Qwen3.5-35B-A3B",
+            "qwen3.5",
+            messages=self.complete_reasoning_tool_conversation,
         )
 
 

@@ -168,7 +168,9 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        output, _ = self.model_runner.forward(forward_batch)
+        output = self.model_runner.forward(forward_batch)
+        if hasattr(output, "logits_output"):
+            output = output.logits_output
 
         input_lens = [len(req.origin_input_ids) for req in reqs]
         if (

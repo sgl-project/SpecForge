@@ -31,15 +31,23 @@ class TargetEmbeddingsAndHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        text_cfg = _get_text_config_for_embeddings(config)
-
-        self.embed_tokens = nn.Embedding(
-            text_cfg.vocab_size,
-            text_cfg.hidden_size,
-            padding_idx=getattr(text_cfg, "pad_token_id", None),
-        )
-
-        self.lm_head = nn.Linear(text_cfg.hidden_size, text_cfg.vocab_size, bias=False)
+        # Support for MLLMs with separate text_config
+        if hasattr(config, "text_config"):
+            self.embed_tokens = nn.Embedding(
+                config.text_config.vocab_size,
+                config.text_config.hidden_size,
+                padding_idx=config.text_config.pad_token_id,
+            )
+            self.lm_head = nn.Linear(
+                config.text_config.hidden_size,
+                config.text_config.vocab_size,
+                bias=False,
+            )
+        else:
+            self.embed_tokens = nn.Embedding(
+                config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+            )
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     @classmethod
     def from_pretrained(
