@@ -500,7 +500,9 @@ def build_dataloaders(
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
-            eval_dataset = _load_dataset_from_path(args.eval_data_path, args.is_preformatted)
+            eval_dataset = _load_dataset_from_path(
+                args.eval_data_path, args.is_preformatted
+            )
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
