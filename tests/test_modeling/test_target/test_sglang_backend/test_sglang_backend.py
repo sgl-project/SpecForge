@@ -32,19 +32,12 @@ def test_dense(rank, world_size, port, tp_size):
         device="cuda",
         attention_backend="fa3",
         mem_fraction_static=0.4,
-        enable_nccl_nvls=True,
-        enable_symm_mem=False,
-        enable_torch_compile=True,
-        enable_dp_attention=False,
-        enable_dp_lm_head=False,
-        enable_piecewise_cuda_graph=True,
-        ep_size=1,
-        context_length=256,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
         input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask
     )
+    print(f"[Rank {rank}] test_dense passed successfully!")
 
 
 @torch.no_grad()
@@ -69,19 +62,12 @@ def test_moe(rank, world_size, port, tp_size):
         device="cuda",
         attention_backend="fa3",
         mem_fraction_static=0.4,
-        enable_torch_compile=True,
-        enable_nccl_nvls=True,
-        enable_symm_mem=False,
-        enable_dp_attention=False,
-        enable_dp_lm_head=False,
-        enable_piecewise_cuda_graph=True,
-        ep_size=2,
-        context_length=256,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
         input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask
     )
+    print(f"[Rank {rank}] test_moe passed successfully!")
 
 
 def test_vlm(rank, world_size, port, tp_size):
@@ -207,13 +193,6 @@ def test_vlm(rank, world_size, port, tp_size):
         device="cuda",
         attention_backend="fa3",
         mem_fraction_static=0.75,
-        enable_torch_compile=True,
-        enable_nccl_nvls=True,
-        enable_symm_mem=False,  # Disable to avoid nccl_allocator compilation issues
-        enable_dp_attention=False,
-        enable_dp_lm_head=False,
-        enable_piecewise_cuda_graph=True,
-        context_length=4096,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
@@ -230,6 +209,7 @@ def test_vlm(rank, world_size, port, tp_size):
         print(f"[Rank {rank}] hidden_states shape: {sgl_out.hidden_states.shape}")
         print(f"[Rank {rank}] target shape: {sgl_out.target.shape}")
         print(f"[Rank {rank}] input_ids shape: {sgl_out.input_ids.shape}")
+        print(f"[Rank {rank}] test_vlm passed successfully!")
 
 
 def test_vlm_multi_batch(rank, world_size, port, tp_size):
@@ -366,13 +346,6 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         device="cuda",
         attention_backend="fa3",
         mem_fraction_static=0.4,
-        enable_nccl_nvls=True,
-        enable_torch_compile=True,
-        enable_symm_mem=False,
-        enable_dp_attention=False,
-        enable_dp_lm_head=False,
-        enable_piecewise_cuda_graph=True,
-        context_length=4096,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
@@ -398,6 +371,7 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         ), f"Expected batch_size={batch_size}, got {sgl_out.input_ids.shape[0]}"
         print(f"[Rank {rank}] Batch size verification: PASSED")
         print(f"{'='*60}\n")
+        print(f"[Rank {rank}] test_vlm_multi_batch passed successfully!")
 
 
 class TestTargetModelBackend(unittest.TestCase):

@@ -101,7 +101,7 @@ def get_last_checkpoint(folder, prefix="epoch"):
     ]
 
     if len(checkpoints) == 0:
-        return None, None, None
+        return None, (0, 0)
 
     # Sort key: (epoch, step), step=0 when not present
     def sort_key(x):
@@ -376,8 +376,18 @@ def safe_conversations_generator(file_path):
 
                     cleaned_convs.append(new_msg)
 
-                # Yield only the processed 'conversations'
-                yield {"conversations": cleaned_convs}
+                # Build result with conversations
+                result = {"conversations": cleaned_convs}
+
+                # Preserve 'tools' field if present (keep as list for preprocessing)
+                if "tools" in row:
+                    tools = row["tools"]
+                    if tools is not None and isinstance(tools, list):
+                        result["tools"] = tools
+                    else:
+                        result["tools"] = []
+
+                yield result
 
             except Exception as e:
                 logger.warning(f"Skipping line {i + 1}: {e}")
