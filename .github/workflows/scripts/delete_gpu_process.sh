@@ -19,7 +19,7 @@ nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader,nounits | whi
                 pid=$(echo "$pid" | tr -d ' ')
                 echo "  Killing PID $pid..."
                 # kill -9 "$pid" && echo "  PID $pid killed." || echo "  Failed to kill PID $pid (may need sudo)."
-                docker run --rm --privileged --pid=host ubuntu bash -c "kill -9 $pid"
+                kill -9 $pid
             done
         fi
     else
