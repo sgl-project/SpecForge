@@ -142,9 +142,6 @@ class WandbTracker(Tracker):
             if args.wandb_dir is None:
                 args.wandb_dir = self._default_wandb_dir()
             os.makedirs(args.wandb_dir, exist_ok=True)
-            if args.wandb_offline:
-                os.environ["WANDB_MODE"] = "offline"
-            os.environ["WANDB_DIR"] = args.wandb_dir
 
             if not args.wandb_offline:
                 wandb.login(key=args.wandb_key)
