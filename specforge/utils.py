@@ -77,20 +77,45 @@ def print_on_rank0(message):
 
 
 def get_last_checkpoint(folder, prefix="epoch"):
+    """
+    Get the latest checkpoint directory along with its epoch and step information.
+
+    Args:
+        folder: The folder path containing checkpoints.
+        prefix: The prefix for checkpoint directories, default is "epoch".
+
+    Returns:
+        tuple: (checkpoint_path, epoch, step)
+               - Returns (None, None, None) if no checkpoint is found.
+               - step is 0 if not present in the directory name.
+    """
     content = os.listdir(folder)
-    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
+    # Match: epoch_X or epoch_X_step_Y
+    _re_checkpoint = re.compile(rf"^{re.escape(prefix)}_(\d+)(?:_step_(\d+))?$")
+
     checkpoints = [
         path
         for path in content
         if _re_checkpoint.search(path) is not None
         and os.path.isdir(os.path.join(folder, path))
     ]
+
     if len(checkpoints) == 0:
-        return
-    return os.path.join(
-        folder,
-        max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])),
-    )
+        return None, (0, 0)
+
+    # Sort key: (epoch, step), step=0 when not present
+    def sort_key(x):
+        match = _re_checkpoint.search(x)
+        epoch = int(match.group(1))
+        step = int(match.group(2)) if match.group(2) else 0
+        return (epoch, step)
+
+    last_checkpoint = max(checkpoints, key=sort_key)
+    match = _re_checkpoint.search(last_checkpoint)
+    epoch = int(match.group(1))
+    step = int(match.group(2)) if match.group(2) else 0
+
+    return os.path.join(folder, last_checkpoint), (epoch, step)
 
 
 def generate_draft_model_config(
@@ -351,8 +376,18 @@ def safe_conversations_generator(file_path):
 
                     cleaned_convs.append(new_msg)
 
-                # Yield only the processed 'conversations'
-                yield {"conversations": cleaned_convs}
+                # Build result with conversations
+                result = {"conversations": cleaned_convs}
+
+                # Preserve 'tools' field if present (keep as list for preprocessing)
+                if "tools" in row:
+                    tools = row["tools"]
+                    if tools is not None and isinstance(tools, list):
+                        result["tools"] = tools
+                    else:
+                        result["tools"] = []
+
+                yield result
 
             except Exception as e:
                 logger.warning(f"Skipping line {i + 1}: {e}")

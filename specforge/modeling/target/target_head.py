@@ -18,7 +18,12 @@ class TargetHead(nn.Module):
         self.config = AutoConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
-        self.fc = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.text_config = getattr(self.config, "text_config", self.config)
+
+        self.hidden_size = self.text_config.hidden_size
+        self.vocab_size = self.text_config.vocab_size
+
+        self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
     @classmethod
     def from_pretrained(

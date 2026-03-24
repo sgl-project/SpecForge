@@ -297,7 +297,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
 import hashlib
 
 
-def process_opc_sft_stage1(row: Dict) -> Tuple[Dict, int]:
+def process_opc_sft_stage1(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     row_id = hashlib.md5((row["instruction"] + row["output"]).encode()).hexdigest()
     processed_row = {
         "id": row_id,

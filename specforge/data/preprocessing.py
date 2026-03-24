@@ -122,6 +122,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
+    tools: Optional[List[List[Dict]]] = [[]],
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -135,6 +136,7 @@ def preprocess_conversations(
         max_length: The maximum length of the tokenized input.
         is_preformatted: Whether the input is already formatted text strings.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+        tools: Optional list of tools information corresponding to each conversation, used for tool-use conversations.
 
     Returns:
         A dictionary containing:
@@ -145,7 +147,6 @@ def preprocess_conversations(
 
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
-
     if chat_template.parser_type == "general":
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
@@ -154,12 +155,11 @@ def preprocess_conversations(
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
-
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
-    for source, kwargs_item in zip(conversations, kwargs_list):
+    for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
         if not source:
             # if the source is None, skip it
             continue
@@ -168,6 +168,7 @@ def preprocess_conversations(
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
+            tool=tool,
             **kwargs_item,
         )
         results["input_ids"].append(input_ids[None, :])
@@ -384,6 +385,10 @@ def build_eagle3_dataset(
             conversations = examples.pop("conversations")
             if "id" in examples:
                 examples.pop("id")
+            if "tools" in examples:
+                tools = examples.pop("tools")
+            else:
+                tools = [[] for _ in range(len(conversations))]
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
@@ -391,6 +396,7 @@ def build_eagle3_dataset(
                 max_length,
                 is_preformatted=False,
                 train_only_last_turn=train_only_last_turn,
+                tools=tools,
                 **examples,
             )
 
@@ -410,6 +416,11 @@ def build_eagle3_dataset(
         warnings.warn(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
+
+    # Disable tokenizers internal parallelism when using multiprocessing to avoid
+    # deadlocks caused by forked Rust threads (see huggingface/tokenizers#1391).
+    if num_proc is not None and num_proc > 1:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     # adjust batch size based on dataset type
     if is_vlm:
