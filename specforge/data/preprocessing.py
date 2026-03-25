@@ -22,6 +22,7 @@
 
 import gzip
 import io
+import json
 import os
 import re
 import warnings
@@ -144,7 +145,6 @@ def preprocess_conversations(
             - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
             - attention_mask: List of attention masks.
     """
-
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
     if chat_template.parser_type == "general":
@@ -386,7 +386,27 @@ def build_eagle3_dataset(
             if "id" in examples:
                 examples.pop("id")
             if "tools" in examples:
-                tools = examples.pop("tools")
+                tools_raw = examples.pop("tools")
+                # Parse tools: handle JSON strings from safe_conversations_generator
+                tools = []
+                for tool_item in tools_raw:
+                    if isinstance(tool_item, (str, list)):
+                        try:
+                            tools.append(json.loads(tool_item))
+                        except json.JSONDecodeError:
+                            warnings.warn(
+                                f"Failed to parse tools JSON string: {tool_item[:100]}..."
+                            )
+                            tools.append([])
+                    elif isinstance(tool_item, list):
+                        tools.append(tool_item)
+                    elif tool_item is None:
+                        tools.append([])
+                    else:
+                        warnings.warn(
+                            f"Unexpected tools type: {type(tool_item)}, using empty list"
+                        )
+                        tools.append([])
             else:
                 tools = [[] for _ in range(len(conversations))]
             processed = preprocess_conversations(
