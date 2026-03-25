@@ -11,10 +11,21 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 
+def _get_text_config_for_embeddings(config):
+    """
+    For VLM configs (Qwen3_5, etc.), vocab_size/hidden_size are in text_config.
+    Returns the config to use for embedding/lm_head dimensions.
+    """
+    if hasattr(config, "text_config"):
+        return config.text_config
+    return config
+
+
 class TargetEmbeddingsAndHead(nn.Module):
     """
     Efficiently loads only the embedding layer and lm_head from a pretrained model.
     Handles safetensors slicing and Weight Tying correctly.
+    Supports VLM configs (Qwen3.5) where vocab_size/hidden_size live in text_config.
     """
 
     def __init__(self, config):
