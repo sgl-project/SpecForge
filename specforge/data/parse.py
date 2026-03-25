@@ -21,6 +21,7 @@ class Parser(ABC):
     ):
         self.tokenizer = tokenizer
         self.chat_template = chat_template
+        self.standard_keys = {"role", "content", "tool_calls"}
 
     @abstractmethod
     def parse(
@@ -35,6 +36,71 @@ class Parser(ABC):
         Returns:
             A list of tensors: [input_ids, loss_mask]
         """
+
+    def _sanitize_message(self, message: dict) -> dict:
+        """
+        Clean up individual messages, handling the following issues:
+        1. `tool_calls` is a string → Parse as a list
+        2. `tool_calls[].function.arguments` is a string → Parse as a dictionary
+        3. Non-standard fields (extra, etc.) in `tool_calls[]` → Remove
+        """
+        cleaned = {k: v for k, v in message.items() if k in self.standard_keys}
+
+        # ===== handle tool_calls =====
+        if "tool_calls" in cleaned:
+            tool_calls = cleaned["tool_calls"]
+
+            # tool_calls is a string → Parsing
+            if isinstance(tool_calls, str):
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except json.JSONDecodeError:
+                    warnings.warn(
+                        f"Failed to parse tool_calls JSON string, removing tool_calls"
+                    )
+                    cleaned.pop("tool_calls", None)
+                    return cleaned
+
+            # Clean each tool_call
+            if isinstance(tool_calls, list):
+                sanitized_tool_calls = []
+
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+
+                    # Only retain the standard fields: id, type, function
+                    clean_tc = {
+                        "id": tc.get("id", ""),
+                        "type": tc.get("type", "function"),
+                    }
+
+                    # handle function
+                    func = tc.get("function", {})
+                    if isinstance(func, dict):
+                        clean_func = {
+                            "name": func.get("name", ""),
+                        }
+
+                        arguments = func.get("arguments", {})
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except json.JSONDecodeError:
+                                warnings.warn(
+                                    f"Failed to parse arguments for tool '{clean_func['name']}': "
+                                    f"{arguments[:100]}..."
+                                )
+                                arguments = {}
+
+                        clean_func["arguments"] = arguments
+                        clean_tc["function"] = clean_func
+
+                    sanitized_tool_calls.append(clean_tc)
+
+                cleaned["tool_calls"] = sanitized_tool_calls
+
+        return cleaned
 
 
 _harmony_encoding = None
@@ -125,15 +191,8 @@ class GeneralParser(Parser):
                             f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
                         break
-                tool_calls = sentence.get("tool_calls")
-                if isinstance(tool_calls, str):
-                    try:
-                        sentence["tool_calls"] = json.loads(tool_calls)
-                    except json.JSONDecodeError:
-                        warnings.warn(f"Failed to parse tool_calls JSON: {tool_calls}")
-                        break
+                sentence = self._sanitize_message(sentence)
                 messages.append(sentence)
-
             try:
                 conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
             except (ValueError, TypeError):
@@ -363,6 +422,7 @@ class ThinkingParser(GeneralParser):
         chat_template: ChatTemplate,
     ):
         super().__init__(tokenizer, chat_template)
+        self.standard_keys = {"role", "content", "tool_calls", "reasoning_content"}
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         """Apply chat template to all messages, handling reasoning_content and tool_calls."""
