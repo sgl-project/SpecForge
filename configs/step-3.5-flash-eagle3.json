@@ -4,9 +4,9 @@
   ],
   "eagle_config": {
     "eagle_aux_hidden_state_layer_ids": [
-      1,
-      22,
-      42
+      4,
+      20,
+      40
     ],
     "use_aux_hidden_state": true
   },
