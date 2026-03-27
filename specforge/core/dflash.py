@@ -24,18 +24,20 @@ def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, de
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
-    mask = torch.zeros((B, 1, Q_LEN, KV_LEN), dtype=torch.bool, device=device)
-
-    q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1) # (1, 1, Q_LEN, 1)
-    kv_indices = torch.arange(KV_LEN, device=device).view(1, 1, 1, -1) # (1, 1, 1, KV_LEN)
+    q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)  # (1, 1, Q_LEN, 1)
+    kv_indices = torch.arange(KV_LEN, device=device).view(
+        1, 1, 1, -1
+    )  # (1, 1, 1, KV_LEN)
 
     q_block_ids = q_indices // block_size
 
-    anchor_expanded = anchor_positions.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
+    anchor_expanded = anchor_positions.view(B, 1, N, 1).repeat_interleave(
+        block_size, dim=2
+    )
 
     mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
 
-    is_draft = (kv_indices >= S)
+    is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
 
