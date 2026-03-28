@@ -8,6 +8,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+
+# Import Qwen3.5 EAGLE3 patch
+try:
+    from specforge.modeling.qwen3_5_eagle_patch import patch_qwen3_5_instance
+except ImportError:
+    patch_qwen3_5_instance = None
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     init_mm_embedding_cache,
@@ -349,6 +355,16 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
+        # Apply Qwen3.5 EAGLE3 patch if the model doesn't have the method yet
+        model = self.model_runner.model
+        if not hasattr(model, "set_eagle3_layers_to_capture"):
+            if patch_qwen3_5_instance is not None:
+                patch_qwen3_5_instance(model)
+            else:
+                raise AttributeError(
+                    f"Model {type(model).__name__} does not have set_eagle3_layers_to_capture method. "
+                    "Please ensure the EAGLE3 patch is properly applied."
+                )
         self.model_runner.model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
 
     @torch.no_grad

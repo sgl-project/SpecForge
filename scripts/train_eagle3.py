@@ -6,6 +6,17 @@ import time
 from argparse import ArgumentParser, Namespace
 from typing import List, Optional, Tuple, Union
 
+# Enable Qwen3.5 EAGLE3 patch via environment variable
+# Set QWEN35_EAGLE3_ENABLE=1 to enable the patch
+os.environ['QWEN35_EAGLE3_ENABLE'] = '1'
+
+# Patch Qwen3.5 4B for EAGLE3 support
+try:
+    from specforge.modeling.qwen3_5_eagle_patch import patch_qwen3_5_for_eagle3, patch_qwen3_5_instance
+    patch_qwen3_5_for_eagle3()
+except Exception as e:
+    print(f"Warning: Failed to apply Qwen3.5 EAGLE3 patch: {e}")
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -305,6 +316,11 @@ def build_target_model(
                 draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
             )
         else:
+            # Apply instance-level patch if model wasn't patched at class level
+            try:
+                patch_qwen3_5_instance(target_model.model_runner.model)
+            except:
+                pass
             target_model.set_aux_hidden_states_layers()
 
         if args.is_vlm:
