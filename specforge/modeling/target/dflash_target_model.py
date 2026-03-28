@@ -110,11 +110,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         self.spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
         self.vlm_model_type = getattr(vision_config, "model_type", "")
 
-        text_config = getattr(hf_config, "text_config", hf_config)
         self.tokens_per_second = None
-
-        rope_params = getattr(text_config, "rope_parameters", {}) or {}
-        self.mrope_interleaved = rope_params.get("mrope_interleaved", False)
 
     @classmethod
     def from_pretrained(
@@ -437,9 +433,9 @@ class HFDFlashTargetModel(DFlashTargetModel):
             output_hidden_states=True,
             use_cache=False,
         )
-        if pixel_values:
+        if pixel_values is not None:
             model_kwargs["pixel_values"] = pixel_values
-        if image_grid_thw:
+        if image_grid_thw is not None:
             model_kwargs["image_grid_thw"] = image_grid_thw
         outputs = self.model(**model_kwargs)
 

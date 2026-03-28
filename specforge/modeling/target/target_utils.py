@@ -63,7 +63,10 @@ class TargetEmbeddingsAndHead(nn.Module):
         instance = cls(config)
 
         if embed_key is None:
-            embed_key = "model.embed_tokens.weight"
+            if hasattr(config, "text_config") and config.text_config is not None:
+                embed_key = "model.language_model.embed_tokens.weight"
+            else:
+                embed_key = "model.embed_tokens.weight"
         if lm_head_key is None:
             lm_head_key = "lm_head.weight"
 

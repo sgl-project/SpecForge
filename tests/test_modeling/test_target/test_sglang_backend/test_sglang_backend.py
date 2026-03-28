@@ -32,7 +32,6 @@ def test_dense(rank, world_size, port, tp_size):
         device="cuda",
         attention_backend="fa3",
         mem_fraction_static=0.4,
-        # enable_torch_compile=True,
         enable_nccl_nvls=True,
         # enable_symm_mem=True,
         enable_symm_mem=False,
