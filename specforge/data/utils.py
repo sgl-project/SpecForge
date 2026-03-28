@@ -205,6 +205,10 @@ class VlmDataCollatorWithPadding:
                 - attention_mask: torch.Tensor of shape (B, N)
                 - loss_mask: torch.Tensor of shape (B, N)
         """
+        assert len(features) == 1, (
+            f"VlmDataCollatorWithPadding requires batch_size=1, got {len(features)}. "
+            "Set per_device_train_batch_size=1 in your training config."
+        )
         max_length = max(item["input_ids"].shape[1] for item in features)
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -218,12 +222,30 @@ class VlmDataCollatorWithPadding:
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
         )
-        batch_pixel_values = torch.cat(
-            [item["pixel_values"] for item in features], dim=0
-        )
-        batch_image_grid_thw = torch.cat(
-            [item["image_grid_thw"] for item in features], dim=0
-        )
+        # Collect pixel_values and image_grid_thw per sample.
+        # Image samples have non-empty pixel_values; text-only samples have empty tensors.
+        all_pixel_values = []
+        all_image_grid_thw = []
+        for item in features:
+            pv = item.get("pixel_values")
+            thw = item.get("image_grid_thw")
+            if pv is not None and isinstance(pv, torch.Tensor) and pv.numel() > 0:
+                all_pixel_values.append(pv)
+                all_image_grid_thw.append(thw)
+            else:
+                all_image_grid_thw.append(None)
+
+        if all_pixel_values:
+            batch_pixel_values = torch.cat(all_pixel_values, dim=0)
+        else:
+            batch_pixel_values = None
+
+        # If all samples are text-only, set image_grid_thw to None
+        if all(thw is None for thw in all_image_grid_thw):
+            batch_image_grid_thw = None
+        else:
+            batch_image_grid_thw = all_image_grid_thw
+
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
@@ -304,17 +326,10 @@ def prepare_dp_dataloaders(
 
 
 def parse_harmony_message_content(content):
-    """
-    解析 content 字符串中的 Harmony 格式。
-    如果匹配到 Harmony 格式，返回包含 channel 和 content 的列表；
-    否则，返回原内容并标记为默认 channel。
-    """
-    # 匹配 <|channel|>xxx<|message|>yyy<|end|>
     pattern = r"<\|channel\|>(.*?)<\|message\|>(.*?)<\|end|>"
     matches = re.findall(pattern, content, re.DOTALL)
 
     if not matches:
-        # 如果没有匹配到 Harmony 标签，视作普通文本
         return [{"channel": "text", "content": content}]
 
     results = []
@@ -324,22 +339,17 @@ def parse_harmony_message_content(content):
 
 
 def process_harmony_conversations(conversation):
-    """
-    处理传入的 list[list[dict]] 结构
-    """
     new_conversation = []
     for msg in conversation:
         role = msg.get("role")
         original_content = msg.get("content", "")
 
-        # 解析 content 中的 Harmony 结构
         segments = parse_harmony_message_content(original_content)
 
-        # 为每个解析出的通道生成一个新的消息字典
         for seg in segments:
             new_msg = {
                 "role": role,
-                "channel": seg["channel"],  # 新增字段标识通道
+                "channel": seg["channel"],
                 "content": seg["content"],
             }
             new_conversation.append(new_msg)

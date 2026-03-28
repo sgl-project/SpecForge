@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
@@ -34,6 +34,8 @@ from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+
+logging.getLogger("sglang.srt.mem_cache.memory_pool").setLevel(logging.WARNING)
 
 
 def parse_args():
@@ -94,6 +96,9 @@ def parse_args():
         default=None,
         help="LM head weight key in the target model. Default: 'lm_head.weight'.",
     )
+    model_group.add_argument("--is-vlm", action="store_true")
+    model_group.add_argument("--min-pixels", type=int, default=50176)
+    model_group.add_argument("--max-pixels", type=int, default=802816)
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -207,7 +212,16 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     return target_model, draft_model
 
 
-def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
+def _load_raw_dataset(data_path: str):
+    """load jsonl"""
+    if os.path.isdir(data_path):
+        return load_from_disk(data_path)
+    return load_dataset("json", data_files=data_path)["train"]
+
+
+def build_dataloader(
+    args, tokenizer, processor=None
+) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
 
@@ -219,7 +233,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    train_dataset = _load_raw_dataset(args.train_data_path)
     train_eagle3_dataset = build_eagle3_dataset(
         dataset=train_dataset,
         tokenizer=tokenizer,
@@ -229,8 +243,9 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
+        is_vlm=args.is_vlm,
+        processor=processor,
     )
-
     min_loss_tokens = 2 * args.block_size
     original_size = len(train_eagle3_dataset)
     train_eagle3_dataset = train_eagle3_dataset.filter(
@@ -246,17 +261,20 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
+        is_vlm=args.is_vlm,
     )
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+        eval_dataset = _load_raw_dataset(args.eval_data_path)
         eval_eagle3_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
+            is_vlm=args.is_vlm,
+            processor=processor,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -264,6 +282,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=get_dp_group(),
+            is_vlm=args.is_vlm,
         )
 
     return train_dataloader, eval_dataloader
@@ -396,7 +415,23 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
+
+    processor = None
+    if args.is_vlm:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            args.target_model_path,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+            trust_remote_code=args.trust_remote_code,
+        )
+        print_on_rank0(
+            f"Loaded VLM processor (min_pixels={args.min_pixels}, max_pixels={args.max_pixels})"
+        )
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
@@ -412,8 +447,7 @@ def main():
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
-
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer, processor)
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
@@ -496,11 +530,30 @@ def main():
                 continue
             global_step += 1
 
+            input_ids_cpu = data["input_ids"]
+            attention_mask_cpu = data["attention_mask"]
+            loss_mask_cpu = data["loss_mask"]
+
             input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
+            pixel_values = None
+            image_grid_thw_cpu = None
+            if (
+                args.is_vlm
+                and "pixel_values" in data
+                and data["pixel_values"] is not None
+            ):
+                pixel_values = data["pixel_values"].cuda()
+                image_grid_thw_cpu = [
+                    thw.squeeze() if thw is not None else None
+                    for thw in data["image_grid_thw"]
+                ]
             target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
+                input_ids_cpu,
+                attention_mask_cpu,
+                loss_mask_cpu,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw_cpu,
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
