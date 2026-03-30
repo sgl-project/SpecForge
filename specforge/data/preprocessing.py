@@ -214,7 +214,6 @@ def preprocess_vlm_conversations(
     for i, images in enumerate(examples["images"]):
         source = examples["conversations"][i]
         messages = []
-        # messages = [{"role": "system", "content": system_prompt}]
         if not source:
             # if the source is None, skip it
             continue
@@ -424,7 +423,7 @@ def build_eagle3_dataset(
                 # Parse tools: handle JSON strings from safe_conversations_generator
                 tools = []
                 for tool_item in tools_raw:
-                    if isinstance(tool_item, (str, list)):
+                    if isinstance(tool_item, str):
                         try:
                             tools.append(json.loads(tool_item))
                         except json.JSONDecodeError:
