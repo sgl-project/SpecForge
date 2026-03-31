@@ -68,7 +68,8 @@ def create_dflash_block_mask(
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
-        anchor_pos = anchor_positions[b, q_block_id]
+        safe_q_block_id = q_block_id.clamp(max=N - 1)
+        anchor_pos = anchor_positions[b, safe_q_block_id]
 
         is_context = kv_idx < S
         # Strictly less than: matches inference where target_hidden[anchor_pos]
@@ -79,8 +80,9 @@ def create_dflash_block_mask(
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
 
-        is_valid_block = block_keep_mask[b, q_block_id]
-        return (mask_context | mask_draft) & is_valid_block
+        is_valid_block = block_keep_mask[b, safe_q_block_id]
+        in_bounds = q_block_id < N
+        return (mask_context | mask_draft) & is_valid_block & in_bounds
 
     B, N = anchor_positions.shape
     Q_LEN = N * block_size

@@ -19,7 +19,9 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.scheduler import Scheduler
+
+# - prepare_mlp_sync_batch_raw is now a module-level function, not a Scheduler method
+from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -302,10 +304,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
         tp_size = dist.get_world_size(get_tp_group())
+        # NOTE: sglang 0.5.9 requires dtype to be non-None
+        # If torch_dtype is None, use "auto" to let sglang decide the dtype
+        dtype_arg = torch_dtype if torch_dtype is not None else "auto"
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
-            dtype=torch_dtype,
+            dtype=dtype_arg,
             enable_return_hidden_states=True,
             disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
             tp_size=tp_size,
@@ -316,6 +321,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
+        # - Added is_draft_worker=False parameter (new in 0.5.9)
+        # - Other new parameters (dp_rank, attn_cp_rank, moe_dp_rank, etc.) use default values
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -328,6 +335,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             pp_size=1,
             server_args=server_args,
             nccl_port=None,
+            is_draft_worker=False,
         )
         wrap_eagle3_logits_processors_in_module(
             model_runner.model, return_full_logits=False
@@ -379,26 +387,32 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        eagle3_output, _ = self.model_runner.forward(forward_batch)
-
+        eagle3_output = self.model_runner.forward(forward_batch)
         aux_hidden_states_list = None
         input_lens = [len(req.origin_input_ids) for req in reqs]
 
         if return_logits:
-            logits = torch.split(eagle3_output.logits, input_lens, dim=0)
+            if hasattr(eagle3_output, "logits_output"):
+                raw_logits = eagle3_output.logits_output.logits
+            else:
+                raw_logits = eagle3_output.logits
+            logits = torch.split(raw_logits, input_lens, dim=0)
         else:
             logits = [None] * len(reqs)
 
         if capture_aux_hidden_states:
+            raw_aux_hidden_states = (
+                eagle3_output.logits_output.aux_hidden_states
+            )  # concat hidden shape: (total_tokens, H*3)
             aux_hidden_states_list = torch.split(
-                eagle3_output.aux_hidden_states, input_lens, dim=0
+                raw_aux_hidden_states, input_lens, dim=0
             )
         else:
             aux_hidden_states_list = [None] * len(reqs)
 
         if return_last_hidden_states:
             last_hidden_states = torch.split(
-                eagle3_output.last_hidden_states, input_lens, dim=0
+                eagle3_output.logits_output.last_hidden_states, input_lens, dim=0
             )
         else:
             last_hidden_states = [None] * len(reqs)
@@ -410,15 +424,17 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            # - Removed spec_algorithm and speculative_num_draft_tokens parameters
+            # - Added attn_cp_size parameter
+            # - Changed from Scheduler.prepare_mlp_sync_batch_raw to direct function call
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
+                attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
@@ -609,7 +625,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 video_token_id=self.video_token_id,
                 vision_start_token_id=self.vision_start_token_id,
                 model_type=self.model_type,
-                input_ids=input_id_flat.unsqueeze(0),
+                input_ids=input_id_flat.unsqueeze(0).cpu(),
                 image_grid_thw=(
                     image_grid_thw_.cpu() if image_grid_thw_ is not None else None
                 ),
