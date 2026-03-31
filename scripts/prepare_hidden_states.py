@@ -613,15 +613,19 @@ def main():
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
-    dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.data_path},
-        cache_dir=os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "cache",
-            "hf_dataset",
-        ),
-    )
+
+    with rank_0_priority():
+        print_with_rank("Loading/building dataset cache...")
+        dataset = Dataset.from_generator(
+            generator=safe_conversations_generator,
+            gen_kwargs={"file_path": args.data_path},
+            cache_dir=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "cache",
+                "hf_dataset",
+            ),
+            num_proc=min(args.build_dataset_num_proc, 32),
+        )
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
