@@ -5,6 +5,32 @@ from typing import Any, Dict, List
 from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
 
 
+def adapt_sglang_server_args_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt piecewise cuda graph kwargs for sglang version compatibility.
+
+    New sglang (post-0.5.9) uses 'enforce_piecewise_cuda_graph' (piecewise cuda graph
+    is enabled by default, this flag forces it on even when auto-disabled).
+    Old sglang (<=0.5.9) uses 'enable_piecewise_cuda_graph' (disabled by default).
+
+    This function translates between the two based on the installed sglang version.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    has_enforce = hasattr(ServerArgs, "enforce_piecewise_cuda_graph")
+    has_enable = hasattr(ServerArgs, "enable_piecewise_cuda_graph")
+
+    if "enforce_piecewise_cuda_graph" in kwargs and not has_enforce and has_enable:
+        kwargs["enable_piecewise_cuda_graph"] = kwargs.pop(
+            "enforce_piecewise_cuda_graph"
+        )
+    elif "enable_piecewise_cuda_graph" in kwargs and not has_enable and has_enforce:
+        kwargs["enforce_piecewise_cuda_graph"] = kwargs.pop(
+            "enable_piecewise_cuda_graph"
+        )
+
+    return kwargs
+
+
 @dataclass
 class TrackerArgs:
     report_to: str = "none"
@@ -188,7 +214,7 @@ class SGLangBackendArgs:
         )
 
     def to_kwargs(self) -> Dict[str, Any]:
-        return dict(
+        kwargs = dict(
             attention_backend=self.sglang_attention_backend,
             mem_fraction_static=self.sglang_mem_fraction_static,
             context_length=self.sglang_context_length,
@@ -204,3 +230,4 @@ class SGLangBackendArgs:
             max_running_requests=self.sglang_max_running_requests,
             max_total_tokens=self.sglang_max_total_tokens,
         )
+        return adapt_sglang_server_args_kwargs(kwargs)

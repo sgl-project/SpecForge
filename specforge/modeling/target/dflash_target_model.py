@@ -17,6 +17,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
+from specforge.args import adapt_sglang_server_args_kwargs
 from specforge.distributed import get_tp_group
 
 from .sglang_backend import SGLangRunner
@@ -80,6 +81,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         **kwargs,
     ) -> "SGLangDFlashTargetModel":
         tp_size = dist.get_world_size(get_tp_group())
+        kwargs = adapt_sglang_server_args_kwargs(kwargs)
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
