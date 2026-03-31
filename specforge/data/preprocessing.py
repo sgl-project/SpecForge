@@ -22,6 +22,7 @@
 
 import gzip
 import io
+import json
 import os
 import re
 import warnings
@@ -122,6 +123,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
+    tools: Optional[List[List[Dict]]] = [[]],
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -135,6 +137,7 @@ def preprocess_conversations(
         max_length: The maximum length of the tokenized input.
         is_preformatted: Whether the input is already formatted text strings.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+        tools: Optional list of tools information corresponding to each conversation, used for tool-use conversations.
 
     Returns:
         A dictionary containing:
@@ -142,10 +145,8 @@ def preprocess_conversations(
             - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
             - attention_mask: List of attention masks.
     """
-
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
-
     if chat_template.parser_type == "general":
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
@@ -154,12 +155,11 @@ def preprocess_conversations(
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
-
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
-    for source, kwargs_item in zip(conversations, kwargs_list):
+    for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
         if not source:
             # if the source is None, skip it
             continue
@@ -168,6 +168,7 @@ def preprocess_conversations(
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
+            tool=tool,
             **kwargs_item,
         )
         results["input_ids"].append(input_ids[None, :])
@@ -384,6 +385,30 @@ def build_eagle3_dataset(
             conversations = examples.pop("conversations")
             if "id" in examples:
                 examples.pop("id")
+            if "tools" in examples:
+                tools_raw = examples.pop("tools")
+                # Parse tools: handle JSON strings from safe_conversations_generator
+                tools = []
+                for tool_item in tools_raw:
+                    if isinstance(tool_item, (str, list)):
+                        try:
+                            tools.append(json.loads(tool_item))
+                        except json.JSONDecodeError:
+                            warnings.warn(
+                                f"Failed to parse tools JSON string: {tool_item[:100]}..."
+                            )
+                            tools.append([])
+                    elif isinstance(tool_item, list):
+                        tools.append(tool_item)
+                    elif tool_item is None:
+                        tools.append([])
+                    else:
+                        warnings.warn(
+                            f"Unexpected tools type: {type(tool_item)}, using empty list"
+                        )
+                        tools.append([])
+            else:
+                tools = [[] for _ in range(len(conversations))]
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
@@ -391,6 +416,7 @@ def build_eagle3_dataset(
                 max_length,
                 is_preformatted=False,
                 train_only_last_turn=train_only_last_turn,
+                tools=tools,
                 **examples,
             )
 

@@ -21,7 +21,7 @@ jobs:
       with:
         python-version: '3.11'
 
-    - run: python setup.py sdist build
+    - run: pip install build && python -m build --sdist
 
     # publish to PyPI if executed on the main branch
     - name: Publish package to PyPI
