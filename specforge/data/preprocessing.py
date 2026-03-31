@@ -246,7 +246,7 @@ def preprocess_vlm_conversations(
             else:
                 messages.append({"role": role, "content": sentence["content"]})
 
-        conversation = processor.apply_chat_template(
+        conversation = processor.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
