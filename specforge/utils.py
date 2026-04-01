@@ -342,6 +342,12 @@ def safe_conversations_generator(file_path):
                 continue
             try:
                 row = json.loads(line)
+
+                # If the row has a 'text' field (preformatted data), yield it directly
+                if "text" in row:
+                    yield {"text": row["text"]}
+                    continue
+
                 raw_convs = row.get("conversations", [])
 
                 # 1. Ensure 'conversations' is a list

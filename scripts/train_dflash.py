@@ -599,6 +599,7 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
+
     target_config = AutoConfig.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
@@ -700,7 +701,9 @@ def main():
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
-    embed_key, lm_head_key = _resolve_target_weight_keys(target_config)
+    resolved_embed_key, resolved_lm_head_key = _resolve_target_weight_keys(target_config)
+    embed_key = args.embedding_key if args.embedding_key is not None else resolved_embed_key
+    lm_head_key = args.lm_head_key if args.lm_head_key is not None else resolved_lm_head_key
     print_on_rank0(
         f"Loading target embeddings/head with keys: embed='{embed_key}', head='{lm_head_key}'"
     )
