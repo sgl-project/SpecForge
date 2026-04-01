@@ -1,6 +1,6 @@
 import argparse
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
 
@@ -217,3 +217,184 @@ class SGLangBackendArgs:
             max_running_requests=self.sglang_max_running_requests,
             max_total_tokens=self.sglang_max_total_tokens,
         )
+
+
+@dataclass
+class RayArgs:
+    """Parameters for Ray cluster initialisation."""
+
+    ray_address: Optional[str] = None
+    ray_num_gpus: Optional[int] = None
+    ray_namespace: str = "specforge"
+
+    @staticmethod
+    def add_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--ray-address",
+            type=str,
+            default=None,
+            help=(
+                "Ray cluster address (e.g. 'auto' or 'ray://head:10001'). "
+                "If not set, Ray will start a local cluster."
+            ),
+        )
+        parser.add_argument(
+            "--ray-num-gpus",
+            type=int,
+            default=None,
+            help=(
+                "Total GPUs to expose to the local Ray cluster. "
+                "Only used when --ray-address is not set."
+            ),
+        )
+        parser.add_argument(
+            "--ray-namespace",
+            type=str,
+            default="specforge",
+            help="Ray namespace used for actor naming isolation.",
+        )
+
+    @staticmethod
+    def from_args(args: argparse.Namespace) -> "RayArgs":
+        return RayArgs(
+            ray_address=args.ray_address,
+            ray_num_gpus=args.ray_num_gpus,
+            ray_namespace=args.ray_namespace,
+        )
+
+
+@dataclass
+class DisaggregateArgs:
+    """Controls whether inference and training run on separate GPUs."""
+
+    disaggregate: bool = False
+    rollout_num_gpus: Optional[int] = None
+    train_num_gpus: Optional[int] = None
+    rollout_tp_size: int = 1
+    train_tp_size: int = 1
+    train_sp_ulysses_size: int = 1
+    train_sp_ring_size: int = 1
+    transfer_backend: str = "ray"
+    rollout_async: bool = False
+
+    @staticmethod
+    def add_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--disaggregate",
+            action="store_true",
+            help=(
+                "Enable disaggregated (inference/training separated) mode. "
+                "When set, rollout GPUs and train GPUs are isolated."
+            ),
+        )
+        parser.add_argument(
+            "--rollout-num-gpus",
+            type=int,
+            default=None,
+            help="Number of GPUs dedicated to target-model rollout (disaggregated mode).",
+        )
+        parser.add_argument(
+            "--train-num-gpus",
+            type=int,
+            default=None,
+            help=(
+                "Number of GPUs dedicated to draft-model training. "
+                "Must equal dp_size * train_tp_size."
+            ),
+        )
+        parser.add_argument(
+            "--rollout-tp-size",
+            type=int,
+            default=1,
+            help="Tensor-parallel degree for the rollout (target) model.",
+        )
+        parser.add_argument(
+            "--train-tp-size",
+            type=int,
+            default=1,
+            help="Tensor-parallel degree for the draft model during training.",
+        )
+        parser.add_argument(
+            "--train-sp-ulysses-size",
+            type=int,
+            default=1,
+            help="Ulysses sequence-parallel degree for training (requires --attention-backend usp).",
+        )
+        parser.add_argument(
+            "--train-sp-ring-size",
+            type=int,
+            default=1,
+            help="Ring sequence-parallel degree for training (requires --attention-backend usp).",
+        )
+        parser.add_argument(
+            "--transfer-backend",
+            type=str,
+            default="ray",
+            choices=["ray"],
+            help="Backend used to transfer rollout tensors from rollout to train workers.",
+        )
+        parser.add_argument(
+            "--rollout-async",
+            action="store_true",
+            help=(
+                "Prefetch the next rollout batch while the current training step runs "
+                "(advanced pipeline parallelism)."
+            ),
+        )
+
+    @staticmethod
+    def from_args(args: argparse.Namespace) -> "DisaggregateArgs":
+        return DisaggregateArgs(
+            disaggregate=args.disaggregate,
+            rollout_num_gpus=args.rollout_num_gpus,
+            train_num_gpus=args.train_num_gpus,
+            rollout_tp_size=args.rollout_tp_size,
+            train_tp_size=args.train_tp_size,
+            train_sp_ulysses_size=args.train_sp_ulysses_size,
+            train_sp_ring_size=args.train_sp_ring_size,
+            transfer_backend=args.transfer_backend,
+            rollout_async=args.rollout_async,
+        )
+
+    def validate(self, args: argparse.Namespace) -> None:
+        """
+        Validate disaggregate-related argument combinations.
+
+        Raises
+        ------
+        ValueError if any constraint is violated.
+        """
+        if self.disaggregate:
+            if self.rollout_num_gpus is None:
+                raise ValueError("--rollout-num-gpus is required in disaggregated mode.")
+            if self.train_num_gpus is None:
+                raise ValueError("--train-num-gpus is required in disaggregated mode.")
+            if self.rollout_num_gpus % self.rollout_tp_size != 0:
+                raise ValueError(
+                    f"rollout_num_gpus ({self.rollout_num_gpus}) must be divisible by "
+                    f"rollout_tp_size ({self.rollout_tp_size})."
+                )
+            if self.train_num_gpus % self.train_tp_size != 0:
+                raise ValueError(
+                    f"train_num_gpus ({self.train_num_gpus}) must be divisible by "
+                    f"train_tp_size ({self.train_tp_size})."
+                )
+            sp_size = self.train_sp_ulysses_size * self.train_sp_ring_size
+            if self.train_num_gpus % sp_size != 0:
+                raise ValueError(
+                    f"train_num_gpus ({self.train_num_gpus}) must be divisible by "
+                    f"train_sp_size ({sp_size})."
+                )
+
+        sp_size = self.train_sp_ulysses_size * self.train_sp_ring_size
+        if sp_size > 1:
+            if getattr(args, "attention_backend", "sdpa") != "usp":
+                raise ValueError(
+                    "SP (train_sp_ulysses_size * train_sp_ring_size > 1) "
+                    "requires --attention-backend usp."
+                )
+            if getattr(args, "batch_size", 1) != 1:
+                raise ValueError(
+                    "SP (train_sp_ulysses_size * train_sp_ring_size > 1) "
+                    "requires --batch-size 1."
+                )
