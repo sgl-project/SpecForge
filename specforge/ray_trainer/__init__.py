@@ -1,9 +1,9 @@
-from .orchestrator import Eagle3RayOrchestrator
+from .orchestrator import RayOrchestrator
 from .pipeline import TrainingPipeline
 from .resource_manager import RolloutWorkerGroup, TrainWorkerGroup, build_worker_groups
 
 __all__ = [
-    "Eagle3RayOrchestrator",
+    "RayOrchestrator",
     "TrainingPipeline",
     "RolloutWorkerGroup",
     "TrainWorkerGroup",

@@ -191,10 +191,14 @@ class SGLangBackendArgs:
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
             sglang_max_running_requests=(
-                args.target_batch_size if hasattr(args, "target_batch_size") else None
+                args.target_batch_size * getattr(args, "rollout_batch_size", 1)
+                if hasattr(args, "target_batch_size")
+                else None
             ),
             sglang_max_total_tokens=(
-                args.target_batch_size * args.max_length
+                args.target_batch_size
+                * getattr(args, "rollout_batch_size", 1)
+                * args.max_length
                 if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
                 else None
             ),
@@ -276,6 +280,7 @@ class DisaggregateArgs:
     train_sp_ring_size: int = 1
     transfer_backend: str = "ray"
     rollout_async: bool = False
+    rollout_batch_size: int = 1
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
@@ -330,7 +335,7 @@ class DisaggregateArgs:
             "--transfer-backend",
             type=str,
             default="ray",
-            choices=["ray"],
+            choices=["ray", "nccl"],
             help="Backend used to transfer rollout tensors from rollout to train workers.",
         )
         parser.add_argument(
@@ -339,6 +344,15 @@ class DisaggregateArgs:
             help=(
                 "Prefetch the next rollout batch while the current training step runs "
                 "(advanced pipeline parallelism)."
+            ),
+        )
+        parser.add_argument(
+            "--rollout-batch-size",
+            type=int,
+            default=1,
+            help=(
+                "Number of train batches to accumulate per rollout call. "
+                "Larger values improve rollout GPU utilization (disaggregated mode)."
             ),
         )
 
@@ -354,6 +368,7 @@ class DisaggregateArgs:
             train_sp_ring_size=args.train_sp_ring_size,
             transfer_backend=args.transfer_backend,
             rollout_async=args.rollout_async,
+            rollout_batch_size=args.rollout_batch_size,
         )
 
     def validate(self, args: argparse.Namespace) -> None:
@@ -366,7 +381,9 @@ class DisaggregateArgs:
         """
         if self.disaggregate:
             if self.rollout_num_gpus is None:
-                raise ValueError("--rollout-num-gpus is required in disaggregated mode.")
+                raise ValueError(
+                    "--rollout-num-gpus is required in disaggregated mode."
+                )
             if self.train_num_gpus is None:
                 raise ValueError("--train-num-gpus is required in disaggregated mode.")
             if self.rollout_num_gpus % self.rollout_tp_size != 0:
@@ -378,6 +395,11 @@ class DisaggregateArgs:
                 raise ValueError(
                     f"train_num_gpus ({self.train_num_gpus}) must be divisible by "
                     f"train_tp_size ({self.train_tp_size})."
+                )
+            if self.train_tp_size != 1:
+                raise ValueError(
+                    "Draft model does not support tensor parallelism. "
+                    "Use --train-tp-size 1 with DP+SP instead."
                 )
             sp_size = self.train_sp_ulysses_size * self.train_sp_ring_size
             if self.train_num_gpus % sp_size != 0:

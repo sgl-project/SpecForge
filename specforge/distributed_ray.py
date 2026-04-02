@@ -10,6 +10,7 @@ torchrun launcher.
 import os
 import socket
 from contextlib import closing
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -27,18 +28,105 @@ def get_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _set_dist_env(rank: int, world_size: int, master_addr: str, master_port: int) -> None:
+def _set_dist_env(
+    rank: int, world_size: int, master_addr: str, master_port: int
+) -> None:
     """Set the environment variables expected by torch.distributed."""
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    # LOCAL_RANK: in a Ray Actor, CUDA_VISIBLE_DEVICES exposes exactly
-    # the GPUs allocated to this actor, so we always map to device index 0
-    # within the visible set.  init_distributed() in distributed.py also
-    # recomputes local_rank as rank % device_count(), which gives the same
-    # result when each actor owns exactly one GPU (device_count == 1).
-    os.environ["LOCAL_RANK"] = str(rank % max(torch.cuda.device_count(), 1))
+    # LOCAL_RANK: Each Ray Actor is allocated exactly 1 GPU via
+    # @ray.remote(num_gpus=1).  Ray sets CUDA_VISIBLE_DEVICES to expose
+    # only that single GPU, so torch.cuda.device_count() == 1 inside the
+    # actor.  Therefore LOCAL_RANK is always 0.
+    os.environ["LOCAL_RANK"] = "0"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Global process group (cross-group NCCL for disaggregated mode)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def init_global_distributed(
+    global_rank: int,
+    global_world_size: int,
+    master_addr: str,
+    master_port: int,
+    timeout_minutes: int = 20,
+) -> None:
+    """Initialize a GLOBAL NCCL process group spanning ALL actors.
+
+    Must be called by every actor (rollout + train) before any local
+    subgroup initialization.  After this call, ``dist.get_rank()``
+    returns the globally unique rank.
+
+    Args:
+        global_rank:       Unique rank across all actors (rollout + train).
+        global_world_size: Total number of actors.
+        master_addr:       Shared rendezvous address.
+        master_port:       Shared rendezvous port.
+        timeout_minutes:   NCCL timeout.
+    """
+    _set_dist_env(global_rank, global_world_size, master_addr, master_port)
+    torch.cuda.set_device(0)  # Each actor sees exactly 1 GPU
+    dist.init_process_group(
+        backend="nccl",
+        timeout=timedelta(minutes=timeout_minutes),
+    )
+
+
+def init_rollout_subgroup(
+    rollout_ranks: list,
+    tp_size: int,
+) -> None:
+    """Create local subgroups for a RolloutWorker after global init.
+
+    Uses use_local_synchronization=True so only rollout ranks need to
+    participate — no global barrier with train ranks.
+    """
+    from specforge.distributed import init_distributed_from_subgroup
+
+    rollout_group = dist.new_group(
+        ranks=rollout_ranks,
+        use_local_synchronization=True,
+    )
+    init_distributed_from_subgroup(
+        local_group=rollout_group,
+        tp_size=tp_size,
+        sp_ulysses_size=1,
+        sp_ring_size=1,
+    )
+
+
+def init_train_subgroup(
+    train_ranks: list,
+    tp_size: int,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+) -> None:
+    """Create local subgroups for a TrainWorker after global init.
+
+    Uses use_local_synchronization=True so only train ranks need to
+    participate — no global barrier with rollout ranks.
+    """
+    from specforge.distributed import init_distributed_from_subgroup
+
+    train_group = dist.new_group(
+        ranks=train_ranks,
+        use_local_synchronization=True,
+    )
+    init_distributed_from_subgroup(
+        local_group=train_group,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Legacy per-group initialization (used by Ray object store transfer mode)
+# ─────────────────────────────────────────────────────────────────────────
 
 
 def init_rollout_distributed(
@@ -65,8 +153,6 @@ def init_rollout_distributed(
         timeout_minutes: NCCL timeout in minutes.
     """
     _set_dist_env(rank, world_size, master_addr, master_port)
-    # Reuse the existing init_distributed logic; sp sizes default to 1 so
-    # no SP process groups are created.
     from specforge.distributed import init_distributed
 
     init_distributed(
@@ -93,15 +179,6 @@ def init_train_distributed(
     Fully equivalent to calling specforge.distributed.init_distributed()
     from a torchrun context, but populates the required env vars first
     so that no external launcher is needed.
-
-    After this call, ALL global variables in specforge.distributed
-    (_TP_GROUP, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP,
-    _SP_ULYSSES_GROUP, _SP_RING_GROUP, etc.) are correctly set and the
-    helper functions (get_tp_group, get_dp_group, …) return usable objects.
-
-    Constraints (same as init_distributed):
-        world_size == dp_size * tp_size
-        world_size % (sp_ulysses_size * sp_ring_size) == 0
 
     Args:
         rank:             Global rank of this TrainWorker.
