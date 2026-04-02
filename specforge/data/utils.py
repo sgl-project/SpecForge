@@ -34,9 +34,17 @@ class DataCollatorWithPadding:
     Datacollator that will dynamically pad the inputs for batching.
     """
 
-    def __init__(self):
-        self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
-        self.ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
+    def __init__(self, sp_degree=None, ulysses_degree=None):
+        if sp_degree is not None:
+            self.sp_degree = sp_degree
+        else:
+            self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
+        if ulysses_degree is not None:
+            self.ulysses_degree = ulysses_degree
+        else:
+            self.ulysses_degree = torch.distributed.get_world_size(
+                get_sp_ulysses_group()
+            )
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """

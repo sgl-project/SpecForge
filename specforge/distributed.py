@@ -63,6 +63,38 @@ def get_sp_ring_group():
     return _SP_RING_GROUP
 
 
+def get_sp_rank():
+    """Return this rank's position within its SP group."""
+    global _DRAFT_SP_GROUP
+    if _DRAFT_SP_GROUP is None:
+        return 0
+    return dist.get_rank(_DRAFT_SP_GROUP)
+
+
+def get_draft_dp_rank():
+    """Return this rank's DP index (across SP groups)."""
+    global _DRAFT_DP_GROUP
+    if _DRAFT_DP_GROUP is None:
+        return 0
+    return dist.get_rank(_DRAFT_DP_GROUP)
+
+
+def get_sp_size():
+    """Return the SP group size."""
+    global _DRAFT_SP_GROUP
+    if _DRAFT_SP_GROUP is None:
+        return 1
+    return dist.get_world_size(_DRAFT_SP_GROUP)
+
+
+def get_draft_dp_size():
+    """Return the number of DP groups."""
+    global _DRAFT_DP_GROUP
+    if _DRAFT_DP_GROUP is None:
+        return 1
+    return dist.get_world_size(_DRAFT_DP_GROUP)
+
+
 def init_distributed(
     timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
 ):
@@ -122,13 +154,126 @@ def init_distributed(
 
 def destroy_distributed():
     global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
+    if _TP_GROUP is not None:
+        dist.destroy_process_group(_TP_GROUP)
+    if _DP_GROUP is not None:
+        dist.destroy_process_group(_DP_GROUP)
+    if _SP_ULYSSES_GROUP is not None:
+        dist.destroy_process_group(_SP_ULYSSES_GROUP)
+    if _SP_RING_GROUP is not None:
+        dist.destroy_process_group(_SP_RING_GROUP)
+    if _DRAFT_DP_GROUP is not None:
+        dist.destroy_process_group(_DRAFT_DP_GROUP)
+    if _DRAFT_SP_GROUP is not None:
+        dist.destroy_process_group(_DRAFT_SP_GROUP)
     dist.destroy_process_group()
+
+
+def init_distributed_from_subgroup(
+    local_group: dist.ProcessGroup,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+) -> None:
+    """Initialize TP/DP/SP process groups from an existing subgroup.
+
+    Used in NCCL transfer mode where a global process group is
+    initialized first, and local (rollout / train) groups are created
+    as subgroups via ``dist.new_group()``.
+
+    This sets the same module-level globals as ``init_distributed()``
+    but derives them from *local_group* instead of the default group.
+
+    Args:
+        local_group:      A subgroup created by ``dist.new_group(ranks=...)``.
+        tp_size:          Tensor-parallel degree.
+        sp_ulysses_size:  Ulysses SP degree.
+        sp_ring_size:     Ring SP degree.
+    """
+    local_world_size = dist.get_world_size(local_group)
+    local_rank = dist.get_rank(local_group)
+    dp_size = local_world_size // tp_size
+
+    assert local_world_size == tp_size * dp_size, (
+        f"local world size must be divisible by tp size, "
+        f"now {local_world_size=}, {tp_size=}"
+    )
+
+    sp_size = sp_ulysses_size * sp_ring_size
+    assert local_world_size % sp_size == 0, (
+        f"local world size ({local_world_size}) must be divisible by "
+        f"SP size ({sp_size})"
+    )
+
+    # Get the global ranks that belong to this subgroup
+    global_rank = dist.get_rank()
+    global_world_size = dist.get_world_size()
+
+    # Collect all global ranks in this subgroup via all_gather
+    rank_tensor = torch.tensor([global_rank], dtype=torch.long, device="cuda")
+    gathered = [
+        torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(local_world_size)
+    ]
+    dist.all_gather(gathered, rank_tensor, group=local_group)
+    subgroup_global_ranks = sorted([t.item() for t in gathered])
+
+    # Build TP groups: ranks within each TP stripe
+    tp_groups = []
+    for dp_idx in range(dp_size):
+        tp_ranks = [subgroup_global_ranks[dp_idx * tp_size + t] for t in range(tp_size)]
+        tp_groups.append(dist.new_group(ranks=tp_ranks, use_local_synchronization=True))
+
+    # Build DP groups: ranks across TP stripes at same tp_rank
+    dp_groups = []
+    for tp_idx in range(tp_size):
+        dp_ranks = [subgroup_global_ranks[d * tp_size + tp_idx] for d in range(dp_size)]
+        dp_groups.append(dist.new_group(ranks=dp_ranks, use_local_synchronization=True))
+
+    # SP groups
+    draft_dp_size = local_world_size // sp_size
+    draft_dp_groups = []
+    draft_sp_groups = []
+    for ddp_idx in range(draft_dp_size):
+        sp_ranks = [
+            subgroup_global_ranks[ddp_idx * sp_size + s] for s in range(sp_size)
+        ]
+        draft_sp_groups.append(
+            dist.new_group(ranks=sp_ranks, use_local_synchronization=True)
+        )
+    for sp_idx in range(sp_size):
+        ddp_ranks = [
+            subgroup_global_ranks[d * sp_size + sp_idx] for d in range(draft_dp_size)
+        ]
+        draft_dp_groups.append(
+            dist.new_group(ranks=ddp_ranks, use_local_synchronization=True)
+        )
+
+    # Pick the groups this rank belongs to
+    tp_rank = local_rank % tp_size
+    dp_rank = local_rank // tp_size
+    sp_rank = local_rank % sp_size
+    draft_dp_rank = local_rank // sp_size
+
+    my_tp_group = tp_groups[dp_rank]
+    my_dp_group = dp_groups[tp_rank]
+    my_draft_dp_group = draft_dp_groups[sp_rank]
+    my_draft_sp_group = draft_sp_groups[draft_dp_rank]
+
+    # Set yunchang SP groups if SP is used
+    if sp_size > 1:
+        set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, local_rank, local_world_size)
+
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH
+    global _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    _TP_GROUP = my_tp_group
+    _DP_GROUP = my_dp_group
+    _DRAFT_DP_GROUP = my_draft_dp_group
+    _DRAFT_SP_GROUP = my_draft_sp_group
+    _SP_ULYSSES_GROUP = PROCESS_GROUP.ULYSSES_PG if sp_size > 1 else my_draft_sp_group
+    _SP_RING_GROUP = PROCESS_GROUP.RING_PG if sp_size > 1 else my_draft_sp_group
+    _TP_DEVICE_MESH = dist.DeviceMesh.from_group(my_tp_group, device_type="cuda")
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(my_dp_group, device_type="cuda")
+    _DEVICE_MESH = None  # 2D mesh not available in subgroup mode
 
 
 def shard_tensor(
