@@ -389,9 +389,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        eagle3_output = self.model_runner.forward(forward_batch)
-        if hasattr(eagle3_output, "logits_output"):
-            eagle3_output = eagle3_output.logits_output
+        eagle3_output = self.model_runner.forward(forward_batch).logits_output
         input_lens = [len(req.origin_input_ids) for req in reqs]
 
         logits = eagle3_output.logits
