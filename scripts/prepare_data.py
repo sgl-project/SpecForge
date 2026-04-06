@@ -188,10 +188,7 @@ def process_smoltalk_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int
         content = message["content"]
         assert role in ["user", "assistant"]
         formatted_conversations.append({"role": role, "content": content})
-    row_id = hashlib.md5(
-        "".join(m["content"] for m in conversations).encode()
-    ).hexdigest()
-    return {"id": row_id, "conversations": formatted_conversations}, 0
+    return {"id": row["id"], "conversations": formatted_conversations}, 0
 
 
 def process_sharegpt_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
@@ -603,7 +600,7 @@ def main():
         ds = ds.rename_column("uuid", "id")
         proc_fn = process_sharegpt_row
     elif args.dataset == "smoltalk-chinese":
-        ds = load_dataset("opencsg/smoltalk-chinese")["train"]
+        ds = load_dataset("zjxia/smoltalk-chinese")["train"]
         proc_fn = process_smoltalk_row
     elif args.dataset == "sharegpt4v":
         ds = load_dataset("Lin-Chen/ShareGPT4V", "ShareGPT4V")["train"]
