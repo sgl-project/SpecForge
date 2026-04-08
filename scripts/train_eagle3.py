@@ -991,6 +991,24 @@ def main():
                 # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
+            # ================================================
+            # 7.4 Periodic memory cleanup
+            # ================================================
+            # On systems with glibc (Linux), malloc arenas can retain large
+            # amounts of RSS even after Python objects are freed. Periodically
+            # calling gc.collect() + malloc_trim() keeps RSS in check and
+            # prevents OOM on memory-constrained nodes (e.g. GB200 NVL with
+            # large models and multiple processes per node).
+            if global_step % 10 == 0:
+                import gc
+                import ctypes
+
+                gc.collect()
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
