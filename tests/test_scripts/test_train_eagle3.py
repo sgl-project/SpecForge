@@ -1,5 +1,6 @@
 import shutil
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 from tests.utils import execute_shell_command
@@ -7,17 +8,30 @@ from tests.utils import execute_shell_command
 CACHE_DIR = Path(__file__).parent.parent.parent.joinpath("cache")
 
 
-def replace_in_script(script_path: Path, pattern: str, replacement: str):
+@contextmanager
+def replace_in_script(script_path: Path, *pattern_replacement_pairs):
+    assert len(pattern_replacement_pairs) % 2 == 0
     with open(script_path, "r") as f:
         script = f.readlines()
-    script = [line.replace(pattern, replacement) for line in script]
+    replaced_script = script
+    for pattern, replacement in zip(
+        pattern_replacement_pairs[::2], pattern_replacement_pairs[1::2]
+    ):
+        replaced_script = [
+            line.replace(pattern, replacement) for line in replaced_script
+        ]
+    with open(script_path, "w") as f:
+        for line in replaced_script:
+            f.write(line)
+
+    yield
+
     with open(script_path, "w") as f:
         for line in script:
             f.write(line)
 
 
 class TestTrainEagle3(unittest.TestCase):
-
     def setUp(self) -> None:
         # prepare data
         data_process = execute_shell_command(
@@ -64,15 +78,14 @@ class TestTrainEagle3(unittest.TestCase):
         script_path = Path(__file__).parent.parent.parent.joinpath(
             "examples", "run_llama3.1_8b_eagle3_online.sh"
         )
-        replace_in_script(
+        with replace_in_script(
             script_path, "--target-model-backend sglang", "--target-model-backend hf"
-        )
-
-        # run training
-        train_process = execute_shell_command(
-            "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
-        )
-        train_process.wait()
+        ):
+            # run training
+            train_process = execute_shell_command(
+                "bash examples/run_llama3.1_8b_eagle3_online.sh 2 2"
+            )
+            train_process.wait()
         self.assertEqual(train_process.returncode, 0)
 
     def test_online_train_eagle3_with_custom_backend(self):
@@ -80,45 +93,20 @@ class TestTrainEagle3(unittest.TestCase):
         script_path = Path(__file__).parent.parent.parent.joinpath(
             "examples", "run_llama3.1_8b_eagle3_online.sh"
         )
-        replace_in_script(
+        with replace_in_script(
             script_path,
             "--target-model-backend sglang",
             "--target-model-backend custom",
-        )
-
-        # run training
-        train_process = execute_shell_command(
-            "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
-        )
-        train_process.wait()
+        ):
+            # run training
+            train_process = execute_shell_command(
+                "bash examples/run_llama3.1_8b_eagle3_online.sh 2 2"
+            )
+            train_process.wait()
         self.assertEqual(train_process.returncode, 0)
 
     def test_offline_train_eagle3(self):
         # remove the hidden states if they exist
-        script_path = Path(__file__).parent.parent.parent.joinpath(
-            "examples", "run_llama3.1_8b_eagle3_offline.sh"
-        )
-        replace_in_script(
-            script_path,
-            "meta-llama/Llama-3.1-8B-Instruct",
-            "nreHieW/Llama-3.1-8B-Instruct",
-        )
-        replace_in_script(
-            script_path,
-            "--batch-size 32",
-            "--batch-size 5",
-        )
-        replace_in_script(
-            script_path,
-            "scripts/prepare_hidden_states.py",
-            "scripts/prepare_hidden_states.py --num-samples 10",
-        )
-        replace_in_script(
-            script_path,
-            "$ROOT_DIR/scripts/train_eagle3.py",
-            "$ROOT_DIR/scripts/train_eagle3.py --max-num-steps 2",
-        )
-
         hidden_states_path = Path(__file__).parent.parent.parent.joinpath(
             "cache", "hidden_states", "sharegpt_train_Llama-3.1-8B-Instruct"
         )
@@ -126,10 +114,24 @@ class TestTrainEagle3(unittest.TestCase):
             # delete the directory
             shutil.rmtree(hidden_states_path)
 
-        training_process = execute_shell_command(
-            "bash examples/run_llama3.1_8b_eagle3_offline.sh 2",
+        script_path = Path(__file__).parent.parent.parent.joinpath(
+            "examples", "run_llama3.1_8b_eagle3_offline.sh"
         )
-        training_process.wait()
+        with replace_in_script(
+            script_path,
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "nreHieW/Llama-3.1-8B-Instruct",
+            "--batch-size 32",
+            "--batch-size 5",
+            "scripts/prepare_hidden_states.py",
+            "scripts/prepare_hidden_states.py --num-samples 10",
+            "$ROOT_DIR/scripts/train_eagle3.py",
+            "$ROOT_DIR/scripts/train_eagle3.py --max-num-steps 2",
+        ):
+            training_process = execute_shell_command(
+                "bash examples/run_llama3.1_8b_eagle3_offline.sh 2",
+            )
+            training_process.wait()
         self.assertEqual(training_process.returncode, 0)
 
 
