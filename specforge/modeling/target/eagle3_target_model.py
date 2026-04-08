@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -37,6 +38,8 @@ from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,6 +83,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> Eagle3TargetOutput:
         """
         Generate the eagle3 data from the target model.
@@ -173,12 +177,16 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> Eagle3TargetOutput:
         """
         Optimized HF backend:
         Instead of returning all hidden states (memory heavy), we use forward hooks
         to capture only the specific layers required by Eagle3.
         """
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
         captured_states = {}
         handles = []
 
@@ -718,6 +726,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
         shard_returns: bool = False,
+        **kwargs,
     ) -> Eagle3TargetOutput:
         """
         return:
@@ -730,6 +739,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 - pixel_values: (patch_len, patch_width)
                 - image_grid_thw (batch_size, 3)
         """
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
         if is_vlm:
             data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
                 self.extend_vlm(
@@ -841,7 +853,11 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> Eagle3TargetOutput:
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
