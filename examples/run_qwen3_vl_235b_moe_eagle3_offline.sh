@@ -46,7 +46,7 @@ torchrun \
     --standalone \
     --nproc_per_node 1 \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path "$MODEL_NAME" \
+    --target-model-path "$MODEL_PATH" \
     --draft-model-config "$DRAFT_MODEL_CONFIG" \
     --train-data-path "$DATA_PATH" \
     --train-hidden-states-path "$HIDDEN_STATES_PATH" \
