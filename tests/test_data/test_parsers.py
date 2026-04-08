@@ -328,11 +328,7 @@ class TestTemplatePreprocessing(unittest.TestCase):
         )
 
     def test_qwen35_instruct(self):
-        self._run_template_test(
-            "Qwen/Qwen3.5-35B-A3B",
-            "qwen3.5",
-            messages=self.complete_reasoning_tool_conversation,
-        )
+        self._run_template_test("Qwen/Qwen3.5-35B-A3B", "qwen3.5")
 
 
 if __name__ == "__main__":

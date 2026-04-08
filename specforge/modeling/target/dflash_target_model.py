@@ -2,15 +2,28 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
 
+import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    init_mm_embedding_cache,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -56,6 +69,8 @@ class DFlashTargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[List[torch.Tensor]] = None,
     ) -> DFlashTargetOutput:
         """Generate context hidden states for DFlash training."""
 
@@ -68,6 +83,34 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
     def __init__(self, model_runner: SGLangRunner):
         super().__init__()
         self.model_runner = model_runner
+        self._init_vlm_attributes()
+        cache_params = CacheInitParams(
+            disable=True,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            page_size=self.model_runner.server_args.page_size,
+        )
+        self.dummy_tree_cache = RadixCache(cache_params)
+
+    def _init_vlm_attributes(self):
+        """Detect and cache VLM-specific token IDs / vision config from the HF config."""
+        hf_config = self.model_runner.model_config.hf_config
+        self.is_vlm = hasattr(hf_config, "vision_config")
+        if not self.is_vlm:
+            return
+
+        init_mm_embedding_cache(512 * 1024 * 1024)  # 512 MB embedding cache
+
+        self.image_token_id = getattr(hf_config, "image_token_id", None)
+        self.video_token_id = getattr(hf_config, "video_token_id", None)
+        self.vision_start_token_id = getattr(hf_config, "vision_start_token_id", None)
+        self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
+
+        vision_config = hf_config.vision_config
+        self.spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
+        self.vlm_model_type = getattr(vision_config, "model_type", "")
+
+        self.tokens_per_second = None
 
     @classmethod
     def from_pretrained(
@@ -85,7 +128,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             trust_remote_code=trust_remote_code,
             dtype=torch_dtype,
             enable_return_hidden_states=True,  # Critical for DFlash
-            disable_cuda_graph=True,
+            # disable_cuda_graph=True,
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -112,25 +155,20 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
+        if hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+            self.model_runner.model.set_dflash_layers_to_capture(
+                [val + 1 for val in layer_ids]
+            )
+        elif hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(self.model_runner.model.model.layers_to_capture)
 
-    @torch.no_grad
+    @torch.no_grad()
     def _extend(self, reqs):
-        cache_params = CacheInitParams(
-            disable=False,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-            page_size=self.model_runner.server_args.page_size,
-        )
-        tree_cache = RadixCache(cache_params)
-
         batch = ScheduleBatch.init_new(
             reqs=reqs,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
+            tree_cache=self.dummy_tree_cache,
             model_config=self.model_runner.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -180,42 +218,167 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
         return hidden_states_list
 
+    def _build_vlm_reqs(
+        self,
+        input_ids_list: List[torch.Tensor],
+        pixel_values: Optional[List[torch.Tensor]] = None,
+        image_grid_thw: Optional[List[torch.Tensor]] = None,
+    ):
+        mm_utils.embedding_cache.clear()
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
+        reqs = []
+
+        # pixel_values is a single 2D tensor (total_patches, patch_dim) for Qwen2.5-VL
+        # We need to track offset and slice it based on image_grid_thw for each sample
+        pixel_values_offset = 0  # Track current offset in pixel_values
+        for idx, (input_id_, image_grid_thw_) in enumerate(
+            zip(
+                input_ids_list,
+                image_grid_thw,
+            )
+        ):
+            input_id_flat = input_id_.view(-1)
+
+            # Determine if this sample has image data
+            has_image = (
+                image_grid_thw_ is not None
+                and isinstance(image_grid_thw_, torch.Tensor)
+                and image_grid_thw_.numel() > 0
+            )
+
+            if has_image:
+                # Ensure image_grid_thw_ is 2D: (num_images, 3)
+                if image_grid_thw_.dim() == 1:
+                    image_grid_thw_ = image_grid_thw_.unsqueeze(0)  # (3,) -> (1, 3)
+                elif image_grid_thw_.dim() == 0:
+                    raise ValueError(
+                        f"image_grid_thw_ is 0-dim tensor, expected at least 1D. Value: {image_grid_thw_}"
+                    )
+
+                # Calculate num_patches for this sample: sum(t * h * w) for all images
+                num_patches = (
+                    (
+                        image_grid_thw_[:, 0]
+                        * image_grid_thw_[:, 1]
+                        * image_grid_thw_[:, 2]
+                    )
+                    .sum()
+                    .item()
+                )
+                num_patches = int(num_patches)
+
+                # Slice pixel_values for this sample
+                pixel_value_ = pixel_values[
+                    pixel_values_offset : pixel_values_offset + num_patches
+                ]
+                pixel_values_offset += num_patches
+
+                # Compute mrope positions for VLM models (e.g., Qwen2.5-VL)
+                mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+                    spatial_merge_size=self.spatial_merge_size,
+                    image_token_id=self.image_token_id,
+                    video_token_id=self.video_token_id,
+                    vision_start_token_id=self.vision_start_token_id,
+                    model_type=self.vlm_model_type,
+                    input_ids=input_id_flat.unsqueeze(0),
+                    image_grid_thw=image_grid_thw_,
+                    tokens_per_second=self.tokens_per_second,
+                )
+
+                offset = BaseMultimodalProcessor.get_mm_items_offset(
+                    input_id_flat, self.image_token_id
+                )
+                mm_item = MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=pixel_value_,  # torch.Tensor: (num_patches, patch_dim)
+                    pad_value=self.image_token_id,  # Required for placeholder tensor creation
+                    offsets=offset,  # List of (start, end) tuples
+                )
+                mm_item.set("image_grid_thw", image_grid_thw_)
+                mm_item.set_pad_value()
+                mm_inputs = MultimodalInputs(
+                    mm_items=[mm_item],
+                    im_token_id=self.image_token_id,
+                    im_start_id=self.vision_start_token_id,
+                    im_end_id=self.vision_end_token_id,
+                    mrope_positions=(
+                        mrope_positions.squeeze(1)
+                        if mrope_positions is not None
+                        else None
+                    ),
+                    mrope_position_delta=mrope_position_delta,
+                )
+                pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+                input_id_list = pattern.pad_input_tokens(
+                    input_id_flat.tolist(), mm_inputs
+                )
+                req = Req(
+                    rid=str(idx),
+                    origin_input_text="",
+                    origin_input_ids=input_id_list,
+                    sampling_params=sampling_params,
+                )
+                req.fill_ids = req.origin_input_ids
+                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.multimodal_inputs = mm_inputs
+                reqs.append(req)
+            else:
+                # Text-only sample: create plain text req without multimodal inputs
+                req = Req(
+                    rid=str(idx),
+                    origin_input_text="",
+                    origin_input_ids=input_id_flat.tolist(),
+                    sampling_params=sampling_params,
+                )
+                req.fill_ids = req.origin_input_ids
+                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+                reqs.append(req)
+        return reqs
+
     @torch.no_grad()
     def generate_dflash_data(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
-        reqs, data_cache = [], []
 
         if isinstance(input_ids, torch.Tensor):
             input_ids_list = torch.split(input_ids, 1, dim=0)
             attn_mask_list = torch.split(attention_mask, 1, dim=0)
             loss_mask_list = torch.split(loss_mask, 1, dim=0)
 
-        for idx, (curr_ids, curr_attn, curr_loss) in enumerate(
-            zip(input_ids_list, attn_mask_list, loss_mask_list)
-        ):
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=curr_ids.view(-1).tolist(),
-                sampling_params=sampling_params,
-            )
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            data_cache.append((curr_ids, curr_attn, curr_loss))
-            reqs.append(req)
+        is_vlm_batch = (
+            self.is_vlm and pixel_values is not None and image_grid_thw is not None
+        )
+
+        if is_vlm_batch:
+            reqs = self._build_vlm_reqs(input_ids_list, pixel_values, image_grid_thw)
+        else:
+            sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
+            reqs = []
+            for idx, curr_ids in enumerate(input_ids_list):
+                req = Req(
+                    rid=str(idx),
+                    origin_input_text="",
+                    origin_input_ids=curr_ids.view(-1).tolist(),
+                    sampling_params=sampling_params,
+                )
+                req.fill_ids = req.origin_input_ids
+                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                reqs.append(req)
 
         hidden_states_list = self._extend(reqs)
 
         # Stack back to batch
         hidden_states = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
-        input_ids = torch.cat([d[0] for d in data_cache], dim=0)
-        attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
-        loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
+        input_ids = torch.cat(list(input_ids_list), dim=0)
+        attention_mask = torch.cat(list(attn_mask_list), dim=0)
+        loss_mask = torch.cat(list(loss_mask_list), dim=0)
 
         return DFlashTargetOutput(
             hidden_states=hidden_states,
@@ -261,13 +424,20 @@ class HFDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        pixel_values: Optional[List[torch.Tensor]] = None,
+        image_grid_thw: Optional[List[torch.Tensor]] = None,
     ) -> DFlashTargetOutput:
-        outputs = self.model(
+        model_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             use_cache=False,
         )
+        if pixel_values is not None:
+            model_kwargs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            model_kwargs["image_grid_thw"] = image_grid_thw
+        outputs = self.model(**model_kwargs)
 
         # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
         offset = 1
@@ -296,6 +466,8 @@ def get_dflash_target_model(
     **kwargs,
 ) -> DFlashTargetModel:
     if backend == "sglang":
+        if "enable_piecewise_cuda_graph" in kwargs:
+            del kwargs["enable_piecewise_cuda_graph"]
         return SGLangDFlashTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,

@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from accelerate import skip_first_batches
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
@@ -20,7 +21,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
@@ -34,6 +35,8 @@ from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+
+logging.getLogger("sglang.srt.mem_cache.memory_pool").setLevel(logging.WARNING)
 
 
 def parse_args():
@@ -94,6 +97,9 @@ def parse_args():
         default=None,
         help="LM head weight key in the target model. Default: 'lm_head.weight'.",
     )
+    model_group.add_argument("--is-vlm", action="store_true")
+    model_group.add_argument("--min-pixels", type=int, default=50176)
+    model_group.add_argument("--max-pixels", type=int, default=802816)
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -207,7 +213,16 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     return target_model, draft_model
 
 
-def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
+def _load_raw_dataset(data_path: str):
+    """load jsonl"""
+    if os.path.isdir(data_path):
+        return load_from_disk(data_path)
+    return load_dataset("json", data_files=data_path)["train"]
+
+
+def build_dataloader(
+    args, tokenizer, processor=None
+) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
 
@@ -219,7 +234,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    train_dataset = _load_raw_dataset(args.train_data_path)
     train_eagle3_dataset = build_eagle3_dataset(
         dataset=train_dataset,
         tokenizer=tokenizer,
@@ -229,8 +244,9 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
+        is_vlm=args.is_vlm,
+        processor=processor,
     )
-
     min_loss_tokens = 2 * args.block_size
     original_size = len(train_eagle3_dataset)
     train_eagle3_dataset = train_eagle3_dataset.filter(
@@ -246,24 +262,27 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
+        is_vlm=args.is_vlm,
     )
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+        eval_dataset = _load_raw_dataset(args.eval_data_path)
         eval_eagle3_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
+            is_vlm=args.is_vlm,
+            processor=processor,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            is_vlm=args.is_vlm,
         )
 
     return train_dataloader, eval_dataloader
@@ -272,9 +291,21 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
 def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
-    if dist.get_rank() == 0:
+    rank = dist.get_rank()
+
+    if rank == 0:
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
+
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": step,
+            "args": args,
+            **optimizer.state_dict(),
+        },
+        os.path.join(save_dir, f"training_state_rank_{rank}.pt"),
+    )
 
     with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
         state_dict = dflash_model.state_dict()
@@ -284,17 +315,7 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
             if "draft_model." in k
         }
 
-        if dist.get_rank() == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": step,
-                    "args": args,
-                    **optimizer.state_dict(),
-                },
-                os.path.join(save_dir, "training_state.pt"),
-            )
-
+        if rank == 0:
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
             modeling_src = os.path.join(
@@ -358,45 +379,70 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
-    draft_model_last_checkpoint = None
-    ckpt_info = (0, 0)
-    if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
-        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
-
-    # If resuming, load config from checkpoint to ensure consistency
-    if draft_model_last_checkpoint:
-        checkpoint_config_path = os.path.join(
-            draft_model_last_checkpoint, "config.json"
-        )
-        if os.path.exists(checkpoint_config_path):
-            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
-            args.draft_config_path = checkpoint_config_path
-
     target_model, draft_model = build_models(args)
 
+    draft_model_last_checkpoint = None
+    if args.ckpt_dir is not None:
+        if os.path.isdir(args.ckpt_dir):
+            draft_model_last_checkpoint = args.ckpt_dir
+            print_on_rank0(f"Using checkpoint: {draft_model_last_checkpoint}")
+        else:
+            raise ValueError(
+                f"Provided ckpt dir {args.ckpt_dir} is not a valid directory."
+            )
+
+    start_epoch = 0
+    global_step = 0
+    ckpt_info = None
+    if args.resume and os.path.isdir(args.output_dir):
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
+            args.output_dir, prefix="epoch_"
+        )
+        if ckpt_info:
+            start_epoch = ckpt_info[0]
+            global_step = ckpt_info[1]
+            print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
+    rank = dist.get_rank()
     resume_state = None
+
     if draft_model_last_checkpoint:
         loaded_model = DFlashDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
-        print("Loaded draft model weights from checkpoint")
+        print_on_rank0("Loaded draft model weights from checkpoint")
 
         training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+            draft_model_last_checkpoint, f"training_state_rank_{rank}.pt"
         )
+
         if os.path.exists(training_state_path):
             resume_state = torch.load(
                 training_state_path, map_location="cpu", weights_only=False
             )
-            print(
-                f"Will resume from epoch {resume_state['epoch']}, "
-                f"step {resume_state['global_step']}"
-            )
+            print(f"[Rank {rank}] Found and loading state from {training_state_path}")
+        else:
+            print(f"[Rank {rank}] Warning: {training_state_path} not found!")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
+
+    processor = None
+    if args.is_vlm:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            args.target_model_path,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+            trust_remote_code=args.trust_remote_code,
+        )
+        print_on_rank0(
+            f"Loaded VLM processor (min_pixels={args.min_pixels}, max_pixels={args.max_pixels})"
+        )
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
@@ -412,8 +458,7 @@ def main():
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
-
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer, processor)
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
@@ -449,9 +494,6 @@ def main():
     )
     print_with_rank("Initialized FSDP")
 
-    start_epoch = ckpt_info[0]
-    global_step = ckpt_info[1]
-
     optimizer = BF16Optimizer(
         draft_model,
         lr=args.learning_rate,
@@ -461,7 +503,7 @@ def main():
     )
 
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        optimizer.load_state_dict(resume_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
@@ -484,23 +526,57 @@ def main():
         train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
 
+        steps_to_skip_this_epoch = 0
+        if epoch == start_epoch and skip_steps > 0:
+            steps_to_skip_this_epoch = skip_steps
+            print_on_rank0(
+                f"Fast-forwarding DataLoader, skipping first {steps_to_skip_this_epoch} batches..."
+            )
+            active_dataloader = skip_first_batches(
+                train_dataloader, steps_to_skip_this_epoch
+            )
+            total_batches = len(train_dataloader) - steps_to_skip_this_epoch
+        else:
+            active_dataloader = train_dataloader
+            total_batches = len(train_dataloader)
+
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+                active_dataloader,
+                total=total_batches,
+                desc=f"Training Epoch {epoch}",
+                leave=True,
             )
         else:
-            progress_bar = train_dataloader
+            progress_bar = active_dataloader
 
-        for step_in_epoch, data in enumerate(progress_bar):
-            if epoch == start_epoch and step_in_epoch < skip_steps:
-                continue
+        for _, data in enumerate(progress_bar):
             global_step += 1
 
+            input_ids_cpu = data["input_ids"]
+            attention_mask_cpu = data["attention_mask"]
+            loss_mask_cpu = data["loss_mask"]
+
             input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
+            pixel_values = None
+            image_grid_thw_cpu = None
+            if (
+                args.is_vlm
+                and "pixel_values" in data
+                and data["pixel_values"] is not None
+            ):
+                pixel_values = data["pixel_values"].cuda()
+                image_grid_thw_cpu = [
+                    thw.squeeze() if thw is not None else None
+                    for thw in data["image_grid_thw"]
+                ]
             target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
+                input_ids_cpu,
+                attention_mask_cpu,
+                loss_mask_cpu,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw_cpu,
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
@@ -541,6 +617,7 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "lr": f"{optimizer.get_learning_rate():.2e}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

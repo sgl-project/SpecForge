@@ -202,8 +202,6 @@ def preprocess_vlm_conversations(
             - pixel_values: List of pixel values for images in the examples.
             - image_grid_thw: List of image grid tensors.
     """
-    system_prompt = chat_template.system_prompt
-
     # prepare result
     results = {
         "input_ids": [],
@@ -213,12 +211,51 @@ def preprocess_vlm_conversations(
         "image_grid_thw": [],
     }
 
-    # Note: currently, we assume that each example has only one image
-    for i, image in enumerate(examples["image"]):
+    for i, images in enumerate(examples["images"]):
         source = examples["conversations"][i]
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = []
         if not source:
             # if the source is None, skip it
+            continue
+
+        if not images:
+            text_messages = []
+            convroles = ["user", "assistant"]
+            for j, sentence in enumerate(source):
+                role = sentence["role"]
+                assert role == convroles[j % 2], f"unexpected role {role}"
+                text_messages.append({"role": role, "content": sentence["content"]})
+            conversation = processor.apply_chat_template(
+                text_messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            encoding = processor(
+                text=[conversation],
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+                add_special_tokens=False,
+            )
+
+            input_ids = encoding.input_ids[0]
+            offsets = encoding.offset_mapping[0]
+
+            # get conversation with image info for loss mask generation
+            decoded_conversation = processor.tokenizer.decode(
+                encoding.input_ids[0], skip_special_tokens=False
+            )
+
+            # Apply loss mask
+            loss_mask = _apply_loss_mask_from_chat_template(
+                decoded_conversation, offsets, chat_template
+            )
+            results["input_ids"].append(input_ids[None, :])
+            results["loss_mask"].append(loss_mask[None, :])
+            results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+            results["pixel_values"].append(torch.empty(0, 0).float())
+            results["image_grid_thw"].append([])
             continue
 
         if source[0]["role"] != "user":
@@ -226,23 +263,19 @@ def preprocess_vlm_conversations(
             source = source[1:]
 
         convroles = ["user", "assistant"]
+        has_added_images = False
         for j, sentence in enumerate(source):
             role = sentence["role"]
             assert role == convroles[j % 2], f"unexpected role {role}"
             if role == "user":
-                # if the message is from user and has image, process the image
-                messages.append(
-                    {
-                        "role": role,
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": image,
-                            },
-                            {"type": "text", "text": sentence["content"]},
-                        ],
-                    }
-                )
+                # Insert all images into the first user message
+                if not has_added_images:
+                    content = [{"type": "image", "image": img} for img in images]
+                    content.append({"type": "text", "text": sentence["content"]})
+                    messages.append({"role": role, "content": content})
+                    has_added_images = True
+                else:
+                    messages.append({"role": role, "content": sentence["content"]})
             else:
                 messages.append({"role": role, "content": sentence["content"]})
 
@@ -273,7 +306,7 @@ def preprocess_vlm_conversations(
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
         pixel_values = encoding.pixel_values
-        image_grid_thw = encoding.image_grid_thw[0]
+        image_grid_thw = encoding.image_grid_thw  # shape: (num_images, 3)
 
         # get conversation with image info for loss mask generation
         decoded_conversation = processor.tokenizer.decode(
@@ -289,7 +322,7 @@ def preprocess_vlm_conversations(
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
         results["pixel_values"].append(pixel_values)
-        results["image_grid_thw"].append(image_grid_thw[None, :])
+        results["image_grid_thw"].append(image_grid_thw)
     return results
 
 
@@ -390,7 +423,7 @@ def build_eagle3_dataset(
                 # Parse tools: handle JSON strings from safe_conversations_generator
                 tools = []
                 for tool_item in tools_raw:
-                    if isinstance(tool_item, (str, list)):
+                    if isinstance(tool_item, str):
                         try:
                             tools.append(json.loads(tool_item))
                         except json.JSONDecodeError:
