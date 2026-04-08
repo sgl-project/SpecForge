@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from accelerate import skip_first_batches
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
@@ -281,7 +282,6 @@ def build_dataloader(
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
             is_vlm=args.is_vlm,
         )
 
@@ -291,9 +291,21 @@ def build_dataloader(
 def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
-    if dist.get_rank() == 0:
+    rank = dist.get_rank()
+
+    if rank == 0:
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
+
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": step,
+            "args": args,
+            **optimizer.state_dict(),
+        },
+        os.path.join(save_dir, f"training_state_rank_{rank}.pt"),
+    )
 
     with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
         state_dict = dflash_model.state_dict()
@@ -303,17 +315,7 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
             if "draft_model." in k
         }
 
-        if dist.get_rank() == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": step,
-                    "args": args,
-                    **optimizer.state_dict(),
-                },
-                os.path.join(save_dir, "training_state.pt"),
-            )
-
+        if rank == 0:
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
             modeling_src = os.path.join(
@@ -377,43 +379,52 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
-    draft_model_last_checkpoint = None
-    ckpt_info = (0, 0)
-    if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
-        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
-
-    # If resuming, load config from checkpoint to ensure consistency
-    if draft_model_last_checkpoint:
-        checkpoint_config_path = os.path.join(
-            draft_model_last_checkpoint, "config.json"
-        )
-        if os.path.exists(checkpoint_config_path):
-            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
-            args.draft_config_path = checkpoint_config_path
-
     target_model, draft_model = build_models(args)
 
+    draft_model_last_checkpoint = None
+    if args.ckpt_dir is not None:
+        if os.path.isdir(args.ckpt_dir):
+            draft_model_last_checkpoint = args.ckpt_dir
+            print_on_rank0(f"Using checkpoint: {draft_model_last_checkpoint}")
+        else:
+            raise ValueError(
+                f"Provided ckpt dir {args.ckpt_dir} is not a valid directory."
+            )
+
+    start_epoch = 0
+    global_step = 0
+    ckpt_info = None
+    if args.resume and os.path.isdir(args.output_dir):
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(
+            args.output_dir, prefix="epoch_"
+        )
+        if ckpt_info:
+            start_epoch = ckpt_info[0]
+            global_step = ckpt_info[1]
+            print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
+    rank = dist.get_rank()
     resume_state = None
+
     if draft_model_last_checkpoint:
         loaded_model = DFlashDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
-        print("Loaded draft model weights from checkpoint")
+        print_on_rank0("Loaded draft model weights from checkpoint")
 
         training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+            draft_model_last_checkpoint, f"training_state_rank_{rank}.pt"
         )
+
         if os.path.exists(training_state_path):
             resume_state = torch.load(
                 training_state_path, map_location="cpu", weights_only=False
             )
-            print(
-                f"Will resume from epoch {resume_state['epoch']}, "
-                f"step {resume_state['global_step']}"
-            )
+            print(f"[Rank {rank}] Found and loading state from {training_state_path}")
+        else:
+            print(f"[Rank {rank}] Warning: {training_state_path} not found!")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
@@ -483,9 +494,6 @@ def main():
     )
     print_with_rank("Initialized FSDP")
 
-    start_epoch = ckpt_info[0]
-    global_step = ckpt_info[1]
-
     optimizer = BF16Optimizer(
         draft_model,
         lr=args.learning_rate,
@@ -495,7 +503,7 @@ def main():
     )
 
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        optimizer.load_state_dict(resume_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
@@ -518,16 +526,31 @@ def main():
         train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
 
+        steps_to_skip_this_epoch = 0
+        if epoch == start_epoch and skip_steps > 0:
+            steps_to_skip_this_epoch = skip_steps
+            print_on_rank0(
+                f"Fast-forwarding DataLoader, skipping first {steps_to_skip_this_epoch} batches..."
+            )
+            active_dataloader = skip_first_batches(
+                train_dataloader, steps_to_skip_this_epoch
+            )
+            total_batches = len(train_dataloader) - steps_to_skip_this_epoch
+        else:
+            active_dataloader = train_dataloader
+            total_batches = len(train_dataloader)
+
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+                active_dataloader,
+                total=total_batches,
+                desc=f"Training Epoch {epoch}",
+                leave=True,
             )
         else:
-            progress_bar = train_dataloader
+            progress_bar = active_dataloader
 
-        for step_in_epoch, data in enumerate(progress_bar):
-            if epoch == start_epoch and step_in_epoch < skip_steps:
-                continue
+        for _, data in enumerate(progress_bar):
             global_step += 1
 
             input_ids_cpu = data["input_ids"]
@@ -594,6 +617,7 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "lr": f"{optimizer.get_learning_rate():.2e}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )
