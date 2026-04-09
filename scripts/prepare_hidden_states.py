@@ -191,7 +191,9 @@ def build_target_model(
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
         if hasattr(model_config, "dtype") and model_config.dtype is not None:
             torch_dtype = model_config.dtype
-        elif hasattr(model_config, "text_config") and hasattr(model_config.text_config, "dtype"):
+        elif hasattr(model_config, "text_config") and hasattr(
+            model_config.text_config, "dtype"
+        ):
             torch_dtype = model_config.text_config.dtype
         else:
             torch_dtype = getattr(model_config, "torch_dtype", "bfloat16")
@@ -493,8 +495,8 @@ class HiddenStatesGenerator:
                 "attention_mask": batch["attention_mask"][valid_indices_in_batch],
                 "loss_mask": batch["loss_mask"][valid_indices_in_batch],
             }
-            pixel_values=batch["pixel_values"][valid_indices_in_batch]
-            image_grid_thw=batch["image_grid_thw"][valid_indices_in_batch]
+            pixel_values = batch["pixel_values"][valid_indices_in_batch]
+            image_grid_thw = batch["image_grid_thw"][valid_indices_in_batch]
             del batch
             if num_valid == 0:
                 # Data has already been generated, no sample processing, update progress bar.
