@@ -734,7 +734,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         if has_logits:
             B = len(logits_list)
             T, V = logits_list[0].shape[-2], logits_list[0].shape[-1]
-            target_out = torch.empty(B, T, V, device=logits_list[0].device, dtype=logits_list[0].dtype)
+            target_out = torch.empty(
+                B, T, V, device=logits_list[0].device, dtype=logits_list[0].dtype
+            )
 
         for idx, (data, logits, aux_hidden_states, last_hidden_states) in enumerate(
             zip(
