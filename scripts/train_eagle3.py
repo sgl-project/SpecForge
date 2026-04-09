@@ -90,6 +90,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
     model_group.add_argument(
+        "--shard-target-output",
+        action=argparse.BooleanOptionalAction,
+        help="Whether the target model output is sharded across batch dimension",
+        dest="shard_target_output",
+    )
+    model_group.add_argument(
         "--target-model-backend",
         type=str,
         default="sglang",
@@ -341,6 +347,11 @@ def sanity_check(args: Namespace) -> None:
     args.target_batch_size = args.tp_size * args.batch_size
     if args.attention_backend == "usp":
         sp_sanity_check(args)
+    if args.shard_target_output:
+        if args.target_model_backend != "sglang":
+            raise ValueError("shard_target_output is only supported for sglang backend")
+        if args.is_vlm:
+            raise ValueError("shard_target_output is only supported non vlm model")
 
 
 def sp_sanity_check(args: Namespace) -> None:
@@ -632,13 +643,24 @@ def run_forward(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
+                    shard_returns=args.shard_target_output,
                 )
 
-            input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
-            attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
-            loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-            target = get_dp_data_shard_from_tp(eagle3_data.target)
-            hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            input_ids = get_dp_data_shard_from_tp(
+                eagle3_data.input_ids, args.shard_target_output
+            )
+            attention_mask = get_dp_data_shard_from_tp(
+                eagle3_data.attention_mask, args.shard_target_output
+            )
+            loss_mask = get_dp_data_shard_from_tp(
+                eagle3_data.loss_mask, args.shard_target_output
+            )
+            target = get_dp_data_shard_from_tp(
+                eagle3_data.target, args.shard_target_output
+            )
+            hidden_states = get_dp_data_shard_from_tp(
+                eagle3_data.hidden_states, args.shard_target_output
+            )
         else:
             # we generate the logits using the hidden states loaded from disk
             attention_mask = data["attention_mask"].cuda()
@@ -716,10 +738,14 @@ def record_metrcs(
     tracker.log(logdict, step=global_step)
 
 
-def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
+def get_dp_data_shard_from_tp(
+    tensor: torch.Tensor, sharded: bool = False
+) -> torch.Tensor:
     """
     Get the data shard from the tensor.
     """
+    if sharded:
+        return tensor
     tp_size = dist.get_world_size(get_tp_group())
     tp_rank = dist.get_rank(get_tp_group())
     return tensor.chunk(tp_size, dim=0)[tp_rank]
