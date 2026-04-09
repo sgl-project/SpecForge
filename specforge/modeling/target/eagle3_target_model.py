@@ -723,10 +723,18 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 )
             )
         aux_hidden_states_out = []
-        target_out = []
         loss_mask_out = []
         input_ids_out = []
         last_hidden_states_out = []
+
+        # Pre-allocate target_out to avoid the 2x peak memory from list+cat+padding.
+        # All sequences in a batch share the same padded length (from the DataLoader),
+        # so we can write each sequence's padded logits directly into the output tensor.
+        has_logits = logits_list[0] is not None
+        if has_logits:
+            B = len(logits_list)
+            T, V = logits_list[0].shape[-2], logits_list[0].shape[-1]
+            target_out = torch.empty(B, T, V, device=logits_list[0].device, dtype=logits_list[0].dtype)
 
         for idx, (data, logits, aux_hidden_states, last_hidden_states) in enumerate(
             zip(
@@ -739,10 +747,10 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
             # when generating hidden states for offline training, we don't compute logits and only keep the last_hidden_states
             # when training online, we don't keep the last_hidden_states and only keep the logits
-            if logits is not None:
-                target_out.append(logits.unsqueeze(0))
-            else:
-                target_out.append(None)
+            if has_logits:
+                # Write shifted logits directly into pre-allocated tensor (no extra copy)
+                target_out[idx, :-1] = logits[..., 1:, :]
+                target_out[idx, -1] = 0
 
             if last_hidden_states is not None:
                 last_hidden_states_out.append(last_hidden_states.unsqueeze(0))
@@ -754,9 +762,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         loss_mask_out = torch.cat(loss_mask_out, dim=0)
         input_ids_out = torch.cat(input_ids_out, dim=0)
 
-        if target_out[0] is not None:
-            target_out = torch.cat(target_out, dim=0)
-        else:
+        if not has_logits:
             target_out = None
 
         if last_hidden_states_out[0] is not None:
@@ -764,7 +770,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             last_hidden_states_out = None
 
-        target_out = padding(target_out, left=False)
         input_ids_out = padding(input_ids_out, left=False)
         loss_mask_out = loss_mask_out[..., None]
 
