@@ -218,7 +218,7 @@ def preprocess_vlm_conversations(
         source = examples["conversations"][i]
         if source[0]["role"] == "system":
             messages = [{"role": "system", "content": source[0]["content"]}]
-            source = source[1:]  
+            source = source[1:]
         else:
             messages = [{"role": "system", "content": system_prompt}]
         if not source:
@@ -537,7 +537,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["target"] = target
         new_data["hidden_state"] = hidden_state
         new_data["input_ids"] = input_ids
-    
+
         if "pixel_values" in data:
             new_data["pixel_values"] = data["pixel_values"]
         if "image_grid_thw" in data:
