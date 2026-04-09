@@ -216,7 +216,11 @@ def preprocess_vlm_conversations(
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         source = examples["conversations"][i]
-        messages = [{"role": "system", "content": system_prompt}]
+        if source[0]["role"] == "system":
+            messages = [{"role": "system", "content": source[0]["content"]}]
+            source = source[1:]
+        else:
+            messages = [{"role": "system", "content": system_prompt}]
         if not source:
             # if the source is None, skip it
             continue
@@ -533,6 +537,12 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["target"] = target
         new_data["hidden_state"] = hidden_state
         new_data["input_ids"] = input_ids
+
+        if "pixel_values" in data:
+            new_data["pixel_values"] = data["pixel_values"]
+        if "image_grid_thw" in data:
+            new_data["image_grid_thw"] = data["image_grid_thw"]
+
         if transform:
             new_data = transform(new_data)
         return new_data
