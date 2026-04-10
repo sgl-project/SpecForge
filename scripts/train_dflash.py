@@ -610,7 +610,7 @@ def main():
             f"Detected VLM target config (model_type={getattr(target_config, 'model_type', None)}); "
             "enabling VLM mode automatically."
         )
-    if is_vlm and args.target_model_backend != "hf":
+    if is_vlm and not args.text_only and args.target_model_backend != "hf":
         raise ValueError(
             "Real multimodal DFlash training currently supports only HF backend. "
             "Please set --target-model-backend hf."
