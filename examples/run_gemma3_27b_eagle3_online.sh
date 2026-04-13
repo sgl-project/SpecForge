@@ -3,22 +3,22 @@ ROOT_DIR=$(dirname $SCRIPT_DIR)
 export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # train eagle3 for gemma3-1b
-NUM_GPUS=${1:-1}
-TP_SIZE=${2:-1}
+NUM_GPUS=${1:-8}
+TP_SIZE=${2:-8}
 
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path google/gemma-3-1b-it \
-    --draft-model-config $ROOT_DIR/configs/gemma3-1b-eagle3.json \
+    --target-model-path google/gemma-3-27b-it \
+    --draft-model-config $ROOT_DIR/configs/gemma3-27b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/ultrachat_train.jsonl \
-    --output-dir $ROOT_DIR/outputs/gemma3-1b-eagle3-sharegpt \
+    --output-dir $ROOT_DIR/outputs/gemma3-27b-eagle3-ultrachat \
     --num-epochs 10 \
-    --batch-size 1 \
+    --batch-size 2 \
     --tp-size $TP_SIZE \
     --learning-rate 1e-4 \
-    --max-length 4096 \
+    --max-length 2048 \
     --chat-template gemma \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
@@ -26,4 +26,5 @@ torchrun \
     --log-interval 500 \
     --eval-interval 2500 \
     --save-interval 60000 \
-    --report-to tensorboard
+    --report-to tensorboard \
+    --embedding-key=language_model.model.embed_tokens.weight
