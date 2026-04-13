@@ -47,6 +47,7 @@ def parse_args():
             "perfectblend-llama4-scout-instruct",
             "perfectblend-llama4-maverick-instruct",
             "magpie-qwen2.5-pro-1m-v0.1",
+            "smoltalk-chinese",
             "sharegpt4v",
             "allava4v",
             "opc",
@@ -165,6 +166,31 @@ def process_ultrachat_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, in
         formatted_conversations.append({"role": role, "content": content})
     row = {"id": row["prompt_id"], "conversations": formatted_conversations}
     return row, 0
+
+
+def process_smoltalk_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row from the opencsg/smoltalk-chinese dataset.
+
+    The function expects a row with the following schema:
+    {
+        "conversations": [
+            {
+                "role": "user" | "assistant",
+                "content": str
+            }
+        ]
+    }
+    """
+    conversations = row[
+        "conversations"
+    ]  # smoltalk uses "conversations", not "messages"
+    formatted_conversations = []
+    for message in conversations:
+        role = message["role"]  # already "user" or "assistant" — no mapping needed
+        content = message["content"]
+        assert role in ["user", "assistant"]
+        formatted_conversations.append({"role": role, "content": content})
+    return {"id": row["id"], "conversations": formatted_conversations}, 0
 
 
 def process_sharegpt_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
@@ -575,6 +601,9 @@ def main():
         ds = load_dataset("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")["train"]
         ds = ds.rename_column("uuid", "id")
         proc_fn = process_sharegpt_row
+    elif args.dataset == "smoltalk-chinese":
+        ds = load_dataset("zjxia/smoltalk-chinese")["train"]
+        proc_fn = process_smoltalk_row
     elif args.dataset == "sharegpt4v":
         ds = load_dataset("Lin-Chen/ShareGPT4V", "ShareGPT4V")["train"]
         raise Exception("Not supported sharegpt4v now")

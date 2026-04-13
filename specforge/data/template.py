@@ -130,6 +130,18 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="step3.5",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="phi3",
     template=ChatTemplate(
         assistant_header="<|assistant|>\n",
