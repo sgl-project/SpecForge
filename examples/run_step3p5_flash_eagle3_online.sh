@@ -15,7 +15,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path stepfun-ai/Step-3.5-Flash \
     --draft-model-config configs/step-3.5-flash-eagle3.json \
-    --train-data-path cache/dataset/ultrachat_train_regen.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/ultrachat_train_regen.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/step-3.5-flash-eagle3-ultrachat-regen-online \
     --tp-size $TP_SIZE \
