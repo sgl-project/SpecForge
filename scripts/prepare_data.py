@@ -181,7 +181,9 @@ def process_smoltalk_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int
         ]
     }
     """
-    conversations = row["conversations"]  # smoltalk uses "conversations", not "messages"
+    conversations = row[
+        "conversations"
+    ]  # smoltalk uses "conversations", not "messages"
     formatted_conversations = []
     for message in conversations:
         role = message["role"]  # already "user" or "assistant" — no mapping needed
