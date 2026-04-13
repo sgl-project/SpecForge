@@ -36,7 +36,8 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssRMSNorm
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
-from transformers.utils.generic import check_model_inputs
+from transformers.utils.generic import merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
 
 from specforge.distributed import get_tp_group, shard_tensor
 from specforge.layers import (
@@ -585,7 +586,8 @@ class GptOssModel(GptOssPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @merge_with_config_defaults
+    @capture_outputs
     @auto_docstring
     def forward(
         self,
