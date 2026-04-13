@@ -404,7 +404,7 @@ def safe_conversations_generator(file_path):
                             result["tools"] = tools
                     else:
                         result["tools"] = []
-                
+
                 # preserve image - required in preprocess_vlm_conversations for vlm
                 if "image" in row:
                     result["image"] = row["image"]
