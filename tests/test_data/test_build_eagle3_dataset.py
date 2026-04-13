@@ -194,6 +194,26 @@ class TestBuildEagle3Dataset(unittest.TestCase):
             assistant_indices = torch.where(loss_mask == 1)[0]
             self.assertTrue(len(assistant_indices) > 0, "No assistant tokens found")
 
+    def test_vlm_image_field_preserved(self):
+        """Regression test - preprocess_vlm_conversations relies on 'image'
+        field being preserved when the dataset is built with build_eagle3_dataset."""
+        data_file = os.path.join(
+            os.path.dirname(__file__), "data", "vlm_conversation.jsonl"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset = Dataset.from_generator(
+                generator=safe_conversations_generator,
+                gen_kwargs={"file_path": data_file},
+                cache_dir=tmp_dir,
+                keep_in_memory=True,
+            )
+            self.assertIn(
+                "image",
+                dataset.column_names,
+                "image column missing from dataset — results in KeyError in preprocess_vlm_conversations",
+            )
+            self.assertEqual(dataset[0]["image"], "/data/images/test.jpg")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
