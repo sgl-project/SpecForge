@@ -23,8 +23,8 @@ torchrun \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
     --target-model-backend hf \
-    --log-interval 500 \
-    --eval-interval 2500 \
-    --save-interval 60000 \
+    --log-interval 100 \
+    --eval-interval 500 \
+    --save-interval 10000 \
     --report-to tensorboard \
     --embedding-key=language_model.model.embed_tokens.weight
