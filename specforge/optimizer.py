@@ -26,9 +26,13 @@ class BF16Optimizer:
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
+        # self.optimizer = torch.optim.AdamW(
+        #     self.fp32_params, lr=lr, weight_decay=weight_decay
+        # )
         self.optimizer = torch.optim.AdamW(
-            self.fp32_params, lr=lr, weight_decay=weight_decay
+            self.fp32_params, lr=lr, weight_decay=weight_decay,betas=(0.9, 0.95)
         )
+    
         self.scheduler = CosineAnnealingWarmupLR(
             self.optimizer,
             total_steps=total_steps,
