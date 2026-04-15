@@ -925,9 +925,9 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
-        assert (
-            flash_attn_func is not None
-        ), "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        assert flash_attn_func is not None, (
+            "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        )
         attn_output, lse, _ = flash_attn_func(
             query_states,
             k0,
@@ -981,9 +981,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
 
     def __init__(self, config):
         super().__init__(config)
-        assert (
-            dist.is_initialized()
-        ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        assert dist.is_initialized(), (
+            f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        )
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             raise NotImplementedError(
                 f"LlamaMutiRotaryEmbedding is currently not supported for LlamaUSPFlashAttention."
@@ -1008,7 +1008,6 @@ class LlamaUSPFlashAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
 
@@ -1099,9 +1098,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
         else:
             acc_lse = lse_ring
 
-        assert (
-            acc_lse.shape[1] == current_q_len
-        ), f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
+        assert acc_lse.shape[1] == current_q_len, (
+            f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
+        )
 
         acc_out = out_ring
 
@@ -1311,7 +1310,6 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
-
     config_class = LlamaConfig
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
@@ -1339,6 +1337,17 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
+
+        # Embedding scale factor for target models that use scaled embeddings
+        # (e.g., Gemma3/Gemma4 multiply by hidden_size**0.5).  Set via config
+        # field ``embed_scale`` or auto-detected from ``target_model_type``.
+        target_type = getattr(config, "target_model_type", None) or ""
+        if getattr(config, "embed_scale", None) is not None:
+            self.embed_scale = config.embed_scale
+        elif "gemma" in target_type:
+            self.embed_scale = config.hidden_size**0.5
+        else:
+            self.embed_scale = 1.0
 
         # create vocab buffers
         t2d = torch.ones(self.vocab_size, dtype=torch.bool)
@@ -1403,7 +1412,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        embeds = self.embed_tokens(input_ids)
+        if self.embed_scale != 1.0:
+            embeds = embeds * self.embed_scale
+        return embeds
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers

@@ -3,6 +3,7 @@ import hashlib
 import math
 import os
 import time
+from datetime import datetime
 from argparse import ArgumentParser, Namespace
 from typing import List, Optional, Tuple, Union
 
@@ -103,6 +104,13 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument(
+        "--eval-holdout-ratio",
+        type=float,
+        default=None,
+        help="Fraction of the training dataset to hold out for evaluation (0 to 1). "
+        "Mutually exclusive with --eval-data-path and --eval-hidden-states-path.",
+    )
     dataset_group.add_argument("--chat-template", type=str, default="llama3")
     dataset_group.add_argument(
         "--is-preformatted",
@@ -339,6 +347,19 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+
+    if args.eval_holdout_ratio is not None:
+        if not (0 < args.eval_holdout_ratio < 1):
+            raise ValueError(
+                f"--eval-holdout-ratio must be between 0 and 1 (exclusive), "
+                f"got {args.eval_holdout_ratio}"
+            )
+        if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
+            raise ValueError(
+                "--eval-holdout-ratio is mutually exclusive with "
+                "--eval-data-path and --eval-hidden-states-path"
+            )
+
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -347,9 +368,9 @@ def sp_sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
-    assert (
-        args.batch_size == 1
-    ), f"USP only supports batch_size=1, got batch_size={args.batch_size}"
+    assert args.batch_size == 1, (
+        f"USP only supports batch_size=1, got batch_size={args.batch_size}"
+    )
 
     assert args.sp_ring_size * args.sp_ulysses_size > 1, (
         f"USP requires sp_ring_size * sp_ulysses_size > 1. "
@@ -491,6 +512,21 @@ def build_dataloaders(
                 use_usp_preprocess=(args.attention_backend == "usp"),
             )
 
+    # Split a holdout portion from the training set if requested.
+    eval_eagle3_dataset_from_holdout = None
+    if args.eval_holdout_ratio is not None and args.eval_holdout_ratio > 0:
+        split = train_eagle3_dataset.train_test_split(
+            test_size=args.eval_holdout_ratio,
+            seed=args.seed,
+        )
+        train_eagle3_dataset = split["train"]
+        eval_eagle3_dataset_from_holdout = split["test"]
+        print_on_rank0(
+            f"Holdout split: {len(train_eagle3_dataset)} train, "
+            f"{len(eval_eagle3_dataset_from_holdout)} eval "
+            f"(ratio={args.eval_holdout_ratio})"
+        )
+
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
@@ -503,7 +539,13 @@ def build_dataloaders(
         ),
         is_vlm=args.is_vlm,
     )
-    if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
+
+    has_eval = (
+        args.eval_data_path is not None
+        or args.eval_hidden_states_path is not None
+        or eval_eagle3_dataset_from_holdout is not None
+    )
+    if has_eval:
         if args.eval_data_path is not None:
             eval_dataset = Dataset.from_generator(
                 generator=safe_conversations_generator,
@@ -527,6 +569,8 @@ def build_dataloaders(
                 ttt_length=args.ttt_length,
                 use_usp_preprocess=(args.attention_backend == "usp"),
             )
+        else:
+            eval_eagle3_dataset = eval_eagle3_dataset_from_holdout
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.target_batch_size,
@@ -742,6 +786,16 @@ def main():
     )
 
     sanity_check(args)
+
+    # Create a datetime subfolder for this run (skip when resuming into an
+    # existing output directory so that checkpoints stay in the same place).
+    if not args.resume:
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_dir = os.path.join(args.output_dir, run_timestamp)
+    if dist.get_rank() == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+    dist.barrier()
+
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
@@ -946,10 +1000,7 @@ def main():
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
-            should_evaluate = (
-                args.eval_data_path is not None
-                or args.eval_hidden_states_path is not None
-            )
+            should_evaluate = eval_dataloader is not None
             if (
                 should_evaluate
                 and global_step % (args.eval_interval * args.draft_accumulation_steps)
