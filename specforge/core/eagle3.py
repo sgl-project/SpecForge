@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import LogSoftmaxLoss, _compute_loss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -92,7 +92,12 @@ class OnlineEagle3Model(Eagle3Model):
             )
             acc = local_correct / local_denom
 
-        loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        try:
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        except RuntimeError:
+            # Fused Triton kernel has a block-size ceiling (131072); fall back
+            # to the @torch.compile reference for large-vocab models.
+            loss = _compute_loss(logits, target_p, position_mask)
         loss = adapter.reduce_loss(loss)
         return acc, loss
 
@@ -553,7 +558,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            try:
+                loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            except RuntimeError:
+                # Fused Triton kernel has a block-size ceiling (131072); fall
+                # back to the @torch.compile reference for large-vocab models.
+                loss = _compute_loss(logits, target_p, position_mask)
             plosses.append(loss)
 
             if not is_last:
