@@ -28,8 +28,12 @@ try:
     from flash_attn import flash_attn_varlen_func as _std_flash_attn_varlen_func
     from flash_attn.bert_padding import pad_input as _std_flash_pad_input
     from flash_attn.bert_padding import unpad_input as _std_flash_unpad_input
-    from flash_attn.flash_attn_interface import _flash_attn_backward as _std_flash_attn_backward
-    from flash_attn.flash_attn_interface import _flash_attn_forward as _std_flash_attn_forward
+    from flash_attn.flash_attn_interface import (
+        _flash_attn_backward as _std_flash_attn_backward,
+    )
+    from flash_attn.flash_attn_interface import (
+        _flash_attn_forward as _std_flash_attn_forward,
+    )
     from flash_attn.flash_attn_interface import (
         _flash_attn_varlen_backward as _std_flash_attn_varlen_backward,
     )
@@ -987,9 +991,12 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
         num_kv_heads = cache_k.shape[3]
         num_groups = num_heads // num_kv_heads
         q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
-        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long).clamp_(0, q_len)
+        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long).clamp_(
+            0, q_len
+        )
         valid_mask = (
-            torch.arange(q_len, device=q.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+            torch.arange(q_len, device=q.device).unsqueeze(0)
+            < valid_lengths.unsqueeze(1)
         ).view(bsz, q_len, 1, 1)
         attention_mask = valid_mask.view(bsz, q_len)
 
@@ -1003,9 +1010,15 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
             softmax_scale=softmax_scale,
             causal=True,
         )
-        out0_expanded = out0.view(bsz, q_len, num_kv_heads, num_groups, head_dim).float()
+        out0_expanded = out0.view(
+            bsz, q_len, num_kv_heads, num_groups, head_dim
+        ).float()
         neg_inf = torch.tensor(float("-inf"), device=q.device, dtype=torch.float32)
-        lse0 = lse0_kernel.transpose(1, 2).view(bsz, q_len, num_kv_heads, num_groups).float()
+        lse0 = (
+            lse0_kernel.transpose(1, 2)
+            .view(bsz, q_len, num_kv_heads, num_groups)
+            .float()
+        )
         lse0 = torch.where(valid_mask, lse0, neg_inf)
         lse_terms = [lse0]
         attn_terms = [out0_expanded]
@@ -1039,12 +1052,15 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
             grad_out = grad_out.view(bsz, q_len, num_heads, head_dim)
         valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long)
         valid_mask = (
-            torch.arange(q_len, device=q.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+            torch.arange(q_len, device=q.device).unsqueeze(0)
+            < valid_lengths.unsqueeze(1)
         ).view(bsz, q_len, 1, 1)
         attention_mask = valid_mask.view(bsz, q_len)
         grad_out = torch.where(valid_mask, grad_out, 0.0)
 
-        grad_out_f = grad_out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        grad_out_f = grad_out.float().view(
+            bsz, q_len, num_kv_heads, num_groups, head_dim
+        )
         q_f = q.float()
         q_expanded = q_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
         out_f = out.float()
@@ -1058,7 +1074,9 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
         dq0 = torch.zeros_like(q)
         dk0 = torch.zeros_like(cache_k[:, 0])
         dv0 = torch.zeros_like(cache_v[:, 0])
-        merged_lse_kernel = merged_lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+        merged_lse_kernel = (
+            merged_lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+        )
         _standard_flash_attn_varlen_backward_call(
             grad_out.contiguous(),
             q.contiguous(),
@@ -1083,7 +1101,9 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
             lse_i = (q_expanded * ki).sum(-1) * scale
             wi = torch.where(valid_mask, torch.exp(lse_i - merged_lse), 0.0)
             d_out_i = grad_out_f * wi.unsqueeze(-1)
-            d_lse_i = wi * (grad_out_f * (vi.expand_as(out_expanded) - out_expanded)).sum(-1)
+            d_lse_i = wi * (
+                grad_out_f * (vi.expand_as(out_expanded) - out_expanded)
+            ).sum(-1)
             dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
             dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
             dcache_v[:, i] += d_out_i.sum(dim=3)
@@ -1169,7 +1189,9 @@ class LlamaFlashAttention(LlamaAttention):
             cache_k = [key_states]
             cache_v = [value_states]
 
-        assert attention_mask is not None, "LlamaFlashAttention cached path requires attention_mask"
+        assert (
+            attention_mask is not None
+        ), "LlamaFlashAttention cached path requires attention_mask"
         valid_lengths = attention_mask.sum(dim=-1, dtype=torch.long) - lck
         valid_lengths = valid_lengths.clamp_(0, q_len)
 

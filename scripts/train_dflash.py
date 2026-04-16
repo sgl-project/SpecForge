@@ -328,6 +328,9 @@ def record_metrics(
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
+        grad_norm = optimizer.get_last_grad_norm()
+        if grad_norm is not None:
+            logdict["train/pre_clip_grad_norm"] = grad_norm
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy

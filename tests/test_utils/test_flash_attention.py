@@ -26,6 +26,30 @@ def assert_similar(ref, out):
     assert abs(1 - norm_ratio) <= 0.025, f"{norm_ratio=}"
 
 
+def assert_scalar_close(name, ref, out, rtol=0.025, atol=1e-4):
+    ref = float(ref)
+    out = float(out)
+    diff = abs(ref - out)
+    scale = max(abs(ref), abs(out), 1.0)
+    rel_diff = diff / scale
+    assert diff <= atol or rel_diff <= rtol, (
+        f"{name} mismatch: ref={ref:.6f}, out={out:.6f}, "
+        f"abs_diff={diff:.6f}, rel_diff={rel_diff:.6f}"
+    )
+
+
+def collect_grad_metrics(module):
+    metrics = {}
+    total_sq_norm = 0.0
+    for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+        grad = getattr(module, proj_name).weight.grad
+        grad_norm = torch.linalg.norm(grad.float()).item()
+        metrics[f"{proj_name}_grad_norm"] = grad_norm
+        total_sq_norm += grad_norm**2
+    metrics["total_grad_norm"] = total_sq_norm**0.5
+    return metrics
+
+
 class TestFlashAttention(unittest.TestCase):
 
     def setUp(self):
@@ -45,6 +69,7 @@ class TestFlashAttention(unittest.TestCase):
         self.config = LlamaConfig(**self.config_dict)
 
         self.seq_lengths = [128, 200, 256, 300, 512, 800, 1024, 2048]
+        self.metric_seq_lengths = [128, 512, 1024]
         self.dtype = torch.bfloat16
 
     def test_forward_pass_comparison(self):
@@ -232,6 +257,96 @@ class TestFlashAttention(unittest.TestCase):
             assert_similar(
                 getattr(attention, proj_name).weight.grad,
                 getattr(flash_attention, proj_name).weight.grad,
+            )
+
+    def test_end_to_end_metric_comparison(self):
+        """Compare end-to-end metrics, including loss and grad norms."""
+        for seq_len in self.metric_seq_lengths:
+            with self.subTest(seq_len=seq_len):
+                self._test_end_to_end_metric_comparison_for_seq_len(seq_len)
+
+    def _test_end_to_end_metric_comparison_for_seq_len(self, seq_len):
+        attention = LlamaAttention(self.config).to("cuda").to(self.dtype)
+        flash_attention = LlamaFlashAttention(self.config).to("cuda").to(self.dtype)
+
+        with torch.no_grad():
+            flash_attention.q_proj.weight.copy_(attention.q_proj.weight)
+            flash_attention.k_proj.weight.copy_(attention.k_proj.weight)
+            flash_attention.v_proj.weight.copy_(attention.v_proj.weight)
+            flash_attention.o_proj.weight.copy_(attention.o_proj.weight)
+
+        batch_size = 2
+        hidden_size = self.config.hidden_size * 2
+        position_ids = (
+            torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to("cuda")
+        )
+        flash_position_ids = position_ids.clone()
+        cache_hidden = [[], []]
+        flash_cache_hidden = [[], []]
+        attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool).to("cuda")
+        padding_start_index = seq_len - min(200, seq_len // 3)
+        attention_mask[1, padding_start_index:] = False
+        input_embeds = norm_tensor(
+            (batch_size, seq_len, self.config.hidden_size),
+            device="cuda",
+            dtype=self.dtype,
+        )
+        decoder_attention_mask = prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            input_shape=(batch_size, seq_len),
+            inputs_embeds=input_embeds,
+            past_key_values_length=0,
+        )
+        loss_mask = attention_mask.to(self.dtype)
+
+        hidden_states_list = []
+        flash_hidden_states_list = []
+        for _ in range(TTT_LENGTH):
+            hidden_states = norm_tensor(
+                (batch_size, seq_len, hidden_size), device="cuda", dtype=self.dtype
+            )
+            flash_hidden_states = hidden_states.clone().detach().requires_grad_(True)
+            hidden_states_list.append(hidden_states)
+            flash_hidden_states_list.append(flash_hidden_states)
+
+        loss_list = []
+        loss_flash_list = []
+        for idx in range(TTT_LENGTH):
+            output = attention(
+                hidden_states=hidden_states_list[idx],
+                attention_mask=decoder_attention_mask,
+                position_ids=position_ids,
+                cache_hidden=cache_hidden,
+                output_attentions=False,
+                use_cache=True,
+            )
+            output_flash = flash_attention(
+                hidden_states=flash_hidden_states_list[idx],
+                attention_mask=attention_mask,
+                position_ids=flash_position_ids,
+                cache_hidden=flash_cache_hidden,
+            )
+            loss = (output * loss_mask[..., None]).sum().mean()
+            loss_flash = (output_flash * loss_mask[..., None]).sum().mean()
+            loss_list.append(loss)
+            loss_flash_list.append(loss_flash)
+            if idx != TTT_LENGTH - 1:
+                loss_mask = padding(loss_mask, left=False)
+
+        mean_loss = sum(loss_list) / len(loss_list)
+        mean_loss_flash = sum(loss_flash_list) / len(loss_flash_list)
+        mean_loss.backward()
+        mean_loss_flash.backward()
+
+        assert_scalar_close("mean_loss", mean_loss.item(), mean_loss_flash.item())
+
+        attention_metrics = collect_grad_metrics(attention)
+        flash_metrics = collect_grad_metrics(flash_attention)
+        for metric_name, metric_value in attention_metrics.items():
+            assert_scalar_close(
+                metric_name,
+                metric_value,
+                flash_metrics[metric_name],
             )
 
 

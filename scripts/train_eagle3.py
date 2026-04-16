@@ -181,7 +181,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--attention-backend",
         type=str,
         default="flex_attention",
-        help="The attention backend for the draft model",
+        help="The attention backend for the draft model (e.g. flex_attention, fa, usp)",
     )
 
     # other args
@@ -693,6 +693,9 @@ def record_metrcs(
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
+        grad_norm = optimizer.get_last_grad_norm()
+        if grad_norm is not None:
+            logdict["train/pre_clip_grad_norm"] = grad_norm
 
     accuracies = torch.stack(accuracies)
     plosses = torch.stack(plosses)
