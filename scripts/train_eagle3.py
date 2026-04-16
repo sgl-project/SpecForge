@@ -165,6 +165,11 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--log-grad-norm",
+        action="store_true",
+        help="Log train/pre_clip_grad_norm during training.",
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -829,6 +834,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=args.total_steps,
+        log_grad_norm=args.log_grad_norm,
     )
     print_with_rank("Initialized optimizer and scheduler")
 

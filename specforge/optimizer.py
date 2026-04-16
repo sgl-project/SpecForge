@@ -14,6 +14,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        log_grad_norm: bool = False,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
@@ -22,6 +23,7 @@ class BF16Optimizer:
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
+        self.log_grad_norm = log_grad_norm
         self.last_grad_norm = None
         self.fp32_params = [
             p.detach().clone().to(torch.float32) for p in self.model_params
@@ -62,7 +64,10 @@ class BF16Optimizer:
         return float(torch.sqrt(grad_sq_sum).item())
 
     def step(self):
-        self.last_grad_norm = self._compute_global_grad_norm()
+        if self.log_grad_norm:
+            self.last_grad_norm = self._compute_global_grad_norm()
+        else:
+            self.last_grad_norm = None
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 mp.grad = (

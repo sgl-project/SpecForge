@@ -117,6 +117,11 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--log-grad-norm",
+        action="store_true",
+        help="Log train/pre_clip_grad_norm during training.",
+    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -461,6 +466,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
+        log_grad_norm=args.log_grad_norm,
     )
 
     if resume_state is not None:
