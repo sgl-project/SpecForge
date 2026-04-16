@@ -26,7 +26,7 @@
   "transformers_version": "4.50.0",
   "use_cache": true,
   "use_sliding_window": false,
-  "vocab_size": 262145,
+  "vocab_size": 262144,
   "draft_vocab_size": 32000,
   "target_model_type": "gemma3_text"
 }
