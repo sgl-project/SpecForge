@@ -164,10 +164,27 @@ def wrap_eagle3_logits_processors_in_module(
     module: nn.Module, return_full_logits: bool = False
 ):
     """
-    This function will wrap the SGLang's original logits processor with the modified one for EAGLE3.
+    Wrap SGLang's original logits processors with the EAGLE3 variant.
+
+    Fixes:
+      1. Iterate over a materialized list so mutations to _modules do not
+         corrupt the iterator returned by named_modules().
+      2. Use module.set_submodule(dotted_name, wrapped) so nested
+         LogitsProcessors (e.g. language_model.logits_processor) are actually
+         replaced in their parent module, instead of creating a literal
+         dotted-name attribute on the root module.
     """
-    for name, submodule in module.named_modules():
-        if isinstance(submodule, LogitsProcessor):
-            wrapped = LogitsProcessorForEAGLE3(submodule, return_full_logits)
-            setattr(module, name, wrapped)
-            print(f"wrapped {name} with LogitsProcessorForEAGLE3")
+    to_wrap = [
+        (name, submodule)
+        for name, submodule in list(module.named_modules())
+        if isinstance(submodule, LogitsProcessor)
+    ]
+    for name, submodule in to_wrap:
+        wrapped = LogitsProcessorForEAGLE3(submodule, return_full_logits)
+        if name == "":
+            print(
+                "warning: root module is a LogitsProcessor; cannot replace in-place"
+            )
+            continue
+        module.set_submodule(name, wrapped)
+        print(f"wrapped {name} with LogitsProcessorForEAGLE3")
