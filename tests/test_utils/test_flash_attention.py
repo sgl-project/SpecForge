@@ -119,6 +119,7 @@ class TestFlashAttention(unittest.TestCase):
             with torch.no_grad():
                 output_flash = flash_attention(
                     hidden_states=flash_hidden_states_list[idx],
+                    attention_mask=attention_mask,
                     position_ids=flash_position_ids,
                     cache_hidden=flash_cache_hidden,
                 )
@@ -208,6 +209,7 @@ class TestFlashAttention(unittest.TestCase):
             )
             output_flash = flash_attention(
                 hidden_states=flash_hidden_states_list[idx],
+                attention_mask=attention_mask,
                 position_ids=flash_position_ids,
                 cache_hidden=flash_cache_hidden,
             )

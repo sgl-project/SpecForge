@@ -24,13 +24,30 @@ from ...layers.ring import ring_flash_attn_func
 from .base import Eagle3DraftModel
 
 try:
-    from flash_attn import flash_attn_func
-except ImportError:
+    import flash_attn as _std_flash_attn_mod
+    from flash_attn import flash_attn_varlen_func as _std_flash_attn_varlen_func
+    from flash_attn.bert_padding import pad_input as _std_flash_pad_input
+    from flash_attn.bert_padding import unpad_input as _std_flash_unpad_input
+    from flash_attn.flash_attn_interface import _flash_attn_backward as _std_flash_attn_backward
+    from flash_attn.flash_attn_interface import _flash_attn_forward as _std_flash_attn_forward
+    from flash_attn.flash_attn_interface import (
+        _flash_attn_varlen_backward as _std_flash_attn_varlen_backward,
+    )
+except ImportError as exc:
     warnings.warn(
         "flash_attn is not found, falling back to flex_attention. "
         "Please install flash_attn if you want to use the flash attention backend."
     )
-    flash_attn_func = None
+    _std_flash_attn_mod = None
+    _std_flash_attn_varlen_func = None
+    _std_flash_pad_input = None
+    _std_flash_unpad_input = None
+    _std_flash_attn_forward = None
+    _std_flash_attn_backward = None
+    _std_flash_attn_varlen_backward = None
+    _std_flash_attn_import_error = exc
+else:
+    _std_flash_attn_import_error = None
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -860,6 +877,226 @@ class LlamaFlexAttention(LlamaAttention):
         return attn_output
 
 
+def _raise_standard_flash_attn_unavailable() -> None:
+    raise RuntimeError(
+        "LlamaFlashAttention requires the standard flash-attn interface "
+        f"(import error: {_std_flash_attn_import_error!r})"
+    )
+
+
+def _standard_flash_attn_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(
+        q, attention_mask
+    )
+    k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(
+        k, attention_mask
+    )
+    v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
+    out_unpad, lse_unpad, _ = _std_flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_attn_probs=True,
+    )
+    out = _std_flash_pad_input(out_unpad, indices_q, q.shape[0], q.shape[1])
+    lse_padded = _std_flash_pad_input(
+        lse_unpad.transpose(0, 1), indices_q, q.shape[0], q.shape[1]
+    ).transpose(1, 2)
+    return out, lse_padded, indices_q, cu_seqlens_q
+
+
+def _standard_flash_attn_varlen_backward_call(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    attention_mask: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> None:
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(
+        q, attention_mask
+    )
+    k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(
+        k, attention_mask
+    )
+    v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
+    dout_unpad, _, _, _, _ = _std_flash_unpad_input(dout, attention_mask)
+    out_unpad, _, _, _, _ = _std_flash_unpad_input(out, attention_mask)
+    lse_unpad, _, _, _, _ = _std_flash_unpad_input(
+        softmax_lse.transpose(1, 2), attention_mask
+    )
+    lse_unpad = lse_unpad.transpose(0, 1).contiguous()
+
+    dq_unpad = torch.empty_like(q_unpad)
+    dk_unpad = torch.empty_like(k_unpad)
+    dv_unpad = torch.empty_like(v_unpad)
+    _std_flash_attn_varlen_backward(
+        dout_unpad,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        lse_unpad,
+        dq_unpad,
+        dk_unpad,
+        dv_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+        None,
+    )
+    dq.copy_(_std_flash_pad_input(dq_unpad, indices_q, q.shape[0], q.shape[1]))
+    dk.copy_(_std_flash_pad_input(dk_unpad, indices_k, k.shape[0], k.shape[1]))
+    dv.copy_(_std_flash_pad_input(dv_unpad, indices_k, v.shape[0], v.shape[1]))
+
+
+class _FlashCachedMergeFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, valid_lengths, softmax_scale: float):
+        bsz, q_len, num_heads, head_dim = q.shape
+        num_blocks = cache_k.shape[1]
+        num_kv_heads = cache_k.shape[3]
+        num_groups = num_heads // num_kv_heads
+        q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long).clamp_(0, q_len)
+        valid_mask = (
+            torch.arange(q_len, device=q.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+        ).view(bsz, q_len, 1, 1)
+        attention_mask = valid_mask.view(bsz, q_len)
+
+        k0 = cache_k[:, 0].contiguous()
+        v0 = cache_v[:, 0].contiguous()
+        out0, lse0_kernel, _, _ = _standard_flash_attn_varlen_forward(
+            q.contiguous(),
+            k0,
+            v0,
+            attention_mask,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        out0_expanded = out0.view(bsz, q_len, num_kv_heads, num_groups, head_dim).float()
+        neg_inf = torch.tensor(float("-inf"), device=q.device, dtype=torch.float32)
+        lse0 = lse0_kernel.transpose(1, 2).view(bsz, q_len, num_kv_heads, num_groups).float()
+        lse0 = torch.where(valid_mask, lse0, neg_inf)
+        lse_terms = [lse0]
+        attn_terms = [out0_expanded]
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].unsqueeze(-2).float()
+            vi = cache_v[:, i].unsqueeze(-2).float()
+            lse_i = (q_expanded.float() * ki).sum(-1) * softmax_scale
+            lse_terms.append(torch.where(valid_mask, lse_i, neg_inf))
+            attn_terms.append(vi.expand_as(out0_expanded))
+
+        merged_lse = torch.logsumexp(torch.stack(lse_terms, dim=-1), dim=-1)
+        out = sum(
+            term * torch.exp(lse - merged_lse).unsqueeze(-1)
+            for term, lse in zip(attn_terms, lse_terms)
+        )
+        out = torch.where(valid_mask.unsqueeze(-1), out, 0.0)
+        merged_lse = torch.where(valid_mask, merged_lse, 0.0)
+        ctx.save_for_backward(q, cache_k, cache_v, out, merged_lse, valid_lengths)
+        ctx.softmax_scale = softmax_scale
+        return out.to(q.dtype).reshape_as(q)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, cache_k, cache_v, out, merged_lse, valid_lengths = ctx.saved_tensors
+        bsz, q_len, num_heads, head_dim = q.shape
+        num_blocks = cache_k.shape[1]
+        num_kv_heads = cache_k.shape[3]
+        num_groups = num_heads // num_kv_heads
+        scale = ctx.softmax_scale
+        if grad_out.ndim == 3:
+            grad_out = grad_out.view(bsz, q_len, num_heads, head_dim)
+        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long)
+        valid_mask = (
+            torch.arange(q_len, device=q.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+        ).view(bsz, q_len, 1, 1)
+        attention_mask = valid_mask.view(bsz, q_len)
+        grad_out = torch.where(valid_mask, grad_out, 0.0)
+
+        grad_out_f = grad_out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        q_f = q.float()
+        q_expanded = q_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_f = out.float()
+        out_expanded = out_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_q = out.to(q.dtype).reshape(bsz, q_len, num_heads, head_dim)
+
+        dq = torch.zeros_like(q_f)
+        dcache_k = torch.zeros_like(cache_k.float())
+        dcache_v = torch.zeros_like(cache_v.float())
+
+        dq0 = torch.zeros_like(q)
+        dk0 = torch.zeros_like(cache_k[:, 0])
+        dv0 = torch.zeros_like(cache_v[:, 0])
+        merged_lse_kernel = merged_lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+        _standard_flash_attn_varlen_backward_call(
+            grad_out.contiguous(),
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out_q.contiguous(),
+            merged_lse_kernel,
+            attention_mask,
+            dq0,
+            dk0,
+            dv0,
+            softmax_scale=scale,
+            causal=True,
+        )
+        dq += dq0.float()
+        dcache_k[:, 0] += dk0.float()
+        dcache_v[:, 0] += dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float().unsqueeze(-2)
+            vi = cache_v[:, i].float().unsqueeze(-2)
+            lse_i = (q_expanded * ki).sum(-1) * scale
+            wi = torch.where(valid_mask, torch.exp(lse_i - merged_lse), 0.0)
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (grad_out_f * (vi.expand_as(out_expanded) - out_expanded)).sum(-1)
+            dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
+            dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
+            dcache_v[:, i] += d_out_i.sum(dim=3)
+
+        return (
+            dq.to(q.dtype),
+            dcache_k.to(cache_k.dtype),
+            dcache_v.to(cache_v.dtype),
+            None,
+            None,
+        )
+
+
 class LlamaFlashAttention(LlamaAttention):
     """
     Attention layer implemented with flash attention. We keep the parameters consistent with LlamaAttention.
@@ -868,6 +1105,17 @@ class LlamaFlashAttention(LlamaAttention):
         - position_ids: position ids
         - cache_hidden: manual cache used for storing past key and value states
     """
+
+    def __init__(self, config):
+        super().__init__(config)
+        if (
+            _std_flash_attn_forward is None
+            or _std_flash_attn_backward is None
+            or _std_flash_unpad_input is None
+            or _std_flash_pad_input is None
+            or _std_flash_attn_varlen_backward is None
+        ):
+            _raise_standard_flash_attn_unavailable()
 
     def forward(
         self,
@@ -915,62 +1163,26 @@ class LlamaFlashAttention(LlamaAttention):
         if cache_hidden is not None:
             cache_hidden[0] = cache_hidden[0] + [key_states]
             cache_hidden[1] = cache_hidden[1] + [value_states]
-
             cache_k = cache_hidden[0]
             cache_v = cache_hidden[1]
         else:
             cache_k = [key_states]
             cache_v = [value_states]
 
-        k0 = cache_k[0]
-        v0 = cache_v[0]
+        assert attention_mask is not None, "LlamaFlashAttention cached path requires attention_mask"
+        valid_lengths = attention_mask.sum(dim=-1, dtype=torch.long) - lck
+        valid_lengths = valid_lengths.clamp_(0, q_len)
 
-        assert (
-            flash_attn_func is not None
-        ), "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
-        attn_output, lse, _ = flash_attn_func(
+        attn_output = _FlashCachedMergeFunc.apply(
             query_states,
-            k0,
-            v0,
-            dropout_p=0.0,
-            softmax_scale=1.0 / math.sqrt(self.head_dim),
-            causal=True,
-            return_attn_probs=True,
+            torch.stack(cache_k, dim=1),
+            torch.stack(cache_v, dim=1),
+            valid_lengths,
+            1.0 / math.sqrt(self.head_dim),
         )
-        lse = lse.transpose(1, 2)
-
-        lck = len(cache_k)
-        if lck > 1:
-            q_shape_expanded = (
-                bsz,
-                q_len,
-                self.num_key_value_heads,
-                self.num_key_value_groups,
-                self.head_dim,
-            )
-            attn_outputs = [attn_output.view(q_shape_expanded)]
-            lses = [lse.view(q_shape_expanded[:-1])]
-
-            for i in range(1, lck):
-                ki = cache_k[i].unsqueeze(-2)
-                qi = query_states.view(q_shape_expanded)
-                vi = cache_v[i].unsqueeze(-2)
-
-                attn_outputs.append(vi)
-                lses.append((qi * ki).sum(-1) / math.sqrt(self.head_dim))
-
-            lse = torch.logsumexp(torch.stack(lses, dim=-1), dim=-1)
-            attn_output = sum(
-                attn_outputi * torch.exp(lsei - lse).unsqueeze(-1)
-                for attn_outputi, lsei in zip(attn_outputs, lses)
-            )
-            # lse is fp32, downcast attn_output back
-            attn_output = attn_output.to(self.o_proj.weight.dtype)
 
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
-
         attn_output = self.o_proj(attn_output)
-
         return attn_output
 
 
