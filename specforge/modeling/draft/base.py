@@ -116,7 +116,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
     @torch.no_grad()
     def load_embedding(
-        self, model_path: str, embedding_key: str = "model.embed_tokens.weight"
+        self, model_path: str, embedding_key: str = "language_model.embed_tokens.weight"
     ) -> None:
         """
         Load the embedding of the draft model.

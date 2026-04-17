@@ -52,7 +52,6 @@ from transformers.utils import (
     logging,
 )
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
 
 # [MODIFIED] Import from transformers library
 from specforge.distributed import get_tp_group, shard_tensor
@@ -431,7 +430,6 @@ class Llama4TextModel(Llama4PreTrainedModel):
         self.post_init()
 
     @can_return_tuple
-    @check_model_inputs
     @auto_docstring
     def forward(
         self,

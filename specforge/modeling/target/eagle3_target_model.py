@@ -94,19 +94,13 @@ class Eagle3TargetModel(ABC):
         if aux_hidden_states_layers is None:
             if hasattr(self.model.config, "num_hidden_layers"):
                 num_layers = self.model.config.num_hidden_layers
+
+            elif hasattr(self.model.config, "text_config") and hasattr(self.model.config.text_config, "num_hidden_layers"):
+                num_layers = self.model.config.text_config.num_hidden_layers
             else:
                 raise ValueError(
                     f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers"
                 )
-            aux_hidden_states_layers = [
-                1,
-                num_layers // 2 - 1,
-                num_layers - 4,
-            ]
-        self.aux_hidden_states_layers = aux_hidden_states_layers
-        assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
@@ -154,18 +148,20 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         Helper to find the module list containing the transformer layers.
         Adapts to common architectures (Llama, Qwen, Mistral, OPT, etc.)
         """
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model.layers
+        if hasattr(self.model, "model"):
+            if hasattr(self.model.model, "layers"):
+                return self.model.model.layers
+            elif hasattr(self.model.model, "language_model"):
+                return self.model.model.language_model.layers
         elif hasattr(self.model, "layers"):
             return self.model.layers
         elif hasattr(self.model, "transformer") and hasattr(
             self.model.transformer, "h"
         ):
             return self.model.transformer.h
-        else:
-            raise ValueError(
-                "Could not locate transformer layers in the model architecture to register hooks."
-            )
+        raise ValueError(
+            "Could not locate transformer layers in the model architecture to register hooks."
+        )
 
     @torch.no_grad()
     def generate_eagle3_data(
