@@ -165,6 +165,11 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--log-grad-norm",
+        action="store_true",
+        help="Log train/pre_clip_grad_norm during training.",
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -181,7 +186,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--attention-backend",
         type=str,
         default="flex_attention",
-        help="The attention backend for the draft model",
+        help="The attention backend for the draft model (e.g. flex_attention, fa, usp)",
     )
 
     # other args
@@ -693,6 +698,9 @@ def record_metrcs(
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
+        grad_norm = optimizer.get_last_grad_norm()
+        if grad_norm is not None:
+            logdict["train/pre_clip_grad_norm"] = grad_norm
 
     accuracies = torch.stack(accuracies)
     plosses = torch.stack(plosses)
@@ -826,6 +834,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=args.total_steps,
+        log_grad_norm=args.log_grad_norm,
     )
     print_with_rank("Initialized optimizer and scheduler")
 

@@ -117,6 +117,11 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--log-grad-norm",
+        action="store_true",
+        help="Log train/pre_clip_grad_norm during training.",
+    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -328,6 +333,9 @@ def record_metrics(
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
+        grad_norm = optimizer.get_last_grad_norm()
+        if grad_norm is not None:
+            logdict["train/pre_clip_grad_norm"] = grad_norm
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
@@ -458,6 +466,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
+        log_grad_norm=args.log_grad_norm,
     )
 
     if resume_state is not None:

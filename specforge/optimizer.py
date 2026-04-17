@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
@@ -13,6 +14,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        log_grad_norm: bool = False,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
@@ -21,6 +23,8 @@ class BF16Optimizer:
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
+        self.log_grad_norm = log_grad_norm
+        self.last_grad_norm = None
         self.fp32_params = [
             p.detach().clone().to(torch.float32) for p in self.model_params
         ]
@@ -35,7 +39,35 @@ class BF16Optimizer:
             warmup_steps=int(warmup_ratio * total_steps),
         )
 
+    def _compute_global_grad_norm(self):
+        grad_sq_sum = None
+        grad_device = None
+        for param in self.model_params:
+            if param.grad is None:
+                continue
+            grad = param.grad.detach().float()
+            grad_device = grad.device
+            local_sq_sum = (grad * grad).sum()
+            if grad_sq_sum is None:
+                grad_sq_sum = local_sq_sum
+            else:
+                grad_sq_sum = grad_sq_sum + local_sq_sum
+
+        if grad_sq_sum is None:
+            if grad_device is None:
+                grad_device = self.model_params[0].device
+            grad_sq_sum = torch.zeros((), device=grad_device, dtype=torch.float32)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(grad_sq_sum, op=dist.ReduceOp.SUM)
+
+        return float(torch.sqrt(grad_sq_sum).item())
+
     def step(self):
+        if self.log_grad_norm:
+            self.last_grad_norm = self._compute_global_grad_norm()
+        else:
+            self.last_grad_norm = None
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 mp.grad = (
@@ -64,3 +96,6 @@ class BF16Optimizer:
 
     def get_learning_rate(self):
         return self.optimizer.param_groups[0]["lr"]
+
+    def get_last_grad_norm(self):
+        return self.last_grad_norm
