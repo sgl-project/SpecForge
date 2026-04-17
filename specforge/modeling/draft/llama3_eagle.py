@@ -1129,11 +1129,10 @@ class LlamaFlashAttention(LlamaAttention):
     def __init__(self, config):
         super().__init__(config)
         if (
-            _std_flash_attn_forward is None
-            or _std_flash_attn_backward is None
+            _std_flash_attn_varlen_func is None
+            or _std_flash_attn_varlen_backward is None
             or _std_flash_unpad_input is None
             or _std_flash_pad_input is None
-            or _std_flash_attn_varlen_backward is None
         ):
             _raise_standard_flash_attn_unavailable()
 
