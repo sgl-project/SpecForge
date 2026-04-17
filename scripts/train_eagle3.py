@@ -402,6 +402,11 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
+    # if the target model is gemma, we should use global attention for the draft model
+    if "gemma" in getattr(draft_model_config, "target_model_type", "").lower():
+        draft_model_config.use_global_attention = True
+        print_on_rank0("Using global attention for draft model.")
+
     # Handle base ckpt, config file
     draft_model_last_checkpoint = None
     is_resume_checkpoint = False
@@ -427,6 +432,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
             draft_model_last_checkpoint,
+            config=draft_model_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()

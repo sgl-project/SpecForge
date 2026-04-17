@@ -14,6 +14,7 @@ torchrun \
     --draft-model-config $ROOT_DIR/configs/gemma3-27b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/ultrachat_train.jsonl \
     --output-dir $ROOT_DIR/outputs/gemma3-27b-eagle3-ultrachat \
+    --eval-holdout-ratio 0.03 \
     --num-epochs 10 \
     --batch-size 8 \
     --tp-size $TP_SIZE \
