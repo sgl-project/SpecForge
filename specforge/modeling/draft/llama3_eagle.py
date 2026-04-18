@@ -1346,6 +1346,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
+        self.post_init()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
