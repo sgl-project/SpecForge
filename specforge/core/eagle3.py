@@ -140,6 +140,8 @@ class OnlineEagle3Model(Eagle3Model):
         position_ids: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        pre_projected: bool = False,
+        target_in_draft_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -148,9 +150,12 @@ class OnlineEagle3Model(Eagle3Model):
         Args:
             input_ids: (batch, seq_len)
             attention_mask: (batch, seq_len)
+            target: (batch, seq_len, vocab_size) or (batch, seq_len, draft_vocab_size) if pre_projected
             loss_mask: (batch, seq_len)
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
+            pre_projected: if True, target is already projected to draft_vocab_size
+            target_in_draft_mask: (batch, seq_len) bool mask, required when pre_projected=True
         """
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
@@ -158,6 +163,8 @@ class OnlineEagle3Model(Eagle3Model):
             t2d=self.draft_model.t2d,
             loss_mask=loss_mask,
             length=self.length,
+            pre_projected=pre_projected,
+            target_in_draft_mask=target_in_draft_mask,
         )
         del target
         torch.cuda.empty_cache()
@@ -565,13 +572,26 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         return plosses, vlosses, acces
 
 
-def _compute_target_p_padded(target, t2d, loss_mask, length):
+def _compute_target_p_padded(
+    target, t2d, loss_mask, length,
+    pre_projected=False, target_in_draft_mask=None,
+):
     with torch.no_grad():
-        target_p, position_mask = _compute_target_p(
-            target=target,
-            t2d=t2d,
-            loss_mask=loss_mask,
-        )
+        if pre_projected:
+            # Target logits are already projected to draft_vocab_size.
+            # target shape: (batch, seq_len, draft_vocab_size)
+            # target_in_draft_mask shape: (batch, seq_len) — bool mask
+            target_p, position_mask = _compute_target_p_from_projected(
+                target=target,
+                target_in_draft_mask=target_in_draft_mask,
+                loss_mask=loss_mask,
+            )
+        else:
+            target_p, position_mask = _compute_target_p(
+                target=target,
+                t2d=t2d,
+                loss_mask=loss_mask,
+            )
 
         assert len(target_p.shape) == 3
         target_p_padded = F.pad(
@@ -594,6 +614,28 @@ def _compute_target_p(target, t2d, loss_mask):
     position_mask = target_mask * loss_mask
     target_head = target_head[..., t2d]
     target_head = target_head.float()
+    target_p = nn.Softmax(dim=2)(target_head)
+    target_p = target_p.detach()
+    return target_p, position_mask
+
+
+@torch.compile(dynamic=None)
+def _compute_target_p_from_projected(target, target_in_draft_mask, loss_mask):
+    """
+    Compute target probability distribution from pre-projected logits.
+
+    When early vocab projection is used, target logits are already in draft_vocab_size
+    and target_in_draft_mask is pre-computed. This avoids the expensive full-vocab
+    argmax and fancy indexing operations.
+
+    Args:
+        target: (batch, seq_len, draft_vocab_size) — already projected logits
+        target_in_draft_mask: (batch, seq_len) — bool, whether target argmax is in draft vocab
+        loss_mask: (batch, seq_len, 1) — loss mask
+    """
+    target_mask = target_in_draft_mask[..., None].int()
+    position_mask = target_mask * loss_mask
+    target_head = target.float()
     target_p = nn.Softmax(dim=2)(target_head)
     target_p = target_p.detach()
     return target_p, position_mask

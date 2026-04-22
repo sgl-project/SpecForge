@@ -1,0 +1,1 @@
+bash examples/run_qwen3.5_122b_a10b_eagle3_online.sh

@@ -48,6 +48,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
+    padding,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
@@ -85,6 +86,18 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=str,
         default="lm_head.weight",
         help="The key of the lm head weight to load from the target model, this is only required for offline training",
+    )
+    model_group.add_argument(
+        "--load-mtp-weights",
+        action="store_true",
+        help="Load MoE weights from the target model's native MTP head to initialize the draft model. "
+        "Only applicable when the draft model uses MoE architecture (e.g., Qwen3MoeForCausalLMEagle3).",
+    )
+    model_group.add_argument(
+        "--mtp-layer-idx",
+        type=int,
+        default=0,
+        help="Index of the MTP block to load weights from (default: 0).",
     )
     model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
@@ -173,6 +186,27 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=int,
         default=1,
         help="The size of the tensor parallel for the target model",
+    )
+    optimization_group.add_argument(
+        "--target-micro-batch-size",
+        type=int,
+        default=0,
+        help="Number of samples per micro-batch for target model inference. "
+        "When > 0 and vocab mapping is available, enables memory-optimized mode: "
+        "1) processes samples in micro-batches to reduce peak memory, "
+        "2) projects full-vocab logits to draft vocab immediately after each micro-batch. "
+        "Recommended value: 1 (minimum memory). 0 = process all samples at once (original behavior). "
+        "This is essential for large-vocab models (e.g., 248K vocab) with long sequences (e.g., 20K tokens).",
+    )
+    optimization_group.add_argument(
+        "--logits-chunk-size",
+        type=int,
+        default=2048,
+        help="Chunk size (in tokens) for chunked logits computation during target model inference. "
+        "When > 0 and total tokens exceed this value, logits are computed in chunks to reduce "
+        "the peak memory of tensor_model_parallel_all_gather from (total_tokens × vocab_size) "
+        "to (chunk_size × vocab_size). For chunk_size=2048 and vocab_size=248K: peak ≈ 0.96 GB. "
+        "0 = disable chunking (compute all logits at once, original behavior).",
     )
     # distributed training
     optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
@@ -433,6 +467,22 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+
+    # Load MTP weights for MoE draft models if requested
+    if (
+        args.load_mtp_weights
+        and hasattr(draft_model, "load_mtp_weights")
+        and not draft_model_last_checkpoint
+    ):
+        print_on_rank0(
+            f"Loading MTP weights from {args.target_model_path} "
+            f"(mtp_block_{args.mtp_layer_idx})"
+        )
+        draft_model.load_mtp_weights(
+            args.target_model_path,
+            mtp_layer_idx=args.mtp_layer_idx,
+        )
+
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
@@ -608,10 +658,12 @@ def run_forward(
         )
     else:
         image_grid_thw = None
+        pre_projected = False
+        target_in_draft_mask = None
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
             # Handle VLM data: pixel_values and image_grid_thw are lists
-            # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
+            target_mbs = getattr(args, "target_micro_batch_size", 0)
             if args.is_vlm:
                 image_grid_thw = (
                     [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
@@ -626,12 +678,14 @@ def run_forward(
                     is_vlm=args.is_vlm,
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
+                    target_micro_batch_size=target_mbs,
                 )
             else:
                 eagle3_data = target_model.generate_eagle3_data(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
+                    target_micro_batch_size=target_mbs,
                 )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
@@ -639,6 +693,32 @@ def run_forward(
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            pre_projected = eagle3_data.pre_projected
+            if eagle3_data.target_in_draft_mask is not None:
+                target_in_draft_mask = get_dp_data_shard_from_tp(
+                    eagle3_data.target_in_draft_mask
+                )
+
+            # Apply padding AFTER DP sharding to avoid 2x peak memory.
+            # Before sharding: target is (tp_size, seq_len, vocab) e.g. (8, 20480, 32000)
+            # = 9.77 GiB.  padding() would need another 9.77 GiB copy → OOM.
+            # After sharding: target is (1, seq_len, vocab) = 1.22 GiB → padding trivially fits.
+            #
+            # IMPORTANT: get_dp_data_shard_from_tp returns a view (via chunk), so the
+            # original (8, ...) tensor stays alive until all views are released.
+            # We must .contiguous() the large tensors to create independent copies,
+            # then del eagle3_data to free the original 9.77 GiB tensor before padding.
+            target = target.contiguous()
+            hidden_states = hidden_states.contiguous()
+            if target_in_draft_mask is not None:
+                target_in_draft_mask = target_in_draft_mask.contiguous()
+            del eagle3_data
+            torch.cuda.empty_cache()
+
+            input_ids = padding(input_ids, left=False)
+            target = padding(target, left=False)
+            if target_in_draft_mask is not None:
+                target_in_draft_mask = padding(target_in_draft_mask, left=False)
         else:
             # we generate the logits using the hidden states loaded from disk
             attention_mask = data["attention_mask"].cuda()
@@ -662,6 +742,8 @@ def run_forward(
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
+            pre_projected=pre_projected,
+            target_in_draft_mask=target_in_draft_mask,
         )
     return plosses, acces
 
@@ -761,6 +843,31 @@ def main():
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
+
+    # Pass vocab mapping to target model for early projection (memory optimization).
+    # This is critical for large-vocab models (e.g. 248K vocab): without it, the full-
+    # vocab logits tensor (~9.5 GiB for 20K tokens) would cause OOM during padding.
+    # Early projection reduces this to ~1.2 GiB (draft_vocab=32K).
+    # We set it unconditionally for all online modes (both micro-batch and full-batch),
+    # since the early projection happens inside the logits processor and benefits both.
+    if is_online and hasattr(draft_model, "t2d") and hasattr(target_model, "set_vocab_mapping"):
+        target_model.set_vocab_mapping(draft_model.t2d)
+        print_with_rank(
+            f"Early vocab projection enabled (full_vocab → draft_vocab). "
+            f"micro_batch_size={args.target_micro_batch_size}"
+        )
+
+    # Set chunked logits computation size (memory optimization)
+    if is_online and hasattr(target_model, "set_logits_chunk_size"):
+        target_model.set_logits_chunk_size(args.logits_chunk_size)
+        if args.logits_chunk_size > 0:
+            vocab_size = getattr(draft_model.config, "vocab_size", 248320)
+            print_with_rank(
+                f"Enabled chunked logits: chunk_size={args.logits_chunk_size} tokens "
+                f"(peak ≈ {args.logits_chunk_size * vocab_size * 2 / 1024**3:.2f} GB per chunk)"
+            )
+        else:
+            print_with_rank("Chunked logits disabled (--logits-chunk-size 0)")
 
     # Calculate total steps if not provided
     if args.total_steps is None:

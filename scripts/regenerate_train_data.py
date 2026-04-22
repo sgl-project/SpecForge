@@ -191,6 +191,56 @@ def build_query_kwargs(args, messages, max_tokens=None):
     return query_kwargs
 
 
+def _normalize_message_for_regen(msg):
+    """
+    Normalize a single message dict to OpenAI format (role/content).
+    Handles both ShareGPT format (from/value) and OpenAI format (role/content).
+    """
+    if not isinstance(msg, dict):
+        return None
+
+    # Already in OpenAI format (role/content)
+    if "role" in msg and "content" in msg:
+        return msg
+
+    # ShareGPT format (from/value) -> convert to OpenAI format (role/content)
+    if "from" in msg or "value" in msg:
+        role_mapping = {
+            "human": "user",
+            "gpt": "assistant",
+            "system": "system",
+            "tool": "tool",
+            "observation": "tool",
+        }
+        raw_role = msg.get("from", "user")
+        new_msg = {
+            "role": role_mapping.get(raw_role, raw_role),
+            "content": msg.get("value", ""),
+        }
+        for k, v in msg.items():
+            if k not in ("from", "value"):
+                new_msg[k] = v
+        return new_msg
+
+    return msg
+
+
+def _get_conversations(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extract and normalize conversation messages from data.
+    Supports both 'conversations' (ShareGPT) and 'messages' (OpenAI) keys.
+    """
+    raw = data.get("conversations", None) or data.get("messages", [])
+    if not isinstance(raw, list):
+        return []
+    normalized = []
+    for msg in raw:
+        n = _normalize_message_for_regen(msg)
+        if n is not None:
+            normalized.append(n)
+    return normalized
+
+
 def call_sglang(
     args,
     server_address: str,
@@ -200,8 +250,13 @@ def call_sglang(
     """Send a batch of prompts to sglang /v1/completions."""
     client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
 
-    messages = data["conversations"]
+    messages = _get_conversations(data)
     regenerated_messages = []
+
+    if not messages:
+        data["status"] = "error"
+        data["error"] = "No conversations/messages found in data"
+        return data
 
     # ignore data which starts with an assistant message
     if messages[0]["role"] == "assistant":

@@ -47,6 +47,8 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    target_in_draft_mask: Optional[torch.Tensor] = None  # pre-computed bool mask: whether target argmax is in draft vocab
+    pre_projected: bool = False  # whether target logits are already projected to draft_vocab_size
 
 
 class Eagle3TargetModel(ABC):
@@ -349,7 +351,390 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
-        self.model_runner.model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
+        model = self.model_runner.model
+        if hasattr(model, "set_eagle3_layers_to_capture"):
+            model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
+        else:
+            # Fallback for models that don't natively support Eagle3 layer capture
+            # (e.g., Qwen3_5MoeForConditionalGeneration / Qwen3_5MoeForCausalLM).
+            # We monkey-patch the forward methods to inject aux_hidden_states capture logic.
+            print(
+                f"[Eagle3] Model {type(model).__name__} does not have "
+                f"set_eagle3_layers_to_capture, applying monkey-patch..."
+            )
+            self._monkey_patch_eagle3_layer_capture(model, aux_hidden_states_layers)
+
+    def set_vocab_mapping(self, t2d: torch.Tensor) -> None:
+        """
+        Store the target-to-draft vocab mapping for early vocab projection.
+
+        When set, the logits processor will project full-vocab logits to draft_vocab
+        *inside* the chunked computation loop, so the full-vocab tensor is never
+        materialised across all tokens simultaneously.
+
+        Memory improvement:
+        - Without: chunked logits are computed then torch.cat → peak = 2 × (tokens × full_vocab)
+        - With:    each chunk is projected immediately → peak = 1 chunk × full_vocab + tokens × draft_vocab
+        - For 20K tokens, vocab 248K, draft 32K: 19 GiB → 2.2 GiB (8.6× reduction)
+
+        Args:
+            t2d: Bool tensor of shape (target_vocab_size,) indicating which target vocab
+                 tokens are in the draft vocabulary.
+        """
+        self._t2d = t2d.cuda()
+
+        # Set on the module-level global (backward compatibility)
+        from .sglang_backend import utils as sglang_utils
+        sglang_utils._T2D_MAPPING = self._t2d
+
+        # Also set directly on each LogitsProcessorForEAGLE3 instance — this is the
+        # primary mechanism.  Instance-level takes priority over the module-level
+        # global inside replaced_logits_processor_forward_for_eagle3(), eliminating
+        # any risk of the global variable not being visible.
+        n_set = 0
+        for _name, module in self.model_runner.model.named_modules():
+            if isinstance(module, LogitsProcessorForEAGLE3):
+                module.t2d_mapping = self._t2d
+                n_set += 1
+        print(
+            f"[Eagle3] Vocab mapping set: target_vocab={t2d.shape[0]}, "
+            f"draft_vocab={t2d.sum().item()}, "
+            f"set on {n_set} LogitsProcessorForEAGLE3 instance(s) + module-level global"
+        )
+
+    def set_logits_chunk_size(self, chunk_size: int) -> None:
+        """
+        Set the chunk size for chunked logits computation.
+
+        When chunk_size > 0 and total tokens exceed this value, logits are computed
+        in chunks to reduce peak all_gather memory from (total_tokens × vocab_size)
+        to (chunk_size × vocab_size).
+
+        Args:
+            chunk_size: Number of tokens per chunk. 0 = disable chunking.
+        """
+        # Set on the module-level global (backward compatibility)
+        from .sglang_backend import utils as sglang_utils
+        sglang_utils.LOGITS_CHUNK_SIZE = chunk_size
+
+        # Also set directly on each LogitsProcessorForEAGLE3 instance
+        n_set = 0
+        for _name, module in self.model_runner.model.named_modules():
+            if isinstance(module, LogitsProcessorForEAGLE3):
+                module.logits_chunk_size = chunk_size
+                n_set += 1
+        print(
+            f"[Eagle3] Logits chunk size set to {chunk_size} "
+            f"({'enabled' if chunk_size > 0 else 'disabled'}), "
+            f"set on {n_set} LogitsProcessorForEAGLE3 instance(s) + module-level global"
+        )
+
+    def _monkey_patch_eagle3_layer_capture(
+        self, model: nn.Module, layer_ids: Optional[List[int]] = None
+    ) -> None:
+        """
+        Monkey-patch Eagle3 aux_hidden_states capture logic onto models that don't
+        natively support it (e.g., Qwen3_5MoeForConditionalGeneration).
+
+        This replicates the behavior of Qwen3MoeForCausalLM.set_eagle3_layers_to_capture
+        and Qwen3MoeModel.forward's aux_hidden_states collection logic.
+
+        Model hierarchy handled:
+        - VLM: Qwen3_5MoeForConditionalGeneration
+            - self.model = Qwen3_5MoeForCausalLM (inherits Qwen3_5ForCausalLM)
+                - self.layers = decoder layers
+                - self.embed_tokens, self.norm, etc.
+        - Non-VLM CausalLM without Eagle3 support (similar flat structure)
+        """
+        import types
+
+        # --- Step 1: Find the language model (the one with self.layers) ---
+        language_model = self._find_language_model(model)
+        if language_model is None:
+            raise ValueError(
+                f"Cannot find language model with 'layers' attribute in {type(model).__name__}. "
+                f"Cannot apply Eagle3 monkey-patch."
+            )
+
+        # --- Step 2: Determine layer IDs to capture ---
+        num_layers = len(language_model.layers)
+        if layer_ids is None:
+            # Default Eagle3 layers: low, mid, high
+            # In Qwen3MoeForCausalLM.set_eagle3_layers_to_capture, the default is
+            # [2, num_layers//2, num_layers-3] with +1 offset because it captures
+            # at the START of the marked layer (i.e., previous layer's output).
+            # Here we capture AFTER the marked layer completes, so we use the
+            # actual target layer indices directly (equivalent to layer_ids=[1, num_layers//2-1, num_layers-4]).
+            capture_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+        else:
+            # User-provided layer_ids are 0-indexed target layers.
+            # In Qwen3MoeForCausalLM, layer_ids are offset by +1 because capture
+            # happens at the start of the next layer. Here we capture after the
+            # layer completes, so we use layer_ids directly.
+            capture_layer_ids = list(layer_ids)
+
+        # --- Step 3: Set _is_layer_to_capture on target decoder layers ---
+        language_model.layers_to_capture = capture_layer_ids
+        for layer_id in capture_layer_ids:
+            if 0 <= layer_id < num_layers:
+                setattr(language_model.layers[layer_id], "_is_layer_to_capture", True)
+            else:
+                raise ValueError(
+                    f"Layer index {layer_id} out of bounds for model with {num_layers} layers."
+                )
+
+        print(
+            f"[Eagle3] Set _is_layer_to_capture on layers {capture_layer_ids} "
+            f"(total {num_layers} layers)"
+        )
+
+        # --- Step 4: Patch the language model's forward to collect aux_hidden_states ---
+        # Note: Qwen3_5AttentionDecoderLayer/Qwen3_5LinearDecoderLayer do NOT handle
+        # `captured_last_layer_outputs` parameter (unlike Qwen3MoeDecoderLayer).
+        # So we capture hidden states manually after each marked layer executes.
+        #
+        # In Qwen3MoeModel, `captured_last_layer_outputs` captures the residual at the
+        # start of the marked layer (i.e., the previous layer's output via prepare_attn).
+        # Here we capture the residual after the marked layer completes (post MLP + residual).
+        # To get the same effective layer outputs, we use the target layer indices directly
+        # without the +1 offset that Qwen3MoeForCausalLM applies.
+        original_lm_forward = language_model.forward
+
+        # Try to import expert_distribution recorder (optional, for MoE expert stats).
+        # Different SGLang versions use different module paths. Resolve once at patch time.
+        _get_recorder = None
+        for _mod_path in (
+            "sglang.srt.eplb.expert_distribution",
+            "sglang.srt.managers.expert_distribution",
+        ):
+            try:
+                _mod = __import__(_mod_path, fromlist=["get_global_expert_distribution_recorder"])
+                _get_recorder = _mod.get_global_expert_distribution_recorder
+                break
+            except (ImportError, ModuleNotFoundError):
+                continue
+
+        if _get_recorder is None:
+            print(
+                "[Eagle3] Warning: expert_distribution module not found in SGLang. "
+                "Expert distribution recording will be disabled."
+            )
+
+        def patched_lm_forward(
+            self_lm,
+            input_ids=None,
+            positions=None,
+            forward_batch=None,
+            input_embeds=None,
+            pp_proxy_tensors=None,
+            input_deepstack_embeds=None,
+            **kwargs,
+        ):
+            """Patched forward that captures aux_hidden_states from marked layers."""
+            # Initialize hidden states
+            if self_lm.pp_group.is_first_rank:
+                if input_embeds is None:
+                    hidden_states = self_lm.embed_tokens(input_ids)
+                else:
+                    hidden_states = input_embeds
+                residual = None
+            else:
+                assert pp_proxy_tensors is not None
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                residual = pp_proxy_tensors["residual"]
+
+            # Pass through decoder layers with aux_hidden_states capture
+            aux_hidden_states = []
+            for layer_idx in range(len(self_lm.layers)):
+                layer = self_lm.layers[layer_idx]
+
+                # Use expert distribution recorder context if available
+                if _get_recorder is not None:
+                    with _get_recorder().with_current_layer(layer_idx):
+                        hidden_states, residual = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            residual=residual,
+                            forward_batch=forward_batch,
+                        )
+                else:
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                    )
+
+                # Capture aux_hidden_states for Eagle3 from marked layers.
+                # We capture `residual` which contains the full hidden states
+                # (hidden + residual connection) before the next layer's RMSNorm.
+                # This is equivalent to what Qwen3MoeModel captures via
+                # prepare_attn_and_capture_last_layer_outputs in the next layer.
+                if getattr(layer, "_is_layer_to_capture", False):
+                    # Clone to avoid in-place modification by subsequent layers
+                    aux_hidden_states.append(residual.clone())
+
+                # Process deepstack embeddings if provided
+                if (
+                    input_deepstack_embeds is not None
+                    and input_deepstack_embeds.numel() > 0
+                    and layer_idx < 3
+                ):
+                    sep = self_lm.hidden_size * layer_idx
+                    hidden_states.add_(
+                        input_deepstack_embeds[:, sep : sep + self_lm.hidden_size]
+                    )
+
+            # Return intermediate tensors for pipeline parallelism
+            if not self_lm.pp_group.is_last_rank:
+                from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                    }
+                )
+
+            # Apply final normalization
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self_lm.norm(hidden_states)
+                else:
+                    hidden_states, _ = self_lm.norm(hidden_states, residual)
+
+            if len(aux_hidden_states) == 0:
+                return hidden_states
+
+            return hidden_states, aux_hidden_states
+
+        # Bind the patched forward to the language model instance
+        language_model.forward = types.MethodType(patched_lm_forward, language_model)
+
+        # --- Step 5: Handle the outer model (VLM or CausalLM wrapper) ---
+        # For VLM models like Qwen3_5MoeForConditionalGeneration, the outer forward
+        # calls general_mm_embed_routine which calls language_model(...).
+        # The language_model now returns (hidden_states, aux_hidden_states) tuple.
+        # We need the outer forward to unpack this and pass aux_hidden_states to logits_processor.
+
+        # Check if model is a VLM wrapper (has self.model which is the language model)
+        if hasattr(model, "model") and model.model is language_model:
+            # VLM model: patch the outer forward
+            self._patch_vlm_forward_for_eagle3(model, language_model)
+        elif model is language_model:
+            # Direct CausalLM model (no VLM wrapper): need to handle aux_hidden_states
+            # in the logits processing step. Set capture flag.
+            model.capture_aux_hidden_states = True
+
+        print(f"[Eagle3] Monkey-patch applied successfully to {type(model).__name__}")
+
+    def _find_language_model(self, model: nn.Module) -> Optional[nn.Module]:
+        """
+        Find the language model component that has self.layers (decoder layers).
+
+        Handles various model hierarchies:
+        - VLM: model.model (language model with layers)
+        - CausalLM with inner model: model.model (inner model with layers)
+        - Flat CausalLM: model itself has layers
+        """
+        # Check if model itself has layers
+        if hasattr(model, "layers"):
+            return model
+
+        # Check model.model (common for VLM and some CausalLM)
+        if hasattr(model, "model"):
+            inner = model.model
+            if hasattr(inner, "layers"):
+                return inner
+            # Check model.model.model (deeper nesting)
+            if hasattr(inner, "model") and hasattr(inner.model, "layers"):
+                return inner.model
+
+        # Check model.language_model
+        if hasattr(model, "language_model"):
+            lm = model.language_model
+            if hasattr(lm, "layers"):
+                return lm
+            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+                return lm.model
+
+        return None
+
+    def _patch_vlm_forward_for_eagle3(
+        self, vlm_model: nn.Module, language_model: nn.Module
+    ) -> None:
+        """
+        Patch the VLM outer model's forward to handle aux_hidden_states from
+        the patched language model.
+
+        For Qwen3_5MoeForConditionalGeneration, the forward calls
+        general_mm_embed_routine which calls language_model.forward().
+        After patching, language_model.forward() returns (hidden_states, aux_hidden_states).
+        We need to unpack this and pass aux_hidden_states to logits_processor.
+        """
+        import types
+
+        original_vlm_forward = vlm_model.forward
+
+        def patched_vlm_forward(
+            self_vlm,
+            input_ids,
+            positions,
+            forward_batch,
+            get_embedding=False,
+            pp_proxy_tensors=None,
+        ):
+            """Patched VLM forward that handles aux_hidden_states from language model."""
+            from sglang.srt.models.qwen3_vl import general_mm_embed_routine
+
+            if hasattr(self_vlm, "is_mrope_enabled") and self_vlm.is_mrope_enabled:
+                positions = forward_batch.mrope_positions
+
+            if not (
+                forward_batch.forward_mode.is_decode()
+                or not forward_batch.contains_image_inputs()
+            ):
+                if (
+                    hasattr(self_vlm, "is_mrope_enabled")
+                    and self_vlm.is_mrope_enabled
+                ):
+                    assert positions.ndim == 2 and positions.size(0) == 3, (
+                        "multimodal section rotary embedding requires "
+                        f"(3, seq_len) positions, but got {positions.size()}"
+                    )
+
+            result = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self_vlm.model,
+                multimodal_model=self_vlm,
+                positions=positions,
+                use_deepstack=getattr(self_vlm, "use_deepstack", {}),
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
+            # The patched language model may return (hidden_states, aux_hidden_states)
+            aux_hidden_states = None
+            if isinstance(result, tuple) and len(result) == 2:
+                hidden_states, aux_hidden_states = result
+            else:
+                hidden_states = result
+
+            if self_vlm.pp_group.is_last_rank:
+                if not get_embedding:
+                    return self_vlm.logits_processor(
+                        input_ids,
+                        hidden_states,
+                        self_vlm.lm_head,
+                        forward_batch,
+                        aux_hidden_states,
+                    )
+                else:
+                    return self_vlm.pooler(hidden_states, forward_batch)
+            else:
+                return hidden_states
+
+        vlm_model.forward = types.MethodType(patched_vlm_forward, vlm_model)
 
     @torch.no_grad
     def _extend(
@@ -391,18 +776,30 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         aux_hidden_states_list = None
         input_lens = [len(req.origin_input_ids) for req in reqs]
 
+        # Extract the logits output object (may carry pre-projection metadata)
+        logits_output_obj = getattr(eagle3_output, "logits_output", eagle3_output)
+
+        # Check if logits were pre-projected inside the logits processor
+        logits_pre_projected = getattr(logits_output_obj, "logits_pre_projected", False)
+        target_in_draft_mask_raw = getattr(logits_output_obj, "target_in_draft_mask", None)
+
         if return_logits:
-            if hasattr(eagle3_output, "logits_output"):
-                raw_logits = eagle3_output.logits_output.logits
-            else:
-                raw_logits = eagle3_output.logits
+            raw_logits = logits_output_obj.logits
             logits = torch.split(raw_logits, input_lens, dim=0)
         else:
             logits = [None] * len(reqs)
 
+        # Split target_in_draft_mask per sample if present
+        if target_in_draft_mask_raw is not None:
+            target_in_draft_mask_list = torch.split(
+                target_in_draft_mask_raw, input_lens, dim=0
+            )
+        else:
+            target_in_draft_mask_list = [None] * len(reqs)
+
         if capture_aux_hidden_states:
             raw_aux_hidden_states = (
-                eagle3_output.logits_output.aux_hidden_states
+                logits_output_obj.aux_hidden_states
             )  # concat hidden shape: (total_tokens, H*3)
             aux_hidden_states_list = torch.split(
                 raw_aux_hidden_states, input_lens, dim=0
@@ -412,7 +809,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         if return_last_hidden_states:
             last_hidden_states = torch.split(
-                eagle3_output.logits_output.last_hidden_states, input_lens, dim=0
+                logits_output_obj.last_hidden_states, input_lens, dim=0
             )
         else:
             last_hidden_states = [None] * len(reqs)
@@ -420,7 +817,10 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         # TODO: can we not clear?
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
-        return logits, aux_hidden_states_list, last_hidden_states
+        return (
+            logits, aux_hidden_states_list, last_hidden_states,
+            logits_pre_projected, target_in_draft_mask_list,
+        )
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
         if require_mlp_sync(self.model_runner.server_args):
@@ -477,14 +877,21 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
 
-        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
+        (
+            logits_list, aux_hidden_states_list, last_hidden_states_list,
+            logits_pre_projected, target_in_draft_mask_list,
+        ) = self._extend(
             reqs,
             capture_aux_hidden_states=True,
             return_last_hidden_states=return_last_hidden_states,
             return_logits=return_logits,
         )
 
-        return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+        return (
+            data_cache, logits_list, aux_hidden_states_list,
+            last_hidden_states_list, logits_pre_projected,
+            target_in_draft_mask_list,
+        )
 
     def get_rope_index(
         self,
@@ -670,14 +1077,21 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
 
-        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
+        (
+            logits_list, aux_hidden_states_list, last_hidden_states_list,
+            logits_pre_projected, target_in_draft_mask_list,
+        ) = self._extend(
             reqs,
             capture_aux_hidden_states=True,
             return_last_hidden_states=return_last_hidden_states,
             return_logits=return_logits,
         )
 
-        return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+        return (
+            data_cache, logits_list, aux_hidden_states_list,
+            last_hidden_states_list, logits_pre_projected,
+            target_in_draft_mask_list,
+        )
 
     @torch.no_grad()
     def generate_eagle3_data(
@@ -688,21 +1102,42 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        target_micro_batch_size: int = 0,
     ) -> Eagle3TargetOutput:
         """
-        return:
-            data_for_draft: List[Dict[str, torch.Tensor]] of draft_batch_size, draft_micro_batch_size = 1
-                - input_ids: (1, seq_len)
-                - attention_mask: (1, seq_len)
-                - loss_mask: (1, seq_len)
-                - target: (1, seq_len, vocab_size) or (1, seq_len, hidden_size)
-                - hidden_states: (1, seq_len, hidden_size)
-                - pixel_values: (patch_len, patch_width)
-                - image_grid_thw (batch_size, 3)
+        Generate Eagle3 training data from the target model.
+
+        Memory optimization (v2): Early vocab projection is now done INSIDE the logits
+        processor (in sglang_backend/utils.py), so the full-vocab logits tensor is never
+        materialized across all tokens simultaneously. This is controlled by set_vocab_mapping()
+        which sets _T2D_MAPPING on the utils module.
+
+        With target_micro_batch_size > 0, samples are additionally processed in micro-batches
+        for further memory savings on the KV cache side.
+
+        Memory chain for a 20K-token sample on vocab_size=248K, draft_vocab=32K:
+        - Without optimization: ~19 GiB (full-vocab logits for all tokens)
+        - With logits-processor projection: ~2.2 GiB (chunk peak + projected logits)
+        - With micro-batch + projection: same logits savings + KV cache savings
+
+        Args:
+            target_micro_batch_size: Number of samples per micro-batch for target inference.
+                0 = process all samples at once (original behavior).
+                1 = process one sample at a time (minimum memory usage, recommended for large vocab).
         """
-        if is_vlm:
-            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                self.extend_vlm(
+        batch_size = input_ids.shape[0]
+        use_micro_batch = target_micro_batch_size > 0
+
+        if not use_micro_batch:
+            # --- Process all samples at once ---
+            # Note: even without micro-batching, early projection happens inside the
+            # logits processor if _T2D_MAPPING is set (via set_vocab_mapping).
+            if is_vlm:
+                (
+                    data_cache, logits_list, aux_hidden_states_list,
+                    last_hidden_states_list, logits_pre_projected,
+                    target_in_draft_mask_list,
+                ) = self.extend_vlm(
                     input_ids,
                     attention_mask,
                     loss_mask,
@@ -711,17 +1146,263 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                 )
-            )
-        else:
-            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                self.extend(
+            else:
+                (
+                    data_cache, logits_list, aux_hidden_states_list,
+                    last_hidden_states_list, logits_pre_projected,
+                    target_in_draft_mask_list,
+                ) = self.extend(
                     input_ids,
                     attention_mask,
                     loss_mask,
                     return_last_hidden_states=False,
                     return_logits=True,
                 )
+
+            if logits_pre_projected:
+                # Logits are already projected to draft vocab inside logits processor
+                return self._assemble_eagle3_output_projected(
+                    data_cache, logits_list, aux_hidden_states_list,
+                    target_in_draft_mask_list, attention_mask,
+                )
+            else:
+                return self._assemble_eagle3_output(
+                    data_cache, logits_list, aux_hidden_states_list,
+                    last_hidden_states_list, attention_mask,
+                )
+
+        # --- Memory-optimized path: micro-batch ---
+        mbs = target_micro_batch_size
+
+        # Split inputs into micro-batches
+        input_ids_splits = torch.split(input_ids, mbs, dim=0)
+        attention_mask_splits = torch.split(attention_mask, mbs, dim=0)
+        loss_mask_splits = torch.split(loss_mask, mbs, dim=0)
+
+        # Handle VLM pixel_values and image_grid_thw splitting
+        if is_vlm and image_grid_thw is not None:
+            if isinstance(image_grid_thw, (list, tuple)):
+                image_grid_thw_splits = [
+                    image_grid_thw[i : i + mbs]
+                    for i in range(0, len(image_grid_thw), mbs)
+                ]
+            else:
+                image_grid_thw_splits = [None] * len(input_ids_splits)
+            pixel_values_splits = self._split_pixel_values_by_grid_thw(
+                pixel_values, image_grid_thw, mbs
             )
+        else:
+            image_grid_thw_splits = [None] * len(input_ids_splits)
+            pixel_values_splits = [None] * len(input_ids_splits)
+
+        # Process micro-batches
+        all_aux_hidden_states = []
+        all_projected_logits = []
+        all_target_in_draft_mask = []
+        all_input_ids = []
+        all_loss_mask = []
+        any_pre_projected = False
+
+        for mb_idx, (ids_mb, attn_mb, lm_mb) in enumerate(
+            zip(input_ids_splits, attention_mask_splits, loss_mask_splits)
+        ):
+            # Forward through target model
+            if is_vlm:
+                (
+                    data_cache, logits_list, aux_hs_list, _,
+                    logits_pre_projected, timd_list,
+                ) = self.extend_vlm(
+                    ids_mb, attn_mb, lm_mb,
+                    return_last_hidden_states=False,
+                    return_logits=True,
+                    pixel_values=pixel_values_splits[mb_idx],
+                    image_grid_thw=image_grid_thw_splits[mb_idx],
+                )
+            else:
+                (
+                    data_cache, logits_list, aux_hs_list, _,
+                    logits_pre_projected, timd_list,
+                ) = self.extend(
+                    ids_mb, attn_mb, lm_mb,
+                    return_last_hidden_states=False,
+                    return_logits=True,
+                )
+
+            if logits_pre_projected:
+                any_pre_projected = True
+
+            # Collect per-sample results
+            for i, (data, logits, aux_hs, timd) in enumerate(
+                zip(data_cache, logits_list, aux_hs_list, timd_list)
+            ):
+                all_aux_hidden_states.append(aux_hs.unsqueeze(0))
+                all_input_ids.append(data[0])
+                all_loss_mask.append(data[2])
+
+                if logits is not None:
+                    # Determine if logits are actually projected by checking shape,
+                    # NOT relying on the logits_pre_projected flag alone.
+                    # This is the most reliable check: if the last dimension matches
+                    # draft_vocab_size, it's projected; if it matches full vocab, it's not.
+                    t2d = self._t2d
+                    draft_vocab_size = int(t2d.sum().item()) if t2d is not None else None
+                    actually_projected = (
+                        draft_vocab_size is not None
+                        and logits.shape[-1] == draft_vocab_size
+                    )
+
+                    if actually_projected:
+                        # Already projected inside logits processor
+                        all_projected_logits.append(logits.unsqueeze(0))
+                        all_target_in_draft_mask.append(
+                            timd.unsqueeze(0) if timd is not None else None
+                        )
+                        any_pre_projected = True
+                    elif t2d is not None:
+                        # Fallback: logits processor claimed projected but shape disagrees,
+                        # or logits_pre_projected was False.  Project here.
+                        if logits_pre_projected and logits.shape[-1] != draft_vocab_size:
+                            print(
+                                f"[Eagle3] WARNING: logits_pre_projected=True but "
+                                f"logits.shape[-1]={logits.shape[-1]} != "
+                                f"draft_vocab_size={draft_vocab_size}. "
+                                f"Applying fallback projection for mb={mb_idx}, sample={i}."
+                            )
+                        target_max_token = logits.argmax(-1)
+                        in_draft_mask = t2d[target_max_token]
+                        projected = logits[..., t2d]
+                        del logits, target_max_token
+                        all_projected_logits.append(projected.unsqueeze(0))
+                        all_target_in_draft_mask.append(in_draft_mask.unsqueeze(0))
+                        any_pre_projected = True
+                    else:
+                        all_projected_logits.append(logits.unsqueeze(0))
+                        all_target_in_draft_mask.append(None)
+                else:
+                    all_projected_logits.append(None)
+                    all_target_in_draft_mask.append(None)
+
+            # Free memory after each micro-batch
+            del data_cache, logits_list, aux_hs_list, timd_list
+            torch.cuda.empty_cache()
+
+        # --- Assembly: cat all samples, NO padding here ---
+        # Padding is deferred to run_forward() in train_eagle3.py, AFTER
+        # get_dp_data_shard_from_tp() reduces the batch from tp_size (e.g. 8)
+        # to 1 per GPU.  This avoids the 2x peak memory that padding causes
+        # on the large logits tensor (e.g. 9.77 GiB for 8×20480×32000 bf16).
+
+        aux_hidden_states_out = torch.cat(all_aux_hidden_states, dim=0)
+        del all_aux_hidden_states
+
+        input_ids_out = torch.cat(all_input_ids, dim=0)
+        del all_input_ids
+
+        loss_mask_out = torch.cat(all_loss_mask, dim=0)
+        del all_loss_mask
+
+        # Assemble logits: defensive project full-vocab samples, then cat
+        t2d = self._t2d
+        has_logits = all_projected_logits[0] is not None
+
+        if has_logits:
+            draft_vocab_size = int(t2d.sum().item()) if t2d is not None else None
+            full_vocab_size = t2d.shape[0] if t2d is not None else None
+
+            for s_idx in range(len(all_projected_logits)):
+                logits_s = all_projected_logits[s_idx]
+                if logits_s is None:
+                    continue
+                # Defensive: project full-vocab samples
+                if t2d is not None and logits_s.shape[-1] == full_vocab_size:
+                    print(
+                        f"[Eagle3] WARNING: sample {s_idx} logits has full-vocab "
+                        f"shape {logits_s.shape}. Projecting to draft_vocab ({draft_vocab_size})."
+                    )
+                    logits_2d = logits_s.squeeze(0)  # (S, full_V)
+                    max_token = logits_2d.argmax(-1)
+                    timd_s = t2d[max_token].unsqueeze(0)
+                    logits_s = logits_2d[..., t2d].unsqueeze(0)
+                    all_projected_logits[s_idx] = logits_s
+                    all_target_in_draft_mask[s_idx] = timd_s
+                    any_pre_projected = True
+                    del logits_2d, max_token
+
+            target_out = torch.cat(
+                [x for x in all_projected_logits if x is not None], dim=0
+            )
+            del all_projected_logits
+            torch.cuda.empty_cache()
+
+            has_timd = any(x is not None for x in all_target_in_draft_mask)
+            if has_timd:
+                target_in_draft_mask = torch.cat(
+                    [x for x in all_target_in_draft_mask if x is not None], dim=0
+                )
+            else:
+                target_in_draft_mask = None
+            del all_target_in_draft_mask
+        else:
+            target_out = None
+            target_in_draft_mask = None
+
+        loss_mask_out = loss_mask_out[..., None]
+
+        return Eagle3TargetOutput(
+            hidden_states=aux_hidden_states_out,
+            target=target_out,
+            loss_mask=loss_mask_out,
+            input_ids=input_ids_out,
+            attention_mask=attention_mask,
+            target_in_draft_mask=target_in_draft_mask,
+            pre_projected=any_pre_projected,
+        )
+
+    def _split_pixel_values_by_grid_thw(
+        self,
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[List[torch.Tensor]],
+        micro_batch_size: int,
+    ) -> List[Optional[torch.Tensor]]:
+        """Split pixel_values into micro-batches based on image_grid_thw patch counts."""
+        if pixel_values is None or image_grid_thw is None:
+            return [None]
+
+        if not isinstance(image_grid_thw, (list, tuple)):
+            image_grid_thw = [image_grid_thw]
+
+        # Calculate patch counts per sample
+        patch_counts = []
+        for thw in image_grid_thw:
+            if thw is not None:
+                if thw.dim() == 1:
+                    thw = thw.unsqueeze(0)
+                n_patches = (thw[:, 0] * thw[:, 1] * thw[:, 2]).sum().item()
+                patch_counts.append(int(n_patches))
+            else:
+                patch_counts.append(0)
+
+        # Split pixel_values by micro-batch
+        splits = []
+        offset = 0
+        for i in range(0, len(patch_counts), micro_batch_size):
+            mb_patch_count = sum(patch_counts[i : i + micro_batch_size])
+            if mb_patch_count > 0:
+                splits.append(pixel_values[offset : offset + mb_patch_count])
+                offset += mb_patch_count
+            else:
+                splits.append(None)
+        return splits
+
+    def _assemble_eagle3_output(
+        self,
+        data_cache,
+        logits_list,
+        aux_hidden_states_list,
+        last_hidden_states_list,
+        attention_mask,
+    ) -> Eagle3TargetOutput:
+        """Assemble Eagle3TargetOutput from raw extend/extend_vlm results (original path)."""
         aux_hidden_states_out = []
         target_out = []
         loss_mask_out = []
@@ -737,8 +1418,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             loss_mask_out.append(data[2])
             input_ids_out.append(data[0])
 
-            # when generating hidden states for offline training, we don't compute logits and only keep the last_hidden_states
-            # when training online, we don't keep the last_hidden_states and only keep the logits
             if logits is not None:
                 target_out.append(logits.unsqueeze(0))
             else:
@@ -764,8 +1443,48 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             last_hidden_states_out = None
 
-        target_out = padding(target_out, left=False)
-        input_ids_out = padding(input_ids_out, left=False)
+        # --- Defensive fallback: project full-vocab logits ---
+        # Check based on actual shape, not flags.  Use chunked projection to
+        # avoid OOM during the fallback itself (full-vocab tensor is ~9.5 GiB).
+        pre_projected = False
+        target_in_draft_mask = None
+        if target_out is not None and self._t2d is not None:
+            t2d = self._t2d
+            full_vocab_size = t2d.shape[0]
+            draft_vocab_size = int(t2d.sum().item())
+            if target_out.shape[-1] == full_vocab_size:
+                print(
+                    f"[Eagle3] WARNING: _assemble_eagle3_output received full-vocab "
+                    f"logits {target_out.shape}. Applying chunked defensive projection "
+                    f"to draft_vocab ({draft_vocab_size})."
+                )
+                batch_dim = target_out.shape[0]
+                seq_dim = target_out.shape[1]
+                projected_out = torch.empty(
+                    batch_dim, seq_dim, draft_vocab_size,
+                    dtype=target_out.dtype, device=target_out.device,
+                )
+                all_in_draft = torch.empty(
+                    batch_dim, seq_dim,
+                    dtype=torch.bool, device=target_out.device,
+                )
+                for b in range(batch_dim):
+                    sample_logits = target_out[b]  # (S, V)
+                    sample_max = sample_logits.argmax(-1)  # (S,)
+                    all_in_draft[b] = t2d[sample_max]
+                    projected_out[b] = sample_logits[..., t2d]
+                    del sample_logits, sample_max
+
+                del target_out
+                torch.cuda.empty_cache()
+                target_out = projected_out
+                target_in_draft_mask = all_in_draft
+                pre_projected = True
+
+        # NOTE: padding is NOT done here — it is deferred to run_forward() in
+        # train_eagle3.py, AFTER get_dp_data_shard_from_tp() reduces the batch
+        # from tp_size (e.g. 8) to 1.  This avoids 2x peak memory on the large
+        # logits tensor (e.g. 9.77 GiB for 8×20480×32000 bf16).
         loss_mask_out = loss_mask_out[..., None]
 
         return Eagle3TargetOutput(
@@ -775,6 +1494,105 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             input_ids=input_ids_out,
             attention_mask=attention_mask,
             last_hidden_states=last_hidden_states_out,
+            target_in_draft_mask=target_in_draft_mask,
+            pre_projected=pre_projected,
+        )
+
+    def _assemble_eagle3_output_projected(
+        self,
+        data_cache,
+        logits_list,
+        aux_hidden_states_list,
+        target_in_draft_mask_list,
+        attention_mask,
+    ) -> Eagle3TargetOutput:
+        """Assemble Eagle3TargetOutput when logits are pre-projected to draft vocab."""
+        aux_hidden_states_out = []
+        target_out = []
+        loss_mask_out = []
+        input_ids_out = []
+        timd_out = []
+
+        for data, logits, aux_hs, timd in zip(
+            data_cache, logits_list, aux_hidden_states_list, target_in_draft_mask_list
+        ):
+            aux_hidden_states_out.append(aux_hs.unsqueeze(0))
+            loss_mask_out.append(data[2])
+            input_ids_out.append(data[0])
+
+            if logits is not None:
+                target_out.append(logits.unsqueeze(0))
+            else:
+                target_out.append(None)
+
+            if timd is not None:
+                timd_out.append(timd.unsqueeze(0))
+            else:
+                timd_out.append(None)
+
+        aux_hidden_states_out = torch.cat(aux_hidden_states_out, dim=0)
+        loss_mask_out = torch.cat(loss_mask_out, dim=0)
+        input_ids_out = torch.cat(input_ids_out, dim=0)
+
+        if target_out[0] is not None:
+            target_out = torch.cat(target_out, dim=0)
+        else:
+            target_out = None
+
+        has_timd = any(x is not None for x in timd_out)
+        if has_timd:
+            target_in_draft_mask = torch.cat(
+                [x for x in timd_out if x is not None], dim=0
+            )
+        else:
+            target_in_draft_mask = None
+
+        # Safety check: even on the "projected" path, verify the shape
+        if target_out is not None and self._t2d is not None:
+            t2d = self._t2d
+            full_vocab_size = t2d.shape[0]
+            draft_vocab_size = int(t2d.sum().item())
+            if target_out.shape[-1] == full_vocab_size:
+                print(
+                    f"[Eagle3] WARNING: _assemble_eagle3_output_projected received "
+                    f"full-vocab logits {target_out.shape}! Applying chunked fallback "
+                    f"to draft_vocab ({draft_vocab_size})."
+                )
+                batch_dim = target_out.shape[0]
+                seq_dim = target_out.shape[1]
+                projected_out = torch.empty(
+                    batch_dim, seq_dim, draft_vocab_size,
+                    dtype=target_out.dtype, device=target_out.device,
+                )
+                all_in_draft = torch.empty(
+                    batch_dim, seq_dim,
+                    dtype=torch.bool, device=target_out.device,
+                )
+                for b in range(batch_dim):
+                    sample_logits = target_out[b]
+                    sample_max = sample_logits.argmax(-1)
+                    all_in_draft[b] = t2d[sample_max]
+                    projected_out[b] = sample_logits[..., t2d]
+                    del sample_logits, sample_max
+                del target_out
+                torch.cuda.empty_cache()
+                target_out = projected_out
+                target_in_draft_mask = all_in_draft
+
+        # NOTE: padding is NOT done here — it is deferred to run_forward() in
+        # train_eagle3.py, AFTER get_dp_data_shard_from_tp() reduces the batch
+        # from tp_size (e.g. 8) to 1.  This avoids 2x peak memory on the large
+        # logits tensor (e.g. 9.77 GiB for 8×20480×32000 bf16).
+        loss_mask_out = loss_mask_out[..., None]
+
+        return Eagle3TargetOutput(
+            hidden_states=aux_hidden_states_out,
+            target=target_out,
+            loss_mask=loss_mask_out,
+            input_ids=input_ids_out,
+            attention_mask=attention_mask,
+            target_in_draft_mask=target_in_draft_mask,
+            pre_projected=True,
         )
 
 

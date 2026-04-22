@@ -34,6 +34,13 @@ def default_torch_dtype(dtype: torch.dtype):
 
 @torch.no_grad()
 def padding(tensor, left=True):
+    """Shift tensor along the sequence dimension by one position.
+
+    For left=False: drops the first token, appends a zero padding at the end.
+    For left=True:  drops the last token, prepends a zero padding at the start.
+    """
+    if tensor is None:
+        return None
     zeropadding = torch.zeros_like(tensor[:, -1:])
     if left:
         tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
@@ -150,8 +157,18 @@ def generate_draft_model_config(
     with open(template_config_path, "r") as f:
         draft_config = json.load(f)
 
+    # Detect if target model is MoE
+    is_moe = (
+        hasattr(target_config, "num_experts")
+        and target_config.num_experts is not None
+        and target_config.num_experts > 0
+    )
+
     # Adjust architecture config based on target model type
-    if hasattr(target_config, "model_type"):
+    if is_moe:
+        draft_config["model_type"] = "qwen3_moe"
+        draft_config["architectures"] = ["Qwen3MoeForCausalLMEagle3"]
+    elif hasattr(target_config, "model_type"):
         # Default to llama architecture
         draft_config["model_type"] = "llama"
 
@@ -178,6 +195,25 @@ def generate_draft_model_config(
             if target_param == "torch_dtype" and isinstance(value, torch.dtype):
                 value = str(value).replace("torch.", "")
             draft_config[draft_param] = value
+
+    # Copy MoE-specific parameters if target is MoE
+    if is_moe:
+        moe_param_mappings = {
+            "num_experts": "num_experts",
+            "num_experts_per_tok": "num_experts_per_tok",
+            "moe_intermediate_size": "moe_intermediate_size",
+            "norm_topk_prob": "norm_topk_prob",
+            "decoder_sparse_step": "decoder_sparse_step",
+        }
+        for target_param, draft_param in moe_param_mappings.items():
+            if hasattr(target_config, target_param):
+                value = getattr(target_config, target_param)
+                if value is not None:
+                    draft_config[draft_param] = value
+
+        # Copy mlp_only_layers if present
+        if hasattr(target_config, "mlp_only_layers") and target_config.mlp_only_layers:
+            draft_config["mlp_only_layers"] = target_config.mlp_only_layers
 
     # Special handling for some parameters
     # Ensure num_hidden_layers is always 1 (EAGLE3 feature)
@@ -328,12 +364,49 @@ def shard_optimizer_state_with_dtensor(bf16_optimizer, device_mesh):
                 )
 
 
+def _normalize_message(msg):
+    """
+    Normalize a single message dict to OpenAI format (role/content).
+    Handles both ShareGPT format (from/value) and OpenAI format (role/content).
+    """
+    if not isinstance(msg, dict):
+        return None
+
+    # Already in OpenAI format (role/content)
+    if "role" in msg and "content" in msg:
+        return msg
+
+    # ShareGPT format (from/value) -> convert to OpenAI format (role/content)
+    if "from" in msg or "value" in msg:
+        role_mapping = {
+            "human": "user",
+            "gpt": "assistant",
+            "system": "system",
+            "tool": "tool",
+            "observation": "tool",
+        }
+        raw_role = msg.get("from", "user")
+        new_msg = {
+            "role": role_mapping.get(raw_role, raw_role),
+            "content": msg.get("value", ""),
+        }
+        # Preserve extra fields (e.g., tool_calls, name, etc.)
+        for k, v in msg.items():
+            if k not in ("from", "value"):
+                new_msg[k] = v
+        return new_msg
+
+    # Unknown format, return as-is
+    return msg
+
+
 def safe_conversations_generator(file_path):
     """
     Generator that:
-    1. Extracts the 'conversations' field.
-    2. Preserves all original fields within each message.
-    3. [Key step] Converts all list/dict-type field values to strings to resolve mixed-type conflicts (e.g., for Arrow compatibility).
+    1. Extracts the 'conversations' or 'messages' field (supports both ShareGPT and OpenAI formats).
+    2. Normalizes all messages to OpenAI format (role/content).
+    3. Preserves all original fields within each message.
+    4. [Key step] Converts all list/dict-type field values to strings to resolve mixed-type conflicts (e.g., for Arrow compatibility).
     """
     with open(file_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
@@ -342,30 +415,32 @@ def safe_conversations_generator(file_path):
                 continue
             try:
                 row = json.loads(line)
-                raw_convs = row.get("conversations", [])
+                # Support both 'conversations' (ShareGPT) and 'messages' (OpenAI) keys
+                raw_convs = row.get("conversations", None) or row.get("messages", [])
 
-                # 1. Ensure 'conversations' is a list
+                # 1. Ensure 'conversations'/'messages' is a list
                 if not isinstance(raw_convs, list):
                     # If it's None or some unexpected type, treat as empty or skip
                     if raw_convs is None:
                         raw_convs = []
                     else:
-                        # Edge case: 'conversations' is a plain string or non-iterable—skip this line
+                        # Edge case: field is a plain string or non-iterable—skip this line
                         logger.warning(
-                            f"Line {i + 1}: 'conversations' is not a list. Please check!"
+                            f"Line {i + 1}: 'conversations'/'messages' is not a list. Please check!"
                         )
                         continue
 
                 cleaned_convs = []
                 for msg in raw_convs:
-                    # 2. Ensure each item in the list is a dictionary
-                    if not isinstance(msg, dict):
+                    # 2. Normalize message to OpenAI format (role/content)
+                    normalized = _normalize_message(msg)
+                    if normalized is None:
                         # Skip if an element is not a dict (e.g., malformed like ["user", "hi"])
                         continue
 
                     # 3. [Core logic] Iterate over all fields in the message (role, content, tools, etc.)
                     new_msg = {}
-                    for k, v in msg.items():
+                    for k, v in normalized.items():
                         # If the value is a list or dict, serialize it to a JSON string
                         # This ensures Arrow treats the column as string type instead of list/struct
                         if isinstance(v, (list, dict)):
