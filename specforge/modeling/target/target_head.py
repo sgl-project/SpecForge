@@ -110,17 +110,25 @@ class TargetHead(nn.Module):
     def forward(self, hidden_states):
         if self.t2d_mapping is not None:
             return self._forward_chunked_projected(hidden_states)
-        return self.fc(hidden_states)
+        return self.fc(hidden_states), None
 
     @torch.no_grad()
     def _forward_chunked_projected(self, hidden_states):
         """Project hidden_states to draft vocab using chunked computation.
+
+        Also computes target_in_draft_mask: for each position, whether the
+        argmax token (in full vocab) falls within the draft vocab.
 
         Without this optimization:
           fc output = (batch, 16384, 248320) ≈ 7.7 GB  →  OOM
         With chunked projection (chunk_size=2048):
           per-chunk peak = (batch, 2048, 248320) ≈ 0.96 GB
           final output   = (batch, 16384, 32000)  ≈ 1.0 GB
+
+        Returns:
+            tuple: (projected_logits, target_in_draft_mask)
+              - projected_logits: (batch, seq_len, draft_vocab_size)
+              - target_in_draft_mask: (batch, seq_len) bool tensor
         """
         t2d = self.t2d_mapping
         if t2d.device != hidden_states.device:
@@ -131,15 +139,23 @@ class TargetHead(nn.Module):
         chunk_size = self.logits_chunk_size if self.logits_chunk_size > 0 else seq_len
 
         projected_chunks = []
+        mask_chunks = []
         for start in range(0, seq_len, chunk_size):
             end = min(start + chunk_size, seq_len)
             chunk = hidden_states[:, start:end, :]
-            full_logits = self.fc(chunk)            # (batch, chunk_len, full_vocab)
-            draft_logits = full_logits[:, :, t2d]   # (batch, chunk_len, draft_vocab)
+            full_logits = self.fc(chunk)              # (batch, chunk_len, full_vocab)
+            # Compute mask: is argmax token in draft vocab?
+            argmax_tokens = full_logits.argmax(dim=-1)  # (batch, chunk_len)
+            chunk_mask = t2d[argmax_tokens]              # (batch, chunk_len) bool
+            mask_chunks.append(chunk_mask)
+            # Project to draft vocab
+            draft_logits = full_logits[:, :, t2d]     # (batch, chunk_len, draft_vocab)
             projected_chunks.append(draft_logits)
-            del full_logits
+            del full_logits, argmax_tokens
 
-        return torch.cat(projected_chunks, dim=1)    # (batch, seq_len, draft_vocab)
+        projected = torch.cat(projected_chunks, dim=1)  # (batch, seq_len, draft_vocab)
+        target_in_draft_mask = torch.cat(mask_chunks, dim=1)  # (batch, seq_len)
+        return projected, target_in_draft_mask
 
     def preprocess(self, input_ids, target, loss_mask):
         # apply pading

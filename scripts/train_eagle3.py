@@ -727,15 +727,18 @@ def run_forward(
                 data["input_ids"], data["target"], data["loss_mask"]
             )
             input_ids = input_ids.cuda()
-            target = target_model(
-                target.cuda()
-            )  # Projects last_hidden_states → logits via lm_head.
-            # When t2d_mapping is set on TargetHead, this produces (batch, seq, draft_vocab)
-            # instead of (batch, seq, full_vocab), using chunked computation to limit peak memory.
+            # target_model(hidden_states) returns:
+            #   - With t2d_mapping: (projected_logits, target_in_draft_mask) — draft vocab
+            #   - Without t2d_mapping: (full_logits, None) — full vocab
+            target_result = target_model(target.cuda())
+            if isinstance(target_result, tuple):
+                target, target_in_draft_mask = target_result
+                if target_in_draft_mask is not None:
+                    pre_projected = True
+            else:
+                # Backward compatibility: old code returned a single tensor
+                target = target_result
             loss_mask = loss_mask.cuda()
-            # Mark as pre-projected if early vocab projection was applied
-            if hasattr(target_model, "t2d_mapping") and target_model.t2d_mapping is not None:
-                pre_projected = True
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
