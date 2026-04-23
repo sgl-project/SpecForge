@@ -25,6 +25,10 @@ class TargetHead(nn.Module):
 
         self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
+        # Early vocab projection support (target-to-draft mapping)
+        self.t2d_mapping = None
+        self.logits_chunk_size = 2048
+
     @classmethod
     def from_pretrained(
         cls,
@@ -86,8 +90,56 @@ class TargetHead(nn.Module):
         for param in self.fc.parameters():
             param.requires_grad = False
 
+    def set_vocab_mapping(self, t2d_mapping):
+        """Set target-to-draft vocab mapping for early projection.
+
+        When set, forward() will project hidden_states to draft_vocab_size
+        instead of full vocab_size, reducing peak memory from
+        (batch, seq_len, 248320) = ~7.7 GB to (batch, seq_len, 32000) = ~1 GB.
+        """
+        self.t2d_mapping = t2d_mapping
+
+    def set_logits_chunk_size(self, chunk_size):
+        """Set chunk size for chunked logits computation.
+
+        Computes logits in chunks along the sequence dimension to limit peak
+        memory to (batch, chunk_size, vocab_size) instead of (batch, seq_len, vocab_size).
+        """
+        self.logits_chunk_size = chunk_size
+
     def forward(self, hidden_states):
+        if self.t2d_mapping is not None:
+            return self._forward_chunked_projected(hidden_states)
         return self.fc(hidden_states)
+
+    @torch.no_grad()
+    def _forward_chunked_projected(self, hidden_states):
+        """Project hidden_states to draft vocab using chunked computation.
+
+        Without this optimization:
+          fc output = (batch, 16384, 248320) ≈ 7.7 GB  →  OOM
+        With chunked projection (chunk_size=2048):
+          per-chunk peak = (batch, 2048, 248320) ≈ 0.96 GB
+          final output   = (batch, 16384, 32000)  ≈ 1.0 GB
+        """
+        t2d = self.t2d_mapping
+        if t2d.device != hidden_states.device:
+            t2d = t2d.to(hidden_states.device)
+            self.t2d_mapping = t2d  # cache on correct device
+
+        seq_len = hidden_states.shape[1]
+        chunk_size = self.logits_chunk_size if self.logits_chunk_size > 0 else seq_len
+
+        projected_chunks = []
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            chunk = hidden_states[:, start:end, :]
+            full_logits = self.fc(chunk)            # (batch, chunk_len, full_vocab)
+            draft_logits = full_logits[:, :, t2d]   # (batch, chunk_len, draft_vocab)
+            projected_chunks.append(draft_logits)
+            del full_logits
+
+        return torch.cat(projected_chunks, dim=1)    # (batch, seq_len, draft_vocab)
 
     def preprocess(self, input_ids, target, loss_mask):
         # apply pading

@@ -729,8 +729,13 @@ def run_forward(
             input_ids = input_ids.cuda()
             target = target_model(
                 target.cuda()
-            )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
+            )  # Projects last_hidden_states → logits via lm_head.
+            # When t2d_mapping is set on TargetHead, this produces (batch, seq, draft_vocab)
+            # instead of (batch, seq, full_vocab), using chunked computation to limit peak memory.
             loss_mask = loss_mask.cuda()
+            # Mark as pre-projected if early vocab projection was applied
+            if hasattr(target_model, "t2d_mapping") and target_model.t2d_mapping is not None:
+                pre_projected = True
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -846,19 +851,18 @@ def main():
 
     # Pass vocab mapping to target model for early projection (memory optimization).
     # This is critical for large-vocab models (e.g. 248K vocab): without it, the full-
-    # vocab logits tensor (~9.5 GiB for 20K tokens) would cause OOM during padding.
-    # Early projection reduces this to ~1.2 GiB (draft_vocab=32K).
-    # We set it unconditionally for all online modes (both micro-batch and full-batch),
-    # since the early projection happens inside the logits processor and benefits both.
-    if is_online and hasattr(draft_model, "t2d") and hasattr(target_model, "set_vocab_mapping"):
+    # vocab logits tensor (~7.7 GiB for 16K tokens) would cause OOM.
+    # Early projection reduces this to ~1.0 GiB (draft_vocab=32K).
+    # Works for both online mode (SGLang logits processor) and offline mode (TargetHead).
+    if hasattr(draft_model, "t2d") and hasattr(target_model, "set_vocab_mapping"):
         target_model.set_vocab_mapping(draft_model.t2d)
+        mode_str = "online" if is_online else "offline"
         print_with_rank(
-            f"Early vocab projection enabled (full_vocab → draft_vocab). "
-            f"micro_batch_size={args.target_micro_batch_size}"
+            f"Early vocab projection enabled ({mode_str}, full_vocab → draft_vocab)"
         )
 
     # Set chunked logits computation size (memory optimization)
-    if is_online and hasattr(target_model, "set_logits_chunk_size"):
+    if hasattr(target_model, "set_logits_chunk_size"):
         target_model.set_logits_chunk_size(args.logits_chunk_size)
         if args.logits_chunk_size > 0:
             vocab_size = getattr(draft_model.config, "vocab_size", 248320)
