@@ -330,7 +330,34 @@ def build_target_model(
             )
 
         # set the aux hidden states layers
-        if (
+        if args.load_mtp_weights:
+            # MTP single-hidden-state regime: the draft consumes ONE hidden state
+            # from the target's last transformer layer (matching how the target's
+            # native MTP head is wired in inference). We therefore configure the
+            # target to capture exactly one layer — the last one — so that the
+            # tensor reaching OnlineEagle3Model.forward has shape [B, S, H] and
+            # `project_hidden_states` can stay an identity pass-through.
+            from transformers import AutoConfig as _AutoConfig
+
+            _t_cfg = _AutoConfig.from_pretrained(
+                args.target_model_path,
+                trust_remote_code=args.trust_remote_code,
+            )
+            # Multimodal targets nest the LM config under `text_config`.
+            _text_cfg = getattr(_t_cfg, "text_config", _t_cfg)
+            if not hasattr(_text_cfg, "num_hidden_layers"):
+                raise ValueError(
+                    "Cannot determine target's num_hidden_layers for MTP mode "
+                    "from config; expected `num_hidden_layers` on either the "
+                    "root config or `text_config`."
+                )
+            _last_layer_idx = _text_cfg.num_hidden_layers - 1
+            print_on_rank0(
+                f"[MTP] Configuring target to capture single hidden state "
+                f"from last transformer layer (idx={_last_layer_idx})."
+            )
+            target_model.set_aux_hidden_states_layers([_last_layer_idx])
+        elif (
             hasattr(draft_model_config, "eagle_config")
             and draft_model_config.eagle_config is not None
             and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config

@@ -1219,7 +1219,30 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
         MTP-compatible backbone: fc fusion at every TTT step.
 
         Flow: fc(cat(norm(emb), norm(hidden))) → midlayer(fused)
+
+        IMPORTANT: `hidden_states` MUST have last-dim == `config.hidden_size`
+        (i.e. ONE hidden state from the target's last transformer layer). This
+        matches the target MTP head's single-hidden-state regime. If the target
+        is dumping multiple aux layers concatenated as [B, S, N*H] (eagle3
+        default), the trainer must configure the target to capture exactly one
+        layer (the last) — see scripts/train_eagle3.py build_target_model
+        MTP branch. Without this, RMSNorm broadcast would silently surface as
+        an opaque dynamo shape error under the flex_attention path.
         """
+        H = self.config.hidden_size
+        assert hidden_states.shape[-1] == H, (
+            f"[MTP] backbone() received hidden_states with last-dim "
+            f"{hidden_states.shape[-1]}, expected {H}. The target is likely "
+            f"dumping multiple aux hidden layers (eagle3 3-layer concat). "
+            f"In MTP mode, configure target to capture only the last "
+            f"transformer layer (this is done automatically when "
+            f"--load-mtp-weights is set in scripts/train_eagle3.py)."
+        )
+        assert input_embeds.shape[-1] == H, (
+            f"[MTP] backbone() received input_embeds with last-dim "
+            f"{input_embeds.shape[-1]}, expected {H}."
+        )
+
         emb_normed = self.pre_fc_norm_embedding(input_embeds)
         hid_normed = self.pre_fc_norm_hidden(hidden_states)
         fused = self.fc(torch.cat([emb_normed, hid_normed], dim=-1))
