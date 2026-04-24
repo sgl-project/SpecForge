@@ -388,8 +388,14 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # Share RoPE init with SDPA attention
+        # Share RoPE init with SDPA attention.
+        # NOTE: nn.Module.__init__(_attn) is required because __new__ alone
+        # does NOT set up the internal `_modules` / `_parameters` dicts that
+        # nn.Module.__setattr__ relies on. Without it, `self.rotary_emb = ...`
+        # inside `_init_rope` raises:
+        #   "AttributeError: cannot assign module before Module.__init__() call"
         _attn = Qwen3MoeMTPAttention.__new__(Qwen3MoeMTPAttention)
+        nn.Module.__init__(_attn)
         _attn.config = config
         _attn.head_dim = self.head_dim
         _attn.max_position_embeddings = self.max_position_embeddings
