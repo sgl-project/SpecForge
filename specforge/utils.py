@@ -383,7 +383,7 @@ def safe_conversations_generator(file_path, is_vlm=False):
                     image = row.get("image", "")
                     result = {
                         "conversations": cleaned_convs,
-                        "image":image,
+                        "image": image,
                     }
                 else:
                     result = {"conversations": cleaned_convs}
