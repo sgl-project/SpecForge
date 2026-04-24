@@ -58,9 +58,9 @@ class TemplateRegistry:
             template(ChatTemplate): The chat template.
             override(bool): Whether to override the existing template, default to False
         """
-        assert (
-            not override and name not in self.templates
-        ), f"Chat template for the model type {name} has already been registered"
+        assert not override and name not in self.templates, (
+            f"Chat template for the model type {name} has already been registered"
+        )
         self.templates[name] = template
 
     def get(self, name: str) -> ChatTemplate:
@@ -286,7 +286,7 @@ TEMPLATE_REGISTRY.register(
     template=ChatTemplate(
         assistant_header="<start_of_turn>model\n",
         user_header="<start_of_turn>user\n",
-        system_prompt="You are a helpful assistant.",
+        system_prompt=None,
         end_of_turn_token="<end_of_turn>\n",
     ),
 )
@@ -320,6 +320,18 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="",
         end_of_turn_token="<|im_end|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="gemma-4",
+    template=ChatTemplate(
+        assistant_header="<|turn>model\n",
+        user_header="<|turn>user\n",
+        system_prompt="",
+        end_of_turn_token="<turn|>\n",
         parser_type="thinking",
         enable_thinking=True,
     ),

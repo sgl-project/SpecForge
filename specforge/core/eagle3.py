@@ -153,9 +153,13 @@ class OnlineEagle3Model(Eagle3Model):
             position_ids: (batch, seq_len)
         """
         # Step 1: handle vocab size
+        # When draft_vocab_size == vocab_size, skip the d2t/t2d mapping entirely.
+        use_vocab_mapping = (
+            self.draft_model.draft_vocab_size != self.draft_model.vocab_size
+        )
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,
-            t2d=self.draft_model.t2d,
+            t2d=self.draft_model.t2d if use_vocab_mapping else None,
             loss_mask=loss_mask,
             length=self.length,
         )
@@ -439,9 +443,13 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         )
 
         # Step 1: handle vocab size
+        # When draft_vocab_size == vocab_size, skip the d2t/t2d mapping entirely.
+        use_vocab_mapping = (
+            self.draft_model.draft_vocab_size != self.draft_model.vocab_size
+        )
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,
-            t2d=self.draft_model.t2d,
+            t2d=self.draft_model.t2d if use_vocab_mapping else None,
             loss_mask=loss_mask,
             length=self.length,
         )
@@ -567,11 +575,18 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():
-        target_p, position_mask = _compute_target_p(
-            target=target,
-            t2d=t2d,
-            loss_mask=loss_mask,
-        )
+        if t2d is None:
+            # draft_vocab_size == target_vocab_size: skip d2t/t2d mapping
+            target_p, position_mask = _compute_target_p_full_vocab(
+                target=target,
+                loss_mask=loss_mask,
+            )
+        else:
+            target_p, position_mask = _compute_target_p(
+                target=target,
+                t2d=t2d,
+                loss_mask=loss_mask,
+            )
 
         assert len(target_p.shape) == 3
         target_p_padded = F.pad(
@@ -583,6 +598,16 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
         )
 
         return target_p_padded, position_mask
+
+
+@torch.compile(dynamic=None)
+def _compute_target_p_full_vocab(target, loss_mask):
+    """Fast path when draft_vocab_size == target_vocab_size (no vocab subsetting)."""
+    target_head = target.float()
+    target_p = nn.Softmax(dim=2)(target_head)
+    target_p = target_p.detach()
+    # All target tokens are in the draft vocab, so position_mask == loss_mask.
+    return target_p, loss_mask
 
 
 @torch.compile(dynamic=None)

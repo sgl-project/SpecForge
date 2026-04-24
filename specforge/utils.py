@@ -379,6 +379,10 @@ def safe_conversations_generator(file_path):
                 # Build result with conversations
                 result = {"conversations": cleaned_convs}
 
+                # Preserve 'text' field if present (for preformatted data)
+                if "text" in row:
+                    result["text"] = row["text"]
+
                 # Preserve 'tools' field if present
                 if "tools" in row:
                     tools = row["tools"]
