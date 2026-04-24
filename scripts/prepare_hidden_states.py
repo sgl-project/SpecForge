@@ -618,7 +618,7 @@ def main():
         print_with_rank("Loading/building dataset cache...")
         dataset = Dataset.from_generator(
             generator=safe_conversations_generator,
-            gen_kwargs={"file_path": args.data_path},
+            gen_kwargs={"file_path": args.data_path, "is_vlm": args.is_vlm},
             cache_dir=os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "cache",

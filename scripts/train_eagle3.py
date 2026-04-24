@@ -456,7 +456,7 @@ def build_dataloaders(
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = Dataset.from_generator(
         generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.train_data_path},
+        gen_kwargs={"file_path": args.train_data_path, "is_vlm": args.is_vlm},
     )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
@@ -507,7 +507,7 @@ def build_dataloaders(
         if args.eval_data_path is not None:
             eval_dataset = Dataset.from_generator(
                 generator=safe_conversations_generator,
-                gen_kwargs={"file_path": args.eval_data_path},
+                gen_kwargs={"file_path": args.eval_data_path, "is_vlm": args.is_vlm},
             )
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
