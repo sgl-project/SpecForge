@@ -3,7 +3,6 @@ import logging
 import os
 import re
 from contextlib import contextmanager
-from unittest import result
 
 import torch
 import torch.distributed as dist
@@ -383,11 +382,11 @@ def safe_conversations_generator(file_path, is_vlm=False):
                 if is_vlm:
                     image = row.get("image", "")
                     result = {
-                        "conversation":cleaned_convs,
-                        "image":image
+                        "conversations": cleaned_convs,
+                        "image":image,
                     }
                 else:
-                     result = {"conversations": cleaned_convs}
+                    result = {"conversations": cleaned_convs}
 
                 # Preserve 'tools' field if present
                 if "tools" in row:
