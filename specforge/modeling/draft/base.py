@@ -114,6 +114,28 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         self.embed_tokens.weight.requires_grad = False
 
+    def freeze_lm_head(self) -> None:
+        """
+        Freeze the lm_head of the draft model so that it is not updated during
+        training. This is required by MTP-style draft training where the
+        draft's lm_head is initialised from the target model and must remain
+        bit-identical to the target so the trained draft weights can be
+        plugged back into the target's MTP slot without any quality loss.
+
+        The default implementation freezes ``self.lm_head`` if present, which
+        covers the common case of ``nn.Linear(hidden_size, vocab_size)``.
+        Sub-classes whose lm_head is structured differently (e.g. shared with
+        the embedding) should override this method.
+        """
+        if not hasattr(self, "lm_head") or self.lm_head is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no `lm_head` attribute; cannot "
+                "freeze it. Either implement `freeze_lm_head` in the subclass "
+                "or expose an `lm_head` module."
+            )
+        for p in self.lm_head.parameters():
+            p.requires_grad = False
+
     @torch.no_grad()
     def load_embedding(
         self, model_path: str, embedding_key: str = "model.embed_tokens.weight"

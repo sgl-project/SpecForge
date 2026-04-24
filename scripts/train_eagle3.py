@@ -468,20 +468,40 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
 
-    # Load MTP weights for MoE draft models if requested
-    if (
-        args.load_mtp_weights
-        and hasattr(draft_model, "load_mtp_weights")
-        and not draft_model_last_checkpoint
-    ):
-        print_on_rank0(
-            f"Loading MTP weights from {args.target_model_path} "
-            f"(mtp_block_{args.mtp_layer_idx})"
-        )
-        draft_model.load_mtp_weights(
-            args.target_model_path,
-            mtp_layer_idx=args.mtp_layer_idx,
-        )
+    # Load MTP weights for MoE draft models if requested.
+    # Two paths:
+    #   (a) Fresh start (no checkpoint) — copy ALL weights from target MTP head
+    #       so the draft model is initialized as an exact replica.
+    #   (b) Resume — checkpoint was saved WITHOUT lm_head (it is frozen and
+    #       always equal to target's `mtp.layers.{idx}.shared_head.head`).
+    #       Reload ONLY lm_head so the resumed model matches the original init.
+    if args.load_mtp_weights and hasattr(draft_model, "load_mtp_weights"):
+        if not draft_model_last_checkpoint:
+            print_on_rank0(
+                f"Loading MTP weights from {args.target_model_path} "
+                f"(mtp_block_{args.mtp_layer_idx})"
+            )
+            draft_model.load_mtp_weights(
+                args.target_model_path,
+                mtp_layer_idx=args.mtp_layer_idx,
+            )
+        else:
+            print_on_rank0(
+                f"Resume detected: re-loading lm_head only from target MTP "
+                f"(mtp_block_{args.mtp_layer_idx}) — other weights kept from checkpoint"
+            )
+            draft_model.load_mtp_weights(
+                args.target_model_path,
+                mtp_layer_idx=args.mtp_layer_idx,
+                only_lm_head=True,
+            )
+
+    # MTP mode: freeze the (full-vocab) lm_head so it stays identical to
+    # target's `shared_head.head`. This is what makes the trained draft
+    # weights drop-in compatible with target's native MTP inference path.
+    if args.load_mtp_weights and hasattr(draft_model, "freeze_lm_head"):
+        draft_model.freeze_lm_head()
+        print_on_rank0("Froze draft lm_head (MTP target-equivalence guarantee)")
 
     return draft_model_config, draft_model, ckpt_info, resume_state
 
@@ -619,10 +639,28 @@ def save_checkpoints(
             "args": args,
         }
         state_to_save.update(optimizer.state_dict())
+        # Filter out:
+        #   - embed_tokens: shared with target (loaded from `target_model_path`
+        #     via `load_embedding`), kept frozen.
+        #   - lm_head: in MTP mode this is also frozen and identical to
+        #     target's `shared_head.head`; on resume we reload it from
+        #     `target_model_path` (see `build_draft_model`). For Eagle3 mode
+        #     the draft lm_head is shaped (draft_vocab, hidden) and is small
+        #     enough that the filter still saves ~tens of MB without harm
+        #     since `from_pretrained` will simply re-init missing keys from
+        #     the config (Eagle3 baseline already trains lm_head — keep it!).
+        # To stay backwards-compatible with Eagle3, only filter lm_head when
+        # it is frozen (i.e. MTP mode).
+        lm_head_frozen = (
+            args.load_mtp_weights
+            and hasattr(eagle3_model.draft_model, "freeze_lm_head")
+        )
         draft_model_state_dict = {
             k.replace("draft_model.", ""): v
             for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
+            if "draft_model." in k
+            and "embed" not in k.lower()
+            and not (lm_head_frozen and "lm_head" in k)
         }
 
         if dist.get_rank() == 0:
@@ -875,6 +913,16 @@ def main():
             )
         else:
             print_with_rank("Chunked logits disabled (--logits-chunk-size 0)")
+
+    # Draft-side chunked lm_head (memory optimization for full-vocab MTP head).
+    # The MTP draft has a 248K-vocab lm_head; computing logits in chunks and
+    # immediately t2d-projecting to draft_vocab keeps peak activation memory
+    # bounded. Only available on MTP-compatible draft models.
+    if hasattr(draft_model, "set_lm_head_chunk_size") and args.logits_chunk_size > 0:
+        draft_model.set_lm_head_chunk_size(args.logits_chunk_size)
+        print_with_rank(
+            f"Draft lm_head chunked: chunk_size={args.logits_chunk_size} tokens"
+        )
 
     # Calculate total steps if not provided
     if args.total_steps is None:

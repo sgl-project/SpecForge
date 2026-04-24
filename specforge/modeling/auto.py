@@ -20,6 +20,7 @@ from transformers import (
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .draft.qwen3_moe_eagle import Qwen3MoeForCausalLMEagle3
+from .draft.qwen3_moe_mtp import Qwen3MoeForCausalLMMTP
 from .target.custom_backend import (
     GptOssForCausalLM,
     Llama4ForCausalLM,
@@ -38,11 +39,23 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         Qwen3MoeConfig: Qwen3MoeForCausalLMEagle3,
     }
 
+    # Architecture-level mapping for disambiguating configs that map to multiple model classes
+    # (e.g., Qwen3MoeConfig can be either Eagle3 or MTP)
+    _arch_model_mapping = {
+        "LlamaForCausalLMEagle3": LlamaForCausalLMEagle3,
+        "Qwen3MoeForCausalLMEagle3": Qwen3MoeForCausalLMEagle3,
+        "Qwen3MoeForCausalLMMTP": Qwen3MoeForCausalLMMTP,
+    }
+
     @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
         This class method takes a configuration object and create its model based on the
         _model_mapping class variable.
+
+        When multiple model classes share the same config type (e.g., Qwen3MoeConfig
+        for both Eagle3 and MTP), the architectures field in the config is used to
+        disambiguate.
 
         Args:
             config (PretrainedConfig): A configuration object.
@@ -50,8 +63,13 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         Returns:
             A model instance.
         """
-        # get the model class from the
-        _model_cls = cls._model_mapping[type(config)]
+        # First try architecture-level disambiguation
+        architectures = getattr(config, "architectures", None)
+        if architectures and len(architectures) == 1 and architectures[0] in cls._arch_model_mapping:
+            _model_cls = cls._arch_model_mapping[architectures[0]]
+        else:
+            # Fallback to config-type mapping
+            _model_cls = cls._model_mapping[type(config)]
         model = _model_cls(config, **config_kwargs)
 
         # Convert model to specified dtype if provided
@@ -76,6 +94,39 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         modeling_utils.logger.warning = filtered_warning
 
         try:
+            # Check if we need architecture-level disambiguation
+            config_path = os.path.join(str(pretrained_model_name_or_path), "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    raw_config = json.load(f)
+                architectures = raw_config.get("architectures", [])
+                if len(architectures) == 1 and architectures[0] in cls._arch_model_mapping:
+                    _model_cls = cls._arch_model_mapping[architectures[0]]
+                    config = AutoDraftModelConfig.from_file(config_path)
+                    model = _model_cls(config, **kwargs)
+                    # Load weights manually
+                    import glob
+                    from safetensors.torch import load_file
+                    ckpt_files = sorted(glob.glob(os.path.join(str(pretrained_model_name_or_path), "*.safetensors")))
+                    if ckpt_files:
+                        state_dict = {}
+                        for ckpt_file in ckpt_files:
+                            state_dict.update(load_file(ckpt_file))
+                        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                        if missing:
+                            print(f"Missing keys when loading checkpoint: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+                    else:
+                        # Try pytorch_model.bin
+                        pt_path = os.path.join(str(pretrained_model_name_or_path), "pytorch_model.bin")
+                        if os.path.exists(pt_path):
+                            state_dict = torch.load(pt_path, map_location="cpu", weights_only=False)
+                            model.load_state_dict(state_dict, strict=False)
+                    # Apply dtype
+                    torch_dtype = kwargs.get("torch_dtype", None)
+                    if torch_dtype is not None:
+                        model = model.to(dtype=torch_dtype)
+                    return model
+
             model = super().from_pretrained(
                 pretrained_model_name_or_path, *model_args, **kwargs
             )
@@ -136,6 +187,7 @@ class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
         "Qwen3MoeForCausalLMEagle3": Qwen3MoeConfig,
+        "Qwen3MoeForCausalLMMTP": Qwen3MoeConfig,
     }
 
     @classmethod

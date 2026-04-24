@@ -30,6 +30,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
     --sglang-mem-fraction-static 0.4 \
     --save-interval 5000 \
     --report-to wandb \
+    --wandb-project "w1w_moe_mtp" \
+    --wandb-name "qwen3.5-122b-eagle3-moe-run1" \
     --target-micro-batch-size 1 \
     --logits-chunk-size 2048
 

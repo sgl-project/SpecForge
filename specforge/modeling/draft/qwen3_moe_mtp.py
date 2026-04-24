@@ -14,18 +14,33 @@
 # limitations under the License.
 
 """
-Qwen3 MoE Eagle3 Draft Model.
+Qwen3 MoE MTP-Compatible Draft Model.
 
-This module implements an Eagle3 draft model with MoE (Mixture of Experts) layers,
-designed for Qwen3.5-122B-A10B and similar MoE target models. The draft model uses
-the same MoE structure as the target model's MTP heads, enabling weight initialization
-from native MTP and better alignment with the target model's behavior.
+This module implements a draft model that is **structurally identical** to the
+target Qwen3.5 model's native MTP (Multi-Token Prediction) head. After training,
+the weights can be directly merged back into the target model's MTP head for
+native MTP inference, with no separate Eagle3 framework needed at inference time.
 
-Structure alignment with target MTP head:
-- MoE block: router + 256 experts + shared_expert + shared_expert_gate
-- Attention: q_norm / k_norm (RMSNorm on head_dim) between projection and RoPE
-- Top-level: pre_fc_norm_embedding, pre_fc_norm_hidden (applied before fc fusion)
-- Decoder layer: standard input_layernorm as pre-attention norm
+Key differences from Eagle3 (qwen3_moe_eagle.py):
+- fc: Linear(hidden_size*2, hidden_size) — fuses embedding + 1 hidden state
+  (vs Eagle3's 3*hidden_size for 3 target layers)
+- q_proj: Linear(hidden_size, num_heads*head_dim*2) — standard input, output
+  includes sigmoid gate for attn_output_gate
+  (vs Eagle3's Linear(hidden_size*2, num_heads*head_dim))
+- k_proj/v_proj: Linear(hidden_size, ...) — standard input
+  (vs Eagle3's Linear(hidden_size*2, ...))
+- Output gating: attn_output *= sigmoid(gate) where gate comes from q_proj's
+  second half (not present in Eagle3)
+- Decoder layer: standard pre-norm transformer (no input_emb concatenation)
+  (vs Eagle3's cat(input_emb, hidden) → attention)
+- project_hidden_states: identity pass-through (fc fusion moved to backbone)
+  (vs Eagle3's fc(3_layer_hidden) called once before TTT loop)
+- backbone: fc(cat(norm(emb), norm(hidden))) → midlayer(fused)
+  (vs Eagle3's midlayer(input_emb, hidden))
+- lm_head: Linear(hidden_size, vocab_size) — full vocab (248320)
+  (vs Eagle3's Linear(hidden_size, draft_vocab_size=32000))
+- Hidden states: 1 layer from target (last transformer layer)
+  (vs Eagle3's 3 layers from low/mid/high)
 """
 
 from typing import List, Optional, Tuple
@@ -41,31 +56,156 @@ from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
 from .llama3_eagle import (
-    LlamaAttention,
-    LlamaFlashAttention,
-    LlamaFlexAttention,
     LlamaRMSNorm,
-    LlamaUSPFlashAttention,
     prepare_decoder_attention_mask,
+)
+
+# Re-export MoE components from the Eagle3 module (identical structure)
+from .qwen3_moe_eagle import (
+    Qwen3MoeDraftMLP,
+    Qwen3MoeDraftSparseMoeBlock,
 )
 
 
 # ---------------------------------------------------------------------------
-# Attention subclasses with q_norm / k_norm
+# MTP Attention classes
 # ---------------------------------------------------------------------------
-# These mirror the target MTP's Qwen3NextAttention which applies RMSNorm
-# to query and key states after view-reshape but before RoPE.
-# Each subclass overrides only __init__ (to add the norms) and forward
-# (to insert the norm calls at the right place).
+# These differ from Eagle3 attention in three fundamental ways:
+# 1. q/k/v_proj input is hidden_size (not 2*hidden_size)
+# 2. q_proj output is num_heads * head_dim * 2 (includes gate for output gating)
+# 3. Output gating: attn_output *= sigmoid(gate)
+#
+# Because the projection dimensions are fundamentally different from
+# LlamaAttention (which uses hidden_size*2 input), we implement these
+# attention classes from scratch, reusing only RoPE and cache_hidden logic.
 # ---------------------------------------------------------------------------
 
-class Qwen3MoeAttention(LlamaAttention):
-    """LlamaAttention (SDPA) with q_norm and k_norm, matching target MTP attention."""
+
+class Qwen3MoeMTPAttention(nn.Module):
+    """MTP-compatible attention (SDPA) with output gating, q_norm and k_norm."""
 
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
+        else:
+            self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        # MTP q_proj: input=hidden_size, output=num_heads*head_dim*2 (includes gate)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim * 2, bias=False
+        )
+        # MTP k/v_proj: input=hidden_size (standard)
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
+        # q_norm / k_norm (matching target MTP attention)
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self._init_rope()
+
+    def _init_rope(self):
+        from .llama3_eagle import (
+            LlamaRotaryEmbedding,
+            LlamaLinearScalingRotaryEmbedding,
+            LlamaDynamicNTKScalingRotaryEmbedding,
+            LlamaMutiRotaryEmbedding,
+            LlamaYarnRotaryEmbedding,
+        )
+
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=getattr(self.config, "rope_theta", 10000),
+            )
+        else:
+            rope_scaling = self.config.rope_scaling
+
+            def rope_get(key, default=None):
+                if isinstance(rope_scaling, dict):
+                    return rope_scaling.get(key, default)
+                return getattr(rope_scaling, key, default)
+
+            scaling_type = rope_get("rope_type", rope_get("type"))
+            scaling_factor = rope_get("factor")
+
+            if scaling_type == "default":
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                )
+            elif scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "llama3":
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                    scaling_factor=(
+                        scaling_factor if scaling_factor is not None else 1.0
+                    ),
+                    low_freq_factor=rope_get("low_freq_factor"),
+                    high_freq_factor=rope_get("high_freq_factor"),
+                    orig_max_position=rope_get("original_max_position_embeddings"),
+                )
+            elif scaling_type == "mrope":
+                self.rotary_emb = LlamaMutiRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                )
+            elif scaling_type == "yarn":
+                self.rotary_emb = LlamaYarnRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    original_max_position_embeddings=rope_get(
+                        "original_max_position_embeddings"
+                    ),
+                    scaling_factor=scaling_factor,
+                    beta_fast=rope_get("beta_fast"),
+                    beta_slow=rope_get("beta_slow"),
+                    mscale=rope_get("mscale"),
+                    mscale_all_dim=rope_get("mscale_all_dim"),
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _split_qkv_and_gate(self, query_states, bsz, q_len):
+        """Split q_proj output into query states and output gate."""
+        # q_proj output: (bsz, q_len, num_heads * head_dim * 2)
+        # Split into query (num_heads * head_dim) and gate (num_heads * head_dim)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim * 2
+        )
+        # Split along head_dim: first half is query, second half is gate
+        query, gate = query_states.split(self.head_dim, dim=-1)
+        # gate shape: (bsz, q_len, num_heads, head_dim) → will be reshaped later
+        return query, gate
 
     def forward(
         self,
@@ -87,13 +227,17 @@ class Qwen3MoeAttention(LlamaAttention):
 
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
+        # Project and split query + gate
+        q_out = self.q_proj(hidden_states)
+        query_states, gate = self._split_qkv_and_gate(q_out, bsz, q_len)
+        # query_states: (bsz, q_len, num_heads, head_dim)
+        # gate: (bsz, q_len, num_heads, head_dim)
+
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        # Transpose to (bsz, num_heads, q_len, head_dim)
+        query_states = query_states.transpose(1, 2)
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
@@ -101,7 +245,7 @@ class Qwen3MoeAttention(LlamaAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        # --- q_norm / k_norm (before RoPE) ---
+        # q_norm / k_norm (before RoPE)
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
@@ -198,7 +342,13 @@ class Qwen3MoeAttention(LlamaAttention):
                 attn_outputi = attn_weightsi[..., None] * vi
                 attn_output = attn_output + attn_outputi
 
+        # attn_output: (bsz, num_heads, q_len, head_dim) → (bsz, q_len, num_heads, head_dim)
         attn_output = attn_output.transpose(1, 2).contiguous()
+
+        # --- Output gating (MTP-specific) ---
+        # gate shape: (bsz, q_len, num_heads, head_dim)
+        attn_output = attn_output * torch.sigmoid(gate)
+
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
 
         attn_output = self.o_proj(attn_output)
@@ -206,13 +356,52 @@ class Qwen3MoeAttention(LlamaAttention):
         return attn_output
 
 
-class Qwen3MoeFlexAttention(LlamaFlexAttention):
-    """LlamaFlexAttention with q_norm and k_norm, matching target MTP attention."""
+class Qwen3MoeMTPFlexAttention(nn.Module):
+    """MTP-compatible FlexAttention with output gating, q_norm and k_norm."""
 
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
+        else:
+            self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim * 2, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        # Share RoPE init with SDPA attention
+        _attn = Qwen3MoeMTPAttention.__new__(Qwen3MoeMTPAttention)
+        _attn.config = config
+        _attn.head_dim = self.head_dim
+        _attn.max_position_embeddings = self.max_position_embeddings
+        _attn._init_rope()
+        self.rotary_emb = _attn.rotary_emb
+
+    def _split_qkv_and_gate(self, query_states, bsz, q_len):
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim * 2
+        )
+        query, gate = query_states.split(self.head_dim, dim=-1)
+        return query, gate
 
     def forward(
         self,
@@ -241,13 +430,15 @@ class Qwen3MoeFlexAttention(LlamaFlexAttention):
             past_key_values.get_seq_length() if past_key_values is not None else 0
         )
 
-        query_states = self.q_proj(hidden_states)
+        q_out = self.q_proj(hidden_states)
+        query_states, gate = self._split_qkv_and_gate(q_out, bsz, q_len)
+        # query_states: (bsz, q_len, num_heads, head_dim)
+
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        # Transpose: (bsz, num_heads, q_len, head_dim)
+        query_states = query_states.transpose(1, 2)
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
@@ -255,7 +446,7 @@ class Qwen3MoeFlexAttention(LlamaFlexAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        # --- q_norm / k_norm (before RoPE) ---
+        # q_norm / k_norm (before RoPE)
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
@@ -277,7 +468,7 @@ class Qwen3MoeFlexAttention(LlamaFlexAttention):
                 query_states, key_states, cos, sin, position_ids + lck
             )
 
-        cache_position: torch.Tensor = torch.arange(
+        cache_position = torch.arange(
             past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
         )
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -318,19 +509,62 @@ class Qwen3MoeFlexAttention(LlamaFlexAttention):
             block_mask=block_mask,
             enable_gqa=True,
         )
+        # (bsz, num_heads, q_len, head_dim) → (bsz, q_len, num_heads, head_dim)
         attn_output = attn_output.transpose(1, 2).contiguous()
+
+        # Output gating
+        attn_output = attn_output * torch.sigmoid(gate)
+
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
         return attn_output
 
 
-class Qwen3MoeFlashAttention(LlamaFlashAttention):
-    """LlamaFlashAttention with q_norm and k_norm, matching target MTP attention."""
+class Qwen3MoeMTPFlashAttention(nn.Module):
+    """MTP-compatible FlashAttention with output gating, q_norm and k_norm."""
 
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
+        else:
+            self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim * 2, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        _attn = Qwen3MoeMTPAttention.__new__(Qwen3MoeMTPAttention)
+        _attn.config = config
+        _attn.head_dim = self.head_dim
+        _attn.max_position_embeddings = self.max_position_embeddings
+        _attn._init_rope()
+        self.rotary_emb = _attn.rotary_emb
+
+    def _split_qkv_and_gate(self, query_states, bsz, q_len):
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim * 2
+        )
+        query, gate = query_states.split(self.head_dim, dim=-1)
+        return query, gate
 
     def forward(
         self,
@@ -352,11 +586,13 @@ class Qwen3MoeFlashAttention(LlamaFlashAttention):
 
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
+        q_out = self.q_proj(hidden_states)
+        query_states, gate = self._split_qkv_and_gate(q_out, bsz, q_len)
+        # query_states: (bsz, q_len, num_heads, head_dim) — flash attn layout
+
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
@@ -364,7 +600,7 @@ class Qwen3MoeFlashAttention(LlamaFlashAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
 
-        # --- q_norm / k_norm (before RoPE) ---
+        # q_norm / k_norm (before RoPE)
         # flash attention uses (bsz, q_len, num_heads, head_dim) layout
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
@@ -443,6 +679,10 @@ class Qwen3MoeFlashAttention(LlamaFlashAttention):
             # lse is fp32, downcast attn_output back
             attn_output = attn_output.to(self.o_proj.weight.dtype)
 
+        # attn_output: (bsz, q_len, num_heads, head_dim) in flash attn layout
+        # Output gating (applied before reshape)
+        attn_output = attn_output * torch.sigmoid(gate)
+
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
 
         attn_output = self.o_proj(attn_output)
@@ -450,13 +690,63 @@ class Qwen3MoeFlashAttention(LlamaFlashAttention):
         return attn_output
 
 
-class Qwen3MoeUSPFlashAttention(LlamaUSPFlashAttention):
-    """LlamaUSPFlashAttention with q_norm and k_norm, matching target MTP attention."""
+class Qwen3MoeMTPUSPFlashAttention(nn.Module):
+    """MTP-compatible USP FlashAttention with output gating, q_norm and k_norm."""
 
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
+        else:
+            self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim * 2, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        _attn = Qwen3MoeMTPAttention.__new__(Qwen3MoeMTPAttention)
+        _attn.config = config
+        _attn.head_dim = self.head_dim
+        _attn.max_position_embeddings = self.max_position_embeddings
+        _attn._init_rope()
+        self.rotary_emb = _attn.rotary_emb
+
+        # USP-specific: import SP group info
+        from .llama3_eagle import get_sp_ring_group, get_sp_ulysses_group
+
+        self.ring_pg = get_sp_ring_group()
+        self.ulysses_pg = get_sp_ulysses_group()
+        self.sp_ring_degree = self.ring_pg.size()
+        self.sp_ulysses_degree = self.ulysses_pg.size()
+
+        self.scatter_idx = 1  # seq dim
+        self.gather_idx = 2  # head dim
+        self.use_sync = True
+
+    def _split_qkv_and_gate(self, query_states, bsz, q_len):
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim * 2
+        )
+        query, gate = query_states.split(self.head_dim, dim=-1)
+        return query, gate
 
     def forward(
         self,
@@ -481,12 +771,24 @@ class Qwen3MoeUSPFlashAttention(LlamaUSPFlashAttention):
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
 
-        # 1. Projections & Ulysses Scatter
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        # 1. Projections & split gate
+        q_out = self.q_proj(hidden_states)
+        query_states, gate = self._split_qkv_and_gate(q_out, bsz, q_len)
+        # query_states: (bsz, q_len, num_heads, head_dim)
+
+        # Ulysses scatter for query
         query_states = SeqAllToAll4D.apply(
             self.ulysses_pg,
             query_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        # Ulysses scatter for gate (same seq/head split as query)
+        gate = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            gate,
             self.scatter_idx,
             self.gather_idx,
             self.use_sync,
@@ -519,8 +821,7 @@ class Qwen3MoeUSPFlashAttention(LlamaUSPFlashAttention):
         current_q_len = query_states.shape[1]
         local_num_heads = query_states.shape[2]
 
-        # --- q_norm / k_norm (before RoPE) ---
-        # After Ulysses scatter, shape is (bsz, current_q_len, local_num_heads, head_dim)
+        # q_norm / k_norm (before RoPE)
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
@@ -610,6 +911,10 @@ class Qwen3MoeUSPFlashAttention(LlamaUSPFlashAttention):
 
         attn_output = acc_out.to(query_states.dtype)
 
+        # Output gating (before Ulysses gather)
+        # gate has already been scattered, same layout as attn_output
+        attn_output = attn_output * torch.sigmoid(gate)
+
         # 4. Ulysses Gather & Output Projection
         attn_output = SeqAllToAll4D.apply(
             self.ulysses_pg,
@@ -628,129 +933,17 @@ class Qwen3MoeUSPFlashAttention(LlamaUSPFlashAttention):
 
 
 # ---------------------------------------------------------------------------
-# MoE components
+# MTP Decoder layer
 # ---------------------------------------------------------------------------
 
-class Qwen3MoeDraftMLP(nn.Module):
-    """Single expert MLP for the MoE draft model (no TP, used in training)."""
-
-    def __init__(self, config, intermediate_size=None):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = (
-            intermediate_size
-            if intermediate_size is not None
-            else config.intermediate_size
-        )
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-class Qwen3MoeDraftSparseMoeBlock(nn.Module):
+class Qwen3MoeDecoderLayerMTP(nn.Module):
     """
-    Sparse MoE block for the Eagle3 draft model.
+    MTP-compatible decoder layer.
 
-    This implements the same MoE routing logic as the target model's MoE layers,
-    including shared_expert and shared_expert_gate, matching the target MTP's
-    Qwen2MoeSparseMoeBlock / Qwen3NextSparseMoeBlock structure.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-        self.norm_topk_prob = config.norm_topk_prob
-
-        # gating / router
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                Qwen3MoeDraftMLP(config, intermediate_size=config.moe_intermediate_size)
-                for _ in range(self.num_experts)
-            ]
-        )
-
-        # Shared expert (runs in parallel with routed experts)
-        shared_expert_intermediate_size = getattr(
-            config, "shared_expert_intermediate_size", config.moe_intermediate_size
-        )
-        self.shared_expert = Qwen3MoeDraftMLP(
-            config, intermediate_size=shared_expert_intermediate_size
-        )
-        # Gate controlling shared expert output via sigmoid
-        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
-
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states_flat)
-
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states_flat.dtype)
-
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim),
-            dtype=hidden_states_flat.dtype,
-            device=hidden_states_flat.device,
-        )
-
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
-
-        expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hitted:
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-
-            current_state = hidden_states_flat[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = (
-                expert_layer(current_state) * routing_weights[top_x, idx, None]
-            )
-
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states_flat.dtype)
-            )
-
-        # Shared expert contribution
-        shared_expert_output = self.shared_expert(hidden_states_flat)
-        shared_expert_output = (
-            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
-        )
-        final_hidden_states = final_hidden_states + shared_expert_output
-
-        final_hidden_states = final_hidden_states.reshape(
-            batch_size, sequence_length, hidden_dim
-        )
-        return final_hidden_states
-
-
-# ---------------------------------------------------------------------------
-# Decoder layer
-# ---------------------------------------------------------------------------
-
-class Qwen3MoeDecoderLayerEagle3(nn.Module):
-    """
-    Eagle3 decoder layer with MoE MLP.
-
-    Structure matches the target MTP's decoder layer:
-    - input_layernorm: standard pre-attention RMSNorm (applied to hidden_states)
-    - self_attn: attention with q_norm/k_norm (input is cat(input_emb, normed_hidden))
-    - post_attention_layernorm: pre-MLP RMSNorm
-    - mlp: MoE block with shared_expert
+    Key difference from Eagle3's Qwen3MoeDecoderLayerEagle3:
+    - Standard pre-norm transformer: forward takes ONLY hidden_states
+      (no input_emb parameter, no concatenation)
+    - Uses MTP attention classes with output gating
     """
 
     def __init__(self, config, attention_backend: str = "sdpa"):
@@ -758,23 +951,23 @@ class Qwen3MoeDecoderLayerEagle3(nn.Module):
         self.hidden_size = config.hidden_size
 
         if attention_backend == "sdpa":
-            self.self_attn = Qwen3MoeAttention(config=config)
+            self.self_attn = Qwen3MoeMTPAttention(config=config)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = Qwen3MoeFlexAttention(config=config)
+            self.self_attn = Qwen3MoeMTPFlexAttention(config=config)
         elif attention_backend == "fa":
-            self.self_attn = Qwen3MoeFlashAttention(config=config)
+            self.self_attn = Qwen3MoeMTPFlashAttention(config=config)
         elif attention_backend == "usp":
-            self.self_attn = Qwen3MoeUSPFlashAttention(config=config)
+            self.self_attn = Qwen3MoeMTPUSPFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
         self.attention_backend = attention_backend
 
-        # Use MoE block instead of dense MLP
+        # Use MoE block (identical to Eagle3)
         self.mlp = Qwen3MoeDraftSparseMoeBlock(config)
 
-        # Standard pre-attention norm (matches target MTP's layers.0.input_layernorm)
+        # Standard pre-attention norm
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -782,7 +975,6 @@ class Qwen3MoeDecoderLayerEagle3(nn.Module):
 
     def forward(
         self,
-        input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
         cache_hidden: List[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -791,16 +983,16 @@ class Qwen3MoeDecoderLayerEagle3(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> torch.Tensor:
+        """
+        Standard pre-norm transformer decoder layer.
+        NO input_emb parameter — fc fusion is done upstream in the model's backbone().
+        """
         residual = hidden_states
 
-        # Pre-attention norm on hidden_states (standard transformer pre-norm)
+        # Pre-attention norm
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Concat input_emb and normed hidden_states for attention input
-        # (Eagle3 uses 2*hidden_size input to q/k/v projections)
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
-
-        # Self Attention (with q_norm/k_norm inside)
+        # Self Attention (with output gating, q_norm/k_norm inside)
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
             hidden_states=hidden_states,
@@ -822,25 +1014,24 @@ class Qwen3MoeDecoderLayerEagle3(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full draft model
+# Full MTP-compatible draft model
 # ---------------------------------------------------------------------------
 
-class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
+class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
     """
-    Eagle3 draft model with MoE layers for Qwen3.5 MoE target models.
+    MTP-compatible draft model for Qwen3.5 MoE target models.
 
-    This model uses the same architecture as LlamaForCausalLMEagle3 but replaces
-    the dense MLP in the decoder layer with a Sparse MoE block. This allows:
-    1. Weight initialization from the target model's native MTP heads
-    2. Better alignment with the target model's MoE routing behavior
-    3. Same active parameter count as native MTP during inference
+    This model is structurally identical to the target model's native MTP head.
+    After training, all weights (including fc, q/k/v_proj, lm_head) can be
+    directly merged back into the target model's MTP for native MTP inference.
 
-    Structural alignment with target MTP:
-    - pre_fc_norm_embedding / pre_fc_norm_hidden: RMSNorm before fc fusion
-    - fc: linear projection (3*hidden → hidden for Eagle3, 2*hidden → hidden for MTP)
-    - midlayer: decoder layer with input_layernorm, attention (q_norm/k_norm),
-                post_attention_layernorm, MoE MLP (shared_expert + shared_expert_gate)
-    - norm: final RMSNorm
+    Key differences from Qwen3MoeForCausalLMEagle3:
+    - fc: 2*hidden → hidden (not 3*hidden)
+    - project_hidden_states: identity (fc fusion moved to backbone)
+    - backbone: does fc(cat(norm(emb), norm(hidden))) → midlayer(fused)
+    - lm_head: full vocab (not draft_vocab)
+    - q/k/v_proj: standard hidden_size input (not 2*hidden_size)
+    - Output gating in attention
     """
 
     config_class = Qwen3MoeConfig
@@ -851,24 +1042,20 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
-        self.draft_vocab_size = config.draft_vocab_size
+        self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = Qwen3MoeDecoderLayerEagle3(
+        self.midlayer = Qwen3MoeDecoderLayerMTP(
             config, attention_backend=attention_backend
         )
 
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * 3, config.hidden_size, bias=False
-            )
-        else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * 3, config.hidden_size, bias=False
-            )
+        # fc: Linear(2*hidden, hidden) — fuses embedding + 1 hidden state
+        self.fc = torch.nn.Linear(
+            config.hidden_size * 2, config.hidden_size, bias=False
+        )
 
-        # Pre-FC norms (matching target MTP's pre_fc_norm_embedding / pre_fc_norm_hidden)
+        # Pre-FC norms (matching target MTP)
         self.pre_fc_norm_embedding = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -877,15 +1064,29 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # lm_head: FULL target vocab (matches target MTP's shared_head.head exactly).
+        # We deliberately keep the full [vocab_size, hidden] matrix so that:
+        #   1) load_mtp_weights can copy weights with no shape mismatch
+        #   2) export_mtp_weights round-trips losslessly back to the target slot
+        #   3) when training on a t2d subset, we still chunk-matmul the full vocab
+        #      and project to draft_vocab_size via index_select(d2t) (see compute_logits)
         self.lm_head = nn.Linear(
-            config.hidden_size, config.draft_vocab_size, bias=False
+            config.hidden_size, self.vocab_size, bias=False
         )
 
-        # create vocab buffers
+        # Vocab mapping buffers — when draft_vocab_size == vocab_size,
+        # t2d is all-True and d2t is identity, effectively a pass-through.
+        # When training on a subset, base.load_vocab_mapping(file_path) overwrites both.
         t2d = torch.ones(self.vocab_size, dtype=torch.bool)
-        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
+        d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+        # Optional row-chunk size for compute_logits (lm_head matmul over full vocab).
+        # None ⇒ run the full [N, hidden] @ [hidden, vocab] in one shot.
+        # Set via set_lm_head_chunk_size(n) to cap activation memory peak.
+        self._lm_head_chunk_size: Optional[int] = None
 
     def forward(
         self,
@@ -917,22 +1118,13 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
-        # Apply pre-FC norms (matching target MTP forward flow)
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        # MTP forward: fc(cat(norm(emb), norm(hidden))) → midlayer
+        emb_normed = self.pre_fc_norm_embedding(inputs_embeds)
+        hid_normed = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(torch.cat([emb_normed, hid_normed], dim=-1))
 
-        # hidden_states contains 3 concatenated hidden layers from target model
-        # Apply pre_fc_norm_hidden to each layer separately
-        h1, h2, h3 = hidden_states.chunk(3, dim=-1)
-        h1 = self.pre_fc_norm_hidden(h1)
-        h2 = self.pre_fc_norm_hidden(h2)
-        h3 = self.pre_fc_norm_hidden(h3)
-        hidden_states = torch.cat([h1, h2, h3], dim=-1)
-
-        # fc fusion
-        hidden_states = self.fc(hidden_states)
         hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
-            hidden_states=hidden_states,
+            hidden_states=fused,
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -950,13 +1142,62 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
-        return self.fc(hidden_states)
+        """Identity pass-through — fc fusion is done inside backbone() at each TTT step."""
+        return hidden_states
+
+    def set_lm_head_chunk_size(self, chunk_size: Optional[int]) -> None:
+        """
+        Cap the row-chunk size of the lm_head matmul inside compute_logits.
+
+        Set this to a small int (e.g. 1024) when training on huge vocabs
+        (e.g. Qwen3.5 248K) to keep the per-step logits activation memory
+        bounded. Pass None to disable chunking.
+        """
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(
+                f"lm_head chunk_size must be a positive int or None, got {chunk_size}"
+            )
+        self._lm_head_chunk_size = chunk_size
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        norm_hidden_states = self.norm(hidden_states)
-        return self.lm_head(norm_hidden_states)
+        """
+        Project final hidden states to logits.
+
+        Strategy:
+          1) Run lm_head over the FULL target vocab (matches target MTP exactly).
+          2) If training on a draft vocab subset (draft_vocab_size < vocab_size),
+             immediately project each chunk to [..., draft_vocab_size] via d2t
+             so the downstream loss only sees the subset.
+          3) Optionally chunk along the flattened (B*S) dim to bound peak memory.
+
+        The chunked outputs are concatenated (NOT scatter-assigned) to keep
+        autograd clean.
+        """
+        norm_h = self.norm(hidden_states)
+        project = self.draft_vocab_size < self.vocab_size
+
+        orig_shape = norm_h.shape  # (..., hidden)
+        H = orig_shape[-1]
+        flat_h = norm_h.reshape(-1, H)
+        N = flat_h.shape[0]
+
+        chunk = self._lm_head_chunk_size if self._lm_head_chunk_size is not None else N
+        if chunk >= N:
+            logits = self.lm_head(flat_h)
+            if project:
+                logits = logits.index_select(-1, self.d2t.to(logits.device))
+        else:
+            chunks = []
+            for start in range(0, N, chunk):
+                end = min(start + chunk, N)
+                cl = self.lm_head(flat_h[start:end])
+                if project:
+                    cl = cl.index_select(-1, self.d2t.to(cl.device))
+                chunks.append(cl)
+            logits = torch.cat(chunks, dim=0)
+
+        out_dim = self.draft_vocab_size if project else self.vocab_size
+        return logits.reshape(*orig_shape[:-1], out_dim)
 
     def backbone(
         self,
@@ -968,9 +1209,17 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
+        """
+        MTP-compatible backbone: fc fusion at every TTT step.
+
+        Flow: fc(cat(norm(emb), norm(hidden))) → midlayer(fused)
+        """
+        emb_normed = self.pre_fc_norm_embedding(input_embeds)
+        hid_normed = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(torch.cat([emb_normed, hid_normed], dim=-1))
+
         return self.midlayer(
-            input_emb=input_embeds,
-            hidden_states=hidden_states,
+            hidden_states=fused,
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -984,35 +1233,20 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         self,
         model_path: str,
         mtp_layer_idx: int = 0,
+        only_lm_head: bool = False,
     ) -> None:
         """
-        Load weights from the target model's native MTP (Multi-Token Prediction) head
-        into this draft model.
+        Load weights from the target model's native MTP head.
 
-        The MTP head in Qwen3.5 MoE models has the structure:
-            mtp.fc.weight
-            mtp.pre_fc_norm_embedding.weight
-            mtp.pre_fc_norm_hidden.weight
-            mtp.norm.weight
-            mtp.layers.0.embed_tokens.weight
-            mtp.layers.0.input_layernorm.weight
-            mtp.layers.0.self_attn.{q,k,v,o}_proj.weight
-            mtp.layers.0.self_attn.q_norm.weight
-            mtp.layers.0.self_attn.k_norm.weight
-            mtp.layers.0.post_attention_layernorm.weight
-            mtp.layers.0.mlp.gate.weight (router)
-            mtp.layers.0.mlp.experts.{0-255}.{gate,up,down}_proj.weight
-            mtp.layers.0.mlp.shared_expert.{gate,up,down}_proj.weight
-            mtp.layers.0.mlp.shared_expert_gate.weight
-            mtp.layers.0.shared_head.head.weight (full vocab lm_head)
-
-        This method loads all structurally matching weights. Non-matching weights
-        (fc due to 3*hidden vs 2*hidden, q/k/v_proj due to 2*hidden vs hidden input,
-        lm_head due to draft_vocab vs full vocab) are skipped.
+        Unlike the Eagle3 version, this MTP-compatible model has identical
+        dimensions for ALL parameters (fc, q/k/v_proj, lm_head), so every
+        single weight can be loaded without any shape mismatch.
 
         Args:
-            model_path: Path to the target model directory containing safetensors files.
+            model_path: Path to the target model directory.
             mtp_layer_idx: Index of the MTP block to load from (default: 0).
+            only_lm_head: If True, ONLY reload `lm_head.weight` (resume path —
+                the rest of the draft weights come from the checkpoint).
         """
         import glob
         import json
@@ -1054,6 +1288,15 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         # Map from MTP weight keys to draft model keys
         weight_mapping = {}
 
+        # --- Shared input embedding ---
+        # Target uses mtp_use_dedicated_embeddings=False, so the MTP head shares
+        # `model.embed_tokens.weight`. Draft has its own embed_tokens module —
+        # initialize it from the same shared embedding so we start aligned.
+        weight_mapping["model.embed_tokens.weight"] = "embed_tokens.weight"
+
+        # --- fc (now dimensions match: 2*hidden → hidden) ---
+        weight_mapping[f"{mtp_prefix}.fc.weight"] = "fc.weight"
+
         # --- Pre-FC norms ---
         weight_mapping[f"{mtp_prefix}.pre_fc_norm_embedding.weight"] = "pre_fc_norm_embedding.weight"
         weight_mapping[f"{mtp_prefix}.pre_fc_norm_hidden.weight"] = "pre_fc_norm_hidden.weight"
@@ -1065,7 +1308,10 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         weight_mapping[f"{layer_prefix}.input_layernorm.weight"] = "midlayer.input_layernorm.weight"
         weight_mapping[f"{layer_prefix}.post_attention_layernorm.weight"] = "midlayer.post_attention_layernorm.weight"
 
-        # --- Attention: o_proj (q/k/v_proj have dimension mismatch, skip) ---
+        # --- Attention: ALL projections (now dimensions match) ---
+        weight_mapping[f"{layer_prefix}.self_attn.q_proj.weight"] = "midlayer.self_attn.q_proj.weight"
+        weight_mapping[f"{layer_prefix}.self_attn.k_proj.weight"] = "midlayer.self_attn.k_proj.weight"
+        weight_mapping[f"{layer_prefix}.self_attn.v_proj.weight"] = "midlayer.self_attn.v_proj.weight"
         weight_mapping[f"{layer_prefix}.self_attn.o_proj.weight"] = "midlayer.self_attn.o_proj.weight"
 
         # --- Attention: q_norm / k_norm ---
@@ -1089,13 +1335,14 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         # --- Shared expert gate ---
         weight_mapping[f"{moe_prefix}.shared_expert_gate.weight"] = "midlayer.mlp.shared_expert_gate.weight"
 
-        # Note: The following weights have dimension mismatches between Eagle3 and MTP
-        # and are intentionally NOT loaded:
-        # - fc.weight: Eagle3 uses 3*hidden_size input, MTP uses 2*hidden_size
-        # - self_attn.q_proj.weight: Eagle3 uses 2*hidden_size input, MTP uses hidden_size
-        # - self_attn.k_proj.weight: same as above
-        # - self_attn.v_proj.weight: same as above
-        # - lm_head / shared_head.head.weight: Eagle3 uses draft_vocab_size, MTP uses vocab_size
+        # --- lm_head (now dimensions match: full vocab) ---
+        weight_mapping[f"{layer_prefix}.shared_head.head.weight"] = "lm_head.weight"
+
+        # Resume path: only refresh lm_head (everything else comes from the
+        # training checkpoint and must NOT be overwritten).
+        if only_lm_head:
+            lm_head_src = f"{layer_prefix}.shared_head.head.weight"
+            weight_mapping = {lm_head_src: "lm_head.weight"}
 
         # Load and copy weights
         loaded_count = 0
@@ -1154,8 +1401,82 @@ class Qwen3MoeForCausalLMEagle3(Eagle3DraftModel):
         )
         if skipped_shape_mismatch:
             print_with_rank(
-                f"Skipped {len(skipped_shape_mismatch)} weights due to shape mismatch "
-                f"(expected for fc, q/k/v_proj, lm_head):"
+                f"WARNING: Skipped {len(skipped_shape_mismatch)} weights due to shape mismatch "
+                f"(this should NOT happen for MTP-compatible model):"
             )
             for msg in skipped_shape_mismatch:
                 print_with_rank(f"  - {msg}")
+
+    @torch.no_grad()
+    def export_mtp_weights(
+        self,
+        output_path: str,
+        mtp_layer_idx: int = 0,
+    ) -> dict:
+        """
+        Export trained weights as a state_dict with MTP weight key format.
+
+        This produces a state_dict that can be directly merged back into the
+        target model's MTP head weights.
+
+        Args:
+            output_path: Path to save the exported weights.
+            mtp_layer_idx: MTP block index for key naming (default: 0).
+
+        Returns:
+            The state_dict with MTP-format keys.
+        """
+        mtp_prefix = "mtp"
+        layer_prefix = f"{mtp_prefix}.layers.{mtp_layer_idx}"
+        moe_prefix = f"{layer_prefix}.mlp"
+
+        # Reverse mapping: draft model key → MTP key
+        export_mapping = {
+            "fc.weight": f"{mtp_prefix}.fc.weight",
+            "pre_fc_norm_embedding.weight": f"{mtp_prefix}.pre_fc_norm_embedding.weight",
+            "pre_fc_norm_hidden.weight": f"{mtp_prefix}.pre_fc_norm_hidden.weight",
+            "norm.weight": f"{mtp_prefix}.norm.weight",
+            "midlayer.input_layernorm.weight": f"{layer_prefix}.input_layernorm.weight",
+            "midlayer.post_attention_layernorm.weight": f"{layer_prefix}.post_attention_layernorm.weight",
+            "midlayer.self_attn.q_proj.weight": f"{layer_prefix}.self_attn.q_proj.weight",
+            "midlayer.self_attn.k_proj.weight": f"{layer_prefix}.self_attn.k_proj.weight",
+            "midlayer.self_attn.v_proj.weight": f"{layer_prefix}.self_attn.v_proj.weight",
+            "midlayer.self_attn.o_proj.weight": f"{layer_prefix}.self_attn.o_proj.weight",
+            "midlayer.self_attn.q_norm.weight": f"{layer_prefix}.self_attn.q_norm.weight",
+            "midlayer.self_attn.k_norm.weight": f"{layer_prefix}.self_attn.k_norm.weight",
+            "midlayer.mlp.gate.weight": f"{moe_prefix}.gate.weight",
+            "midlayer.mlp.shared_expert_gate.weight": f"{moe_prefix}.shared_expert_gate.weight",
+            "lm_head.weight": f"{layer_prefix}.shared_head.head.weight",
+        }
+
+        # Add experts
+        for expert_idx in range(self.config.num_experts):
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                src = f"midlayer.mlp.experts.{expert_idx}.{proj}.weight"
+                dst = f"{moe_prefix}.experts.{expert_idx}.{proj}.weight"
+                export_mapping[src] = dst
+
+        # Add shared expert
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            src = f"midlayer.mlp.shared_expert.{proj}.weight"
+            dst = f"{moe_prefix}.shared_expert.{proj}.weight"
+            export_mapping[src] = dst
+
+        # Build export state_dict
+        mtp_state_dict = {}
+        model_state = self.state_dict()
+        for draft_key, mtp_key in export_mapping.items():
+            if draft_key in model_state:
+                mtp_state_dict[mtp_key] = model_state[draft_key]
+            else:
+                print_with_rank(f"Warning: {draft_key} not found in model state_dict")
+
+        # Also include embedding (it's shared with the target model)
+        mtp_state_dict[f"{layer_prefix}.embed_tokens.weight"] = model_state["embed_tokens.weight"]
+
+        torch.save(mtp_state_dict, output_path)
+        print_with_rank(
+            f"Exported {len(mtp_state_dict)} MTP weights to {output_path} "
+            f"(mtp layer {mtp_layer_idx})"
+        )
+        return mtp_state_dict

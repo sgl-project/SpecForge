@@ -92,6 +92,9 @@ class Eagle3TargetModel(ABC):
     ) -> None:
         """
         Set the layers to capture the aux hidden states from the target model outputs.
+
+        For Eagle3 mode (default): captures 3 layers (low, mid, high).
+        For MTP mode: captures 1 layer (last transformer layer).
         """
         if aux_hidden_states_layers is None:
             if hasattr(self.model.config, "num_hidden_layers"):
@@ -107,8 +110,8 @@ class Eagle3TargetModel(ABC):
             ]
         self.aux_hidden_states_layers = aux_hidden_states_layers
         assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
+            len(self.aux_hidden_states_layers) >= 1
+        ), "aux_hidden_states_layers must have at least 1 layer"
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
@@ -227,19 +230,15 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 handle.remove()
 
         # Verify we captured everything
-        if len(captured_states) != 3:
+        num_expected = len(target_indices)
+        if len(captured_states) != num_expected:
             raise RuntimeError(
-                f"Expected to capture 3 layers, but captured {len(captured_states)}"
+                f"Expected to capture {num_expected} layers, but captured {len(captured_states)}"
             )
 
-        # Extract in the correct order
-        hidden_states0 = captured_states[target_indices[0]]
-        hidden_states1 = captured_states[target_indices[1]]
-        hidden_states2 = captured_states[target_indices[2]]
-
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
+        # Extract in the correct order and concatenate along hidden dim
+        hidden_states_list = [captured_states[idx] for idx in target_indices]
+        hidden_states = torch.cat(hidden_states_list, dim=-1)
 
         # apply pading
         target = outputs.logits
