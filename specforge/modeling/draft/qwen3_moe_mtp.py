@@ -1288,11 +1288,14 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
         # Map from MTP weight keys to draft model keys
         weight_mapping = {}
 
-        # --- Shared input embedding ---
-        # Target uses mtp_use_dedicated_embeddings=False, so the MTP head shares
-        # `model.embed_tokens.weight`. Draft has its own embed_tokens module —
-        # initialize it from the same shared embedding so we start aligned.
-        weight_mapping["model.embed_tokens.weight"] = "embed_tokens.weight"
+        # --- Input embedding ---
+        # Target's MTP head always materializes `mtp.layers.{idx}.embed_tokens.weight`
+        # in its sharded checkpoint (regardless of whether target uses the nested
+        # multimodal layout `model.language_model.embed_tokens.weight` or the
+        # flat `model.embed_tokens.weight`). Sourcing from the MTP-side key keeps
+        # this loader agnostic to the target's main-trunk module layout and is
+        # also the perfect dual of `export_mtp_weights` (which writes the same key).
+        weight_mapping[f"{layer_prefix}.embed_tokens.weight"] = "embed_tokens.weight"
 
         # --- fc (now dimensions match: 2*hidden → hidden) ---
         weight_mapping[f"{mtp_prefix}.fc.weight"] = "fc.weight"

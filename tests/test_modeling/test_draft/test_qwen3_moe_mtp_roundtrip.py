@@ -49,12 +49,17 @@ from typing import Dict, List
 # ---------------------------------------------------------------------------
 
 def _expected_mtp_keys(num_experts: int, mtp_layer_idx: int = 0) -> List[str]:
-    """Mirror `Qwen3MoeForCausalLMMTP.load_mtp_weights` weight_mapping (src side)."""
+    """Mirror `Qwen3MoeForCausalLMMTP.load_mtp_weights` weight_mapping (src side).
+
+    Note: embed_tokens is sourced from the MTP-side key
+    `mtp.layers.{idx}.embed_tokens.weight` (always present in target index,
+    regardless of multimodal nesting on the main trunk).
+    """
     mtp = "mtp"
     layer = f"{mtp}.layers.{mtp_layer_idx}"
     moe = f"{layer}.mlp"
     keys = [
-        "model.embed_tokens.weight",
+        f"{layer}.embed_tokens.weight",
         f"{mtp}.fc.weight",
         f"{mtp}.pre_fc_norm_embedding.weight",
         f"{mtp}.pre_fc_norm_hidden.weight",
@@ -229,14 +234,15 @@ def check_load_equivalence_and_roundtrip(
     )
     print("[load] OK: draft.lm_head.weight bit-equals target shared_head.head.weight.")
 
-    # embed_tokens bit-equality (shared with target's main embedding)
-    emb_src = _read_tensor(model_path, weight_map, "model.embed_tokens.weight")
+    # embed_tokens bit-equality (loaded from target's MTP-side dedicated embed,
+    # which is shared with the main trunk embedding by construction).
+    emb_src = _read_tensor(model_path, weight_map, f"{layer_prefix}.embed_tokens.weight")
     diff_emb = (model.embed_tokens.weight.detach().cpu().float() - emb_src.float()).abs().max().item()
     assert diff_emb == 0.0, (
-        f"draft.embed_tokens.weight diverges from target model.embed_tokens.weight "
+        f"draft.embed_tokens.weight diverges from target {layer_prefix}.embed_tokens.weight "
         f"(max abs diff = {diff_emb})"
     )
-    print("[load] OK: draft.embed_tokens.weight bit-equals target model.embed_tokens.weight.")
+    print(f"[load] OK: draft.embed_tokens.weight bit-equals target {layer_prefix}.embed_tokens.weight.")
 
     # (a) round-trip: export → re-read → diff against the source we loaded from
     with tempfile.TemporaryDirectory() as td:
@@ -248,14 +254,8 @@ def check_load_equivalence_and_roundtrip(
             try:
                 src_tensor = _read_tensor(model_path, weight_map, export_key)
             except KeyError:
-                # embed_tokens we re-emit as "{layer_prefix}.embed_tokens.weight" even though
-                # target stores it shared at "model.embed_tokens.weight" (mtp_use_dedicated_embeddings=False).
-                # Resolve that aliasing here.
-                if export_key == f"{layer_prefix}.embed_tokens.weight":
-                    src_tensor = _read_tensor(model_path, weight_map, "model.embed_tokens.weight")
-                else:
-                    bad.append(f"{export_key}: not found in target index")
-                    continue
+                bad.append(f"{export_key}: not found in target index")
+                continue
             d = (exported_tensor.detach().cpu().float() - src_tensor.float()).abs().max().item()
             if d != 0.0:
                 bad.append(f"{export_key}: max abs diff = {d}")
