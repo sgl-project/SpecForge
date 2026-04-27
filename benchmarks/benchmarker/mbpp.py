@@ -14,7 +14,7 @@ from .utils import create_simple_sgl_function
 
 def extract_code_from_output(output: str) -> Optional[str]:
     """Extract Python code from model output (markdown block or `def ...:`)."""
-    code_block_pattern = r"```(?:python)?\n(.*?)```"
+    code_block_pattern = r"```(?:python)?\s*(.*?)\s*```"
     match = re.search(code_block_pattern, output, re.DOTALL)
     if match:
         return match.group(1).strip()
