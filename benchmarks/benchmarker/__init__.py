@@ -8,6 +8,7 @@ from .livecodebench import LCBBenchmarker
 from .math500 import Math500Benchmarker
 from .mmlu import MMLUBenchmarker
 from .mmstar import MMStarBenchmarker
+from .mbpp import MBPPBenchmarker
 from .mtbench import MTBenchBenchmarker
 from .registry import BENCHMARKS
 from .simpleqa import SimpleQABenchmarker
@@ -25,5 +26,6 @@ __all__ = [
     "FinanceQABenchmarker",
     "MMLUBenchmarker",
     "LCBBenchmarker",
+    "MBPPBenchmarker",
     "SimpleQABenchmarker",
 ]
