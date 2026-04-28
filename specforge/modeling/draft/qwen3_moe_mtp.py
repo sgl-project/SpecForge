@@ -81,6 +81,152 @@ from .qwen3_moe_eagle import (
 # ---------------------------------------------------------------------------
 
 
+def _get_rope_params(config):
+    """Resolve effective RoPE parameters for an MTP attention class.
+
+    Priority:
+        1) ``config.rope_parameters`` (Qwen3.5+ canonical key, used by
+           HF transformers >=4.55 and SGLang). May be a dict containing
+           ``rope_type``, ``rope_theta``, ``partial_rotary_factor``,
+           ``mrope_section``, ``mrope_interleaved`` and any scaling fields.
+        2) ``config.rope_scaling`` (legacy).
+
+    Returns:
+        Tuple ``(rope_params, partial_rotary_factor, mrope_section,
+        mrope_interleaved, rope_theta)`` where ``rope_params`` is the
+        underlying dict (possibly empty) used for further scaling-type
+        dispatch in ``_init_rope``.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is None:
+        rope_params = getattr(config, "rope_scaling", None)
+    if rope_params is None or not isinstance(rope_params, dict):
+        rope_params = {}
+
+    # partial_rotary_factor: prefer the value embedded in rope_parameters
+    # (Qwen3.5 canonical placement), then fall back to a top-level config attr.
+    partial_rotary_factor = rope_params.get(
+        "partial_rotary_factor",
+        getattr(config, "partial_rotary_factor", 1.0),
+    )
+    mrope_section = rope_params.get("mrope_section", None)
+    mrope_interleaved = bool(rope_params.get("mrope_interleaved", False))
+    rope_theta = rope_params.get(
+        "rope_theta", getattr(config, "rope_theta", 10000)
+    )
+    return (
+        rope_params,
+        partial_rotary_factor,
+        mrope_section,
+        mrope_interleaved,
+        rope_theta,
+    )
+
+
+def _is_mrope_active(mrope_section, mrope_interleaved):
+    """MRoPE is active iff mrope_section is provided.
+
+    `mrope_interleaved` is only meaningful in conjunction with mrope_section.
+    """
+    return mrope_section is not None and len(mrope_section) > 0
+
+
+def _apply_partial_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    rotary_dim: int,
+    head_dim: int,
+    is_mrope: bool,
+    mrope_section,
+    mrope_interleaved: bool,
+    position_ids: Optional[torch.LongTensor],
+    unsqueeze_dim: int,
+):
+    """Apply (possibly partial, possibly MRoPE-interleaved) rotary embeddings.
+
+    The contract is:
+        - ``q`` / ``k`` carry the **full** ``head_dim`` last dimension. Only the
+          first ``rotary_dim`` of the last dim is rotated; the remaining
+          ``head_dim - rotary_dim`` features pass through unchanged.
+        - ``cos`` / ``sin`` are shaped ``(..., rotary_dim)`` (regular RoPE) or
+          ``(3, ..., rotary_dim)`` (MRoPE), matching what
+          ``LlamaRotaryEmbedding`` / ``LlamaMutiRotaryEmbedding`` returns when
+          their ``dim`` arg equals ``rotary_dim``.
+        - ``unsqueeze_dim`` selects the layout: 1 for ``(B, H, S, D)`` (SDPA /
+          Flex), 2 for ``(B, S, H, D)`` (Flash).
+
+    For MRoPE we further dispatch on ``mrope_interleaved``:
+        - True  → ``apply_multimodal_rotary_pos_emb_interleaved`` (Qwen3.5
+          canonical, mirrors vllm's ``apply_interleaved_rope``).
+        - False → legacy chunked ``apply_multimodal_rotary_pos_emb``.
+    """
+    from .llama3_eagle import (
+        apply_rotary_pos_emb,
+        apply_multimodal_rotary_pos_emb,
+        apply_multimodal_rotary_pos_emb_interleaved,
+    )
+
+    # Fast path: full RoPE (rotary_dim == head_dim) and no MRoPE.
+    no_partial = rotary_dim == head_dim
+    if no_partial and not is_mrope:
+        q_r, k_r = apply_rotary_pos_emb(
+            q, k, cos, sin, position_ids, unsqueeze_dim=unsqueeze_dim
+        )
+        return q_r, k_r
+
+    # Partial RoPE: split last dim into "rotated" + "pass-through".
+    if no_partial:
+        q_rot, q_pass = q, None
+        k_rot, k_pass = k, None
+    else:
+        q_rot = q[..., :rotary_dim]
+        q_pass = q[..., rotary_dim:]
+        k_rot = k[..., :rotary_dim]
+        k_pass = k[..., rotary_dim:]
+
+    # Rotate only the leading rotary_dim slice.
+    if is_mrope:
+        if mrope_interleaved:
+            q_rot, k_rot = apply_multimodal_rotary_pos_emb_interleaved(
+                q_rot, k_rot, cos, sin, mrope_section, unsqueeze_dim=unsqueeze_dim
+            )
+        else:
+            q_rot, k_rot = apply_multimodal_rotary_pos_emb(
+                q_rot, k_rot, cos, sin, mrope_section, unsqueeze_dim=unsqueeze_dim
+            )
+    else:
+        q_rot, k_rot = apply_rotary_pos_emb(
+            q_rot, k_rot, cos, sin, position_ids, unsqueeze_dim=unsqueeze_dim
+        )
+
+    if no_partial:
+        return q_rot, k_rot
+
+    return (
+        torch.cat((q_rot, q_pass), dim=-1),
+        torch.cat((k_rot, k_pass), dim=-1),
+    )
+
+
+def _copy_rope_meta(dst, src):
+    """Copy the RoPE-related metadata fields from ``src`` to ``dst``.
+
+    Used by the Flex / Flash / USP attention classes to reuse the exact same
+    RoPE configuration as the SDPA reference class without re-parsing the
+    config (single source of truth, no drift).
+    """
+    dst.partial_rotary_factor = src.partial_rotary_factor
+    dst.rotary_dim = src.rotary_dim
+    dst.mrope_section = src.mrope_section
+    dst.mrope_interleaved = src.mrope_interleaved
+    dst._is_mrope = src._is_mrope
+    dst.rope_theta = src.rope_theta
+    dst.rotary_emb = src.rotary_emb
+
+
 class Qwen3MoeMTPAttention(nn.Module):
     """MTP-compatible attention (SDPA) with output gating, q_norm and k_norm."""
 
@@ -96,6 +242,20 @@ class Qwen3MoeMTPAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
+
+        # --- Resolve RoPE-related config (partial RoPE + MRoPE interleaved) ---
+        # See target Qwen3.5 text_config: head_dim=256, partial_rotary_factor=0.25
+        # → rotary_dim = 64; mrope_section = [11, 11, 10] (sums to 32 = rotary_dim/2);
+        # mrope_interleaved = True; rope_theta = 1e7.
+        (
+            _rope_params,
+            self.partial_rotary_factor,
+            self.mrope_section,
+            self.mrope_interleaved,
+            self.rope_theta,
+        ) = _get_rope_params(config)
+        self.rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+        self._is_mrope = _is_mrope_active(self.mrope_section, self.mrope_interleaved)
 
         # MTP q_proj: input=hidden_size, output=num_heads*head_dim*2 (includes gate)
         self.q_proj = nn.Linear(
@@ -127,73 +287,98 @@ class Qwen3MoeMTPAttention(nn.Module):
             LlamaYarnRotaryEmbedding,
         )
 
-        if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim,
+        # Effective rotary dimension after partial RoPE.
+        # All RotaryEmbedding `dim` arguments below MUST be the rotary_dim,
+        # not head_dim, so that inv_freq / cos / sin all have shape rotary_dim.
+        rotary_dim = self.rotary_dim
+
+        # Prefer the canonical `rope_parameters` (Qwen3.5+) over the legacy
+        # `rope_scaling`. We re-use the dict resolved in __init__ to avoid drift.
+        rope_params = getattr(self.config, "rope_parameters", None)
+        if rope_params is None:
+            rope_params = getattr(self.config, "rope_scaling", None)
+
+        # MRoPE branch: triggered by presence of mrope_section.
+        if self._is_mrope:
+            self.rotary_emb = LlamaMutiRotaryEmbedding(
+                rotary_dim,
                 max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
+                base=self.rope_theta,
+                mrope_section=self.mrope_section,
+                mrope_interleaved=self.mrope_interleaved,
+            )
+            return
+
+        # No scaling: plain partial-RoPE.
+        if rope_params is None or not isinstance(rope_params, dict) or len(rope_params) == 0:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                rotary_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+            return
+
+        def rope_get(key, default=None):
+            return rope_params.get(key, default)
+
+        scaling_type = rope_get("rope_type", rope_get("type"))
+        scaling_factor = rope_get("factor")
+
+        if scaling_type in (None, "default"):
+            self.rotary_emb = LlamaRotaryEmbedding(
+                rotary_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+        elif scaling_type == "linear":
+            self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                rotary_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                scaling_factor=scaling_factor,
+            )
+        elif scaling_type == "dynamic":
+            self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                rotary_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                scaling_factor=scaling_factor,
+            )
+        elif scaling_type == "llama3":
+            self.rotary_emb = LlamaRotaryEmbedding(
+                rotary_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+                scaling_factor=(
+                    scaling_factor if scaling_factor is not None else 1.0
+                ),
+                low_freq_factor=rope_get("low_freq_factor"),
+                high_freq_factor=rope_get("high_freq_factor"),
+                orig_max_position=rope_get("original_max_position_embeddings"),
+            )
+        elif scaling_type == "mrope":
+            # Defensive: someone explicitly set rope_type="mrope" but did not
+            # populate mrope_section. Fall back to plain RoPE rather than crash.
+            self.rotary_emb = LlamaMutiRotaryEmbedding(
+                rotary_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+                mrope_section=self.mrope_section,
+                mrope_interleaved=self.mrope_interleaved,
+            )
+        elif scaling_type == "yarn":
+            self.rotary_emb = LlamaYarnRotaryEmbedding(
+                rotary_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                original_max_position_embeddings=rope_get(
+                    "original_max_position_embeddings"
+                ),
+                scaling_factor=scaling_factor,
+                beta_fast=rope_get("beta_fast"),
+                beta_slow=rope_get("beta_slow"),
+                mscale=rope_get("mscale"),
+                mscale_all_dim=rope_get("mscale_all_dim"),
             )
         else:
-            rope_scaling = self.config.rope_scaling
-
-            def rope_get(key, default=None):
-                if isinstance(rope_scaling, dict):
-                    return rope_scaling.get(key, default)
-                return getattr(rope_scaling, key, default)
-
-            scaling_type = rope_get("rope_type", rope_get("type"))
-            scaling_factor = rope_get("factor")
-
-            if scaling_type == "default":
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
-                )
-            elif scaling_type == "linear":
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                )
-            elif scaling_type == "llama3":
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
-                    scaling_factor=(
-                        scaling_factor if scaling_factor is not None else 1.0
-                    ),
-                    low_freq_factor=rope_get("low_freq_factor"),
-                    high_freq_factor=rope_get("high_freq_factor"),
-                    orig_max_position=rope_get("original_max_position_embeddings"),
-                )
-            elif scaling_type == "mrope":
-                self.rotary_emb = LlamaMutiRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                )
-            elif scaling_type == "yarn":
-                self.rotary_emb = LlamaYarnRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    original_max_position_embeddings=rope_get(
-                        "original_max_position_embeddings"
-                    ),
-                    scaling_factor=scaling_factor,
-                    beta_fast=rope_get("beta_fast"),
-                    beta_slow=rope_get("beta_slow"),
-                    mscale=rope_get("mscale"),
-                    mscale_all_dim=rope_get("mscale_all_dim"),
-                )
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def _split_qkv_and_gate(self, query_states, bsz, q_len):
         """Split q_proj output into query states and output gate."""
@@ -218,12 +403,7 @@ class Qwen3MoeMTPAttention(nn.Module):
         use_cache: bool = False,
     ):
         import math
-        from .llama3_eagle import (
-            apply_rotary_pos_emb,
-            apply_multimodal_rotary_pos_emb,
-            repeat_kv,
-            LlamaMutiRotaryEmbedding,
-        )
+        from .llama3_eagle import repeat_kv
 
         bsz, q_len, _ = hidden_states.size()
 
@@ -236,7 +416,7 @@ class Qwen3MoeMTPAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Transpose to (bsz, num_heads, q_len, head_dim)
+        # Transpose to (bsz, num_heads, q_len, head_dim) [BHSD layout]
         query_states = query_states.transpose(1, 2)
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
@@ -249,23 +429,32 @@ class Qwen3MoeMTPAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        if cache_hidden is None:
-            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                cos, sin = self.rotary_emb(query_states, position_ids)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    self.config.rope_scaling["mrope_section"],
-                )
+        # Helper closure: compute (cos, sin) at the right effective seq length
+        # and apply (partial / mrope-interleaved) RoPE in BHSD layout.
+        def _apply_rope(q, k, pids, eff_seq_len):
+            if self._is_mrope:
+                cos, sin = self.rotary_emb(q, pids)
             else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids
-                )
+                cos, sin = self.rotary_emb(q, seq_len=eff_seq_len)
+            cos, sin = cos.to(q.device), sin.to(q.device)
+            return _apply_partial_rope(
+                q,
+                k,
+                cos,
+                sin,
+                rotary_dim=self.rotary_dim,
+                head_dim=self.head_dim,
+                is_mrope=self._is_mrope,
+                mrope_section=self.mrope_section,
+                mrope_interleaved=self.mrope_interleaved,
+                position_ids=pids,
+                unsqueeze_dim=1,  # BHSD
+            )
+
+        if cache_hidden is None:
+            query_states, key_states = _apply_rope(
+                query_states, key_states, position_ids, q_len
+            )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -281,22 +470,9 @@ class Qwen3MoeMTPAttention(nn.Module):
 
         else:
             lck = len(cache_hidden[0])
-            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                cos, sin = self.rotary_emb(query_states, position_ids + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    self.config.rope_scaling["mrope_section"],
-                )
-            else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids + lck
-                )
+            query_states, key_states = _apply_rope(
+                query_states, key_states, position_ids + lck, q_len + lck
+            )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -388,7 +564,12 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # Share RoPE init with SDPA attention.
+        # Share RoPE init with SDPA attention. We construct a "stub" attn,
+        # populate the minimum fields its `_init_rope` reads, then mirror
+        # ALL RoPE-related metadata (partial_rotary_factor / rotary_dim /
+        # mrope_section / mrope_interleaved / rotary_emb / ...) onto self via
+        # _copy_rope_meta -- this guarantees a single source of truth and
+        # avoids drift between the four attention backends.
         # NOTE: nn.Module.__init__(_attn) is required because __new__ alone
         # does NOT set up the internal `_modules` / `_parameters` dicts that
         # nn.Module.__setattr__ relies on. Without it, `self.rotary_emb = ...`
@@ -399,8 +580,18 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
         _attn.config = config
         _attn.head_dim = self.head_dim
         _attn.max_position_embeddings = self.max_position_embeddings
+        # Pre-populate RoPE metadata that _init_rope() consumes.
+        (
+            _,
+            _attn.partial_rotary_factor,
+            _attn.mrope_section,
+            _attn.mrope_interleaved,
+            _attn.rope_theta,
+        ) = _get_rope_params(config)
+        _attn.rotary_dim = int(_attn.head_dim * _attn.partial_rotary_factor)
+        _attn._is_mrope = _is_mrope_active(_attn.mrope_section, _attn.mrope_interleaved)
         _attn._init_rope()
-        self.rotary_emb = _attn.rotary_emb
+        _copy_rope_meta(self, _attn)
 
     def _split_qkv_and_gate(self, query_states, bsz, q_len):
         query_states = query_states.view(
@@ -420,9 +611,6 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
         use_cache: bool = False,
     ):
         from .llama3_eagle import (
-            apply_rotary_pos_emb,
-            apply_multimodal_rotary_pos_emb,
-            LlamaMutiRotaryEmbedding,
             generate_eagle3_mask,
             create_block_mask,
             compile_friendly_create_block_mask,
@@ -457,22 +645,24 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
         key_states = self.k_norm(key_states)
 
         lck = past_seen_tokens // q_len
-        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+        if self._is_mrope:
             cos, sin = self.rotary_emb(query_states, position_ids + lck)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_multimodal_rotary_pos_emb(
-                query_states,
-                key_states,
-                cos,
-                sin,
-                self.config.rope_scaling["mrope_section"],
-            )
         else:
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids + lck
-            )
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        query_states, key_states = _apply_partial_rope(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            rotary_dim=self.rotary_dim,
+            head_dim=self.head_dim,
+            is_mrope=self._is_mrope,
+            mrope_section=self.mrope_section,
+            mrope_interleaved=self.mrope_interleaved,
+            position_ids=position_ids + lck,
+            unsqueeze_dim=1,  # BHSD
+        )
 
         cache_position = torch.arange(
             past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
@@ -558,12 +748,24 @@ class Qwen3MoeMTPFlashAttention(nn.Module):
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # Share RoPE init with SDPA attention (see Flex variant for the
+        # full rationale and ordering constraints).
         _attn = Qwen3MoeMTPAttention.__new__(Qwen3MoeMTPAttention)
+        nn.Module.__init__(_attn)
         _attn.config = config
         _attn.head_dim = self.head_dim
         _attn.max_position_embeddings = self.max_position_embeddings
+        (
+            _,
+            _attn.partial_rotary_factor,
+            _attn.mrope_section,
+            _attn.mrope_interleaved,
+            _attn.rope_theta,
+        ) = _get_rope_params(config)
+        _attn.rotary_dim = int(_attn.head_dim * _attn.partial_rotary_factor)
+        _attn._is_mrope = _is_mrope_active(_attn.mrope_section, _attn.mrope_interleaved)
         _attn._init_rope()
-        self.rotary_emb = _attn.rotary_emb
+        _copy_rope_meta(self, _attn)
 
     def _split_qkv_and_gate(self, query_states, bsz, q_len):
         query_states = query_states.view(
@@ -583,12 +785,7 @@ class Qwen3MoeMTPFlashAttention(nn.Module):
         use_cache: bool = False,
     ):
         import math
-        from .llama3_eagle import (
-            apply_rotary_pos_emb,
-            apply_multimodal_rotary_pos_emb,
-            LlamaMutiRotaryEmbedding,
-            flash_attn_func,
-        )
+        from .llama3_eagle import flash_attn_func
 
         bsz, q_len, _ = hidden_states.size()
 
@@ -612,23 +809,24 @@ class Qwen3MoeMTPFlashAttention(nn.Module):
         key_states = self.k_norm(key_states)
 
         lck = 0 if cache_hidden is None else len(cache_hidden[0])
-        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+        if self._is_mrope:
             cos, sin = self.rotary_emb(query_states, position_ids + lck)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_multimodal_rotary_pos_emb(
-                query_states,
-                key_states,
-                cos,
-                sin,
-                self.config.rope_scaling["mrope_section"],
-                unsqueeze_dim=2,
-            )
         else:
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
-            )
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        query_states, key_states = _apply_partial_rope(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            rotary_dim=self.rotary_dim,
+            head_dim=self.head_dim,
+            is_mrope=self._is_mrope,
+            mrope_section=self.mrope_section,
+            mrope_interleaved=self.mrope_interleaved,
+            position_ids=position_ids + lck,
+            unsqueeze_dim=2,  # BSHD (flash-attn layout)
+        )
 
         if cache_hidden is not None:
             cache_hidden[0] = cache_hidden[0] + [key_states]
@@ -728,12 +926,24 @@ class Qwen3MoeMTPUSPFlashAttention(nn.Module):
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # Share RoPE init with SDPA attention (see Flex variant for the
+        # full rationale and ordering constraints).
         _attn = Qwen3MoeMTPAttention.__new__(Qwen3MoeMTPAttention)
+        nn.Module.__init__(_attn)
         _attn.config = config
         _attn.head_dim = self.head_dim
         _attn.max_position_embeddings = self.max_position_embeddings
+        (
+            _,
+            _attn.partial_rotary_factor,
+            _attn.mrope_section,
+            _attn.mrope_interleaved,
+            _attn.rope_theta,
+        ) = _get_rope_params(config)
+        _attn.rotary_dim = int(_attn.head_dim * _attn.partial_rotary_factor)
+        _attn._is_mrope = _is_mrope_active(_attn.mrope_section, _attn.mrope_interleaved)
         _attn._init_rope()
-        self.rotary_emb = _attn.rotary_emb
+        _copy_rope_meta(self, _attn)
 
         # USP-specific: import SP group info
         from .llama3_eagle import get_sp_ring_group, get_sp_ulysses_group
@@ -766,8 +976,6 @@ class Qwen3MoeMTPUSPFlashAttention(nn.Module):
     ):
         import math
         from .llama3_eagle import (
-            apply_rotary_pos_emb,
-            LlamaMutiRotaryEmbedding,
             SeqAllToAll4D,
             ring_flash_attn_func,
             get_sp_ring_group,
@@ -834,13 +1042,26 @@ class Qwen3MoeMTPUSPFlashAttention(nn.Module):
         # Global length calculation (for RoPE)
         global_q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
 
-        # 2. RoPE & Cache Management
+        # 2. RoPE & Cache Management (partial RoPE + MRoPE interleaved aware)
         lck = 0 if cache_hidden is None else len(cache_hidden[0])
 
-        cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
+        if self._is_mrope:
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
         cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+        query_states, key_states = _apply_partial_rope(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            rotary_dim=self.rotary_dim,
+            head_dim=self.head_dim,
+            is_mrope=self._is_mrope,
+            mrope_section=self.mrope_section,
+            mrope_interleaved=self.mrope_interleaved,
+            position_ids=position_ids + lck,
+            unsqueeze_dim=2,  # BSHD (flash-attn layout)
         )
 
         # Update Cache

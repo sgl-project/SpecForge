@@ -159,6 +159,68 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
     return q_embed, k_embed
 
 
+def _apply_interleaved_mrope_half(x_half: torch.Tensor, mrope_section) -> torch.Tensor:
+    """Apply interleaved MRoPE merge on a "half-dim" tensor.
+
+    Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+    interleaved [THWTHWTHW...TT], preserving frequency continuity.
+
+    Args:
+        x_half (`torch.Tensor`): cos/sin tensor of shape [3, ..., rotary_dim/2]
+            where the first axis is (T, H, W).
+        mrope_section (`List[int]`): channel split [t, h, w] on the half-dim
+            (sum(mrope_section) == rotary_dim/2).
+
+    Returns:
+        Tensor of shape [..., rotary_dim/2] obtained by:
+            - taking T as the base
+            - overwriting positions [1, 1+3, 1+6, ...] (count = h) with H
+            - overwriting positions [2, 2+3, 2+6, ...] (count = w) with W
+        See vllm.model_executor.layers.rotary_embedding.mrope.apply_interleaved_rope.
+    """
+    # x_half: [3, ..., rotary_dim/2], mrope_section example: [11, 11, 10]
+    x_t = x_half[0].clone()
+    h = mrope_section[1]
+    w = mrope_section[2]
+    if h > 0:
+        x_t[..., 1 : 1 + h * 3 : 3] = x_half[1, ..., 1 : 1 + h * 3 : 3]
+    if w > 0:
+        x_t[..., 2 : 2 + w * 3 : 3] = x_half[2, ..., 2 : 2 + w * 3 : 3]
+    return x_t
+
+
+def apply_multimodal_rotary_pos_emb_interleaved(
+    q, k, cos, sin, mrope_section, unsqueeze_dim=1
+):
+    """Apply *interleaved* Multimodal RoPE.
+
+    The frequency layout used by Qwen3.5 (and other Qwen3-VL variants) keeps
+    the temporal/height/width components interleaved at stride 3 inside the
+    half-dim, instead of chunked [T...H...W...].
+
+    Inputs `cos`/`sin` are of shape [3, B, S, rotary_dim] (full-dim, since
+    LlamaMutiRotaryEmbedding.forward concatenates `freqs` twice). We:
+      1) take the first half (rotary_dim/2) which is the base frequency,
+      2) merge the (T,H,W) axes via `_apply_interleaved_mrope_half`,
+      3) duplicate to full rotary_dim by `cat([x, x], dim=-1)`.
+
+    The final cos/sin have shape [B, S, rotary_dim] (no leading "3" axis).
+    """
+    # cos/sin: [3, B, S, rotary_dim] - take half, then merge.
+    half_dim = cos.shape[-1] // 2
+    cos_half = cos[..., :half_dim]
+    sin_half = sin[..., :half_dim]
+    cos_merged = _apply_interleaved_mrope_half(cos_half, mrope_section)
+    sin_merged = _apply_interleaved_mrope_half(sin_half, mrope_section)
+    # restore full rotary_dim via duplication, matching rotate_half layout.
+    cos = torch.cat((cos_merged, cos_merged), dim=-1).unsqueeze(unsqueeze_dim)
+    sin = torch.cat((sin_merged, sin_merged), dim=-1).unsqueeze(unsqueeze_dim)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 def prepare_decoder_attention_mask(
     attention_mask, input_shape, inputs_embeds, past_key_values_length
 ):
@@ -359,6 +421,17 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
 
 
 class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
+    """Multimodal (T/H/W) rotary embedding.
+
+    Args:
+        dim: rotary dimension (= int(head_dim * partial_rotary_factor)).
+        mrope_section: List[int] of channel splits on the half-dim, e.g.
+            [11, 11, 10] for Qwen3.5 (sums to rotary_dim/2 = 32).
+        mrope_interleaved: when True, frequencies are interleaved at stride 3
+            (Qwen3-VL/Qwen3.5 style). When False, they are chunked T..H..W..
+            (Qwen2-VL style).
+    """
+
     def __init__(
         self,
         dim,
@@ -366,11 +439,23 @@ class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
         base=10000,
         device=None,
         scaling_factor=1.0,
+        mrope_section=None,
+        mrope_interleaved: bool = False,
     ):
         super().__init__(dim, max_position_embeddings, base, device)
         self.scaling_factor = scaling_factor
+        self.mrope_section = list(mrope_section) if mrope_section is not None else None
+        self.mrope_interleaved = bool(mrope_interleaved)
 
     def forward(self, x, position_ids):
+        # Accept both 1D-broadcasted text positions (B, S) and full 3D MRoPE
+        # positions (3, B, S). Internally we always promote to (3, B, S) so
+        # that downstream apply_multimodal_rotary_pos_emb[_interleaved] sees
+        # a uniform layout.
+        if position_ids.dim() == 2:
+            # Plain text: T = H = W = same monotonic position ids.
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
         # In contrast to other models, Qwen2_5_VL has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
         inv_freq_expanded = (

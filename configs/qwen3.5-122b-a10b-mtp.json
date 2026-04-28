@@ -25,6 +25,13 @@
     "pad_token_id": null,
     "partial_rotary_factor": 0.25,
     "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+        "rope_type": "default",
+        "rope_theta": 10000000,
+        "partial_rotary_factor": 0.25,
+        "mrope_section": [11, 11, 10],
+        "mrope_interleaved": true
+    },
     "rope_scaling": null,
     "rope_theta": 10000000,
     "tie_word_embeddings": false,
