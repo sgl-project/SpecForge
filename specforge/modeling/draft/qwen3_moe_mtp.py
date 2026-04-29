@@ -1297,16 +1297,24 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
         #   1) load_mtp_weights can copy weights with no shape mismatch
         #   2) export_mtp_weights round-trips losslessly back to the target slot
         #   3) when training on a t2d subset, we still chunk-matmul the full vocab
-        #      and project to draft_vocab_size via index_select(d2t) (see compute_logits)
+        #      and then project to the draft subset via t2d boolean mask
+        #      (see compute_logits). NOTE: we MUST use t2d (bool) here, not
+        #      index_select(d2t), because d2t is a spec-decode OFFSET
+        #      (d2t[i] = used_tokens[i] - i), NOT vocab indices.
         self.lm_head = nn.Linear(
             config.hidden_size, self.vocab_size, bias=False
         )
 
-        # Vocab mapping buffers — when draft_vocab_size == vocab_size,
-        # t2d is all-True and d2t is identity, effectively a pass-through.
-        # When training on a subset, base.load_vocab_mapping(file_path) overwrites both.
+        # Vocab mapping buffers.
+        # Semantics (see specforge/data/preprocessing.py:process_token_dict_to_mappings):
+        #   used_tokens = sorted target ids kept in the draft subset (len = draft_vocab_size)
+        #   d2t[i] = used_tokens[i] - i               (OFFSET; spec-decode draft_id->target_id)
+        #   t2d[j] = (j in used_tokens)               (BOOL mask over target vocab)
+        # Default init: t2d all-True, d2t zeros. base.load_vocab_mapping(file)
+        # overwrites both with the real mapping prior to training. We deliberately
+        # match the convention in qwen3_moe_eagle.py / llama3_eagle.py.
         t2d = torch.ones(self.vocab_size, dtype=torch.bool)
-        d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
+        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
@@ -1393,12 +1401,19 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
         Strategy:
           1) Run lm_head over the FULL target vocab (matches target MTP exactly).
           2) If training on a draft vocab subset (draft_vocab_size < vocab_size),
-             immediately project each chunk to [..., draft_vocab_size] via d2t
-             so the downstream loss only sees the subset.
+             project each chunk to [..., draft_vocab_size] via the t2d boolean
+             mask so the downstream loss only sees the subset, AND so it stays
+             aligned with how target_p is computed in
+             specforge/core/eagle3.py::_compute_target_p, which does
+             ``target_head[..., t2d]``.
           3) Optionally chunk along the flattened (B*S) dim to bound peak memory.
 
         The chunked outputs are concatenated (NOT scatter-assigned) to keep
         autograd clean.
+
+        IMPORTANT: do NOT use ``index_select(-1, d2t)`` here. d2t is the
+        spec-decode OFFSET (d2t[i] = used_tokens[i] - i), not vocab indices;
+        using it as indices selects misaligned columns and breaks training.
         """
         norm_h = self.norm(hidden_states)
         project = self.draft_vocab_size < self.vocab_size
@@ -1408,18 +1423,31 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
         flat_h = norm_h.reshape(-1, H)
         N = flat_h.shape[0]
 
+        # Pre-fetch t2d on the right device once to avoid per-chunk H2D copies.
+        t2d_dev = self.t2d.to(flat_h.device) if project else None
+        if project:
+            assert t2d_dev.dtype == torch.bool, (
+                f"t2d must be a boolean mask, got dtype={t2d_dev.dtype}. "
+                "Did you forget to call load_vocab_mapping()?"
+            )
+            assert int(t2d_dev.sum().item()) == self.draft_vocab_size, (
+                f"t2d has {int(t2d_dev.sum().item())} True entries, "
+                f"expected draft_vocab_size={self.draft_vocab_size}. "
+                "Did you forget to call load_vocab_mapping()?"
+            )
+
         chunk = self._lm_head_chunk_size if self._lm_head_chunk_size is not None else N
         if chunk >= N:
             logits = self.lm_head(flat_h)
             if project:
-                logits = logits.index_select(-1, self.d2t.to(logits.device))
+                logits = logits[..., t2d_dev]
         else:
             chunks = []
             for start in range(0, N, chunk):
                 end = min(start + chunk, N)
                 cl = self.lm_head(flat_h[start:end])
                 if project:
-                    cl = cl.index_select(-1, self.d2t.to(cl.device))
+                    cl = cl[..., t2d_dev]
                 chunks.append(cl)
             logits = torch.cat(chunks, dim=0)
 
