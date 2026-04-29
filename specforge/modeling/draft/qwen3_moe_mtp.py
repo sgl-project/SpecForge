@@ -644,7 +644,7 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        lck = past_seen_tokens // q_len
+        lck = past_seen_tokens
         if self._is_mrope:
             cos, sin = self.rotary_emb(query_states, position_ids + lck)
         else:
@@ -677,7 +677,6 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
         )
 
         seq_lengths = attention_mask.sum(dim=-1)
-        seq_lengths -= lck
         if q_len <= 128:
             create_block_mask_func = create_block_mask
             flex_attention_func = flex_attention
