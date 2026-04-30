@@ -669,6 +669,13 @@ def save_checkpoints(
         # Filter out:
         #   - embed_tokens: shared with target (loaded from `target_model_path`
         #     via `load_embedding`), kept frozen.
+        #     IMPORTANT: match by exact substring `embed_tokens` (NOT just
+        #     `embed`), otherwise we will accidentally drop other learnable
+        #     parameters whose names happen to contain the substring
+        #     "embed", such as MTP's `pre_fc_norm_embedding.weight`.
+        #     Historical bug: the old check `"embed" not in k.lower()` silently
+        #     dropped `pre_fc_norm_embedding` from MTP checkpoints, leading to
+        #     a missing key on resume + degraded sglang acceptance length.
         #   - lm_head: in MTP mode this is also frozen and identical to
         #     target's `shared_head.head`; on resume we reload it from
         #     `target_model_path` (see `build_draft_model`). For Eagle3 mode
@@ -686,7 +693,7 @@ def save_checkpoints(
             k.replace("draft_model.", ""): v
             for k, v in model_state_dict.items()
             if "draft_model." in k
-            and "embed" not in k.lower()
+            and "embed_tokens" not in k
             and not (lm_head_frozen and "lm_head" in k)
         }
 

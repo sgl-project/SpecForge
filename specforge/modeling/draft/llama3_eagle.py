@@ -1295,10 +1295,18 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaRMSNorm(nn.Module):
+    """
+    Llama-style RMSNorm: ``y = w * x_normed``, weight initialized to 1.
+
+    Use this for draft models whose target is a Llama-family model that
+    stores RMSNorm.weight in the same Llama parametrization (init=1).
+    Note: this is INCOMPATIBLE with Gemma-style RMSNorm checkpoints
+    (init=0, ``y = (1+w) * x_normed``) such as Qwen3.5-MoE / Qwen3-MoE /
+    Gemma / DeepSeek-V3, because the stored weight differs by 1.0.
+    For those targets use :class:`GemmaRMSNorm` instead.
+    """
+
     def __init__(self, hidden_size, eps=1e-6):
-        """
-        LlamaRMSNorm is equivalent to T5LayerNorm
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -1310,6 +1318,48 @@ class LlamaRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+class GemmaRMSNorm(nn.Module):
+    """
+    Gemma-style RMSNorm: ``y = (1 + w) * x_normed``, weight initialized to 0
+    (i.e. *1-centered*: a freshly initialized weight produces an identity
+    transform, exactly like ``torch.ones`` does in the Llama variant).
+
+    This MUST be used for draft models whose target stores RMSNorm.weight
+    in the same Gemma parametrization, including (but not limited to):
+        * Qwen3.5-MoE  (`transformers.Qwen3_5MoeRMSNorm`)
+        * Qwen3-MoE    (`transformers.Qwen3MoeRMSNorm`)
+        * Gemma / Gemma2 / Gemma3
+        * DeepSeek-V3 / V3.1 (MTP head norms)
+    sglang's runtime also implements RMSNorm as ``(1 + w) * x``, so when
+    the trained draft is merged back into the target's MTP slots the
+    inference forward will reproduce the exact training-time forward
+    iff both sides use this Gemma parametrization.
+
+    Why a separate class (rather than a flag on `LlamaRMSNorm`):
+        Mixing the two parametrizations under the same class name has
+        already silently destroyed an MTP draft once -- making this a
+        distinct class forces the per-target choice to be explicit at
+        the call site.
+    """
+
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        # init=0  =>  (1 + 0) * x = x  =>  identity at step 0, like Llama init=1.
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    @torch.compile(dynamic=True)
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        # Cast `(1 + w)` in fp32 to avoid bf16/fp16 round-off on small w,
+        # then cast back to the activation dtype.
+        scale = (1.0 + self.weight.float()).to(input_dtype)
+        return scale * hidden_states.to(input_dtype)
 
 
 class LlamaDecoderLayer(nn.Module):

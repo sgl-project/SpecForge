@@ -56,9 +56,15 @@ from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
 from .llama3_eagle import (
-    LlamaRMSNorm,
+    GemmaRMSNorm,
     prepare_decoder_attention_mask,
 )
+# NOTE: Qwen3.5/Qwen3-MoE 系列 target 使用的 RMSNorm 范式是
+#   y = (1 + w) * x_normed     (weight 初始化为 0)
+# 这与 Llama 风格 (y = w * x_normed, weight 初始化为 1) 不同。
+# 因此本文件统一使用 GemmaRMSNorm，确保 draft 训练时与 target/sglang 推理
+# 在数值上完全一致，draft↔target 之间 norm.weight 可直接 copy。
+# 详见 llama3_eagle.GemmaRMSNorm 的 docstring。
 
 # Re-export MoE components from the Eagle3 module (identical structure)
 from .qwen3_moe_eagle import (
@@ -273,8 +279,8 @@ class Qwen3MoeMTPAttention(nn.Module):
         )
 
         # q_norm / k_norm (matching target MTP attention)
-        self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self._init_rope()
 
@@ -561,8 +567,8 @@ class Qwen3MoeMTPFlexAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # Share RoPE init with SDPA attention. We construct a "stub" attn,
         # populate the minimum fields its `_init_rope` reads, then mirror
@@ -745,8 +751,8 @@ class Qwen3MoeMTPFlashAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # Share RoPE init with SDPA attention (see Flex variant for the
         # full rationale and ordering constraints).
@@ -923,8 +929,8 @@ class Qwen3MoeMTPUSPFlashAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # Share RoPE init with SDPA attention (see Flex variant for the
         # full rationale and ordering constraints).
@@ -1195,8 +1201,8 @@ class Qwen3MoeDecoderLayerMTP(nn.Module):
         self.mlp = Qwen3MoeDraftSparseMoeBlock(config)
 
         # Standard pre-attention norm
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -1283,14 +1289,14 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
         )
 
         # Pre-FC norms (matching target MTP)
-        self.pre_fc_norm_embedding = LlamaRMSNorm(
+        self.pre_fc_norm_embedding = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = LlamaRMSNorm(
+        self.pre_fc_norm_hidden = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # lm_head: FULL target vocab (matches target MTP's shared_head.head exactly).
         # We deliberately keep the full [vocab_size, hidden] matrix so that:
@@ -1520,6 +1526,27 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
         dimensions for ALL parameters (fc, q/k/v_proj, lm_head), so every
         single weight can be loaded without any shape mismatch.
 
+        RMSNorm convention (IMPORTANT)
+        ------------------------------
+        This module uses :class:`GemmaRMSNorm` for every RMSNorm layer
+        (q_norm, k_norm, input_layernorm, post_attention_layernorm,
+        pre_fc_norm_embedding, pre_fc_norm_hidden, norm), which matches
+        the convention used by Qwen3.5/Qwen3-MoE target weights and by
+        sglang at inference time:
+
+            y = (1 + w) * x_normed,    weight initialised to 0
+
+        Therefore the target's `*norm.weight` tensors can be copied into
+        the draft model verbatim via `param.copy_(src_tensor)` — NO ±1.0
+        conversion is required.
+
+        Historical note: an earlier version of this code paired draft-side
+        :class:`LlamaRMSNorm` (`y = w * x_normed`, weight init 1) with the
+        Gemma-style target weights; that mismatch silently shifted every
+        norm output by 1.0 and required a corrective `W_target_slot = W - 1`
+        step in the offline merge script. Since the draft now uses
+        GemmaRMSNorm, both training and merging are 1-to-1 with the target.
+
         Args:
             model_path: Path to the target model directory.
             mtp_layer_idx: Index of the MTP block to load from (default: 0).
@@ -1667,6 +1694,27 @@ class Qwen3MoeForCausalLMMTP(Eagle3DraftModel):
                     )
                     continue
 
+                # Sanity check (dev safeguard): for any RMSNorm weight, both
+                # target and draft use Gemma convention `y = (1 + w) * x`
+                # where `w` is initialised to 0 and stays close to 0 after
+                # training (typical |mean| << 0.5).  If the source tensor
+                # looks like a Llama-style norm (mean ≈ 1 after init),
+                # something is very wrong with the target checkpoint and we
+                # should refuse to silently corrupt the draft.
+                if dst_key.endswith("norm.weight") and src_tensor.numel() > 0:
+                    src_mean = float(src_tensor.float().mean().abs().item())
+                    if src_mean > 0.8:
+                        print_with_rank(
+                            f"WARNING: {src_key} mean={src_mean:.4f} looks "
+                            f"like Llama-style RMSNorm (init=1). The draft "
+                            f"uses GemmaRMSNorm (init=0). Verify the target "
+                            f"actually uses Gemma convention; otherwise the "
+                            f"loaded weight is off by 1.0."
+                        )
+
+                # Direct copy is correct because target and draft now share
+                # the SAME RMSNorm convention (Gemma: y = (1+w)*x).  No ±1
+                # adjustment is needed here or in the offline merge script.
                 param.copy_(src_tensor)
                 loaded_count += 1
 
