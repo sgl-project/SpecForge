@@ -123,7 +123,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
-    tools: Optional[List[List[Dict]]] = None,
+    tools: Optional[List[List[Dict]]] = [[]],
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -155,9 +155,6 @@ def preprocess_conversations(
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
-    # Ensure tools list matches conversations length
-    if tools is None or len(tools) != len(conversations):
-        tools = [[] for _ in range(len(conversations))]
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
@@ -347,9 +344,9 @@ def build_eagle3_dataset(
     if chat_template is None:
         raise ValueError("chat_template must be provided for all dataset types")
 
-    assert chat_template in TEMPLATE_REGISTRY.get_all_template_names(), (
-        f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
-    )
+    assert (
+        chat_template in TEMPLATE_REGISTRY.get_all_template_names()
+    ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 

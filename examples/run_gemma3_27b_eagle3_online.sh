@@ -13,8 +13,7 @@ torchrun \
     --target-model-path google/gemma-3-27b-it \
     --draft-model-config $ROOT_DIR/configs/gemma3-27b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/ultrachat_train.jsonl \
-                      $ROOT_DIR/cache/dataset/translate_bp_regen_gemma3_train.jsonl \
-    --output-dir $ROOT_DIR/outputs/gemma3-27b-eagle3-ucml-mix-l-aq \
+    --output-dir $ROOT_DIR/outputs/gemma3-27b-eagle3 \
     --num-epochs 8 \
     --batch-size 2 \
     --draft-accumulation-steps 2 \
@@ -30,5 +29,4 @@ torchrun \
     --save-interval 10000 \
     --build-dataset-num-proc 64 \
     --report-to tensorboard \
-    --eval-holdout-ratio 0.005 \
     --embedding-key=language_model.model.embed_tokens.weight

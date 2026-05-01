@@ -1,10 +1,9 @@
 import argparse
-import glob
 import hashlib
+import json
 import math
 import os
 import time
-from datetime import datetime
 from argparse import ArgumentParser, Namespace
 from typing import List, Optional, Tuple, Union
 
@@ -108,17 +107,10 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # dataset arguments
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, nargs="+", required=True)
+    dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
-    dataset_group.add_argument(
-        "--eval-holdout-ratio",
-        type=float,
-        default=None,
-        help="Fraction of the training dataset to hold out for evaluation (0 to 1). "
-        "Mutually exclusive with --eval-data-path and --eval-hidden-states-path.",
-    )
     dataset_group.add_argument("--chat-template", type=str, default="llama3")
     dataset_group.add_argument(
         "--is-preformatted",
@@ -356,18 +348,6 @@ def sanity_check(args: Namespace) -> None:
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
 
-    if args.eval_holdout_ratio is not None:
-        if not (0 < args.eval_holdout_ratio < 1):
-            raise ValueError(
-                f"--eval-holdout-ratio must be between 0 and 1 (exclusive), "
-                f"got {args.eval_holdout_ratio}"
-            )
-        if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
-            raise ValueError(
-                "--eval-holdout-ratio is mutually exclusive with "
-                "--eval-data-path and --eval-hidden-states-path"
-            )
-
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -376,9 +356,9 @@ def sp_sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
-    assert args.batch_size == 1, (
-        f"USP only supports batch_size=1, got batch_size={args.batch_size}"
-    )
+    assert (
+        args.batch_size == 1
+    ), f"USP only supports batch_size=1, got batch_size={args.batch_size}"
 
     assert args.sp_ring_size * args.sp_ulysses_size > 1, (
         f"USP requires sp_ring_size * sp_ulysses_size > 1. "
@@ -477,55 +457,24 @@ def build_dataloaders(
     args: Namespace,
     draft_model_config: AutoDraftModelConfig,
     processor: Optional[AutoProcessor] = None,
-) -> Tuple[DataLoader, Optional[str], Optional[DataLoader]]:
+) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
 
-    # Resolve all training data paths: expand directories to their .jsonl files
-    resolved_train_files = []
-    for path in args.train_data_path:
-        if os.path.isdir(path):
-            jsonl_files = sorted(glob.glob(os.path.join(path, "*.jsonl")))
-            if not jsonl_files:
-                raise ValueError(f"No .jsonl files found in directory: {path}")
-            resolved_train_files.extend(jsonl_files)
-        elif os.path.isfile(path):
-            resolved_train_files.append(path)
-        else:
-            raise ValueError(f"Training data path does not exist: {path}")
-    print_on_rank0(
-        f"Resolved {len(resolved_train_files)} training file(s) from "
-        f"{len(args.train_data_path)} path(s)"
-    )
-
     # convert to dataloader
     cache_params_string = (
-        f"{','.join(sorted(resolved_train_files))}-"
+        f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-
-    # Build datasets from all resolved files and concatenate
-    from datasets import concatenate_datasets
-
-    train_datasets = []
-    for file_path in resolved_train_files:
-        ds = Dataset.from_generator(
-            generator=safe_conversations_generator,
-            gen_kwargs={"file_path": file_path},
-        )
-        train_datasets.append(ds)
-    train_dataset = (
-        concatenate_datasets(train_datasets)
-        if len(train_datasets) > 1
-        else train_datasets[0]
+    train_dataset = Dataset.from_generator(
+        generator=safe_conversations_generator,
+        gen_kwargs={"file_path": args.train_data_path},
     )
-    print_on_rank0(f"Combined training dataset: {len(train_dataset)} examples")
-
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
@@ -559,21 +508,6 @@ def build_dataloaders(
                 use_usp_preprocess=(args.attention_backend == "usp"),
             )
 
-    # Split a holdout portion from the training set if requested.
-    eval_eagle3_dataset_from_holdout = None
-    if args.eval_holdout_ratio is not None and args.eval_holdout_ratio > 0:
-        split = train_eagle3_dataset.train_test_split(
-            test_size=args.eval_holdout_ratio,
-            seed=args.seed,
-        )
-        train_eagle3_dataset = split["train"]
-        eval_eagle3_dataset_from_holdout = split["test"]
-        print_on_rank0(
-            f"Holdout split: {len(train_eagle3_dataset)} train, "
-            f"{len(eval_eagle3_dataset_from_holdout)} eval "
-            f"(ratio={args.eval_holdout_ratio})"
-        )
-
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
@@ -586,13 +520,7 @@ def build_dataloaders(
         ),
         is_vlm=args.is_vlm,
     )
-
-    has_eval = (
-        args.eval_data_path is not None
-        or args.eval_hidden_states_path is not None
-        or eval_eagle3_dataset_from_holdout is not None
-    )
-    if has_eval:
+    if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
             eval_dataset = Dataset.from_generator(
                 generator=safe_conversations_generator,
@@ -616,8 +544,6 @@ def build_dataloaders(
                 ttt_length=args.ttt_length,
                 use_usp_preprocess=(args.attention_backend == "usp"),
             )
-        else:
-            eval_eagle3_dataset = eval_eagle3_dataset_from_holdout
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.target_batch_size,
@@ -682,8 +608,6 @@ def save_checkpoints(
             # transformers v5 mutating rope_scaling/rope_parameters and other
             # fields in model.config during save_pretrained.
             if getattr(args, "draft_model_config", None):
-                import json
-
                 config_path = os.path.join(epoch_output_dir, "config.json")
                 with open(args.draft_model_config) as f:
                     original_config = json.load(f)
@@ -845,16 +769,6 @@ def main():
     )
 
     sanity_check(args)
-
-    # Create a datetime subfolder for this run (skip when resuming into an
-    # existing output directory so that checkpoints stay in the same place).
-    if not args.resume:
-        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_dir = os.path.join(args.output_dir, run_timestamp)
-    if dist.get_rank() == 0:
-        os.makedirs(args.output_dir, exist_ok=True)
-    dist.barrier()
-
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
 
@@ -1064,7 +978,10 @@ def main():
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
-            should_evaluate = eval_dataloader is not None
+            should_evaluate = (
+                args.eval_data_path is not None
+                or args.eval_hidden_states_path is not None
+            )
             if (
                 should_evaluate
                 and global_step % (args.eval_interval * args.draft_accumulation_steps)

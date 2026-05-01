@@ -14,9 +14,8 @@ torchrun \
     --draft-model-config $ROOT_DIR/configs/gemma4-26b-a4b-eagle3.json \
     --train-data-path \
         $ROOT_DIR/outputs/dataset/ultrachat_regen_gemma4_preformatted.jsonl \
-        $ROOT_DIR/outputs/dataset/translate_bp_regen_gemma4_preformatted.jsonl \
     --is-preformatted \
-    --output-dir $ROOT_DIR/outputs/gemma4-26b-a4b-eagle3-ucml \
+    --output-dir $ROOT_DIR/outputs/gemma4-26b-a4b-eagle3 \
     --num-epochs 8 \
     --batch-size 4 \
     --tp-size $TP_SIZE \
@@ -31,5 +30,4 @@ torchrun \
     --save-interval 10000 \
     --build-dataset-num-proc 64 \
     --report-to tensorboard \
-    --embedding-key=model.language_model.embed_tokens.weight \
-    --eval-holdout-ratio 0.005
+    --embedding-key=model.language_model.embed_tokens.weight

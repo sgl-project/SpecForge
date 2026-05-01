@@ -58,9 +58,9 @@ class TemplateRegistry:
             template(ChatTemplate): The chat template.
             override(bool): Whether to override the existing template, default to False
         """
-        assert not override and name not in self.templates, (
-            f"Chat template for the model type {name} has already been registered"
-        )
+        assert (
+            not override and name not in self.templates
+        ), f"Chat template for the model type {name} has already been registered"
         self.templates[name] = template
 
     def get(self, name: str) -> ChatTemplate:

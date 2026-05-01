@@ -174,7 +174,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
     @torch.no_grad()
     def load_embedding(
-        self, model_path: str, embedding_key: str = "language_model.embed_tokens.weight"
+        self, model_path: str, embedding_key: str = "model.embed_tokens.weight"
     ) -> None:
         """
         Load the embedding of the draft model from the target model checkpoint.
@@ -220,9 +220,9 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         Args:
             file_path (str): The path to the vocab mapping file.
         """
-        assert hasattr(self, "t2d") and hasattr(self, "d2t"), (
-            "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
-        )
+        assert hasattr(self, "t2d") and hasattr(
+            self, "d2t"
+        ), "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
         vocab_mapping = torch.load(file_path)
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])

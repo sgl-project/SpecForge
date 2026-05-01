@@ -936,9 +936,9 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
-        assert flash_attn_func is not None, (
-            "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
-        )
+        assert (
+            flash_attn_func is not None
+        ), "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
         attn_output, lse, _ = flash_attn_func(
             query_states,
             k0,
@@ -992,9 +992,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
 
     def __init__(self, config):
         super().__init__(config)
-        assert dist.is_initialized(), (
-            f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
-        )
+        assert (
+            dist.is_initialized()
+        ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             raise NotImplementedError(
                 f"LlamaMutiRotaryEmbedding is currently not supported for LlamaUSPFlashAttention."
@@ -1109,9 +1109,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
         else:
             acc_lse = lse_ring
 
-        assert acc_lse.shape[1] == current_q_len, (
-            f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
-        )
+        assert (
+            acc_lse.shape[1] == current_q_len
+        ), f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
 
         acc_out = out_ring
 

@@ -95,7 +95,9 @@ class Eagle3TargetModel(ABC):
             if hasattr(self.model.config, "num_hidden_layers"):
                 num_layers = self.model.config.num_hidden_layers
 
-            elif hasattr(self.model.config, "text_config") and hasattr(self.model.config.text_config, "num_hidden_layers"):
+            elif hasattr(self.model.config, "text_config") and hasattr(
+                self.model.config.text_config, "num_hidden_layers"
+            ):
                 num_layers = self.model.config.text_config.num_hidden_layers
             else:
                 raise ValueError(
