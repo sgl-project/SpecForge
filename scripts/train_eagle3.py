@@ -161,6 +161,34 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=7,
         help="The length for Test-Time Training (TTT).",
     )
+    training_group.add_argument(
+        "--ploss-weight-strategy",
+        type=str,
+        default="decay",
+        choices=["decay", "uniform", "reverse_linear", "custom"],
+        help="How to weight per-step pLoss across `ttt_length` steps. "
+        "'decay'=0.8**i (legacy default, biased to step 0); "
+        "'uniform'=all 1; "
+        "'reverse_linear'=[0.5, 1.0, 1.5, ...] (favors later steps, "
+        "useful when later TTT steps under-train, e.g. MTP init + ttt>1); "
+        "'custom'=use --ploss-weights.",
+    )
+    training_group.add_argument(
+        "--ploss-weights",
+        type=str,
+        default=None,
+        help="Comma-separated per-step weights, used only when "
+        "--ploss-weight-strategy=custom. Length MUST equal --ttt-length. "
+        "Example for ttt_length=4: '0.5,1.0,1.5,2.0'.",
+    )
+    training_group.add_argument(
+        "--normalize-ploss-weights",
+        action="store_true",
+        help="If set, rescale weights so that sum(w) == ttt_length (i.e. "
+        "average weight == 1). This keeps the *total* gradient magnitude "
+        "comparable to the uniform baseline, so you do NOT have to retune "
+        "learning rate when switching strategies. Strongly recommended.",
+    )
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
         "--ckpt-dir",
@@ -828,10 +856,51 @@ def run_forward(
     return plosses, acces
 
 
+def _resolve_ploss_weight(args: Namespace, n: int) -> List[float]:
+    """Compute the per-step pLoss weight vector of length `n` (= ttt_length).
+
+    Selection order:
+      - "uniform"        -> [1.0] * n
+      - "reverse_linear" -> [0.5, 1.0, 1.5, ..., 0.5*(n)]   (later steps weighted higher)
+      - "custom"         -> parsed from --ploss-weights, must have length n
+      - "decay" (legacy) -> [0.8 ** i for i in range(n)]    (earlier steps weighted higher)
+
+    If --normalize-ploss-weights is set, the weights are rescaled so that
+    sum(w) == n (i.e. average weight == 1). This keeps the *total* gradient
+    magnitude comparable to the uniform baseline, so the effective learning
+    rate stays roughly the same when switching strategies.
+    """
+    strategy = getattr(args, "ploss_weight_strategy", "decay")
+    if strategy == "uniform":
+        weights = [1.0] * n
+    elif strategy == "reverse_linear":
+        # 0.5, 1.0, 1.5, 2.0, ...  (linearly increasing, never zero at step 0)
+        weights = [0.5 * (i + 1) for i in range(n)]
+    elif strategy == "custom":
+        raw = getattr(args, "ploss_weights", None)
+        assert raw, (
+            "--ploss-weights is required when --ploss-weight-strategy=custom"
+        )
+        weights = [float(x) for x in raw.split(",")]
+        assert len(weights) == n, (
+            f"len(--ploss-weights)={len(weights)} does not match "
+            f"--ttt-length={n}; please provide exactly {n} comma-separated values."
+        )
+    else:  # "decay" — legacy default
+        weights = [0.8**i for i in range(n)]
+
+    if getattr(args, "normalize_ploss_weights", False):
+        s = sum(weights)
+        assert s > 0, f"sum(ploss_weights)={s} is non-positive; cannot normalize."
+        weights = [n * w / s for w in weights]
+
+    return weights
+
+
 def run_backward_and_update(
     args: Namespace, plosses: List[torch.Tensor], optimizer: Optimizer, global_step: int
 ) -> None:
-    ploss_weight = [0.8**i for i in range(len(plosses))]
+    ploss_weight = _resolve_ploss_weight(args, len(plosses))
     ploss = (
         sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         / args.draft_accumulation_steps
@@ -1056,6 +1125,17 @@ def main():
     # ================================================
     print_on_rank0(
         f"Starting training from epoch:{start_epoch}          step:{global_step}"
+    )
+
+    # Resolve and log the effective per-step pLoss weights once for transparency.
+    # Doing this here (before the train loop) makes the chosen strategy
+    # immediately visible in the rank-0 log, which is helpful when comparing runs.
+    _effective_ploss_weight = _resolve_ploss_weight(args, args.ttt_length)
+    print_on_rank0(
+        f"[pLoss] strategy={args.ploss_weight_strategy}, "
+        f"normalize={args.normalize_ploss_weights}, "
+        f"weights={['%.4f' % w for w in _effective_ploss_weight]} "
+        f"(sum={sum(_effective_ploss_weight):.4f}, ttt_length={args.ttt_length})"
     )
 
     for epoch in range(start_epoch, args.num_epochs):
