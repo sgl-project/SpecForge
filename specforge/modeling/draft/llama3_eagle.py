@@ -437,7 +437,6 @@ def yarn_linear_ramp_mask(min_val, max_val, dim):
 
 
 class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
-
     def __init__(
         self,
         dim,
@@ -993,9 +992,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
 
     def __init__(self, config):
         super().__init__(config)
-        assert (
-            dist.is_initialized()
-        ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        assert dist.is_initialized(), (
+            f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        )
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             raise NotImplementedError(
                 f"LlamaMutiRotaryEmbedding is currently not supported for LlamaUSPFlashAttention."
@@ -1333,14 +1332,22 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
 
-        # Per-layer RMSNorm applied to each aux hidden state before concatenation,
-        # so that all three layers contribute equally regardless of their raw scale.
-        self.aux_norm_low = LlamaRMSNorm(target_hidden_size, eps=config.rms_norm_eps)
-        self.aux_norm_mid = LlamaRMSNorm(target_hidden_size, eps=config.rms_norm_eps)
-        self.aux_norm_high = LlamaRMSNorm(target_hidden_size, eps=config.rms_norm_eps)
+        # Optional per-layer RMSNorm applied to each aux hidden state before
+        # concatenation, so that all three layers contribute equally regardless
+        # of their raw scale. Enabled via config "use_aux_norm": true.
+        self.use_aux_norm = getattr(config, "use_aux_norm", False)
+        if self.use_aux_norm:
+            self.aux_norm_low = LlamaRMSNorm(
+                target_hidden_size, eps=config.rms_norm_eps
+            )
+            self.aux_norm_mid = LlamaRMSNorm(
+                target_hidden_size, eps=config.rms_norm_eps
+            )
+            self.aux_norm_high = LlamaRMSNorm(
+                target_hidden_size, eps=config.rms_norm_eps
+            )
 
         self.fc = torch.nn.Linear(
             target_hidden_size * 3, config.hidden_size, bias=False
@@ -1472,13 +1479,14 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         target_h = getattr(self.config, "target_hidden_size", self.config.hidden_size)
         assert hidden_states.size(-1) == target_h * 3
 
-        # Normalize each aux layer independently before fc projection,
-        # so all three contribute equally regardless of their raw scale.
-        h_low, h_mid, h_high = hidden_states.split(target_h, dim=-1)
-        h_low = self.aux_norm_low(h_low)
-        h_mid = self.aux_norm_mid(h_mid)
-        h_high = self.aux_norm_high(h_high)
-        hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
+        if self.use_aux_norm:
+            # Normalize each aux layer independently before fc projection,
+            # so all three contribute equally regardless of their raw scale.
+            h_low, h_mid, h_high = hidden_states.split(target_h, dim=-1)
+            h_low = self.aux_norm_low(h_low)
+            h_mid = self.aux_norm_mid(h_mid)
+            h_high = self.aux_norm_high(h_high)
+            hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
 
         return self.fc(hidden_states)
 

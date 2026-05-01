@@ -32,6 +32,6 @@
   "eagle_config": {
     "eagle_aux_hidden_state_layer_ids": [1, 29, 61]
   },
-  "additional_fc": false,
+  "use_aux_norm": true,
   "reuse_target_lm_head": true
 }
