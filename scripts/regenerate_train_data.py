@@ -60,6 +60,36 @@ def parse_arguments():
         action="store_true",
         help="Whether the model is a GPT-OSS model",
     )
+    # ===== Quality / format-alignment knobs (added for SFT-data-aligned regen) =====
+    model_group.add_argument(
+        "--respect-no-think",
+        action="store_true",
+        help=(
+            "If the last user message contains the literal '/no_think' directive, "
+            "send extra_body={'chat_template_kwargs': {'enable_thinking': False}} so "
+            "the server skips the thinking phase. This avoids reasoning-mode drift on "
+            "non-thinking prompts."
+        ),
+    )
+    model_group.add_argument(
+        "--drop-truncated",
+        action="store_true",
+        help=(
+            "Drop samples whose finish_reason == 'length' (i.e. hit max_tokens). "
+            "Such samples often have an empty final answer and pollute the draft "
+            "training target."
+        ),
+    )
+    model_group.add_argument(
+        "--inline-reasoning-into-content",
+        action="store_true",
+        help=(
+            "Merge reasoning_content back into content as '<think>\\n{rc}\\n</think>\\n\\n{content}', "
+            "and drop the standalone reasoning_content field, so the regen output "
+            "matches the original OpenAI SFT data layout (a single string in 'content'). "
+            "Implies --is-reasoning-model is meaningful."
+        ),
+    )
 
     # sampling params
     sampling_params_group = parser.add_argument_group("sampling parameters")
@@ -167,6 +197,17 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     return length
 
 
+def _last_user_has_no_think(messages):
+    """Return True if the most recent user message contains '/no_think' directive."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str) and "/no_think" in c:
+                return True
+            return False
+    return False
+
+
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
@@ -184,6 +225,10 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+    # Honor /no_think by disabling thinking via Qwen3 chat_template kwargs.
+    # Without this, even an SFT-ed model can drift back to reasoning mode at inference.
+    if getattr(args, "respect_no_think", False) and _last_user_has_no_think(messages):
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
@@ -280,15 +325,79 @@ def call_sglang(
                 data["status"] = "error"
                 data["error"] = str(e)
                 return data
-            response_text = resp.choices[0].message.content
-            resp_msg = {
-                "role": "assistant",
-                "content": response_text,
-            }
+
+            choice = resp.choices[0]
+            response_text = choice.message.content
+            finish_reason = getattr(choice, "finish_reason", None)
+            reasoning_content = None
             if args.is_reasoning_model:
-                resp_msg["reasoning_content"] = resp.choices[
-                    0
-                ].message.reasoning_content
+                reasoning_content = getattr(
+                    choice.message, "reasoning_content", None
+                )
+
+            # ----- Quality gate 1: drop truncated samples -----
+            if (
+                getattr(args, "drop_truncated", False)
+                and finish_reason == "length"
+            ):
+                data["status"] = "error"
+                data["error"] = (
+                    f"truncated_at_max_tokens: finish_reason=length, "
+                    f"max_tokens={query_kwargs['max_tokens']}, "
+                    f"content_len={len(response_text or '')}, "
+                    f"rc_len={len(reasoning_content or '') if isinstance(reasoning_content, str) else 0}"
+                )
+                return data
+
+            # ----- Format alignment: inline reasoning_content into content -----
+            # Original SFT data has assistant.content as a SINGLE string that may already
+            # contain '<think>...</think>' inside; reasoning_content as a separate
+            # field never appears. To produce regen output that matches the original
+            # format exactly, we re-wrap reasoning_content into a <think>...</think>
+            # block and prepend it back to content, then drop the standalone
+            # reasoning_content field.
+            if getattr(args, "inline_reasoning_into_content", False):
+                merged = response_text or ""
+                if isinstance(reasoning_content, str) and reasoning_content.strip():
+                    merged = (
+                        f"<think>\n{reasoning_content}\n</think>\n\n{merged}"
+                    )
+                resp_msg = {
+                    "role": "assistant",
+                    "content": merged,
+                }
+                # ----- Quality gate 2: empty assistant turn is unacceptable -----
+                if not merged.strip():
+                    data["status"] = "error"
+                    data["error"] = (
+                        f"empty_assistant_turn: content+reasoning_content both empty, "
+                        f"finish_reason={finish_reason}"
+                    )
+                    return data
+            else:
+                # Legacy behavior: keep two separate fields.
+                resp_msg = {
+                    "role": "assistant",
+                    "content": response_text,
+                }
+                if args.is_reasoning_model:
+                    resp_msg["reasoning_content"] = reasoning_content
+                # Quality gate 2 (legacy variant)
+                empty_content = response_text is None or (
+                    isinstance(response_text, str) and response_text.strip() == ""
+                )
+                empty_rc = not (
+                    isinstance(reasoning_content, str) and reasoning_content.strip()
+                )
+                if empty_content and (
+                    not args.is_reasoning_model or empty_rc
+                ):
+                    data["status"] = "error"
+                    data["error"] = (
+                        f"empty_assistant_turn: finish_reason={finish_reason}"
+                    )
+                    return data
+
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
@@ -319,6 +428,12 @@ def main():
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")
     print(f"  Resume mode: {args.resume}")
+    print(f"  is-reasoning-model: {args.is_reasoning_model}")
+    print(f"  respect-no-think: {getattr(args, 'respect_no_think', False)}")
+    print(f"  drop-truncated: {getattr(args, 'drop_truncated', False)}")
+    print(
+        f"  inline-reasoning-into-content: {getattr(args, 'inline_reasoning_into_content', False)}"
+    )
     print("-" * 50)
     total_lines = sum(1 for _ in open(args.input_file_path))
 
