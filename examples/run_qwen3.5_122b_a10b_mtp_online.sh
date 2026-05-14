@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 # Train the native MTP draft head for Qwen3.5-122B-A10B with online data collection.
-#
-# Differences vs. run_qwen3.5_122b_a10b_eagle3_online.sh:
-#   * draft model uses configs/qwen3.5-122b-a10b-mtp.json (Qwen3MoeForCausalLMMTP-style)
-#   * --load-mtp-weights / --mtp-layer-idx 0  ->  init draft weights from target's
-#     native MTP block (incl. lm_head + shared embed_tokens + MoE + attn norms)
-#   * --ttt-length 1                          ->  match target MTP's single-step regime
-#   * target path points to the latest tidal-alsh01 snapshot
-#   * separate --output-dir / --wandb-name to avoid clashing with the eagle3 run
+
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)

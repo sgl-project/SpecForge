@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-# Train the native MTP draft head for Qwen3.5-122B-A10B with online data collection.
-#
-# Differences vs. run_qwen3.5_122b_a10b_eagle3_online.sh:
-#   * draft model uses configs/qwen3.5-122b-a10b-mtp.json (Qwen3MoeForCausalLMMTP-style)
-#   * --load-mtp-weights / --mtp-layer-idx 0  ->  init draft weights from target's
-#     native MTP block (incl. lm_head + shared embed_tokens + MoE + attn norms)
-#   * --ttt-length 1                          ->  match target MTP's single-step regime
-#   * target path points to the latest tidal-alsh01 snapshot
-#   * separate --output-dir / --wandb-name to avoid clashing with the eagle3 run
+# Train the native MTP draft head for Qwen3.5-122B-A10B with offline data collection.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
@@ -16,19 +8,19 @@ export https_proxy=10.140.24.177:3128
 # TP_SIZE=8
 BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node 8 scripts/prepare_hidden_states.py \
-#     --target-model-path /mnt/tidal-alsh01/dataset/xiaowen/model/qwen35-122b \
-#     --enable-aux-hidden-states \
-#     --aux-hidden-states-layers 47 \
-#     --data-path /mnt/tidal-alsh01/dataset/xiaowen/data/w1w/online/train_openai_chat.jsonl \
-#     --output-path /mnt/tidal-alsh-share2/dataset/xiaowen/data/w1w/online/qwen3.5-122b-a10b-w1w-onv8 \
-#     --max-length 20480 \
-#     --chat-template qwen3.5 \
-#     --batch-size 2 \
-#     --tp-size 8 \
-#     --build-dataset-num-proc 32 \
-#     --sglang-mem-fraction-static 0.6 \
-#     --dist-timeout 10000
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node 8 scripts/prepare_hidden_states.py \
+    --target-model-path /mnt/tidal-alsh01/dataset/xiaowen/model/qwen35-122b \
+    --enable-aux-hidden-states \
+    --aux-hidden-states-layers 47 \
+    --data-path /mnt/tidal-alsh01/dataset/xiaowen/data/w1w/online/train_openai_chat.jsonl \
+    --output-path /mnt/tidal-alsh-share2/dataset/xiaowen/data/w1w/online/qwen3.5-122b-a10b-w1w-onv8 \
+    --max-length 20480 \
+    --chat-template qwen3.5 \
+    --batch-size 2 \
+    --tp-size 8 \
+    --build-dataset-num-proc 32 \
+    --sglang-mem-fraction-static 0.6 \
+    --dist-timeout 10000
 
 # export HF_DATASETS_CACHE=$ROOT_DIR/cache/hf_datasets
 
