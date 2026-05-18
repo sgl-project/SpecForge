@@ -24,7 +24,7 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
-from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.args import RemoteBackendArgs, SGLangBackendArgs, TrackerArgs
 from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
@@ -120,7 +120,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--target-model-backend",
         type=str,
         default="sglang",
-        choices=["sglang", "hf", "custom"],
+        choices=["sglang", "hf", "custom", "remote"],
         help="The backend of the target model",
     )
 
@@ -250,6 +250,10 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     sglang_group = parser.add_argument_group("sglang target model backend")
     SGLangBackendArgs.add_args(sglang_group)
 
+    # remote target model backend related args
+    remote_group = parser.add_argument_group("remote target model backend")
+    RemoteBackendArgs.add_args(remote_group)
+
     # tracker related args
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
@@ -310,6 +314,8 @@ def build_target_model(
         else:
             if args.target_model_backend == "sglang":
                 target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+            elif args.target_model_backend == "remote":
+                target_model_kwargs = RemoteBackendArgs.from_args(args).to_kwargs()
             else:
                 target_model_kwargs = {}
             target_model = get_eagle3_target_model(
@@ -393,15 +399,23 @@ def sp_sanity_check(args: Namespace) -> None:
         )
 
 
+from specforge.utils import (
+    maybe_fetch_remote_config as _maybe_fetch_remote_config,
+    resolve_local_model_path as _resolve_local_model_path,
+)
+
+
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # ckpt info(epoch, step)
     ckpt_info = (0, 0)
 
     # Handle draft model config
     if args.draft_model_config is None:
-        # Auto-generate and save config file
+        hf_config_dict = _maybe_fetch_remote_config(args)
         auto_config_path = create_draft_config_from_target(
-            target_model_path=args.target_model_path, cache_dir=args.model_download_dir
+            target_model_path=args.target_model_path if hf_config_dict is None else None,
+            hf_config_dict=hf_config_dict,
+            cache_dir=args.model_download_dir,
         )
         draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
     else:
@@ -458,7 +472,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
                 f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
             )
 
-    draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
+    draft_model.load_embedding(
+        _resolve_local_model_path(args), embedding_key=args.embedding_key
+    )
     draft_model.freeze_embedding()
     return draft_model_config, draft_model, ckpt_info, resume_state
 
@@ -470,7 +486,7 @@ def build_dataloaders(
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_path, trust_remote_code=args.trust_remote_code
+        _resolve_local_model_path(args), trust_remote_code=args.trust_remote_code
     )
 
     # convert to dataloader
@@ -666,6 +682,9 @@ def run_forward(
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            position_mask = eagle3_data.position_mask
+            if position_mask is not None:
+                position_mask = get_dp_data_shard_from_tp(position_mask)
         else:
             # we generate the logits using the hidden states loaded from disk
             attention_mask = data["attention_mask"].cuda()
@@ -689,6 +708,7 @@ def run_forward(
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
+            position_mask=position_mask if is_online else None,
         )
     return plosses, acces
 
@@ -752,6 +772,79 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.chunk(tp_size, dim=0)[tp_rank]
 
 
+def _can_pipeline_async(args, target_model) -> bool:
+    return (
+        args.draft_accumulation_steps > 1
+        and args.target_model_backend == "remote"
+        and hasattr(target_model, "generate_eagle3_data_async")
+    )
+
+
+def run_forward_accumulated(
+    args: Namespace,
+    eagle3_model: nn.Module,
+    data_list: list,
+    target_model,
+):
+    """Async-pipelined forward for draft_accumulation_steps > 1 with remote backend.
+
+    Submits all target-forward passes to the server pool in parallel, then
+    yields results one at a time.  The caller does backward immediately after
+    each yield so that backward for batch K-1 overlaps with the collect step
+    for batch K (since multi-server may have already finished processing K).
+
+    This is a generator — iterate over it to get (plosses, acces) tuples.
+    """
+    # Submit all forward passes asynchronously
+    futures = []
+    for d in data_list:
+        pixel_values = None
+        image_grid_thw = None
+        is_vlm = args.is_vlm
+        if is_vlm:
+            pixel_values = d.get("pixel_values")
+            image_grid_thw = (
+                [thw.cuda().squeeze() for thw in d["image_grid_thw"]]
+                if "image_grid_thw" in d
+                else None
+            )
+        futures.append(
+            target_model.generate_eagle3_data_async(
+                input_ids=d["input_ids"].cuda(),
+                attention_mask=d["attention_mask"].cuda(),
+                loss_mask=d["loss_mask"].cuda(),
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                is_vlm=is_vlm,
+            )
+        )
+
+    # Yield results in order so the caller can interleave backward.
+    for f in futures:
+        eagle3_data = f.result()
+        input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+        attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
+        loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+        target = get_dp_data_shard_from_tp(eagle3_data.target)
+        hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+        position_mask = eagle3_data.position_mask
+        if position_mask is not None:
+            position_mask = get_dp_data_shard_from_tp(position_mask)
+
+        plosses, _, acces = eagle3_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            target=target,
+            hidden_states=hidden_states,
+            position_ids=None,
+            image_grid_thw=None,
+            is_vlm=False,
+            position_mask=position_mask,
+        )
+        yield (plosses, acces)
+
+
 def main():
     # ================================================
     # 1. Initialize
@@ -796,6 +889,11 @@ def main():
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
     print_cuda_memory_debug("after load_vocab_mapping")
+
+    # Send vocab mapping to remote server for server-side target_p compression
+    if args.target_model_backend == "remote" and hasattr(draft_model, "t2d"):
+        target_model.set_vocab_mapping(draft_model.t2d)
+        print_with_rank("Sent vocab mapping to remote server")
 
     # Calculate total steps if not provided
     if args.total_steps is None:
@@ -897,6 +995,9 @@ def main():
         f"Starting training from epoch:{start_epoch}          step:{global_step}"
     )
 
+    pipeline = _can_pipeline_async(args, target_model)
+    accum_data = []
+
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -914,7 +1015,10 @@ def main():
             if epoch == start_epoch and step_in_epoch < skip_steps:
                 continue
 
-            global_step += 1
+            if pipeline:
+                accum_data.append(data)
+                if len(accum_data) < args.draft_accumulation_steps:
+                    continue
 
             # ================================================
             # 7.0 Profiling
@@ -944,39 +1048,59 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(
-                args,
-                eagle3_model,
-                data,
-                target_model,
-                is_online,
-            )
-            run_backward_and_update(args, plosses, optimizer, global_step)
-
-            # log training metrics
-            if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
-                record_metrcs(
+            if pipeline:
+                datas = accum_data
+                accum_data = []
+                for plosses, acces in run_forward_accumulated(args, eagle3_model, datas, target_model):
+                    global_step += 1
+                    run_backward_and_update(args, plosses, optimizer, global_step)
+                    if dist.get_rank() == 0:
+                        time_per_step = time.time() - last_time
+                        last_time = time.time()
+                        avg_loss = sum(pl for pl in plosses) / len(plosses)
+                        avg_acc = sum(acces) / len(acces)
+                        progress_bar.set_postfix({
+                            "loss": f"{avg_loss:.2f}",
+                            "acc": f"{avg_acc:.2f}",
+                            "time": f"{time_per_step:.2f}s",
+                        })
+                    if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
+                        record_metrcs(args, acces, plosses, global_step // args.draft_accumulation_steps, tracker, optimizer, mode="train")
+            else:
+                global_step += 1
+                plosses, acces = run_forward(
                     args,
-                    acces,
-                    plosses,
-                    global_step // args.draft_accumulation_steps,
-                    tracker,
-                    optimizer,
-                    mode="train",
+                    eagle3_model,
+                    data,
+                    target_model,
+                    is_online,
                 )
+                run_backward_and_update(args, plosses, optimizer, global_step)
 
-            if dist.get_rank() == 0:
-                time_per_step = time.time() - last_time
-                last_time = time.time()
-                avg_loss = sum(pl for pl in plosses) / len(plosses)
-                avg_acc = sum(acces) / len(acces)
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{avg_loss:.2f}",
-                        "acc": f"{avg_acc:.2f}",
-                        "time": f"{time_per_step:.2f}s",
-                    }
-                )
+                # log training metrics
+                if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
+                    record_metrcs(
+                        args,
+                        acces,
+                        plosses,
+                        global_step // args.draft_accumulation_steps,
+                        tracker,
+                        optimizer,
+                        mode="train",
+                    )
+
+                if dist.get_rank() == 0:
+                    time_per_step = time.time() - last_time
+                    last_time = time.time()
+                    avg_loss = sum(pl for pl in plosses) / len(plosses)
+                    avg_acc = sum(acces) / len(acces)
+                    progress_bar.set_postfix(
+                        {
+                            "loss": f"{avg_loss:.2f}",
+                            "acc": f"{avg_acc:.2f}",
+                            "time": f"{time_per_step:.2f}s",
+                        }
+                    )
 
             # ================================================
             # 7.2 Evaluation Step
@@ -1028,6 +1152,23 @@ def main():
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
+
+        # Flush trailing batches that didn't fill a full accumulation window.
+        if pipeline and accum_data:
+            results = run_forward_accumulated(args, eagle3_model, accum_data, target_model)
+            for plosses, acces in results:
+                global_step += 1
+                run_backward_and_update(args, plosses, optimizer, global_step)
+                if dist.get_rank() == 0:
+                    avg_loss = sum(pl for pl in plosses) / len(plosses)
+                    avg_acc = sum(acces) / len(acces)
+                    progress_bar.set_postfix({
+                        "loss": f"{avg_loss:.2f}",
+                        "acc": f"{avg_acc:.2f}",
+                        "time": f"{time.time() - last_time:.2f}s",
+                    })
+                    last_time = time.time()
+            accum_data = []
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break

@@ -153,12 +153,23 @@ class OnlineEagle3Model(Eagle3Model):
             position_ids: (batch, seq_len)
         """
         # Step 1: handle vocab size
-        target_p_padded, position_mask = _compute_target_p_padded(
-            target=target,
-            t2d=self.draft_model.t2d,
-            loss_mask=loss_mask,
-            length=self.length,
-        )
+        precomputed_position_mask = kwargs.pop("position_mask", None)
+        if precomputed_position_mask is not None:
+            # target is already target_p (draft vocab, post-softmax) from remote server
+            target_p_padded = F.pad(
+                target,
+                pad=(0, 0, 0, self.length),
+                mode="constant",
+                value=1 / target.shape[-1],
+            )
+            position_mask = precomputed_position_mask
+        else:
+            target_p_padded, position_mask = _compute_target_p_padded(
+                target=target,
+                t2d=self.draft_model.t2d,
+                loss_mask=loss_mask,
+                length=self.length,
+            )
         del target
         torch.cuda.empty_cache()
 
