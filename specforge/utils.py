@@ -119,21 +119,31 @@ def get_last_checkpoint(folder, prefix="epoch"):
 
 
 def generate_draft_model_config(
-    target_model_path: str, template_config_path: str = None, cache_dir: str = None
+    target_model_path: str = None,
+    template_config_path: str = None,
+    cache_dir: str = None,
+    hf_config_dict: dict = None,
 ):
     """
     Auto-generate draft model config based on target model parameters aligned with template config
 
     Args:
-        target_model_path (str): Path to the target model
+        target_model_path (str): Path to the target model (ignored if hf_config_dict is given)
         template_config_path (str, optional): Template config file path, defaults to llama3-8B-eagle3.json
         cache_dir (str, optional): Cache directory
+        hf_config_dict (dict, optional): HuggingFace config dict (for remote backends). When
+            provided, it is used directly instead of loading from target_model_path.
 
     Returns:
         dict: Generated draft model config dictionary
     """
     # Get target model config
-    target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir)
+    if hf_config_dict is not None:
+        from types import SimpleNamespace
+
+        target_config = SimpleNamespace(**hf_config_dict)
+    else:
+        target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir)
 
     # If no template specified, use default llama3-8B-eagle3.json
     if template_config_path is None:
@@ -211,19 +221,21 @@ def save_draft_model_config(config_dict: dict, output_path: str):
 
 
 def create_draft_config_from_target(
-    target_model_path: str,
+    target_model_path: str = None,
     output_dir: str = None,
     template_config_path: str = None,
     cache_dir: str = None,
+    hf_config_dict: dict = None,
 ):
     """
     Convenient function to create draft model config file from target model
 
     Args:
-        target_model_path (str): Target model path
+        target_model_path (str): Target model path (ignored if hf_config_dict is given)
         output_dir (str, optional): Output directory, defaults to configs folder in current directory
         template_config_path (str, optional): Template config path
         cache_dir (str, optional): Cache directory
+        hf_config_dict (dict, optional): HuggingFace config dict (for remote backends)
 
     Returns:
         str: Generated config file path
@@ -236,7 +248,7 @@ def create_draft_config_from_target(
             "No draft model config provided, auto-generating from target model..."
         )
         config_dict = generate_draft_model_config(
-            target_model_path, template_config_path, cache_dir
+            target_model_path, template_config_path, cache_dir, hf_config_dict
         )
     dist.barrier()
 
@@ -250,7 +262,10 @@ def create_draft_config_from_target(
         output_dir = os.path.join(project_root, "configs")
 
     # Extract model name from model path
-    model_name = target_model_path.split("/")[-1].lower()
+    if hf_config_dict is not None:
+        model_name = hf_config_dict.get("model_type", "remote-model")
+    else:
+        model_name = target_model_path.split("/")[-1].lower()
     output_filename = f"{model_name}-eagle3-auto.json"
     output_path = os.path.join(output_dir, output_filename)
 
@@ -261,6 +276,99 @@ def create_draft_config_from_target(
     dist.barrier()
 
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Remote backend helpers (shared across train_eagle3.py and train_dflash.py)
+# ---------------------------------------------------------------------------
+
+
+def resolve_remote_url(args):
+    """Return the primary remote server URL from args."""
+    urls = getattr(args, "remote_urls", None)
+    if urls:
+        return urls.split(",")[0] if isinstance(urls, str) else urls[0]
+    return getattr(args, "remote_url", None) or args.target_model_path
+
+
+def maybe_fetch_remote_config(args):
+    """If using remote backend, query the server for hf_config_dict.
+
+    Caches the server's local model path in ``args._server_model_path``.
+    Returns hf_config_dict or None for non-remote backends.
+
+    TP-aware: only rank 0 sends the HTTP request; results are broadcast to
+    other ranks to avoid concurrent requests that deadlock the server's
+    broadcast-based request routing.
+    """
+    if getattr(args, "target_model_backend", None) != "remote":
+        return None
+
+    # Determine TP rank (if distributed)
+    tp_group = None
+    tp_rank = 0
+    if dist.is_initialized():
+        from specforge.distributed import get_tp_group
+        tp_group = get_tp_group()
+        if tp_group is not None and dist.get_world_size(tp_group) > 1:
+            tp_rank = dist.get_rank(tp_group)
+        else:
+            tp_group = None  # No need for broadcast if TP=1
+
+    if tp_rank == 0:
+        from specforge.modeling.target.remote_target_client import fetch_remote_target_config
+
+        info = fetch_remote_target_config(
+            resolve_remote_url(args),
+            timeout=getattr(args, "remote_timeout", 120),
+            max_retries=getattr(args, "remote_max_retries", 3),
+        )
+        hf_config_dict = info.get("hf_config_dict")
+        if hf_config_dict is None:
+            raise ValueError("Remote server did not return hf_config_dict in /get_model_info")
+        server_model_path = info.get("server_model_path")
+    else:
+        hf_config_dict = None
+        server_model_path = None
+
+    # Broadcast results to other TP ranks
+    if tp_group is not None:
+        import json as _json
+        tp_src = dist.get_global_rank(tp_group, 0)
+        if tp_rank == 0:
+            payload = _json.dumps({
+                "hf_config_dict": hf_config_dict,
+                "server_model_path": server_model_path,
+            }).encode("utf-8")
+            payload_t = torch.frombuffer(bytearray(payload), dtype=torch.uint8).cuda()
+            len_t = torch.tensor([len(payload)], dtype=torch.int64, device="cuda")
+        else:
+            len_t = torch.zeros(1, dtype=torch.int64, device="cuda")
+            payload_t = None
+
+        dist.broadcast(len_t, src=tp_src, group=tp_group)
+
+        if tp_rank != 0:
+            payload_t = torch.zeros(int(len_t.item()), dtype=torch.uint8, device="cuda")
+
+        dist.broadcast(payload_t, src=tp_src, group=tp_group)
+
+        if tp_rank != 0:
+            payload = payload_t.cpu().numpy().tobytes()
+            data = _json.loads(payload.decode("utf-8"))
+            hf_config_dict = data["hf_config_dict"]
+            server_model_path = data["server_model_path"]
+
+    args._server_model_path = server_model_path
+    return hf_config_dict
+
+
+def resolve_local_model_path(args):
+    """Return local model path for file-based ops (tokenizer, embeddings).
+
+    For remote backend this is the server's local path; otherwise target_model_path.
+    """
+    return getattr(args, "_server_model_path", None) or args.target_model_path
 
 
 def get_full_optimizer_state(optimizer_state_dict: dict):

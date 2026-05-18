@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 from typing import Any, Optional
 
@@ -71,9 +72,22 @@ def init_distributed(
     Args:
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
+
+    The GPU device is selected by (in priority order):
+    1. ``SPECFORGE_GPU_ID`` environment variable (absolute GPU index)
+    2. ``LOCAL_RANK`` environment variable (set by torchrun)
+    3. ``dist.get_rank() % torch.cuda.device_count()``
     """
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
+    local_rank = int(
+        os.environ.get(
+            "SPECFORGE_GPU_ID",
+            os.environ.get(
+                "LOCAL_RANK",
+                str(dist.get_rank() % torch.cuda.device_count()),
+            ),
+        )
+    )
     torch.cuda.set_device(local_rank)
     print_with_rank(f"bind to device {local_rank}")
 

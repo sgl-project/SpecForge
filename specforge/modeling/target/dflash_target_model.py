@@ -93,6 +93,8 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             dtype=torch_dtype,
             enable_return_hidden_states=True,  # Critical for DFlash
             disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+            enforce_disable_flashinfer_allreduce_fusion=kwargs.pop("enforce_disable_flashinfer_allreduce_fusion", True),
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -392,6 +394,16 @@ def get_dflash_target_model(
         )
     elif backend == "hf":
         return HFDFlashTargetModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+    elif backend == "remote":
+        from .remote_target_client import RemoteDFlashTargetModel
+
+        return RemoteDFlashTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,

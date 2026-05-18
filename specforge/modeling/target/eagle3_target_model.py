@@ -50,6 +50,7 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    position_mask: Optional[torch.Tensor] = None  # pre-computed by remote server
 
 
 class Eagle3TargetModel(ABC):
@@ -321,6 +322,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             dtype=dtype_arg,
             enable_return_hidden_states=True,
             disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
+            disable_piecewise_cuda_graph=True,
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -910,6 +912,16 @@ def get_eagle3_target_model(
         )
     elif backend == "custom":
         return CustomEagle3TargetModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+    elif backend == "remote":
+        from .remote_target_client import RemoteEagle3TargetModel
+
+        return RemoteEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,

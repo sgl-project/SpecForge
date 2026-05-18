@@ -25,7 +25,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from datasets import load_dataset
-from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.args import RemoteBackendArgs, SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
@@ -175,8 +175,8 @@ def parse_args():
         "--target-model-backend",
         type=str,
         default="hf",
-        choices=["sglang", "hf"],
-        help="Backend for target model: 'sglang' (service) or 'hf' (local)",
+        choices=["sglang", "hf", "remote"],
+        help="Backend for target model: 'sglang' (local SGLang), 'hf' (HuggingFace), or 'remote' (remote server)",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
@@ -262,6 +262,7 @@ def parse_args():
 
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
+    training_group.add_argument("--max-num-steps", type=int, default=None, help="Max steps (None = full epoch)")
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
     training_group.add_argument("--max-length", type=int, default=3072)
@@ -295,7 +296,17 @@ def parse_args():
     sglang_group = parser.add_argument_group("sglang backend")
     SGLangBackendArgs.add_args(sglang_group)
 
+    # Remote backend specific args
+    remote_group = parser.add_argument_group("remote backend")
+    RemoteBackendArgs.add_args(remote_group)
+
     return parser.parse_args()
+
+
+from specforge.utils import (
+    maybe_fetch_remote_config as _maybe_fetch_remote_config,
+    resolve_local_model_path as _resolve_local_model_path,
+)
 
 
 def build_models(
@@ -307,8 +318,9 @@ def build_models(
     )
 
     if target_config is None:
+        _maybe_fetch_remote_config(args)
         target_config = AutoConfig.from_pretrained(
-            args.target_model_path, trust_remote_code=args.trust_remote_code
+            _resolve_local_model_path(args), trust_remote_code=args.trust_remote_code
         )
     target_model_type = getattr(target_config, "model_type", None)
 
@@ -359,6 +371,8 @@ def build_models(
         target_model_kwargs = {}
         if args.target_model_backend == "sglang":
             target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+        elif args.target_model_backend == "remote":
+            target_model_kwargs = RemoteBackendArgs.from_args(args).to_kwargs()
 
         target_model = get_dflash_target_model(
             pretrained_model_name_or_path=args.target_model_path,
@@ -600,8 +614,11 @@ def main():
     print_with_rank("Initialized distributed")
 
 
+    # Fetch remote config early so _server_model_path is cached before any
+    # _resolve_local_model_path() call.
+    _maybe_fetch_remote_config(args)
     target_config = AutoConfig.from_pretrained(
-        args.target_model_path, trust_remote_code=args.trust_remote_code
+        _resolve_local_model_path(args), trust_remote_code=args.trust_remote_code
     )
     detected_vlm = getattr(target_config, "model_type", None) in VLM_MODEL_TYPES
     is_vlm = args.is_vlm or detected_vlm
@@ -673,7 +690,7 @@ def main():
         tokenizer = processor.tokenizer
     else:
         processor = None
-        tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+        tokenizer = AutoTokenizer.from_pretrained(_resolve_local_model_path(args))
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
@@ -708,9 +725,9 @@ def main():
         f"Loading target embeddings/head with keys: embed='{embed_key}', head='{lm_head_key}'"
     )
     target_components = TargetEmbeddingsAndHead.from_pretrained(
-        args.target_model_path,
-        embed_key=args.embedding_key or embed_key,
-        lm_head_key=args.lm_head_key or lm_head_key,
+        _resolve_local_model_path(args),
+        embed_key=embed_key,
+        lm_head_key=lm_head_key,
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
@@ -876,6 +893,11 @@ def main():
                     args, epoch, global_step, dflash_model, draft_model, optimizer
                 )
 
+            if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                break
+
+        if args.max_num_steps is not None and global_step >= args.max_num_steps:
+            break
     save_checkpoint(
         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
     )
