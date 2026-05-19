@@ -8,9 +8,7 @@ Transport layers (auto-negotiated via HTTP headers)
 ---------------------------------------------------
 * NCCL (X-SpecForge-Nccl: 1) — same-machine GPU→GPU via NCCL send/recv.
   Large tensor data transferred directly GPU-to-GPU; HTTP carries only metadata.
-* Custom wire format — replaces torch.save, 8× smaller than pickle.
-* POSIX SHM (X-SpecForge-Shm-Enabled: 1) — same-machine CPU fallback.
-* torch.save pickle — legacy cross-machine fallback (request side only).
+* Custom wire format — compact binary encoding (fallback).
 
 Eagle3
 ------
@@ -40,7 +38,6 @@ import requests
 import torch
 import torch.distributed as dist
 
-from . import _shm_transport as _shm
 from . import _tensor_wire as _wire
 from ._nccl_transport import NCCLTransport, decode_nccl_metadata
 from .dflash_target_model import DFlashTargetModel, DFlashTargetOutput
@@ -79,14 +76,59 @@ def _dtype_to_int(dtype: torch.dtype) -> int:
 def _int_to_dtype(i: int) -> torch.dtype:
     return _INT_TO_DTYPE.get(i, torch.float32)
 
+
+def _tp_broadcast_tensors(tp_group, tp_src, tensors: List[torch.Tensor], flags: List[bool]):
+    """Broadcast a list of tensors from tp_src to all ranks in tp_group.
+
+    On rank 0 (sender): packs metadata (flags + per-tensor shape/dtype) and
+    broadcasts it, then broadcasts each tensor.
+
+    On other ranks (receiver): receives metadata, allocates buffers, receives
+    tensors.
+
+    Returns (received_tensors, flags) on all ranks.
+    """
+    rank = dist.get_rank(tp_group)
+    if rank == 0:
+        # Pack metadata: [*flags, num_tensors, then per tensor: ndim, *shape, dtype_int]
+        meta = [int(f) for f in flags] + [len(tensors)]
+        for t in tensors:
+            meta.append(len(t.shape))
+            meta.extend(t.shape)
+            meta.append(_dtype_to_int(t.dtype))
+        meta_t = torch.tensor(meta, dtype=torch.int64, device="cuda")
+        len_t = torch.tensor([len(meta)], dtype=torch.int64, device="cuda")
+        dist.broadcast(len_t, src=tp_src, group=tp_group)
+        dist.broadcast(meta_t, src=tp_src, group=tp_group)
+        for t in tensors:
+            dist.broadcast(t.contiguous(), src=tp_src, group=tp_group)
+        return tensors, [bool(f) for f in flags]
+    else:
+        len_t = torch.zeros(1, dtype=torch.int64, device="cuda")
+        dist.broadcast(len_t, src=tp_src, group=tp_group)
+        meta_t = torch.zeros(int(len_t.item()), dtype=torch.int64, device="cuda")
+        dist.broadcast(meta_t, src=tp_src, group=tp_group)
+        meta = meta_t.tolist()
+        num_flags = len(flags)  # caller tells us how many flags to expect
+        decoded_flags = [bool(meta[i]) for i in range(num_flags)]
+        num_tensors = int(meta[num_flags])
+        idx = num_flags + 1
+        received = []
+        for _ in range(num_tensors):
+            ndim = int(meta[idx]); idx += 1
+            shape = tuple(int(meta[idx + j]) for j in range(ndim)); idx += ndim
+            dtype = _int_to_dtype(int(meta[idx])); idx += 1
+            buf = torch.empty(shape, dtype=dtype, device="cuda")
+            dist.broadcast(buf, src=tp_src, group=tp_group)
+            received.append(buf)
+        return received, decoded_flags
+
 # HTTP header name (must match remote_target_server.py)
 NCCL_HEADER = "X-SpecForge-Nccl"
 
 
 def _is_localhost_url(url: str) -> bool:
-    """Return True if *url* refers to a localhost address where POSIX
-    shared memory (/dev/shm) is accessible from both client and server.
-    """
+    """Return True if *url* refers to a localhost address (NCCL eligible)."""
     from urllib.parse import urlparse
     host = urlparse(url).hostname
     return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
@@ -295,12 +337,10 @@ class RemoteModelClient:
     def _request_transport(
         self, endpoint: str, payload: bytes, map_location: str = "cpu"
     ) -> dict:
-        """Unified transport with auto-negotiation: NCCL > SHM > wire format.
+        """Unified transport with auto-negotiation: NCCL > wire format.
 
-        On localhost the client signals it can accept both NCCL and SHM.
-        The server picks NCCL if the NCCL group is established, falls back to
-        SHM for CPU tensors, otherwise sends compact wire format.
-        Cross-machine requests use wire format over plain HTTP.
+        On localhost the client signals NCCL capability.  The server picks NCCL
+        if the NCCL group is established, otherwise sends compact wire format.
         """
         url = f"{self.url}/{endpoint.lstrip('/')}"
         headers = {"Content-Type": "application/octet-stream"}
@@ -310,8 +350,6 @@ class RemoteModelClient:
             if self._nccl_enabled and not self._nccl_init_attempted:
                 self._init_nccl()
 
-            # Always prefer SHM on localhost as fallback
-            headers[_shm.SHM_HEADER] = "1"
             # Signal NCCL capability if initialized
             if self._nccl_transport is not None and self._nccl_transport.is_initialized:
                 headers[NCCL_HEADER] = "1"
@@ -324,7 +362,6 @@ class RemoteModelClient:
                 resp.raise_for_status()
 
                 nccl_used = resp.headers.get(NCCL_HEADER) == "1"
-                shm_used = resp.headers.get(_shm.SHM_HEADER) == "1"
 
                 if nccl_used and self._nccl_transport is not None and self._nccl_transport.is_initialized:
                     # NCCL path: HTTP body contains only metadata (JSON)
@@ -335,10 +372,6 @@ class RemoteModelClient:
                     for k, v in cpu_scalars.items():
                         result[k] = torch.tensor(v, dtype=torch.int32)
                     return result
-                elif shm_used:
-                    return _shm.unpack_response(
-                        resp.content, shm_enabled=True, map_location=map_location
-                    )
                 else:
                     return _wire.decode(resp.content, map_location=map_location)
             except (requests.ConnectionError, requests.Timeout) as exc:
@@ -390,8 +423,6 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         super().__init__()
         self._clients = [RemoteModelClient(u, timeout, max_retries) for u in urls]
         self._next = itertools.cycle(range(len(self._clients)))
-        self._prefetch_future: Optional[Future] = None
-        self._prefetch_payload_bytes: Optional[bytes] = None
         self._executor_cache = None
 
     @staticmethod
@@ -527,11 +558,7 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
     ) -> Eagle3TargetOutput:
-        """TP-aware: rank 0 sends request, broadcasts result to other ranks.
-
-        Protocol: 1 metadata broadcast (flags + shapes + dtypes packed into a
-        fixed-size int64 tensor), then N contiguous data broadcasts.
-        """
+        """TP-aware: rank 0 sends request, broadcasts result to other ranks."""
         tp_rank = dist.get_rank(tp_group)
         tp_src = dist.get_global_rank(tp_group, 0)
 
@@ -541,52 +568,16 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
                 pixel_values, image_grid_thw, is_vlm,
             )
             tensors = [output.hidden_states, output.target, output.loss_mask, output.input_ids]
-            if output.last_hidden_states is not None:
+            flags = [output.last_hidden_states is not None, output.position_mask is not None]
+            if flags[0]:
                 tensors.append(output.last_hidden_states)
-            if output.position_mask is not None:
+            if flags[1]:
                 tensors.append(output.position_mask)
-
-            # Pack metadata: [has_last_hidden, has_position_mask, num_tensors,
-            #                  then per tensor: ndim, *shape, dtype_int]
-            meta = [int(output.last_hidden_states is not None),
-                    int(output.position_mask is not None), len(tensors)]
-            for t in tensors:
-                meta.append(len(t.shape))
-                meta.extend(t.shape)
-                meta.append(_dtype_to_int(t.dtype))
-            meta_t = torch.tensor(meta, dtype=torch.int64, device="cuda")
-            # Broadcast metadata length then metadata
-            len_t = torch.tensor([len(meta)], dtype=torch.int64, device="cuda")
-            dist.broadcast(len_t, src=tp_src, group=tp_group)
-            dist.broadcast(meta_t, src=tp_src, group=tp_group)
-
-            # Broadcast tensor data
-            for t in tensors:
-                dist.broadcast(t.contiguous(), src=tp_src, group=tp_group)
+            _tp_broadcast_tensors(tp_group, tp_src, tensors, flags)
             return output
         else:
-            # Receive metadata
-            len_t = torch.zeros(1, dtype=torch.int64, device="cuda")
-            dist.broadcast(len_t, src=tp_src, group=tp_group)
-            meta_t = torch.zeros(int(len_t.item()), dtype=torch.int64, device="cuda")
-            dist.broadcast(meta_t, src=tp_src, group=tp_group)
-
-            meta = meta_t.tolist()
-            has_last_hidden, has_position_mask, num_tensors = (
-                bool(meta[0]), bool(meta[1]), int(meta[2])
-            )
-
-            # Parse per-tensor shapes and dtypes, then receive data
-            idx = 3
-            received = []
-            for _ in range(num_tensors):
-                ndim = int(meta[idx]); idx += 1
-                shape = tuple(int(meta[idx + j]) for j in range(ndim)); idx += ndim
-                dtype = _int_to_dtype(int(meta[idx])); idx += 1
-                buf = torch.empty(shape, dtype=dtype, device="cuda")
-                dist.broadcast(buf, src=tp_src, group=tp_group)
-                received.append(buf)
-
+            received, flags = _tp_broadcast_tensors(tp_group, tp_src, [], [False, False])
+            has_last_hidden, has_position_mask = flags
             return Eagle3TargetOutput(
                 hidden_states=received[0],
                 target=received[1],
@@ -636,74 +627,16 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
     ) -> Eagle3TargetOutput:
-        _timing = {}
-
-        t0 = time.perf_counter()
         payload_bytes = self._build_eagle3_payload(
             input_ids, attention_mask, loss_mask,
             pixel_values, image_grid_thw, is_vlm,
         )
-        _timing["serialize_req"] = time.perf_counter() - t0
-
-        # Check if we have a prefetched result for this exact payload
-        result = None
-        if self._prefetch_future is not None:
-            if self._prefetch_payload_bytes == payload_bytes:
-                # Prefetch hit — reuse the background result
-                t0 = time.perf_counter()
-                try:
-                    result = self._prefetch_future.result()
-                    _timing["prefetch_wait"] = time.perf_counter() - t0
-                except Exception:
-                    result = None  # Fall through to synchronous path
-            # Clear the prefetch state regardless of hit/miss
-            self._prefetch_future = None
-            self._prefetch_payload_bytes = None
-
-        if result is None:
-            # Synchronous request (no prefetch available or miss)
-            t0 = time.perf_counter()
-            client = self._clients[next(self._next)]
-            result = client._request_transport(
-                "generate_eagle3_data", payload_bytes
-            )
-            _timing["http_roundtrip"] = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        output = self._result_to_eagle3_output(result, attention_mask)
-        _timing["cuda_copy"] = time.perf_counter() - t0
-
-        parts = [f"{k}={v:.3f}s" for k, v in _timing.items()]
-        logger.debug("EAGLE3_CLIENT_TIMING: %s | TOTAL=%.3fs", ", ".join(parts), sum(_timing.values()))
-        return output
-
-    def prefetch_eagle3_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        is_vlm: bool = False,
-    ) -> None:
-        """Start an async prefetch of the next batch's target data.
-
-        Call this AFTER receiving the current batch's result, BEFORE starting
-        the draft model backward pass.  The next call to generate_eagle3_data()
-        with matching inputs will return immediately from the prefetch cache.
-        """
-        payload_bytes = self._build_eagle3_payload(
-            input_ids, attention_mask, loss_mask,
-            pixel_values, image_grid_thw, is_vlm,
-        )
-        self._prefetch_payload_bytes = payload_bytes
 
         client = self._clients[next(self._next)]
-
-        def _do_prefetch():
-            return client._request_transport("generate_eagle3_data", payload_bytes)
-
-        self._prefetch_future = self._executor.submit(_do_prefetch)
+        result = client._request_transport(
+            "generate_eagle3_data", payload_bytes
+        )
+        return self._result_to_eagle3_output(result, attention_mask)
 
     def generate_eagle3_data_async(
         self,
@@ -759,7 +692,6 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
         super().__init__()
         self._clients = [RemoteModelClient(u, timeout, max_retries) for u in urls]
         self._next = itertools.cycle(range(len(self._clients)))
-        self._executor_cache = None
 
     @classmethod
     def from_pretrained(
@@ -868,43 +800,14 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
             output = self._result_to_dflash_output(result)
 
             tensors = [output.hidden_states, output.input_ids, output.attention_mask, output.loss_mask]
-            has_position_ids = output.position_ids is not None
-            if has_position_ids:
+            flags = [output.position_ids is not None]
+            if flags[0]:
                 tensors.append(output.position_ids)
-
-            # Pack metadata: [has_position_ids, num_tensors, then per tensor: ndim, *shape, dtype_int]
-            meta = [int(has_position_ids), len(tensors)]
-            for t in tensors:
-                meta.append(len(t.shape))
-                meta.extend(t.shape)
-                meta.append(_dtype_to_int(t.dtype))
-            meta_t = torch.tensor(meta, dtype=torch.int64, device="cuda")
-            len_t = torch.tensor([len(meta)], dtype=torch.int64, device="cuda")
-            dist.broadcast(len_t, src=tp_src, group=tp_group)
-            dist.broadcast(meta_t, src=tp_src, group=tp_group)
-            for t in tensors:
-                dist.broadcast(t.contiguous(), src=tp_src, group=tp_group)
+            _tp_broadcast_tensors(tp_group, tp_src, tensors, flags)
             return output
         else:
-            # Receive metadata
-            len_t = torch.zeros(1, dtype=torch.int64, device="cuda")
-            dist.broadcast(len_t, src=tp_src, group=tp_group)
-            meta_t = torch.zeros(int(len_t.item()), dtype=torch.int64, device="cuda")
-            dist.broadcast(meta_t, src=tp_src, group=tp_group)
-
-            meta = meta_t.tolist()
-            has_position_ids, num_tensors = bool(meta[0]), int(meta[1])
-
-            idx = 2
-            received = []
-            for _ in range(num_tensors):
-                ndim = int(meta[idx]); idx += 1
-                shape = tuple(int(meta[idx + j]) for j in range(ndim)); idx += ndim
-                dtype = _int_to_dtype(int(meta[idx])); idx += 1
-                buf = torch.empty(shape, dtype=dtype, device="cuda")
-                dist.broadcast(buf, src=tp_src, group=tp_group)
-                received.append(buf)
-
+            received, flags = _tp_broadcast_tensors(tp_group, tp_src, [], [False])
+            has_position_ids = flags[0]
             return DFlashTargetOutput(
                 hidden_states=received[0],
                 input_ids=received[1],
@@ -912,27 +815,3 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
                 loss_mask=received[3],
                 position_ids=received[4] if has_position_ids else None,
             )
-
-    def generate_dflash_data_async(
-        self, input_ids, attention_mask, loss_mask, **_
-    ) -> Future:
-        client = self._clients[next(self._next)]
-        payload_bytes = _serialize_tensors({
-            "input_ids": input_ids.cpu(),
-            "attention_mask": attention_mask.cpu(),
-            "loss_mask": loss_mask.cpu(),
-        })
-
-        def _do_request():
-            result = client._request_transport("generate_dflash_data", payload_bytes)
-            return self._result_to_dflash_output(result)
-
-        return self._executor.submit(_do_request)
-
-    @property
-    def _executor(self):
-        if self._executor_cache is None:
-            self._executor_cache = concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(self._clients)
-            )
-        return self._executor_cache
