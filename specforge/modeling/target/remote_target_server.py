@@ -8,9 +8,7 @@ Launched via scripts/launch_target_server.py, this module:
 Transport backends (auto-selected via HTTP headers)
 ----------------------------------------------------
 * NCCL (X-SpecForge-Nccl: 1) — same-machine GPU→GPU via NCCL send/recv.
-* Custom wire format — replaces torch.save, compact binary encoding.
-* POSIX SHM (X-SpecForge-Shm-Enabled: 1) — same-machine CPU fallback.
-* torch.save pickle — legacy cross-machine fallback.
+* Custom wire format — compact binary encoding (fallback).
 
 Endpoints
 ---------
@@ -36,7 +34,6 @@ from socketserver import ThreadingMixIn
 import torch
 import torch.distributed as dist
 
-from . import _shm_transport as _shm
 from . import _tensor_wire as _wire
 from ._nccl_transport import NCCLTransport, encode_nccl_metadata
 
@@ -47,7 +44,6 @@ logger = logging.getLogger(__name__)
 
 # HTTP header names
 NCCL_HEADER = "X-SpecForge-Nccl"
-SHM_HEADER = _shm.SHM_HEADER
 
 # ---------------------------------------------------------------------------
 # Wire-format serialization (replaces torch.save / torch.load)
@@ -98,7 +94,6 @@ class TargetModelServer:
         self._vocab_t2d: torch.Tensor = None  # set via /set_vocab_mapping
         self._vocab_t2d_cuda: torch.Tensor = None  # cached CUDA version
         self._use_nccl: bool = False  # per-request NCCL flag
-        self._use_shm: bool = False   # per-request SHM flag
         self._gpu_id: int = None  # set after model loading
         self._pending_nccl_send = None  # stashed for deferred NCCL send
         # NCCL transport for GPU-to-GPU data transfer
@@ -158,7 +153,7 @@ class TargetModelServer:
     def _serialize_response(self, data: dict) -> bytes:
         """Serialise handler response dict to bytes.
 
-        Priority: NCCL (GPU→GPU send) > POSIX SHM > wire format.
+        Priority: NCCL (GPU→GPU send) > wire format.
 
         For NCCL: returns metadata only (no send here — send happens AFTER
         the HTTP response is written, to avoid deadlock with client recv).
@@ -181,8 +176,6 @@ class TargetModelServer:
             # Stash data for deferred send
             self._pending_nccl_send = (data, keys_order)
             return encode_nccl_metadata(data, keys_order, cpu_scalars=cpu_scalars)
-        if self._use_shm:
-            return _shm.pack_response(data, use_shm=True)
         # Default: compact wire format (no pickle)
         return _wire.encode_to_buffer(data)
 
@@ -466,8 +459,6 @@ class _RequestHandler(BaseHTTPRequestHandler):
         # Echo the transport mode so the client knows how to decode
         if self.server_app._keep_on_gpu:
             self.send_header(NCCL_HEADER, "1")
-        if self.server_app._use_shm:
-            self.send_header(SHM_HEADER, "1")
         self.end_headers()
         self.wfile.write(body)
         self.wfile.flush()
@@ -505,7 +496,6 @@ class _RequestHandler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         # Detect transport mode from headers
         self.server_app._use_nccl = self.headers.get(NCCL_HEADER) == "1"
-        self.server_app._use_shm = self.headers.get(SHM_HEADER) == "1"
 
         # Heavy endpoints: gate concurrent forward passes to avoid OOM.
         if path in ("/generate_eagle3_data", "/generate_dflash_data"):

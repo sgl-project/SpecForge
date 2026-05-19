@@ -419,9 +419,7 @@ class TestServerClientNegotiation(unittest.TestCase):
         self.assertTrue(on_localhost)
 
         # Simulate header construction
-        from specforge.modeling.target import _shm_transport as _shm
         if on_localhost:
-            headers[_shm.SHM_HEADER] = "1"
             if client._nccl_transport is not None and client._nccl_transport.is_initialized:
                 headers[NCCL_HEADER] = "1"
 
@@ -470,22 +468,21 @@ class TestServerClientNegotiation(unittest.TestCase):
         data = json.loads(result)
         self.assertEqual(data["status"], "error")
 
-    def test_server_serialize_fallback_to_shm(self):
-        """When NCCL is not initialized, server should fallback to SHM/wire."""
+    def test_server_serialize_fallback_to_wire(self):
+        """When NCCL is not initialized, server should fallback to wire format."""
         from specforge.modeling.target.remote_target_server import TargetModelServer
 
         server = TargetModelServer(mode="eagle3", model_path="/fake", nccl_port=9999)
         server._use_nccl = True  # Client requests NCCL
-        server._use_shm = True   # Client also signals SHM
-        # But transport is not initialized → should use SHM
+        # But transport is not initialized → should use wire format
         server._nccl_transport = None
 
         data = {"x": torch.randn(2, 3)}
-        with patch("specforge.modeling.target._shm_transport.pack_response") as mock_shm:
-            mock_shm.return_value = b"shm_data"
+        with patch("specforge.modeling.target._tensor_wire.encode_to_buffer") as mock_wire:
+            mock_wire.return_value = b"wire_data"
             result = server._serialize_response(data)
-            mock_shm.assert_called_once_with(data, use_shm=True)
-            self.assertEqual(result, b"shm_data")
+            mock_wire.assert_called_once_with(data)
+            self.assertEqual(result, b"wire_data")
 
 
 class TestClientNCCLPortResolution(unittest.TestCase):
