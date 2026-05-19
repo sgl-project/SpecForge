@@ -1,4 +1,4 @@
-"""NCCL-based tensor transport for same-machine GPU-to-GPU transfer.
+"""NCCL-based tensor transport for GPU-to-GPU transfer.
 
 Replaces the unreliable CUDA IPC path with NCCL point-to-point send/recv.
 NCCL provides built-in synchronization semantics and works reliably across

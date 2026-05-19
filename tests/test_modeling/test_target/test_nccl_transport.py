@@ -403,7 +403,6 @@ class TestServerClientNegotiation(unittest.TestCase):
         from specforge.modeling.target.remote_target_client import (
             NCCL_HEADER,
             RemoteModelClient,
-            _is_localhost_url,
         )
 
         client = RemoteModelClient("http://127.0.0.1:8001", timeout=5, max_retries=0)
@@ -413,15 +412,11 @@ class TestServerClientNegotiation(unittest.TestCase):
         client._nccl_init_attempted = True
 
         # Check that _request_transport would include the header
-        # (We can't fully test without a server, but we can verify the logic)
         headers = {"Content-Type": "application/octet-stream"}
-        on_localhost = _is_localhost_url(client.url)
-        self.assertTrue(on_localhost)
 
-        # Simulate header construction
-        if on_localhost:
-            if client._nccl_transport is not None and client._nccl_transport.is_initialized:
-                headers[NCCL_HEADER] = "1"
+        # Simulate header construction (no localhost gate anymore)
+        if client._nccl_transport is not None and client._nccl_transport.is_initialized:
+            headers[NCCL_HEADER] = "1"
 
         self.assertIn(NCCL_HEADER, headers)
         self.assertEqual(headers[NCCL_HEADER], "1")
