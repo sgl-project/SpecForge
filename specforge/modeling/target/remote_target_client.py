@@ -6,7 +6,7 @@ the model locally.
 
 Transport layers (auto-negotiated via HTTP headers)
 ---------------------------------------------------
-* NCCL (X-SpecForge-Nccl: 1) — same-machine GPU→GPU via NCCL send/recv.
+* NCCL (X-SpecForge-Nccl: 1) — GPU→GPU via NCCL send/recv (same-machine or cross-machine).
   Large tensor data transferred directly GPU-to-GPU; HTTP carries only metadata.
 * Custom wire format — compact binary encoding (fallback).
 
@@ -127,12 +127,6 @@ def _tp_broadcast_tensors(tp_group, tp_src, tensors: List[torch.Tensor], flags: 
 NCCL_HEADER = "X-SpecForge-Nccl"
 
 
-def _is_localhost_url(url: str) -> bool:
-    """Return True if *url* refers to a localhost address (NCCL eligible)."""
-    from urllib.parse import urlparse
-    host = urlparse(url).hostname
-    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
-
 # ---------------------------------------------------------------------------
 # Helper: serialize / deserialize dicts of tensors
 # ---------------------------------------------------------------------------
@@ -193,8 +187,6 @@ class RemoteModelClient:
         self._session.headers.update({"Connection": "keep-alive"})
         # Bypass HTTP_PROXY for localhost connections
         self._session.trust_env = False
-        # Cache localhost check
-        self._on_localhost = _is_localhost_url(self.url)
         # NCCL transport state
         self._nccl_enabled = os.environ.get("SPECFORGE_ENABLE_NCCL", "1") == "1"
         self._nccl_transport: Optional[NCCLTransport] = None
@@ -223,7 +215,7 @@ class RemoteModelClient:
         return host
 
     def _init_nccl(self) -> bool:
-        """Lazily initialize the NCCL transport (called on first localhost request).
+        """Lazily initialize the NCCL transport (called on first request).
 
         This sends POST /init_nccl to the server, then both sides block on
         the TCP store rendezvous to establish the NCCL group.
@@ -339,20 +331,19 @@ class RemoteModelClient:
     ) -> dict:
         """Unified transport with auto-negotiation: NCCL > wire format.
 
-        On localhost the client signals NCCL capability.  The server picks NCCL
+        The client signals NCCL capability.  The server picks NCCL
         if the NCCL group is established, otherwise sends compact wire format.
         """
         url = f"{self.url}/{endpoint.lstrip('/')}"
         headers = {"Content-Type": "application/octet-stream"}
 
-        if self._on_localhost:
-            # Lazily initialize NCCL on first localhost request
-            if self._nccl_enabled and not self._nccl_init_attempted:
-                self._init_nccl()
+        # Lazily initialize NCCL on first request
+        if self._nccl_enabled and not self._nccl_init_attempted:
+            self._init_nccl()
 
-            # Signal NCCL capability if initialized
-            if self._nccl_transport is not None and self._nccl_transport.is_initialized:
-                headers[NCCL_HEADER] = "1"
+        # Signal NCCL capability if initialized
+        if self._nccl_transport is not None and self._nccl_transport.is_initialized:
+            headers[NCCL_HEADER] = "1"
 
         for attempt in range(self.max_retries + 1):
             try:

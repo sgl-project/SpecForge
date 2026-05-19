@@ -7,7 +7,7 @@ Launched via scripts/launch_target_server.py, this module:
 
 Transport backends (auto-selected via HTTP headers)
 ----------------------------------------------------
-* NCCL (X-SpecForge-Nccl: 1) — same-machine GPU→GPU via NCCL send/recv.
+* NCCL (X-SpecForge-Nccl: 1) — GPU→GPU via NCCL send/recv (same-machine or cross-machine).
 * Custom wire format — compact binary encoding (fallback).
 
 Endpoints
@@ -408,7 +408,7 @@ class TargetModelServer:
         # Create and initialize NCCL transport (server = rank 0)
         # For TCP store rendezvous, use a routable address (0.0.0.0 is not
         # connectable; only usable for listen/bind).
-        nccl_host = self._host if self._host not in ("0.0.0.0", "::") else "127.0.0.1"
+        nccl_host = "0.0.0.0" if self._host in ("0.0.0.0", "::") else self._host
         self._nccl_transport = NCCLTransport(
             nccl_port=nccl_port,
             host=nccl_host,
