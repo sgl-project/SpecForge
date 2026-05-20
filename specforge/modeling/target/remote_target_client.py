@@ -6,7 +6,7 @@ the model locally.
 
 Transport layers (auto-negotiated via HTTP headers)
 ---------------------------------------------------
-* NCCL (X-SpecForge-Nccl: 1) — GPU→GPU via NCCL send/recv (same-machine or cross-machine).
+* NCCL (X-SpecForge-Nccl: 1) — GPU→GPU via NCCL send/recv.
   Large tensor data transferred directly GPU-to-GPU; HTTP carries only metadata.
 * Custom wire format — compact binary encoding (fallback).
 
@@ -25,6 +25,7 @@ Training → POST /generate_dflash_data
 
 import concurrent.futures
 import io
+import atexit
 import itertools
 import json
 import logging
@@ -192,6 +193,7 @@ class RemoteModelClient:
         self._nccl_transport: Optional[NCCLTransport] = None
         self._nccl_init_attempted = False
         self._nccl_init_lock = threading.Lock()
+        atexit.register(self.close)
 
     def _get_nccl_port(self) -> int:
         """Determine the NCCL port for rendezvous."""
@@ -209,7 +211,8 @@ class RemoteModelClient:
         from urllib.parse import urlparse
         parsed = urlparse(self.url)
         host = parsed.hostname
-        # For rendezvous, use 0.0.0.0 so both sides can connect
+        # Loopback aliases connect through 127.0.0.1; otherwise use the URL
+        # host so cross-machine clients connect to the advertised server address.
         if host in ("localhost", "::1"):
             return "127.0.0.1"
         return host
@@ -665,6 +668,13 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
             )
         return self._executor_cache
 
+    def close(self):
+        if self._executor_cache is not None:
+            self._executor_cache.shutdown(wait=False, cancel_futures=True)
+            self._executor_cache = None
+        for client in self._clients:
+            client.close()
+
 
 class RemoteDFlashTargetModel(DFlashTargetModel):
     """DFlash target model that delegates forward passes to remote servers.
@@ -806,3 +816,7 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
                 loss_mask=received[3],
                 position_ids=received[4] if has_position_ids else None,
             )
+
+    def close(self):
+        for client in self._clients:
+            client.close()

@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 
 import torch
 import torch.distributed as dist
@@ -157,7 +158,9 @@ def main():
 
         def shutdown(signum, frame):
             logger.info("Received signal %d, shutting down...", signum)
-            httpd.shutdown()
+            # HTTPServer.shutdown() must be called from a different thread than
+            # serve_forever(); signal handlers run on the main thread.
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
 
         signal.signal(signal.SIGINT, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
@@ -168,6 +171,7 @@ def main():
             pass
         finally:
             httpd.server_close()
+            server_app.close()
             # Signal worker ranks to exit
             if dist.get_world_size() > 1:
                 from specforge.modeling.target.remote_target_server import _SENTINEL_EXIT
@@ -179,7 +183,10 @@ def main():
         from specforge.modeling.target.remote_target_server import _worker_loop
 
         logger.info("Worker rank %d entering sync loop", rank)
-        _worker_loop(server_app)
+        try:
+            _worker_loop(server_app)
+        finally:
+            server_app.close()
 
 
 if __name__ == "__main__":

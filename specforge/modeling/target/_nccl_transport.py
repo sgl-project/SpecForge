@@ -18,7 +18,7 @@ Environment variables
 ---------------------
   SPECFORGE_ENABLE_NCCL : str
       "1" (default) to enable NCCL transport.  "0" to disable, falling back
-      to POSIX SHM.
+      to the custom wire format.
   SPECFORGE_NCCL_PORT : str
       TCP port for NCCL rendezvous (default: HTTP port + 100).
 """
@@ -222,25 +222,50 @@ class NCCLTransport:
         return result
 
     def destroy(self) -> None:
-        """Mark the NCCL process group as destroyed.
+        """Abort and unregister the dedicated NCCL data-transfer group.
 
-        Note: We intentionally skip dist.destroy_process_group() because it
-        requires both sides to participate (blocking), which causes hangs when
-        client finishes before server. The NCCL communicator is cleaned up
-        automatically when the process exits.
-
-        We also unregister the PG from torch.distributed's internal tracking
-        to prevent PyTorch's atexit hooks from calling destroy on it (which
-        would also block).
+        This group is intentionally asymmetric: the training client can finish
+        before the long-lived target server.  Calling dist.destroy_process_group()
+        would run a blocking NCCL shutdown that expects both peers to participate.
+        Instead, abort the local communicator and remove it from PyTorch's global
+        process-group registry so the later default-group teardown does not try
+        to shut it down again.
         """
-        if self._pg is not None:
-            try:
-                from torch.distributed.distributed_c10d import _world
-                _world.pg_group_ranks.pop(self._pg, None)
-            except Exception:
-                pass
+        pg = self._pg
         self._pg = None
         self._initialized = False
+        if pg is None:
+            return
+
+        try:
+            pg.abort()
+        except Exception:
+            pass
+
+        try:
+            from torch.distributed.distributed_c10d import (
+                _unregister_process_group,
+                _world,
+            )
+
+            group_name = _world.pg_names.get(pg)
+            if group_name is None:
+                group_name = getattr(pg, "group_name", None)
+
+            _world.pg_map.pop(pg, None)
+            _world.pg_names.pop(pg, None)
+            _world.pg_group_ranks.pop(pg, None)
+            _world.pg_backend_config.pop(pg, None)
+            _world.pg_coalesce_state.pop(pg, None)
+            _world.pg_to_tag.pop(pg, None)
+            for groups in _world.tags_to_pg.values():
+                while pg in groups:
+                    groups.remove(pg)
+
+            if group_name is not None:
+                _unregister_process_group(group_name)
+        except Exception:
+            pass
 
 
 def encode_nccl_metadata(

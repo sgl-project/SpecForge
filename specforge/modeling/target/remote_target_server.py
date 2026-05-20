@@ -7,7 +7,7 @@ Launched via scripts/launch_target_server.py, this module:
 
 Transport backends (auto-selected via HTTP headers)
 ----------------------------------------------------
-* NCCL (X-SpecForge-Nccl: 1) — GPU→GPU via NCCL send/recv (same-machine or cross-machine).
+* NCCL (X-SpecForge-Nccl: 1) — GPU→GPU via NCCL send/recv.
 * Custom wire format — compact binary encoding (fallback).
 
 Endpoints
@@ -55,7 +55,7 @@ def _deserialize_tensors(raw: bytes, map_location: str = "cuda") -> dict:
 
     Request payloads use torch.save (legacy) because they're small
     (input_ids, masks) and setup endpoints may carry non-tensor data.
-    Response deserialization is handled separately via wire/SHM/IPC.
+    Response deserialization is handled separately via NCCL metadata or wire format.
     """
     buf = io.BytesIO(raw)
     return torch.load(buf, map_location=map_location, weights_only=False)
@@ -144,6 +144,11 @@ class TargetModelServer:
         # Pre-set defaults for layers so model is ready
         if self.mode == "eagle3":
             self._model.set_aux_hidden_states_layers()
+
+    def close(self):
+        if self._nccl_transport is not None:
+            self._nccl_transport.destroy()
+            self._nccl_transport = None
 
     @property
     def _keep_on_gpu(self) -> bool:
@@ -405,9 +410,9 @@ class TargetModelServer:
         if nccl_port is None:
             return json.dumps({"status": "error", "message": "No NCCL port specified"}).encode()
 
-        # Create and initialize NCCL transport (server = rank 0)
-        # For TCP store rendezvous, use a routable address (0.0.0.0 is not
-        # connectable; only usable for listen/bind).
+        # Create and initialize NCCL transport (server = rank 0).  When the
+        # HTTP server binds to a wildcard address, make TCPStore listen on all
+        # interfaces; clients connect via the URL host/IP they were given.
         nccl_host = "0.0.0.0" if self._host in ("0.0.0.0", "::") else self._host
         self._nccl_transport = NCCLTransport(
             nccl_port=nccl_port,
