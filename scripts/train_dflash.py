@@ -876,8 +876,15 @@ def main():
         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
     )
 
+    print_on_rank0("Closing target model...")
+    if hasattr(target_model, "close"):
+        target_model.close()
+    print_on_rank0("Closing tracker...")
     tracker.close()
+    print_on_rank0("Destroying distributed...")
     destroy_distributed()
+    if int(os.environ.get("RANK", "0")) == 0:
+        print("Training process cleanup complete.", flush=True)
 
 
 if __name__ == "__main__":
