@@ -731,6 +731,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         is_vlm: bool = False,
         shard_returns: bool = False,
         rank_only_forward: bool = False,
+        pad_target: bool = True,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """
@@ -820,8 +821,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             last_hidden_states_out = None
 
-        target_out = padding(target_out, left=False)
-        input_ids_out = padding(input_ids_out, left=False)
+        if pad_target:
+            target_out = padding(target_out, left=False)
+            input_ids_out = padding(input_ids_out, left=False)
         loss_mask_out = loss_mask_out[..., None]
 
         return Eagle3TargetOutput(
