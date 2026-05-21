@@ -67,7 +67,7 @@ def _deserialize_tensors(raw: bytes, map_location: str = "cuda") -> dict:
 
 
 # Reuse baseline's compiled _compute_target_p to guarantee identical results.
-from specforge.core.eagle3 import _compute_target_p
+from specforge.utils import padding
 
 
 class TargetModelServer:
@@ -231,6 +231,7 @@ class TargetModelServer:
                 image_grid_thw=payload.get("image_grid_thw", None),
                 is_vlm=True,
                 rank_only_forward=rank_only_forward,
+                pad_target=(self._vocab_t2d is None),
             )
         else:
             result = self._model.generate_eagle3_data(
@@ -238,6 +239,7 @@ class TargetModelServer:
                 attention_mask=attention_mask,
                 loss_mask=loss_mask,
                 rank_only_forward=rank_only_forward,
+                pad_target=(self._vocab_t2d is None),
             )
         _t["model_fwd"] = time.perf_counter() - _t0
 
@@ -259,10 +261,19 @@ class TargetModelServer:
             if self._vocab_t2d_cuda is None or self._vocab_t2d_cuda.device != target_tensor.device:
                 self._vocab_t2d_cuda = self._vocab_t2d.to(target_tensor.device)
             t2d = self._vocab_t2d_cuda
-            # Baseline's _prepare_data unsqueezes loss_mask to [batch, seq, 1] before
-            # calling _compute_target_p.  Replicate that here.
             _lm = loss_mask.unsqueeze(-1) if loss_mask.dim() == 2 else loss_mask
-            target_p, position_mask = _compute_target_p(target_tensor, t2d, _lm)
+            target_max_token = padding(target_tensor.argmax(-1), left=False)
+            position_mask = t2d[target_max_token][..., None].int() * _lm
+            target_head = target_tensor[..., t2d].float()
+            target_p = torch.softmax(target_head, dim=-1).detach()
+            target_p = torch.cat(
+                (
+                    target_p[:, 1:],
+                    torch.full_like(target_p[:, -1:], 1 / target_p.shape[-1]),
+                ),
+                dim=1,
+            )
+            input_ids_out = padding(result.input_ids, left=False)
 
             # Top-k sparsification for transfer efficiency.
             seq_dim = target_p.shape[-1]  # draft vocab size
@@ -280,7 +291,7 @@ class TargetModelServer:
             out = {
                 "hidden_states": _maybe_cpu(result.hidden_states),
                 "loss_mask": _maybe_cpu(result.loss_mask),
-                "input_ids": _maybe_cpu(result.input_ids),
+                "input_ids": _maybe_cpu(input_ids_out),
                 "position_mask": _maybe_cpu(position_mask),
             }
             if target_out_indices is not None:
