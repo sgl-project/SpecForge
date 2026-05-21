@@ -13,7 +13,6 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import get_global_server_args
 
 
 @dataclass
@@ -48,13 +47,6 @@ def replaced_logits_processor_forward_for_eagle3(
 
     if isinstance(logits_metadata, ForwardBatch):
         logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
-
-    # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
-    multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
-    if multi_item_delimiter is not None and logits_metadata.is_prefill_only:
-        return self.compute_logprobs_for_multi_item_scoring(
-            input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter
-        )
 
     # Get the last hidden states and last logits for the next token prediction
     if (

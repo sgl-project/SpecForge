@@ -81,6 +81,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
     ) -> Eagle3TargetOutput:
         """
         Generate the eagle3 data from the target model.
@@ -174,6 +175,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
     ) -> Eagle3TargetOutput:
         """
         Optimized HF backend:
@@ -690,6 +692,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        rank_only_forward: bool = False,
     ) -> Eagle3TargetOutput:
         """
         return:
@@ -723,6 +726,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     return_last_hidden_states=False,
                     return_logits=True,
                 )
+            )
+        if rank_only_forward:
+            return Eagle3TargetOutput(
+                hidden_states=None,
+                target=None,
+                loss_mask=None,
+                input_ids=None,
+                attention_mask=attention_mask,
             )
         aux_hidden_states_out = []
         target_out = []
@@ -812,6 +823,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
     ) -> Eagle3TargetOutput:
         outputs = self.model(
             input_ids=input_ids,

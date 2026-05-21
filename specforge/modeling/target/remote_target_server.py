@@ -230,12 +230,14 @@ class TargetModelServer:
                 pixel_values=payload.get("pixel_values", None),
                 image_grid_thw=payload.get("image_grid_thw", None),
                 is_vlm=True,
+                rank_only_forward=rank_only_forward,
             )
         else:
             result = self._model.generate_eagle3_data(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 loss_mask=loss_mask,
+                rank_only_forward=rank_only_forward,
             )
         _t["model_fwd"] = time.perf_counter() - _t0
 
