@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -87,10 +87,11 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         **kwargs,
     ) -> "SGLangDFlashTargetModel":
         tp_size = dist.get_world_size(get_tp_group())
+        dtype_arg = torch_dtype if torch_dtype is not None else "auto"
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
-            dtype=torch_dtype,
+            dtype=dtype_arg,
             enable_return_hidden_states=True,  # Critical for DFlash
             disable_cuda_graph=True,
             disable_piecewise_cuda_graph=True,
@@ -116,6 +117,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             pp_size=1,
             server_args=server_args,
             nccl_port=None,
+            is_draft_worker=False,
         )
         return cls(model_runner)
 
@@ -150,15 +152,14 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         batch.prepare_for_extend()
 
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
+                attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),

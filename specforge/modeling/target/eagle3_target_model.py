@@ -84,6 +84,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """
@@ -178,6 +179,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """
@@ -728,6 +730,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
         shard_returns: bool = False,
+        rank_only_forward: bool = False,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """
@@ -766,6 +769,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     return_logits=True,
                     shard_returns=shard_returns,
                 )
+            )
+        if rank_only_forward:
+            return Eagle3TargetOutput(
+                hidden_states=None,
+                target=None,
+                loss_mask=None,
+                input_ids=None,
+                attention_mask=attention_mask,
             )
         aux_hidden_states_out = []
         target_out = []
@@ -855,6 +866,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
         **kwargs,
     ) -> Eagle3TargetOutput:
         if kwargs:
