@@ -89,6 +89,12 @@ def parse_args():
         help="Enable torch.compile for target model (default: True, matches baseline)",
     )
     parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default=None,
+        help="SGLang attention backend for target model (default: auto-select)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -129,11 +135,12 @@ def main():
     )
 
     logger.info(
-        "Loading %s target model from %s (tp_size=%d, mem_fraction_static=%.2f)...",
+        "Loading %s target model from %s (tp_size=%d, mem_fraction_static=%.2f, attention_backend=%s)...",
         args.mode,
         args.model_path,
         args.tp_size,
         args.mem_fraction_static,
+        args.attention_backend,
     )
 
     server_app = TargetModelServer(
@@ -145,6 +152,7 @@ def main():
         enable_torch_compile=args.enable_torch_compile,
         nccl_port=args.nccl_port if args.nccl_port else args.port + 100,
         host=args.host,
+        attention_backend=args.attention_backend,
     )
     server_app.load_model()
     logger.info("Model loaded successfully.")

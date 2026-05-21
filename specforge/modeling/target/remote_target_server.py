@@ -83,6 +83,7 @@ class TargetModelServer:
         enable_torch_compile: bool = True,
         nccl_port: int = None,
         host: str = "0.0.0.0",
+        attention_backend: str | None = None,
     ):
         self.mode = mode
         self.model_path = model_path
@@ -90,6 +91,7 @@ class TargetModelServer:
         self.mem_fraction_static = mem_fraction_static
         self.trust_remote_code = trust_remote_code
         self.enable_torch_compile = enable_torch_compile
+        self.attention_backend = attention_backend
         self._model = None
         self._vocab_t2d: torch.Tensor = None  # set via /set_vocab_mapping
         self._vocab_t2d_cuda: torch.Tensor = None  # cached CUDA version
@@ -111,6 +113,7 @@ class TargetModelServer:
         kwargs = dict(
             mem_fraction_static=self.mem_fraction_static,
             enable_torch_compile=self.enable_torch_compile,
+            attention_backend=self.attention_backend,
         )
         if self.mode == "eagle3":
             self._model = SGLangEagle3TargetModel.from_pretrained(
