@@ -32,7 +32,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from concurrent.futures import Future
 
 import requests
@@ -123,6 +123,50 @@ def _tp_broadcast_tensors(tp_group, tp_src, tensors: List[torch.Tensor], flags: 
             dist.broadcast(buf, src=tp_src, group=tp_group)
             received.append(buf)
         return received, decoded_flags
+
+
+class _AsyncTargetHandle:
+    """Future-like handle that finalizes target output on ``result()``."""
+
+    def __init__(
+        self,
+        future: Optional[Future] = None,
+        convert: Optional[Callable[[dict], Any]] = None,
+        broadcast: Optional[Callable[[Any], Any]] = None,
+        receive: Optional[Callable[[], Any]] = None,
+    ):
+        self._future = future
+        self._convert = convert
+        self._broadcast = broadcast
+        self._receive = receive
+        self._consumed = False
+
+    def result(self, timeout: Optional[float] = None):
+        if self._consumed:
+            raise RuntimeError("Async target handle result() can only be called once")
+        try:
+            if self._future is not None:
+                raw = self._future.result(timeout=timeout)
+                output = self._convert(raw) if self._convert is not None else raw
+                if self._broadcast is not None:
+                    output = self._broadcast(output)
+            elif self._receive is not None:
+                output = self._receive()
+            else:
+                raise RuntimeError("Async target handle has neither future nor receiver")
+            return output
+        finally:
+            self._future = None
+            self._convert = None
+            self._broadcast = None
+            self._receive = None
+            self._consumed = True
+
+    def cancel(self) -> bool:
+        if self._future is None:
+            return False
+        return self._future.cancel()
+
 
 # HTTP header name (must match remote_target_server.py)
 NCCL_HEADER = "X-SpecForge-Nccl"
@@ -394,7 +438,26 @@ class RemoteModelClient:
 # ---------------------------------------------------------------------------
 
 
-class RemoteEagle3TargetModel(Eagle3TargetModel):
+class _RemoteTargetExecutorMixin:
+    @property
+    def num_remote_servers(self) -> int:
+        return len(self._clients)
+
+    @property
+    def _executor(self):
+        if self._executor_cache is None:
+            self._executor_cache = concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(self._clients)
+            )
+        return self._executor_cache
+
+    def _shutdown_executor(self) -> None:
+        if self._executor_cache is not None:
+            self._executor_cache.shutdown(wait=False, cancel_futures=True)
+            self._executor_cache = None
+
+
+class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
     """Eagle3 target model that delegates forward passes to remote servers.
 
     Supports multiple server URLs for load-balanced inference.
@@ -402,10 +465,8 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
     broadcast to all servers.  Forward calls (generate_eagle3_data) are
     round-robin distributed across the server pool.
 
-    Async prefetch: when enable_prefetch() is called with an iterator,
-    the model transparently prefetches the NEXT batch's target data in
-    background while the current batch's draft training runs.  This
-    overlaps server computation + transfer with client training.
+    Async prefetch is exposed via generate_eagle3_data_async(), which lets
+    training loops overlap server computation + transfer with draft training.
     """
 
     def __init__(
@@ -432,7 +493,10 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         }
         if is_vlm and pixel_values is not None:
             payload["pixel_values"] = pixel_values.cpu()
-            payload["image_grid_thw"] = image_grid_thw.cpu()
+            if isinstance(image_grid_thw, (list, tuple)):
+                payload["image_grid_thw"] = [thw.cpu() for thw in image_grid_thw]
+            elif image_grid_thw is not None:
+                payload["image_grid_thw"] = image_grid_thw.cpu()
             payload["is_vlm"] = torch.tensor(True)
         else:
             payload["is_vlm"] = torch.tensor(is_vlm)
@@ -542,6 +606,38 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
             pixel_values, image_grid_thw, is_vlm,
         )
 
+    def _broadcast_eagle3_output(
+        self,
+        tp_group,
+        attention_mask: torch.Tensor,
+        output: Optional[Eagle3TargetOutput] = None,
+    ) -> Eagle3TargetOutput:
+        """Broadcast a rank-0 Eagle3 output to all ranks in the TP group."""
+        tp_rank = dist.get_rank(tp_group)
+        tp_src = dist.get_global_rank(tp_group, 0)
+
+        if tp_rank == 0:
+            tensors = [output.hidden_states, output.target, output.loss_mask, output.input_ids]
+            flags = [output.last_hidden_states is not None, output.position_mask is not None]
+            if flags[0]:
+                tensors.append(output.last_hidden_states)
+            if flags[1]:
+                tensors.append(output.position_mask)
+            _tp_broadcast_tensors(tp_group, tp_src, tensors, flags)
+            return output
+
+        received, flags = _tp_broadcast_tensors(tp_group, tp_src, [], [False, False])
+        has_last_hidden, has_position_mask = flags
+        return Eagle3TargetOutput(
+            hidden_states=received[0],
+            target=received[1],
+            loss_mask=received[2],
+            input_ids=received[3],
+            attention_mask=attention_mask,
+            last_hidden_states=received[4] if has_last_hidden else None,
+            position_mask=received[5 if has_last_hidden else 4] if has_position_mask else None,
+        )
+
     def _generate_eagle3_data_tp(
         self,
         tp_group,
@@ -553,34 +649,13 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         is_vlm: bool = False,
     ) -> Eagle3TargetOutput:
         """TP-aware: rank 0 sends request, broadcasts result to other ranks."""
-        tp_rank = dist.get_rank(tp_group)
-        tp_src = dist.get_global_rank(tp_group, 0)
-
-        if tp_rank == 0:
+        if dist.get_rank(tp_group) == 0:
             output = self._generate_eagle3_data_single(
                 input_ids, attention_mask, loss_mask,
                 pixel_values, image_grid_thw, is_vlm,
             )
-            tensors = [output.hidden_states, output.target, output.loss_mask, output.input_ids]
-            flags = [output.last_hidden_states is not None, output.position_mask is not None]
-            if flags[0]:
-                tensors.append(output.last_hidden_states)
-            if flags[1]:
-                tensors.append(output.position_mask)
-            _tp_broadcast_tensors(tp_group, tp_src, tensors, flags)
-            return output
-        else:
-            received, flags = _tp_broadcast_tensors(tp_group, tp_src, [], [False, False])
-            has_last_hidden, has_position_mask = flags
-            return Eagle3TargetOutput(
-                hidden_states=received[0],
-                target=received[1],
-                loss_mask=received[2],
-                input_ids=received[3],
-                attention_mask=attention_mask,
-                last_hidden_states=received[4] if has_last_hidden else None,
-                position_mask=received[5 if has_last_hidden else 4] if has_position_mask else None,
-            )
+            return self._broadcast_eagle3_output(tp_group, attention_mask, output)
+        return self._broadcast_eagle3_output(tp_group, attention_mask)
 
     def _result_to_eagle3_output(self, result: dict, attention_mask: torch.Tensor) -> Eagle3TargetOutput:
         """Convert a transport result dict to Eagle3TargetOutput on CUDA."""
@@ -640,12 +715,14 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         pixel_values=None,
         image_grid_thw=None,
         is_vlm=False,
-    ) -> Future:
-        """Submit an async forward pass.  Returns a ``Future[Eagle3TargetOutput]``.
+    ) -> _AsyncTargetHandle:
+        """Submit an async forward pass and return a future-like handle."""
+        tp_group = _get_tp_group_if_distributed()
+        if tp_group is not None and dist.get_rank(tp_group) != 0:
+            return _AsyncTargetHandle(
+                receive=lambda: self._broadcast_eagle3_output(tp_group, attention_mask)
+            )
 
-        Useful with ``--draft-accumulation-steps > 1`` to pipeline the
-        forward passes across the server pool.
-        """
         client = self._clients[next(self._next)]
         # Pre-serialise payload so the background thread doesn't hold the
         # GIL across PyTorch ops in the main thread.
@@ -655,28 +732,27 @@ class RemoteEagle3TargetModel(Eagle3TargetModel):
         )
 
         def _do_request():
-            result = client._request_transport("generate_eagle3_data", payload_bytes)
-            return self._result_to_eagle3_output(result, attention_mask)
+            return client._request_transport("generate_eagle3_data", payload_bytes)
 
-        return self._executor.submit(_do_request)
-
-    @property
-    def _executor(self):
-        if self._executor_cache is None:
-            self._executor_cache = concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(self._clients)
+        future = self._executor.submit(_do_request)
+        if tp_group is None:
+            return _AsyncTargetHandle(
+                future=future,
+                convert=lambda result: self._result_to_eagle3_output(result, attention_mask),
             )
-        return self._executor_cache
+        return _AsyncTargetHandle(
+            future=future,
+            convert=lambda result: self._result_to_eagle3_output(result, attention_mask),
+            broadcast=lambda output: self._broadcast_eagle3_output(tp_group, attention_mask, output),
+        )
 
     def close(self):
-        if self._executor_cache is not None:
-            self._executor_cache.shutdown(wait=False, cancel_futures=True)
-            self._executor_cache = None
+        self._shutdown_executor()
         for client in self._clients:
             client.close()
 
 
-class RemoteDFlashTargetModel(DFlashTargetModel):
+class RemoteDFlashTargetModel(_RemoteTargetExecutorMixin, DFlashTargetModel):
     """DFlash target model that delegates forward passes to remote servers.
 
     Supports multiple server URLs for load-balanced inference.
@@ -693,6 +769,7 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
         super().__init__()
         self._clients = [RemoteModelClient(u, timeout, max_retries) for u in urls]
         self._next = itertools.cycle(range(len(self._clients)))
+        self._executor_cache = None
 
     @classmethod
     def from_pretrained(
@@ -731,6 +808,18 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
             dist.barrier(group=tp_group)
 
     @staticmethod
+    def _build_dflash_payload(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> bytes:
+        return _serialize_tensors({
+            "input_ids": input_ids.cpu(),
+            "attention_mask": attention_mask.cpu(),
+            "loss_mask": loss_mask.cpu(),
+        })
+
+    @staticmethod
     def _result_to_dflash_output(result: dict) -> DFlashTargetOutput:
         """Convert a transport result dict to DFlashTargetOutput on CUDA."""
         return DFlashTargetOutput(
@@ -765,17 +854,48 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
             return self._generate_dflash_data_tp(
                 tp_group, input_ids, attention_mask, loss_mask,
             )
-        payload = {
-            "input_ids": input_ids.cpu(),
-            "attention_mask": attention_mask.cpu(),
-            "loss_mask": loss_mask.cpu(),
-        }
+        return self._generate_dflash_data_single(input_ids, attention_mask, loss_mask)
+
+    def _generate_dflash_data_single(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> DFlashTargetOutput:
         # Round-robin across server pool
         client = self._clients[next(self._next)]
         result = client._request_transport(
-            "generate_dflash_data", _serialize_tensors(payload)
+            "generate_dflash_data",
+            self._build_dflash_payload(input_ids, attention_mask, loss_mask),
         )
         return self._result_to_dflash_output(result)
+
+    def _broadcast_dflash_output(
+        self,
+        tp_group,
+        output: Optional[DFlashTargetOutput] = None,
+    ) -> DFlashTargetOutput:
+        """Broadcast a rank-0 DFlash output to all ranks in the TP group."""
+        tp_rank = dist.get_rank(tp_group)
+        tp_src = dist.get_global_rank(tp_group, 0)
+
+        if tp_rank == 0:
+            tensors = [output.hidden_states, output.input_ids, output.attention_mask, output.loss_mask]
+            flags = [output.position_ids is not None]
+            if flags[0]:
+                tensors.append(output.position_ids)
+            _tp_broadcast_tensors(tp_group, tp_src, tensors, flags)
+            return output
+
+        received, flags = _tp_broadcast_tensors(tp_group, tp_src, [], [False])
+        has_position_ids = flags[0]
+        return DFlashTargetOutput(
+            hidden_states=received[0],
+            input_ids=received[1],
+            attention_mask=received[2],
+            loss_mask=received[3],
+            position_ids=received[4] if has_position_ids else None,
+        )
 
     def _generate_dflash_data_tp(
         self,
@@ -785,38 +905,49 @@ class RemoteDFlashTargetModel(DFlashTargetModel):
         loss_mask: torch.Tensor,
     ) -> DFlashTargetOutput:
         """TP-aware: rank 0 sends request, broadcasts result to other ranks."""
-        tp_rank = dist.get_rank(tp_group)
-        tp_src = dist.get_global_rank(tp_group, 0)
+        if dist.get_rank(tp_group) == 0:
+            output = self._generate_dflash_data_single(input_ids, attention_mask, loss_mask)
+            return self._broadcast_dflash_output(tp_group, output)
+        return self._broadcast_dflash_output(tp_group)
 
-        if tp_rank == 0:
-            payload = {
-                "input_ids": input_ids.cpu(),
-                "attention_mask": attention_mask.cpu(),
-                "loss_mask": loss_mask.cpu(),
-            }
-            client = self._clients[next(self._next)]
-            result = client._request_transport(
-                "generate_dflash_data", _serialize_tensors(payload)
+    def generate_dflash_data_async(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+    ) -> _AsyncTargetHandle:
+        """Submit an async DFlash target request and return a future-like handle."""
+        if pixel_values is not None or image_grid_thw is not None or video_grid_thw is not None:
+            raise NotImplementedError(
+                "Remote DFlash target does not yet support multimodal inputs."
             )
-            output = self._result_to_dflash_output(result)
 
-            tensors = [output.hidden_states, output.input_ids, output.attention_mask, output.loss_mask]
-            flags = [output.position_ids is not None]
-            if flags[0]:
-                tensors.append(output.position_ids)
-            _tp_broadcast_tensors(tp_group, tp_src, tensors, flags)
-            return output
-        else:
-            received, flags = _tp_broadcast_tensors(tp_group, tp_src, [], [False])
-            has_position_ids = flags[0]
-            return DFlashTargetOutput(
-                hidden_states=received[0],
-                input_ids=received[1],
-                attention_mask=received[2],
-                loss_mask=received[3],
-                position_ids=received[4] if has_position_ids else None,
+        tp_group = _get_tp_group_if_distributed()
+        if tp_group is not None and dist.get_rank(tp_group) != 0:
+            return _AsyncTargetHandle(receive=lambda: self._broadcast_dflash_output(tp_group))
+
+        client = self._clients[next(self._next)]
+        payload_bytes = self._build_dflash_payload(input_ids, attention_mask, loss_mask)
+
+        def _do_request():
+            return client._request_transport("generate_dflash_data", payload_bytes)
+
+        future = self._executor.submit(_do_request)
+        if tp_group is None:
+            return _AsyncTargetHandle(
+                future=future,
+                convert=self._result_to_dflash_output,
             )
+        return _AsyncTargetHandle(
+            future=future,
+            convert=self._result_to_dflash_output,
+            broadcast=lambda output: self._broadcast_dflash_output(tp_group, output),
+        )
 
     def close(self):
+        self._shutdown_executor()
         for client in self._clients:
             client.close()
