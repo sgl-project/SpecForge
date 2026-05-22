@@ -269,6 +269,7 @@ def parse_args():
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
+    training_group.add_argument("--target-prefetch-depth", type=int, default=0)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
 
@@ -594,6 +595,67 @@ def record_metrics(
     tracker.log(logdict, step=global_step)
 
 
+def _build_dflash_target_kwargs(data: dict, is_vlm: bool) -> dict:
+    target_kwargs = {}
+    if is_vlm:
+        if "pixel_values" in data:
+            target_kwargs["pixel_values"] = data["pixel_values"].cuda()
+        if "image_grid_thw" in data:
+            target_kwargs["image_grid_thw"] = data["image_grid_thw"].cuda()
+        if "video_grid_thw" in data:
+            target_kwargs["video_grid_thw"] = data["video_grid_thw"].cuda()
+    return target_kwargs
+
+
+def submit_dflash_target_async(target_model, data: dict, is_vlm: bool):
+    if not hasattr(target_model, "generate_dflash_data_async"):
+        raise ValueError("DFlash target prefetch requires remote target async support.")
+    return target_model.generate_dflash_data_async(
+        data["input_ids"].cuda(),
+        data["attention_mask"].cuda(),
+        data["loss_mask"].cuda(),
+        **_build_dflash_target_kwargs(data, is_vlm),
+    )
+
+
+def run_dflash_step_from_target_output(dflash_model, target_output):
+    input_ids = target_output.input_ids.cuda()
+    attention_mask = target_output.attention_mask.cuda()
+    loss_mask = target_output.loss_mask.cuda()
+    hidden_states = target_output.hidden_states.cuda()
+    position_ids = (
+        target_output.position_ids.cuda()
+        if target_output.position_ids is not None
+        else None
+    )
+
+    loss, accuracy = dflash_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+        loss_mask=loss_mask,
+        position_ids=position_ids,
+    )
+    return loss, accuracy
+
+
+def run_dflash_step_sync(args, target_model, dflash_model, data: dict, is_vlm: bool):
+    target_output = target_model.generate_dflash_data(
+        data["input_ids"].cuda(),
+        data["attention_mask"].cuda(),
+        data["loss_mask"].cuda(),
+        **_build_dflash_target_kwargs(data, is_vlm),
+    )
+    return run_dflash_step_from_target_output(dflash_model, target_output)
+
+
+def cancel_dflash_prefetch_queue(prefetch_queue) -> None:
+    for _, handle in prefetch_queue:
+        if hasattr(handle, "cancel"):
+            handle.cancel()
+    prefetch_queue.clear()
+
+
 def main():
 
     logging.basicConfig(
@@ -608,6 +670,10 @@ def main():
     )
 
     args = parse_args()
+    if args.target_prefetch_depth < 0:
+        raise ValueError("--target-prefetch-depth must be non-negative.")
+    if args.target_prefetch_depth > 0 and args.target_model_backend != "remote":
+        raise ValueError("--target-prefetch-depth is only supported with --target-model-backend remote.")
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -658,6 +724,15 @@ def main():
     target_model, draft_model, target_config = build_models(
         args, target_config, is_vlm=is_vlm
     )
+    if args.target_prefetch_depth > 0:
+        num_remote_servers = getattr(target_model, "num_remote_servers", 1)
+        effective_depth = min(args.target_prefetch_depth, num_remote_servers)
+        if effective_depth != args.target_prefetch_depth:
+            print_on_rank0(
+                f"Capping target prefetch depth from {args.target_prefetch_depth} to {effective_depth} "
+                f"for {num_remote_servers} remote server(s)."
+            )
+        args.target_prefetch_depth = effective_depth
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -808,109 +883,152 @@ def main():
     last_time = time.time()
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
-    for epoch in range(start_epoch, args.num_epochs):
-        train_dataloader.sampler.set_epoch(epoch)
-        draft_model.train()
+    prefetch_queue = []
 
-        if dist.get_rank() == 0:
-            progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+    def next_prefetch_boundary() -> int | float:
+        boundary = float("inf")
+        if args.save_interval > 0:
+            boundary = min(
+                boundary,
+                global_step + (args.save_interval - global_step % args.save_interval),
+            )
+        if args.max_num_steps is not None:
+            boundary = min(boundary, args.max_num_steps)
+        return boundary
+
+    def train_one_dflash_batch(epoch: int, progress_bar, data: dict, target_output=None) -> bool:
+        nonlocal global_step, last_time
+        global_step += 1
+        if target_output is None:
+            loss, accuracy = run_dflash_step_sync(
+                args, target_model, dflash_model, data, is_vlm
             )
         else:
-            progress_bar = train_dataloader
-
-        for step_in_epoch, data in enumerate(progress_bar):
-            if epoch == start_epoch and step_in_epoch < skip_steps:
-                continue
-            global_step += 1
-
-            input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
-            target_kwargs = {}
-            if is_vlm:
-                if "pixel_values" in data:
-                    target_kwargs["pixel_values"] = data["pixel_values"].cuda()
-                if "image_grid_thw" in data:
-                    target_kwargs["image_grid_thw"] = data["image_grid_thw"].cuda()
-                if "video_grid_thw" in data:
-                    target_kwargs["video_grid_thw"] = data["video_grid_thw"].cuda()
-            target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask, **target_kwargs
-            )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
-            position_ids = (
-                target_output.position_ids.cuda()
-                if target_output.position_ids is not None
-                else None
+            loss, accuracy = run_dflash_step_from_target_output(
+                dflash_model, target_output
             )
 
-            loss, accuracy = dflash_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                hidden_states=hidden_states,
-                loss_mask=loss_mask,
-                position_ids=position_ids,
+        (loss / args.accumulation_steps).backward()
+
+        if global_step % args.accumulation_steps == 0:
+            optimizer.step()
+
+        if global_step % args.log_interval == 0:
+            loss_log = loss.clone()
+            acc_log = accuracy.clone()
+            dist.all_reduce(loss_log)
+            dist.all_reduce(acc_log)
+            loss_log = loss_log / dist.get_world_size()
+            acc_log = acc_log / dist.get_world_size()
+
+            record_metrics(
+                args,
+                loss_log.item(),
+                acc_log.item(),
+                global_step,
+                tracker,
+                optimizer,
+                train_dataloader,
+                mode="train",
             )
 
-            (loss / args.accumulation_steps).backward()
+        if dist.get_rank() == 0:
+            elapsed = time.time() - last_time
+            last_time = time.time()
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "acc": f"{accuracy.item():.4f}",
+                    "iter_time": f"{elapsed:.2f}s",
+                }
+            )
 
-            if global_step % args.accumulation_steps == 0:
-                optimizer.step()
+        if args.save_interval > 0 and global_step % args.save_interval == 0:
+            save_checkpoint(
+                args, epoch, global_step, dflash_model, draft_model, optimizer
+            )
 
-            if global_step % args.log_interval == 0:
-                loss_log = loss.clone()
-                acc_log = accuracy.clone()
-                dist.all_reduce(loss_log)
-                dist.all_reduce(acc_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
+        return args.max_num_steps is not None and global_step >= args.max_num_steps
 
-                record_metrics(
-                    args,
-                    loss_log.item(),
-                    acc_log.item(),
-                    global_step,
-                    tracker,
-                    optimizer,
-                    train_dataloader,
-                    mode="train",
-                )
+    try:
+        for epoch in range(start_epoch, args.num_epochs):
+            train_dataloader.sampler.set_epoch(epoch)
+            draft_model.train()
 
             if dist.get_rank() == 0:
-                elapsed = time.time() - last_time
-                last_time = time.time()
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{loss.item():.4f}",
-                        "acc": f"{accuracy.item():.4f}",
-                        "iter_time": f"{elapsed:.2f}s",
-                    }
+                progress_bar = tqdm(
+                    train_dataloader, desc=f"Training Epoch {epoch}", leave=True
                 )
+            else:
+                progress_bar = train_dataloader
 
-            if global_step % args.save_interval == 0:
-                save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
-                )
+            if args.target_prefetch_depth > 0:
+                data_iter = enumerate(progress_bar)
+                data_exhausted = False
+
+                def next_data():
+                    nonlocal data_exhausted
+                    while True:
+                        try:
+                            step_in_epoch, batch = next(data_iter)
+                        except StopIteration:
+                            data_exhausted = True
+                            return None
+                        if epoch == start_epoch and step_in_epoch < skip_steps:
+                            continue
+                        return batch
+
+                def fill_prefetch_queue(pending_current: int) -> None:
+                    nonlocal data_exhausted
+                    boundary = next_prefetch_boundary()
+                    while (
+                        not data_exhausted
+                        and len(prefetch_queue) < args.target_prefetch_depth
+                    ):
+                        assigned_step = global_step + pending_current + len(prefetch_queue) + 1
+                        if assigned_step > boundary:
+                            return
+                        batch = next_data()
+                        if batch is None:
+                            return
+                        prefetch_queue.append(
+                            (batch, submit_dflash_target_async(target_model, batch, is_vlm))
+                        )
+
+                fill_prefetch_queue(pending_current=0)
+                while prefetch_queue:
+                    data, handle = prefetch_queue.pop(0)
+                    target_output = handle.result()
+                    fill_prefetch_queue(pending_current=1)
+                    if train_one_dflash_batch(epoch, progress_bar, data, target_output):
+                        cancel_dflash_prefetch_queue(prefetch_queue)
+                        break
+                    if not prefetch_queue:
+                        fill_prefetch_queue(pending_current=0)
+            else:
+                for step_in_epoch, data in enumerate(progress_bar):
+                    if epoch == start_epoch and step_in_epoch < skip_steps:
+                        continue
+                    if train_one_dflash_batch(epoch, progress_bar, data):
+                        break
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
-        if args.max_num_steps is not None and global_step >= args.max_num_steps:
-            break
-    save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
-    )
-
-    print_on_rank0("Closing target model...")
-    if hasattr(target_model, "close"):
-        target_model.close()
-    print_on_rank0("Closing tracker...")
-    tracker.close()
-    print_on_rank0("Destroying distributed...")
-    destroy_distributed()
-    if int(os.environ.get("RANK", "0")) == 0:
-        print("Training process cleanup complete.", flush=True)
+        save_checkpoint(
+            args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        )
+    finally:
+        cancel_dflash_prefetch_queue(prefetch_queue)
+        print_on_rank0("Closing target model...")
+        if hasattr(target_model, "close"):
+            target_model.close()
+        print_on_rank0("Closing tracker...")
+        tracker.close()
+        print_on_rank0("Destroying distributed...")
+        destroy_distributed()
+        if int(os.environ.get("RANK", "0")) == 0:
+            print("Training process cleanup complete.", flush=True)
 
 
 if __name__ == "__main__":
