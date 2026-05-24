@@ -437,7 +437,6 @@ def yarn_linear_ramp_mask(min_val, max_val, dim):
 
 
 class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
-
     def __init__(
         self,
         dim,
@@ -538,12 +537,24 @@ class LlamaAttention(nn.Module):
         )
         self._init_rope()
 
+    def _get_rope_theta(self):
+        """Extract rope_theta from config, handling transformers v5 which moves
+        rope_theta into rope_scaling/rope_parameters instead of a top-level attr."""
+        rope_theta = getattr(self.config, "rope_theta", None)
+        if rope_theta is not None:
+            return rope_theta
+        for attr in ("rope_parameters", "rope_scaling"):
+            params = getattr(self.config, attr, None)
+            if isinstance(params, dict) and "rope_theta" in params:
+                return params["rope_theta"]
+        raise RuntimeError("rope theta is not set.")
+
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
+                base=self._get_rope_theta(),
             )
         else:
             rope_scaling = self.config.rope_scaling
@@ -560,7 +571,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=self._get_rope_theta(),
                 )
                 return
             elif scaling_type == "linear":
@@ -1008,7 +1019,6 @@ class LlamaUSPFlashAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
 
@@ -1246,10 +1256,8 @@ class LlamaDecoderLayer(nn.Module):
 
         self.attention_backend = attention_backend
         self.mlp = LlamaMLP(config)
-        # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # if self.index!=0:
 
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1306,12 +1314,10 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # outputs = (hidden_states, return_hidden)
         return hidden_states
 
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
-
     config_class = LlamaConfig
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
@@ -1326,25 +1332,85 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * 3, config.hidden_size, bias=False
+        target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+
+        # Optional per-layer RMSNorm applied to each aux hidden state before
+        # concatenation, so that all three layers contribute equally regardless
+        # of their raw scale. Enabled via config "use_aux_norm": true.
+        self.use_aux_norm = getattr(config, "use_aux_norm", False)
+        if self.use_aux_norm:
+            self.aux_norm_low = LlamaRMSNorm(
+                target_hidden_size, eps=config.rms_norm_eps
             )
-        else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * 3, config.hidden_size, bias=False
+            self.aux_norm_mid = LlamaRMSNorm(
+                target_hidden_size, eps=config.rms_norm_eps
             )
+            self.aux_norm_high = LlamaRMSNorm(
+                target_hidden_size, eps=config.rms_norm_eps
+            )
+
+        self.fc = torch.nn.Linear(
+            target_hidden_size * 3, config.hidden_size, bias=False
+        )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
 
+        # Embedding scale factor for target models that use scaled embeddings
+        # (e.g., Gemma3/Gemma4 multiply by hidden_size**0.5).  Set via config
+        # field ``embed_scale`` or auto-detected from ``target_model_type``.
+        target_type = getattr(config, "target_model_type", None) or ""
+        if getattr(config, "embed_scale", None) is not None:
+            self.embed_scale = config.embed_scale
+        elif "gemma" in target_type:
+            self.embed_scale = config.hidden_size**0.5
+        else:
+            self.embed_scale = 1.0
+
         # create vocab buffers
         t2d = torch.ones(self.vocab_size, dtype=torch.bool)
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+        # Apply improved initialization for stable training with mixed
+        # pretrained (frozen) and randomly initialized (trainable) parameters.
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """
+        Initialize weights for stable training when mixing pretrained frozen
+        components (embed_tokens, lm_head) with randomly initialized trainable
+        layers.
+
+        Strategy:
+        - Zero-init residual projections (o_proj, down_proj) so the decoder
+          layer starts as near-identity through the residual stream.
+        - Use small normal init (std=0.02) for other projections instead of
+          Kaiming uniform, matching the config's initializer_range.
+        - RMSNorm weights stay at ones (PyTorch default).
+        """
+        std = getattr(self.config, "initializer_range", 0.02)
+
+        for name, param in self.named_parameters():
+            if "embed_tokens" in name or "lm_head" in name:
+                # These will be overwritten by load_embedding / load_lm_head
+                continue
+            if "norm" in name or "layernorm" in name:
+                # RMSNorm weights: keep at ones (default)
+                continue
+            if param.dim() < 2:
+                # Biases and 1-d params: zero init
+                nn.init.zeros_(param)
+                continue
+
+            # Zero-init residual-path projections for near-identity at start
+            if "o_proj" in name or "down_proj" in name:
+                nn.init.zeros_(param)
+            else:
+                nn.init.normal_(param, mean=0.0, std=std)
 
     def forward(
         self,
@@ -1403,11 +1469,25 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        embeds = self.embed_tokens(input_ids)
+        if self.embed_scale != 1.0:
+            embeds = embeds * self.embed_scale
+        return embeds
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        target_h = getattr(self.config, "target_hidden_size", self.config.hidden_size)
+        assert hidden_states.size(-1) == target_h * 3
+
+        if self.use_aux_norm:
+            # Normalize each aux layer independently before fc projection,
+            # so all three contribute equally regardless of their raw scale.
+            h_low, h_mid, h_high = hidden_states.split(target_h, dim=-1)
+            h_low = self.aux_norm_low(h_low)
+            h_mid = self.aux_norm_mid(h_mid)
+            h_high = self.aux_norm_high(h_high)
+            hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
+
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

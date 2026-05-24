@@ -665,7 +665,6 @@ def build_offline_eagle3_dataset(
     ttt_length: int = 1,
     use_usp_preprocess: bool = False,
 ) -> torch.utils.data.Dataset:
-
     return OfflineEagle3Dataset(
         list_local_files(hidden_states_path),
         max_len=max_len,
@@ -683,7 +682,7 @@ def generate_vocab_mapping_file(
     draft_vocab_size: int,
     cache_dir: str = "./cache/vocab_mapping",
     cache_key: str = "vocab_mapping",
-) -> str:
+) -> Optional[str]:
     """
     Generate a vocab mapping file for the dataset.
 
@@ -695,8 +694,16 @@ def generate_vocab_mapping_file(
         cache_key: The key to use for caching the vocab mapping file.
 
     Returns:
-        The path to the vocab mapping file.
+        The path to the vocab mapping file, or None if draft_vocab_size
+        equals target_vocab_size (no mapping needed).
     """
+    if draft_vocab_size == target_vocab_size:
+        print(
+            f"draft_vocab_size ({draft_vocab_size}) == target_vocab_size "
+            f"({target_vocab_size}), skipping vocab mapping generation."
+        )
+        return None
+
     # prepare cache directory
     os.makedirs(cache_dir, exist_ok=True)
     vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")

@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json
 import math
 import os
 import time
@@ -85,6 +86,13 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=str,
         default="lm_head.weight",
         help="The key of the lm head weight to load from the target model, this is only required for offline training",
+    )
+    model_group.add_argument(
+        "--reuse-target-lm-head",
+        action="store_true",
+        help="Load the target model's lm_head weights into the draft model's lm_head "
+        "and freeze it. Supports both tied and untied target models. "
+        "Requires draft_vocab_size == vocab_size.",
     )
     model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
@@ -339,6 +347,7 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -433,6 +442,14 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+    if args.reuse_target_lm_head:
+        draft_model.load_lm_head(
+            args.target_model_path,
+            lm_head_key=args.lm_head_key,
+            embedding_key=args.embedding_key,
+        )
+        draft_model.freeze_lm_head()
+        print_on_rank0("Loaded and froze lm_head from target model")
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
@@ -587,6 +604,16 @@ def save_checkpoints(
                 epoch_output_dir,
                 state_dict=draft_model_state_dict,
             )
+            # Overwrite config.json with the original training config to avoid
+            # transformers v5 mutating rope_scaling/rope_parameters and other
+            # fields in model.config during save_pretrained.
+            if getattr(args, "draft_model_config", None):
+                config_path = os.path.join(epoch_output_dir, "config.json")
+                with open(args.draft_model_config) as f:
+                    original_config = json.load(f)
+                with open(config_path, "w") as f:
+                    json.dump(original_config, f, indent=2)
+                print_on_rank0(f"Overwrote config.json with original training config")
             print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
         dist.barrier()
 
@@ -758,9 +785,14 @@ def main():
         args, draft_model_config, processor
     )
 
-    # we load the vocab mapping then
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank("Loaded vocab mapping")
+    # we load the vocab mapping then (skip when draft_vocab_size == target_vocab_size)
+    if vocab_mapping_path is not None:
+        draft_model.load_vocab_mapping(vocab_mapping_path)
+        print_with_rank("Loaded vocab mapping")
+    else:
+        print_with_rank(
+            "Skipped vocab mapping loading (draft_vocab_size == target_vocab_size)"
+        )
 
     # Calculate total steps if not provided
     if args.total_steps is None:
