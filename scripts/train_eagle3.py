@@ -155,6 +155,23 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=None,
         help="directory includes the checkpoint to start training with",
     )
+    training_group.add_argument(
+        "--regenerate-vocab-mapping",
+        action="store_true",
+        help=(
+            "Recompute the d2t/t2d vocab mapping from the new training data "
+            "even when fine-tuning from a checkpoint. By default, when "
+            "--ckpt-dir is provided or --resume picks up a previous run, the "
+            "drafter reuses the mapping stored in the loaded checkpoint so "
+            "that the lm_head slots stay aligned with the target token ids "
+            "they were trained against. Setting this flag overwrites that "
+            "mapping with a fresh one derived from the new corpus's token "
+            "frequencies, which silently realigns slot->target_id and "
+            "collapses acceptance until lm_head is retrained. Only use this "
+            "for true cold-start continuation where the data distribution has "
+            "shifted enough to justify re-picking the reduced 32K vocab."
+        ),
+    )
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
     training_group.add_argument(
@@ -366,9 +383,26 @@ def sp_sanity_check(args: Namespace) -> None:
         )
 
 
-def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
+def build_draft_model(
+    args: Namespace,
+) -> Tuple[
+    AutoDraftModelConfig, nn.Module, Tuple[int, int], Optional[dict], bool
+]:
+    """Build (or load) the draft model.
+
+    Returns:
+        (draft_model_config, draft_model, ckpt_info, resume_state, warm_started)
+
+        ``warm_started`` is True if the drafter weights were loaded from an
+        existing checkpoint (via ``--ckpt-dir`` or a detected ``--resume``
+        checkpoint). When True, the loaded checkpoint's d2t/t2d buffers must
+        be preserved: the drafter's lm_head slots are aligned to that
+        specific mapping, and overwriting it with a freshly-regenerated
+        mapping silently mis-aligns every slot.
+    """
     # ckpt info(epoch, step)
     ckpt_info = (0, 0)
+    warm_started = False
 
     # Handle draft model config
     if args.draft_model_config is None:
@@ -409,6 +443,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
+        warm_started = True
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
@@ -433,14 +468,15 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    return draft_model_config, draft_model, ckpt_info, resume_state
+    return draft_model_config, draft_model, ckpt_info, resume_state, warm_started
 
 
 def build_dataloaders(
     args: Namespace,
     draft_model_config: AutoDraftModelConfig,
     processor: Optional[AutoProcessor] = None,
-) -> Tuple[DataLoader, str, Optional[DataLoader]]:
+    skip_vocab_mapping: bool = False,
+) -> Tuple[DataLoader, Optional[str], Optional[DataLoader]]:
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
@@ -475,13 +511,20 @@ def build_dataloaders(
             num_proc=args.build_dataset_num_proc,
             train_only_last_turn=args.train_only_last_turn,
         )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
-        )
+        if skip_vocab_mapping:
+            vocab_mapping_path = None
+            print_on_rank0(
+                "Skipping vocab mapping generation: reusing d2t/t2d from the "
+                "loaded checkpoint (lm_head slots are aligned to that mapping)."
+            )
+        else:
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+            )
 
         if not is_online:
             train_eagle3_dataset = build_offline_eagle3_dataset(
@@ -748,18 +791,51 @@ def main():
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model, ckpt_info, resume_state = build_draft_model(args)
+    draft_model_config, draft_model, ckpt_info, resume_state, warm_started = (
+        build_draft_model(args)
+    )
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
     # 3. Build dataloader
     # ================================================
+    # When warm-starting from a checkpoint, the d2t/t2d buffers loaded from
+    # model.safetensors are the ground truth: the drafter's lm_head slots were
+    # trained against exactly that mapping. Regenerating from the new training
+    # data would silently remap every slot to a different target token id and
+    # collapse acceptance. Reuse unless the user explicitly opts out via
+    # --regenerate-vocab-mapping (for true cold-start continuation).
+    skip_vocab_mapping = warm_started and not args.regenerate_vocab_mapping
+    if warm_started and args.regenerate_vocab_mapping:
+        print_on_rank0(
+            "WARNING: --regenerate-vocab-mapping is set while warm-starting "
+            "from a checkpoint. The d2t/t2d mapping will be recomputed from "
+            "the new training data, which realigns the drafter's lm_head "
+            "slots to different target token ids. Acceptance will drop "
+            "significantly until lm_head retrains against the new mapping. "
+            "Confirm this is intended."
+        )
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
-        args, draft_model_config, processor
+        args, draft_model_config, processor, skip_vocab_mapping=skip_vocab_mapping
     )
 
-    # we load the vocab mapping then
+    # Load vocab mapping (no-op when skip_vocab_mapping=True; the buffers were
+    # already populated by from_pretrained() in build_draft_model).
     draft_model.load_vocab_mapping(vocab_mapping_path)
+    if vocab_mapping_path is None:
+        # Defensive sanity check: if we're reusing the checkpoint mapping,
+        # verify the buffers actually contain a real mapping (i.e. the
+        # checkpoint wasn't saved before load_vocab_mapping was called).
+        if not draft_model.has_nondefault_vocab_mapping():
+            raise RuntimeError(
+                "Refusing to start training: --ckpt-dir was provided (or "
+                "--resume picked up a checkpoint) but the drafter's d2t/t2d "
+                "buffers still match the uninitialized defaults (d2t all "
+                "zeros, t2d all True). This means the checkpoint was saved "
+                "without a vocab mapping. Re-run with "
+                "--regenerate-vocab-mapping to build one from the training "
+                "data (this will reinitialize lm_head alignment from scratch)."
+            )
     print_with_rank("Loaded vocab mapping")
 
     # Calculate total steps if not provided

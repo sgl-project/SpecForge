@@ -174,6 +174,18 @@ class SGLangBackendArgs:
             default=1,
             help="The ep size of the SGLang backend",
         )
+        parser.add_argument(
+            "--sglang-max-running-requests",
+            type=int,
+            default=None,
+            help="Override auto-computed max_running_requests for SGLang backend (default: target_batch_size)",
+        )
+        parser.add_argument(
+            "--sglang-max-total-tokens",
+            type=int,
+            default=None,
+            help="Override auto-computed max_total_tokens for SGLang backend (default: target_batch_size * max_length)",
+        )
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "SGLangBackendArgs":
@@ -191,12 +203,18 @@ class SGLangBackendArgs:
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
             sglang_max_running_requests=(
-                args.target_batch_size if hasattr(args, "target_batch_size") else None
+                args.sglang_max_running_requests
+                if getattr(args, "sglang_max_running_requests", None) is not None
+                else (args.target_batch_size if hasattr(args, "target_batch_size") else None)
             ),
             sglang_max_total_tokens=(
-                args.target_batch_size * args.max_length
-                if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
-                else None
+                args.sglang_max_total_tokens
+                if getattr(args, "sglang_max_total_tokens", None) is not None
+                else (
+                    args.target_batch_size * args.max_length
+                    if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
+                    else None
+                )
             ),
         )
 

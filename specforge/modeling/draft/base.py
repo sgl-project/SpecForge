@@ -173,17 +173,53 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             local_cache_path = snapshot_download(repo_id=model_path)
             self.load_embedding(local_cache_path, embedding_key)
 
-    def load_vocab_mapping(self, file_path: str) -> None:
+    def load_vocab_mapping(self, file_path: Optional[str]) -> None:
         """
         Load the vocab buffers of the draft model.
 
         Args:
-            file_path (str): The path to the vocab mapping file.
+            file_path: Path to the vocab mapping file. If ``None``, this is a
+                no-op and the caller is expected to have already populated the
+                ``d2t``/``t2d`` buffers (for example by loading them from a
+                checkpoint via ``from_pretrained``). This is the correct
+                behaviour when fine-tuning from an existing drafter: the
+                mapping stored in the checkpoint is the one the ``lm_head``
+                slots were trained against, so it must not be overwritten with
+                a freshly-computed mapping derived from a different training
+                corpus.
         """
         assert hasattr(self, "t2d") and hasattr(
             self, "d2t"
-        ), "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
+        ), "t2d and d2t buffers are not found in the draft model, please check your draft model implementation"
+        if file_path is None:
+            self.vocab_mapping_loaded = True
+            return
         vocab_mapping = torch.load(file_path)
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])
         self.vocab_mapping_loaded = True
+
+    def has_nondefault_vocab_mapping(self) -> bool:
+        """
+        Return ``True`` if ``d2t``/``t2d`` buffers look like a real, trained
+        mapping (i.e. they differ from the all-zeros / all-True defaults set
+        in the draft model's ``__init__``).
+
+        A fresh draft model constructed via ``from_config`` has
+        ``d2t = zeros(draft_vocab_size)`` and ``t2d = ones(vocab_size, bool)``.
+        Either the first forward pass should receive a mapping generated from
+        the training data (cold start) or the mapping should be loaded from a
+        checkpoint's ``model.safetensors`` via ``from_pretrained`` (warm
+        start). This helper lets callers sanity-check that one of those paths
+        actually populated the buffers before training begins.
+        """
+        if not (hasattr(self, "d2t") and hasattr(self, "t2d")):
+            return False
+        # d2t defaults to all zeros; any real mapping has non-zero entries
+        # because token id 0 cannot be the most-frequent id across all 32K
+        # drafter slots.
+        d2t_is_default = bool((self.d2t == 0).all().item())
+        # t2d defaults to all True; a real mapping keeps only the top-K
+        # targets marked True and zeroes out the rest.
+        t2d_is_default = bool(self.t2d.all().item())
+        return not (d2t_is_default and t2d_is_default)
