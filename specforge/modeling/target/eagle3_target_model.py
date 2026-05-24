@@ -349,7 +349,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
-        self.model_runner.model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
+        # Some target models (e.g., Kimi-K2.5) load via a multimodal wrapper
+        # that delegates to a text backbone at .language_model.  The EAGLE-3
+        # helper set_eagle3_layers_to_capture is defined on the text backbone,
+        # not the outer wrapper.
+        inner = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
+        inner.set_eagle3_layers_to_capture(aux_hidden_states_layers)
 
     @torch.no_grad
     def _extend(
