@@ -24,7 +24,6 @@ torchrun \
     --max-length 3072 \
     --chat-template qwen \
     --attention-backend $ATTENTION_BACKEND \
-    --num-anchors 512 \
     --loss-decay-gamma 7.0 \
     --log-interval 50 \
     --save-interval 1000 \
