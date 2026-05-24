@@ -523,6 +523,7 @@ class LlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
+        self.use_global_attention = getattr(config, "use_global_attention", False)
 
         self.q_proj = nn.Linear(
             self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
@@ -760,6 +761,10 @@ class LlamaFlexAttention(LlamaAttention):
         - past_key_values: dynamic cache used for storing past key and value states.
     """
 
+    def __init__(self, config):
+        super().__init__(config)
+        self.use_global_attention = getattr(config, "use_global_attention", False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -821,39 +826,45 @@ class LlamaFlexAttention(LlamaAttention):
             cache_kwargs=cache_kwargs,
         )
 
-        seq_lengths = attention_mask.sum(dim=-1)
-        # Shrink the attention mask to align with the padding to the right.
-        # This is equivalent to the shrinking logic in eagle3.py
-        seq_lengths -= lck
-        # TODO: Remove the usage of uncompiled create_block_mask after
-        # https://github.com/pytorch/pytorch/issues/160018
-        if q_len <= 128:
-            create_block_mask_func = create_block_mask
-            flex_attention_func = flex_attention
+        if self.use_global_attention:
+            block_mask = None # Enables full attention
         else:
-            create_block_mask_func = compile_friendly_create_block_mask
-            flex_attention_func = compile_friendly_flex_attention
+            seq_lengths = attention_mask.sum(dim=-1)
+            # Shrink the attention mask to align with the padding to the right.
+            # This is equivalent to the shrinking logic in eagle3.py
+            seq_lengths -= lck
+            # TODO: Remove the usage of uncompiled create_block_mask after
+            # https://github.com/pytorch/pytorch/issues/160018
+            if q_len <= 128:
+                create_block_mask_func = create_block_mask
+                flex_attention_func = flex_attention
+            else:
+                create_block_mask_func = compile_friendly_create_block_mask
+                flex_attention_func = compile_friendly_flex_attention
 
-        block_mask = create_block_mask_func(
-            mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths,
-                Q_LEN=q_len,
-                KV_LEN=key_cache.shape[-2],
-                lck=lck,
-            ),
-            B=bsz,
-            H=1,  # Rely on broadcast
-            Q_LEN=q_len,
-            KV_LEN=key_cache.shape[-2],
-            device=query_states.device,
-        )
-        attn_output = flex_attention_func(
-            query=query_states,
-            key=key_cache.contiguous(),
-            value=value_cache.contiguous(),
-            block_mask=block_mask,
-            enable_gqa=True,
-        )
+            if self.use_global_attention:
+                block_mask = None  # This will result in dense attention
+            else:
+                block_mask = create_block_mask_func(
+                    mask_mod=generate_eagle3_mask(
+                        seq_lengths=seq_lengths,
+                        Q_LEN=q_len,
+                        KV_LEN=key_cache.shape[-2],
+                        lck=lck,
+                    ),
+                    B=bsz,
+                    H=1,  # Rely on broadcast
+                    Q_LEN=q_len,
+                    KV_LEN=key_cache.shape[-2],
+                    device=query_states.device,
+                )
+            attn_output = flex_attention_func(
+                query=query_states,
+                key=key_cache.contiguous(),
+                value=value_cache.contiguous(),
+                block_mask=block_mask,
+                enable_gqa=True,
+            )
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
@@ -868,6 +879,10 @@ class LlamaFlashAttention(LlamaAttention):
         - position_ids: position ids
         - cache_hidden: manual cache used for storing past key and value states
     """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.use_global_attention = getattr(config, "use_global_attention", False)
 
     def forward(
         self,
@@ -925,16 +940,16 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
-        assert (
-            flash_attn_func is not None
-        ), "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        assert flash_attn_func is not None, (
+            "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        )
         attn_output, lse, _ = flash_attn_func(
             query_states,
             k0,
             v0,
             dropout_p=0.0,
             softmax_scale=1.0 / math.sqrt(self.head_dim),
-            causal=True,
+            causal=not self.use_global_attention, # Set causal based on the flag
             return_attn_probs=True,
         )
         lse = lse.transpose(1, 2)
@@ -981,9 +996,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
 
     def __init__(self, config):
         super().__init__(config)
-        assert (
-            dist.is_initialized()
-        ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        assert dist.is_initialized(), (
+            f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        )
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             raise NotImplementedError(
                 f"LlamaMutiRotaryEmbedding is currently not supported for LlamaUSPFlashAttention."
@@ -1008,7 +1023,6 @@ class LlamaUSPFlashAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
 
@@ -1099,9 +1113,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
         else:
             acc_lse = lse_ring
 
-        assert (
-            acc_lse.shape[1] == current_q_len
-        ), f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
+        assert acc_lse.shape[1] == current_q_len, (
+            f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
+        )
 
         acc_out = out_ring
 
@@ -1311,7 +1325,6 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
-
     config_class = LlamaConfig
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
@@ -1339,6 +1352,17 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
+
+        # Embedding scale factor for target models that use scaled embeddings
+        # (e.g., Gemma3/Gemma4 multiply by hidden_size**0.5).  Set via config
+        # field ``embed_scale`` or auto-detected from ``target_model_type``.
+        target_type = getattr(config, "target_model_type", None) or ""
+        if getattr(config, "embed_scale", None) is not None:
+            self.embed_scale = config.embed_scale
+        elif "gemma" in target_type:
+            self.embed_scale = config.hidden_size**0.5
+        else:
+            self.embed_scale = 1.0
 
         # create vocab buffers
         t2d = torch.ones(self.vocab_size, dtype=torch.bool)
@@ -1403,7 +1427,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        embeds = self.embed_tokens(input_ids)
+        if self.embed_scale != 1.0:
+            embeds = embeds * self.embed_scale
+        return embeds
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers

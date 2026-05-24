@@ -1,6 +1,6 @@
 """
 This script will re-generate the dataset from target model,
-which better aligns the draft model with the target model’s output distribution.
+which better aligns the draft model with the target model's output distribution.
 
 Usage:
 1. Set up one or more SGLang servers for the target model.
@@ -59,6 +59,15 @@ def parse_arguments():
         "--is-gpt-oss",
         action="store_true",
         help="Whether the model is a GPT-OSS model",
+    )
+    model_group.add_argument(
+        "--thinking-ratio",
+        type=float,
+        default=None,
+        help="Fraction of requests sent with thinking enabled (0 to 1). "
+        "Requires --is-reasoning-model. When set, each request randomly "
+        "enables or disables thinking based on this ratio. "
+        "E.g., 0.7 means 70%% of samples use thinking, 30%% do not.",
     )
 
     # sampling params
@@ -184,6 +193,9 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+    if args.thinking_ratio is not None:
+        enable_thinking = random.random() < args.thinking_ratio
+        extra_body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
@@ -255,11 +267,19 @@ def main():
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
 
+    if args.thinking_ratio is not None:
+        if not (0.0 <= args.thinking_ratio <= 1.0):
+            raise ValueError("--thinking-ratio must be between 0.0 and 1.0")
+        if not args.is_reasoning_model:
+            raise ValueError("--thinking-ratio requires --is-reasoning-model")
+
     print(f"Configuration:")
     print(f"  Model path: {args.model}")
     print(f"  Max tokens: {args.max_tokens}")
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Temperature: {args.temperature}")
+    if args.thinking_ratio is not None:
+        print(f"  Thinking ratio: {args.thinking_ratio:.0%}")
     print(f"  API URL: {args.server_address}")
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")

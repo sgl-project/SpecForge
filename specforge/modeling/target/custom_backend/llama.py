@@ -41,7 +41,6 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
-from transformers.utils.generic import check_model_inputs
 
 from specforge.distributed import get_tp_group
 from specforge.layers import (
@@ -275,7 +274,6 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
