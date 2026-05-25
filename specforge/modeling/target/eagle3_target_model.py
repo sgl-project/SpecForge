@@ -47,6 +47,33 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+
+
+def _sp_chunk_bounds(
+    seq_len: int, sp_rank: int, sp_size: int, ttt_length: int
+) -> Tuple[int, int]:
+    chunk_size = (seq_len + sp_size - 1) // sp_size
+    start = sp_rank * chunk_size
+    end = min(start + chunk_size + ttt_length, seq_len)
+    return start, end
+
+
+def _slice_sequence_for_sp(
+    tensor: torch.Tensor, sp_rank: int, sp_size: int, ttt_length: int
+) -> torch.Tensor:
+    seq_len = tensor.shape[1]
+    chunk_size = (seq_len + sp_size - 1) // sp_size
+    local_len = chunk_size + ttt_length
+    start, end = _sp_chunk_bounds(seq_len, sp_rank, sp_size, ttt_length)
+    sliced = tensor[:, start:end].contiguous()
+    if sliced.shape[1] == local_len:
+        return sliced
+    padded_shape = list(sliced.shape)
+    padded_shape[1] = local_len
+    padded = torch.zeros(padded_shape, dtype=sliced.dtype, device=sliced.device)
+    padded[:, : sliced.shape[1]] = sliced
+    return padded
 
 
 class Eagle3TargetModel(ABC):
@@ -301,6 +328,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         device: str = None,
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
+        shard_target_logits: bool = False,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
         tp_size = dist.get_world_size(get_tp_group())
@@ -337,14 +365,21 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             nccl_port=None,
             is_draft_worker=False,
         )
+        tp_group = get_tp_group()
         wrap_eagle3_logits_processors_in_module(
-            model_runner.model, return_full_logits=False
+            model_runner.model,
+            return_full_logits=False,
+            shard_target_logits=shard_target_logits,
+            tp_group=tp_group,
         )
 
         # Get hf_config from model_config for VLM attributes
         hf_config = getattr(model_config, "hf_config", None)
 
-        return cls(model_runner, hf_config=hf_config)
+        instance = cls(model_runner, hf_config=hf_config)
+        instance.shard_target_logits = shard_target_logits
+        instance.tp_group = tp_group
+        return instance
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -358,12 +393,23 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         capture_aux_hidden_states: bool = True,
         return_last_hidden_states: bool = False,
         return_logits: bool = False,
+        shard_target_logits: bool = False,
+        sequence_parallel: bool = False,
+        sequence_rank: int = 0,
+        sequence_size: int = 1,
+        sp_ttt_length: int = 0,
     ):
         # set the logits processor for the model runner
         for name, module in self.model_runner.model.named_modules():
             if isinstance(module, LogitsProcessorForEAGLE3):
                 module.return_last_hidden_states = return_last_hidden_states
                 module.return_logits = return_logits
+                module.shard_target_logits = shard_target_logits
+                module.sequence_parallel = sequence_parallel
+                module.sequence_rank = sequence_rank
+                module.sequence_size = sequence_size
+                module.sp_ttt_length = sp_ttt_length
+                module.tp_group = getattr(self, "tp_group", None)
 
         cache_params = CacheInitParams(
             disable=False,
@@ -391,36 +437,69 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         aux_hidden_states_list = None
         input_lens = [len(req.origin_input_ids) for req in reqs]
 
+        local_input_lens = getattr(
+            eagle3_output.logits_output, "local_input_lens", None
+        )
+        local_sample_indices = getattr(
+            eagle3_output.logits_output, "local_sample_indices", None
+        )
+        if local_input_lens is None:
+            local_input_lens = input_lens
+        if local_sample_indices is None:
+            local_sample_indices = list(range(len(reqs)))
+        local_num_samples = len(local_input_lens)
+
         if return_logits:
-            if hasattr(eagle3_output, "logits_output"):
-                raw_logits = eagle3_output.logits_output.logits
+            raw_logits = (
+                eagle3_output.logits_output.logits
+                if hasattr(eagle3_output, "logits_output")
+                else eagle3_output.logits
+            )
+            if raw_logits is not None and len(local_input_lens) > 0:
+                logits = torch.split(raw_logits, local_input_lens, dim=0)
+            elif raw_logits is not None:
+                logits = []
             else:
-                raw_logits = eagle3_output.logits
-            logits = torch.split(raw_logits, input_lens, dim=0)
+                logits = [None] * local_num_samples
         else:
-            logits = [None] * len(reqs)
+            logits = [None] * local_num_samples
 
         if capture_aux_hidden_states:
-            raw_aux_hidden_states = (
-                eagle3_output.logits_output.aux_hidden_states
-            )  # concat hidden shape: (total_tokens, H*3)
-            aux_hidden_states_list = torch.split(
-                raw_aux_hidden_states, input_lens, dim=0
-            )
+            raw_aux_hidden_states = eagle3_output.logits_output.aux_hidden_states
+            if raw_aux_hidden_states is not None and len(local_input_lens) > 0:
+                aux_hidden_states_list = torch.split(
+                    raw_aux_hidden_states, local_input_lens, dim=0
+                )
+            elif raw_aux_hidden_states is not None:
+                aux_hidden_states_list = []
+            else:
+                aux_hidden_states_list = [None] * local_num_samples
         else:
-            aux_hidden_states_list = [None] * len(reqs)
+            aux_hidden_states_list = [None] * local_num_samples
 
         if return_last_hidden_states:
-            last_hidden_states = torch.split(
-                eagle3_output.logits_output.last_hidden_states, input_lens, dim=0
-            )
+            raw_last_hidden_states = eagle3_output.logits_output.last_hidden_states
+            if raw_last_hidden_states is not None and len(local_input_lens) > 0:
+                last_hidden_states = torch.split(
+                    raw_last_hidden_states, local_input_lens, dim=0
+                )
+            elif raw_last_hidden_states is not None:
+                last_hidden_states = []
+            else:
+                last_hidden_states = [None] * local_num_samples
         else:
-            last_hidden_states = [None] * len(reqs)
+            last_hidden_states = [None] * local_num_samples
 
         # TODO: can we not clear?
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
-        return logits, aux_hidden_states_list, last_hidden_states
+        return (
+            logits,
+            aux_hidden_states_list,
+            last_hidden_states,
+            local_sample_indices,
+            local_input_lens,
+        )
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
         if require_mlp_sync(self.model_runner.server_args):
@@ -449,6 +528,11 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         loss_mask: torch.Tensor,
         return_last_hidden_states: bool = False,
         return_logits: bool = True,
+        shard_target_logits: bool = False,
+        sequence_parallel: bool = False,
+        sequence_rank: int = 0,
+        sequence_size: int = 1,
+        sp_ttt_length: int = 0,
     ):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
@@ -477,12 +561,30 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
 
-        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
+        (
+            logits_list,
+            aux_hidden_states_list,
+            last_hidden_states_list,
+            local_sample_indices,
+            local_input_lens,
+        ) = self._extend(
             reqs,
             capture_aux_hidden_states=True,
             return_last_hidden_states=return_last_hidden_states,
             return_logits=return_logits,
+            shard_target_logits=shard_target_logits,
+            sequence_parallel=sequence_parallel,
+            sequence_rank=sequence_rank,
+            sequence_size=sequence_size,
+            sp_ttt_length=sp_ttt_length,
         )
+
+        if (
+            shard_target_logits
+            and not sequence_parallel
+            and local_sample_indices != list(range(len(data_cache)))
+        ):
+            data_cache = [data_cache[i] for i in local_sample_indices]
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
 
@@ -541,6 +643,11 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         return_logits: bool = True,
         pixel_values: Optional[List[torch.Tensor]] = None,
         image_grid_thw: Optional[List[torch.Tensor]] = None,
+        shard_target_logits: bool = False,
+        sequence_parallel: bool = False,
+        sequence_rank: int = 0,
+        sequence_size: int = 1,
+        sp_ttt_length: int = 0,
     ):
         """
         Args:
@@ -641,7 +748,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 pad_value=self.image_token_id,  # Required for placeholder tensor creation
                 offsets=offset,  # List of (start, end) tuples
             )
-            mm_item.set("image_grid_thw", image_grid_thw_.cpu())
+            if image_grid_thw_ is not None:
+                mm_item.set("image_grid_thw", image_grid_thw_.cpu())
             mm_item.set_pad_value()
             mm_inputs = MultimodalInputs(
                 mm_items=[mm_item],
@@ -670,12 +778,30 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
 
-        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
+        (
+            logits_list,
+            aux_hidden_states_list,
+            last_hidden_states_list,
+            local_sample_indices,
+            local_input_lens,
+        ) = self._extend(
             reqs,
             capture_aux_hidden_states=True,
             return_last_hidden_states=return_last_hidden_states,
             return_logits=return_logits,
+            shard_target_logits=shard_target_logits,
+            sequence_parallel=sequence_parallel,
+            sequence_rank=sequence_rank,
+            sequence_size=sequence_size,
+            sp_ttt_length=sp_ttt_length,
         )
+
+        if (
+            shard_target_logits
+            and not sequence_parallel
+            and local_sample_indices != list(range(len(data_cache)))
+        ):
+            data_cache = [data_cache[i] for i in local_sample_indices]
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
 
@@ -688,93 +814,119 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        dp_rank: Optional[int] = None,
+        dp_size: int = 1,
+        sequence_parallel: bool = False,
+        sp_rank: int = 0,
+        sp_size: int = 1,
+        sp_ring_rank: int = 0,
+        sp_ring_size: int = 1,
+        ttt_length: int = 0,
     ) -> Eagle3TargetOutput:
-        """
-        return:
-            data_for_draft: List[Dict[str, torch.Tensor]] of draft_batch_size, draft_micro_batch_size = 1
-                - input_ids: (1, seq_len)
-                - attention_mask: (1, seq_len)
-                - loss_mask: (1, seq_len)
-                - target: (1, seq_len, vocab_size) or (1, seq_len, hidden_size)
-                - hidden_states: (1, seq_len, hidden_size)
-                - pixel_values: (patch_len, patch_width)
-                - image_grid_thw (batch_size, 3)
-        """
+        shard_target_logits = getattr(self, "shard_target_logits", False)
         if is_vlm:
-            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                self.extend_vlm(
-                    input_ids,
-                    attention_mask,
-                    loss_mask,
-                    return_last_hidden_states=False,
-                    return_logits=True,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                )
+            data_cache, logits_list, aux_hidden_states_list, _ = self.extend_vlm(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                return_last_hidden_states=False,
+                return_logits=True,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                shard_target_logits=shard_target_logits,
+                sequence_parallel=sequence_parallel,
+                sequence_rank=sp_rank,
+                sequence_size=sp_size,
+                sp_ttt_length=ttt_length,
             )
         else:
-            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                self.extend(
-                    input_ids,
-                    attention_mask,
-                    loss_mask,
-                    return_last_hidden_states=False,
-                    return_logits=True,
-                )
+            data_cache, logits_list, aux_hidden_states_list, _ = self.extend(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                return_last_hidden_states=False,
+                return_logits=True,
+                shard_target_logits=shard_target_logits,
+                sequence_parallel=sequence_parallel,
+                sequence_rank=sp_rank,
+                sequence_size=sp_size,
+                sp_ttt_length=ttt_length,
             )
-        aux_hidden_states_out = []
-        target_out = []
-        loss_mask_out = []
-        input_ids_out = []
-        last_hidden_states_out = []
 
-        for idx, (data, logits, aux_hidden_states, last_hidden_states) in enumerate(
-            zip(
-                data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
-            )
+        kept_aux_hidden_states = []
+        kept_targets = []
+        kept_loss_masks = []
+        kept_input_ids = []
+        kept_attention_masks = []
+        kept_position_ids = []
+
+        for sample_idx, (data, logits, aux_hidden_states) in enumerate(
+            zip(data_cache, logits_list, aux_hidden_states_list)
         ):
-            aux_hidden_states_out.append(aux_hidden_states.unsqueeze(0))
-            loss_mask_out.append(data[2])
-            input_ids_out.append(data[0])
+            should_keep = True
+            if sequence_parallel and dp_rank is not None and dp_size > 1:
+                should_keep = (sample_idx % dp_size) == dp_rank
+            elif not shard_target_logits and dp_rank is not None and dp_size > 1:
+                should_keep = (sample_idx % dp_size) == dp_rank
 
-            # when generating hidden states for offline training, we don't compute logits and only keep the last_hidden_states
-            # when training online, we don't keep the last_hidden_states and only keep the logits
-            if logits is not None:
-                target_out.append(logits.unsqueeze(0))
-            else:
-                target_out.append(None)
+            if should_keep:
+                input_id, attention_mask_, loss_mask_ = data
+                if sequence_parallel:
+                    input_id = _slice_sequence_for_sp(
+                        input_id, sp_rank, sp_size, ttt_length
+                    )
+                    attention_mask_ = _slice_sequence_for_sp(
+                        attention_mask_, sp_rank, sp_size, ttt_length
+                    )
+                    loss_mask_ = _slice_sequence_for_sp(
+                        loss_mask_, sp_rank, sp_size, ttt_length
+                    )
+                    seq_len = input_id.shape[1]
+                    sp_ulysses_size = max(1, sp_size // sp_ring_size)
+                    usp_chunk_size = max(seq_len - ttt_length, 0)
+                    ring_chunk = usp_chunk_size * sp_ulysses_size
+                    ring_start = sp_ring_rank * ring_chunk
+                    kept_position_ids.append(
+                        torch.arange(
+                            ring_start,
+                            ring_start + ring_chunk,
+                            dtype=torch.long,
+                            device=input_id.device,
+                        ).unsqueeze(0)
+                    )
 
-            if last_hidden_states is not None:
-                last_hidden_states_out.append(last_hidden_states.unsqueeze(0))
-            else:
-                last_hidden_states_out.append(None)
+                kept_aux_hidden_states.append(aux_hidden_states.unsqueeze(0))
+                kept_loss_masks.append(loss_mask_)
+                kept_input_ids.append(input_id)
+                kept_attention_masks.append(attention_mask_)
+                if logits is not None:
+                    kept_targets.append(logits.unsqueeze(0))
 
-        aux_hidden_states_out = torch.cat(aux_hidden_states_out, dim=0)
+        aux_hidden_states_out = torch.cat(kept_aux_hidden_states, dim=0)
+        loss_mask_out = torch.cat(kept_loss_masks, dim=0)
+        input_ids_out = torch.cat(kept_input_ids, dim=0)
+        attention_mask_out = torch.cat(kept_attention_masks, dim=0)
 
-        loss_mask_out = torch.cat(loss_mask_out, dim=0)
-        input_ids_out = torch.cat(input_ids_out, dim=0)
-
-        if target_out[0] is not None:
-            target_out = torch.cat(target_out, dim=0)
+        if kept_targets:
+            target_out = torch.cat(kept_targets, dim=0)
         else:
             target_out = None
-
-        if last_hidden_states_out[0] is not None:
-            last_hidden_states_out = torch.cat(last_hidden_states_out, dim=0)
-        else:
-            last_hidden_states_out = None
 
         target_out = padding(target_out, left=False)
         input_ids_out = padding(input_ids_out, left=False)
         loss_mask_out = loss_mask_out[..., None]
+        position_ids_out = (
+            torch.cat(kept_position_ids, dim=0) if kept_position_ids else None
+        )
 
         return Eagle3TargetOutput(
             hidden_states=aux_hidden_states_out,
             target=target_out,
             loss_mask=loss_mask_out,
             input_ids=input_ids_out,
-            attention_mask=attention_mask,
-            last_hidden_states=last_hidden_states_out,
+            attention_mask=attention_mask_out,
+            last_hidden_states=None,
+            position_ids=position_ids_out,
         )
 
 
