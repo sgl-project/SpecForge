@@ -22,7 +22,6 @@ POST /get_model_info          – Return model metadata (num layers, etc.)
 GET  /health                  – Liveness check
 """
 
-import io
 import json
 import logging
 import os
@@ -46,19 +45,13 @@ logger = logging.getLogger(__name__)
 NCCL_HEADER = "X-SpecForge-Nccl"
 
 # ---------------------------------------------------------------------------
-# Wire-format serialization (replaces torch.save / torch.load)
+# Wire-format serialization
 # ---------------------------------------------------------------------------
 
 
-def _deserialize_tensors(raw: bytes, map_location: str = "cuda") -> dict:
-    """Deserialize REQUEST payloads using torch.load.
-
-    Request payloads use torch.save (legacy) because they're small
-    (input_ids, masks) and setup endpoints may carry non-tensor data.
-    Response deserialization is handled separately via NCCL metadata or wire format.
-    """
-    buf = io.BytesIO(raw)
-    return torch.load(buf, map_location=map_location, weights_only=False)
+def _deserialize_tensors(raw: bytes, map_location: str = "cpu") -> dict:
+    """Deserialize REQUEST payloads (tensor dicts) from wire format."""
+    return _wire.decode(raw, map_location=map_location)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +88,6 @@ class TargetModelServer:
         self._model = None
         self._vocab_t2d: torch.Tensor = None  # set via /set_vocab_mapping
         self._vocab_t2d_cuda: torch.Tensor = None  # cached CUDA version
-        self._use_nccl: bool = False  # per-request NCCL flag
         self._gpu_id: int = None  # set after model loading
         self._pending_nccl_send = None  # stashed for deferred NCCL send
         # NCCL transport for GPU-to-GPU data transfer
@@ -156,7 +148,7 @@ class TargetModelServer:
     @property
     def _keep_on_gpu(self) -> bool:
         """Whether tensors should stay on GPU (NCCL path) or move to CPU."""
-        return self._use_nccl and self._nccl_transport is not None and self._nccl_transport.is_initialized
+        return getattr(_request_local, 'use_nccl', False) and self._nccl_transport is not None and self._nccl_transport.is_initialized
 
     def _serialize_response(self, data: dict) -> bytes:
         """Serialise handler response dict to bytes.
@@ -191,9 +183,20 @@ class TargetModelServer:
         """Send pending NCCL tensors (called AFTER HTTP response is flushed)."""
         pending = self._pending_nccl_send
         if pending is not None:
-            data, keys_order = pending
-            self._nccl_transport.send_tensors(data, keys_order)
             self._pending_nccl_send = None
+            data, keys_order = pending
+            try:
+                self._nccl_transport.send_tensors(data, keys_order)
+            except Exception:
+                logger.exception("NCCL send failed — disabling NCCL for subsequent requests")
+                transport = self._nccl_transport
+                self._nccl_transport = None
+                if transport is not None:
+                    try:
+                        transport.destroy()
+                    except Exception:
+                        logger.exception("Failed to destroy NCCL transport after send failure")
+                raise
 
     # ------------------------------------------------------------------
     # Request handlers
@@ -284,7 +287,9 @@ class TargetModelServer:
                 topk_vals, topk_indices = target_p.topk(self._topk, dim=-1)
                 topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                 target_out_vals = topk_vals.bfloat16() if self._use_bf16_target else topk_vals
-                target_out_indices = topk_indices.to(torch.int16)
+                # int16 is safe when draft_vocab_size <= 32768; use int32 otherwise
+                idx_dtype = torch.int16 if seq_dim <= 32768 else torch.int32
+                target_out_indices = topk_indices.to(idx_dtype)
                 target_key = None
             else:
                 target_out_vals = target_p.bfloat16() if self._use_bf16_target else target_p
@@ -379,6 +384,7 @@ class TargetModelServer:
         """Receive t2d/d2t vocab mapping for server-side target_p computation."""
         payload = _deserialize_tensors(raw_body, map_location="cpu")
         self._vocab_t2d = payload["t2d"]
+        self._vocab_t2d_cuda = None  # invalidate cached CUDA version
         logger.info("Vocab mapping set: t2d shape=%s", self._vocab_t2d.shape)
         return b"ok"
 
@@ -397,11 +403,7 @@ class TargetModelServer:
                         info["hf_config_dict"] = hf_cfg.to_dict()
         info["server_model_path"] = self.model_path
         info["mode"] = self.mode
-        # Use torch.save (real pickle) — model_info contains scalars (int/str/dict),
-        # not tensors, so the wire format is not applicable.
-        buf = io.BytesIO()
-        torch.save(info, buf)
-        return buf.getvalue()
+        return json.dumps(info, default=str).encode()
 
     def handle_init_nccl(self, raw_body: bytes) -> bytes:
         """Initialize NCCL transport on the server side.
@@ -461,6 +463,7 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 # when tp > 1, and (b) single-GPU forward + serialisation already saturates
 # one CPU core – real parallelism comes from multi-server via --remote-urls.
 _forward_semaphore = threading.BoundedSemaphore(1)
+_request_local = threading.local()
 
 
 class _RequestHandler(BaseHTTPRequestHandler):
@@ -509,30 +512,44 @@ class _RequestHandler(BaseHTTPRequestHandler):
             torch.cuda.set_device(self.server_app._gpu_id)
 
         try:
-            body = self._read_body()
-        except Exception:
-            self._send_error("Failed to read request body", 400)
-            return
-
-        path = self.path.rstrip("/")
-        # Detect transport mode from headers
-        self.server_app._use_nccl = self.headers.get(NCCL_HEADER) == "1"
-
-        # Heavy endpoints: gate concurrent forward passes to avoid OOM.
-        if path in ("/generate_eagle3_data", "/generate_dflash_data"):
-            acquired = _forward_semaphore.acquire(blocking=False)
-            if not acquired:
-                self._send_error("Server busy – too many concurrent forward passes", 503)
-                return
             try:
-                result = _route_request_synced(self.server_app, path, body)
-            finally:
-                _forward_semaphore.release()
-        else:
-            result = _route_request_synced(self.server_app, path, body)
+                body = self._read_body()
+            except Exception:
+                self._send_error("Failed to read request body", 400)
+                return
 
-        if result is not None:
-            self._send_response(result)
+            path = self.path.rstrip("/")
+            # Detect transport mode from headers (request-local)
+            use_nccl = self.headers.get(NCCL_HEADER) == "1"
+            _request_local.use_nccl = use_nccl
+
+            # Heavy endpoints: gate concurrent forward passes AND response/NCCL send.
+            if path in ("/generate_eagle3_data", "/generate_dflash_data"):
+                acquired = _forward_semaphore.acquire(blocking=False)
+                if not acquired:
+                    self._send_error("Server busy – too many concurrent forward passes", 503)
+                    return
+                try:
+                    result = _route_request_synced(self.server_app, path, body)
+                    if result is not None:
+                        if isinstance(result, tuple):
+                            resp_body, status = result
+                            self._send_response(resp_body, status)
+                        else:
+                            self._send_response(result)
+                finally:
+                    self.server_app._pending_nccl_send = None
+                    _forward_semaphore.release()
+            else:
+                result = _route_request_synced(self.server_app, path, body)
+                if result is not None:
+                    if isinstance(result, tuple):
+                        resp_body, status = result
+                        self._send_response(resp_body, status)
+                    else:
+                        self._send_response(result)
+        finally:
+            _request_local.use_nccl = False
 
     def log_message(self, fmt, *args):
         logger.debug(fmt, *args)
@@ -625,7 +642,11 @@ def _route_request_synced(app, path, body):
     so that worker ranks do not waste CPU serialising results that are discarded.
     """
     if not dist.is_initialized() or dist.get_world_size() == 1:
-        return _route_request(app, path, body)
+        try:
+            return _route_request(app, path, body)
+        except Exception:
+            logger.exception("Error handling %s", path)
+            return json.dumps({"error": "Internal server error"}).encode(), 500
 
     # /init_nccl must run ONLY on rank 0 — it sets up a separate 2-rank NCCL
     # group (server rank 0 + training client rank 1).  TP worker ranks must
@@ -645,7 +666,11 @@ def _route_request_synced(app, path, body):
             out = app._run_generate_eagle3_data(body_bytes, rank_only_forward=(rank != 0))
         except Exception:
             logger.exception("Error handling %s (rank %d)", synced_path, rank)
-        return app._serialize_response(out) if rank == 0 and out is not None else None
+        if rank == 0:
+            if out is not None:
+                return app._serialize_response(out)
+            return json.dumps({"error": "Internal server error during forward pass"}).encode(), 500
+        return None
 
     if synced_path == "/generate_dflash_data":
         out = None
@@ -653,7 +678,11 @@ def _route_request_synced(app, path, body):
             out = app._run_generate_dflash_data(body_bytes, rank_only_forward=(rank != 0))
         except Exception:
             logger.exception("Error handling %s (rank %d)", synced_path, rank)
-        return app._serialize_response(out) if rank == 0 and out is not None else None
+        if rank == 0:
+            if out is not None:
+                return app._serialize_response(out)
+            return json.dumps({"error": "Internal server error during forward pass"}).encode(), 500
+        return None
 
     # Lightweight endpoints: broadcast + execute on all ranks
     try:
@@ -662,7 +691,11 @@ def _route_request_synced(app, path, body):
         logger.exception("Error handling %s (rank %d)", synced_path, rank)
         result = None
 
-    return result if rank == 0 else None
+    if rank == 0:
+        if result is not None:
+            return result
+        return json.dumps({"error": "Internal server error"}).encode(), 500
+    return None
 
 
 def _worker_loop(server_app):
