@@ -1,8 +1,6 @@
-"""Custom binary tensor serialisation – replaces torch.save / torch.load.
+"""Custom binary tensor serialisation for SpecForge remote training.
 
-torch.save adds substantial pickle-metadata overhead (up to 8× observed in
-Eagle3 16384-token forward responses).  This module defines a compact wire
-format that encodes only dtype, shape, and raw contiguous bytes, making it
+Compact wire format that encodes dtype, shape, and raw contiguous bytes,
 suitable for high-throughput tensor transport over HTTP or shared memory.
 
 Format (little-endian unless noted)
@@ -76,6 +74,8 @@ def encode(tensor_dict: Dict[str, Optional[torch.Tensor]]) -> bytearray:
         else:
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
+            if tensor.is_cuda:
+                raise ValueError("wire encoding expects CPU tensors, got CUDA tensor")
             dt = tensor.dtype
             code = _DTYPE_TO_CODE.get(dt)
             if code is None:

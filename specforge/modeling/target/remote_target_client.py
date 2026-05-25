@@ -24,7 +24,6 @@ Training → POST /generate_dflash_data
 """
 
 import concurrent.futures
-import io
 import atexit
 import itertools
 import json
@@ -178,16 +177,13 @@ NCCL_HEADER = "X-SpecForge-Nccl"
 
 
 def _serialize_tensors(data: Dict[str, torch.Tensor]) -> bytes:
-    """Serialize a dict of tensors into a bytes buffer via torch.save."""
-    buffer = io.BytesIO()
-    torch.save(data, buffer)
-    return buffer.getvalue()
+    """Serialize a dict of tensors into wire format."""
+    return _wire.encode_to_buffer(data)
 
 
 def _deserialize_scalar_dict(raw: bytes) -> dict:
     """Deserialize a dict of scalars (returned by /get_model_info)."""
-    buffer = io.BytesIO(raw)
-    return torch.load(buffer, map_location="cpu", weights_only=False)
+    return json.loads(raw.decode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
