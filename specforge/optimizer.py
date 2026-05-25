@@ -18,8 +18,16 @@ class BF16Optimizer:
         # TODO: We should make these parameters configurable
         #   These magic numbers: weight_decay=0.0, max_grad_norm=0.5, total_steps=800k, warmup_steps=12k are copied from
         #   https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json
-        self.model = model
-        self.model_params = [p for p in model.parameters() if p.requires_grad]
+        if isinstance(model, list):
+            self.model = None
+            self.model_params = [
+                p for p in model if p.requires_grad
+            ]
+        else:
+            self.model = model
+            self.model_params = [
+                p for p in model.parameters() if p.requires_grad
+            ]
         self.max_grad_norm = max_grad_norm
         self.fp32_params = [
             p.detach().clone().to(torch.float32) for p in self.model_params

@@ -438,6 +438,13 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
     )
 
+    # Freeze target components: only train draft model
+    for param in target_components.lm_head.parameters():
+        param.requires_grad = False
+    for param in target_components.embed_tokens.parameters():
+        param.requires_grad = False
+    print_on_rank0("Frozen target_lm_head and target_embed_tokens")
+
     dflash_model = FSDP(
         dflash_model,
         use_orig_params=True,
@@ -452,8 +459,15 @@ def main():
     start_epoch = ckpt_info[0]
     global_step = ckpt_info[1]
 
+    # BF16Optimizer must operate on the FSDP-wrapped model's draft parameters
+    # to ensure gradient synchronization works correctly with use_orig_params=True
+    draft_params = []
+    for name, param in dflash_model.named_parameters():
+        if param.requires_grad and "draft_model." in name:
+            draft_params.append(param)
+
     optimizer = BF16Optimizer(
-        draft_model,
+        draft_params,
         lr=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
