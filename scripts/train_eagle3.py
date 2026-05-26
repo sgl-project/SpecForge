@@ -984,10 +984,11 @@ def main():
                     tracker,
                     mode="eval",
                 )
+                draft_model.train()
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
-            if global_step % args.save_interval == 0:
+            if global_step % (args.save_interval * args.draft_accumulation_steps) == 0:
                 # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 

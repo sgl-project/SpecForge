@@ -461,7 +461,7 @@ def main():
     )
 
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        optimizer.load_state_dict(resume_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state

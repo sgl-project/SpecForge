@@ -206,7 +206,6 @@ class Gather(torch.autograd.Function):
             None,
             None,
             None,
-            None,
         )
 
 
