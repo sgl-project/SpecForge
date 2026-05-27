@@ -249,6 +249,10 @@ class OnlineEagle3Model(Eagle3Model):
             # update hidden states for next step
             hidden_states = hidden_states_out
 
+            # Apply output norm for EAGLE 3.1 post-norm architecture
+            if self.draft_model.norm_output:
+                hidden_states = self.draft_model.norm(hidden_states)
+
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
 
@@ -537,6 +541,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
             # update hidden states for next step
             hidden_states = hidden_states_out
+
+            # Apply output norm for EAGLE 3.1 post-norm architecture
+            if self.draft_model.norm_output:
+                hidden_states = self.draft_model.norm(hidden_states)
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
