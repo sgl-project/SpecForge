@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft.peagle import PEagleDraftModel
 
 
@@ -129,36 +128,41 @@ def compute_peagle_metrics(
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Compute KL divergence loss and per-depth accuracy for P-EAGLE.
 
-    Uses LogSoftmaxLoss (Triton-accelerated KL div) and per-depth accuracy metrics.
+    Uses standard PyTorch KL div loss with proper normalization by valid positions.
     """
     device = logits.device
     orig_positions = anchor_pos + depth
 
+    # Ensure loss_mask is 2D [batch, seq_len]
+    if loss_mask.dim() == 3:
+        loss_mask = loss_mask.squeeze(-1)
+
     # Map targets to draft vocabulary and compute softmax
     target_logits = targets[:, orig_positions, :]
-    # Apply vocab mapping if available
     if t2d is not None and t2d.dtype == torch.bool:
         target_logits = target_logits[:, :, t2d]
 
-    target_p = torch.softmax(target_logits.float(), dim=-1).to(logits.dtype)
+    # Compute KL div loss matching speculators: kl_div_loss + loss_function
+    log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+    target_p = torch.nn.functional.softmax(target_logits.float(), dim=-1)
+    elementwise_loss = torch.nn.functional.kl_div(
+        log_probs, target_p, reduction="none", log_target=False
+    ).sum(dim=-1)  # [batch, total_sampled]
 
-    # Position mask from loss_mask
-    sampled_loss_mask = loss_mask[:, orig_positions]
-    position_mask = sampled_loss_mask.unsqueeze(-1)
-
-    # LogSoftmaxLoss (KL divergence)
-    loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    sampled_loss_mask = loss_mask[:, orig_positions].float()  # [batch, total_sampled]
+    masked_loss = elementwise_loss * sampled_loss_mask
+    denominator = sampled_loss_mask.sum(dim=1).clamp_min(1e-5)  # [batch]
+    loss = (masked_loss.sum(dim=1) / denominator).mean()
 
     with torch.no_grad():
-        pred_ids = torch.argmax(logits, dim=-1)
-        target_ids = torch.argmax(target_p, dim=-1)
+        pred_ids = torch.argmax(logits, dim=-1)  # [batch, total_sampled]
+        target_ids = torch.argmax(target_p, dim=-1)  # [batch, total_sampled]
 
         metrics: Dict[str, Any] = {
             "loss_sum": loss.detach(),
             "loss_total": torch.tensor(1.0, device=device),
         }
 
-        # Per-depth accuracy
         correct_total = torch.tensor(0.0, device=device)
         count_total = torch.tensor(0.0, device=device)
         for d in range(num_depths):
@@ -233,6 +237,10 @@ class OnlinePEagleModel(nn.Module):
         """
         device = hidden_states.device
         seq_length = input_ids.shape[1]
+
+        # Ensure loss_mask is 2D [batch, seq_len]
+        if loss_mask.dim() == 3:
+            loss_mask = loss_mask.squeeze(-1)
 
         if lengths is None:
             lengths = torch.tensor([seq_length], dtype=torch.long, device=device)
