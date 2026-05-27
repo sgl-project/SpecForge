@@ -61,6 +61,7 @@ def test_moe(rank, world_size, port, tp_size):
         torch_dtype=torch.float16,
         device="cuda",
         attention_backend="fa3",
+        load_format="dummy",
         mem_fraction_static=0.4,
     )
     sgl_target_model.set_aux_hidden_states_layers()
@@ -192,6 +193,7 @@ def test_vlm(rank, world_size, port, tp_size):
         torch_dtype=torch.float16,
         device="cuda",
         attention_backend="fa3",
+        load_format="dummy",
         mem_fraction_static=0.75,
     )
     sgl_target_model.set_aux_hidden_states_layers()
@@ -345,6 +347,7 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         torch_dtype=torch.float16,
         device="cuda",
         attention_backend="fa3",
+        load_format="dummy",
         mem_fraction_static=0.4,
     )
     sgl_target_model.set_aux_hidden_states_layers()
