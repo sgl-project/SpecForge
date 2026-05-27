@@ -1025,7 +1025,7 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
         out0_expanded = out0.view(
             bsz, q_len, num_kv_heads, num_groups, head_dim
         ).float()
-        neg_inf = torch.tensor(float("-inf"), device=q.device, dtype=torch.float32)
+        neg_inf = float("-inf")
         lse0 = (
             lse0_kernel.transpose(1, 2)
             .view(bsz, q_len, num_kv_heads, num_groups)
