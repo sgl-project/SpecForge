@@ -19,6 +19,7 @@ from transformers import (
 )
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .draft.peagle import PEagleDraftModel
 from .target.custom_backend import (
     GptOssForCausalLM,
     Llama4ForCausalLM,
@@ -133,6 +134,7 @@ class AutoDraftModelConfig:
 
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
+        "PEagleDraftModel": LlamaConfig,
     }
 
     @classmethod
