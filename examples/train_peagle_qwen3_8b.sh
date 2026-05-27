@@ -10,7 +10,7 @@ export TORCHINDUCTOR_CACHE_DIR="$ROOT_DIR/cache/compiled_kernels"
 export FLASHINFER_WORKSPACE_BASE="$ROOT_DIR/cache/flashinfer"
 
 # Model
-TARGET_MODEL="/home/share/model_weight/qwen/Qwen3-1.7B/"
+TARGET_MODEL="/home/share/model_weight/qwen/Qwen3-8B/"
 
 # P-EAGLE parameters
 NUM_DEPTHS=4
