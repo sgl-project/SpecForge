@@ -559,17 +559,8 @@ def main():
     )
 
     # ================================================
-    # 5. Build optimizer and scheduler
+    # 5. Wrap with FSDP, then build optimizer and scheduler
     # ================================================
-    # Pass peagle_model (not draft_model) so mask_hidden is also optimized
-    optimizer = BF16Optimizer(
-        peagle_model,
-        lr=args.learning_rate,
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
-        total_steps=args.total_steps,
-    )
-
     peagle_model = FSDP(
         peagle_model,
         use_orig_params=True,
@@ -580,6 +571,15 @@ def main():
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         process_group=dist.group.WORLD,
         device_id=torch.cuda.current_device(),
+    )
+
+    # Build optimizer after FSDP so fp32 param copies match sharded shapes
+    optimizer = BF16Optimizer(
+        peagle_model,
+        lr=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
+        warmup_ratio=args.warmup_ratio,
+        total_steps=args.total_steps,
     )
     print_with_rank("Initialized optimizer and scheduler")
 
