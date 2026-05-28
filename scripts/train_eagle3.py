@@ -624,9 +624,24 @@ def run_forward(
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+) -> Tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+]:
     if args.is_vlm and args.target_model_backend == "custom":
-        plosses, _, acces = eagle3_model(
+        (
+            plosses,
+            _,
+            acces,
+            acc_corrects,
+            acc_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        ) = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
             loss_mask=data["loss_mask"].cuda(),
@@ -678,7 +693,15 @@ def run_forward(
                 target.cuda()
             )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
-        plosses, _, acces = eagle3_model(
+        (
+            plosses,
+            _,
+            acces,
+            acc_corrects,
+            acc_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        ) = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
@@ -690,12 +713,12 @@ def run_forward(
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
         )
-    return plosses, acces
+    return plosses, acces, acc_corrects, acc_denoms, metric_losses, metric_loss_denoms
 
 
 def run_backward_and_update(
     args: Namespace, plosses: List[torch.Tensor], optimizer: Optimizer, global_step: int
-) -> None:
+) -> Optional[torch.Tensor]:
     ploss_weight = [0.8**i for i in range(len(plosses))]
     ploss = (
         sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
@@ -704,7 +727,16 @@ def run_backward_and_update(
     ploss.backward()
 
     if global_step % args.draft_accumulation_steps == 0:
-        optimizer.step()
+        grad_norm = optimizer.step()
+        if dist.is_initialized():
+            grad_norm = grad_norm.detach().float()
+            if torch.cuda.is_available():
+                grad_norm = grad_norm.to(torch.cuda.current_device())
+            grad_norm = grad_norm.pow(2)
+            dist.all_reduce(grad_norm, op=dist.ReduceOp.SUM)
+            grad_norm = grad_norm.sqrt()
+        return grad_norm
+    return None
 
 
 def record_metrcs(
@@ -715,17 +747,30 @@ def record_metrcs(
     tracker: Tracker,
     optimizer: Optional[Optimizer] = None,
     mode: str = "train",
+    acc_corrects: Optional[List[torch.Tensor]] = None,
+    acc_denoms: Optional[List[torch.Tensor]] = None,
+    ploss_denoms: Optional[List[torch.Tensor]] = None,
+    grad_norms: Optional[List[torch.Tensor]] = None,
 ) -> None:
     logdict = {}
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
 
-    accuracies = torch.stack(accuracies)
     plosses = torch.stack(plosses)
 
-    assert accuracies.shape[0] == args.ttt_length
-    dist.all_reduce(accuracies, op=dist.ReduceOp.AVG)
+    if acc_corrects is not None and acc_denoms is not None:
+        corrects = torch.stack(acc_corrects)
+        denoms = torch.stack(acc_denoms)
+        assert corrects.shape[0] == args.ttt_length
+        dist.all_reduce(corrects, op=dist.ReduceOp.SUM)
+        dist.all_reduce(denoms, op=dist.ReduceOp.SUM)
+        accuracies = corrects / denoms.clamp_min(1e-6)
+    else:
+        accuracies = torch.stack(accuracies)
+        assert accuracies.shape[0] == args.ttt_length
+        dist.all_reduce(accuracies, op=dist.ReduceOp.AVG)
+
     accuracies = accuracies.cpu().tolist()
     for i in range(len(accuracies)):
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
@@ -733,14 +778,57 @@ def record_metrcs(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
         )
 
-    dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
+    if ploss_denoms is not None:
+        ploss_denoms = torch.stack(ploss_denoms)
+        dist.all_reduce(plosses, op=dist.ReduceOp.SUM)
+        dist.all_reduce(ploss_denoms, op=dist.ReduceOp.SUM)
+        plosses = plosses / ploss_denoms.clamp_min(1e-6)
+    else:
+        dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
+
     plosses = plosses.cpu().tolist()
     for i in range(len(plosses)):
         logdict[f"{mode}/ploss_{i}"] = plosses[i]
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
         )
+
+    if grad_norms:
+        grad_norm = torch.stack([norm.detach().float() for norm in grad_norms]).mean()
+        logdict[f"{mode}/grad_norm"] = grad_norm.item()
+
     tracker.log(logdict, step=global_step)
+
+
+def get_progress_metrics(
+    acc_corrects: List[torch.Tensor],
+    acc_denoms: List[torch.Tensor],
+    metric_losses: List[torch.Tensor],
+    metric_loss_denoms: List[torch.Tensor],
+    grad_norm: Optional[torch.Tensor] = None,
+    last_grad_norm: Optional[float] = None,
+) -> Tuple[float, float, Optional[float]]:
+    loss_num = sum(
+        loss.detach() * denom.detach()
+        for loss, denom in zip(metric_losses, metric_loss_denoms)
+    )
+    loss_den = sum(denom.detach() for denom in metric_loss_denoms)
+    acc_num = sum(correct.detach() for correct in acc_corrects)
+    acc_den = sum(denom.detach() for denom in acc_denoms)
+
+    metric_values = [
+        loss_num.float(),
+        loss_den.float(),
+        acc_num.float(),
+        acc_den.float(),
+    ]
+    metrics = torch.stack(metric_values)
+    dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+    loss = metrics[0] / metrics[1].clamp_min(1e-6)
+    acc = metrics[2] / metrics[3].clamp_min(1e-6)
+    if grad_norm is not None:
+        last_grad_norm = grad_norm.detach().float().item()
+    return loss.item(), acc.item(), last_grad_norm
 
 
 def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
@@ -889,6 +977,12 @@ def main():
     dist.barrier()
 
     last_time = time.time()
+    metric_correct_sums = None
+    metric_denom_sums = None
+    metric_loss_weighted_sums = None
+    metric_loss_denom_sums = None
+    grad_norms = []
+    last_grad_norm = None
 
     # ================================================
     # 7. Start training
@@ -944,39 +1038,86 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(
+            (
+                plosses,
+                acces,
+                acc_corrects,
+                acc_denoms,
+                metric_losses,
+                metric_loss_denoms,
+            ) = run_forward(
                 args,
                 eagle3_model,
                 data,
                 target_model,
                 is_online,
             )
-            run_backward_and_update(args, plosses, optimizer, global_step)
+            grad_norm = run_backward_and_update(args, plosses, optimizer, global_step)
+            if grad_norm is not None:
+                grad_norms.append(grad_norm)
+
+            with torch.no_grad():
+                if metric_correct_sums is None:
+                    metric_correct_sums = [
+                        correct.detach().clone() for correct in acc_corrects
+                    ]
+                    metric_denom_sums = [denom.detach().clone() for denom in acc_denoms]
+                    metric_loss_weighted_sums = [
+                        loss.detach() * denom.detach()
+                        for loss, denom in zip(metric_losses, metric_loss_denoms)
+                    ]
+                    metric_loss_denom_sums = [
+                        denom.detach().clone() for denom in metric_loss_denoms
+                    ]
+                else:
+                    for i in range(len(acc_corrects)):
+                        metric_correct_sums[i] += acc_corrects[i].detach()
+                        metric_denom_sums[i] += acc_denoms[i].detach()
+                        metric_loss_weighted_sums[i] += (
+                            metric_losses[i].detach() * metric_loss_denoms[i].detach()
+                        )
+                        metric_loss_denom_sums[i] += metric_loss_denoms[i].detach()
 
             # log training metrics
             if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
                 record_metrcs(
                     args,
                     acces,
-                    plosses,
+                    metric_loss_weighted_sums,
                     global_step // args.draft_accumulation_steps,
                     tracker,
                     optimizer,
                     mode="train",
+                    acc_corrects=metric_correct_sums,
+                    acc_denoms=metric_denom_sums,
+                    ploss_denoms=metric_loss_denom_sums,
+                    grad_norms=grad_norms,
                 )
+                metric_correct_sums = None
+                metric_denom_sums = None
+                metric_loss_weighted_sums = None
+                metric_loss_denom_sums = None
+                grad_norms = []
 
+            avg_loss, avg_acc, last_grad_norm = get_progress_metrics(
+                acc_corrects,
+                acc_denoms,
+                metric_losses,
+                metric_loss_denoms,
+                grad_norm,
+                last_grad_norm,
+            )
             if dist.get_rank() == 0:
                 time_per_step = time.time() - last_time
                 last_time = time.time()
-                avg_loss = sum(pl for pl in plosses) / len(plosses)
-                avg_acc = sum(acces) / len(acces)
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{avg_loss:.2f}",
-                        "acc": f"{avg_acc:.2f}",
-                        "time": f"{time_per_step:.2f}s",
-                    }
-                )
+                postfix = {
+                    "loss": f"{avg_loss:.2f}",
+                    "acc": f"{avg_acc:.2f}",
+                    "time": f"{time_per_step:.2f}s",
+                }
+                if last_grad_norm is not None:
+                    postfix["grad_norm"] = f"{last_grad_norm:.2f}"
+                progress_bar.set_postfix(postfix)
 
             # ================================================
             # 7.2 Evaluation Step
@@ -997,7 +1138,7 @@ def main():
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
-                        plosses, acces = run_forward(
+                        plosses, acces, _, _, _, _ = run_forward(
                             args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
