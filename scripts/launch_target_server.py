@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Launch a standalone target model inference server for remote SpecForge training.
 
 Usage
@@ -26,7 +25,6 @@ import signal
 import sys
 import threading
 
-import torch
 import torch.distributed as dist
 
 # Add parent dir so 'specforge' is importable when running as a standalone script.
@@ -125,8 +123,11 @@ def main():
     # The SGLang target model wrapper calls specforge.distributed.get_tp_group()
     # which requires init_process_group. Always run via torchrun.
     from specforge.distributed import init_distributed
+
     init_distributed(timeout=30, tp_size=args.tp_size)
-    logger.info("Distributed initialized (tp_size=%d, rank=%d)", args.tp_size, dist.get_rank())
+    logger.info(
+        "Distributed initialized (tp_size=%d, rank=%d)", args.tp_size, dist.get_rank()
+    )
 
     # ---- Load model via TargetModelServer ----
     from specforge.modeling.target.remote_target_server import (
@@ -162,7 +163,12 @@ def main():
     if rank == 0:
         # ---- Start HTTP server (rank 0 only) ----
         httpd = create_http_server(server_app, args.host, args.port)
-        logger.info("Target model server listening on %s:%d (mode=%s)", args.host, args.port, args.mode)
+        logger.info(
+            "Target model server listening on %s:%d (mode=%s)",
+            args.host,
+            args.port,
+            args.mode,
+        )
 
         def shutdown(signum, frame):
             logger.info("Received signal %d, shutting down...", signum)
@@ -182,7 +188,9 @@ def main():
             server_app.close()
             # Signal worker ranks to exit
             if dist.get_world_size() > 1:
-                from specforge.modeling.target.remote_target_server import _SENTINEL_EXIT
+                from specforge.modeling.target.remote_target_server import (
+                    _SENTINEL_EXIT,
+                )
 
                 dist.broadcast_object_list([_SENTINEL_EXIT], src=0)
         logger.info("Server stopped.")

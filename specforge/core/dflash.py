@@ -204,7 +204,9 @@ class OnlineDFlashModel(nn.Module):
         """
         device = anchor_positions.device
         offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        gather_indices = (anchor_positions.unsqueeze(-1) + offsets).clamp(max=seq_len - 1)
+        gather_indices = (anchor_positions.unsqueeze(-1) + offsets).clamp(
+            max=seq_len - 1
+        )
 
         if context_position_ids.ndim == 2:
             bsz, n_blocks = anchor_positions.shape

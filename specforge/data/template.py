@@ -333,5 +333,3 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="</longcat_s>",
     ),
 )
-
-

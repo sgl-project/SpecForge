@@ -78,7 +78,9 @@ def init_distributed_environment(
         try:
             dist.destroy_process_group(group_to_destroy)
         except Exception:
-            logger.debug("Failed to destroy temporary SGLang world group", exc_info=True)
+            logger.debug(
+                "Failed to destroy temporary SGLang world group", exc_info=True
+            )
 
 
 def initialize_model_parallel(
@@ -221,7 +223,9 @@ def initialize_model_parallel(
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
 
-    assert parallel_state._MOE_DP is None, "moe data parallel group is already initialized"
+    assert (
+        parallel_state._MOE_DP is None
+    ), "moe data parallel group is already initialized"
     if attn_cp_size > moe_dp_size:
         parallel_state._MOE_DP = parallel_state._ATTN_CP
     elif moe_dp_size == tensor_model_parallel_size:
@@ -231,7 +235,9 @@ def initialize_model_parallel(
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for tp_ep_combined_idx in range(moe_tp_size * moe_ep_size):
                 st = tp_group_idx * tensor_model_parallel_size + tp_ep_combined_idx
-                en = (tp_group_idx + 1) * tensor_model_parallel_size + tp_ep_combined_idx
+                en = (
+                    tp_group_idx + 1
+                ) * tensor_model_parallel_size + tp_ep_combined_idx
                 ranks = list(range(st, en, moe_tp_size * moe_ep_size))
                 group_ranks.append(ranks)
         parallel_state._MOE_DP = init_model_parallel_group(
@@ -299,14 +305,18 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
         )
 
-    num_pipeline_model_parallel_groups = distributed_world_size // pipeline_model_parallel_size
+    num_pipeline_model_parallel_groups = (
+        distributed_world_size // pipeline_model_parallel_size
+    )
     assert (
         parallel_state._PP is None
     ), "pipeline model parallel group is already initialized"
     group_ranks = []
     for pp_group_idx in range(num_pipeline_model_parallel_groups):
         ranks = list(
-            range(pp_group_idx, distributed_world_size, num_pipeline_model_parallel_groups)
+            range(
+                pp_group_idx, distributed_world_size, num_pipeline_model_parallel_groups
+            )
         )
         group_ranks.append(ranks)
     parallel_state._PP = init_model_parallel_group(

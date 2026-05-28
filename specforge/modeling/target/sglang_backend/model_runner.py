@@ -2,7 +2,6 @@ import logging
 import os
 
 import torch
-from sglang.srt.environ import envs
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -11,6 +10,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     initialize_dp_attention,

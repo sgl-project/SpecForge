@@ -28,9 +28,9 @@ from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
+    VLM_MODEL_TYPES,
     DFlashTargetModel,
     HFDFlashTargetModel,
-    VLM_MODEL_TYPES,
     get_dflash_target_model,
 )
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
@@ -82,9 +82,9 @@ def _build_target_layer_ids(
 
     if layer_types is not None:
         eligible = [
-            i for i, lt in enumerate(layer_types)
-            if lt in ("full_attention", "attention")
-            and start_layer <= i <= end_layer
+            i
+            for i, lt in enumerate(layer_types)
+            if lt in ("full_attention", "attention") and start_layer <= i <= end_layer
         ]
         if len(eligible) == 0:
             raise ValueError(
@@ -128,9 +128,10 @@ def _resolve_draft_config(target_config):
         ):
             if not hasattr(target_config, attr_name):
                 continue
-            if not hasattr(draft_config, attr_name) or getattr(
-                draft_config, attr_name
-            ) is None:
+            if (
+                not hasattr(draft_config, attr_name)
+                or getattr(draft_config, attr_name) is None
+            ):
                 setattr(draft_config, attr_name, getattr(target_config, attr_name))
         return draft_config
     return copy.deepcopy(target_config)
@@ -156,9 +157,11 @@ def _ensure_layer_types(draft_config) -> None:
     if max_window_layers is None:
         max_window_layers = num_hidden_layers
     draft_config.layer_types = [
-        "sliding_attention"
-        if sliding_window is not None and layer_idx >= max_window_layers
-        else "full_attention"
+        (
+            "sliding_attention"
+            if sliding_window is not None and layer_idx >= max_window_layers
+            else "full_attention"
+        )
         for layer_idx in range(num_hidden_layers)
     ]
 
@@ -259,7 +262,9 @@ def parse_args():
 
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
-    training_group.add_argument("--max-num-steps", type=int, default=None, help="Max steps (None = full epoch)")
+    training_group.add_argument(
+        "--max-num-steps", type=int, default=None, help="Max steps (None = full epoch)"
+    )
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
     training_group.add_argument("--max-length", type=int, default=3072)
@@ -301,10 +306,8 @@ def parse_args():
     return parser.parse_args()
 
 
-from specforge.utils import (
-    maybe_fetch_remote_config as _maybe_fetch_remote_config,
-    resolve_local_model_path as _resolve_local_model_path,
-)
+from specforge.utils import maybe_fetch_remote_config as _maybe_fetch_remote_config
+from specforge.utils import resolve_local_model_path as _resolve_local_model_path
 
 
 def build_models(
@@ -670,12 +673,13 @@ def main():
     if args.target_prefetch_depth < 0:
         raise ValueError("--target-prefetch-depth must be non-negative.")
     if args.target_prefetch_depth > 0 and args.target_model_backend != "remote":
-        raise ValueError("--target-prefetch-depth is only supported with --target-model-backend remote.")
+        raise ValueError(
+            "--target-prefetch-depth is only supported with --target-model-backend remote."
+        )
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
-
 
     # Fetch remote config early so _server_model_path is cached before any
     # _resolve_local_model_path() call.
@@ -790,9 +794,15 @@ def main():
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
-    resolved_embed_key, resolved_lm_head_key = _resolve_target_weight_keys(target_config)
-    embed_key = args.embedding_key if args.embedding_key is not None else resolved_embed_key
-    lm_head_key = args.lm_head_key if args.lm_head_key is not None else resolved_lm_head_key
+    resolved_embed_key, resolved_lm_head_key = _resolve_target_weight_keys(
+        target_config
+    )
+    embed_key = (
+        args.embedding_key if args.embedding_key is not None else resolved_embed_key
+    )
+    lm_head_key = (
+        args.lm_head_key if args.lm_head_key is not None else resolved_lm_head_key
+    )
     print_on_rank0(
         f"Loading target embeddings/head with keys: embed='{embed_key}', head='{lm_head_key}'"
     )
@@ -870,7 +880,9 @@ def main():
             boundary = min(boundary, args.max_num_steps)
         return boundary
 
-    def train_one_dflash_batch(epoch: int, progress_bar, data: dict, target_output=None) -> bool:
+    def train_one_dflash_batch(
+        epoch: int, progress_bar, data: dict, target_output=None
+    ) -> bool:
         nonlocal global_step, last_time
         global_step += 1
         if target_output is None:
@@ -959,14 +971,19 @@ def main():
                         not data_exhausted
                         and len(prefetch_queue) < args.target_prefetch_depth
                     ):
-                        assigned_step = global_step + pending_current + len(prefetch_queue) + 1
+                        assigned_step = (
+                            global_step + pending_current + len(prefetch_queue) + 1
+                        )
                         if assigned_step > boundary:
                             return
                         batch = next_data()
                         if batch is None:
                             return
                         prefetch_queue.append(
-                            (batch, submit_dflash_target_async(target_model, batch, is_vlm))
+                            (
+                                batch,
+                                submit_dflash_target_async(target_model, batch, is_vlm),
+                            )
                         )
 
                 fill_prefetch_queue(pending_current=0)

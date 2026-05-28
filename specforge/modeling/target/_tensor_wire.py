@@ -45,13 +45,13 @@ _DTYPE_TABLE: Dict[int, torch.dtype] = {
 _DTYPE_TO_CODE = {dt: c for c, dt in _DTYPE_TABLE.items()}
 
 # struct formats (little-endian)
-_HEADER_FMT = struct.Struct("<I")         # magic
-_ENTRY_KEYLEN_FMT = struct.Struct("<I")   # key_len
-_FLAG_FMT = struct.Struct("<B")           # flags
-_DTYPE_FMT = struct.Struct("<B")          # dtype_code
-_NDIM_FMT = struct.Struct("<B")           # ndim
-_SHAPE_FMT = struct.Struct("<q")          # single int64
-_NBYTES_FMT = struct.Struct("<Q")         # uint64
+_HEADER_FMT = struct.Struct("<I")  # magic
+_ENTRY_KEYLEN_FMT = struct.Struct("<I")  # key_len
+_FLAG_FMT = struct.Struct("<B")  # flags
+_DTYPE_FMT = struct.Struct("<B")  # dtype_code
+_NDIM_FMT = struct.Struct("<B")  # ndim
+_SHAPE_FMT = struct.Struct("<q")  # single int64
+_NBYTES_FMT = struct.Struct("<Q")  # uint64
 
 _FLAG_NONE = 0x01
 
@@ -81,7 +81,13 @@ def encode(tensor_dict: Dict[str, Optional[torch.Tensor]]) -> bytearray:
             if code is None:
                 raise TypeError(f"Unsupported dtype for wire encoding: {dt}")
             nbytes = tensor.numel() * tensor.element_size()
-            entry_size += _DTYPE_FMT.size + _NDIM_FMT.size + tensor.ndim * _SHAPE_FMT.size + _NBYTES_FMT.size + nbytes
+            entry_size += (
+                _DTYPE_FMT.size
+                + _NDIM_FMT.size
+                + tensor.ndim * _SHAPE_FMT.size
+                + _NBYTES_FMT.size
+                + nbytes
+            )
             entries.append((key_bytes, tensor, nbytes))
         total_size += entry_size
 
@@ -94,7 +100,7 @@ def encode(tensor_dict: Dict[str, Optional[torch.Tensor]]) -> bytearray:
     for key_bytes, tensor, nbytes in entries:
         _ENTRY_KEYLEN_FMT.pack_into(buf, pos, len(key_bytes))
         pos += _ENTRY_KEYLEN_FMT.size
-        buf[pos:pos + len(key_bytes)] = key_bytes
+        buf[pos : pos + len(key_bytes)] = key_bytes
         pos += len(key_bytes)
 
         if tensor is None:

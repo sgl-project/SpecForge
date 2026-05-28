@@ -5,10 +5,7 @@ from .eagle3_target_model import (
     SGLangEagle3TargetModel,
     get_eagle3_target_model,
 )
-from .remote_target_client import (
-    RemoteDFlashTargetModel,
-    RemoteEagle3TargetModel,
-)
+from .remote_target_client import RemoteDFlashTargetModel, RemoteEagle3TargetModel
 from .target_head import TargetHead
 
 __all__ = [

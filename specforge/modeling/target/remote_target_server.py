@@ -27,7 +27,7 @@ import logging
 import os
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 import torch
@@ -35,9 +35,8 @@ import torch.distributed as dist
 
 from . import _tensor_wire as _wire
 from ._nccl_transport import NCCLTransport, encode_nccl_metadata
-
-from .eagle3_target_model import SGLangEagle3TargetModel
 from .dflash_target_model import SGLangDFlashTargetModel
+from .eagle3_target_model import SGLangEagle3TargetModel
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +113,7 @@ class TargetModelServer:
                 trust_remote_code=self.trust_remote_code,
                 **kwargs,
             )
-            logger.info(
-                "Loaded SGLangEagle3TargetModel for %s", self.model_path
-            )
+            logger.info("Loaded SGLangEagle3TargetModel for %s", self.model_path)
         elif self.mode == "dflash":
             kwargs["enforce_disable_flashinfer_allreduce_fusion"] = True
             self._model = SGLangDFlashTargetModel.from_pretrained(
@@ -125,9 +122,7 @@ class TargetModelServer:
                 trust_remote_code=self.trust_remote_code,
                 **kwargs,
             )
-            logger.info(
-                "Loaded SGLangDFlashTargetModel for %s", self.model_path
-            )
+            logger.info("Loaded SGLangDFlashTargetModel for %s", self.model_path)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -148,7 +143,11 @@ class TargetModelServer:
     @property
     def _keep_on_gpu(self) -> bool:
         """Whether tensors should stay on GPU (NCCL path) or move to CPU."""
-        return getattr(_request_local, 'use_nccl', False) and self._nccl_transport is not None and self._nccl_transport.is_initialized
+        return (
+            getattr(_request_local, "use_nccl", False)
+            and self._nccl_transport is not None
+            and self._nccl_transport.is_initialized
+        )
 
     def _serialize_response(self, data: dict) -> bytes:
         """Serialise handler response dict to bytes.
@@ -165,13 +164,29 @@ class TargetModelServer:
             # Ensure all tensors are contiguous
             for k in list(data.keys()):
                 t = data[k]
-                if t is not None and hasattr(t, 'is_cuda') and t.is_cuda and not t.is_contiguous():
+                if (
+                    t is not None
+                    and hasattr(t, "is_cuda")
+                    and t.is_cuda
+                    and not t.is_contiguous()
+                ):
                     data[k] = t.contiguous()
-            keys_order = [k for k in data.keys() if data[k] is not None and hasattr(data[k], 'is_cuda') and data[k].is_cuda]
+            keys_order = [
+                k
+                for k in data.keys()
+                if data[k] is not None
+                and hasattr(data[k], "is_cuda")
+                and data[k].is_cuda
+            ]
             # Collect CPU scalar tensors to include in metadata JSON
             cpu_scalars = {}
             for k, v in data.items():
-                if v is not None and isinstance(v, torch.Tensor) and not v.is_cuda and v.numel() <= 8:
+                if (
+                    v is not None
+                    and isinstance(v, torch.Tensor)
+                    and not v.is_cuda
+                    and v.numel() <= 8
+                ):
                     cpu_scalars[k] = v.tolist()
             # Stash data for deferred send
             self._pending_nccl_send = (data, keys_order)
@@ -188,14 +203,18 @@ class TargetModelServer:
             try:
                 self._nccl_transport.send_tensors(data, keys_order)
             except Exception:
-                logger.exception("NCCL send failed — disabling NCCL for subsequent requests")
+                logger.exception(
+                    "NCCL send failed — disabling NCCL for subsequent requests"
+                )
                 transport = self._nccl_transport
                 self._nccl_transport = None
                 if transport is not None:
                     try:
                         transport.destroy()
                     except Exception:
-                        logger.exception("Failed to destroy NCCL transport after send failure")
+                        logger.exception(
+                            "Failed to destroy NCCL transport after send failure"
+                        )
                 raise
 
     # ------------------------------------------------------------------
@@ -204,7 +223,9 @@ class TargetModelServer:
 
     # -- Forward helpers (NCCL-safe, return raw dicts) --
 
-    def _run_generate_eagle3_data(self, raw_body: bytes, rank_only_forward: bool = False) -> dict:
+    def _run_generate_eagle3_data(
+        self, raw_body: bytes, rank_only_forward: bool = False
+    ) -> dict:
         """Execute the full Eagle3 forward pass.
 
         If NCCL mode is enabled, tensors stay on GPU (sent via NCCL).
@@ -261,10 +282,17 @@ class TargetModelServer:
         target_tensor = result.target
         # Determine if tensors stay on GPU (NCCL path) or go to CPU
         keep_gpu = self._keep_on_gpu
-        _maybe_cpu = (lambda t: t) if keep_gpu else (lambda t: t.cpu() if t is not None else None)
+        _maybe_cpu = (
+            (lambda t: t)
+            if keep_gpu
+            else (lambda t: t.cpu() if t is not None else None)
+        )
 
         if target_tensor is not None and self._vocab_t2d is not None:
-            if self._vocab_t2d_cuda is None or self._vocab_t2d_cuda.device != target_tensor.device:
+            if (
+                self._vocab_t2d_cuda is None
+                or self._vocab_t2d_cuda.device != target_tensor.device
+            ):
                 self._vocab_t2d_cuda = self._vocab_t2d.to(target_tensor.device)
             t2d = self._vocab_t2d_cuda
             _lm = loss_mask.unsqueeze(-1) if loss_mask.dim() == 2 else loss_mask
@@ -285,14 +313,20 @@ class TargetModelServer:
             seq_dim = target_p.shape[-1]  # draft vocab size
             if self._topk > 0 and self._topk < seq_dim:
                 topk_vals, topk_indices = target_p.topk(self._topk, dim=-1)
-                topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                target_out_vals = topk_vals.bfloat16() if self._use_bf16_target else topk_vals
+                topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(
+                    1e-8
+                )
+                target_out_vals = (
+                    topk_vals.bfloat16() if self._use_bf16_target else topk_vals
+                )
                 # int16 is safe when draft_vocab_size <= 32768; use int32 otherwise
                 idx_dtype = torch.int16 if seq_dim <= 32768 else torch.int32
                 target_out_indices = topk_indices.to(idx_dtype)
                 target_key = None
             else:
-                target_out_vals = target_p.bfloat16() if self._use_bf16_target else target_p
+                target_out_vals = (
+                    target_p.bfloat16() if self._use_bf16_target else target_p
+                )
                 target_out_indices = None
                 target_key = target_out_vals
 
@@ -326,7 +360,9 @@ class TargetModelServer:
     def handle_generate_eagle3_data(self, raw_body: bytes) -> bytes:
         return self._serialize_response(self._run_generate_eagle3_data(raw_body))
 
-    def _run_generate_dflash_data(self, raw_body: bytes, rank_only_forward: bool = False) -> dict:
+    def _run_generate_dflash_data(
+        self, raw_body: bytes, rank_only_forward: bool = False
+    ) -> dict:
         """Execute the full DFlash forward pass.
 
         Parameters
@@ -352,7 +388,11 @@ class TargetModelServer:
             return {}
 
         keep_gpu = self._keep_on_gpu
-        _maybe_cpu = (lambda t: t) if keep_gpu else (lambda t: t.cpu() if t is not None else None)
+        _maybe_cpu = (
+            (lambda t: t)
+            if keep_gpu
+            else (lambda t: t.cpu() if t is not None else None)
+        )
         out = {
             "hidden_states": _maybe_cpu(result.hidden_states),
             "input_ids": _maybe_cpu(result.input_ids),
@@ -426,7 +466,9 @@ class TargetModelServer:
 
         # Resolve NCCL port
         if nccl_port is None:
-            return json.dumps({"status": "error", "message": "No NCCL port specified"}).encode()
+            return json.dumps(
+                {"status": "error", "message": "No NCCL port specified"}
+            ).encode()
 
         # Create and initialize NCCL transport (server = rank 0).  When the
         # HTTP server binds to a wildcard address, make TCPStore listen on all
@@ -443,7 +485,9 @@ class TargetModelServer:
             return json.dumps({"status": "ok"}).encode()
         else:
             self._nccl_transport = None
-            return json.dumps({"status": "error", "message": "NCCL init failed"}).encode()
+            return json.dumps(
+                {"status": "error", "message": "NCCL init failed"}
+            ).encode()
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +571,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             if path in ("/generate_eagle3_data", "/generate_dflash_data"):
                 acquired = _forward_semaphore.acquire(blocking=False)
                 if not acquired:
-                    self._send_error("Server busy – too many concurrent forward passes", 503)
+                    self._send_error(
+                        "Server busy – too many concurrent forward passes", 503
+                    )
                     return
                 try:
                     result = _route_request_synced(self.server_app, path, body)
@@ -557,12 +603,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
 def make_handler(app: TargetModelServer):
     """Create a handler class bound to a specific TargetModelServer."""
+
     class Handler(_RequestHandler):
         server_app = app
+
     return Handler
 
 
-def create_http_server(server_app: TargetModelServer, host: str, port: int) -> HTTPServer:
+def create_http_server(
+    server_app: TargetModelServer, host: str, port: int
+) -> HTTPServer:
     """Create and return a threading HTTP server instance."""
     handler = make_handler(server_app)
     httpd = _ThreadingHTTPServer((host, port), handler)
@@ -663,25 +713,39 @@ def _route_request_synced(app, path, body):
     if synced_path == "/generate_eagle3_data":
         out = None
         try:
-            out = app._run_generate_eagle3_data(body_bytes, rank_only_forward=(rank != 0))
+            out = app._run_generate_eagle3_data(
+                body_bytes, rank_only_forward=(rank != 0)
+            )
         except Exception:
             logger.exception("Error handling %s (rank %d)", synced_path, rank)
         if rank == 0:
             if out is not None:
                 return app._serialize_response(out)
-            return json.dumps({"error": "Internal server error during forward pass"}).encode(), 500
+            return (
+                json.dumps(
+                    {"error": "Internal server error during forward pass"}
+                ).encode(),
+                500,
+            )
         return None
 
     if synced_path == "/generate_dflash_data":
         out = None
         try:
-            out = app._run_generate_dflash_data(body_bytes, rank_only_forward=(rank != 0))
+            out = app._run_generate_dflash_data(
+                body_bytes, rank_only_forward=(rank != 0)
+            )
         except Exception:
             logger.exception("Error handling %s (rank %d)", synced_path, rank)
         if rank == 0:
             if out is not None:
                 return app._serialize_response(out)
-            return json.dumps({"error": "Internal server error during forward pass"}).encode(), 500
+            return (
+                json.dumps(
+                    {"error": "Internal server error during forward pass"}
+                ).encode(),
+                500,
+            )
         return None
 
     # Lightweight endpoints: broadcast + execute on all ranks
@@ -730,7 +794,9 @@ def _worker_loop(server_app):
             else torch.empty(0, dtype=torch.uint8, device="cuda")
         )
         dist.broadcast(body_tensor, src=0)
-        body_bytes = body_tensor.cpu().numpy().tobytes() if body_tensor.numel() > 0 else b""
+        body_bytes = (
+            body_tensor.cpu().numpy().tobytes() if body_tensor.numel() > 0 else b""
+        )
 
         # Heavy endpoints: worker only participates in model forward (TP allreduce),
         # skips post-processing (target_p, .cpu() transfers) since result is discarded.
