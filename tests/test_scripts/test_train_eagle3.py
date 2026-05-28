@@ -143,7 +143,7 @@ class TestTrainEagle3(unittest.TestCase):
         # run training
         print_gpu_memory_usage("test_online_train_eagle3_with_hf_backend")
         train_process = execute_shell_command(
-            "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
+            "bash examples/run_llama3.1_8b_eagle3_online.sh 1"
         )
         train_process.wait()
         self.assertEqual(train_process.returncode, 0)
@@ -159,7 +159,7 @@ class TestTrainEagle3(unittest.TestCase):
 
         # run training
         train_process = execute_shell_command(
-            "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
+            "bash examples/run_llama3.1_8b_eagle3_online.sh 1"
         )
         train_process.wait()
         self.assertEqual(train_process.returncode, 0)
