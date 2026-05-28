@@ -18,6 +18,9 @@ OFFLINE_SCRIPT_PATH = Path(__file__).parent.parent.parent.joinpath(
 )
 ONLINE_SCRIPT_TEMPLATE = ONLINE_SCRIPT_PATH.read_text()
 OFFLINE_SCRIPT_TEMPLATE = OFFLINE_SCRIPT_PATH.read_text()
+GPU_CLEANUP_SCRIPT = Path(__file__).parent.parent.parent.joinpath(
+    ".github", "workflows", "scripts", "delete_gpu_process.sh"
+)
 
 
 def replace_in_script(script_path: Path, pattern: str, replacement: str):
@@ -62,12 +65,16 @@ def prepare_random_target_model():
 
 
 def build_online_script() -> str:
-    return ONLINE_SCRIPT_TEMPLATE.replace(
-        "meta-llama/Llama-3.1-8B-Instruct",
-        str(RANDOM_TARGET_MODEL_DIR),
-    ).replace(
-        "$ROOT_DIR/scripts/train_eagle3.py",
-        "$ROOT_DIR/scripts/train_eagle3.py --max-num-steps 10",
+    return (
+        ONLINE_SCRIPT_TEMPLATE.replace(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            str(RANDOM_TARGET_MODEL_DIR),
+        )
+        .replace("--max-length 4096", "--max-length 512")
+        .replace(
+            "$ROOT_DIR/scripts/train_eagle3.py",
+            "$ROOT_DIR/scripts/train_eagle3.py --max-num-steps 10",
+        )
     )
 
 
@@ -77,10 +84,11 @@ def build_offline_script() -> str:
             "meta-llama/Llama-3.1-8B-Instruct",
             str(RANDOM_TARGET_MODEL_DIR),
         )
+        .replace("--max-length 4096", "--max-length 512")
         .replace("--batch-size 32", "--batch-size 1")
         .replace(
             "scripts/prepare_hidden_states.py",
-            "scripts/prepare_hidden_states.py --num-samples 10 --sglang-mem-fraction-static 0.4",
+            "scripts/prepare_hidden_states.py --num-samples 10",
         )
         .replace(
             "$ROOT_DIR/scripts/train_eagle3.py",
@@ -93,6 +101,10 @@ def print_gpu_memory_usage(label: str):
     print(f"\n===== GPU memory usage before {label} =====", flush=True)
     subprocess.run(["nvidia-smi"], check=False)
     print("===== End GPU memory usage =====\n", flush=True)
+
+
+def cleanup_gpu_processes():
+    subprocess.run(["bash", str(GPU_CLEANUP_SCRIPT)], check=False)
 
 
 class TestTrainEagle3(unittest.TestCase):
@@ -126,6 +138,7 @@ class TestTrainEagle3(unittest.TestCase):
                 os.environ.pop("SPECFORGE_CI_MEMORY_DEBUG", None)
             else:
                 os.environ["SPECFORGE_CI_MEMORY_DEBUG"] = old_memory_debug
+            cleanup_gpu_processes()
         self.assertEqual(train_process.returncode, 0)
 
     def test_online_train_eagle3_with_hf_backend(self):
@@ -140,6 +153,7 @@ class TestTrainEagle3(unittest.TestCase):
             "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
         )
         train_process.wait()
+        cleanup_gpu_processes()
         self.assertEqual(train_process.returncode, 0)
 
     def test_online_train_eagle3_with_custom_backend(self):
@@ -156,6 +170,7 @@ class TestTrainEagle3(unittest.TestCase):
             "bash examples/run_llama3.1_8b_eagle3_online.sh 2"
         )
         train_process.wait()
+        cleanup_gpu_processes()
         self.assertEqual(train_process.returncode, 0)
 
     def test_offline_train_eagle3(self):
@@ -174,6 +189,7 @@ class TestTrainEagle3(unittest.TestCase):
             "bash examples/run_llama3.1_8b_eagle3_offline.sh 2",
         )
         training_process.wait()
+        cleanup_gpu_processes()
         self.assertEqual(training_process.returncode, 0)
 
 
