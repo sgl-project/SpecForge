@@ -175,6 +175,7 @@ class TestTrainEagle3(unittest.TestCase):
             # delete the directory
             shutil.rmtree(hidden_states_path)
 
+        print_gpu_memory_usage("test_offline_train_eagle3")
         training_process = execute_shell_command(
             "bash examples/run_llama3.1_8b_eagle3_offline.sh 2",
         )
