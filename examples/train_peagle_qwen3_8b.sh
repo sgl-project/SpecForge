@@ -8,7 +8,6 @@ ROOT_DIR=$(dirname "$SCRIPT_DIR")
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 export TORCHINDUCTOR_CACHE_DIR="$ROOT_DIR/cache/compiled_kernels"
 export FLASHINFER_WORKSPACE_BASE="$ROOT_DIR/cache/flashinfer"
-export SPECFORGE_DATA_NUM_PROC=32
 
 # Model
 TARGET_MODEL="${TARGET_MODEL:-/home/share/model_weight/qwen/qwen3-8b}"
@@ -26,6 +25,7 @@ LEARNING_RATE=1e-4
 MAX_LENGTH=8192
 WARMUP_RATIO=0.0025
 MAX_GRAD_NORM=1
+BUILD_DATASET_NUM_PROC=32
 
 # Data
 TRAIN_DATA_PATH="$ROOT_DIR/cache/dataset/sharegpt_train.jsonl"
@@ -41,7 +41,7 @@ fi
 
 "$TORCHRUN" \
     --standalone \
-    --nproc_per_node=2 \
+    --nproc_per_node=8 \
     "$ROOT_DIR/scripts/train_peagle.py" \
     --target-model-path "$TARGET_MODEL" \
     --draft-model-config "$DRAFT_CONFIG" \
@@ -54,6 +54,7 @@ fi
     --max-length "$MAX_LENGTH" \
     --warmup-ratio "$WARMUP_RATIO" \
     --max-grad-norm "$MAX_GRAD_NORM" \
+    --build-dataset-num-proc "$BUILD_DATASET_NUM_PROC" \
     --num-depths "$NUM_DEPTHS" \
     --down-sample-ratio "$DOWN_SAMPLE_RATIO" \
     --down-sample-ratio-min "$DOWN_SAMPLE_RATIO_MIN" \
