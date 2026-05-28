@@ -352,10 +352,7 @@ def load_conversation_dataset(data_path: str):
         try:
             return _select_train_split(load_from_disk(data_path))
         except (FileNotFoundError, ValueError, OSError):
-            try:
-                return _select_train_split(load_dataset(data_path, split="train"))
-            except (FileNotFoundError, ValueError, OSError):
-                return _load_dataset_from_data_dir(data_path)
+            return _load_dataset_from_data_dir(data_path)
 
     return _select_train_split(load_dataset(data_path, split="train"))
 
