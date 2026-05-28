@@ -4,6 +4,7 @@ Based on train_eagle3.py but replaces TTT with COD parallel sampling.
 """
 
 import argparse
+import glob
 import hashlib
 import json
 import math
@@ -23,7 +24,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from datasets import Dataset
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from specforge import AutoDraftModelConfig, get_eagle3_target_model
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.peagle import OnlinePEagleModel
@@ -305,6 +306,60 @@ def build_draft_model(args: Namespace) -> Tuple:
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
+def _select_train_split(dataset):
+    if isinstance(dataset, DatasetDict):
+        if "train" not in dataset:
+            raise ValueError(
+                f"Expected a 'train' split, but found splits: {list(dataset.keys())}"
+            )
+        return dataset["train"]
+    return dataset
+
+
+def _load_dataset_from_data_dir(data_path: str):
+    supported_exts = (".parquet", ".jsonl", ".json", ".csv")
+    for ext in supported_exts:
+        data_files = sorted(
+            glob.glob(os.path.join(data_path, "**", f"*{ext}"), recursive=True)
+        )
+        if not data_files:
+            continue
+        dataset_type = "json" if ext in (".json", ".jsonl") else ext.removeprefix(".")
+        return _select_train_split(
+            load_dataset(dataset_type, data_files=data_files, split="train")
+        )
+    raise FileNotFoundError(
+        f"No supported dataset files found in {data_path}. "
+        f"Supported extensions: {', '.join(supported_exts)}"
+    )
+
+
+def load_conversation_dataset(data_path: str):
+    """Load a local JSON/JSONL file, local dataset directory, or HF dataset id."""
+    if os.path.isfile(data_path):
+        ext = os.path.splitext(data_path)[1].lower()
+        if ext in (".json", ".jsonl"):
+            return Dataset.from_generator(
+                generator=safe_conversations_generator,
+                gen_kwargs={"file_path": data_path},
+            )
+        dataset_type = ext.removeprefix(".")
+        return _select_train_split(
+            load_dataset(dataset_type, data_files=data_path, split="train")
+        )
+
+    if os.path.isdir(data_path):
+        try:
+            return _select_train_split(load_from_disk(data_path))
+        except (FileNotFoundError, ValueError, OSError):
+            try:
+                return _select_train_split(load_dataset(data_path, split="train"))
+            except (FileNotFoundError, ValueError, OSError):
+                return _load_dataset_from_data_dir(data_path)
+
+    return _select_train_split(load_dataset(data_path, split="train"))
+
+
 def build_dataloaders(
     args: Namespace,
     draft_model_config,
@@ -320,10 +375,7 @@ def build_dataloaders(
         f"{args.target_model_path}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.train_data_path},
-    )
+    train_dataset = load_conversation_dataset(args.train_data_path)
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -360,10 +412,7 @@ def build_dataloaders(
 
     eval_dataloader = None
     if args.eval_data_path is not None:
-        eval_dataset = Dataset.from_generator(
-            generator=safe_conversations_generator,
-            gen_kwargs={"file_path": args.eval_data_path},
-        )
+        eval_dataset = load_conversation_dataset(args.eval_data_path)
         eval_eagle3_dataset = build_eagle3_dataset(
             eval_dataset,
             tokenizer,
