@@ -47,15 +47,21 @@ class PEagleAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+        query_states = (
+            self.q_proj(hidden_states)
+            .view(bsz, q_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        key_states = (
+            self.k_proj(hidden_states)
+            .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        value_states = (
+            self.v_proj(hidden_states)
+            .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         # position_embeddings: (cos, sin), each [batch, seq_len, head_dim], pre-indexed
         cos, sin = position_embeddings
@@ -196,6 +202,7 @@ class PEagleDraftModel(Eagle3DraftModel):
         else:
             fc_input_size = config.hidden_size * 3
         self.fc = nn.Linear(fc_input_size, config.hidden_size, bias=False)
+        self.mask_hidden = nn.Parameter(torch.randn(1, 1, fc_input_size))
 
         num_layers = config.num_hidden_layers
         layers: List[nn.Module] = [
@@ -206,7 +213,9 @@ class PEagleDraftModel(Eagle3DraftModel):
         self.layers = nn.ModuleList(layers)
 
         self.rotary_emb = LlamaRotaryEmbedding(
-            dim=getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+            dim=getattr(
+                config, "head_dim", config.hidden_size // config.num_attention_heads
+            ),
             max_position_embeddings=config.max_position_embeddings,
             base=getattr(config, "rope_theta", 10000),
         )

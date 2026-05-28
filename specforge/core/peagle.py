@@ -137,9 +137,15 @@ def compute_peagle_metrics(
     if loss_mask.dim() == 3:
         loss_mask = loss_mask.squeeze(-1)
 
-    # Map targets to draft vocabulary and compute softmax
+    sampled_loss_mask = loss_mask[:, orig_positions].float()  # [batch, total_sampled]
+
+    # Map targets to draft vocabulary and skip positions whose target top-1
+    # token is outside the draft vocabulary.
     target_logits = targets[:, orig_positions, :]
     if t2d is not None and t2d.dtype == torch.bool:
+        target_top1 = targets.argmax(dim=-1)[:, orig_positions]
+        target_in_draft_vocab = t2d[target_top1].to(sampled_loss_mask.dtype)
+        sampled_loss_mask = sampled_loss_mask * target_in_draft_vocab
         target_logits = target_logits[:, :, t2d]
 
     # Compute KL div loss matching speculators: kl_div_loss + loss_function
@@ -147,9 +153,10 @@ def compute_peagle_metrics(
     target_p = torch.nn.functional.softmax(target_logits.float(), dim=-1)
     elementwise_loss = torch.nn.functional.kl_div(
         log_probs, target_p, reduction="none", log_target=False
-    ).sum(dim=-1)  # [batch, total_sampled]
+    ).sum(
+        dim=-1
+    )  # [batch, total_sampled]
 
-    sampled_loss_mask = loss_mask[:, orig_positions].float()  # [batch, total_sampled]
     masked_loss = elementwise_loss * sampled_loss_mask
     denominator = sampled_loss_mask.sum(dim=1).clamp_min(1e-5)  # [batch]
     loss = (masked_loss.sum(dim=1) / denominator).mean()
@@ -201,18 +208,6 @@ class OnlinePEagleModel(nn.Module):
         self.num_depths = num_depths
         self.down_sample_ratio = down_sample_ratio
         self.down_sample_ratio_min = down_sample_ratio_min
-
-        fc_input_size = draft_model.fc.in_features
-        ref_param = next(draft_model.parameters())
-        self.mask_hidden = nn.Parameter(
-            torch.randn(
-                1,
-                1,
-                fc_input_size,
-                device=ref_param.device,
-                dtype=ref_param.dtype,
-            )
-        )
 
     def forward(
         self,
@@ -268,7 +263,9 @@ class OnlinePEagleModel(nn.Module):
         )
 
         # Step 3: Build sampled hidden states
-        mask_hidden = self.mask_hidden.to(device=device, dtype=hidden_states.dtype)
+        mask_hidden = self.draft_model.mask_hidden.to(
+            device=device, dtype=hidden_states.dtype
+        )
         sampled_hidden = torch.where(
             is_depth_0.unsqueeze(-1),
             hidden_states[0, orig_positions],

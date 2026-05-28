@@ -5,11 +5,12 @@ Based on train_eagle3.py but replaces TTT with COD parallel sampling.
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -209,6 +210,7 @@ def build_target_model(
 def build_draft_model(args: Namespace) -> Tuple:
     ckpt_info = (0, 0)
     resume_state = None
+    should_load_target_embedding = True
 
     if args.draft_model_config is not None:
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
@@ -233,6 +235,7 @@ def build_draft_model(args: Namespace) -> Tuple:
             )
             draft_model_config.num_hidden_layers = args.num_draft_layers
             draft_model_last_checkpoint = args.ckpt_dir
+            should_load_target_embedding = False
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
         else:
             raise ValueError(
@@ -243,19 +246,37 @@ def build_draft_model(args: Namespace) -> Tuple:
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
         is_resume_checkpoint = True
+        should_load_target_embedding = False
 
-    norm_before_residual = args.norm_before_residual and not args.no_norm_before_residual
+    norm_before_residual = (
+        args.norm_before_residual and not args.no_norm_before_residual
+    )
 
     if draft_model_last_checkpoint:
         draft_model = PEagleDraftModel(
             config=draft_model_config,
             norm_before_residual=norm_before_residual,
         ).to(dtype=torch.bfloat16, device="cuda")
-        safetensors_path = os.path.join(draft_model_last_checkpoint, "model.safetensors")
+        safetensors_path = os.path.join(
+            draft_model_last_checkpoint, "model.safetensors"
+        )
         if os.path.exists(safetensors_path):
             from safetensors.torch import load_file
+
             state_dict = load_file(safetensors_path, device="cuda")
             draft_model.load_state_dict(state_dict, strict=False)
+            if "embed_tokens.weight" not in state_dict:
+                should_load_target_embedding = True
+                print_on_rank0(
+                    "Checkpoint does not contain trainable P-EAGLE embeddings; "
+                    "loading embeddings from the target model."
+                )
+        else:
+            should_load_target_embedding = True
+            print_on_rank0(
+                f"No model.safetensors found in {draft_model_last_checkpoint}; "
+                "loading embeddings from the target model."
+            )
     else:
         draft_model = PEagleDraftModel(
             config=draft_model_config,
@@ -275,10 +296,12 @@ def build_draft_model(args: Namespace) -> Tuple:
                 f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
             )
 
-    draft_model.load_embedding(
-        args.target_model_path, embedding_key=args.embedding_key
-    )
-    draft_model.freeze_embedding()
+    if should_load_target_embedding:
+        draft_model.load_embedding(
+            args.target_model_path, embedding_key=args.embedding_key
+        )
+    else:
+        print_on_rank0("Using embeddings from the P-EAGLE checkpoint.")
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
@@ -388,12 +411,8 @@ def save_checkpoints(
         draft_model_state_dict = {
             k.replace("draft_model.", ""): v
             for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
+            if "draft_model." in k
         }
-        # Also save mask_hidden from the wrapper
-        for k, v in model_state_dict.items():
-            if "mask_hidden" in k and "draft_model." not in k:
-                draft_model_state_dict["mask_hidden"] = v
 
         if dist.get_rank() == 0:
             torch.save(
@@ -404,9 +423,6 @@ def save_checkpoints(
                 epoch_output_dir,
                 state_dict=draft_model_state_dict,
             )
-            # Save P-EAGLE specific config
-            import json
-
             peagle_config = {
                 "num_depths": args.num_depths,
                 "down_sample_ratio": args.down_sample_ratio,
@@ -415,9 +431,7 @@ def save_checkpoints(
                 "num_draft_layers": args.num_draft_layers,
                 "norm_before_residual": args.norm_before_residual,
             }
-            with open(
-                os.path.join(epoch_output_dir, "peagle_config.json"), "w"
-            ) as f:
+            with open(os.path.join(epoch_output_dir, "peagle_config.json"), "w") as f:
                 json.dump(peagle_config, f, indent=2)
 
             print_on_rank0(f"Saved model to {epoch_output_dir}")
@@ -494,11 +508,65 @@ def record_metrics(
             dist.all_reduce(d_total, op=dist.ReduceOp.SUM)
             d_acc = (d_sum / d_total.clamp_min(1)).item()
             logdict[f"{mode}/acc_depth_{d}"] = d_acc
-            print_on_rank0(
-                f"{mode} - Step {global_step}, Depth {d} Acc: {d_acc:.4f}"
-            )
+            print_on_rank0(f"{mode} - Step {global_step}, Depth {d} Acc: {d_acc:.4f}")
 
     tracker.log(logdict, step=global_step)
+
+
+def _print_on_rank0_or_local(message: str) -> None:
+    if dist.is_available() and dist.is_initialized():
+        print_on_rank0(message)
+    else:
+        print_with_rank(message)
+
+
+def _validate_mask_token_id(mask_token_id: int, embedding_vocab_size: int) -> int:
+    if not 0 <= mask_token_id < embedding_vocab_size:
+        raise ValueError(
+            f"mask_token_id {mask_token_id} is outside embedding vocab "
+            f"size {embedding_vocab_size}."
+        )
+    return mask_token_id
+
+
+def resolve_mask_token_id(args: Namespace, embedding_vocab_size: int) -> int:
+    if args.mask_token_id is not None:
+        return _validate_mask_token_id(args.mask_token_id, embedding_vocab_size)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
+    if getattr(tokenizer, "mask_token_id", None) is not None:
+        mask_token_id = _validate_mask_token_id(
+            tokenizer.mask_token_id, embedding_vocab_size
+        )
+        _print_on_rank0_or_local(
+            f"Auto-set mask_token_id to tokenizer mask token {mask_token_id}"
+        )
+        return mask_token_id
+
+    if len(tokenizer) < embedding_vocab_size:
+        mask_token_id = len(tokenizer)
+        _print_on_rank0_or_local(
+            f"Auto-set mask_token_id to unused embedding slot {mask_token_id}"
+        )
+        return mask_token_id
+
+    for token_name in ("pad_token_id", "eos_token_id", "unk_token_id"):
+        token_id = getattr(tokenizer, token_name, None)
+        if token_id is not None:
+            mask_token_id = _validate_mask_token_id(token_id, embedding_vocab_size)
+            _print_on_rank0_or_local(
+                "Tokenizer has no mask token or unused draft embedding slot; "
+                f"falling back to {token_name}={mask_token_id}. "
+                "Pass --mask-token-id to use a dedicated trainable mask token."
+            )
+            return mask_token_id
+
+    raise ValueError(
+        "Could not resolve mask_token_id. Pass --mask-token-id or use a tokenizer "
+        "with mask/pad/eos/unk token."
+    )
 
 
 def main():
@@ -531,14 +599,10 @@ def main():
     print_with_rank("Loaded vocab mapping")
 
     # Resolve mask_token_id
-    if args.mask_token_id is None:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.target_model_path, trust_remote_code=args.trust_remote_code
-        )
-        args.mask_token_id = (
-            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        )
-        print_on_rank0(f"Auto-set mask_token_id to {args.mask_token_id}")
+    args.mask_token_id = resolve_mask_token_id(
+        args,
+        draft_model_config.vocab_size,
+    )
 
     # Calculate total steps
     if args.total_steps is None:
@@ -645,10 +709,7 @@ def main():
                         record_shapes=args.profile_record_shapes,
                     )
                     torch_profiler.start()
-                if (
-                    global_step
-                    == args.profile_start_step + args.profile_num_steps + 1
-                ):
+                if global_step == args.profile_start_step + args.profile_num_steps + 1:
                     output_path = os.path.join(
                         args.output_dir,
                         f"profile_rank{dist.get_rank()}_{time.time()}.trace.json.gz",
@@ -666,11 +727,7 @@ def main():
                 optimizer.step()
 
             # Logging
-            if (
-                global_step
-                % (args.log_interval * args.draft_accumulation_steps)
-                == 0
-            ):
+            if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
                 record_metrics(
                     args,
                     metrics,
@@ -697,8 +754,7 @@ def main():
             if (
                 args.eval_data_path is not None
                 and eval_dataloader is not None
-                and global_step
-                % (args.eval_interval * args.draft_accumulation_steps)
+                and global_step % (args.eval_interval * args.draft_accumulation_steps)
                 == 0
             ):
                 draft_model.eval()
@@ -730,9 +786,7 @@ def main():
 
             # Save Checkpoints
             if global_step % args.save_interval == 0:
-                save_checkpoints(
-                    args, epoch, global_step, peagle_model, optimizer
-                )
+                save_checkpoints(args, epoch, global_step, peagle_model, optimizer)
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
