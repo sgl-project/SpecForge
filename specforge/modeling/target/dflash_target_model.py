@@ -31,7 +31,9 @@ class DFlashTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
-    position_ids: Optional[torch.Tensor] = None  # [batch, seq_len] or [3, batch, seq_len]
+    position_ids: Optional[torch.Tensor] = (
+        None  # [batch, seq_len] or [3, batch, seq_len]
+    )
 
 
 class DFlashTargetModel(ABC):
@@ -95,7 +97,9 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             enable_return_hidden_states=True,  # Critical for DFlash
             disable_cuda_graph=True,
             disable_piecewise_cuda_graph=True,
-            enforce_disable_flashinfer_allreduce_fusion=kwargs.pop("enforce_disable_flashinfer_allreduce_fusion", True),
+            enforce_disable_flashinfer_allreduce_fusion=kwargs.pop(
+                "enforce_disable_flashinfer_allreduce_fusion", True
+            ),
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -203,7 +207,11 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         image_grid_thw: Optional[torch.Tensor] = None,
         video_grid_thw: Optional[torch.Tensor] = None,
     ) -> DFlashTargetOutput:
-        if pixel_values is not None or image_grid_thw is not None or video_grid_thw is not None:
+        if (
+            pixel_values is not None
+            or image_grid_thw is not None
+            or video_grid_thw is not None
+        ):
             raise NotImplementedError(
                 "SGLangDFlashTargetModel does not yet support multimodal inputs. "
                 "Use HF backend for real VLM DFlash training."
@@ -339,12 +347,16 @@ class HFDFlashTargetModel(DFlashTargetModel):
 
         filtered_target_kwargs = {}
         for key, value in target_kwargs.items():
-            if key in {
-                "input_ids",
-                "attention_mask",
-                "output_hidden_states",
-                "use_cache",
-            } or value is not None:
+            if (
+                key
+                in {
+                    "input_ids",
+                    "attention_mask",
+                    "output_hidden_states",
+                    "use_cache",
+                }
+                or value is not None
+            ):
                 filtered_target_kwargs[key] = value
 
         outputs = self.model(**filtered_target_kwargs)

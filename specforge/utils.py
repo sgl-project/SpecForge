@@ -143,7 +143,9 @@ def generate_draft_model_config(
 
         target_config = SimpleNamespace(**hf_config_dict)
     else:
-        target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir)
+        target_config = AutoConfig.from_pretrained(
+            target_model_path, cache_dir=cache_dir
+        )
 
     # If no template specified, use default llama3-8B-eagle3.json
     if template_config_path is None:
@@ -309,6 +311,7 @@ def maybe_fetch_remote_config(args):
     tp_rank = 0
     if dist.is_initialized():
         from specforge.distributed import get_tp_group
+
         tp_group = get_tp_group()
         if tp_group is not None and dist.get_world_size(tp_group) > 1:
             tp_rank = dist.get_rank(tp_group)
@@ -316,7 +319,9 @@ def maybe_fetch_remote_config(args):
             tp_group = None  # No need for broadcast if TP=1
 
     if tp_rank == 0:
-        from specforge.modeling.target.remote_target_client import fetch_remote_target_config
+        from specforge.modeling.target.remote_target_client import (
+            fetch_remote_target_config,
+        )
 
         info = fetch_remote_target_config(
             resolve_remote_url(args),
@@ -325,7 +330,9 @@ def maybe_fetch_remote_config(args):
         )
         hf_config_dict = info.get("hf_config_dict")
         if hf_config_dict is None:
-            raise ValueError("Remote server did not return hf_config_dict in /get_model_info")
+            raise ValueError(
+                "Remote server did not return hf_config_dict in /get_model_info"
+            )
         server_model_path = info.get("server_model_path")
     else:
         hf_config_dict = None
@@ -334,12 +341,15 @@ def maybe_fetch_remote_config(args):
     # Broadcast results to other TP ranks
     if tp_group is not None:
         import json as _json
+
         tp_src = dist.get_global_rank(tp_group, 0)
         if tp_rank == 0:
-            payload = _json.dumps({
-                "hf_config_dict": hf_config_dict,
-                "server_model_path": server_model_path,
-            }).encode("utf-8")
+            payload = _json.dumps(
+                {
+                    "hf_config_dict": hf_config_dict,
+                    "server_model_path": server_model_path,
+                }
+            ).encode("utf-8")
             payload_t = torch.frombuffer(bytearray(payload), dtype=torch.uint8).cuda()
             len_t = torch.tensor([len(payload)], dtype=torch.int64, device="cuda")
         else:

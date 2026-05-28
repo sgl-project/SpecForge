@@ -9,8 +9,6 @@ Test categories:
 import json
 import os
 import sys
-import threading
-import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -23,9 +21,9 @@ if _PROJECT_DIR not in sys.path:
     sys.path.insert(0, _PROJECT_DIR)
 
 from specforge.modeling.target._nccl_transport import (
-    NCCLTransport,
     _DTYPE_TABLE,
     _DTYPE_TO_CODE,
+    NCCLTransport,
     decode_nccl_metadata,
     encode_nccl_metadata,
 )
@@ -95,7 +93,13 @@ class TestNCCLMetadataEncodeDecode(unittest.TestCase):
         for code, dtype in _DTYPE_TABLE.items():
             if dtype == torch.bool:
                 t = torch.ones(2, dtype=dtype)
-            elif dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+            elif dtype in (
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            ):
                 t = torch.ones(2, dtype=dtype)
             else:
                 t = torch.ones(2, dtype=dtype)
@@ -171,7 +175,7 @@ class TestNCCLTransportInit(unittest.TestCase):
 
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.device_count() >= 2,
-    "Requires at least 2 CUDA GPUs (NCCL P2P needs separate devices)"
+    "Requires at least 2 CUDA GPUs (NCCL P2P needs separate devices)",
 )
 class TestNCCLTransportGPU(unittest.TestCase):
     """GPU tests for NCCL transport — requires 2+ CUDA GPUs.
@@ -214,15 +218,27 @@ class TestNCCLTransportGPU(unittest.TestCase):
 
         # Check exit codes
         if p_server.exitcode != 0:
-            server_err = server_queue.get_nowait() if not server_queue.empty() else "unknown"
-            self.fail(f"Server process exited with code {p_server.exitcode}: {server_err}")
+            server_err = (
+                server_queue.get_nowait() if not server_queue.empty() else "unknown"
+            )
+            self.fail(
+                f"Server process exited with code {p_server.exitcode}: {server_err}"
+            )
         if p_client.exitcode != 0:
-            client_err = client_queue.get_nowait() if not client_queue.empty() else "unknown"
-            self.fail(f"Client process exited with code {p_client.exitcode}: {client_err}")
+            client_err = (
+                client_queue.get_nowait() if not client_queue.empty() else "unknown"
+            )
+            self.fail(
+                f"Client process exited with code {p_client.exitcode}: {client_err}"
+            )
 
         # Get results
-        server_result = server_queue.get_nowait() if not server_queue.empty() else ("ok", None)
-        client_result = client_queue.get_nowait() if not client_queue.empty() else ("ok", None)
+        server_result = (
+            server_queue.get_nowait() if not server_queue.empty() else ("ok", None)
+        )
+        client_result = (
+            client_queue.get_nowait() if not client_queue.empty() else ("ok", None)
+        )
 
         return server_result, client_result
 
@@ -271,10 +287,12 @@ class TestNCCLTransportGPU(unittest.TestCase):
 
 # --- Top-level functions for multiprocessing (must be picklable) ---
 
+
 def _gpu_server_single(nccl_port, host, q):
     try:
         torch.cuda.set_device(0)  # Server on GPU 0
         from specforge.modeling.target._nccl_transport import NCCLTransport
+
         transport = NCCLTransport(nccl_port=nccl_port, host=host, is_server=True)
         ok = transport.initialize(timeout_seconds=60)
         if not ok:
@@ -287,24 +305,32 @@ def _gpu_server_single(nccl_port, host, q):
         transport.destroy()
     except Exception as e:
         import traceback
+
         q.put(("error", traceback.format_exc()))
 
 
 def _gpu_client_single(nccl_port, host, q):
     try:
         torch.cuda.set_device(1)  # Client on GPU 1
-        from specforge.modeling.target._nccl_transport import NCCLTransport, _DTYPE_TO_CODE
+        from specforge.modeling.target._nccl_transport import (
+            _DTYPE_TO_CODE,
+            NCCLTransport,
+        )
+
         transport = NCCLTransport(nccl_port=nccl_port, host=host, is_server=False)
         ok = transport.initialize(timeout_seconds=60)
         if not ok:
             q.put(("error", "Client NCCL init returned False"))
             return
-        metadata = {"data": {"dtype_code": _DTYPE_TO_CODE[torch.float32], "shape": [4, 8]}}
+        metadata = {
+            "data": {"dtype_code": _DTYPE_TO_CODE[torch.float32], "shape": [4, 8]}
+        }
         result = transport.recv_tensors(metadata, ["data"])
         q.put(("ok", result["data"].cpu().tolist()))
         transport.destroy()
     except Exception as e:
         import traceback
+
         q.put(("error", traceback.format_exc()))
 
 
@@ -312,6 +338,7 @@ def _gpu_server_multi(nccl_port, host, q):
     try:
         torch.cuda.set_device(0)  # Server on GPU 0
         from specforge.modeling.target._nccl_transport import NCCLTransport
+
         transport = NCCLTransport(nccl_port=nccl_port, host=host, is_server=True)
         ok = transport.initialize(timeout_seconds=30)
         assert ok
@@ -328,7 +355,11 @@ def _gpu_server_multi(nccl_port, host, q):
 def _gpu_client_multi(nccl_port, host, q):
     try:
         torch.cuda.set_device(1)  # Client on GPU 1
-        from specforge.modeling.target._nccl_transport import NCCLTransport, _DTYPE_TO_CODE
+        from specforge.modeling.target._nccl_transport import (
+            _DTYPE_TO_CODE,
+            NCCLTransport,
+        )
+
         transport = NCCLTransport(nccl_port=nccl_port, host=host, is_server=False)
         ok = transport.initialize(timeout_seconds=30)
         assert ok
@@ -337,7 +368,15 @@ def _gpu_client_multi(nccl_port, host, q):
             "ids": {"dtype_code": _DTYPE_TO_CODE[torch.int64], "shape": [2, 3]},
         }
         result = transport.recv_tensors(metadata, ["hidden", "ids"])
-        q.put(("ok", {"hidden": result["hidden"].cpu().tolist(), "ids": result["ids"].cpu().tolist()}))
+        q.put(
+            (
+                "ok",
+                {
+                    "hidden": result["hidden"].cpu().tolist(),
+                    "ids": result["ids"].cpu().tolist(),
+                },
+            )
+        )
         transport.destroy()
     except Exception as e:
         q.put(("error", str(e)))
@@ -346,7 +385,8 @@ def _gpu_client_multi(nccl_port, host, q):
 def _gpu_server_metadata(nccl_port, host, q):
     try:
         torch.cuda.set_device(0)  # Server on GPU 0
-        from specforge.modeling.target._nccl_transport import NCCLTransport, encode_nccl_metadata
+        from specforge.modeling.target._nccl_transport import NCCLTransport
+
         transport = NCCLTransport(nccl_port=nccl_port, host=host, is_server=True)
         ok = transport.initialize(timeout_seconds=30)
         assert ok
@@ -358,10 +398,15 @@ def _gpu_server_metadata(nccl_port, host, q):
         torch.cuda.synchronize()
         transport.send_tensors(data, keys_order)
         torch.cuda.synchronize()
-        q.put(("ok", {
-            "h": data["h"].cpu().float().tolist(),
-            "mask": data["mask"].cpu().int().tolist(),
-        }))
+        q.put(
+            (
+                "ok",
+                {
+                    "h": data["h"].cpu().float().tolist(),
+                    "mask": data["mask"].cpu().int().tolist(),
+                },
+            )
+        )
         transport.destroy()
     except Exception as e:
         q.put(("error", str(e)))
@@ -370,7 +415,11 @@ def _gpu_server_metadata(nccl_port, host, q):
 def _gpu_client_metadata(nccl_port, host, q):
     try:
         torch.cuda.set_device(1)  # Client on GPU 1
-        from specforge.modeling.target._nccl_transport import NCCLTransport, _DTYPE_TO_CODE
+        from specforge.modeling.target._nccl_transport import (
+            _DTYPE_TO_CODE,
+            NCCLTransport,
+        )
+
         transport = NCCLTransport(nccl_port=nccl_port, host=host, is_server=False)
         ok = transport.initialize(timeout_seconds=30)
         assert ok
@@ -380,10 +429,15 @@ def _gpu_client_metadata(nccl_port, host, q):
         }
         keys_order = ["h", "mask"]
         result = transport.recv_tensors(metadata, keys_order)
-        q.put(("ok", {
-            "h": result["h"].cpu().float().tolist(),
-            "mask": result["mask"].cpu().int().tolist(),
-        }))
+        q.put(
+            (
+                "ok",
+                {
+                    "h": result["h"].cpu().float().tolist(),
+                    "mask": result["mask"].cpu().int().tolist(),
+                },
+            )
+        )
         transport.destroy()
     except Exception as e:
         q.put(("error", str(e)))
@@ -392,7 +446,6 @@ def _gpu_client_metadata(nccl_port, host, q):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
 class TestNCCLTransportEndToEnd(unittest.TestCase):
     """End-to-end test — covered by TestNCCLTransportGPU.test_send_recv_with_metadata_encode_decode."""
-    pass
 
 
 class TestServerClientNegotiation(unittest.TestCase):
@@ -426,6 +479,7 @@ class TestServerClientNegotiation(unittest.TestCase):
         """Client should not attempt NCCL when SPECFORGE_ENABLE_NCCL=0."""
         with patch.dict(os.environ, {"SPECFORGE_ENABLE_NCCL": "0"}):
             from specforge.modeling.target.remote_target_client import RemoteModelClient
+
             client = RemoteModelClient("http://127.0.0.1:8001")
             self.assertFalse(client._nccl_enabled)
             client.close()
@@ -438,6 +492,7 @@ class TestServerClientNegotiation(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             os.environ.pop("SPECFORGE_ENABLE_NCCL", None)
             from specforge.modeling.target.remote_target_client import RemoteModelClient
+
             client = RemoteModelClient("http://127.0.0.1:8001")
             self.assertTrue(client._nccl_enabled)
             client.close()
@@ -459,7 +514,7 @@ class TestServerClientNegotiation(unittest.TestCase):
         from specforge.modeling.target.remote_target_server import TargetModelServer
 
         server = TargetModelServer(mode="eagle3", model_path="/fake", nccl_port=None)
-        result = server.handle_init_nccl(b'{}')
+        result = server.handle_init_nccl(b"{}")
         data = json.loads(result)
         self.assertEqual(data["status"], "error")
 
@@ -473,7 +528,9 @@ class TestServerClientNegotiation(unittest.TestCase):
         server._nccl_transport = None
 
         data = {"x": torch.randn(2, 3)}
-        with patch("specforge.modeling.target._tensor_wire.encode_to_buffer") as mock_wire:
+        with patch(
+            "specforge.modeling.target._tensor_wire.encode_to_buffer"
+        ) as mock_wire:
             mock_wire.return_value = b"wire_data"
             result = server._serialize_response(data)
             mock_wire.assert_called_once_with(data)
@@ -487,6 +544,7 @@ class TestClientNCCLPortResolution(unittest.TestCase):
         """SPECFORGE_NCCL_PORT env should be used if set."""
         with patch.dict(os.environ, {"SPECFORGE_NCCL_PORT": "55555"}):
             from specforge.modeling.target.remote_target_client import RemoteModelClient
+
             client = RemoteModelClient("http://127.0.0.1:8001")
             self.assertEqual(client._get_nccl_port(), 55555)
             client.close()
@@ -498,6 +556,7 @@ class TestClientNCCLPortResolution(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             os.environ.pop("SPECFORGE_NCCL_PORT", None)
             from specforge.modeling.target.remote_target_client import RemoteModelClient
+
             client = RemoteModelClient("http://127.0.0.1:8001")
             self.assertEqual(client._get_nccl_port(), 8101)
             client.close()
@@ -509,6 +568,7 @@ class TestClientNCCLPortResolution(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             os.environ.pop("SPECFORGE_NCCL_PORT", None)
             from specforge.modeling.target.remote_target_client import RemoteModelClient
+
             client = RemoteModelClient("http://127.0.0.1:9000")
             self.assertEqual(client._get_nccl_port(), 9100)
             client.close()

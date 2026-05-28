@@ -25,7 +25,6 @@ Environment variables
 
 import json
 import logging
-import os
 import threading
 from typing import Dict, List, Optional, Tuple
 
@@ -109,7 +108,7 @@ class NCCLTransport:
                 # that listens; rank 1 (client) connects.
                 # This bypasses torchelastic's _torchelastic_use_agent_store()
                 # which would make ALL ranks connect (breaking standalone use).
-                is_master = (self._rank == 0)
+                is_master = self._rank == 0
                 store = TCPStore(
                     host_name=self._host,
                     port=self._nccl_port,
@@ -154,9 +153,9 @@ class NCCLTransport:
 
         Unsupported dtypes (int16, int8, bool) are viewed as uint8 for transfer.
         """
-        assert self._initialized and self._pg is not None, (
-            "NCCL transport not initialized"
-        )
+        assert (
+            self._initialized and self._pg is not None
+        ), "NCCL transport not initialized"
         assert self._is_server, "Only the server can send tensors"
 
         for key in keys_order:
@@ -189,9 +188,9 @@ class NCCLTransport:
         -------
         dict of tensors, already on the current CUDA device.
         """
-        assert self._initialized and self._pg is not None, (
-            "NCCL transport not initialized"
-        )
+        assert (
+            self._initialized and self._pg is not None
+        ), "NCCL transport not initialized"
         assert not self._is_server, "Only the client can receive tensors"
 
         result: Dict[str, Optional[torch.Tensor]] = {}
@@ -269,7 +268,8 @@ class NCCLTransport:
 
 
 def encode_nccl_metadata(
-    tensor_dict: Dict[str, Optional[torch.Tensor]], keys_order: List[str],
+    tensor_dict: Dict[str, Optional[torch.Tensor]],
+    keys_order: List[str],
     cpu_scalars: Optional[Dict[str, list]] = None,
 ) -> bytes:
     """Encode tensor metadata (dtype, shape) as JSON for HTTP response.
@@ -302,7 +302,9 @@ def encode_nccl_metadata(
     return json.dumps(payload).encode("utf-8")
 
 
-def decode_nccl_metadata(raw: bytes) -> Tuple[List[str], Dict[str, Optional[dict]], Dict[str, list]]:
+def decode_nccl_metadata(
+    raw: bytes,
+) -> Tuple[List[str], Dict[str, Optional[dict]], Dict[str, list]]:
     """Decode NCCL metadata from HTTP response body.
 
     Returns (keys_order, metadata_dict, cpu_scalars) where metadata_dict maps

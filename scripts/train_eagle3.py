@@ -422,7 +422,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     if args.draft_model_config is None:
         hf_config_dict = _maybe_fetch_remote_config(args)
         auto_config_path = create_draft_config_from_target(
-            target_model_path=args.target_model_path if hf_config_dict is None else None,
+            target_model_path=(
+                args.target_model_path if hf_config_dict is None else None
+            ),
             hf_config_dict=hf_config_dict,
             cache_dir=args.model_download_dir,
         )
@@ -683,9 +685,7 @@ def run_eagle3_step_from_target_output(
         loss_mask=loss_mask,
         target=target,
         hidden_states=hidden_states,
-        position_ids=(
-            data["position_ids"].cuda() if "position_ids" in data else None
-        ),
+        position_ids=(data["position_ids"].cuda() if "position_ids" in data else None),
         image_grid_thw=image_grid_thw,
         is_vlm=args.is_vlm,
         position_mask=position_mask,
@@ -977,8 +977,7 @@ def run_forward_accumulated(
     This is a generator — iterate over it to get forward-output tuples.
     """
     handles = [
-        (d, submit_eagle3_target_async(args, target_model, d))
-        for d in data_list
+        (d, submit_eagle3_target_async(args, target_model, d)) for d in data_list
     ]
 
     # Yield results in order so the caller can interleave backward.
@@ -1003,9 +1002,13 @@ def main():
         raise ValueError("--target-prefetch-depth must be non-negative.")
     if args.target_prefetch_depth > 0:
         if args.target_model_backend != "remote":
-            raise ValueError("--target-prefetch-depth is only supported with --target-model-backend remote.")
+            raise ValueError(
+                "--target-prefetch-depth is only supported with --target-model-backend remote."
+            )
         if args.train_hidden_states_path is not None:
-            raise ValueError("--target-prefetch-depth is only supported for online remote target training.")
+            raise ValueError(
+                "--target-prefetch-depth is only supported for online remote target training."
+            )
     set_seed(args.seed)
     init_distributed(
         timeout=args.dist_timeout,
@@ -1250,7 +1253,9 @@ def main():
         f"Starting training from epoch:{start_epoch}          step:{global_step}"
     )
 
-    pipeline = args.target_prefetch_depth == 0 and _can_pipeline_async(args, target_model)
+    pipeline = args.target_prefetch_depth == 0 and _can_pipeline_async(
+        args, target_model
+    )
     accum_data = []
     prefetch_queue = []
     torch_profiler = None
@@ -1263,8 +1268,7 @@ def main():
                 global_step + (args.save_interval - global_step % args.save_interval),
             )
         should_evaluate = (
-            args.eval_data_path is not None
-            or args.eval_hidden_states_path is not None
+            args.eval_data_path is not None or args.eval_hidden_states_path is not None
         )
         eval_period = args.eval_interval * args.draft_accumulation_steps
         if should_evaluate and eval_period > 0:
