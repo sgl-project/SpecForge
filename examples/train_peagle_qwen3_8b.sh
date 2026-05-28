@@ -8,6 +8,7 @@ ROOT_DIR=$(dirname "$SCRIPT_DIR")
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 export TORCHINDUCTOR_CACHE_DIR="$ROOT_DIR/cache/compiled_kernels"
 export FLASHINFER_WORKSPACE_BASE="$ROOT_DIR/cache/flashinfer"
+export SPECFORGE_DATA_NUM_PROC=32
 
 # Model
 TARGET_MODEL="${TARGET_MODEL:-/home/share/model_weight/qwen/qwen3-8b}"
