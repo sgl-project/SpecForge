@@ -1,3 +1,4 @@
+import gc
 import os
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ from tests.utils import execute_shell_command
 
 CACHE_DIR = Path(__file__).parent.parent.parent.joinpath("cache")
 SOURCE_TARGET_MODEL = "nreHieW/Llama-3.1-8B-Instruct"
+RANDOM_TARGET_MODEL_DIR = CACHE_DIR.joinpath("models", "random_Llama-3.1-8B-Instruct")
 ONLINE_SCRIPT_PATH = Path(__file__).parent.parent.parent.joinpath(
     "examples", "run_llama3.1_8b_eagle3_online.sh"
 )
@@ -22,10 +24,47 @@ def replace_in_script(script_path: Path, pattern: str, replacement: str):
     script_path.write_text(script_path.read_text().replace(pattern, replacement))
 
 
+def prepare_random_target_model():
+    has_config = RANDOM_TARGET_MODEL_DIR.joinpath("config.json").exists()
+    has_weights = (
+        RANDOM_TARGET_MODEL_DIR.joinpath("model.safetensors").exists()
+        or RANDOM_TARGET_MODEL_DIR.joinpath("pytorch_model.bin").exists()
+        or len(list(RANDOM_TARGET_MODEL_DIR.glob("*.index.json"))) > 0
+    )
+    if has_config and has_weights:
+        return
+
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    tmp_dir = RANDOM_TARGET_MODEL_DIR.with_name(f"{RANDOM_TARGET_MODEL_DIR.name}.tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(SOURCE_TARGET_MODEL)
+    tokenizer.save_pretrained(tmp_dir)
+
+    config = AutoConfig.from_pretrained(SOURCE_TARGET_MODEL)
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+    model.save_pretrained(
+        tmp_dir,
+        safe_serialization=True,
+        max_shard_size="4GB",
+    )
+    del model
+    gc.collect()
+
+    if RANDOM_TARGET_MODEL_DIR.exists():
+        shutil.rmtree(RANDOM_TARGET_MODEL_DIR)
+    tmp_dir.rename(RANDOM_TARGET_MODEL_DIR)
+
+
 def build_online_script() -> str:
     return ONLINE_SCRIPT_TEMPLATE.replace(
         "meta-llama/Llama-3.1-8B-Instruct",
-        SOURCE_TARGET_MODEL,
+        str(RANDOM_TARGET_MODEL_DIR),
     ).replace(
         "$ROOT_DIR/scripts/train_eagle3.py",
         "$ROOT_DIR/scripts/train_eagle3.py --max-num-steps 10",
@@ -36,12 +75,12 @@ def build_offline_script() -> str:
     return (
         OFFLINE_SCRIPT_TEMPLATE.replace(
             "meta-llama/Llama-3.1-8B-Instruct",
-            SOURCE_TARGET_MODEL,
+            str(RANDOM_TARGET_MODEL_DIR),
         )
-        .replace("--batch-size 32", "--batch-size 5")
+        .replace("--batch-size 32", "--batch-size 1")
         .replace(
             "scripts/prepare_hidden_states.py",
-            "scripts/prepare_hidden_states.py --num-samples 10",
+            "scripts/prepare_hidden_states.py --num-samples 10 --sglang-mem-fraction-static 0.4",
         )
         .replace(
             "$ROOT_DIR/scripts/train_eagle3.py",
@@ -61,6 +100,7 @@ class TestTrainEagle3(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(ONLINE_SCRIPT_PATH.write_text, ONLINE_SCRIPT_TEMPLATE)
         self.addCleanup(OFFLINE_SCRIPT_PATH.write_text, OFFLINE_SCRIPT_TEMPLATE)
+        prepare_random_target_model()
 
         # prepare data
         data_process = execute_shell_command(
