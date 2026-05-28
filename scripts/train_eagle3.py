@@ -56,6 +56,33 @@ from specforge.utils import (
 )
 
 
+def print_cuda_memory_debug(label: str) -> None:
+    if os.getenv("SPECFORGE_CI_MEMORY_DEBUG") != "1" or not torch.cuda.is_available():
+        return
+
+    try:
+        torch.cuda.synchronize()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        allocated_bytes = torch.cuda.memory_allocated()
+        reserved_bytes = torch.cuda.memory_reserved()
+    except Exception as exc:
+        print(f"[memory-debug] {label}: failed to query CUDA memory: {exc}", flush=True)
+        return
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "NA"
+    local_rank = os.getenv("LOCAL_RANK", "NA")
+    print(
+        "[memory-debug] "
+        f"{label}: rank={rank} local_rank={local_rank} "
+        f"free={free_bytes / 1024**3:.2f}GiB "
+        f"used={(total_bytes - free_bytes) / 1024**3:.2f}GiB "
+        f"total={total_bytes / 1024**3:.2f}GiB "
+        f"torch_allocated={allocated_bytes / 1024**3:.2f}GiB "
+        f"torch_reserved={reserved_bytes / 1024**3:.2f}GiB",
+        flush=True,
+    )
+
+
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
     """
     This function is used to parse the arguments for the training script.
@@ -744,23 +771,31 @@ def main():
     sanity_check(args)
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
+    print_cuda_memory_debug("after init_distributed")
 
     # ================================================
     # 2. Build models
     # ================================================
+    print_cuda_memory_debug("before build_draft_model")
     draft_model_config, draft_model, ckpt_info, resume_state = build_draft_model(args)
+    print_cuda_memory_debug("after build_draft_model")
+    print_cuda_memory_debug("before build_target_model")
     target_model, processor = build_target_model(args, draft_model_config, is_online)
+    print_cuda_memory_debug("after build_target_model")
 
     # ================================================
     # 3. Build dataloader
     # ================================================
+    print_cuda_memory_debug("before build_dataloaders")
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
         args, draft_model_config, processor
     )
+    print_cuda_memory_debug("after build_dataloaders")
 
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
+    print_cuda_memory_debug("after load_vocab_mapping")
 
     # Calculate total steps if not provided
     if args.total_steps is None:
