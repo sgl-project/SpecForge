@@ -10,7 +10,7 @@ export TORCHINDUCTOR_CACHE_DIR="$ROOT_DIR/cache/compiled_kernels"
 export FLASHINFER_WORKSPACE_BASE="$ROOT_DIR/cache/flashinfer"
 
 # Model
-TARGET_MODEL="/home/share/model_weight/qwen/Qwen3-8B/"
+TARGET_MODEL="${TARGET_MODEL:-/home/share/model_weight/qwen/qwen3-8b}"
 
 # P-EAGLE parameters
 NUM_DEPTHS=4
@@ -33,8 +33,12 @@ CHAT_TEMPLATE="qwen"
 # Output
 OUTPUT_DIR="$ROOT_DIR/outputs/peagle_qwen3_8b"
 DRAFT_CONFIG="$ROOT_DIR/configs/qwen3-8b-peagle.json"
+TORCHRUN="$ROOT_DIR/.venv/bin/torchrun"
+if [ ! -x "$TORCHRUN" ]; then
+    TORCHRUN="torchrun"
+fi
 
-torchrun \
+"$TORCHRUN" \
     --standalone \
     --nproc_per_node=2 \
     "$ROOT_DIR/scripts/train_peagle.py" \
@@ -57,5 +61,5 @@ torchrun \
     --target-model-backend sglang \
     --save-interval 5000 \
     --eval-interval 5000 \
-    --log-interval 50 \
-    --report-to none
+    --log-interval 1 \
+    --report-to wandb

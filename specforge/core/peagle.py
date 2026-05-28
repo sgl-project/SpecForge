@@ -167,13 +167,12 @@ def compute_peagle_metrics(
         count_total = torch.tensor(0.0, device=device)
         for d in range(num_depths):
             depth_mask = (depth == d).unsqueeze(0) & (sampled_loss_mask > 0.5)
-            if depth_mask.any():
-                d_correct = ((pred_ids == target_ids) & depth_mask).sum().float()
-                d_total = depth_mask.sum().float()
-                metrics[f"position_{d}_acc_sum"] = d_correct
-                metrics[f"position_{d}_acc_total"] = d_total
-                correct_total += d_correct
-                count_total += d_total
+            d_correct = ((pred_ids == target_ids) & depth_mask).sum().float()
+            d_total = depth_mask.sum().float()
+            metrics[f"position_{d}_acc_sum"] = d_correct
+            metrics[f"position_{d}_acc_total"] = d_total
+            correct_total += d_correct
+            count_total += d_total
 
         metrics["full_acc_sum"] = correct_total
         metrics["full_acc_total"] = count_total

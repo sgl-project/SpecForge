@@ -314,6 +314,7 @@ def build_dataloaders(
             processor=None,
             num_proc=args.build_dataset_num_proc,
             train_only_last_turn=args.train_only_last_turn,
+            minimum_valid_tokens=1,
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,

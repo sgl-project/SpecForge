@@ -70,6 +70,16 @@ class PEagleAttention(nn.Module):
             value=value_states,
             block_mask=attention_mask,
             enable_gqa=True,
+            kernel_options={
+                "FORCE_USE_FLEX_ATTENTION": True,
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "num_stages": 2,
+                "bwd_BLOCK_M1": 32,
+                "bwd_BLOCK_N1": 64,
+                "bwd_BLOCK_M2": 32,
+                "bwd_BLOCK_N2": 32,
+            },
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
