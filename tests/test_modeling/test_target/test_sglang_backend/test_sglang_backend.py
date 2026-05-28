@@ -1,3 +1,4 @@
+import gc
 import os
 import unittest
 
@@ -12,10 +13,17 @@ from tests.utils import get_available_port
 
 
 def cleanup_distributed():
+    gc.collect()
+    torch.cuda.empty_cache()
     if dist.is_available() and dist.is_initialized():
-        torch.cuda.synchronize()
-        dist.barrier()
-        dist.destroy_process_group()
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            pass
+        try:
+            dist.destroy_process_group()
+        except RuntimeError:
+            pass
 
 
 @torch.no_grad()
@@ -46,6 +54,7 @@ def test_dense(rank, world_size, port, tp_size):
         input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask
     )
     print(f"[Rank {rank}] test_dense passed successfully!")
+    del sgl_out, sgl_target_model, input_ids, attention_mask, loss_mask
     cleanup_distributed()
 
 
@@ -78,6 +87,7 @@ def test_moe(rank, world_size, port, tp_size):
         input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask
     )
     print(f"[Rank {rank}] test_moe passed successfully!")
+    del sgl_out, sgl_target_model, input_ids, attention_mask, loss_mask
     cleanup_distributed()
 
 
@@ -222,6 +232,15 @@ def test_vlm(rank, world_size, port, tp_size):
         print(f"[Rank {rank}] target shape: {sgl_out.target.shape}")
         print(f"[Rank {rank}] input_ids shape: {sgl_out.input_ids.shape}")
         print(f"[Rank {rank}] test_vlm passed successfully!")
+    del (
+        sgl_out,
+        sgl_target_model,
+        input_ids,
+        attention_mask,
+        loss_mask,
+        pixel_values,
+        image_grid_thw,
+    )
     cleanup_distributed()
 
 
@@ -386,6 +405,15 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         print(f"[Rank {rank}] Batch size verification: PASSED")
         print(f"{'='*60}\n")
         print(f"[Rank {rank}] test_vlm_multi_batch passed successfully!")
+    del (
+        sgl_out,
+        sgl_target_model,
+        input_ids,
+        attention_mask,
+        loss_mask,
+        pixel_values,
+        image_grid_thw,
+    )
     cleanup_distributed()
 
 
