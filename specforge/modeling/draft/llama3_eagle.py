@@ -1428,6 +1428,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.norm_output:
             norm_hidden_states = self.norm(hidden_states)
+        else:
+            norm_hidden_states = hidden_states
         return self.lm_head(norm_hidden_states)
 
     def backbone(
