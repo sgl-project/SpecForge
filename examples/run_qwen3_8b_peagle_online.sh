@@ -13,7 +13,7 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_peagle.py \
-    --target-model-path /seu_nvme/ogai/models/qwen3-8b \
+    --target-model-path Qwen/Qwen3-8B \
     --draft-model-config $ROOT_DIR/configs/qwen3-8b-peagle.json \
     --train-data-path $ROOT_DIR/cache/dataset/perfectblend-qwen3-8b-regen.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
