@@ -18,7 +18,7 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/perfectblend-qwen3-8b-regen.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/peagle_qwen3_8b \
-    --num-epochs 5 \
+    --num-epochs 20 \
     --batch-size 1 \
     --learning-rate 1e-4 \
     --max-length 8192 \
