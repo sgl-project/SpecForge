@@ -17,7 +17,7 @@ torchrun \
     $ROOT_DIR/scripts/train_peagle.py \
     --target-model-path Qwen/Qwen3-8B \
     --draft-model-config $ROOT_DIR/configs/qwen3-8b-peagle.json \
-    --train-data-path $ROOT_DIR/cache/dataset/perfectblend-qwen3-8b-regen.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/peagle_qwen3_8b \
     --num-epochs 20 \

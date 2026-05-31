@@ -13,7 +13,7 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path /home/share/model_weight/qwen/qwen3-8b/ \
+    --target-model-path Qwen/Qwen3-8B \
     --draft-model-config $ROOT_DIR/configs/qwen3-8b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \

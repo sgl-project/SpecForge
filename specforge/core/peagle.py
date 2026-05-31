@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import LogSoftmaxLoss, _compute_loss
 from specforge.modeling.draft.peagle import PEagleDraftModel
 
 
@@ -157,7 +157,7 @@ def compute_peagle_metrics(
     position_mask = sampled_loss_mask.unsqueeze(-1)  # [batch, total_sampled, 1]
     total_positions = position_mask.shape[0] * position_mask.shape[1]
     denominator = sampled_loss_mask.sum().clamp_min(1e-5)
-    loss = LogSoftmaxLoss.apply(logits, target_p, position_mask) * (
+    loss = _compute_loss(logits, target_p, position_mask) * (
         total_positions / denominator
     )
 
