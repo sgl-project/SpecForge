@@ -31,6 +31,7 @@ torchrun \
     --tp-size $TP_SIZE \
     --num-depths 8 \
     --down-sample-ratio 0.8 \
+    --down-sample-ratio-min 0.2 \
     --num-draft-layers 4 \
     --no-norm-before-residual \
     --target-model-backend sglang \

@@ -83,8 +83,14 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     peagle_group.add_argument(
         "--down-sample-ratio",
         type=float,
-        default=0.7,
+        default=0.8,
         help="Geometric decay ratio for COD sampling",
+    )
+    peagle_group.add_argument(
+        "--down-sample-ratio-min",
+        type=float,
+        default=0.2,
+        help="Minimum retention ratio for COD sampling",
     )
     peagle_group.add_argument(
         "--mask-token-id",
@@ -433,6 +439,7 @@ def save_checkpoints(
             peagle_config = {
                 "num_depths": args.num_depths,
                 "down_sample_ratio": args.down_sample_ratio,
+                "down_sample_ratio_min": args.down_sample_ratio_min,
                 "mask_token_id": args.mask_token_id,
                 "num_draft_layers": args.num_draft_layers,
                 "norm_before_residual": args.norm_before_residual,
@@ -626,6 +633,7 @@ def main():
         mask_token_id=args.mask_token_id,
         num_depths=args.num_depths,
         down_sample_ratio=args.down_sample_ratio,
+        down_sample_ratio_min=args.down_sample_ratio_min,
     )
 
     # ================================================

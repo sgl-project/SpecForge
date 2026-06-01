@@ -14,7 +14,8 @@ def generate_cod_sample_indices(
     seq_length: int,
     loss_mask: torch.Tensor,
     num_depths: int = 8,
-    down_sample_ratio: float = 0.7,
+    down_sample_ratio: float = 0.8,
+    down_sample_ratio_min: float = 0.2,
     filter_position_zero: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     loss_mask = loss_mask.squeeze(0)
@@ -27,7 +28,7 @@ def generate_cod_sample_indices(
 
     for d in range(1, num_depths):
         valid_length = max(0, all_valid_indices.shape[0] - d)
-        ratio = down_sample_ratio**d
+        ratio = max(down_sample_ratio**d, down_sample_ratio_min)
         sample_size = int(valid_length * ratio)
 
         if sample_size <= 0:
