@@ -19,7 +19,17 @@ POST /set_aux_hidden_states_layers – Configure Eagle3 layer capture
 POST /set_capture_layers      – Configure DFlash layer capture
 POST /set_vocab_mapping       – Receive t2d vocab mapping
 POST /get_model_info          – Return model metadata (num layers, etc.)
+POST /disconnect              – Client disconnect notification
+POST /heartbeat               – Client heartbeat ping
 GET  /health                  – Liveness check
+
+Client Lifecycle
+----------------
+The server tracks client connectivity via:
+  1. Explicit /disconnect notification (sent by client on close)
+  2. Heartbeat timeout (detects abnormal client termination)
+
+On client disconnect, the server shuts down automatically.
 """
 
 import json
@@ -42,6 +52,19 @@ logger = logging.getLogger(__name__)
 
 # HTTP header names
 NCCL_HEADER = "X-SpecForge-Nccl"
+
+# Endpoint groups used by request prelude.
+_LIFECYCLE_ENDPOINTS = {"/disconnect", "/heartbeat"}
+_CLIENT_ACTIVITY_ENDPOINTS = {
+    "/generate_eagle3_data",
+    "/generate_dflash_data",
+    "/init_nccl",
+    "/set_aux_hidden_states_layers",
+    "/set_capture_layers",
+    "/get_model_info",
+    "/set_vocab_mapping",
+    "/heartbeat",
+}
 
 # ---------------------------------------------------------------------------
 # Wire-format serialization
@@ -76,6 +99,7 @@ class TargetModelServer:
         nccl_port: int = None,
         host: str = "0.0.0.0",
         attention_backend: str | None = None,
+        client_heartbeat_timeout: float = 60.0,
     ):
         self.mode = mode
         self.model_path = model_path
@@ -98,6 +122,14 @@ class TargetModelServer:
         self._topk = int(os.environ.get("SPECFORGE_TOPK", "0"))
         _target_dtype = os.environ.get("SPECFORGE_TARGET_DTYPE", "fp32").lower()
         self._use_bf16_target = _target_dtype != "fp32"
+        # Client disconnect handling
+        self._client_heartbeat_timeout = client_heartbeat_timeout
+        self._last_client_activity: float = 0.0  # 0 means no client connected yet
+        self._client_connected = False
+        self._heartbeat_timer: threading.Timer = None
+        self._client_lifecycle_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_callback = None  # set by launcher to trigger server shutdown
 
     def load_model(self):
         """Load the target model (reuses existing SGLang*TargetModel classes)."""
@@ -136,9 +168,103 @@ class TargetModelServer:
             self._model.set_aux_hidden_states_layers()
 
     def close(self):
+        self._stop_heartbeat_timer()
         if self._nccl_transport is not None:
             self._nccl_transport.destroy()
             self._nccl_transport = None
+
+    # ------------------------------------------------------------------
+    # Client lifecycle / heartbeat
+    # ------------------------------------------------------------------
+
+    def _record_client_activity(self):
+        """Record that the client is alive (called on client requests)."""
+        with self._client_lifecycle_lock:
+            if self._shutdown_requested:
+                return
+            self._last_client_activity = time.time()
+            if self._client_connected:
+                return
+            self._client_connected = True
+            logger.info("Client connected (first activity detected)")
+            self._start_heartbeat_timer_locked()
+
+    def _start_heartbeat_timer_locked(self):
+        """Start the heartbeat watchdog timer. Caller must hold lifecycle lock."""
+        if self._heartbeat_timer is not None:
+            self._heartbeat_timer.cancel()
+            self._heartbeat_timer = None
+        if self._client_heartbeat_timeout <= 0:
+            return
+        self._heartbeat_timer = threading.Timer(
+            self._client_heartbeat_timeout, self._check_heartbeat
+        )
+        self._heartbeat_timer.daemon = True
+        self._heartbeat_timer.start()
+
+    def _stop_heartbeat_timer(self):
+        """Cancel the heartbeat watchdog timer."""
+        with self._client_lifecycle_lock:
+            self._stop_heartbeat_timer_locked()
+
+    def _stop_heartbeat_timer_locked(self):
+        """Cancel the heartbeat watchdog timer. Caller must hold lifecycle lock."""
+        if self._heartbeat_timer is not None:
+            self._heartbeat_timer.cancel()
+            self._heartbeat_timer = None
+
+    def _check_heartbeat(self):
+        """Called when heartbeat timer fires. Check if client is still alive."""
+        should_shutdown = False
+        with self._client_lifecycle_lock:
+            self._heartbeat_timer = None
+            if not self._client_connected or self._client_heartbeat_timeout <= 0:
+                return
+            elapsed = time.time() - self._last_client_activity
+            if elapsed >= self._client_heartbeat_timeout:
+                logger.warning(
+                    "Client heartbeat timeout (%.1fs since last activity, threshold=%.1fs). "
+                    "Treating as disconnected.",
+                    elapsed,
+                    self._client_heartbeat_timeout,
+                )
+                self._client_connected = False
+                should_shutdown = True
+            else:
+                remaining = self._client_heartbeat_timeout - elapsed
+                self._heartbeat_timer = threading.Timer(
+                    remaining + 1.0, self._check_heartbeat
+                )
+                self._heartbeat_timer.daemon = True
+                self._heartbeat_timer.start()
+        if should_shutdown:
+            self._request_shutdown(reason="heartbeat_timeout")
+
+    def _handle_client_disconnect(self, reason: str = "explicit"):
+        """Handle client disconnection by shutting down the server."""
+        with self._client_lifecycle_lock:
+            self._client_connected = False
+            self._stop_heartbeat_timer_locked()
+        self._request_shutdown(reason=reason)
+
+    def _request_shutdown(self, reason: str):
+        """Request server shutdown exactly once."""
+        with self._client_lifecycle_lock:
+            if self._shutdown_requested:
+                return
+            self._shutdown_requested = True
+        logger.info("Client disconnected (reason=%s). Shutting down server...", reason)
+        if self._shutdown_callback is not None:
+            self._shutdown_callback()
+
+    def handle_disconnect(self, _raw_body: bytes) -> bytes:
+        """Handle explicit client disconnect notification (POST /disconnect)."""
+        self._handle_client_disconnect(reason="explicit")
+        return json.dumps({"status": "ok"}).encode()
+
+    def handle_heartbeat(self, _raw_body: bytes) -> bytes:
+        """Handle client heartbeat ping (POST /heartbeat)."""
+        return json.dumps({"status": "ok"}).encode()
 
     @property
     def _keep_on_gpu(self) -> bool:
@@ -549,12 +675,6 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_error("Not found", 404)
 
     def do_POST(self):
-        # Worker threads spawned by ThreadingHTTPServer do not inherit the
-        # main thread's CUDA device.  Set it here so all GPU ops (Triton
-        # kernels, tensor allocations, etc.) target the correct device.
-        if self.server_app._gpu_id is not None:
-            torch.cuda.set_device(self.server_app._gpu_id)
-
         try:
             try:
                 body = self._read_body()
@@ -563,6 +683,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 return
 
             path = self.path.rstrip("/")
+
+            if path in _CLIENT_ACTIVITY_ENDPOINTS:
+                self.server_app._record_client_activity()
+
+            # Worker threads spawned by ThreadingHTTPServer do not inherit the
+            # main thread's CUDA device.  Set it here so all GPU ops (Triton
+            # kernels, tensor allocations, etc.) target the correct device.
+            if path not in _LIFECYCLE_ENDPOINTS and self.server_app._gpu_id is not None:
+                torch.cuda.set_device(self.server_app._gpu_id)
+
             # Detect transport mode from headers (request-local)
             use_nccl = self.headers.get(NCCL_HEADER) == "1"
             _request_local.use_nccl = use_nccl
@@ -642,6 +772,10 @@ def _route_request(app, path, body):
         return app.handle_get_model_info(body)
     elif path == "/set_vocab_mapping":
         return app.handle_set_vocab_mapping(body)
+    elif path == "/disconnect":
+        return app.handle_disconnect(body)
+    elif path == "/heartbeat":
+        return app.handle_heartbeat(body)
     else:
         raise ValueError(f"Unknown endpoint: {path}")
 
@@ -700,8 +834,8 @@ def _route_request_synced(app, path, body):
 
     # /init_nccl must run ONLY on rank 0 — it sets up a separate 2-rank NCCL
     # group (server rank 0 + training client rank 1).  TP worker ranks must
-    # NOT participate.
-    if path == "/init_nccl":
+    # NOT participate.  Same for /disconnect and /heartbeat.
+    if path in ("/init_nccl", "/disconnect", "/heartbeat"):
         return _route_request(app, path, body)
 
     rank = dist.get_rank()
