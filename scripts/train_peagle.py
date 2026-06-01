@@ -324,11 +324,15 @@ def build_dataloaders(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
 
+    draft_vocab_size = getattr(
+        draft_model_config, "draft_vocab_size", draft_model_config.vocab_size
+    )
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"
+        f"{args.target_model_path}-"
+        f"{draft_vocab_size}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_conversation_dataset(args.train_data_path)
@@ -350,9 +354,7 @@ def build_dataloaders(
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
             target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=getattr(
-                draft_model_config, "draft_vocab_size", draft_model_config.vocab_size
-            ),
+            draft_vocab_size=draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
         )

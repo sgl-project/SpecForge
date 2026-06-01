@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-from specforge.core.loss import LogSoftmaxLoss, _compute_loss
+from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft.peagle import PEagleDraftModel
 
 
@@ -17,16 +17,6 @@ def generate_cod_sample_indices(
     down_sample_ratio: float = 0.7,
     filter_position_zero: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate COD (Conditional-On-Distribution) sampling indices for P-EAGLE.
-
-    Depth 0 retains all seq_length positions. Each subsequent depth d retains
-    r^d * valid_length positions (pure geometric decay, matching the P-EAGLE
-    paper), subsampled randomly then sorted for causal order.
-
-    Returns:
-        anchor_pos: [total_sampled] - starting position in original sequence
-        depth: [total_sampled] - COD round index for each sampled position
-    """
     loss_mask = loss_mask.squeeze(0)
     device = loss_mask.device
     all_valid_indices = torch.where(loss_mask == 1)[0]
@@ -72,13 +62,6 @@ def generate_cod_sample_indices(
 
 
 def create_peagle_mask_mod(anchor_pos, depth, lengths, total_seq_len):
-    """Create flex attention mask function for P-EAGLE parallel group prediction.
-
-    Mask rules:
-    - Same document only (no cross-document attention)
-    - Depth-0 KV: causal ordering on anchor positions
-    - Same rollout chain: depth ordering respected
-    """
     document_ids = torch.repeat_interleave(
         torch.arange(lengths.shape[0], device=lengths.device, dtype=torch.long),
         lengths,
@@ -126,10 +109,6 @@ def compute_peagle_metrics(
     num_depths: int,
     t2d: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Compute KL divergence loss and per-depth accuracy for P-EAGLE.
-
-    Uses standard PyTorch KL div loss with proper normalization by valid positions.
-    """
     device = logits.device
     orig_positions = anchor_pos + depth
 
@@ -148,16 +127,11 @@ def compute_peagle_metrics(
         sampled_loss_mask = sampled_loss_mask * target_in_draft_vocab
         target_logits = target_logits[:, :, t2d]
 
-    # Compute loss with the fused Triton LogSoftmaxLoss kernel (cross-entropy
-    # form). It is equivalent to KL up to the constant target entropy term,
-    # which has zero gradient w.r.t. logits since target_p is detached.
-    # NOTE: the kernel normalizes internally by B*T (all positions). Here B==1,
-    # so we rescale by total_sampled / num_valid to divide by valid positions.
     target_p = torch.nn.functional.softmax(target_logits.float(), dim=-1)
     position_mask = sampled_loss_mask.unsqueeze(-1)  # [batch, total_sampled, 1]
     total_positions = position_mask.shape[0] * position_mask.shape[1]
-    denominator = sampled_loss_mask.sum().clamp_min(1e-5)
-    loss = _compute_loss(logits, target_p, position_mask) * (
+    denominator = sampled_loss_mask.sum().clamp_min(1e-6)
+    loss = LogSoftmaxLoss.apply(logits, target_p, position_mask) * (
         total_positions / denominator
     )
 
@@ -188,11 +162,6 @@ def compute_peagle_metrics(
 
 
 class OnlinePEagleModel(nn.Module):
-    """P-EAGLE online training wrapper.
-
-    Implements Conditional-On-Distribution (COD) sampling for parallel multi-token
-    prediction with flex attention masking.
-    """
 
     def __init__(
         self,
