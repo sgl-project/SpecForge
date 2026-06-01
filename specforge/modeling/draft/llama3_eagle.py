@@ -17,7 +17,7 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.utils import print_with_rank
+from specforge.utils import get_compile_backend, print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
@@ -112,7 +112,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, backend=get_compile_backend())
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
@@ -282,7 +282,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, backend=get_compile_backend())
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len and seq_len > self.max_seq_len_cached:
@@ -1532,7 +1532,7 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, backend=get_compile_backend())
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)

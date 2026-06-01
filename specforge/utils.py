@@ -12,6 +12,13 @@ from transformers import AutoConfig, PretrainedConfig
 logger = logging.getLogger(__name__)
 
 
+def get_compile_backend() -> str:
+    # now ascend npu can not support inductor for backend,
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "eager"
+    return "inductor"
+
+
 @contextmanager
 def rank_0_priority():
     rank = dist.get_rank()

@@ -10,9 +10,11 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from specforge.utils import get_compile_backend
+
 
 # Reference implementation
-@torch.compile(dynamic=None)
+@torch.compile(dynamic=None, backend=get_compile_backend())
 def _compute_loss(logits, target_p, position_mask):
     logits = logits.float()
     out_logp = nn.LogSoftmax(dim=2)(logits)
