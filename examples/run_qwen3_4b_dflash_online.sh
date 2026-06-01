@@ -32,5 +32,4 @@ torchrun \
     --wandb-project specforge-qwen3-4b-dflash \
     --target-model-backend sglang \
     --block-size 16 \
-    --num-anchors 512 \
     --wandb-name qwen3-4b-dflash-perfectblend
