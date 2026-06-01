@@ -50,6 +50,19 @@ Request processing flow:
 - Retrieves model configuration (hidden_size, vocab_size, etc.) via POST `/setup`
 - Each training step sends a request via POST `/generate` and receives results via NCCL recv
 - Supports TP>1 training: only rank 0 sends requests, results are broadcast to other ranks
+- After the first successful connection, a background heartbeat is started; on `close()`, a best-effort `/disconnect` is sent
+
+### Client Lifecycle and Automatic Exit
+
+The target server tracks client activity and automatically shuts down after the client exits, preventing leftover GPU-occupying server processes after training completes:
+
+- After the client's first successful request or successful NCCL initialization, a background heartbeat thread is started, sending POST `/heartbeat` every 15 seconds by default
+- When the client exits normally, it sends a best-effort POST `/disconnect`; upon receiving it, the server immediately triggers shutdown
+- When the client exits abnormally, the server watchdog triggers shutdown after `--client-heartbeat-timeout` is exceeded (default 60 seconds)
+- The server only counts actual client API calls as active requests; `GET /health` and unrelated POSTs do not renew the watchdog timer
+- `--client-heartbeat-timeout 0` disables the server-side timeout watchdog, but `/disconnect` will still trigger automatic shutdown
+
+Since NCCL transport does not support safe disconnect and reconnect within the same server process, it is recommended to treat each target server process as a resource for a single training session: it automatically exits after training completes or the client disconnects, and a new instance is started for the next training run.
 
 ### NCCL Transport
 
@@ -188,6 +201,7 @@ export NCCL_IB_GID_INDEX=3             # RoCE GID index
 | `--attention-backend` | Attention backend (recommended: flashinfer) |
 | `--nccl-port` | NCCL rendezvous port (default: HTTP port + 100) |
 | `--host` | Bind address (must be 0.0.0.0 for cross-machine) |
+| `--client-heartbeat-timeout` | Auto-exit timeout after no active client requests (seconds, default 60; 0 disables the watchdog) |
 
 ### Environment Variables
 
@@ -198,6 +212,7 @@ export NCCL_IB_GID_INDEX=3             # RoCE GID index
 | `SPECFORGE_TOPK` | `0` | Server-side target_p top-k compression (`0` = full distribution) |
 | `SPECFORGE_TARGET_DTYPE` | `fp32` | target_p computation precision |
 | `SPECFORGE_GPU_ID` | auto | Specify GPU device ID |
+| `SPECFORGE_HEARTBEAT_INTERVAL` | `15` | Client heartbeat send interval (seconds; `<=0` means the heartbeat thread is not started) |
 
 ## 📊 Benchmark Results
 

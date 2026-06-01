@@ -220,7 +220,7 @@ def fetch_remote_target_config(
         raw = client._request("get_model_info", b"")
         return _deserialize_scalar_dict(raw)
     finally:
-        client.close()
+        client.close(notify_disconnect=False)
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +250,14 @@ class RemoteModelClient:
         self._nccl_transport: Optional[NCCLTransport] = None
         self._nccl_init_attempted = False
         self._nccl_init_lock = threading.Lock()
+        # Heartbeat thread to keep server aware of client liveness
+        self._heartbeat_interval = float(
+            os.environ.get("SPECFORGE_HEARTBEAT_INTERVAL", "15")
+        )
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
         atexit.register(self.close)
 
     def _get_nccl_port(self) -> int:
@@ -354,6 +362,8 @@ class RemoteModelClient:
                 return False
 
             logger.info("NCCL transport established successfully")
+            # Start heartbeat to keep server aware of client liveness
+            self._start_heartbeat()
             return True
 
     def _request(self, endpoint: str, payload: bytes) -> bytes:
@@ -370,6 +380,7 @@ class RemoteModelClient:
                     headers={"Content-Type": "application/octet-stream"},
                 )
                 resp.raise_for_status()
+                self._start_heartbeat()
                 return resp.content
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc
@@ -413,6 +424,7 @@ class RemoteModelClient:
                     url, data=payload, timeout=self.timeout, headers=headers
                 )
                 resp.raise_for_status()
+                self._start_heartbeat()
 
                 nccl_used = resp.headers.get(NCCL_HEADER) == "1"
 
@@ -441,11 +453,70 @@ class RemoteModelClient:
                     f"Remote request failed after {self.max_retries + 1} attempts: {exc}"
                 ) from exc
 
-    def close(self):
+    def close(self, notify_disconnect: bool = True):
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+        # Stop heartbeat thread
+        self._stop_heartbeat()
+        # Notify server of disconnect (best-effort)
+        if notify_disconnect:
+            self._notify_disconnect()
+        # Destroy NCCL transport
         if self._nccl_transport is not None:
             self._nccl_transport.destroy()
             self._nccl_transport = None
         self._session.close()
+
+    def _notify_disconnect(self):
+        """Send disconnect notification to the server (best-effort)."""
+        try:
+            self._session.post(
+                f"{self.url}/disconnect",
+                data=b"",
+                timeout=5,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        except Exception:
+            # Best-effort: server may already be gone, network may be down
+            pass
+
+    def _start_heartbeat(self):
+        """Start background heartbeat thread."""
+        with self._lifecycle_lock:
+            if self._closed or self._heartbeat_thread is not None:
+                return
+            if self._heartbeat_interval <= 0:
+                return
+            self._heartbeat_stop.clear()
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, daemon=True
+            )
+            self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self):
+        """Stop background heartbeat thread."""
+        with self._lifecycle_lock:
+            self._heartbeat_stop.set()
+            thread = self._heartbeat_thread
+            self._heartbeat_thread = None
+        if thread is not None:
+            thread.join(timeout=3)
+
+    def _heartbeat_loop(self):
+        """Periodically ping the server to indicate liveness."""
+        while not self._heartbeat_stop.wait(self._heartbeat_interval):
+            try:
+                self._session.post(
+                    f"{self.url}/heartbeat",
+                    data=b"",
+                    timeout=5,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+            except Exception:
+                # Server may be gone — stop sending heartbeats
+                break
 
     def __del__(self):
         try:

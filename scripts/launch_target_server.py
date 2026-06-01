@@ -105,6 +105,12 @@ def parse_args():
         default=None,
         help="NCCL TCP rendezvous port for GPU-to-GPU data transfer (default: HTTP port + 100)",
     )
+    parser.add_argument(
+        "--client-heartbeat-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds of client inactivity before treating as disconnected (0 to disable). Default: 60",
+    )
     return parser.parse_args()
 
 
@@ -154,6 +160,7 @@ def main():
         nccl_port=args.nccl_port if args.nccl_port else args.port + 100,
         host=args.host,
         attention_backend=args.attention_backend,
+        client_heartbeat_timeout=args.client_heartbeat_timeout,
     )
     server_app.load_model()
     logger.info("Model loaded successfully.")
@@ -169,15 +176,25 @@ def main():
             args.port,
             args.mode,
         )
+        logger.info(
+            "Client disconnect will shut down server (heartbeat timeout: %.0fs)",
+            args.client_heartbeat_timeout,
+        )
 
-        def shutdown(signum, frame):
-            logger.info("Received signal %d, shutting down...", signum)
+        def request_http_shutdown():
             # HTTPServer.shutdown() must be called from a different thread than
             # serve_forever(); signal handlers run on the main thread.
             threading.Thread(target=httpd.shutdown, daemon=True).start()
 
+        def shutdown(signum, frame):
+            logger.info("Received signal %d, shutting down...", signum)
+            request_http_shutdown()
+
         signal.signal(signal.SIGINT, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
+
+        # Register shutdown callback for client disconnect handling
+        server_app._shutdown_callback = request_http_shutdown
 
         try:
             httpd.serve_forever()
