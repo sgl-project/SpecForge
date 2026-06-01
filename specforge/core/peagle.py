@@ -170,12 +170,14 @@ class OnlinePEagleModel(nn.Module):
         mask_token_id: int,
         num_depths: int = 8,
         down_sample_ratio: float = 0.7,
+        down_sample_ratio_min: float = 0.2,
     ):
         super().__init__()
         self.draft_model = draft_model
         self.mask_token_id = mask_token_id
         self.num_depths = num_depths
         self.down_sample_ratio = down_sample_ratio
+        self.down_sample_ratio_min = down_sample_ratio_min
 
     def forward(
         self,
@@ -213,6 +215,7 @@ class OnlinePEagleModel(nn.Module):
             loss_mask=loss_mask,
             num_depths=self.num_depths,
             down_sample_ratio=self.down_sample_ratio,
+            down_sample_ratio_min=self.down_sample_ratio_min,
         )
         total_sampled = anchor_pos.shape[0]
         orig_positions = anchor_pos + depth
