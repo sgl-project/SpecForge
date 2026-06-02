@@ -46,17 +46,16 @@ from specforge.modeling.target import (
 )
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
+from specforge.utils import create_draft_config_from_target, get_last_checkpoint
+from specforge.utils import maybe_fetch_remote_config as _maybe_fetch_remote_config
 from specforge.utils import (
-    create_draft_config_from_target,
-    get_last_checkpoint,
-    maybe_fetch_remote_config as _maybe_fetch_remote_config,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
-    resolve_local_model_path as _resolve_local_model_path,
-    safe_conversations_generator,
 )
+from specforge.utils import resolve_local_model_path as _resolve_local_model_path
+from specforge.utils import safe_conversations_generator
 
 
 def print_cuda_memory_debug(label: str) -> None:
@@ -1181,7 +1180,9 @@ def main():
         nonlocal metric_loss_weighted_sums, metric_loss_denom_sums
         with torch.no_grad():
             if metric_correct_sums is None:
-                metric_correct_sums = [correct.detach().clone() for correct in acc_corrects]
+                metric_correct_sums = [
+                    correct.detach().clone() for correct in acc_corrects
+                ]
                 metric_denom_sums = [denom.detach().clone() for denom in acc_denoms]
                 metric_loss_weighted_sums = [
                     loss.detach() * denom.detach()
@@ -1331,8 +1332,7 @@ def main():
                     eval_acces[i] + [eval_acc[i]] for i in range(len(eval_acc))
                 ]
                 eval_plosses = [
-                    eval_plosses[i] + [eval_ploss[i]]
-                    for i in range(len(eval_ploss))
+                    eval_plosses[i] + [eval_ploss[i]] for i in range(len(eval_ploss))
                 ]
 
         eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
@@ -1483,9 +1483,7 @@ def main():
                     ):
                         global_step += 1
                         maybe_profile_step()
-                        if finish_eagle3_training_step(
-                            epoch, progress_bar, *outputs
-                        ):
+                        if finish_eagle3_training_step(epoch, progress_bar, *outputs):
                             break
                 else:
                     if train_one_eagle3_batch(epoch, progress_bar, data):
