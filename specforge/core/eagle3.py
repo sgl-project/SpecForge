@@ -81,7 +81,14 @@ class OnlineEagle3Model(Eagle3Model):
         position_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         adapter: BackendAdapter,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         with torch.no_grad():
             local_correct = (
                 (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
@@ -92,9 +99,14 @@ class OnlineEagle3Model(Eagle3Model):
             )
             acc = local_correct / local_denom
 
-        loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-        loss = adapter.reduce_loss(loss)
-        return acc, loss
+        metric_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        loss = adapter.reduce_loss(metric_loss)
+        loss_denom = torch.tensor(
+            logits.shape[0] * logits.shape[1],
+            device=logits.device,
+            dtype=torch.float32,
+        )
+        return acc, loss, local_correct, local_denom, metric_loss.detach(), loss_denom
 
     def _prepare_position_ids(
         self,
@@ -204,6 +216,10 @@ class OnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
+        metric_corrects = []
+        metric_denoms = []
+        metric_losses = []
+        metric_loss_denoms = []
         adapter = self._make_adapter()
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
@@ -253,7 +269,7 @@ class OnlineEagle3Model(Eagle3Model):
             logits = self.draft_model.compute_logits(hidden_states)
 
             # Step 5.5 + 5.6: metric and loss
-            acc, loss = self._acc_and_loss(
+            acc, loss, correct, denom, metric_loss, loss_denom = self._acc_and_loss(
                 logits=logits,
                 target_p=state.target_p,
                 position_mask=state.position_mask,
@@ -262,6 +278,10 @@ class OnlineEagle3Model(Eagle3Model):
             )
             acces.append(acc)
             plosses.append(loss)
+            metric_corrects.append(correct)
+            metric_denoms.append(denom)
+            metric_losses.append(metric_loss)
+            metric_loss_denoms.append(loss_denom)
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -269,7 +289,15 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
-        return plosses, vlosses, acces
+        return (
+            plosses,
+            vlosses,
+            acces,
+            metric_corrects,
+            metric_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        )
 
 
 class QwenVLOnlineEagle3Model(Eagle3Model):
@@ -506,6 +534,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
+        metric_corrects = []
+        metric_denoms = []
+        metric_losses = []
+        metric_loss_denoms = []
         if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
             past_key_values = None
@@ -543,18 +575,27 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
-                acces.append(
-                    _compute_metric_acc(
-                        logits=logits,
-                        target_p=target_p,
-                        position_mask=position_mask,
-                        loss_mask=loss_mask,
-                    )
+                correct, denom = _compute_metric_counts(
+                    logits=logits,
+                    target_p=target_p,
+                    position_mask=position_mask,
+                    loss_mask=loss_mask,
                 )
+                acces.append(correct / denom)
+                metric_corrects.append(correct)
+                metric_denoms.append(denom)
 
             # Step 5.6: calculate loss, in-place modifies logits!
             loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
             plosses.append(loss)
+            metric_losses.append(loss.detach())
+            metric_loss_denoms.append(
+                torch.tensor(
+                    logits.shape[0] * logits.shape[1],
+                    device=logits.device,
+                    dtype=torch.float32,
+                )
+            )
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -562,7 +603,15 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
-        return plosses, vlosses, acces
+        return (
+            plosses,
+            vlosses,
+            acces,
+            metric_corrects,
+            metric_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        )
 
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
@@ -604,3 +653,12 @@ def _compute_metric_acc(logits, target_p, position_mask, loss_mask):
     return (
         (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
     ).sum() / loss_mask.sum().clamp_min(1e-6)
+
+
+@torch.compile(dynamic=None)
+def _compute_metric_counts(logits, target_p, position_mask, loss_mask):
+    correct = (
+        (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
+    ).sum()
+    denom = loss_mask.sum().clamp_min(1e-6)
+    return correct, denom
