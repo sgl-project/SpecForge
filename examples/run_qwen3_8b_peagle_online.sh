@@ -23,13 +23,13 @@ torchrun \
     --num-epochs 20 \
     --batch-size 1 \
     --learning-rate 1e-4 \
-    --max-length 8192 \
+    --max-length 4096 \
     --warmup-ratio 0.0025 \
     --max-grad-norm 1 \
     --chat-template qwen \
     --cache-dir $ROOT_DIR/cache \
     --tp-size $TP_SIZE \
-    --num-depths 8 \
+    --num-depths 5 \
     --down-sample-ratio 0.8 \
     --down-sample-ratio-min 0.2 \
     --num-draft-layers 4 \
