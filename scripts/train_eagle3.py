@@ -661,14 +661,24 @@ def run_eagle3_step_from_target_output(
     if image_grid_thw is None and args.is_vlm and "image_grid_thw" in data:
         image_grid_thw = [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
 
-    input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
-    attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
-    loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-    target = get_dp_data_shard_from_tp(eagle3_data.target)
-    hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+    input_ids = get_dp_data_shard_from_tp(
+        eagle3_data.input_ids, args.shard_target_output
+    )
+    attention_mask = get_dp_data_shard_from_tp(
+        eagle3_data.attention_mask, args.shard_target_output
+    )
+    loss_mask = get_dp_data_shard_from_tp(
+        eagle3_data.loss_mask, args.shard_target_output
+    )
+    target = get_dp_data_shard_from_tp(eagle3_data.target, args.shard_target_output)
+    hidden_states = get_dp_data_shard_from_tp(
+        eagle3_data.hidden_states, args.shard_target_output
+    )
     position_mask = eagle3_data.position_mask
     if position_mask is not None:
-        position_mask = get_dp_data_shard_from_tp(position_mask)
+        position_mask = get_dp_data_shard_from_tp(
+            position_mask, args.shard_target_output
+        )
 
     (
         plosses,
