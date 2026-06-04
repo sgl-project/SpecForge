@@ -3,6 +3,7 @@
 """DFlash Training Script."""
 
 import argparse
+import functools
 import logging
 import math
 import os
@@ -14,8 +15,10 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
+from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
@@ -438,15 +441,38 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
     )
 
-    dflash_model = FSDP(
-        dflash_model,
+    # Wrap each transformer block as its own FSDP unit so that all-gather /
+    # reduce-scatter overlap with compute. Without an auto_wrap_policy the
+    # whole model is a single FSDP unit, forcing every collective onto the
+    # critical path with no overlap. The block class is resolved from the
+    # draft model's `_no_split_modules` so this stays architecture-agnostic
+    # rather than hardcoding a specific decoder-layer class.
+    fsdp_kwargs = dict(
         use_orig_params=True,
+        forward_prefetch=True,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        limit_all_gathers=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
+    block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
+    block_classes = {
+        type(m) for m in dflash_model.modules() if type(m).__name__ in block_names
+    }
+    if block_classes:
+        fsdp_kwargs["auto_wrap_policy"] = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=block_classes,
+        )
+    else:
+        print_with_rank(
+            "No _no_split_modules on draft model; falling back to single-unit "
+            "FSDP wrap (no compute-comm overlap)."
+        )
+    dflash_model = FSDP(dflash_model, **fsdp_kwargs)
     print_with_rank("Initialized FSDP")
 
     start_epoch = ckpt_info[0]
