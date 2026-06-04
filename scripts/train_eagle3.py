@@ -496,13 +496,11 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         draft_model = AutoEagle3DraftModel.from_pretrained(
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
-            torch_dtype=torch.bfloat16,
         ).cuda()
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
             attention_backend=args.attention_backend,
-            torch_dtype=torch.bfloat16,
         ).cuda()
 
     # Load training state (optimizer, scheduler, epoch, step) for true resume
@@ -821,6 +819,23 @@ def run_forward(
                 target_in_draft_mask = padding(target_in_draft_mask, left=False)
         else:
             # we generate the logits using the hidden states loaded from disk
+            if data["hidden_state"] is None:
+                # Corrupt batch: prepare_hidden_states.py left a sample without
+                # aux_hidden_state (silent prepare-time IO race, ~1/96k probability
+                # observed on 96277-sample dataset). Return zero-loss/zero-acc
+                # placeholders so training continues; this batch will produce
+                # zero gradient and the optimizer step is effectively a no-op.
+                device = next(eagle3_model.parameters()).device
+                ttt_length = getattr(args, "ttt_length", 4)
+                if torch.distributed.get_rank() == 0:
+                    print(
+                        f"[WARN] skipping batch with None hidden_state "
+                        f"(corrupt prepare-time data)"
+                    )
+                zero = torch.zeros(1, device=device, dtype=torch.bfloat16)
+                plosses = [zero.clone().requires_grad_(True) for _ in range(ttt_length)]
+                acces = [zero.clone() for _ in range(ttt_length)]
+                return plosses, acces
             attention_mask = data["attention_mask"].cuda()
             hidden_states = data["hidden_state"].cuda()
             input_ids, target, loss_mask = target_model.preprocess(
