@@ -372,12 +372,17 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         return_logits: bool = False,
         shard_returns: bool = False,
     ):
+        tp_group = get_tp_group()
+        effective_shard_returns = (
+            shard_returns and tp_group is not None and dist.get_world_size(tp_group) > 1
+        )
+
         # set the logits processor for the model runner
         for name, module in self.model_runner.model.named_modules():
             if isinstance(module, LogitsProcessorForEAGLE3):
                 module.return_last_hidden_states = return_last_hidden_states
                 module.return_logits = return_logits
-                module.shard_returns = shard_returns
+                module.shard_returns = effective_shard_returns
 
         cache_params = CacheInitParams(
             disable=False,
@@ -408,7 +413,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         aux_hidden_states = eagle3_output.aux_hidden_states
         last_hidden_states = eagle3_output.last_hidden_states
 
-        if shard_returns:
+        if effective_shard_returns:
             tp_rank = dist.get_rank(get_tp_group())
             tp_size = dist.get_world_size(get_tp_group())
             batch_size = len(input_lens) // tp_size
@@ -418,7 +423,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             valid_input_lens = [input_lens[i] for i in valid_indices]
 
         if return_logits:
-            if shard_returns:
+            if effective_shard_returns:
                 logits = _get_sharded_return(
                     logits,
                     input_lens,
@@ -431,7 +436,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             logits = [None] * len(reqs)
 
         if capture_aux_hidden_states:
-            if shard_returns:
+            if effective_shard_returns:
                 aux_hidden_states = _get_sharded_return(
                     aux_hidden_states,
                     input_lens,
@@ -444,7 +449,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             aux_hidden_states = [None] * len(reqs)
 
         if return_last_hidden_states:
-            if shard_returns:
+            if effective_shard_returns:
                 last_hidden_states = _get_sharded_return(
                     last_hidden_states,
                     input_lens,

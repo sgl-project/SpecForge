@@ -372,6 +372,11 @@ class TargetModelServer:
         attention_mask = payload["attention_mask"].cuda()
         loss_mask = payload["loss_mask"].cuda()
         is_vlm = payload.get("is_vlm", torch.tensor(False)).item()
+        shard_returns = bool(payload.get("shard_returns", torch.tensor(False)).item())
+        if is_vlm and shard_returns:
+            raise ValueError(
+                "shard_returns is not supported for VLM Eagle3 target output"
+            )
         _t["deser"] = time.perf_counter() - _t0
 
         _t0 = time.perf_counter()
@@ -383,7 +388,8 @@ class TargetModelServer:
                 pixel_values=payload.get("pixel_values", None),
                 image_grid_thw=payload.get("image_grid_thw", None),
                 is_vlm=True,
-                rank_only_forward=rank_only_forward,
+                shard_returns=shard_returns,
+                rank_only_forward=rank_only_forward and not shard_returns,
                 pad_target=(self._vocab_t2d is None),
             )
         else:
@@ -391,15 +397,18 @@ class TargetModelServer:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 loss_mask=loss_mask,
-                rank_only_forward=rank_only_forward,
+                shard_returns=shard_returns,
+                rank_only_forward=rank_only_forward and not shard_returns,
                 pad_target=(self._vocab_t2d is None),
             )
         _t["model_fwd"] = time.perf_counter() - _t0
 
         # Non-rank-0 workers only need to participate in the model forward
         # (for TP allreduce).  Skip target_p computation and .cpu() transfers
-        # since their result is discarded by the caller.
-        if rank_only_forward:
+        # since their result is discarded by the caller.  With shard_returns,
+        # each server TP rank owns a different batch shard, so workers must
+        # still post-process their shard before rank 0 gathers the response.
+        if rank_only_forward and not shard_returns:
             parts = ", ".join(f"{k}={v:.3f}s" for k, v in _t.items())
             logger.debug("EAGLE3_WORKER_TIMING: %s", parts)
             return {}
@@ -421,7 +430,12 @@ class TargetModelServer:
             ):
                 self._vocab_t2d_cuda = self._vocab_t2d.to(target_tensor.device)
             t2d = self._vocab_t2d_cuda
-            _lm = loss_mask.unsqueeze(-1) if loss_mask.dim() == 2 else loss_mask
+            result_loss_mask = result.loss_mask
+            _lm = (
+                result_loss_mask.unsqueeze(-1)
+                if result_loss_mask.dim() == 2
+                else result_loss_mask
+            )
             target_max_token = padding(target_tensor.argmax(-1), left=False)
             position_mask = t2d[target_max_token][..., None].int() * _lm
             target_head = target_tensor[..., t2d].float()
@@ -780,6 +794,87 @@ def _route_request(app, path, body):
         raise ValueError(f"Unknown endpoint: {path}")
 
 
+_EAGLE3_BATCH_OUTPUT_KEYS = {
+    "hidden_states",
+    "target",
+    "target_topk_vals",
+    "target_topk_indices",
+    "loss_mask",
+    "input_ids",
+    "position_mask",
+    "last_hidden_states",
+}
+
+
+def _all_ranks_succeeded(success: bool) -> bool:
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return success
+    flag = torch.tensor([1 if success else 0], dtype=torch.int32, device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def _gather_tensor_dict_to_rank0(data: dict | None) -> dict | None:
+    """Gather per-rank tensor dict shards along batch dim to rank 0."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return data
+    if not _all_ranks_succeeded(data is not None):
+        raise ValueError(
+            "Cannot gather Eagle3 sharded output: at least one rank has no data"
+        )
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    keys = None
+    if rank == 0:
+        keys = [
+            k
+            for k, v in data.items()
+            if k in _EAGLE3_BATCH_OUTPUT_KEYS and isinstance(v, torch.Tensor)
+        ]
+    keys_list = [keys]
+    dist.broadcast_object_list(keys_list, src=0)
+    keys = keys_list[0]
+
+    gathered = {} if rank == 0 else None
+    for key in keys:
+        local = data[key]
+        shape = torch.tensor(local.shape, dtype=torch.long, device="cuda")
+        ndim = torch.tensor([local.ndim], dtype=torch.long, device="cuda")
+        dist.broadcast(ndim, src=0)
+        if rank != 0:
+            shape = torch.empty(int(ndim.item()), dtype=torch.long, device="cuda")
+        dist.broadcast(shape, src=0)
+        shape_tuple = tuple(int(x) for x in shape.cpu().tolist())
+        if tuple(local.shape) != shape_tuple:
+            raise ValueError(
+                f"Cannot gather remote sharded output {key}: rank {rank} shape "
+                f"{tuple(local.shape)} != rank0 shape {shape_tuple}"
+            )
+
+        local_device = local.device
+        local_for_gather = local.contiguous()
+        if not local_for_gather.is_cuda:
+            local_for_gather = local_for_gather.cuda()
+        chunks = (
+            [torch.empty_like(local_for_gather) for _ in range(world_size)]
+            if rank == 0
+            else None
+        )
+        dist.gather(local_for_gather, gather_list=chunks, dst=0)
+        if rank == 0:
+            gathered_value = torch.cat(chunks, dim=0)
+            if local_device.type == "cpu":
+                gathered_value = gathered_value.cpu()
+            gathered[key] = gathered_value
+
+    if rank == 0:
+        for key, value in data.items():
+            if key not in keys:
+                gathered[key] = value
+    return gathered
+
+
 def _broadcast_request(path, body):
     """Broadcast a POST request (path + body) from rank 0 to all tp ranks.
 
@@ -846,12 +941,30 @@ def _route_request_synced(app, path, body):
     # Non-rank-0 workers skip post-processing to avoid blocking the next step.
     if synced_path == "/generate_eagle3_data":
         out = None
+        shard_returns = False
+        forward_ok = False
         try:
+            payload = _deserialize_tensors(body_bytes, map_location="cpu")
+            shard_returns = bool(
+                payload.get("shard_returns", torch.tensor(False)).item()
+            )
             out = app._run_generate_eagle3_data(
                 body_bytes, rank_only_forward=(rank != 0)
             )
+            forward_ok = out is not None
         except Exception:
             logger.exception("Error handling %s (rank %d)", synced_path, rank)
+        if shard_returns:
+            try:
+                if _all_ranks_succeeded(forward_ok):
+                    out = _gather_tensor_dict_to_rank0(out)
+                else:
+                    out = None
+            except Exception:
+                logger.exception(
+                    "Error gathering %s shards (rank %d)", synced_path, rank
+                )
+                out = None
         if rank == 0:
             if out is not None:
                 return app._serialize_response(out)
@@ -934,12 +1047,36 @@ def _worker_loop(server_app):
 
         # Heavy endpoints: worker only participates in model forward (TP allreduce),
         # skips post-processing (target_p, .cpu() transfers) since result is discarded.
-        try:
-            if path == "/generate_eagle3_data":
-                server_app._run_generate_eagle3_data(body_bytes, rank_only_forward=True)
-            elif path == "/generate_dflash_data":
-                server_app._run_generate_dflash_data(body_bytes, rank_only_forward=True)
-            else:
-                _route_request(server_app, path, body_bytes)
-        except Exception:
-            logger.exception("Worker rank %d error handling %s", rank, path)
+        if path == "/generate_eagle3_data":
+            out = None
+            shard_returns = False
+            forward_ok = False
+            try:
+                payload = _deserialize_tensors(body_bytes, map_location="cpu")
+                shard_returns = bool(
+                    payload.get("shard_returns", torch.tensor(False)).item()
+                )
+                out = server_app._run_generate_eagle3_data(
+                    body_bytes, rank_only_forward=True
+                )
+                forward_ok = out is not None
+            except Exception:
+                logger.exception("Worker rank %d error handling %s", rank, path)
+            if shard_returns:
+                try:
+                    if _all_ranks_succeeded(forward_ok):
+                        _gather_tensor_dict_to_rank0(out)
+                except Exception:
+                    logger.exception(
+                        "Worker rank %d error gathering %s shards", rank, path
+                    )
+        else:
+            try:
+                if path == "/generate_dflash_data":
+                    server_app._run_generate_dflash_data(
+                        body_bytes, rank_only_forward=True
+                    )
+                else:
+                    _route_request(server_app, path, body_bytes)
+            except Exception:
+                logger.exception("Worker rank %d error handling %s", rank, path)

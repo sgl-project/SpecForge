@@ -384,8 +384,10 @@ def sanity_check(args: Namespace) -> None:
     if args.attention_backend == "usp":
         sp_sanity_check(args)
     if args.shard_target_output:
-        if args.target_model_backend != "sglang":
-            raise ValueError("shard_target_output is only supported for sglang backend")
+        if args.target_model_backend not in ("sglang", "remote"):
+            raise ValueError(
+                "shard_target_output is only supported for sglang or remote backend"
+            )
         if args.is_vlm:
             raise ValueError("shard_target_output is only supported non vlm model")
 
@@ -662,22 +664,24 @@ def run_eagle3_step_from_target_output(
         image_grid_thw = [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
 
     input_ids = get_dp_data_shard_from_tp(
-        eagle3_data.input_ids, args.shard_target_output
+        eagle3_data.input_ids, use_sharded_target_output(args)
     )
     attention_mask = get_dp_data_shard_from_tp(
-        eagle3_data.attention_mask, args.shard_target_output
+        eagle3_data.attention_mask, use_sharded_target_output(args)
     )
     loss_mask = get_dp_data_shard_from_tp(
-        eagle3_data.loss_mask, args.shard_target_output
+        eagle3_data.loss_mask, use_sharded_target_output(args)
     )
-    target = get_dp_data_shard_from_tp(eagle3_data.target, args.shard_target_output)
+    target = get_dp_data_shard_from_tp(
+        eagle3_data.target, use_sharded_target_output(args)
+    )
     hidden_states = get_dp_data_shard_from_tp(
-        eagle3_data.hidden_states, args.shard_target_output
+        eagle3_data.hidden_states, use_sharded_target_output(args)
     )
     position_mask = eagle3_data.position_mask
     if position_mask is not None:
         position_mask = get_dp_data_shard_from_tp(
-            position_mask, args.shard_target_output
+            position_mask, use_sharded_target_output(args)
         )
 
     (
@@ -725,6 +729,7 @@ def submit_eagle3_target_async(
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
         is_vlm=args.is_vlm,
+        shard_returns=use_sharded_target_output(args),
     )
 
 
@@ -791,7 +796,7 @@ def run_forward(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
-                    shard_returns=args.shard_target_output,
+                    shard_returns=use_sharded_target_output(args),
                 )
 
         else:
@@ -947,6 +952,10 @@ def get_progress_metrics(
     if grad_norm is not None:
         last_grad_norm = grad_norm.detach().float().item()
     return loss.item(), acc.item(), last_grad_norm
+
+
+def use_sharded_target_output(args: Namespace) -> bool:
+    return bool(args.shard_target_output and args.tp_size > 1)
 
 
 def get_dp_data_shard_from_tp(

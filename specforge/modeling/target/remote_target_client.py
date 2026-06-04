@@ -580,12 +580,14 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         pixel_values=None,
         image_grid_thw=None,
         is_vlm=False,
+        shard_returns: bool = False,
     ) -> bytes:
         """Build and serialize the Eagle3 request payload."""
         payload = {
             "input_ids": input_ids.cpu(),
             "attention_mask": attention_mask.cpu(),
             "loss_mask": loss_mask.cpu(),
+            "shard_returns": torch.tensor(bool(shard_returns)),
         }
         if is_vlm and pixel_values is not None:
             payload["pixel_values"] = pixel_values.cpu()
@@ -695,6 +697,8 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        shard_returns: bool = False,
+        **kwargs,
     ) -> Eagle3TargetOutput:
         # If TP > 1, only rank 0 sends the request, then broadcasts to others
         tp_group = _get_tp_group_if_distributed()
@@ -707,6 +711,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
                 pixel_values,
                 image_grid_thw,
                 is_vlm,
+                shard_returns,
             )
         return self._generate_eagle3_data_single(
             input_ids,
@@ -715,6 +720,28 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
             pixel_values,
             image_grid_thw,
             is_vlm,
+            shard_returns,
+        )
+
+    def _select_tp_batch_shard(
+        self, tp_group, output: Eagle3TargetOutput
+    ) -> Eagle3TargetOutput:
+        tp_rank = dist.get_rank(tp_group)
+        tp_size = dist.get_world_size(tp_group)
+
+        def shard(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor.chunk(tp_size, dim=0)[tp_rank].contiguous()
+
+        return Eagle3TargetOutput(
+            hidden_states=shard(output.hidden_states),
+            target=shard(output.target),
+            loss_mask=shard(output.loss_mask),
+            input_ids=shard(output.input_ids),
+            attention_mask=shard(output.attention_mask),
+            last_hidden_states=shard(output.last_hidden_states),
+            position_mask=shard(output.position_mask),
         )
 
     def _broadcast_eagle3_output(
@@ -722,6 +749,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         tp_group,
         attention_mask: torch.Tensor,
         output: Optional[Eagle3TargetOutput] = None,
+        shard_returns: bool = False,
     ) -> Eagle3TargetOutput:
         """Broadcast a rank-0 Eagle3 output to all ranks in the TP group."""
         tp_rank = dist.get_rank(tp_group)
@@ -743,11 +771,15 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
             if flags[1]:
                 tensors.append(output.position_mask)
             _tp_broadcast_tensors(tp_group, tp_src, tensors, flags)
-            return output
+            return (
+                self._select_tp_batch_shard(tp_group, output)
+                if shard_returns
+                else output
+            )
 
         received, flags = _tp_broadcast_tensors(tp_group, tp_src, [], [False, False])
         has_last_hidden, has_position_mask = flags
-        return Eagle3TargetOutput(
+        output = Eagle3TargetOutput(
             hidden_states=received[0],
             target=received[1],
             loss_mask=received[2],
@@ -757,6 +789,9 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
             position_mask=(
                 received[5 if has_last_hidden else 4] if has_position_mask else None
             ),
+        )
+        return (
+            self._select_tp_batch_shard(tp_group, output) if shard_returns else output
         )
 
     def _generate_eagle3_data_tp(
@@ -768,6 +803,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        shard_returns: bool = False,
     ) -> Eagle3TargetOutput:
         """TP-aware: rank 0 sends request, broadcasts result to other ranks."""
         if dist.get_rank(tp_group) == 0:
@@ -778,9 +814,14 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
                 pixel_values,
                 image_grid_thw,
                 is_vlm,
+                shard_returns,
             )
-            return self._broadcast_eagle3_output(tp_group, attention_mask, output)
-        return self._broadcast_eagle3_output(tp_group, attention_mask)
+            return self._broadcast_eagle3_output(
+                tp_group, attention_mask, output, shard_returns=shard_returns
+            )
+        return self._broadcast_eagle3_output(
+            tp_group, attention_mask, shard_returns=shard_returns
+        )
 
     def _result_to_eagle3_output(
         self, result: dict, attention_mask: torch.Tensor
@@ -825,6 +866,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        shard_returns: bool = False,
     ) -> Eagle3TargetOutput:
         payload_bytes = self._build_eagle3_payload(
             input_ids,
@@ -833,6 +875,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
             pixel_values,
             image_grid_thw,
             is_vlm,
+            shard_returns,
         )
 
         client = self._clients[next(self._next)]
@@ -847,12 +890,15 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         pixel_values=None,
         image_grid_thw=None,
         is_vlm=False,
+        shard_returns: bool = False,
     ) -> _AsyncTargetHandle:
         """Submit an async forward pass and return a future-like handle."""
         tp_group = _get_tp_group_if_distributed()
         if tp_group is not None and dist.get_rank(tp_group) != 0:
             return _AsyncTargetHandle(
-                receive=lambda: self._broadcast_eagle3_output(tp_group, attention_mask)
+                receive=lambda: self._broadcast_eagle3_output(
+                    tp_group, attention_mask, shard_returns=shard_returns
+                )
             )
 
         client = self._clients[next(self._next)]
@@ -865,6 +911,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
             pixel_values,
             image_grid_thw,
             is_vlm,
+            shard_returns,
         )
 
         def _do_request():
@@ -884,7 +931,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
                 result, attention_mask
             ),
             broadcast=lambda output: self._broadcast_eagle3_output(
-                tp_group, attention_mask, output
+                tp_group, attention_mask, output, shard_returns=shard_returns
             ),
         )
 
