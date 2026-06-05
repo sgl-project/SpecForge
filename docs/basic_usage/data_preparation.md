@@ -55,6 +55,8 @@ python scripts/regenerate_train_data.py \
     --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
 ```
 
+For reasoning models, add `--reasoning save` to store `reasoning_content` in the regenerated dataset. To use a reasoning model with thinking disabled, add `--reasoning disable`, which forwards `chat_template_kwargs.enable_thinking=false` to the SGLang server and does not save `reasoning_content`.
+
 For maximum performance, we recommend to scale the number of GPUs to regenerate the dataset in data parallel mode. To do this, you can simply add more server addresses to the `--server-address` argument, e.g. `--server-address localhost:30000 localhost:30001 localhost:30002 localhost:30003`.
 
 
