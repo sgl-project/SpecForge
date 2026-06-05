@@ -50,6 +50,7 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    position_mask: Optional[torch.Tensor] = None  # pre-computed by remote server
 
 
 class Eagle3TargetModel(ABC):
@@ -83,6 +84,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """
@@ -177,6 +179,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """
@@ -321,6 +324,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             dtype=dtype_arg,
             enable_return_hidden_states=True,
             disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
+            disable_piecewise_cuda_graph=True,
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -368,12 +372,17 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         return_logits: bool = False,
         shard_returns: bool = False,
     ):
+        tp_group = get_tp_group()
+        effective_shard_returns = (
+            shard_returns and tp_group is not None and dist.get_world_size(tp_group) > 1
+        )
+
         # set the logits processor for the model runner
         for name, module in self.model_runner.model.named_modules():
             if isinstance(module, LogitsProcessorForEAGLE3):
                 module.return_last_hidden_states = return_last_hidden_states
                 module.return_logits = return_logits
-                module.shard_returns = shard_returns
+                module.shard_returns = effective_shard_returns
 
         cache_params = CacheInitParams(
             disable=False,
@@ -404,7 +413,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         aux_hidden_states = eagle3_output.aux_hidden_states
         last_hidden_states = eagle3_output.last_hidden_states
 
-        if shard_returns:
+        if effective_shard_returns:
             tp_rank = dist.get_rank(get_tp_group())
             tp_size = dist.get_world_size(get_tp_group())
             batch_size = len(input_lens) // tp_size
@@ -414,7 +423,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             valid_input_lens = [input_lens[i] for i in valid_indices]
 
         if return_logits:
-            if shard_returns:
+            if effective_shard_returns:
                 logits = _get_sharded_return(
                     logits,
                     input_lens,
@@ -427,7 +436,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             logits = [None] * len(reqs)
 
         if capture_aux_hidden_states:
-            if shard_returns:
+            if effective_shard_returns:
                 aux_hidden_states = _get_sharded_return(
                     aux_hidden_states,
                     input_lens,
@@ -440,7 +449,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             aux_hidden_states = [None] * len(reqs)
 
         if return_last_hidden_states:
-            if shard_returns:
+            if effective_shard_returns:
                 last_hidden_states = _get_sharded_return(
                     last_hidden_states,
                     input_lens,
@@ -726,6 +735,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
         shard_returns: bool = False,
+        rank_only_forward: bool = False,
+        pad_target: bool = True,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """
@@ -764,6 +775,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     return_logits=True,
                     shard_returns=shard_returns,
                 )
+            )
+        if rank_only_forward:
+            return Eagle3TargetOutput(
+                hidden_states=None,
+                target=None,
+                loss_mask=None,
+                input_ids=None,
+                attention_mask=attention_mask,
             )
         aux_hidden_states_out = []
         target_out = []
@@ -807,8 +826,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         else:
             last_hidden_states_out = None
 
-        target_out = padding(target_out, left=False)
-        input_ids_out = padding(input_ids_out, left=False)
+        if pad_target:
+            target_out = padding(target_out, left=False)
+            input_ids_out = padding(input_ids_out, left=False)
         loss_mask_out = loss_mask_out[..., None]
 
         return Eagle3TargetOutput(
@@ -853,6 +873,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        rank_only_forward: bool = False,
         **kwargs,
     ) -> Eagle3TargetOutput:
         if kwargs:
@@ -910,6 +931,16 @@ def get_eagle3_target_model(
         )
     elif backend == "custom":
         return CustomEagle3TargetModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+    elif backend == "remote":
+        from .remote_target_client import RemoteEagle3TargetModel
+
+        return RemoteEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,

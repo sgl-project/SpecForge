@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import logging
 import math
 import os
 import time
@@ -24,7 +25,7 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
-from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.args import RemoteBackendArgs, SGLangBackendArgs, TrackerArgs
 from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
@@ -45,15 +46,16 @@ from specforge.modeling.target import (
 )
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
+from specforge.utils import create_draft_config_from_target, get_last_checkpoint
+from specforge.utils import maybe_fetch_remote_config as _maybe_fetch_remote_config
 from specforge.utils import (
-    create_draft_config_from_target,
-    get_last_checkpoint,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
-    safe_conversations_generator,
 )
+from specforge.utils import resolve_local_model_path as _resolve_local_model_path
+from specforge.utils import safe_conversations_generator
 
 
 def print_cuda_memory_debug(label: str) -> None:
@@ -126,7 +128,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--target-model-backend",
         type=str,
         default="sglang",
-        choices=["sglang", "hf", "custom"],
+        choices=["sglang", "hf", "custom", "remote"],
         help="The backend of the target model",
     )
 
@@ -198,6 +200,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument("--target-prefetch-depth", type=int, default=0)
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -255,6 +258,10 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     # sglang target model backend related args
     sglang_group = parser.add_argument_group("sglang target model backend")
     SGLangBackendArgs.add_args(sglang_group)
+
+    # remote target model backend related args
+    remote_group = parser.add_argument_group("remote target model backend")
+    RemoteBackendArgs.add_args(remote_group)
 
     # tracker related args
     tracker_group = parser.add_argument_group("tracker")
@@ -316,6 +323,8 @@ def build_target_model(
         else:
             if args.target_model_backend == "sglang":
                 target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+            elif args.target_model_backend == "remote":
+                target_model_kwargs = RemoteBackendArgs.from_args(args).to_kwargs()
             else:
                 target_model_kwargs = {}
             target_model = get_eagle3_target_model(
@@ -375,8 +384,10 @@ def sanity_check(args: Namespace) -> None:
     if args.attention_backend == "usp":
         sp_sanity_check(args)
     if args.shard_target_output:
-        if args.target_model_backend != "sglang":
-            raise ValueError("shard_target_output is only supported for sglang backend")
+        if args.target_model_backend not in ("sglang", "remote"):
+            raise ValueError(
+                "shard_target_output is only supported for sglang or remote backend"
+            )
         if args.is_vlm:
             raise ValueError("shard_target_output is only supported non vlm model")
 
@@ -410,9 +421,13 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     # Handle draft model config
     if args.draft_model_config is None:
-        # Auto-generate and save config file
+        hf_config_dict = _maybe_fetch_remote_config(args)
         auto_config_path = create_draft_config_from_target(
-            target_model_path=args.target_model_path, cache_dir=args.model_download_dir
+            target_model_path=(
+                args.target_model_path if hf_config_dict is None else None
+            ),
+            hf_config_dict=hf_config_dict,
+            cache_dir=args.model_download_dir,
         )
         draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
     else:
@@ -469,7 +484,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
                 f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
             )
 
-    draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
+    draft_model.load_embedding(
+        _resolve_local_model_path(args), embedding_key=args.embedding_key
+    )
     draft_model.freeze_embedding()
     return draft_model_config, draft_model, ckpt_info, resume_state
 
@@ -481,7 +498,7 @@ def build_dataloaders(
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_path, trust_remote_code=args.trust_remote_code
+        _resolve_local_model_path(args), trust_remote_code=args.trust_remote_code
     )
 
     # convert to dataloader
@@ -629,6 +646,100 @@ def save_checkpoints(
         dist.barrier()
 
 
+def run_eagle3_step_from_target_output(
+    args: Namespace,
+    eagle3_model: nn.Module,
+    data: dict,
+    eagle3_data,
+    image_grid_thw=None,
+) -> Tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[torch.Tensor],
+]:
+    if image_grid_thw is None and args.is_vlm and "image_grid_thw" in data:
+        image_grid_thw = [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
+
+    input_ids = get_dp_data_shard_from_tp(
+        eagle3_data.input_ids, use_sharded_target_output(args)
+    )
+    attention_mask = get_dp_data_shard_from_tp(
+        eagle3_data.attention_mask, use_sharded_target_output(args)
+    )
+    loss_mask = get_dp_data_shard_from_tp(
+        eagle3_data.loss_mask, use_sharded_target_output(args)
+    )
+    target = get_dp_data_shard_from_tp(
+        eagle3_data.target, use_sharded_target_output(args)
+    )
+    hidden_states = get_dp_data_shard_from_tp(
+        eagle3_data.hidden_states, use_sharded_target_output(args)
+    )
+    position_mask = eagle3_data.position_mask
+    if position_mask is not None:
+        position_mask = get_dp_data_shard_from_tp(
+            position_mask, use_sharded_target_output(args)
+        )
+
+    (
+        plosses,
+        _,
+        acces,
+        acc_corrects,
+        acc_denoms,
+        metric_losses,
+        metric_loss_denoms,
+    ) = eagle3_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        target=target,
+        hidden_states=hidden_states,
+        position_ids=(data["position_ids"].cuda() if "position_ids" in data else None),
+        image_grid_thw=image_grid_thw,
+        is_vlm=args.is_vlm,
+        position_mask=position_mask,
+    )
+    return plosses, acces, acc_corrects, acc_denoms, metric_losses, metric_loss_denoms
+
+
+def submit_eagle3_target_async(
+    args: Namespace,
+    target_model: Eagle3TargetModel,
+    data: dict,
+):
+    if not hasattr(target_model, "generate_eagle3_data_async"):
+        raise ValueError("Eagle3 target prefetch requires remote target async support.")
+    pixel_values = None
+    image_grid_thw = None
+    if args.is_vlm:
+        pixel_values = data.get("pixel_values")
+        image_grid_thw = (
+            [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
+            if "image_grid_thw" in data
+            else None
+        )
+    return target_model.generate_eagle3_data_async(
+        input_ids=data["input_ids"].cuda(),
+        attention_mask=data["attention_mask"].cuda(),
+        loss_mask=data["loss_mask"].cuda(),
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        is_vlm=args.is_vlm,
+        shard_returns=use_sharded_target_output(args),
+    )
+
+
+def cancel_eagle3_prefetch_queue(prefetch_queue) -> None:
+    for _, handle in prefetch_queue:
+        if hasattr(handle, "cancel"):
+            handle.cancel()
+    prefetch_queue.clear()
+
+
 def run_forward(
     args: Namespace,
     eagle3_model: nn.Module,
@@ -685,24 +796,9 @@ def run_forward(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
-                    shard_returns=args.shard_target_output,
+                    shard_returns=use_sharded_target_output(args),
                 )
 
-            input_ids = get_dp_data_shard_from_tp(
-                eagle3_data.input_ids, args.shard_target_output
-            )
-            attention_mask = get_dp_data_shard_from_tp(
-                eagle3_data.attention_mask, args.shard_target_output
-            )
-            loss_mask = get_dp_data_shard_from_tp(
-                eagle3_data.loss_mask, args.shard_target_output
-            )
-            target = get_dp_data_shard_from_tp(
-                eagle3_data.target, args.shard_target_output
-            )
-            hidden_states = get_dp_data_shard_from_tp(
-                eagle3_data.hidden_states, args.shard_target_output
-            )
         else:
             # we generate the logits using the hidden states loaded from disk
             attention_mask = data["attention_mask"].cuda()
@@ -715,6 +811,10 @@ def run_forward(
                 target.cuda()
             )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
+        if is_online:
+            return run_eagle3_step_from_target_output(
+                args, eagle3_model, data, eagle3_data, image_grid_thw
+            )
         (
             plosses,
             _,
@@ -734,6 +834,7 @@ def run_forward(
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
+            position_mask=None,
         )
     return plosses, acces, acc_corrects, acc_denoms, metric_losses, metric_loss_denoms
 
@@ -853,6 +954,10 @@ def get_progress_metrics(
     return loss.item(), acc.item(), last_grad_norm
 
 
+def use_sharded_target_output(args: Namespace) -> bool:
+    return bool(args.shard_target_output and args.tp_size > 1)
+
+
 def get_dp_data_shard_from_tp(
     tensor: torch.Tensor, sharded: bool = False
 ) -> torch.Tensor:
@@ -866,11 +971,62 @@ def get_dp_data_shard_from_tp(
     return tensor.chunk(tp_size, dim=0)[tp_rank]
 
 
+def _can_pipeline_async(args, target_model) -> bool:
+    return (
+        args.draft_accumulation_steps > 1
+        and args.target_model_backend == "remote"
+        and hasattr(target_model, "generate_eagle3_data_async")
+    )
+
+
+def run_forward_accumulated(
+    args: Namespace,
+    eagle3_model: nn.Module,
+    data_list: list,
+    target_model,
+):
+    """Async-pipelined forward for draft_accumulation_steps > 1 with remote backend.
+
+    Submits all target-forward passes to the server pool in parallel, then
+    yields results one at a time.  The caller does backward immediately after
+    each yield so that backward for batch K-1 overlaps with the collect step
+    for batch K (since multi-server may have already finished processing K).
+
+    This is a generator — iterate over it to get forward-output tuples.
+    """
+    handles = [
+        (d, submit_eagle3_target_async(args, target_model, d)) for d in data_list
+    ]
+
+    # Yield results in order so the caller can interleave backward.
+    for d, handle in handles:
+        eagle3_data = handle.result()
+        yield run_eagle3_step_from_target_output(args, eagle3_model, d, eagle3_data)
+
+
 def main():
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logging.getLogger().setLevel(logging.INFO)
+
     # ================================================
     # 1. Initialize
     # ================================================
     parser, args = parse_args()
+    if args.target_prefetch_depth < 0:
+        raise ValueError("--target-prefetch-depth must be non-negative.")
+    if args.target_prefetch_depth > 0:
+        if args.target_model_backend != "remote":
+            raise ValueError(
+                "--target-prefetch-depth is only supported with --target-model-backend remote."
+            )
+        if args.train_hidden_states_path is not None:
+            raise ValueError(
+                "--target-prefetch-depth is only supported for online remote target training."
+            )
     set_seed(args.seed)
     init_distributed(
         timeout=args.dist_timeout,
@@ -896,6 +1052,15 @@ def main():
     print_cuda_memory_debug("before build_target_model")
     target_model, processor = build_target_model(args, draft_model_config, is_online)
     print_cuda_memory_debug("after build_target_model")
+    if args.target_prefetch_depth > 0:
+        num_remote_servers = getattr(target_model, "num_remote_servers", 1)
+        effective_depth = min(args.target_prefetch_depth, num_remote_servers)
+        if effective_depth != args.target_prefetch_depth:
+            print_on_rank0(
+                f"Capping target prefetch depth from {args.target_prefetch_depth} to {effective_depth} "
+                f"for {num_remote_servers} remote server(s)."
+            )
+        args.target_prefetch_depth = effective_depth
 
     # ================================================
     # 3. Build dataloader
@@ -910,6 +1075,11 @@ def main():
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
     print_cuda_memory_debug("after load_vocab_mapping")
+
+    # Send vocab mapping to remote server for server-side target_p compression
+    if args.target_model_backend == "remote" and hasattr(draft_model, "t2d"):
+        target_model.set_vocab_mapping(draft_model.t2d)
+        print_with_rank("Sent vocab mapping to remote server")
 
     # Calculate total steps if not provided
     if args.total_steps is None:
@@ -1010,6 +1180,92 @@ def main():
     grad_norms = []
     last_grad_norm = None
 
+    def reset_training_metric_accumulators() -> None:
+        nonlocal metric_correct_sums, metric_denom_sums
+        nonlocal metric_loss_weighted_sums, metric_loss_denom_sums, grad_norms
+        metric_correct_sums = None
+        metric_denom_sums = None
+        metric_loss_weighted_sums = None
+        metric_loss_denom_sums = None
+        grad_norms = []
+
+    def update_training_metric_accumulators(
+        acc_corrects: List[torch.Tensor],
+        acc_denoms: List[torch.Tensor],
+        metric_losses: List[torch.Tensor],
+        metric_loss_denoms: List[torch.Tensor],
+    ) -> None:
+        nonlocal metric_correct_sums, metric_denom_sums
+        nonlocal metric_loss_weighted_sums, metric_loss_denom_sums
+        with torch.no_grad():
+            if metric_correct_sums is None:
+                metric_correct_sums = [
+                    correct.detach().clone() for correct in acc_corrects
+                ]
+                metric_denom_sums = [denom.detach().clone() for denom in acc_denoms]
+                metric_loss_weighted_sums = [
+                    loss.detach() * denom.detach()
+                    for loss, denom in zip(metric_losses, metric_loss_denoms)
+                ]
+                metric_loss_denom_sums = [
+                    denom.detach().clone() for denom in metric_loss_denoms
+                ]
+            else:
+                for i in range(len(acc_corrects)):
+                    metric_correct_sums[i] += acc_corrects[i].detach()
+                    metric_denom_sums[i] += acc_denoms[i].detach()
+                    metric_loss_weighted_sums[i] += (
+                        metric_losses[i].detach() * metric_loss_denoms[i].detach()
+                    )
+                    metric_loss_denom_sums[i] += metric_loss_denoms[i].detach()
+
+    def maybe_log_training_metrics(acces: List[torch.Tensor]) -> None:
+        if global_step % (args.log_interval * args.draft_accumulation_steps) != 0:
+            return
+        record_metrcs(
+            args,
+            acces,
+            metric_loss_weighted_sums,
+            global_step // args.draft_accumulation_steps,
+            tracker,
+            optimizer,
+            mode="train",
+            acc_corrects=metric_correct_sums,
+            acc_denoms=metric_denom_sums,
+            ploss_denoms=metric_loss_denom_sums,
+            grad_norms=grad_norms,
+        )
+        reset_training_metric_accumulators()
+
+    def update_progress_bar(
+        progress_bar,
+        acc_corrects: List[torch.Tensor],
+        acc_denoms: List[torch.Tensor],
+        metric_losses: List[torch.Tensor],
+        metric_loss_denoms: List[torch.Tensor],
+        grad_norm: Optional[torch.Tensor],
+    ) -> None:
+        nonlocal last_time, last_grad_norm
+        avg_loss, avg_acc, last_grad_norm = get_progress_metrics(
+            acc_corrects,
+            acc_denoms,
+            metric_losses,
+            metric_loss_denoms,
+            grad_norm,
+            last_grad_norm,
+        )
+        if dist.get_rank() == 0:
+            time_per_step = time.time() - last_time
+            last_time = time.time()
+            postfix = {
+                "loss": f"{avg_loss:.2f}",
+                "acc": f"{avg_acc:.2f}",
+                "time": f"{time_per_step:.2f}s",
+            }
+            if last_grad_norm is not None:
+                postfix["grad_norm"] = f"{last_grad_norm:.2f}"
+            progress_bar.set_postfix(postfix)
+
     # ================================================
     # 7. Start training
     # ================================================
@@ -1017,197 +1273,275 @@ def main():
         f"Starting training from epoch:{start_epoch}          step:{global_step}"
     )
 
-    for epoch in range(start_epoch, args.num_epochs):
-        # Run training
-        train_dataloader.sampler.set_epoch(epoch + 1)
+    pipeline = args.target_prefetch_depth == 0 and _can_pipeline_async(
+        args, target_model
+    )
+    accum_data = []
+    prefetch_queue = []
+    torch_profiler = None
+
+    def next_prefetch_boundary() -> int | float:
+        boundary = float("inf")
+        if args.save_interval > 0:
+            boundary = min(
+                boundary,
+                global_step + (args.save_interval - global_step % args.save_interval),
+            )
+        should_evaluate = (
+            args.eval_data_path is not None or args.eval_hidden_states_path is not None
+        )
+        eval_period = args.eval_interval * args.draft_accumulation_steps
+        if should_evaluate and eval_period > 0:
+            boundary = min(
+                boundary,
+                global_step + (eval_period - global_step % eval_period),
+            )
+        if args.max_num_steps is not None:
+            boundary = min(boundary, args.max_num_steps)
+        return boundary
+
+    def maybe_profile_step() -> None:
+        nonlocal torch_profiler
+        if not args.profile:
+            return
+        if global_step == args.profile_start_step + 1:
+            print("Start profile")
+            torch_profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=True,
+                record_shapes=args.profile_record_shapes,
+            )
+            torch_profiler.start()
+        if (
+            torch_profiler is not None
+            and global_step == args.profile_start_step + args.profile_num_steps + 1
+        ):
+            output_path = os.path.join(
+                args.output_dir,
+                f"profile_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
+            )
+            print(f"End profile {output_path=}")
+            torch_profiler.stop()
+            torch_profiler.export_chrome_trace(output_path)
+            torch_profiler = None
+
+    def maybe_evaluate(epoch: int) -> None:
+        should_evaluate = (
+            args.eval_data_path is not None or args.eval_hidden_states_path is not None
+        )
+        if not (
+            should_evaluate
+            and global_step % (args.eval_interval * args.draft_accumulation_steps) == 0
+        ):
+            return
+
+        draft_model.eval()
+        eval_acces = [[] for _ in range(eagle3_model.length)]
+        eval_plosses = [[] for _ in range(eagle3_model.length)]
+
+        for eval_data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
+            with torch.no_grad():
+                eval_ploss, eval_acc, _, _, _, _ = run_forward(
+                    args, eagle3_model, eval_data, target_model, is_online
+                )
+                eval_acces = [
+                    eval_acces[i] + [eval_acc[i]] for i in range(len(eval_acc))
+                ]
+                eval_plosses = [
+                    eval_plosses[i] + [eval_ploss[i]] for i in range(len(eval_ploss))
+                ]
+
+        eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
+        eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
+
+        record_metrcs(
+            args,
+            eval_acces,
+            eval_plosses,
+            global_step // args.draft_accumulation_steps,
+            tracker,
+            mode="eval",
+        )
         draft_model.train()
 
-        if dist.get_rank() == 0:
-            progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
-            )
-        else:
-            progress_bar = train_dataloader
+    def maybe_save_checkpoint(epoch: int) -> None:
+        if args.save_interval > 0 and global_step % args.save_interval == 0:
+            save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
-        for step_in_epoch, data in enumerate(progress_bar):
-            # Skip steps already processed in the current epoch when resuming
-            if epoch == start_epoch and step_in_epoch < skip_steps:
-                continue
+    def finish_eagle3_training_step(
+        epoch: int,
+        progress_bar,
+        plosses: List[torch.Tensor],
+        acces: List[torch.Tensor],
+        acc_corrects: List[torch.Tensor],
+        acc_denoms: List[torch.Tensor],
+        metric_losses: List[torch.Tensor],
+        metric_loss_denoms: List[torch.Tensor],
+    ) -> bool:
+        grad_norm = run_backward_and_update(args, plosses, optimizer, global_step)
+        if grad_norm is not None:
+            grad_norms.append(grad_norm)
+        update_training_metric_accumulators(
+            acc_corrects, acc_denoms, metric_losses, metric_loss_denoms
+        )
+        maybe_log_training_metrics(acces)
+        update_progress_bar(
+            progress_bar,
+            acc_corrects,
+            acc_denoms,
+            metric_losses,
+            metric_loss_denoms,
+            grad_norm,
+        )
+        maybe_evaluate(epoch)
+        maybe_save_checkpoint(epoch)
+        return args.max_num_steps is not None and global_step >= args.max_num_steps
 
-            global_step += 1
-
-            # ================================================
-            # 7.0 Profiling
-            # ================================================
-            if args.profile:
-                # we add the step by 1 to align with global step
-                if global_step == args.profile_start_step + 1:
-                    print("Start profile")
-                    torch_profiler = torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA,
-                        ],
-                        with_stack=True,
-                        record_shapes=args.profile_record_shapes,
-                    )
-                    torch_profiler.start()
-                if global_step == args.profile_start_step + args.profile_num_steps + 1:
-                    output_path = os.path.join(
-                        args.output_dir,
-                        f"profile_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
-                    )
-                    print(f"End profile {output_path=}")
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(output_path)
-
-            # ================================================
-            # 7.1 Training Step
-            # ================================================
-            (
-                plosses,
-                acces,
-                acc_corrects,
-                acc_denoms,
-                metric_losses,
-                metric_loss_denoms,
-            ) = run_forward(
+    def train_one_eagle3_batch(
+        epoch: int, progress_bar, data: dict, eagle3_data=None
+    ) -> bool:
+        nonlocal global_step
+        global_step += 1
+        maybe_profile_step()
+        if eagle3_data is None:
+            outputs = run_forward(
                 args,
                 eagle3_model,
                 data,
                 target_model,
                 is_online,
             )
-            grad_norm = run_backward_and_update(args, plosses, optimizer, global_step)
-            if grad_norm is not None:
-                grad_norms.append(grad_norm)
-
-            with torch.no_grad():
-                if metric_correct_sums is None:
-                    metric_correct_sums = [
-                        correct.detach().clone() for correct in acc_corrects
-                    ]
-                    metric_denom_sums = [denom.detach().clone() for denom in acc_denoms]
-                    metric_loss_weighted_sums = [
-                        loss.detach() * denom.detach()
-                        for loss, denom in zip(metric_losses, metric_loss_denoms)
-                    ]
-                    metric_loss_denom_sums = [
-                        denom.detach().clone() for denom in metric_loss_denoms
-                    ]
-                else:
-                    for i in range(len(acc_corrects)):
-                        metric_correct_sums[i] += acc_corrects[i].detach()
-                        metric_denom_sums[i] += acc_denoms[i].detach()
-                        metric_loss_weighted_sums[i] += (
-                            metric_losses[i].detach() * metric_loss_denoms[i].detach()
-                        )
-                        metric_loss_denom_sums[i] += metric_loss_denoms[i].detach()
-
-            # log training metrics
-            if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
-                record_metrcs(
-                    args,
-                    acces,
-                    metric_loss_weighted_sums,
-                    global_step // args.draft_accumulation_steps,
-                    tracker,
-                    optimizer,
-                    mode="train",
-                    acc_corrects=metric_correct_sums,
-                    acc_denoms=metric_denom_sums,
-                    ploss_denoms=metric_loss_denom_sums,
-                    grad_norms=grad_norms,
-                )
-                metric_correct_sums = None
-                metric_denom_sums = None
-                metric_loss_weighted_sums = None
-                metric_loss_denom_sums = None
-                grad_norms = []
-
-            avg_loss, avg_acc, last_grad_norm = get_progress_metrics(
-                acc_corrects,
-                acc_denoms,
-                metric_losses,
-                metric_loss_denoms,
-                grad_norm,
-                last_grad_norm,
+        else:
+            outputs = run_eagle3_step_from_target_output(
+                args, eagle3_model, data, eagle3_data
             )
+        return finish_eagle3_training_step(epoch, progress_bar, *outputs)
+
+    try:
+        for epoch in range(start_epoch, args.num_epochs):
+            # Run training
+            train_dataloader.sampler.set_epoch(epoch + 1)
+            draft_model.train()
+
             if dist.get_rank() == 0:
-                time_per_step = time.time() - last_time
-                last_time = time.time()
-                postfix = {
-                    "loss": f"{avg_loss:.2f}",
-                    "acc": f"{avg_acc:.2f}",
-                    "time": f"{time_per_step:.2f}s",
-                }
-                if last_grad_norm is not None:
-                    postfix["grad_norm"] = f"{last_grad_norm:.2f}"
-                progress_bar.set_postfix(postfix)
-
-            # ================================================
-            # 7.2 Evaluation Step
-            # ================================================
-            should_evaluate = (
-                args.eval_data_path is not None
-                or args.eval_hidden_states_path is not None
-            )
-            if (
-                should_evaluate
-                and global_step % (args.eval_interval * args.draft_accumulation_steps)
-                == 0
-            ):
-                # Run evaluation
-                draft_model.eval()
-                eval_acces = [[] for _ in range(eagle3_model.length)]
-                eval_plosses = [[] for _ in range(eagle3_model.length)]
-
-                for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                    with torch.no_grad():
-                        plosses, acces, _, _, _, _ = run_forward(
-                            args, eagle3_model, data, target_model, is_online
-                        )
-                        eval_acces = [
-                            eval_acces[i] + [acces[i]] for i in range(len(acces))
-                        ]
-                        eval_plosses = [
-                            eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
-                        ]
-
-                # compute average over all minibatches
-                eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
-                eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
-
-                record_metrcs(
-                    args,
-                    eval_acces,
-                    eval_plosses,
-                    global_step // args.draft_accumulation_steps,
-                    tracker,
-                    mode="eval",
+                progress_bar = tqdm(
+                    train_dataloader, desc=f"Training Epoch {epoch}", leave=True
                 )
-            # ================================================
-            # 7.3 Save Checkpoints
-            # ================================================
-            if global_step % args.save_interval == 0:
-                # Save the model
-                save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+            else:
+                progress_bar = train_dataloader
+
+            if args.target_prefetch_depth > 0:
+                data_iter = enumerate(progress_bar)
+                data_exhausted = False
+
+                def next_data():
+                    nonlocal data_exhausted
+                    while True:
+                        try:
+                            step_in_epoch, batch = next(data_iter)
+                        except StopIteration:
+                            data_exhausted = True
+                            return None
+                        if epoch == start_epoch and step_in_epoch < skip_steps:
+                            continue
+                        return batch
+
+                def fill_prefetch_queue(pending_current: int) -> None:
+                    nonlocal data_exhausted
+                    boundary = next_prefetch_boundary()
+                    while (
+                        not data_exhausted
+                        and len(prefetch_queue) < args.target_prefetch_depth
+                    ):
+                        assigned_step = (
+                            global_step + pending_current + len(prefetch_queue) + 1
+                        )
+                        if assigned_step > boundary:
+                            return
+                        batch = next_data()
+                        if batch is None:
+                            return
+                        prefetch_queue.append(
+                            (
+                                batch,
+                                submit_eagle3_target_async(args, target_model, batch),
+                            )
+                        )
+
+                fill_prefetch_queue(pending_current=0)
+                while prefetch_queue:
+                    data, handle = prefetch_queue.pop(0)
+                    eagle3_data = handle.result()
+                    fill_prefetch_queue(pending_current=1)
+                    if train_one_eagle3_batch(epoch, progress_bar, data, eagle3_data):
+                        cancel_eagle3_prefetch_queue(prefetch_queue)
+                        break
+                    if not prefetch_queue:
+                        fill_prefetch_queue(pending_current=0)
+
+                if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                    break
+                continue
+
+            for step_in_epoch, data in enumerate(progress_bar):
+                # Skip steps already processed in the current epoch when resuming
+                if epoch == start_epoch and step_in_epoch < skip_steps:
+                    continue
+
+                if pipeline:
+                    accum_data.append(data)
+                    if len(accum_data) < args.draft_accumulation_steps:
+                        continue
+                    datas = accum_data
+                    accum_data = []
+                    for outputs in run_forward_accumulated(
+                        args, eagle3_model, datas, target_model
+                    ):
+                        global_step += 1
+                        maybe_profile_step()
+                        if finish_eagle3_training_step(epoch, progress_bar, *outputs):
+                            break
+                else:
+                    if train_one_eagle3_batch(epoch, progress_bar, data):
+                        break
+
+                if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                    break
+
+            # Flush trailing batches that didn't fill a full accumulation window.
+            if pipeline and accum_data:
+                for outputs in run_forward_accumulated(
+                    args, eagle3_model, accum_data, target_model
+                ):
+                    global_step += 1
+                    maybe_profile_step()
+                    if finish_eagle3_training_step(epoch, progress_bar, *outputs):
+                        break
+                accum_data = []
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
-        if args.max_num_steps is not None and global_step >= args.max_num_steps:
-            break
-    # Save final checkpoint if training ended without saving
-    if global_step % args.save_interval != 0:
-        print_on_rank0(
-            f"Training completed at step {global_step}, saving final checkpoint..."
-        )
-        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
-
-    # Close the tracker
-    tracker.close()
-    destroy_distributed()
+        # Save final checkpoint if training ended without saving.
+        if args.save_interval <= 0 or global_step % args.save_interval != 0:
+            print_on_rank0(
+                f"Training completed at step {global_step}, saving final checkpoint..."
+            )
+            save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+    finally:
+        cancel_eagle3_prefetch_queue(prefetch_queue)
+        print_on_rank0("Closing target model...")
+        if hasattr(target_model, "close"):
+            target_model.close()
+        print_on_rank0("Closing tracker...")
+        tracker.close()
+        print_on_rank0("Destroying distributed...")
+        destroy_distributed()
+        if int(os.environ.get("RANK", "0")) == 0:
+            print("Training process cleanup complete.", flush=True)
 
 
 if __name__ == "__main__":

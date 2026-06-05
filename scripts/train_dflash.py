@@ -3,6 +3,7 @@
 """DFlash Training Script."""
 
 import argparse
+import copy
 import functools
 import logging
 import math
@@ -21,22 +22,151 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from datasets import load_dataset
-from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.args import RemoteBackendArgs, SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
+    VLM_MODEL_TYPES,
     DFlashTargetModel,
+    HFDFlashTargetModel,
     get_dflash_target_model,
 )
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+
+QWEN3_5_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
+
+
+def _resolve_target_num_hidden_layers(target_config) -> int:
+    # For VLM configs, top-level num_hidden_layers may refer to
+    # vision stack depth. DFlash target layers must follow language model depth.
+    if hasattr(target_config, "text_config") and hasattr(
+        target_config.text_config, "num_hidden_layers"
+    ):
+        return target_config.text_config.num_hidden_layers
+    if hasattr(target_config, "num_hidden_layers"):
+        return target_config.num_hidden_layers
+    raise ValueError(
+        f"Cannot infer num_target_layers from config type {type(target_config)}"
+    )
+
+
+def _get_layer_types(target_config) -> Optional[list]:
+    """Get layer_types from target config, handling VLM nesting."""
+    if hasattr(target_config, "text_config"):
+        text_cfg = target_config.text_config
+        return getattr(text_cfg, "layer_types", None)
+    return getattr(target_config, "layer_types", None)
+
+
+def _build_target_layer_ids(
+    num_target_layers: int,
+    num_draft_layers: int,
+    start_layer: int = 1,
+    end_layer: Optional[int] = None,
+    layer_types: Optional[list] = None,
+) -> list[int]:
+    """Build evenly spaced target layer ids.
+
+    For Qwen3.5 hybrid models, only full_attention layers are eligible.
+    """
+    if num_draft_layers <= 0:
+        raise ValueError("num_draft_layers must be positive.")
+
+    if end_layer is None:
+        end_layer = num_target_layers - 3
+
+    if layer_types is not None:
+        eligible = [
+            i
+            for i, lt in enumerate(layer_types)
+            if lt in ("full_attention", "attention") and start_layer <= i <= end_layer
+        ]
+        if len(eligible) == 0:
+            raise ValueError(
+                f"No eligible full_attention layers in range [{start_layer}, {end_layer}]."
+            )
+        if num_draft_layers >= len(eligible):
+            return eligible[:num_draft_layers]
+        step = len(eligible) / num_draft_layers
+        return [eligible[int(round(i * step))] for i in range(num_draft_layers)]
+
+    max_layer_idx = num_target_layers - 1
+    start_layer = max(0, min(start_layer, max_layer_idx))
+    end_layer = max(0, min(end_layer, max_layer_idx))
+
+    if end_layer < start_layer:
+        raise ValueError(
+            f"Invalid layer range: start_layer={start_layer}, end_layer={end_layer}"
+        )
+
+    if num_draft_layers == 1:
+        midpoint = num_target_layers // 2
+        return [max(start_layer, min(midpoint, end_layer))]
+
+    span = end_layer - start_layer
+    return [
+        int(start_layer + (i * span) / (num_draft_layers - 1))
+        for i in range(num_draft_layers)
+    ]
+
+
+def _resolve_draft_config(target_config):
+    model_type = getattr(target_config, "model_type", None)
+    if model_type in VLM_MODEL_TYPES and hasattr(target_config, "text_config"):
+        draft_config = copy.deepcopy(target_config.text_config)
+        for attr_name in (
+            "dflash_config",
+            "block_size",
+            "rope_scaling",
+            "rope_theta",
+            "max_position_embeddings",
+        ):
+            if not hasattr(target_config, attr_name):
+                continue
+            if (
+                not hasattr(draft_config, attr_name)
+                or getattr(draft_config, attr_name) is None
+            ):
+                setattr(draft_config, attr_name, getattr(target_config, attr_name))
+        return draft_config
+    return copy.deepcopy(target_config)
+
+
+def _resolve_target_weight_keys(target_config) -> Tuple[str, str]:
+    model_type = getattr(target_config, "model_type", None)
+    if model_type in VLM_MODEL_TYPES:
+        return "model.language_model.embed_tokens.weight", "lm_head.weight"
+    return "model.embed_tokens.weight", "lm_head.weight"
+
+
+def _ensure_layer_types(draft_config) -> None:
+    if hasattr(draft_config, "layer_types") and draft_config.layer_types is not None:
+        return
+
+    if not hasattr(draft_config, "num_hidden_layers"):
+        return
+
+    num_hidden_layers = draft_config.num_hidden_layers
+    sliding_window = getattr(draft_config, "sliding_window", None)
+    max_window_layers = getattr(draft_config, "max_window_layers", num_hidden_layers)
+    if max_window_layers is None:
+        max_window_layers = num_hidden_layers
+    draft_config.layer_types = [
+        (
+            "sliding_attention"
+            if sliding_window is not None and layer_idx >= max_window_layers
+            else "full_attention"
+        )
+        for layer_idx in range(num_hidden_layers)
+    ]
 
 
 def parse_args():
@@ -48,8 +178,8 @@ def parse_args():
         "--target-model-backend",
         type=str,
         default="hf",
-        choices=["sglang", "hf"],
-        help="Backend for target model: 'sglang' (service) or 'hf' (local)",
+        choices=["sglang", "hf", "remote"],
+        help="Backend for target model: 'sglang' (local SGLang), 'hf' (HuggingFace), or 'remote' (remote server)",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
@@ -69,6 +199,17 @@ def parse_args():
     )
     model_group.add_argument(
         "--trust-remote-code", action="store_true", help="Trust remote code"
+    )
+    model_group.add_argument(
+        "--is-vlm",
+        action="store_true",
+        help="Whether to enable VLM training mode. If not set, will auto-detect from target model config.",
+    )
+    model_group.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Use text-only data preprocessing (conversations or text column). "
+        "When set, dataset does not require images even for VLM models like Qwen3.5-27B.",
     )
     model_group.add_argument(
         "--num-anchors",
@@ -109,15 +250,31 @@ def parse_args():
         type=int,
         default=int(os.environ.get("SPECFORGE_DATA_NUM_PROC", 8)),
     )
+    dataset_group.add_argument(
+        "--min-pixels",
+        type=int,
+        default=50176,
+        help="Minimum image pixels for VLM processor.",
+    )
+    dataset_group.add_argument(
+        "--max-pixels",
+        type=int,
+        default=802816,
+        help="Maximum image pixels for VLM processor.",
+    )
 
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
+    training_group.add_argument(
+        "--max-num-steps", type=int, default=None, help="Max steps (None = full epoch)"
+    )
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
     training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
+    training_group.add_argument("--target-prefetch-depth", type=int, default=0)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
 
@@ -135,7 +292,6 @@ def parse_args():
         default=1,
         help="The size of the tensor parallel for the target model",
     )
-
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
@@ -146,30 +302,100 @@ def parse_args():
     sglang_group = parser.add_argument_group("sglang backend")
     SGLangBackendArgs.add_args(sglang_group)
 
+    # Remote backend specific args
+    remote_group = parser.add_argument_group("remote backend")
+    RemoteBackendArgs.add_args(remote_group)
+
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
+from specforge.utils import maybe_fetch_remote_config as _maybe_fetch_remote_config
+from specforge.utils import resolve_local_model_path as _resolve_local_model_path
+
+
+def build_models(
+    args, target_config=None, is_vlm: bool = False
+) -> Tuple[DFlashTargetModel, DFlashDraftModel, AutoConfig]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
     )
 
-    target_model_kwargs = {}
-    if args.target_model_backend == "sglang":
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+    if target_config is None:
+        _maybe_fetch_remote_config(args)
+        target_config = AutoConfig.from_pretrained(
+            _resolve_local_model_path(args), trust_remote_code=args.trust_remote_code
+        )
+    target_model_type = getattr(target_config, "model_type", None)
 
-    target_model = get_dflash_target_model(
-        pretrained_model_name_or_path=args.target_model_path,
-        backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
-        device="cuda" if args.target_model_backend == "hf" else None,
-        trust_remote_code=args.trust_remote_code,
-        **target_model_kwargs,
-    )
+    def _hf_target_load_kwargs():
+        return {
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": args.trust_remote_code,
+        }
+
+    def _hf_target_post_load(model):
+        return model.eval().cuda()
+
+    if (
+        args.target_model_backend == "hf"
+        and is_vlm
+        and target_model_type == "qwen3_5"
+        and args.tp_size == 1
+    ):
+        from transformers import Qwen3_5ForConditionalGeneration
+
+        target_model = HFDFlashTargetModel(
+            _hf_target_post_load(
+                Qwen3_5ForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    **_hf_target_load_kwargs(),
+                )
+            ),
+            model_type=target_model_type,
+        )
+    elif (
+        args.target_model_backend == "hf"
+        and is_vlm
+        and target_model_type == "qwen3_5_moe"
+        and args.tp_size == 1
+    ):
+        from transformers import Qwen3_5MoeForConditionalGeneration
+
+        target_model = HFDFlashTargetModel(
+            _hf_target_post_load(
+                Qwen3_5MoeForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    **_hf_target_load_kwargs(),
+                )
+            ),
+            model_type=target_model_type,
+        )
+    else:
+        target_model_kwargs = {}
+        if args.target_model_backend == "sglang":
+            target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+        elif args.target_model_backend == "remote":
+            target_model_kwargs = RemoteBackendArgs.from_args(args).to_kwargs()
+
+        target_model = get_dflash_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend=args.target_model_backend,
+            torch_dtype=torch.bfloat16,
+            device="cuda" if args.target_model_backend == "hf" else None,
+            trust_remote_code=args.trust_remote_code,
+            **target_model_kwargs,
+        )
+
+    # Resolve before draft config mutations to avoid reading modified values.
+    target_num_layers = _resolve_target_num_hidden_layers(target_config)
+    layer_types = _get_layer_types(target_config)
 
     if args.draft_config_path:
-        draft_config = AutoConfig.from_pretrained(args.draft_config_path)
+        draft_config = AutoConfig.from_pretrained(
+            args.draft_config_path, trust_remote_code=args.trust_remote_code
+        )
+        draft_config = _resolve_draft_config(draft_config)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
         # Warn if command-line args differ from config
         if (
@@ -181,15 +407,33 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
                 f"command-line arg ({args.block_size}). Using checkpoint value."
             )
     else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config = AutoConfig.from_pretrained(args.target_model_path)
+        draft_config = _resolve_draft_config(target_config)
         draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers
         print_on_rank0("Auto-generated draft config from target model")
+
+    # Always use target language model depth for capture layer mapping.
+    draft_config.num_target_layers = target_num_layers
+    _ensure_layer_types(draft_config)
 
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
+    elif not isinstance(draft_config.dflash_config, dict):
+        draft_config.dflash_config = dict(draft_config.dflash_config)
+
+    model_type = getattr(target_config, "model_type", None)
+    if model_type in QWEN3_5_MODEL_TYPES:
+        if "target_layer_ids" not in draft_config.dflash_config:
+            recommended_layer_ids = _build_target_layer_ids(
+                num_target_layers=target_num_layers,
+                num_draft_layers=draft_config.num_hidden_layers,
+                layer_types=layer_types,
+            )
+            draft_config.dflash_config["target_layer_ids"] = recommended_layer_ids
+            print_on_rank0(
+                f"Qwen3.5 detected: target_layer_ids set to {recommended_layer_ids} "
+                "(full_attention layers only)."
+            )
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -207,10 +451,15 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
 
-    return target_model, draft_model
+    return target_model, draft_model, target_config
 
 
-def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
+def build_dataloader(
+    args,
+    tokenizer,
+    is_vlm: bool = False,
+    processor: Optional[AutoProcessor] = None,
+) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
 
@@ -218,7 +467,8 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"
+        f"{args.target_model_path}-"
+        f"text_only={getattr(args, 'text_only', False)}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
@@ -229,6 +479,8 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         chat_template=args.chat_template,
         max_length=args.max_length,
         is_preformatted=args.is_preformatted,
+        is_vlm=is_vlm,
+        processor=processor,
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
@@ -249,6 +501,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
+        is_vlm=is_vlm,
     )
 
     eval_dataloader = None
@@ -260,6 +513,8 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             chat_template=args.chat_template,
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
+            is_vlm=is_vlm,
+            processor=processor,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -267,6 +522,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=get_dp_group(),
+            is_vlm=is_vlm,
         )
 
     return train_dataloader, eval_dataloader
@@ -342,6 +598,67 @@ def record_metrics(
     tracker.log(logdict, step=global_step)
 
 
+def _build_dflash_target_kwargs(data: dict, is_vlm: bool) -> dict:
+    target_kwargs = {}
+    if is_vlm:
+        if "pixel_values" in data:
+            target_kwargs["pixel_values"] = data["pixel_values"].cuda()
+        if "image_grid_thw" in data:
+            target_kwargs["image_grid_thw"] = data["image_grid_thw"].cuda()
+        if "video_grid_thw" in data:
+            target_kwargs["video_grid_thw"] = data["video_grid_thw"].cuda()
+    return target_kwargs
+
+
+def submit_dflash_target_async(target_model, data: dict, is_vlm: bool):
+    if not hasattr(target_model, "generate_dflash_data_async"):
+        raise ValueError("DFlash target prefetch requires remote target async support.")
+    return target_model.generate_dflash_data_async(
+        data["input_ids"].cuda(),
+        data["attention_mask"].cuda(),
+        data["loss_mask"].cuda(),
+        **_build_dflash_target_kwargs(data, is_vlm),
+    )
+
+
+def run_dflash_step_from_target_output(dflash_model, target_output):
+    input_ids = target_output.input_ids.cuda()
+    attention_mask = target_output.attention_mask.cuda()
+    loss_mask = target_output.loss_mask.cuda()
+    hidden_states = target_output.hidden_states.cuda()
+    position_ids = (
+        target_output.position_ids.cuda()
+        if target_output.position_ids is not None
+        else None
+    )
+
+    loss, accuracy = dflash_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+        loss_mask=loss_mask,
+        position_ids=position_ids,
+    )
+    return loss, accuracy
+
+
+def run_dflash_step_sync(args, target_model, dflash_model, data: dict, is_vlm: bool):
+    target_output = target_model.generate_dflash_data(
+        data["input_ids"].cuda(),
+        data["attention_mask"].cuda(),
+        data["loss_mask"].cuda(),
+        **_build_dflash_target_kwargs(data, is_vlm),
+    )
+    return run_dflash_step_from_target_output(dflash_model, target_output)
+
+
+def cancel_dflash_prefetch_queue(prefetch_queue) -> None:
+    for _, handle in prefetch_queue:
+        if hasattr(handle, "cancel"):
+            handle.cancel()
+    prefetch_queue.clear()
+
+
 def main():
 
     logging.basicConfig(
@@ -356,11 +673,43 @@ def main():
     )
 
     args = parse_args()
+    if args.target_prefetch_depth < 0:
+        raise ValueError("--target-prefetch-depth must be non-negative.")
+    if args.target_prefetch_depth > 0 and args.target_model_backend != "remote":
+        raise ValueError(
+            "--target-prefetch-depth is only supported with --target-model-backend remote."
+        )
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
+    # Fetch remote config early so _server_model_path is cached before any
+    # _resolve_local_model_path() call.
+    _maybe_fetch_remote_config(args)
+    target_config = AutoConfig.from_pretrained(
+        _resolve_local_model_path(args), trust_remote_code=args.trust_remote_code
+    )
+    detected_vlm = getattr(target_config, "model_type", None) in VLM_MODEL_TYPES
+    is_vlm = args.is_vlm or detected_vlm
+    if detected_vlm and not args.is_vlm:
+        print_on_rank0(
+            f"Detected VLM target config (model_type={getattr(target_config, 'model_type', None)}); "
+            "enabling VLM mode automatically."
+        )
+    if is_vlm and not args.text_only and args.target_model_backend != "hf":
+        raise ValueError(
+            "Real multimodal DFlash training currently supports only HF backend. "
+            "Please set --target-model-backend hf."
+        )
+    is_vlm_data = is_vlm and not args.text_only
+    if args.text_only:
+        print_on_rank0(
+            "text-only mode: using text preprocessing (conversations/text column) without images"
+        )
+    print_on_rank0(
+        f"Detected target model_type={getattr(target_config, 'model_type', None)}, is_vlm={is_vlm}, is_vlm_data={is_vlm_data}"
+    )
     draft_model_last_checkpoint = None
     ckpt_info = (0, 0)
     if args.resume and os.path.isdir(args.output_dir):
@@ -376,7 +725,18 @@ def main():
             print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
             args.draft_config_path = checkpoint_config_path
 
-    target_model, draft_model = build_models(args)
+    target_model, draft_model, target_config = build_models(
+        args, target_config, is_vlm=is_vlm
+    )
+    if args.target_prefetch_depth > 0:
+        num_remote_servers = getattr(target_model, "num_remote_servers", 1)
+        effective_depth = min(args.target_prefetch_depth, num_remote_servers)
+        if effective_depth != args.target_prefetch_depth:
+            print_on_rank0(
+                f"Capping target prefetch depth from {args.target_prefetch_depth} to {effective_depth} "
+                f"for {num_remote_servers} remote server(s)."
+            )
+        args.target_prefetch_depth = effective_depth
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -399,7 +759,17 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    if is_vlm:
+        processor = AutoProcessor.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+        )
+        tokenizer = processor.tokenizer
+    else:
+        processor = None
+        tokenizer = AutoTokenizer.from_pretrained(_resolve_local_model_path(args))
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
@@ -415,17 +785,34 @@ def main():
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
+    train_dataloader, eval_dataloader = build_dataloader(
+        args,
+        tokenizer,
+        is_vlm=is_vlm_data,
+        processor=processor if is_vlm_data else None,
+    )
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
+    resolved_embed_key, resolved_lm_head_key = _resolve_target_weight_keys(
+        target_config
+    )
+    embed_key = (
+        args.embedding_key if args.embedding_key is not None else resolved_embed_key
+    )
+    lm_head_key = (
+        args.lm_head_key if args.lm_head_key is not None else resolved_lm_head_key
+    )
+    print_on_rank0(
+        f"Loading target embeddings/head with keys: embed='{embed_key}', head='{lm_head_key}'"
+    )
     target_components = TargetEmbeddingsAndHead.from_pretrained(
-        args.target_model_path,
-        embed_key=args.embedding_key,
-        lm_head_key=args.lm_head_key,
+        _resolve_local_model_path(args),
+        embed_key=embed_key,
+        lm_head_key=lm_head_key,
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
@@ -506,82 +893,159 @@ def main():
     last_time = time.time()
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
-    for epoch in range(start_epoch, args.num_epochs):
-        train_dataloader.sampler.set_epoch(epoch)
-        draft_model.train()
+    prefetch_queue = []
 
-        if dist.get_rank() == 0:
-            progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+    def next_prefetch_boundary() -> int | float:
+        boundary = float("inf")
+        if args.save_interval > 0:
+            boundary = min(
+                boundary,
+                global_step + (args.save_interval - global_step % args.save_interval),
+            )
+        if args.max_num_steps is not None:
+            boundary = min(boundary, args.max_num_steps)
+        return boundary
+
+    def train_one_dflash_batch(
+        epoch: int, progress_bar, data: dict, target_output=None
+    ) -> bool:
+        nonlocal global_step, last_time
+        global_step += 1
+        if target_output is None:
+            loss, accuracy = run_dflash_step_sync(
+                args, target_model, dflash_model, data, is_vlm
             )
         else:
-            progress_bar = train_dataloader
-
-        for step_in_epoch, data in enumerate(progress_bar):
-            if epoch == start_epoch and step_in_epoch < skip_steps:
-                continue
-            global_step += 1
-
-            input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
-            target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
-
-            loss, accuracy = dflash_model(
-                input_ids=input_ids,
-                hidden_states=hidden_states,
-                loss_mask=loss_mask,
+            loss, accuracy = run_dflash_step_from_target_output(
+                dflash_model, target_output
             )
 
-            (loss / args.accumulation_steps).backward()
+        (loss / args.accumulation_steps).backward()
 
-            if global_step % args.accumulation_steps == 0:
-                optimizer.step()
+        if global_step % args.accumulation_steps == 0:
+            optimizer.step()
 
-            if global_step % args.log_interval == 0:
-                loss_log = loss.clone()
-                acc_log = accuracy.clone()
-                dist.all_reduce(loss_log)
-                dist.all_reduce(acc_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
+        if global_step % args.log_interval == 0:
+            loss_log = loss.clone()
+            acc_log = accuracy.clone()
+            dist.all_reduce(loss_log)
+            dist.all_reduce(acc_log)
+            loss_log = loss_log / dist.get_world_size()
+            acc_log = acc_log / dist.get_world_size()
 
-                record_metrics(
-                    args,
-                    loss_log.item(),
-                    acc_log.item(),
-                    global_step,
-                    tracker,
-                    optimizer,
-                    train_dataloader,
-                    mode="train",
-                )
+            record_metrics(
+                args,
+                loss_log.item(),
+                acc_log.item(),
+                global_step,
+                tracker,
+                optimizer,
+                train_dataloader,
+                mode="train",
+            )
+
+        if dist.get_rank() == 0:
+            elapsed = time.time() - last_time
+            last_time = time.time()
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "acc": f"{accuracy.item():.4f}",
+                    "iter_time": f"{elapsed:.2f}s",
+                }
+            )
+
+        if args.save_interval > 0 and global_step % args.save_interval == 0:
+            save_checkpoint(
+                args, epoch, global_step, dflash_model, draft_model, optimizer
+            )
+
+        return args.max_num_steps is not None and global_step >= args.max_num_steps
+
+    try:
+        for epoch in range(start_epoch, args.num_epochs):
+            train_dataloader.sampler.set_epoch(epoch)
+            draft_model.train()
 
             if dist.get_rank() == 0:
-                elapsed = time.time() - last_time
-                last_time = time.time()
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{loss.item():.4f}",
-                        "acc": f"{accuracy.item():.4f}",
-                        "iter_time": f"{elapsed:.2f}s",
-                    }
+                progress_bar = tqdm(
+                    train_dataloader, desc=f"Training Epoch {epoch}", leave=True
                 )
+            else:
+                progress_bar = train_dataloader
 
-            if global_step % args.save_interval == 0:
-                save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
-                )
+            if args.target_prefetch_depth > 0:
+                data_iter = enumerate(progress_bar)
+                data_exhausted = False
 
-    save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
-    )
+                def next_data():
+                    nonlocal data_exhausted
+                    while True:
+                        try:
+                            step_in_epoch, batch = next(data_iter)
+                        except StopIteration:
+                            data_exhausted = True
+                            return None
+                        if epoch == start_epoch and step_in_epoch < skip_steps:
+                            continue
+                        return batch
 
-    tracker.close()
-    destroy_distributed()
+                def fill_prefetch_queue(pending_current: int) -> None:
+                    nonlocal data_exhausted
+                    boundary = next_prefetch_boundary()
+                    while (
+                        not data_exhausted
+                        and len(prefetch_queue) < args.target_prefetch_depth
+                    ):
+                        assigned_step = (
+                            global_step + pending_current + len(prefetch_queue) + 1
+                        )
+                        if assigned_step > boundary:
+                            return
+                        batch = next_data()
+                        if batch is None:
+                            return
+                        prefetch_queue.append(
+                            (
+                                batch,
+                                submit_dflash_target_async(target_model, batch, is_vlm),
+                            )
+                        )
+
+                fill_prefetch_queue(pending_current=0)
+                while prefetch_queue:
+                    data, handle = prefetch_queue.pop(0)
+                    target_output = handle.result()
+                    fill_prefetch_queue(pending_current=1)
+                    if train_one_dflash_batch(epoch, progress_bar, data, target_output):
+                        cancel_dflash_prefetch_queue(prefetch_queue)
+                        break
+                    if not prefetch_queue:
+                        fill_prefetch_queue(pending_current=0)
+            else:
+                for step_in_epoch, data in enumerate(progress_bar):
+                    if epoch == start_epoch and step_in_epoch < skip_steps:
+                        continue
+                    if train_one_dflash_batch(epoch, progress_bar, data):
+                        break
+
+            if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                break
+
+        save_checkpoint(
+            args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        )
+    finally:
+        cancel_dflash_prefetch_queue(prefetch_queue)
+        print_on_rank0("Closing target model...")
+        if hasattr(target_model, "close"):
+            target_model.close()
+        print_on_rank0("Closing tracker...")
+        tracker.close()
+        print_on_rank0("Destroying distributed...")
+        destroy_distributed()
+        if int(os.environ.get("RANK", "0")) == 0:
+            print("Training process cleanup complete.", flush=True)
 
 
 if __name__ == "__main__":

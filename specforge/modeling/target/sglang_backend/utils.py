@@ -57,13 +57,16 @@ def replaced_logits_processor_forward_for_eagle3(
         logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
     # Multi-item scoring only for prefill-only requests.
-    if self.multi_item_delimiter is not None and logits_metadata.is_prefill_only:
+    multi_item_delimiter = getattr(self, "multi_item_delimiter", None)
+    if multi_item_delimiter is not None and getattr(
+        logits_metadata, "is_prefill_only", False
+    ):
         return self.compute_logprobs_for_multi_item_scoring(
             input_ids,
             hidden_states,
             lm_head,
             logits_metadata,
-            self.multi_item_delimiter,
+            multi_item_delimiter,
         )
 
     # Diffusion LLM only.

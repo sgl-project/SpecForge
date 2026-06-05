@@ -10,6 +10,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     initialize_dp_attention,
@@ -82,7 +83,10 @@ class SGLangRunner(ModelRunner):
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
-        if self.server_args.dist_init_addr:
+        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+        if dist_init_method_override:
+            dist_init_method = dist_init_method_override
+        elif self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
@@ -115,18 +119,15 @@ class SGLangRunner(ModelRunner):
                 world_size=self.tp_size * self.pp_size,
                 rank=self.tp_size * self.pp_rank + self.tp_rank,
                 local_rank=self.gpu_id,
+                distributed_init_method=dist_init_method,
+                timeout=self.server_args.dist_timeout,
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
-            # NOTE: Updated for sglang 0.5.9
-            # - Removed torch_compile parameter (no longer supported)
-            # - Added new parameters: attention_data_parallel_size, attention_context_model_parallel_size, moe_data_model_parallel_size
 
-            # Debug: Print the values
             dp_size = getattr(self.server_args, "dp_size", 1)
             attn_cp_size = getattr(self.server_args, "attn_cp_size", 1)
             moe_dp_size = getattr(self.server_args, "moe_dp_size", 1)
-            print(
-                f"[DEBUG] tp_size={self.tp_size}, dp_size={dp_size}, attn_cp_size={attn_cp_size}, moe_dp_size={moe_dp_size}"
-            )
 
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -136,6 +137,8 @@ class SGLangRunner(ModelRunner):
                 attention_context_model_parallel_size=attn_cp_size,
                 moe_data_model_parallel_size=moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+                enable_symm_mem=self.server_args.enable_symm_mem,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_dp_attention(
                 server_args=self.server_args,

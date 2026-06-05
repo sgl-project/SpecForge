@@ -59,7 +59,7 @@ class TemplateRegistry:
             override(bool): Whether to override the existing template, default to False
         """
         assert (
-            not override and name not in self.templates
+            override or name not in self.templates
         ), f"Chat template for the model type {name} has already been registered"
         self.templates[name] = template
 
@@ -126,6 +126,28 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3.5",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3.5-thinking",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
     ),
 )
 
@@ -309,18 +331,5 @@ TEMPLATE_REGISTRY.register(
         user_header="<longcat_user>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="</longcat_s>",
-    ),
-)
-
-
-TEMPLATE_REGISTRY.register(
-    name="qwen3.5",
-    template=ChatTemplate(
-        assistant_header="<|im_start|>assistant\n<think>\n",
-        user_header="<|im_start|>user\n",
-        system_prompt="",
-        end_of_turn_token="<|im_end|>\n",
-        parser_type="thinking",
-        enable_thinking=True,
     ),
 )

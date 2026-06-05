@@ -6,6 +6,68 @@ from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
 
 
 @dataclass
+class RemoteBackendArgs:
+    """Arguments for the remote target model backend.
+
+    When using the 'remote' backend, the training script connects to a separately
+    launched target model server via HTTP instead of loading the model locally.
+    """
+
+    remote_url: str = None
+    remote_urls: List[str] = None  # comma-separated list for multi-server
+    remote_timeout: int = 120
+    remote_max_retries: int = 3
+
+    @staticmethod
+    def add_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--remote-url",
+            type=str,
+            default=None,
+            help="URL of the remote target model server (defaults to --target-model-path).",
+        )
+        parser.add_argument(
+            "--remote-urls",
+            type=str,
+            default=None,
+            help="Comma-separated URLs for multi-server inference (e.g. http://h1:8001,http://h2:8001).",
+        )
+        parser.add_argument(
+            "--remote-timeout",
+            type=int,
+            default=120,
+            help="Timeout in seconds for HTTP requests to the remote server.",
+        )
+        parser.add_argument(
+            "--remote-max-retries",
+            type=int,
+            default=3,
+            help="Maximum number of retries for failed HTTP requests.",
+        )
+
+    @staticmethod
+    def from_args(args: argparse.Namespace) -> "RemoteBackendArgs":
+        raw_urls = getattr(args, "remote_urls", None)
+        return RemoteBackendArgs(
+            remote_url=getattr(args, "remote_url", None),
+            remote_urls=raw_urls.split(",") if raw_urls else None,
+            remote_timeout=getattr(args, "remote_timeout", 120),
+            remote_max_retries=getattr(args, "remote_max_retries", 3),
+        )
+
+    def to_kwargs(self) -> Dict[str, Any]:
+        kwargs = dict(
+            timeout=self.remote_timeout,
+            max_retries=self.remote_max_retries,
+        )
+        if self.remote_urls:
+            kwargs["urls"] = self.remote_urls
+        elif self.remote_url:
+            kwargs["url"] = self.remote_url
+        return kwargs
+
+
+@dataclass
 class TrackerArgs:
     report_to: str = "none"
     wandb_project: str = None
@@ -96,7 +158,7 @@ class SGLangBackendArgs:
     sglang_enable_torch_compile: bool = True
     sglang_enable_dp_attention: bool = False
     sglang_enable_dp_lm_head: bool = False
-    sglang_enable_piecewise_cuda_graph: bool = False
+    sglang_enforce_piecewise_cuda_graph: bool = False
     sglang_piecewise_cuda_graph_max_tokens: int = 4096
     sglang_piecewise_cuda_graph_tokens: List[int] = None
     sglang_ep_size: int = 1
@@ -151,7 +213,7 @@ class SGLangBackendArgs:
             help="Enable piecewise CUDA graph for SGLang backend",
         )
         parser.add_argument(
-            "--sglang-enable-piecewise-cuda-graph",
+            "--sglang-enforce-piecewise-cuda-graph",
             action="store_true",
             help="Enable piecewise CUDA graph for SGLang backend's prefill",
         )
@@ -186,7 +248,7 @@ class SGLangBackendArgs:
             sglang_enable_torch_compile=args.sglang_enable_torch_compile,
             sglang_enable_dp_attention=args.sglang_enable_dp_attention,
             sglang_enable_dp_lm_head=args.sglang_enable_dp_lm_head,
-            sglang_enable_piecewise_cuda_graph=args.sglang_enable_piecewise_cuda_graph,
+            sglang_enforce_piecewise_cuda_graph=args.sglang_enforce_piecewise_cuda_graph,
             sglang_piecewise_cuda_graph_max_tokens=args.sglang_piecewise_cuda_graph_max_tokens,
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
@@ -210,7 +272,7 @@ class SGLangBackendArgs:
             enable_torch_compile=self.sglang_enable_torch_compile,
             enable_dp_attention=self.sglang_enable_dp_attention,
             enable_dp_lm_head=self.sglang_enable_dp_lm_head,
-            enable_piecewise_cuda_graph=self.sglang_enable_piecewise_cuda_graph,
+            enforce_piecewise_cuda_graph=self.sglang_enforce_piecewise_cuda_graph,
             piecewise_cuda_graph_max_tokens=self.sglang_piecewise_cuda_graph_max_tokens,
             piecewise_cuda_graph_tokens=self.sglang_piecewise_cuda_graph_tokens,
             ep_size=self.sglang_ep_size,

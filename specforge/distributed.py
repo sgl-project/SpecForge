@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 from typing import Any, Optional
 
@@ -71,9 +72,22 @@ def init_distributed(
     Args:
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
+
+    The GPU device is selected by (in priority order):
+    1. ``SPECFORGE_GPU_ID`` environment variable (absolute GPU index)
+    2. ``LOCAL_RANK`` environment variable (set by torchrun)
+    3. ``dist.get_rank() % torch.cuda.device_count()``
     """
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
+    local_rank = int(
+        os.environ.get(
+            "SPECFORGE_GPU_ID",
+            os.environ.get(
+                "LOCAL_RANK",
+                str(dist.get_rank() % torch.cuda.device_count()),
+            ),
+        )
+    )
     torch.cuda.set_device(local_rank)
     print_with_rank(f"bind to device {local_rank}")
 
@@ -121,14 +135,35 @@ def init_distributed(
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
+    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    if not dist.is_initialized():
+        return
+
+    seen = set()
+    for group in (
+        _TP_GROUP,
+        _DP_GROUP,
+        _SP_ULYSSES_GROUP,
+        _SP_RING_GROUP,
+        _DRAFT_DP_GROUP,
+        _DRAFT_SP_GROUP,
+    ):
+        if group is None or group in seen:
+            continue
+        seen.add(group)
+        try:
+            if group is not dist.group.WORLD:
+                dist.destroy_process_group(group)
+        except Exception:
+            pass
+
     dist.destroy_process_group()
+    _TP_GROUP = None
+    _DP_GROUP = None
+    _SP_ULYSSES_GROUP = None
+    _SP_RING_GROUP = None
+    _DRAFT_DP_GROUP = None
+    _DRAFT_SP_GROUP = None
 
 
 def shard_tensor(
