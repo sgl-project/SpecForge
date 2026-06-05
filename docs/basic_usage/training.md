@@ -60,3 +60,11 @@ It is important to note that the `run_llama3.1_8b_eagle3_offline.sh` script cons
 ## 📈 Experiment Tracking
 
 This project supports logging training progress to Wandb, TensorBoard, and SwanLab. You can enable tracking by adding the `--report-to` argument to the command line in your shell script.
+
+
+## 💾 Checkpoint Management
+To ensure robust training, SpecForge now supports fine-grained checkpointing strategies through `--save-strategy=best` and `--save-total-limit`.
+
+`--save-strategy=best`: Automatically tracks and preserves the checkpoint with the best evaluation metric (by default, `acc_0`). This prevents overfitting and ensures that you always have access to the most optimized version of the draft model, regardless of when the training is interrupted.
+
+`--save-total-limit`: This feature strictly limits the number of saved checkpoints, automatically deleting older or underperforming ones to prevent disk overflow while maintaining a reliable recovery point.
