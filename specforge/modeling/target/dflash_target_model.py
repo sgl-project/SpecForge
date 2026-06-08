@@ -18,6 +18,7 @@ from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
+from specforge.utils import current_device
 
 from .sglang_backend import SGLangRunner
 
@@ -98,7 +99,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=torch.cuda.current_device(),
+            gpu_id=current_device(),
             tp_rank=dist.get_rank(get_tp_group()),
             tp_size=server_args.tp_size,
             moe_ep_rank=moe_ep_rank,

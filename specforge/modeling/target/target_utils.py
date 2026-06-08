@@ -10,6 +10,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from specforge.utils import get_device_type
+
 
 class TargetEmbeddingsAndHead(nn.Module):
     """
@@ -45,12 +47,13 @@ class TargetEmbeddingsAndHead(nn.Module):
         embed_key: Optional[str] = None,
         lm_head_key: Optional[str] = None,
         cache_dir: Optional[str] = None,
-        device: str = "cuda",
+        device: str = None,
         dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = False,
     ) -> "TargetEmbeddingsAndHead":
 
-        # 1. Load Config
+        if device is None:
+            device = get_device_type()
         config = AutoConfig.from_pretrained(
             model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
         )

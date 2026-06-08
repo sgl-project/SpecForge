@@ -28,6 +28,7 @@ from .target.custom_backend import (
     Qwen3ForCausalLM,
     Qwen3MoeForCausalLM,
 )
+from specforge.utils import get_local_device
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
@@ -125,7 +126,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         if device is not None:
             model = model.to(device)
         else:
-            model = model.cuda()
+            model = model.to(get_local_device())
         return model
 
 

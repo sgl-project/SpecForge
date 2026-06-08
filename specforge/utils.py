@@ -79,11 +79,49 @@ def get_local_device() -> torch.device:
     """Return the local torch.device for the current process rank."""
     device_type = get_device_type()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if device_type == "cuda":
-        return torch.device("cuda", local_rank)
-    if device_type == "npu":
-        return torch.device("npu", local_rank)
+    if device_type in ("cuda", "npu"):
+        return torch.device(device_type, local_rank)
     return torch.device("cpu")
+
+
+def get_device_module():
+    """Return the torch device module for the current device type (cuda, npu, etc.)."""
+    return torch.get_device_module(get_device_type())
+
+
+def empty_cache():
+    """Empty the cache for the current accelerator device."""
+    get_device_module().empty_cache()
+
+
+def device_count() -> int:
+    """Return the number of available accelerator devices."""
+    return get_device_module().device_count()
+
+
+def current_device() -> int:
+    """Return the current accelerator device index."""
+    return get_device_module().current_device()
+
+
+def set_device(device_id: int):
+    """Set the current accelerator device."""
+    get_device_module().set_device(device_id)
+
+
+def synchronize():
+    """Synchronize the current accelerator device."""
+    get_device_module().synchronize()
+
+
+def get_dist_backend() -> str:
+    """Return the appropriate distributed backend for the current device type."""
+    device_type = get_device_type()
+    if device_type == "cuda":
+        return "nccl"
+    if device_type == "npu":
+        return "hccl"
+    return "gloo"
 
 
 def print_with_rank(message):

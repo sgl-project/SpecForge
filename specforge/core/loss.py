@@ -10,7 +10,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from specforge.utils import get_compile_backend
+from specforge.utils import get_compile_backend, get_device_type
 
 
 # Reference implementation
@@ -231,7 +231,7 @@ class LogSoftmaxLoss(torch.autograd.Function):
 
 
 if __name__ == "__main__":
-    device = "cuda"
+    device = get_device_type()
     B, T, V = 1, 1024, 16000
     logits = torch.randn(B, T, V, device=device, requires_grad=True)
     logits2 = logits.clone().detach().requires_grad_(True)

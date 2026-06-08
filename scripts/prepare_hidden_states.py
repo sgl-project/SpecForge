@@ -59,6 +59,9 @@ from specforge.distributed import (
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.utils import (
+    empty_cache,
+    get_device_type,
+    get_local_device,
     print_args_with_dots,
     print_with_rank,
     rank_0_priority,
@@ -183,7 +186,7 @@ def build_target_model(
                 ),
             )
             .eval()
-            .cuda()
+            .to(device=get_local_device())
         )
     else:
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -195,7 +198,7 @@ def build_target_model(
                 if hasattr(model_config, "dtype")
                 else model_config.torch_dtype
             ),
-            device="cuda",
+            device=get_device_type(),
             cache_dir=args.model_download_dir,
             trust_remote_code=args.trust_remote_code,
             **target_model_kwargs,
@@ -463,11 +466,11 @@ class HiddenStatesGenerator:
                     output_path, current_batch_indices
                 )
                 exists_tensor = torch.tensor(
-                    exists_list, dtype=torch.bool, device="cuda"
+                    exists_list, dtype=torch.bool, device=get_local_device()
                 )
             else:
                 exists_tensor = torch.tensor(
-                    [False] * batch_size, dtype=torch.bool, device="cuda"
+                    [False] * batch_size, dtype=torch.bool, device=get_local_device()
                 )
             dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
 
@@ -504,7 +507,7 @@ class HiddenStatesGenerator:
                 continue
 
             filtered_batch_gpu = {
-                k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
+                k: v.to(get_local_device(), non_blocking=True) for k, v in filtered_batch.items()
             }
             _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
                 **filtered_batch_gpu,
@@ -559,7 +562,7 @@ class HiddenStatesGenerator:
             del aux_hidden_states_list, last_hidden_states_list, filtered_batch
 
             if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
-                torch.cuda.empty_cache()
+                empty_cache()
                 gc.collect()
 
             if self.show_progress:
