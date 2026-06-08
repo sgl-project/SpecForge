@@ -33,7 +33,7 @@ from specforge.core.compact_teacher import (
 )
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import log_softmax_loss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import get_compile_backend, empty_cache, padding
 
@@ -69,7 +69,7 @@ def _compute_loss_and_acceptance_rate(
         reduce_metrics_fn: Optional distributed reducer for metric numer/denom.
         reduce_loss_fn: Optional distributed reducer for KL loss.
     """
-    kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    kl_loss = log_softmax_loss(logits, target_p, position_mask)
     if reduce_loss_fn is not None:
         kl_loss = reduce_loss_fn(kl_loss)
 

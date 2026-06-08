@@ -3,7 +3,7 @@ import time
 
 import torch
 
-from specforge.core.loss import LogSoftmaxLoss, _compute_loss
+from specforge.core.loss import log_softmax_loss, _compute_loss
 from specforge.utils import empty_cache, get_device_type, get_local_device, synchronize
 
 TTT_LENGTH = 7
@@ -48,7 +48,7 @@ def benchmark_loss_method(
         for i in range(TTT_LENGTH):
             logits = logits_list[i]
             if loss_method == "triton":
-                loss = LogSoftmaxLoss.apply(logits, target, position_mask)
+                loss = log_softmax_loss(logits, target, position_mask)
             else:
                 loss = _compute_loss(logits, target, position_mask)
             plosses.append(loss)
