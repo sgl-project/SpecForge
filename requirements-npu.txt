@@ -1,4 +1,4 @@
-# Use the PyTorch ROCm wheel index (choose the stream that matches your system)
+# Use the PyTorch CPU wheel index cause torch_npu depends on a CPU version of PyTorch
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 pre-commit

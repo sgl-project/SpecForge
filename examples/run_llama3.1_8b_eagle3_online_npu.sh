@@ -7,7 +7,7 @@ NUM_GPUS=${1:-1}
 TP_SIZE=${2:-1}
 BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
-# Currently we only train with --max-length 2048 due to OOM issue on 8 * A3(64GB)
+# Currently we only train with --max-length 2048 due to OOM issue on A3(64GB)
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \

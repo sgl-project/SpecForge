@@ -24,3 +24,18 @@ uv pip install -v . --prerelease=allow
 ```bash
 pip install specforge
 ```
+
+- **Install on Ascend NPU**
+
+1. Pull compatible SGLang image for Ascend NPU, currently `quay.io/ascend/sglang:v0.5.9-cann8.5.0-a3` on A3 device, or `quay.io/ascend/sglang:v0.5.9-cann8.5.0-910b` on A2 device.
+2. Install SpecForge.
+
+```bash
+# git clone the source code
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge
+
+# install specforge
+pip install -r requirements-npu.txt
+pip install . --no-deps
+```
