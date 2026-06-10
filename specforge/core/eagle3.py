@@ -146,7 +146,15 @@ class OnlineEagle3Model(Eagle3Model):
         position_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         adapter: BackendAdapter,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         with torch.no_grad():
             pred_draft_token_ids = logits.argmax(-1)
             pred_target_token_ids = (
@@ -172,7 +180,20 @@ class OnlineEagle3Model(Eagle3Model):
             reduce_metrics_fn=adapter.reduce_metrics,
             reduce_loss_fn=adapter.reduce_loss,
         )
-        return acc, acceptance_rate, loss
+        loss_denom = torch.tensor(
+            logits.shape[0] * logits.shape[1],
+            device=logits.device,
+            dtype=torch.float32,
+        )
+        return (
+            acc,
+            acceptance_rate,
+            loss,
+            local_correct,
+            local_denom,
+            loss.detach(),
+            loss_denom,
+        )
 
     def _prepare_position_ids(
         self,
@@ -219,7 +240,15 @@ class OnlineEagle3Model(Eagle3Model):
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
         **kwargs,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+    ]:
         """
         Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
 
@@ -287,6 +316,10 @@ class OnlineEagle3Model(Eagle3Model):
         plosses = []
         acceptance_rates = []
         acces = []
+        metric_corrects = []
+        metric_denoms = []
+        metric_losses = []
+        metric_loss_denoms = []
         adapter = self._make_adapter()
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
@@ -338,7 +371,15 @@ class OnlineEagle3Model(Eagle3Model):
             logits = self.draft_model.compute_logits(hidden_states)
 
             # Step 5.5 + 5.6: metric and loss
-            acc, acceptance_rate, loss = self._acc_and_loss(
+            (
+                acc,
+                acceptance_rate,
+                loss,
+                correct,
+                denom,
+                metric_loss,
+                loss_denom,
+            ) = self._acc_and_loss(
                 logits=logits,
                 target_p=state.target_p,
                 target_p_on_draft=state.target_p_on_draft,
@@ -350,6 +391,10 @@ class OnlineEagle3Model(Eagle3Model):
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
+            metric_corrects.append(correct)
+            metric_denoms.append(denom)
+            metric_losses.append(metric_loss)
+            metric_loss_denoms.append(loss_denom)
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -357,7 +402,15 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
-        return plosses, acceptance_rates, acces
+        return (
+            plosses,
+            acceptance_rates,
+            acces,
+            metric_corrects,
+            metric_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        )
 
 
 class QwenVLOnlineEagle3Model(Eagle3Model):
@@ -517,7 +570,15 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         position_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+    ]:
         """
         Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
 
@@ -608,6 +669,10 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         plosses = []
         acceptance_rates = []
         acces = []
+        metric_corrects = []
+        metric_denoms = []
+        metric_losses = []
+        metric_loss_denoms = []
         if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
             past_key_values = None
@@ -651,14 +716,15 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
-                acces.append(
-                    _compute_metric_acc(
-                        logits=logits,
-                        target_token_ids=target_token_ids,
-                        loss_mask=loss_mask,
-                        d2t=self.draft_model.d2t,
-                    )
+                correct, denom = _compute_metric_counts(
+                    logits=logits,
+                    target_token_ids=target_token_ids,
+                    loss_mask=loss_mask,
+                    d2t=self.draft_model.d2t,
                 )
+                acces.append(correct / denom)
+                metric_corrects.append(correct)
+                metric_denoms.append(denom)
 
             # Step 5.6: calculate loss, in-place modifies logits!
             acceptance_rate, loss = _compute_loss_and_acceptance_rate(
@@ -672,6 +738,14 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             )
             acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
+            metric_losses.append(loss.detach())
+            metric_loss_denoms.append(
+                torch.tensor(
+                    logits.shape[0] * logits.shape[1],
+                    device=logits.device,
+                    dtype=torch.float32,
+                )
+            )
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -679,7 +753,15 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
-        return plosses, acceptance_rates, acces
+        return (
+            plosses,
+            acceptance_rates,
+            acces,
+            metric_corrects,
+            metric_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        )
 
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):
@@ -743,8 +825,16 @@ def _compute_target_p(target, t2d, loss_mask):
 
 @torch.compile(dynamic=None)
 def _compute_metric_acc(logits, target_token_ids, loss_mask, d2t):
+    correct, denom = _compute_metric_counts(logits, target_token_ids, loss_mask, d2t)
+    return correct / denom
+
+
+@torch.compile(dynamic=None)
+def _compute_metric_counts(logits, target_token_ids, loss_mask, d2t):
     pred_draft_token_ids = logits.argmax(-1)
     pred_target_token_ids = pred_draft_token_ids + d2t[pred_draft_token_ids]
-    return (
+    correct = (
         (pred_target_token_ids == target_token_ids) * loss_mask.squeeze(-1)
-    ).sum() / loss_mask.sum().clamp_min(1e-6)
+    ).sum()
+    denom = loss_mask.sum().clamp_min(1e-6)
+    return correct, denom

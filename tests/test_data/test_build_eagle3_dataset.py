@@ -1,10 +1,13 @@
+import os
+import tempfile
 import unittest
 
 import torch
 from transformers import AutoTokenizer
 
-from datasets import Dataset as HFDataset
+from datasets import Dataset
 from specforge.data.preprocessing import build_eagle3_dataset
+from specforge.utils import safe_conversations_generator
 
 # ANSI color codes
 RED = "\033[91m"
@@ -148,42 +151,48 @@ class TestBuildEagle3Dataset(unittest.TestCase):
     def test_build_eagle3_dataset_basic(self):
         """Test build_eagle3_dataset with 1 tool_use conversation sample."""
         # Create a HF Dataset with 1 sample
-        dataset = HFDataset.from_dict(
-            {"conversations": [TOOL_USE_CONVERSATION], "tools": [TOOLS]}
+        data_file = os.path.join(
+            os.path.dirname(__file__), "data", "tool_use_conversation.jsonl"
         )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset = Dataset.from_generator(
+                generator=safe_conversations_generator,
+                gen_kwargs={"file_path": data_file},
+                cache_dir=tmp_dir,
+                keep_in_memory=True,
+            )
+            result_dataset = build_eagle3_dataset(
+                dataset=dataset,
+                tokenizer=self.tokenizer,
+                chat_template=self.template_key,
+                max_length=self.max_length,
+                shuffle_seed=42,
+                num_proc=1,
+                cache_dir=None,
+                cache_key=None,
+            )
 
-        result_dataset = build_eagle3_dataset(
-            dataset=dataset,
-            tokenizer=self.tokenizer,
-            chat_template=self.template_key,
-            max_length=self.max_length,
-            shuffle_seed=42,
-            num_proc=1,
-            cache_dir=None,
-            cache_key=None,
-        )
+            # Verify the dataset has the expected columns
+            self.assertIn("input_ids", result_dataset.column_names)
+            self.assertIn("loss_mask", result_dataset.column_names)
+            self.assertIn("attention_mask", result_dataset.column_names)
+            self.assertEqual(len(result_dataset), 1)
 
-        # Verify the dataset has the expected columns
-        self.assertIn("input_ids", result_dataset.column_names)
-        self.assertIn("loss_mask", result_dataset.column_names)
-        self.assertIn("attention_mask", result_dataset.column_names)
-        self.assertEqual(len(result_dataset), 1)
+            # Decode input_ids to text
+            input_ids = result_dataset[0]["input_ids"].squeeze()
+            loss_mask = result_dataset[0]["loss_mask"].squeeze()
 
-        # Decode input_ids to text
-        input_ids = result_dataset[0]["input_ids"].squeeze()
-        loss_mask = result_dataset[0]["loss_mask"].squeeze()
+            # Print full text with loss_mask=1 in RED
+            print_with_loss_mask(
+                self.tokenizer,
+                input_ids,
+                loss_mask,
+                title="[build_eagle3_dataset] Full text (RED = loss_mask=1):",
+            )
 
-        # Print full text with loss_mask=1 in RED
-        print_with_loss_mask(
-            self.tokenizer,
-            input_ids,
-            loss_mask,
-            title="[build_eagle3_dataset] Full text (RED = loss_mask=1):",
-        )
-
-        # Verify assistant tokens exist
-        assistant_indices = torch.where(loss_mask == 1)[0]
-        self.assertTrue(len(assistant_indices) > 0, "No assistant tokens found")
+            # Verify assistant tokens exist
+            assistant_indices = torch.where(loss_mask == 1)[0]
+            self.assertTrue(len(assistant_indices) > 0, "No assistant tokens found")
 
 
 if __name__ == "__main__":

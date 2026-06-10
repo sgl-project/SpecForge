@@ -156,6 +156,4 @@ class UspAdapter(BackendAdapter):
         return local_correct, local_denom
 
     def reduce_loss(self, loss: torch.Tensor) -> torch.Tensor:
-        loss = dist_nn.all_reduce(loss, op=dist.ReduceOp.SUM, group=self.sp_group)
-        loss = loss / self.sp_world_size
         return loss

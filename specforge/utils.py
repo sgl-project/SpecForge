@@ -379,11 +379,29 @@ def safe_conversations_generator(file_path):
                 # Build result with conversations
                 result = {"conversations": cleaned_convs}
 
-                # Preserve 'tools' field if present (keep as list for preprocessing)
+                # Preserve 'tools' field if present
                 if "tools" in row:
                     tools = row["tools"]
-                    if tools is not None and isinstance(tools, list):
-                        result["tools"] = tools
+                    if tools is not None:
+                        # If tools is a JSON string, parse it first
+                        if isinstance(tools, str):
+                            try:
+                                tools = json.loads(tools)
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    f"Line {i + 1}: 'tools' is a string but not valid JSON, keeping as-is"
+                                )
+                                result["tools"] = tools
+                                yield result
+                                continue
+
+                        # Serialize tools to JSON string for Arrow compatibility
+                        # (same treatment as list/dict fields in conversations)
+                        if isinstance(tools, (list, dict)):
+                            result["tools"] = json.dumps(tools, ensure_ascii=False)
+                        else:
+                            # Primitive type, keep as-is
+                            result["tools"] = tools
                     else:
                         result["tools"] = []
 
