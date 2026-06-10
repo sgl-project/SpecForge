@@ -352,7 +352,7 @@ class HarmonyParser(Parser):
             for j, message in enumerate(conversation):
                 if j == 0 and (
                     message["role"] != "system"
-                    or message["role"] != "assistant_reasoning_effort"
+                    and message["role"] != "assistant_reasoning_effort"
                 ):
                     prompt_text = self.build_single_turn_prompt(
                         prompt_text,
