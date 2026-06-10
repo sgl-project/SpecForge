@@ -6,25 +6,28 @@ Usage:
 1. Set up one or more SGLang servers for the target model.
 
 python3 -m sglang.launch_server \
-	--model meta-llama/Llama-3.1-8B-Instruct \
-	--mem-fraction-static 0.75 \
-	--cuda-graph-max-bs 128 \
+	--model Qwen/Qwen3.5-35B-A3B \
+	--mem-fraction-static 0.7 \
 	--tp 1 \
 	--trust-remote-code \
+    --cuda-graph-max-bs 128 \
 	--host 0.0.0.0 \
 	--port 30000 \
-	--dtype bfloat16
+	--dtype bfloat16 \
+    --reasoning-parser qwen3
 
 
 2. Regenerate the dataset using the `regenerate_train_data.py` script.
 python scripts/regenerate_train_data.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
+    --model Qwen/Qwen3.5-35B-A3B \
     --concurrency 128 \
     --max-tokens 4096 \
-    --server-address localhost:30000 \
+    --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
     --temperature 0.8 \
-    --input-file-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
+    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
+    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
+    --resume \
+    --reasoning save
 """
 
 import argparse
@@ -48,9 +51,13 @@ def parse_arguments():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--model", type=str, required=True)
     model_group.add_argument(
-        "--is-reasoning-model",
-        action="store_true",
-        help="Whether the model is a reasoning model",
+        "--reasoning",
+        choices=["none", "save", "disable"],
+        default="none",
+        help=(
+            "Reasoning mode: 'none' for standard models, 'save' to store "
+            "reasoning_content, or 'disable' to disable thinking via extra_body"
+        ),
     )
     model_group.add_argument(
         "--is-gpt-oss",
@@ -181,6 +188,8 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+    if args.reasoning == "disable":
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
@@ -227,8 +236,10 @@ def call_sglang(
                 "role": "assistant",
                 "content": response_text,
             }
-            if args.is_reasoning_model:
-                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
+            if args.reasoning == "save":
+                resp_msg["reasoning_content"] = resp.choices[
+                    0
+                ].message.reasoning_content
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"

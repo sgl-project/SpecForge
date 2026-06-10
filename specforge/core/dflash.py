@@ -19,6 +19,34 @@ except ImportError:
     create_block_mask = None
 
 
+def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
+    B, N = anchor_positions.shape
+    Q_LEN = N * block_size
+    KV_LEN = S + N * block_size
+
+    q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)  # (1, 1, Q_LEN, 1)
+    kv_indices = torch.arange(KV_LEN, device=device).view(
+        1, 1, 1, -1
+    )  # (1, 1, 1, KV_LEN)
+
+    q_block_ids = q_indices // block_size
+
+    anchor_expanded = anchor_positions.view(B, 1, N, 1).repeat_interleave(
+        block_size, dim=2
+    )
+
+    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+
+    is_draft = kv_indices >= S
+    kv_block_ids = (kv_indices - S) // block_size
+    mask_draft = is_draft & (q_block_ids == kv_block_ids)
+
+    valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
+
+    final_mask = (mask_context | mask_draft) & valid_block
+    return final_mask
+
+
 def create_dflash_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -40,7 +68,8 @@ def create_dflash_block_mask(
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
-        anchor_pos = anchor_positions[b, q_block_id]
+        safe_q_block_id = q_block_id.clamp(max=N - 1)
+        anchor_pos = anchor_positions[b, safe_q_block_id]
 
         is_context = kv_idx < S
         # Strictly less than: matches inference where target_hidden[anchor_pos]
@@ -51,8 +80,9 @@ def create_dflash_block_mask(
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
 
-        is_valid_block = block_keep_mask[b, q_block_id]
-        return (mask_context | mask_draft) & is_valid_block
+        is_valid_block = block_keep_mask[b, safe_q_block_id]
+        in_bounds = q_block_id < N
+        return (mask_context | mask_draft) & is_valid_block & in_bounds
 
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
@@ -205,13 +235,22 @@ class OnlineDFlashModel(nn.Module):
         draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
-        dflash_attn_mask = create_dflash_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            S=seq_len,
-            block_size=self.block_size,
-            device=device,
-        )
+        if self.attention_backend == "flex_attention":
+            dflash_attn_mask = create_dflash_block_mask(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                S=seq_len,
+                block_size=self.block_size,
+                device=device,
+            )
+        else:
+            dflash_attn_mask = create_dflash_sdpa_mask(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                S=seq_len,
+                block_size=self.block_size,
+                device=device,
+            )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,

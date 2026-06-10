@@ -39,6 +39,9 @@ class TwoStageScheduler(_LRScheduler):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        # Save _last_lr before it gets filtered out
+        last_lr = state_dict.get("_last_lr", None)
+
         if "after_scheduler_dict" not in state_dict:
             warn(
                 "after_scheduler_dict is not found, skip loading after_scheduler. This may cause unexpected behavior."
@@ -51,6 +54,14 @@ class TwoStageScheduler(_LRScheduler):
             if key not in ("after_scheduler_type", "after_scheduler_dict")
         }
         super().load_state_dict(state_dict)
+
+        # Restore optimizer's lr from _last_lr to ensure consistency
+        # This is critical because PyTorch's CosineAnnealingLR.get_lr() uses
+        # group["lr"] to compute the next lr, but load_state_dict doesn't
+        # update the optimizer's lr automatically.
+        if last_lr is not None:
+            for param_group, lr in zip(self.optimizer.param_groups, last_lr):
+                param_group["lr"] = lr
 
 
 class DelayerScheduler(TwoStageScheduler):

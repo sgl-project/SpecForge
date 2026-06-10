@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -19,7 +20,9 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.scheduler import Scheduler
+
+# - prepare_mlp_sync_batch_raw is now a module-level function, not a Scheduler method
+from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -35,6 +38,8 @@ from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -78,6 +83,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> Eagle3TargetOutput:
         """
         Generate the eagle3 data from the target model.
@@ -171,12 +177,16 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> Eagle3TargetOutput:
         """
         Optimized HF backend:
         Instead of returning all hidden states (memory heavy), we use forward hooks
         to capture only the specific layers required by Eagle3.
         """
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
         captured_states = {}
         handles = []
 
@@ -302,10 +312,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
         tp_size = dist.get_world_size(get_tp_group())
+        # NOTE: sglang 0.5.9 requires dtype to be non-None
+        # If torch_dtype is None, use "auto" to let sglang decide the dtype
+        dtype_arg = torch_dtype if torch_dtype is not None else "auto"
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
-            dtype=torch_dtype,
+            dtype=dtype_arg,
             enable_return_hidden_states=True,
             disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
             tp_size=tp_size,
@@ -316,6 +329,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
+        # - Added is_draft_worker=False parameter (new in 0.5.9)
+        # - Other new parameters (dp_rank, attn_cp_rank, moe_dp_rank, etc.) use default values
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -328,6 +343,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             pp_size=1,
             server_args=server_args,
             nccl_port=None,
+            is_draft_worker=False,
         )
         wrap_eagle3_logits_processors_in_module(
             model_runner.model, return_full_logits=False
@@ -350,12 +366,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         capture_aux_hidden_states: bool = True,
         return_last_hidden_states: bool = False,
         return_logits: bool = False,
+        shard_returns: bool = False,
     ):
         # set the logits processor for the model runner
         for name, module in self.model_runner.model.named_modules():
             if isinstance(module, LogitsProcessorForEAGLE3):
                 module.return_last_hidden_states = return_last_hidden_states
                 module.return_logits = return_logits
+                module.shard_returns = shard_returns
 
         cache_params = CacheInitParams(
             disable=False,
@@ -379,46 +397,79 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        eagle3_output, _ = self.model_runner.forward(forward_batch)
-
-        aux_hidden_states_list = None
+        eagle3_output = self.model_runner.forward(forward_batch).logits_output
         input_lens = [len(req.origin_input_ids) for req in reqs]
 
+        logits = eagle3_output.logits
+        aux_hidden_states = eagle3_output.aux_hidden_states
+        last_hidden_states = eagle3_output.last_hidden_states
+
+        if shard_returns:
+            tp_rank = dist.get_rank(get_tp_group())
+            tp_size = dist.get_world_size(get_tp_group())
+            batch_size = len(input_lens) // tp_size
+            valid_indices = list(
+                range(tp_rank * batch_size, (tp_rank + 1) * batch_size)
+            )
+            valid_input_lens = [input_lens[i] for i in valid_indices]
+
         if return_logits:
-            logits = torch.split(eagle3_output.logits, input_lens, dim=0)
+            if shard_returns:
+                logits = _get_sharded_return(
+                    logits,
+                    input_lens,
+                    valid_input_lens,
+                    valid_indices,
+                )
+            else:
+                logits = torch.split(logits, input_lens, dim=0)
         else:
             logits = [None] * len(reqs)
 
         if capture_aux_hidden_states:
-            aux_hidden_states_list = torch.split(
-                eagle3_output.aux_hidden_states, input_lens, dim=0
-            )
+            if shard_returns:
+                aux_hidden_states = _get_sharded_return(
+                    aux_hidden_states,
+                    input_lens,
+                    valid_input_lens,
+                    valid_indices,
+                )
+            else:
+                aux_hidden_states = torch.split(aux_hidden_states, input_lens, dim=0)
         else:
-            aux_hidden_states_list = [None] * len(reqs)
+            aux_hidden_states = [None] * len(reqs)
 
         if return_last_hidden_states:
-            last_hidden_states = torch.split(
-                eagle3_output.last_hidden_states, input_lens, dim=0
-            )
+            if shard_returns:
+                last_hidden_states = _get_sharded_return(
+                    last_hidden_states,
+                    input_lens,
+                    valid_input_lens,
+                    valid_indices,
+                )
+            else:
+                last_hidden_states = torch.split(last_hidden_states, input_lens, dim=0)
         else:
             last_hidden_states = [None] * len(reqs)
 
         # TODO: can we not clear?
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
-        return logits, aux_hidden_states_list, last_hidden_states
+        return logits, aux_hidden_states, last_hidden_states
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            # - Removed spec_algorithm and speculative_num_draft_tokens parameters
+            # - Added attn_cp_size parameter
+            # - Changed from Scheduler.prepare_mlp_sync_batch_raw to direct function call
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
+                attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
@@ -433,6 +484,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         loss_mask: torch.Tensor,
         return_last_hidden_states: bool = False,
         return_logits: bool = True,
+        shard_returns: bool = False,
     ):
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
@@ -466,6 +518,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             capture_aux_hidden_states=True,
             return_last_hidden_states=return_last_hidden_states,
             return_logits=return_logits,
+            shard_returns=shard_returns,
         )
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
@@ -609,7 +662,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 video_token_id=self.video_token_id,
                 vision_start_token_id=self.vision_start_token_id,
                 model_type=self.model_type,
-                input_ids=input_id_flat.unsqueeze(0),
+                input_ids=input_id_flat.unsqueeze(0).cpu(),
                 image_grid_thw=(
                     image_grid_thw_.cpu() if image_grid_thw_ is not None else None
                 ),
@@ -672,6 +725,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        shard_returns: bool = False,
+        **kwargs,
     ) -> Eagle3TargetOutput:
         """
         return:
@@ -684,6 +739,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 - pixel_values: (patch_len, patch_width)
                 - image_grid_thw (batch_size, 3)
         """
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
         if is_vlm:
             data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
                 self.extend_vlm(
@@ -704,11 +762,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     loss_mask,
                     return_last_hidden_states=False,
                     return_logits=True,
+                    shard_returns=shard_returns,
                 )
             )
         aux_hidden_states_out = []
         target_out = []
         loss_mask_out = []
+        attention_mask_out = []
         input_ids_out = []
         last_hidden_states_out = []
 
@@ -717,33 +777,32 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
             )
         ):
-            aux_hidden_states_out.append(aux_hidden_states.unsqueeze(0))
-            loss_mask_out.append(data[2])
-            input_ids_out.append(data[0])
+            if aux_hidden_states is not None:
+                aux_hidden_states_out.append(aux_hidden_states.unsqueeze(0))
+                loss_mask_out.append(data[2])
+                attention_mask_out.append(data[1])
+                input_ids_out.append(data[0])
 
             # when generating hidden states for offline training, we don't compute logits and only keep the last_hidden_states
             # when training online, we don't keep the last_hidden_states and only keep the logits
             if logits is not None:
                 target_out.append(logits.unsqueeze(0))
-            else:
-                target_out.append(None)
 
             if last_hidden_states is not None:
                 last_hidden_states_out.append(last_hidden_states.unsqueeze(0))
-            else:
-                last_hidden_states_out.append(None)
 
         aux_hidden_states_out = torch.cat(aux_hidden_states_out, dim=0)
 
         loss_mask_out = torch.cat(loss_mask_out, dim=0)
+        attention_mask_out = torch.cat(attention_mask_out, dim=0)
         input_ids_out = torch.cat(input_ids_out, dim=0)
 
-        if target_out[0] is not None:
+        if target_out:
             target_out = torch.cat(target_out, dim=0)
         else:
             target_out = None
 
-        if last_hidden_states_out[0] is not None:
+        if last_hidden_states_out:
             last_hidden_states_out = torch.cat(last_hidden_states_out, dim=0)
         else:
             last_hidden_states_out = None
@@ -757,7 +816,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             target=target_out,
             loss_mask=loss_mask_out,
             input_ids=input_ids_out,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask_out,
             last_hidden_states=last_hidden_states_out,
         )
 
@@ -794,7 +853,11 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> Eagle3TargetOutput:
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -855,3 +918,16 @@ def get_eagle3_target_model(
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
+
+
+def _get_sharded_return(
+    input_: torch.Tensor,
+    input_lens: list[int],
+    valid_input_lens: list[int],
+    valid_indices: list[int],
+) -> list[Optional[torch.Tensor]]:
+    out: list[Optional[torch.Tensor]] = [None] * len(input_lens)
+    input_scatter = torch.split(input_, valid_input_lens, dim=0)
+    for j, idx in enumerate(valid_indices):
+        out[idx] = input_scatter[j]
+    return out
