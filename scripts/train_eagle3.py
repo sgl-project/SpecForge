@@ -199,6 +199,28 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
 
+    # LK / acceptance-rate loss arguments
+    lk_group = parser.add_argument_group("lk loss")
+    lk_group.add_argument(
+        "--lk-loss-type",
+        type=str,
+        default=None,
+        choices=["lambda", "alpha"],
+        help="Enable LK loss objective. Choices: lambda (hybrid KL+LK), alpha (pure acceptance-rate likelihood).",
+    )
+    lk_group.add_argument(
+        "--kl-scale",
+        type=float,
+        default=1.0,
+        help="Scale for adaptive KL weight: kl_weight = kl_scale * exp(-kl_decay * acc). Used when --lk-loss-type=lambda.",
+    )
+    lk_group.add_argument(
+        "--kl-decay",
+        type=float,
+        default=3.0,
+        help="Decay for adaptive KL weight. Used when --lk-loss-type=lambda.",
+    )
+
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
@@ -372,6 +394,10 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    if args.kl_scale < 0:
+        raise ValueError(f"--kl-scale must be non-negative, got {args.kl_scale}")
+    if args.kl_decay < 0:
+        raise ValueError(f"--kl-decay must be non-negative, got {args.kl_decay}")
     if args.attention_backend == "usp":
         sp_sanity_check(args)
     if args.shard_target_output:
@@ -642,11 +668,12 @@ def run_forward(
     List[torch.Tensor],
     List[torch.Tensor],
     List[torch.Tensor],
+    List[torch.Tensor],
 ]:
     if args.is_vlm and args.target_model_backend == "custom":
         (
             plosses,
-            _,
+            acceptance_rates,
             acces,
             acc_corrects,
             acc_denoms,
@@ -717,7 +744,7 @@ def run_forward(
             loss_mask = loss_mask.cuda()
         (
             plosses,
-            _,
+            acceptance_rates,
             acces,
             acc_corrects,
             acc_denoms,
@@ -735,7 +762,15 @@ def run_forward(
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
         )
-    return plosses, acces, acc_corrects, acc_denoms, metric_losses, metric_loss_denoms
+    return (
+        plosses,
+        acces,
+        acceptance_rates,
+        acc_corrects,
+        acc_denoms,
+        metric_losses,
+        metric_loss_denoms,
+    )
 
 
 def run_backward_and_update(
@@ -764,6 +799,7 @@ def run_backward_and_update(
 def record_metrcs(
     args: Namespace,
     accuracies: List[torch.Tensor],
+    acceptance_rates: List[torch.Tensor],
     plosses: List[torch.Tensor],
     global_step: int,
     tracker: Tracker,
@@ -798,6 +834,16 @@ def record_metrcs(
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
+        )
+
+    acceptance_rates = torch.stack(acceptance_rates)
+    assert acceptance_rates.shape[0] == args.ttt_length
+    dist.all_reduce(acceptance_rates, op=dist.ReduceOp.AVG)
+    acceptance_rates = acceptance_rates.cpu().tolist()
+    for i in range(len(acceptance_rates)):
+        logdict[f"{mode}/acceptance_rate_{i}"] = acceptance_rates[i]
+        print_on_rank0(
+            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acceptance Rate: {acceptance_rates[i]:.4f}"
         )
 
     if ploss_denoms is not None:
@@ -938,6 +984,9 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            lk_loss_type=args.lk_loss_type,
+            kl_scale=args.kl_scale,
+            kl_decay=args.kl_decay,
         )
     else:
         if is_online:
@@ -946,6 +995,9 @@ def main():
                 draft_model=draft_model,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
+                lk_loss_type=args.lk_loss_type,
+                kl_scale=args.kl_scale,
+                kl_decay=args.kl_decay,
             )
         else:
             # offline: the target_model is TargetHead not a model
@@ -953,6 +1005,9 @@ def main():
                 draft_model=draft_model,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
+                lk_loss_type=args.lk_loss_type,
+                kl_scale=args.kl_scale,
+                kl_decay=args.kl_decay,
             )
     eagle3_model = FSDP(
         eagle3_model,
@@ -1067,6 +1122,7 @@ def main():
             (
                 plosses,
                 acces,
+                acceptance_rates,
                 acc_corrects,
                 acc_denoms,
                 metric_losses,
@@ -1109,6 +1165,7 @@ def main():
                 record_metrcs(
                     args,
                     acces,
+                    acceptance_rates,
                     metric_loss_weighted_sums,
                     global_step // args.draft_accumulation_steps,
                     tracker,
@@ -1136,9 +1193,13 @@ def main():
             if dist.get_rank() == 0:
                 time_per_step = time.time() - last_time
                 last_time = time.time()
+                avg_acceptance_rate = sum(ar for ar in acceptance_rates) / len(
+                    acceptance_rates
+                )
                 postfix = {
                     "loss": f"{avg_loss:.2f}",
                     "acc": f"{avg_acc:.2f}",
+                    "acceptance_rate": f"{avg_acceptance_rate:.2f}",
                     "time": f"{time_per_step:.2f}s",
                 }
                 if last_grad_norm is not None:
@@ -1160,15 +1221,28 @@ def main():
                 # Run evaluation
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
+                eval_acceptance_rates = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
-                        plosses, acces, _, _, _, _ = run_forward(
+                        (
+                            plosses,
+                            acces,
+                            acceptance_rates,
+                            _,
+                            _,
+                            _,
+                            _,
+                        ) = run_forward(
                             args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))
+                        ]
+                        eval_acceptance_rates = [
+                            eval_acceptance_rates[i] + [acceptance_rates[i]]
+                            for i in range(len(acceptance_rates))
                         ]
                         eval_plosses = [
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
@@ -1176,11 +1250,15 @@ def main():
 
                 # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
+                eval_acceptance_rates = [
+                    torch.stack(ar).mean() for ar in eval_acceptance_rates
+                ]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
                 record_metrcs(
                     args,
                     eval_acces,
+                    eval_acceptance_rates,
                     eval_plosses,
                     global_step // args.draft_accumulation_steps,
                     tracker,
