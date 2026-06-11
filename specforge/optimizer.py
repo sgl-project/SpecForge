@@ -29,6 +29,7 @@ class BF16Optimizer:
         self.optimizer = torch.optim.AdamW(
             self.fp32_params, lr=lr, weight_decay=weight_decay
         )
+        self.last_grad_norm = None
         self.scheduler = CosineAnnealingWarmupLR(
             self.optimizer,
             total_steps=total_steps,
@@ -41,7 +42,8 @@ class BF16Optimizer:
                 mp.grad = (
                     p.grad.detach().to(torch.float32) if p.grad is not None else None
                 )
-        torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        self.last_grad_norm = grad_norm.detach()
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
@@ -49,6 +51,7 @@ class BF16Optimizer:
             for p, mp in zip(self.model_params, self.fp32_params):
                 p.data.copy_(mp.data.to(p.dtype))
                 p.grad = None
+        return self.last_grad_norm
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])

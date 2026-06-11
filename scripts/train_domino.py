@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""DFlash Training Script."""
+"""Domino Training Script."""
 
 import argparse
-import functools
 import logging
 import math
 import os
@@ -15,17 +14,15 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
-from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
-from specforge.core.dflash import OnlineDFlashModel
+from specforge.core.domino import OnlineDominoModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
@@ -38,11 +35,9 @@ from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
-logging.getLogger("sglang.srt.mem_cache.memory_pool").setLevel(logging.WARNING)
-
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train DFlash Draft Model")
+    parser = argparse.ArgumentParser(description="Train Domino Draft Model")
 
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
@@ -99,9 +94,6 @@ def parse_args():
         default=None,
         help="LM head weight key in the target model. Default: 'lm_head.weight'.",
     )
-    model_group.add_argument("--is-vlm", action="store_true")
-    model_group.add_argument("--min-pixels", type=int, default=50176)
-    model_group.add_argument("--max-pixels", type=int, default=802816)
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -125,7 +117,18 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
-
+    training_group.add_argument(
+        "--lambda-base-start",
+        type=float,
+        default=1.0,
+        help="Initial weight of base loss.",
+    )
+    training_group.add_argument(
+        "--lambda-base-decay-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of total steps used to decay lambda_base to 0.",
+    )
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
     output_group.add_argument("--cache-dir", type=str, default="./cache")
@@ -196,6 +199,35 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
 
+    projector_type = draft_config.dflash_config.get("projector_type", None)
+    if projector_type != "domino":
+        raise ValueError(
+            "Domino training requires dflash_config.projector_type='domino'."
+        )
+
+    required_fields = [
+        "emb_dim",
+        "gru_hidden_dim",
+        "pure_draft_prefix_len",
+        "shift_label",
+    ]
+    missing_fields = [
+        field for field in required_fields if field not in draft_config.dflash_config
+    ]
+    if missing_fields:
+        raise ValueError(
+            f"Domino config missing dflash_config fields: {missing_fields}"
+        )
+    if not hasattr(draft_config, "vocab_size"):
+        raise ValueError("Domino config missing draft config field: vocab_size")
+
+    pure_prefix = draft_config.dflash_config["pure_draft_prefix_len"]
+    print_on_rank0(
+        f"Using Domino projector: pure_prefix={pure_prefix}, "
+        f"emb_dim={draft_config.dflash_config['emb_dim']}, "
+        f"gru_hidden_dim={draft_config.dflash_config['gru_hidden_dim']}"
+    )
+
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
@@ -215,16 +247,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     return target_model, draft_model
 
 
-def _load_raw_dataset(data_path: str):
-    """load jsonl"""
-    if os.path.isdir(data_path):
-        return load_from_disk(data_path)
-    return load_dataset("json", data_files=data_path)["train"]
-
-
-def build_dataloader(
-    args, tokenizer, processor=None
-) -> Tuple[DataLoader, Optional[DataLoader]]:
+def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
 
@@ -236,7 +259,7 @@ def build_dataloader(
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = _load_raw_dataset(args.train_data_path)
+    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
     train_eagle3_dataset = build_eagle3_dataset(
         dataset=train_dataset,
         tokenizer=tokenizer,
@@ -246,9 +269,8 @@ def build_dataloader(
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
-        is_vlm=args.is_vlm,
-        processor=processor,
     )
+
     min_loss_tokens = 2 * args.block_size
     original_size = len(train_eagle3_dataset)
     train_eagle3_dataset = train_eagle3_dataset.filter(
@@ -264,20 +286,17 @@ def build_dataloader(
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
-        is_vlm=args.is_vlm,
     )
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = _load_raw_dataset(args.eval_data_path)
+        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
         eval_eagle3_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
-            is_vlm=args.is_vlm,
-            processor=processor,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -285,21 +304,20 @@ def build_dataloader(
             num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=get_dp_group(),
-            is_vlm=args.is_vlm,
         )
 
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
+def save_checkpoint(args, epoch, step, domino_model, draft_model, optimizer):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
-        state_dict = dflash_model.state_dict()
+    with FSDP.state_dict_type(domino_model, StateDictType.FULL_STATE_DICT):
+        state_dict = domino_model.state_dict()
         draft_state_dict = {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
@@ -336,6 +354,27 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
     dist.barrier()
 
 
+def reduce_metrics_dict(metrics):
+    if not metrics:
+        return {}
+
+    world_size = dist.get_world_size()
+    reduced = {}
+
+    for k, v in metrics.items():
+        if v is None:
+            continue
+
+        if torch.is_tensor(v):
+            t = v.detach().clone()
+            dist.all_reduce(t)
+            reduced[k] = (t / world_size).item()
+        else:
+            reduced[k] = float(v)
+
+    return reduced
+
+
 def record_metrics(
     args,
     loss: float,
@@ -345,20 +384,50 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    extra_metrics: dict = None,
 ) -> None:
     logdict = {}
 
     if mode == "train" and optimizer is not None:
-        logdict["train/lr"] = optimizer.get_learning_rate()
+        logdict[f"{mode}/lr"] = optimizer.get_learning_rate()
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
 
-    print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+    if extra_metrics:
+        logdict.update(
+            {f"{mode}/{k}": float(v) for k, v in extra_metrics.items() if v is not None}
+        )
+
+    print_msg = (
+        f"{mode.capitalize()} - Step {global_step} "
+        f"[{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], "
+        f"Loss: {loss:.4f}, Acc: {accuracy:.4f}"
     )
 
+    if extra_metrics is not None:
+        if "base_loss" in extra_metrics:
+            print_msg += f", BaseLoss: {extra_metrics['base_loss']:.4f}"
+        if "base_accuracy" in extra_metrics:
+            print_msg += f", BaseAcc: {extra_metrics['base_accuracy']:.4f}"
+
+    print_on_rank0(print_msg)
     tracker.log(logdict, step=global_step)
+
+
+def get_lambda_base(
+    global_step: int,
+    total_steps: int,
+    lambda_start: float = 1.0,
+    decay_ratio: float = 0.5,
+) -> float:
+    decay_steps = max(1, int(total_steps * decay_ratio))
+    progress = min(global_step / decay_steps, 1.0)
+    lambda_base = lambda_start * (1.0 - progress)
+
+    # Clamp to [0, 1].
+    lambda_base = max(0.0, min(1.0, lambda_base))
+    return lambda_base
 
 
 def main():
@@ -418,23 +487,7 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_path, trust_remote_code=args.trust_remote_code
-    )
-
-    processor = None
-    if args.is_vlm:
-        from transformers import AutoProcessor
-
-        processor = AutoProcessor.from_pretrained(
-            args.target_model_path,
-            min_pixels=args.min_pixels,
-            max_pixels=args.max_pixels,
-            trust_remote_code=args.trust_remote_code,
-        )
-        print_on_rank0(
-            f"Loaded VLM processor (min_pixels={args.min_pixels}, max_pixels={args.max_pixels})"
-        )
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
@@ -450,7 +503,8 @@ def main():
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
     print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer, processor)
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
+
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
@@ -464,7 +518,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    dflash_model = OnlineDFlashModel(
+    domino_model = OnlineDominoModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
         target_embed_tokens=target_components.embed_tokens,
@@ -473,40 +527,18 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        shift_label=draft_model.shift_label,
     )
 
-    # Wrap each transformer block as its own FSDP unit so that all-gather /
-    # reduce-scatter overlap with compute. Without an auto_wrap_policy the
-    # whole model is a single FSDP unit, forcing every collective onto the
-    # critical path with no overlap. The block class is resolved from the
-    # draft model's `_no_split_modules` so this stays architecture-agnostic
-    # rather than hardcoding a specific decoder-layer class.
-    fsdp_kwargs = dict(
+    domino_model = FSDP(
+        domino_model,
         use_orig_params=True,
-        forward_prefetch=True,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        limit_all_gathers=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
-    block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
-    block_classes = {
-        type(m) for m in dflash_model.modules() if type(m).__name__ in block_names
-    }
-    if block_classes:
-        fsdp_kwargs["auto_wrap_policy"] = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=block_classes,
-        )
-    else:
-        print_with_rank(
-            "No _no_split_modules on draft model; falling back to single-unit "
-            "FSDP wrap (no compute-comm overlap)."
-        )
-    dflash_model = FSDP(dflash_model, **fsdp_kwargs)
     print_with_rank("Initialized FSDP")
 
     start_epoch = ckpt_info[0]
@@ -556,37 +588,25 @@ def main():
                 continue
             global_step += 1
 
-            input_ids_cpu = data["input_ids"]
-            attention_mask_cpu = data["attention_mask"]
-            loss_mask_cpu = data["loss_mask"]
-
             input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
-            pixel_values = None
-            image_grid_thw_cpu = None
-            if (
-                args.is_vlm
-                and "pixel_values" in data
-                and data["pixel_values"] is not None
-            ):
-                pixel_values = data["pixel_values"].cuda()
-                image_grid_thw_cpu = [
-                    thw.squeeze() if thw is not None else None
-                    for thw in data["image_grid_thw"]
-                ]
             target_output = target_model.generate_dflash_data(
-                input_ids_cpu,
-                attention_mask_cpu,
-                loss_mask_cpu,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw_cpu,
+                input_ids, attention_mask, loss_mask
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            lambda_base = get_lambda_base(
+                global_step=global_step,
+                total_steps=total_steps,
+                lambda_start=args.lambda_base_start,
+                decay_ratio=args.lambda_base_decay_ratio,
+            )
 
-            loss, accuracy = dflash_model(
+            loss, accuracy, metrics = domino_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                lambda_base=lambda_base,
             )
 
             (loss / args.accumulation_steps).backward()
@@ -601,6 +621,7 @@ def main():
                 dist.all_reduce(acc_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
+                metrics = reduce_metrics_dict(metrics)
 
                 record_metrics(
                     args,
@@ -611,6 +632,7 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    extra_metrics=metrics,
                 )
 
             if dist.get_rank() == 0:
@@ -626,11 +648,11 @@ def main():
 
             if global_step % args.save_interval == 0:
                 save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
+                    args, epoch, global_step, domino_model, draft_model, optimizer
                 )
 
     save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        args, args.num_epochs, global_step, domino_model, draft_model, optimizer
     )
 
     tracker.close()
