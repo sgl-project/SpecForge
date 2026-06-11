@@ -237,6 +237,28 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        self.projector_type = dflash_config.get("projector_type", None)
+        self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
+        self.shift_label = dflash_config.get("shift_label", False)
+
+        if self.projector_type == "domino":
+            self.emb_dim = dflash_config["emb_dim"]
+            self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
+            self.prefix_gru = nn.GRU(
+                input_size=config.hidden_size,
+                hidden_size=self.gru_hidden_dim,
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            in_dim = config.hidden_size + self.gru_hidden_dim
+            self.embed_proj = nn.Sequential(
+                nn.Linear(in_dim, self.emb_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(self.emb_dim, config.vocab_size, bias=False),
+            )
+        elif self.projector_type is not None:
+            raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
         self.post_init()
 
     def forward(
