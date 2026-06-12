@@ -4,7 +4,7 @@ import time
 import torch
 
 from specforge.core.loss import log_softmax_loss, _compute_loss
-from specforge.utils import empty_cache, get_device_type, get_local_device, synchronize
+from specforge.utils import empty_cache, get_device_module, get_device_type, get_local_device, synchronize
 
 TTT_LENGTH = 7
 
@@ -25,7 +25,7 @@ def benchmark_loss_method(
         # Clear GPU cache
         if get_device_type() != "cpu":
             empty_cache()
-            torch.get_device_module(get_device_type()).reset_peak_memory_stats()
+            get_device_module().reset_peak_memory_stats()
 
         # Create tensors outside timing measurement
         target = torch.softmax(
@@ -67,7 +67,7 @@ def benchmark_loss_method(
         total_time = end_time - start_time
         peak_memory = 0
         if get_device_type() != "cpu":
-            peak_memory = torch.get_device_module(get_device_type()).max_memory_allocated()
+            peak_memory = get_device_module().max_memory_allocated()
 
         results.append(
             {
@@ -95,12 +95,11 @@ def main():
     print("PyTorch version:", torch.__version__)
     device_type = get_device_type()
     if device_type != "cpu":
-        device_module = torch.get_device_module(device_type)
         print(f"{device_type} available: True")
-        print("Device:", device_module.get_device_name())
+        print("Device:", get_device_module().get_device_name())
         print(
             "Device memory:",
-            device_module.get_device_properties(0).total_memory / 1024**3,
+            get_device_module().get_device_properties(0).total_memory / 1024**3,
             "GB",
         )
     else:

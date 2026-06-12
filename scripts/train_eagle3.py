@@ -48,6 +48,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     current_device,
+    get_device_module,
     get_device_type,
     get_last_checkpoint,
     get_local_device,
@@ -67,7 +68,7 @@ def print_cuda_memory_debug(label: str) -> None:
 
     try:
         synchronize()
-        device_module = torch.get_device_module(device_type)
+        device_module = get_device_module()
         free_bytes, total_bytes = device_module.mem_get_info()
         allocated_bytes = device_module.memory_allocated()
         reserved_bytes = device_module.memory_reserved()

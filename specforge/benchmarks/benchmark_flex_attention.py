@@ -13,7 +13,7 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaFlexAttention,
     prepare_decoder_attention_mask,
 )
-from specforge.utils import empty_cache, get_device_type, get_local_device, synchronize
+from specforge.utils import empty_cache, get_device_module, get_device_type, get_local_device, synchronize
 
 dynamo.config.recompile_limit = 64
 
@@ -136,7 +136,7 @@ def benchmark_function(
         # Clear GPU cache
         if get_device_type() != "cpu":
             empty_cache()
-            torch.get_device_module(get_device_type()).reset_peak_memory_stats()
+            get_device_module().reset_peak_memory_stats()
 
         # Warm up runs for this sequence length
         if enable_warmup:
@@ -157,11 +157,11 @@ def benchmark_function(
             # Clear cache again after warmup
             if get_device_type() != "cpu":
                 empty_cache()
-                torch.get_device_module(get_device_type()).reset_peak_memory_stats()
+                get_device_module().reset_peak_memory_stats()
         # Record initial memory
         initial_memory = 0
         if get_device_type() != "cpu":
-            initial_memory = torch.get_device_module(get_device_type()).memory_allocated()
+            initial_memory = get_device_module().memory_allocated()
         hidden_states = [
             torch.randn(
                 BATCH_SIZE,
@@ -188,8 +188,8 @@ def benchmark_function(
         peak_memory = 0
         current_memory = 0
         if get_device_type() != "cpu":
-            peak_memory = torch.get_device_module(get_device_type()).max_memory_allocated()
-            current_memory = torch.get_device_module(get_device_type()).memory_allocated()
+            peak_memory = get_device_module().max_memory_allocated()
+            current_memory = get_device_module().memory_allocated()
         results_per_seq_len.append(
             {
                 "seq_len": seq_len,
@@ -295,7 +295,7 @@ if __name__ == "__main__":
     print("PyTorch version:", torch.__version__)
     device_type = get_device_type()
     if device_type != "cpu":
-        device_module = torch.get_device_module(device_type)
+        device_module = get_device_module()
         print(f"{device_type} available: True")
         print("Device:", device_module.get_device_name())
         print(
