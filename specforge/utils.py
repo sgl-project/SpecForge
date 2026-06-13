@@ -2,7 +2,9 @@ import json
 import logging
 import os
 import re
+import shutil
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -10,6 +12,7 @@ from torch.distributed._tensor import DTensor, Shard, distribute_tensor
 from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
+PREFIX_CHECKPOINT_DIR = "epoch"  # keep specforge original format
 
 
 @contextmanager
@@ -409,4 +412,96 @@ def safe_conversations_generator(file_path):
 
             except Exception as e:
                 logger.warning(f"Skipping line {i + 1}: {e}")
-                continue
+
+
+def rotate_checkpoints(
+    output_dir: str,
+    save_total_limit: int | None = None,
+    best_model_checkpoint: str | None = None,
+    use_mtime: bool = False,
+    checkpoint_prefix: str = PREFIX_CHECKPOINT_DIR,
+):
+    if save_total_limit is None or save_total_limit <= 0:
+        return
+
+    checkpoints = sort_checkpoints(output_dir, checkpoint_prefix, use_mtime)
+    if len(checkpoints) <= save_total_limit:
+        return
+
+    # Checkpoints that must not be deleted
+    protected = {checkpoints[-1]}  # most recent, for resuming
+    if best_model_checkpoint is not None:
+        protected.add(str(Path(best_model_checkpoint)))
+
+    # Delete oldest non-protected checkpoints until we have save_total_limit left
+    num_to_keep = max(save_total_limit, len(protected))
+    remaining = len(checkpoints)
+    for checkpoint in checkpoints:
+        if remaining <= num_to_keep:
+            break
+        if checkpoint not in protected:
+            shutil.rmtree(checkpoint, ignore_errors=True)
+            remaining -= 1
+
+
+def sort_checkpoints(
+    output_dir: str,
+    checkpoint_prefix: str = PREFIX_CHECKPOINT_DIR,
+    use_mtime: bool = False,
+    best_model_checkpoint: str | None = None,
+) -> list[str]:
+    glob_checkpoints = [
+        str(x)
+        for x in Path(output_dir).glob(f"{checkpoint_prefix}_*")
+        if os.path.isdir(x)
+    ]
+
+    ordering_and_checkpoint_path = []
+    for path in glob_checkpoints:
+        if use_mtime:
+            ordering_and_checkpoint_path.append((os.path.getmtime(path), path))
+        else:
+            regex_match = re.match(
+                f".*{checkpoint_prefix}_([0-9]+)_step_([0-9]+)", path
+            )
+            if regex_match is not None and regex_match.groups() is not None:
+                ordering_and_checkpoint_path.append(
+                    (int(regex_match.groups()[1]), path)
+                )  # sort by step
+
+    checkpoints_sorted = sorted(ordering_and_checkpoint_path)
+
+    # mtime is not reliable on some filesystems (e.g., cloud fuse filesystem)
+    # so we check if the mtime is fake and fail back to numerical ordering
+    if use_mtime and len(checkpoints_sorted) > 1:
+        mtime_diff = checkpoints_sorted[-1][0] - checkpoints_sorted[0][0]
+        if mtime_diff < 1.0:
+            logger.warning(
+                "mtime may not be reliable on this filesystem, falling back to numerical ordering"
+            )
+            return sort_checkpoints(
+                output_dir,
+                checkpoint_prefix,
+                use_mtime=False,
+                best_model_checkpoint=best_model_checkpoint,
+            )
+
+    checkpoints_sorted = [path for _, path in checkpoints_sorted]
+
+    # Move best_model_checkpoint to second-to-last position to protect it from deletion
+    # while keeping the most recent checkpoint at the end for resuming training
+    if best_model_checkpoint is not None:
+        best_model_checkpoint = str(Path(best_model_checkpoint))
+        if (
+            best_model_checkpoint in checkpoints_sorted
+            and checkpoints_sorted[-1] != best_model_checkpoint
+        ):
+            most_recent = checkpoints_sorted[-1]
+            checkpoints_sorted = [
+                c
+                for c in checkpoints_sorted
+                if c not in {best_model_checkpoint, most_recent}
+            ]
+            checkpoints_sorted += [best_model_checkpoint, most_recent]
+
+    return checkpoints_sorted

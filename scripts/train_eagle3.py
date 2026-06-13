@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import math
 import os
+import shutil
 import time
 from argparse import ArgumentParser, Namespace
 from typing import List, Optional, Tuple, Union
@@ -46,12 +47,14 @@ from specforge.modeling.target import (
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
+    PREFIX_CHECKPOINT_DIR,
     create_draft_config_from_target,
     get_last_checkpoint,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
+    rotate_checkpoints,
     safe_conversations_generator,
 )
 
@@ -191,6 +194,10 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
     training_group.add_argument(
+        "--save-strategy", type=str, default="steps", choices=["steps", "best"]
+    )
+    training_group.add_argument("--save-total-limit", type=int, default=None)
+    training_group.add_argument(
         "--log-interval",
         type=int,
         default=50,
@@ -198,6 +205,17 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    # best model tracking
+    training_group.add_argument(
+        "--metric-for-best",
+        type=str,
+        default="acc_0",
+        choices=["acc_0", "acc_1", "acc_2", "ploss_0", "ploss_1", "ploss_2"],
+    )
+    training_group.add_argument(
+        "--greater-is-better", action="store_true", default=True
+    )
+    training_group.add_argument("--load-best-model-at-end", action="store_true")
 
     # LK / acceptance-rate loss arguments
     lk_group = parser.add_argument_group("lk loss")
@@ -405,6 +423,13 @@ def sanity_check(args: Namespace) -> None:
             raise ValueError("shard_target_output is only supported for sglang backend")
         if args.is_vlm:
             raise ValueError("shard_target_output is only supported non vlm model")
+    # check save best model args
+    assert not (
+        args.load_best_model_at_end and args.save_strategy != "best"
+    ), "--load-best-model-at-end requires --save-strategy to be 'best'"
+    assert (
+        args.eval_interval % args.save_interval == 0
+    ), "--eval-interval should be a multiple of --save-interval to ensure proper best model tracking"
 
 
 def sp_sanity_check(args: Namespace) -> None:
@@ -619,8 +644,14 @@ def save_checkpoints(
     step: int,
     eagle3_model: nn.Module,
     optimizer: Optimizer,
-):
-    epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
+    is_best: bool = False,
+    best_model_checkpoint: str = None,
+) -> str:
+    epoch_output_dir = os.path.join(
+        args.output_dir, f"{PREFIX_CHECKPOINT_DIR}_{epoch}_step_{step}"
+    )
+    if is_best:
+        best_model_checkpoint = epoch_output_dir
     if dist.get_rank() == 0:
         os.makedirs(epoch_output_dir, exist_ok=True)
     dist.barrier()
@@ -652,7 +683,15 @@ def save_checkpoints(
                 state_dict=draft_model_state_dict,
             )
             print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+            rotate_checkpoints(
+                args.output_dir,
+                args.save_total_limit,
+                best_model_checkpoint,
+                False,
+                PREFIX_CHECKPOINT_DIR,
+            )
         dist.barrier()
+    return epoch_output_dir
 
 
 def run_forward(
@@ -932,6 +971,11 @@ def main():
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
     print_cuda_memory_debug("after init_distributed")
+    # to track best model
+    best_metric = float("-inf") if args.greater_is_better else float("inf")
+    best_model_checkpoint = None
+    current_is_best = False
+    is_best = False
 
     # ================================================
     # 2. Build models
@@ -1264,12 +1308,40 @@ def main():
                     tracker,
                     mode="eval",
                 )
+                # best metric
+                metric_name = args.metric_for_best
+                kind, idx = metric_name.split("_")
+                idx = int(idx)
+                current = (
+                    eval_acces[idx] if kind == "acc" else eval_plosses[idx]
+                ).item()
+                is_best = (
+                    (current > best_metric)
+                    if args.greater_is_better
+                    else (current < best_metric)
+                )
+                if is_best:
+                    best_metric = current
+                    current_is_best = True
+                else:
+                    current_is_best = False
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
             if global_step % args.save_interval == 0:
                 # Save the model
-                save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+                ckpt_path = save_checkpoints(
+                    args,
+                    epoch,
+                    global_step,
+                    eagle3_model,
+                    optimizer,
+                    is_best=current_is_best,
+                    best_model_checkpoint=best_model_checkpoint,
+                )
+                if current_is_best:
+                    best_model_checkpoint = ckpt_path
+                    current_is_best = False
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
@@ -1281,7 +1353,25 @@ def main():
         print_on_rank0(
             f"Training completed at step {global_step}, saving final checkpoint..."
         )
-        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+        save_checkpoints(
+            args,
+            epoch,
+            global_step,
+            eagle3_model,
+            optimizer,
+            is_best=current_is_best,
+            best_model_checkpoint=best_model_checkpoint,
+        )
+    # save best model at end
+    if (
+        dist.get_rank() == 0
+        and args.load_best_model_at_end
+        and best_model_checkpoint is not None
+    ):
+        final_model_ckpt = os.path.join(args.output_dir, "best")
+        if os.path.exists(final_model_ckpt):
+            shutil.rmtree(final_model_ckpt)
+        shutil.copytree(best_model_checkpoint, final_model_ckpt)
 
     # Close the tracker
     tracker.close()
