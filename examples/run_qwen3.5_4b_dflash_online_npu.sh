@@ -3,12 +3,9 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
 
-# Train DFlash for Qwen3.5-4B
-TP_SIZE=1
-BUILD_DATASET_NUM_PROC=64
-
 export HF_DATASETS_CACHE=$ROOT_DIR/cache/hf_datasets
 export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
+export SPECFORGE_DATA_NUM_PROC=64
 
 ATTENTION_BACKEND=${2:-flex_attention}
 NUM_GPUS=${1:-8}
@@ -36,7 +33,5 @@ torchrun \
     --save-interval 10000 \
     --report-to tensorboard \
     --target-model-backend hf \
-    --tp-size $TP_SIZE \
-    --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --block-size 16 \
     --trust-remote-code
