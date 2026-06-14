@@ -74,7 +74,7 @@ We would like to extend our sincere thanks to [Voltage Park](https://www.voltage
 
 ```bibtex
 @article{li2026specforge,
-  title={SpecForge: A flexible and efficient open-source training framework for speculative decoding},
+  title={{SpecForge}: A flexible and efficient open-source training framework for speculative decoding},
   author={Li, Shenggui and Wang, Chao and Zhu, Yikai and Wang, Yubo and Yin, Fan and Shi, Shuai and Chen, Yefei and Dong, Xiaomin and Chen, Qiaoling and Pan, Jin and others},
   journal={arXiv preprint arXiv:2603.18567},
   year={2026}
