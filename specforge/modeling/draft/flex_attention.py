@@ -77,7 +77,9 @@ class WrappedCreateBlockMask:
     @torch.compiler.disable(recursive=False)
     def __init__(self):
         if not self._is_create_block_mask_compiled:
-            self._compiled_create_block_mask = torch.compile(create_block_mask, backend=get_compile_backend())
+            self._compiled_create_block_mask = torch.compile(
+                create_block_mask, backend=get_compile_backend()
+            )
             self._is_create_block_mask_compiled = True
 
     def __call__(self):

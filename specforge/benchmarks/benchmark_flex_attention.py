@@ -13,7 +13,13 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaFlexAttention,
     prepare_decoder_attention_mask,
 )
-from specforge.utils import empty_cache, get_device_module, get_device_type, get_local_device, synchronize
+from specforge.utils import (
+    empty_cache,
+    get_device_module,
+    get_device_type,
+    get_local_device,
+    synchronize,
+)
 
 dynamo.config.recompile_limit = 64
 

@@ -78,7 +78,9 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    dist.init_process_group(backend=get_dist_backend(), timeout=timedelta(minutes=timeout))
+    dist.init_process_group(
+        backend=get_dist_backend(), timeout=timedelta(minutes=timeout)
+    )
     local_rank = dist.get_rank() % device_count()
     set_device(local_rank)
     print_with_rank(f"bind to device {local_rank}")
@@ -123,7 +125,9 @@ def init_distributed(
     _DP_GROUP = dp_group
     _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
     _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=get_device_type())
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(
+        dp_group, device_type=get_device_type()
+    )
 
 
 def destroy_distributed():

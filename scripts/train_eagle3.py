@@ -73,7 +73,10 @@ def print_cuda_memory_debug(label: str) -> None:
         allocated_bytes = device_module.memory_allocated()
         reserved_bytes = device_module.memory_reserved()
     except Exception as exc:
-        print(f"[memory-debug] {label}: failed to query {device_type} memory: {exc}", flush=True)
+        print(
+            f"[memory-debug] {label}: failed to query {device_type} memory: {exc}",
+            flush=True,
+        )
         return
 
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "NA"
@@ -762,7 +765,10 @@ def run_forward(
             # pixel_values = [pv.to(get_local_device()) for pv in data["pixel_values"]] if args.is_vlm else None
             if args.is_vlm:
                 image_grid_thw = (
-                    [thw.to(get_local_device()).squeeze() for thw in data["image_grid_thw"]]
+                    [
+                        thw.to(get_local_device()).squeeze()
+                        for thw in data["image_grid_thw"]
+                    ]
                     if args.is_vlm
                     else None
                 )
@@ -831,7 +837,9 @@ def run_forward(
             target=target,
             hidden_states=hidden_states,
             position_ids=(
-                data["position_ids"].to(get_local_device()) if "position_ids" in data else None
+                data["position_ids"].to(get_local_device())
+                if "position_ids" in data
+                else None
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,

@@ -3,8 +3,14 @@ import time
 
 import torch
 
-from specforge.core.loss import log_softmax_loss, _compute_loss
-from specforge.utils import empty_cache, get_device_module, get_device_type, get_local_device, synchronize
+from specforge.core.loss import _compute_loss, log_softmax_loss
+from specforge.utils import (
+    empty_cache,
+    get_device_module,
+    get_device_type,
+    get_local_device,
+    synchronize,
+)
 
 TTT_LENGTH = 7
 
@@ -31,13 +37,20 @@ def benchmark_loss_method(
         target = torch.softmax(
             torch.randn(B, T, V, device=get_local_device(), dtype=torch.float32), dim=-1
         )
-        position_mask = torch.ones((B, T, 1), dtype=torch.bool, device=get_local_device())
+        position_mask = torch.ones(
+            (B, T, 1), dtype=torch.bool, device=get_local_device()
+        )
 
         # Pre-allocate logits tensors for each TTT step
         logits_list = []
         for i in range(TTT_LENGTH):
             logits = torch.randn(
-                B, T, V, device=get_local_device(), requires_grad=True, dtype=torch.float32
+                B,
+                T,
+                V,
+                device=get_local_device(),
+                requires_grad=True,
+                dtype=torch.float32,
             )
             logits_list.append(logits)
 

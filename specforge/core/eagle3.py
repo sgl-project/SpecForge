@@ -35,7 +35,7 @@ from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspA
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
 from specforge.core.loss import log_softmax_loss
 from specforge.modeling.draft import Eagle3DraftModel
-from specforge.utils import get_compile_backend, empty_cache, padding
+from specforge.utils import empty_cache, get_compile_backend, padding
 
 
 class Eagle3Model(nn.Module):

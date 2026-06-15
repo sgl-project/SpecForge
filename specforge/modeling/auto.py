@@ -18,6 +18,8 @@ from transformers import (
     modeling_utils,
 )
 
+from specforge.utils import get_local_device
+
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.custom_backend import (
     GptOssForCausalLM,
@@ -28,7 +30,6 @@ from .target.custom_backend import (
     Qwen3ForCausalLM,
     Qwen3MoeForCausalLM,
 )
-from specforge.utils import get_local_device
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):

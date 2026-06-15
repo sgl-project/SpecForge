@@ -507,7 +507,8 @@ class HiddenStatesGenerator:
                 continue
 
             filtered_batch_gpu = {
-                k: v.to(get_local_device(), non_blocking=True) for k, v in filtered_batch.items()
+                k: v.to(get_local_device(), non_blocking=True)
+                for k, v in filtered_batch.items()
             }
             _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
                 **filtered_batch_gpu,
