@@ -24,6 +24,15 @@ We have seen many open-source projects for speculative decoding, but most of the
 Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get started.
 
 
+## 🔧 Supported Methods
+
+| Method | Description | Training | Example | Optimization |
+| --- | --- | --- | --- | --- |
+| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [`scripts/train_eagle3.py`](./scripts/train_eagle3.py) | [`examples/run_qwen3_8b_eagle3_online.sh`](./examples/run_qwen3_8b_eagle3_online.sh) | [LK loss](https://arxiv.org/pdf/2602.23881)
+| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [`scripts/train_dflash.py`](./scripts/train_dflash.py) | [`examples/run_qwen3_8b_dflash_online.sh`](./examples/run_qwen3_8b_dflash_online.sh) | [D-PACE](https://arxiv.org/abs/2605.18810)
+| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [`scripts/train_domino.py`](./scripts/train_domino.py) | [`examples/run_qwen3_8b_domino_online.sh`](./examples/run_qwen3_8b_domino_online.sh) |
+
+
 ## 🚀 Accelerate with SpecBundle
 
 SpecBundle is a collection of production-grade speculative decoding models that are released by the SpecForge team and our industry partners. They provide higher acceptance rate compared to the existing open-source checkpoints over a wide range of domains. Together with SGLang, you can experience up to 4x speedup for inference. Check out our resources below:
@@ -38,6 +47,9 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 ## 🎉 News
 
+- [2026-06] 🔥 Added D-PACE as an optional loss for DFlash training.
+- [2026-06] 🔥 Added Domino online training for DFlash draft models.
+- [2026-01] 🔥 Added DFlash block-parallel online training with SGLang serving support.
 - [2025-12] 🎉 Released SpecBundle (phase 1) and SpecForge v0.2. Check out our blog at [LMSYS.org](https://lmsys.org/blog/2025-12-23-spec-bundle-phase-1/)
 - [2025-12] 🔔 Released the roadmap for 2026 Q1.
 - [2025-08] 🔔 SpecForge is listed as a [flagship project](https://lmsys.org/about/) in LMSYS. Congratulations to the SpecForge team!
@@ -61,6 +73,13 @@ We would like to extend our sincere thanks to [Voltage Park](https://www.voltage
 ## 📃 Citation
 
 ```bibtex
+@article{li2026specforge,
+  title={{SpecForge}: A flexible and efficient open-source training framework for speculative decoding},
+  author={Li, Shenggui and Wang, Chao and Zhu, Yikai and Wang, Yubo and Yin, Fan and Shi, Shuai and Chen, Yefei and Dong, Xiaomin and Chen, Qiaoling and Pan, Jin and others},
+  journal={arXiv preprint arXiv:2603.18567},
+  year={2026}
+}
+
 @misc{specforge2025,
   title={SpecForge: Train speculative decoding models effortlessly},
   author={Shenggui Li, Yikai Zhu, Chao Wang, Fan Yin, Shuai Shi, Yubo Wang, Yi Zhang, Yingyi Huang, Haoshuai Zheng, Yineng Zhang},
@@ -68,3 +87,4 @@ We would like to extend our sincere thanks to [Voltage Park](https://www.voltage
   publisher={GitHub},
   howpublished={\url{https://github.com/sgl-project/specforge}},
 }
+```
