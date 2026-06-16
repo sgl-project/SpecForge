@@ -186,7 +186,9 @@ class WarmupDelayerScheduler(TwoStageScheduler):
                 self.after_scheduler.step(None)
                 self._last_lr = self.after_scheduler.get_last_lr()
             else:
-                self.after_scheduler.step(epoch - self.warmup_epochs)
+                self.after_scheduler.step(
+                    epoch - self.warmup_epochs - self.delay_epochs
+                )
                 self._last_lr = self.after_scheduler.get_last_lr()
         else:
             return super().step(epoch)
