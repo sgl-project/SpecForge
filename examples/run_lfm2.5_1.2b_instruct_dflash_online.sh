@@ -12,24 +12,27 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_dflash.py \
-    --target-model-path Qwen/Qwen3-8B \
-    --draft-config-path $ROOT_DIR/configs/qwen3-8b-dflash.json \
-    --train-data-path $ROOT_DIR/cache/dataset/perfectblend_qwen3-8b_regen.jsonl \
-    --output-dir $ROOT_DIR/outputs/qwen3-8b-perfectblend \
+    --target-model-path LiquidAI/LFM2.5-1.2B-Instruct \
+    --draft-config-path $ROOT_DIR/configs/lfm2.5-1.2b-instruct-dflash.json \
+    --train-data-path $ROOT_DIR/cache/dataset/perfectblend_lfm2.5-1.2b_regen.jsonl \
+    --output-dir $ROOT_DIR/outputs/lfm2.5-1.2b-instruct-dflash-perfectblend-8layers \
     --num-epochs 6 \
-    --batch-size 4 \
+    --batch-size 2 \
+    --accumulation-steps 2 \
     --learning-rate 6e-4 \
     --warmup-ratio 0.04 \
     --max-grad-norm 1.0 \
-    --max-length 3072 \
-    --chat-template qwen \
+    --max-length 4096 \
+    --chat-template lfm \
     --attention-backend $ATTENTION_BACKEND \
+    --num-anchors 512 \
     --loss-decay-gamma 7.0 \
     --log-interval 50 \
-    --save-interval 1000 \
+    --save-interval 10000 \
     --report-to wandb \
-    --wandb-project specforge-qwen3-8b-dflash \
+    --wandb-project specforge-lfm2.5-1.2b-instruct-dflash \
     --target-model-backend sglang \
     --block-size 16 \
     --num-anchors 512 \
-    --wandb-name qwen3-8b-dflash-perfectblend
+    --wandb-name lfm2.5-1.2b-instruct-dflash-perfectblend-8layers \
+    # --resume

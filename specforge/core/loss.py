@@ -225,7 +225,7 @@ class LogSoftmaxLoss(torch.autograd.Function):
             num_warps=num_warps,
         )
         logits = logits.view(B, T, V)
-        return logits, None, None, None, None
+        return logits, None, None
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@
 
 import gzip
 import io
+import json
 import os
 import re
 import warnings
@@ -144,7 +145,6 @@ def preprocess_conversations(
             - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
             - attention_mask: List of attention masks.
     """
-
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
     if chat_template.parser_type == "general":
@@ -248,7 +248,7 @@ def preprocess_vlm_conversations(
             else:
                 messages.append({"role": role, "content": sentence["content"]})
 
-        conversation = processor.apply_chat_template(
+        conversation = processor.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
@@ -388,7 +388,27 @@ def build_eagle3_dataset(
             if "id" in examples:
                 examples.pop("id")
             if "tools" in examples:
-                tools = examples.pop("tools")
+                tools_raw = examples.pop("tools")
+                # Parse tools: handle JSON strings from safe_conversations_generator
+                tools = []
+                for tool_item in tools_raw:
+                    if isinstance(tool_item, (str, list)):
+                        try:
+                            tools.append(json.loads(tool_item))
+                        except json.JSONDecodeError:
+                            warnings.warn(
+                                f"Failed to parse tools JSON string: {tool_item[:100]}..."
+                            )
+                            tools.append([])
+                    elif isinstance(tool_item, list):
+                        tools.append(tool_item)
+                    elif tool_item is None:
+                        tools.append([])
+                    else:
+                        warnings.warn(
+                            f"Unexpected tools type: {type(tool_item)}, using empty list"
+                        )
+                        tools.append([])
             else:
                 tools = [[] for _ in range(len(conversations))]
             processed = preprocess_conversations(
@@ -583,13 +603,15 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["attention_mask"] = attention_mask
 
         # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Local seq_len (per sp_rank) = local_len; attention uses (local_len - ttt_length).
+        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
+        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size
-        ring_start = ring_rank * ring_chunk
+        ulysses_rank = sp_rank % sp_ulysses_size
+        ring_start = ring_rank * ring_chunk + ulysses_rank * usp_chunk_size
         new_data["position_ids"] = torch.arange(
-            ring_start, ring_start + ring_chunk, dtype=torch.long
+            ring_start, ring_start + usp_chunk_size, dtype=torch.long
         ).unsqueeze(0)
 
         if transform:
