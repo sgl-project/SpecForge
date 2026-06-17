@@ -26,4 +26,4 @@ torchrun \
     --attention-backend sdpa \
     --target-model-backend sglang \
     --log-interval 10 \
-    --sglang-mem-fraction-static 0.25
+    --sglang-mem-fraction-static 0.3
