@@ -14,20 +14,21 @@ torchrun \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_dflash.py \
     --target-model-path Qwen/Qwen3-VL-8B-Instruct \
-    --draft-model-config $ROOT_DIR/configs/qwen3-vl-8b-dflash.json \
+    --draft-config-path $ROOT_DIR/configs/qwen3-vl-8b-dflash.json \
     --target-model-backend sglang \
     --is-vlm \
+    --tp-size 1 \
     --trust-remote-code \
-    --train-data-path $ROOT_DIR/cache/dataset/allava4v-mix-20k_train.localimg_regen.jsonl \
+    --train-data-path $ROOT_DIR/cache/dataset/allava4v-train_regen.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --min-pixels 50176 \
     --max-pixels 802816 \
-    --output-dir $ROOT_DIR/outputs/qwen3-vl-8b-allava4v20k-dflash \
+    --output-dir $ROOT_DIR/outputs/qwen3-vl-8b-dflash \
     --cache-dir $ROOT_DIR/cache \
     --num-epochs 6 \
     --batch-size 2 \
-    --learning-rate 1e-4 \
-    --warmup-ratio 0.08 \
+    --learning-rate 6e-4 \
+    --warmup-ratio 0.04 \
     --max-grad-norm 1.0 \
     --max-length 4096 \
     --num-draft-layers 5 \
@@ -37,6 +38,4 @@ torchrun \
     --attention-backend $ATTENTION_BACKEND \
     --block-size 16 \
     --num-anchors 512 \
-    --loss-decay-gamma 7.0 \
-    --log-interval 50 \
-    --save-interval 1000
+    --loss-decay-gamma 7.0

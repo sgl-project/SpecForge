@@ -15,6 +15,6 @@ psutil
 numpy
 accelerate
 pydantic
-sglang[all]==0.5.4
+sglang[all]==0.5.9
 openai-harmony
 tensorboard

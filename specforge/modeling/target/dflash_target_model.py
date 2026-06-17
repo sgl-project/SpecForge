@@ -159,7 +159,9 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
+        if hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+            self.model_runner.model.set_dflash_layers_to_capture(layer_ids)
+        elif hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
 
     @torch.no_grad
@@ -281,7 +283,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             image_item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=pixel_values,
-                pad_value=self.image_token_id,
                 offsets=image_offsets,
             )
             if image_grid_thw is not None:
@@ -296,7 +297,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             video_item = MultimodalDataItem(
                 modality=Modality.VIDEO,
                 feature=pixel_values_videos,
-                pad_value=self.video_token_id,
                 offsets=video_offsets,
             )
             if video_grid_thw is not None:
@@ -496,6 +496,11 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 video_grid_thw=video_grid_thw,
                 second_per_grid_ts=second_per_grid_ts,
             )
+            if position_ids is None:
+                raise ValueError(
+                    "SGLang VLM target did not produce mRoPE position_ids for "
+                    "multimodal DFlash training."
+                )
         else:
             if isinstance(input_ids, torch.Tensor):
                 input_ids_list = torch.split(input_ids, 1, dim=0)
