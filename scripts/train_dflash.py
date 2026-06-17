@@ -36,12 +36,7 @@ from specforge.modeling.target.dflash_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import (
-    get_last_checkpoint,
-    get_local_device,
-    print_on_rank0,
-    print_with_rank,
-)
+from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
 
 def parse_args():
@@ -183,14 +178,11 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
 
-    device = get_local_device()
-    device_type = device.type
-
     target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
         backend=args.target_model_backend,
         torch_dtype=torch.bfloat16,
-        device=device_type if args.target_model_backend == "hf" else None,
+        device="cuda" if args.target_model_backend == "hf" else None,
         trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
@@ -221,7 +213,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -453,7 +445,7 @@ def main():
         args.target_model_path,
         embed_key=args.embedding_key,
         lm_head_key=args.lm_head_key,
-        device=device_type,
+        device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
 
@@ -551,13 +543,13 @@ def main():
                 continue
             global_step += 1
 
-            input_ids = data["input_ids"].to(device, non_blocking=True)
-            attention_mask = data["attention_mask"].to(device, non_blocking=True)
-            loss_mask = data["loss_mask"].to(device, non_blocking=True)
+            input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
+            loss_mask = data["loss_mask"].cuda()
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
-            hidden_states = target_output.hidden_states.to(device, non_blocking=True)
+            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
             loss, accuracy = dflash_model(
                 input_ids=input_ids,
