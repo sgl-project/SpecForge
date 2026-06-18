@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover - import-time fallback
         """No-op fallback when yunchang is not installed (e.g. Ascend NPU)."""
         return
 
+
 from specforge.utils import get_device_type, print_with_rank
 
 _DEVICE_MESH = None

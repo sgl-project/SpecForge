@@ -48,6 +48,7 @@ def load_config_from_file(config_path: str):
 
     return PretrainedConfig.from_dict(config)
 
+
 def get_device_type() -> str:
     """Auto-detect the available accelerator type.
 
