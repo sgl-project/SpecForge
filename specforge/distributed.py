@@ -99,25 +99,6 @@ def _detect_device_and_backend():
     return device_type, backend
 
 
-def _bind_local_device(device_type: str) -> int:
-    """Bind the current process to its local accelerator and return device count."""
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if device_type == "cuda":
-        torch.cuda.set_device(local_rank)
-        return torch.cuda.device_count()
-    if device_type == "npu":
-        # Importing torch_npu registers the npu backend on torch.
-        # It is usually imported once at process start; we keep the import
-        # here defensive so non-NPU environments still work.
-        try:
-            import torch_npu  # noqa: F401
-        except ImportError:
-            pass
-        torch.npu.set_device(local_rank)
-        return torch.npu.device_count()
-    return 1
-
-
 def init_distributed(
     timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
 ):
@@ -135,20 +116,30 @@ def init_distributed(
     """
     device_type, backend = _detect_device_and_backend()
 
-    # 1) Bind the local device BEFORE creating the process group.
-    device_count = _bind_local_device(device_type)
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # NPU/HCCL requires `set_device` BEFORE `init_process_group`, and there is
+    # no equivalent of NCCL's "rank % cuda.device_count()" auto-binding, so on
+    # NPU we honour LOCAL_RANK from the launcher (torchrun / mpirun export it).
+    if device_type == "npu":
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            pass
+        torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
 
-    # 2) Create the global process group.
     dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
+
+    # CUDA derives local_rank from the global rank, matching upstream behaviour
+    # so that mp.spawn-based tests (which do not export LOCAL_RANK) keep
+    # working.
+    if device_type == "cuda":
+        local_rank = dist.get_rank() % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+    else:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    print_with_rank(f"bind to device {local_rank}")
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    print_with_rank(
-        f"[dist] backend={backend} device_type={device_type} "
-        f"rank={rank}/{world_size} local_rank={local_rank} "
-        f"visible_devices={device_count}"
-    )
 
     # 3) DP / TP mesh.
     dp_size = world_size // tp_size
