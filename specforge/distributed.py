@@ -5,13 +5,12 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-# yunchang is CUDA-centric and may be unavailable on Ascend NPU.
-# Provide a graceful fallback so that distributed init still works on NPU.
+# yunchang is CUDA-only; provide a no-op fallback so init still works on NPU.
 try:
-    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg  # type: ignore
+    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
     _YUNCHANG_AVAILABLE = True
-except Exception:  # pragma: no cover - import-time fallback
+except ImportError:
     PROCESS_GROUP = None
     _YUNCHANG_AVAILABLE = False
 
@@ -79,13 +78,7 @@ def get_sp_ring_group():
 
 
 def _detect_device_and_backend():
-    """Return (device_type, collective_backend) using ``get_device_type``.
-
-    The device side is delegated to ``specforge.utils.get_device_type`` so that
-    the resolution rule (SPECFORGE_DEVICE -> cuda -> npu -> cpu) lives in a
-    single place. The backend side keeps the optional ``SPECFORGE_DIST_BACKEND``
-    override for cuda -> nccl, npu -> hccl, cpu -> gloo.
-    """
+    """Return (device_type, collective_backend) for the current accelerator."""
     device_type = get_device_type()
 
     backend = os.environ.get("SPECFORGE_DIST_BACKEND")
@@ -104,15 +97,11 @@ def init_distributed(
 ):
     """Initialize distributed training.
 
-    The function preserves the upstream SpecForge contract (TP / DP / SP groups,
-    device meshes, yunchang sequence-parallel groups) while transparently
-    supporting NVIDIA CUDA and Ascend NPU backends.
-
     Args:
-        timeout(int): Timeout for collective communication in minutes.
-        tp_size(int): The degree of tensor parallelism.
-        sp_ulysses_size(int): Ulysses sequence-parallel size.
-        sp_ring_size(int): Ring sequence-parallel size.
+        timeout(int): Timeout for collective communication in minutes
+        tp_size(int): The degree of tensor parallelism
+        sp_ulysses_size(int): Ulysses sequence-parallel size
+        sp_ring_size(int): Ring sequence-parallel size
     """
     device_type, backend = _detect_device_and_backend()
 
@@ -141,7 +130,6 @@ def init_distributed(
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # 3) DP / TP mesh.
     dp_size = world_size // tp_size
     assert (
         world_size == tp_size * dp_size
@@ -155,7 +143,6 @@ def init_distributed(
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
     dp_device_mesh = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
-    # 4) Draft DP / SP mesh and yunchang seq-parallel groups.
     sp_total = sp_ulysses_size * sp_ring_size
     assert (
         world_size % sp_total == 0
@@ -203,11 +190,7 @@ def init_distributed(
 
 
 def destroy_distributed():
-    """Tear down the process groups created by `init_distributed`.
-
-    Safe to call when some of the optional groups (e.g. yunchang SP groups on
-    NPU) were never created — those are silently skipped.
-    """
+    """Tear down the process groups created by ``init_distributed``."""
     if not dist.is_initialized():
         return
 
