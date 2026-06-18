@@ -44,5 +44,5 @@ torchrun \
     --report-to tensorboard \
     --target-model-backend hf \
     --block-size 16 \
-    --embedding-key model.embed_tokens.weight \
+    --embedding-key model.language_model.embed_tokens.weight \
     --trust-remote-code
