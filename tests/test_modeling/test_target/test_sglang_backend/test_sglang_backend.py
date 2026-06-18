@@ -48,6 +48,14 @@ def test_dense(rank, world_size, port, tp_size):
         device="cuda",
         attention_backend="fa3",
         mem_fraction_static=0.4,
+        enable_nccl_nvls=True,
+        enable_symm_mem=False,
+        enable_torch_compile=True,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        enable_piecewise_cuda_graph=True,
+        ep_size=1,
+        context_length=256,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
@@ -81,6 +89,14 @@ def test_moe(rank, world_size, port, tp_size):
         attention_backend="fa3",
         load_format="dummy",
         mem_fraction_static=0.4,
+        enable_torch_compile=True,
+        enable_nccl_nvls=True,
+        enable_symm_mem=False,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        enable_piecewise_cuda_graph=True,
+        ep_size=2,
+        context_length=256,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
@@ -215,6 +231,13 @@ def test_vlm(rank, world_size, port, tp_size):
         attention_backend="fa3",
         load_format="dummy",
         mem_fraction_static=0.75,
+        enable_torch_compile=True,
+        enable_nccl_nvls=True,
+        enable_symm_mem=False,  # Disable to avoid nccl_allocator compilation issues
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        enable_piecewise_cuda_graph=True,
+        context_length=4096,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
@@ -379,6 +402,13 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         attention_backend="fa3",
         load_format="dummy",
         mem_fraction_static=0.4,
+        enable_nccl_nvls=True,
+        enable_torch_compile=True,
+        enable_symm_mem=False,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        enable_piecewise_cuda_graph=True,
+        context_length=4096,
     )
     sgl_target_model.set_aux_hidden_states_layers()
     sgl_out = sgl_target_model.generate_eagle3_data(
