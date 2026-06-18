@@ -37,7 +37,7 @@ torchrun \
     --max-length 1024 \
     --chat-template qwen3.5 \
     --attention-backend sdpa \
-    --num-anchors 186 \
+    --num-anchors 16 \
     --loss-decay-gamma 7.0 \
     --log-interval 50 \
     --save-interval 3000 \
