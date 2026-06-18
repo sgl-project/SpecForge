@@ -45,7 +45,7 @@ class Tracker(abc.ABC):
     def __init__(self, args, output_dir: str):
         self.args = args
         self.output_dir = output_dir
-        self.rank = dist.get_rank()
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.is_initialized = False
 
     @classmethod
