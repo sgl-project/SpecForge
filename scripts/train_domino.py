@@ -3,6 +3,7 @@
 """Domino Training Script."""
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -63,6 +64,12 @@ def parse_args():
         default="flex_attention",
         choices=["eager", "sdpa", "flex_attention"],
         help="Attention backend for draft model.",
+    )
+    model_group.add_argument(
+        "--flex-kernel-options-json",
+        type=json.loads,
+        default=None,
+        help="JSON dict forwarded as kernel_options when attention-backend=flex_attention.",
     )
     model_group.add_argument(
         "--trust-remote-code", action="store_true", help="Trust remote code"
@@ -444,6 +451,17 @@ def main():
     )
 
     args = parse_args()
+    flex_kernel_options = args.flex_kernel_options_json
+    if flex_kernel_options is not None:
+        if args.attention_backend != "flex_attention":
+            raise ValueError(
+                "--flex-kernel-options-json can only be used when "
+                "--attention-backend is 'flex_attention'."
+            )
+        if not isinstance(flex_kernel_options, dict):
+            raise ValueError(
+                "--flex-kernel-options-json must decode to a JSON object."
+            )
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -528,6 +546,7 @@ def main():
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         shift_label=draft_model.shift_label,
+        flex_kernel_options=flex_kernel_options,
     )
 
     domino_model = FSDP(

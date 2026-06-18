@@ -44,6 +44,7 @@ class OnlineDominoModel(nn.Module):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         shift_label: bool = False,
+        flex_kernel_options: Optional[Dict] = None,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -55,6 +56,7 @@ class OnlineDominoModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.shift_label = shift_label
+        self.flex_kernel_options = flex_kernel_options
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -332,11 +334,19 @@ class OnlineDominoModel(nn.Module):
                 device=device,
             )
 
+        draft_forward_kwargs = {}
+        if (
+            self.attention_backend == "flex_attention"
+            and self.flex_kernel_options is not None
+        ):
+            draft_forward_kwargs["kernel_options"] = self.flex_kernel_options
+
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **draft_forward_kwargs,
         )
 
         # --- Labels ---
