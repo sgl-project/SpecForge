@@ -28,6 +28,11 @@ python scripts/regenerate_train_data.py \
     --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
     --resume \
     --reasoning save
+
+For VLM jsonl samples with a top-level "image" field, the script attaches the
+image to the first user turn in the request while keeping the output jsonl in
+SpecForge format:
+{"image": "...", "conversations": [{"role": "user", "content": "..."}, ...]}.
 """
 
 import argparse
@@ -171,6 +176,30 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     return length
 
 
+def build_api_user_message(message: Dict[str, Any], image_path=None) -> Dict[str, Any]:
+    """Build an OpenAI-compatible multimodal user message for requests only."""
+    api_message = dict(message)
+    if image_path is None:
+        return api_message
+
+    content = message.get("content", "")
+    if isinstance(content, list):
+        # Already in multimodal OpenAI-compatible format.
+        return api_message
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        content = str(content)
+
+    parts: List[Dict[str, Any]] = [
+        {"type": "image_url", "image_url": {"url": image_path}}
+    ]
+    if content:
+        parts.append({"type": "text", "text": content})
+    api_message["content"] = parts
+    return api_message
+
+
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
@@ -200,14 +229,17 @@ def build_query_kwargs(args, messages, max_tokens=None):
 def call_sglang(
     args,
     server_address: str,
-    data: List[Dict[str, Any]],
+    data: Dict[str, Any],
     max_tokens=None,
-) -> str:
-    """Send a batch of prompts to sglang /v1/completions."""
+) -> Dict[str, Any]:
+    """Send a conversation to sglang /v1/chat/completions."""
     client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
 
     messages = data["conversations"]
+    image_path = data.get("image")
+    api_messages = []
     regenerated_messages = []
+    user_turn_index = 0
 
     # ignore data which starts with an assistant message
     if messages[0]["role"] == "assistant":
@@ -217,13 +249,20 @@ def call_sglang(
 
     for message in messages:
         if message["role"] == "system":
+            api_messages.append(message)
             regenerated_messages.append(message)
         elif message["role"] == "assistant":
             continue
         elif message["role"] == "user":
             regenerated_messages.append(message)
+            api_messages.append(
+                build_api_user_message(
+                    message, image_path if user_turn_index == 0 else None
+                )
+            )
+            user_turn_index += 1
 
-            query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
+            query_kwargs = build_query_kwargs(args, api_messages, max_tokens)
 
             try:
                 resp = client.chat.completions.create(**query_kwargs)
@@ -240,6 +279,7 @@ def call_sglang(
                 resp_msg["reasoning_content"] = resp.choices[
                     0
                 ].message.reasoning_content
+            api_messages.append(resp_msg)
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
@@ -332,11 +372,9 @@ def main():
     error_samples = 0
 
     # Create progress bar
-    with (
-        open(args.input_file_path, "r") as input_file,
+    with open(args.input_file_path, "r") as input_file,
         open(args.output_file_path, file_mode) as output_file_handle,
-        open(error_file_path, file_mode) as error_file_handle,
-    ):
+        open(error_file_path, file_mode) as error_file_handle:
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
         )

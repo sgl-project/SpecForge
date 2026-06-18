@@ -39,6 +39,64 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def get_rope_scaling_value(config: Qwen3Config, key: str, default=None):
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is None:
+        return default
+    if isinstance(rope_scaling, dict):
+        return rope_scaling.get(key, default)
+    return getattr(rope_scaling, key, default)
+
+
+class Qwen3InterleavedMultiRotaryEmbedding(Qwen3RotaryEmbedding):
+    """Interleaved mRoPE for Qwen3-VL style multimodal position ids."""
+
+    def __init__(self, config: Qwen3Config):
+        super().__init__(config)
+        self.mrope_section = get_rope_scaling_value(
+            config, "mrope_section", [24, 20, 20]
+        )
+
+    def _apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
+        freqs_t = freqs[0]
+        for dim_idx, offset in enumerate((1, 2), start=1):
+            length = self.mrope_section[dim_idx] * 3
+            idx_slice = slice(offset, length, 3)
+            freqs_t[..., idx_slice] = freqs[dim_idx, ..., idx_slice]
+        return freqs_t
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(2, 3)
+            interleaved_freqs = self._apply_interleaved_mrope(freqs)
+            emb = torch.cat((interleaved_freqs, interleaved_freqs), dim=-1)
+            scaling = getattr(self, "attention_scaling", 1.0)
+            cos = emb.cos() * scaling
+            sin = emb.sin() * scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class Qwen3DFlashAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -228,7 +286,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.use_interleaved_mrope = bool(
+            get_rope_scaling_value(config, "mrope_interleaved", False)
+        )
+        if self.use_interleaved_mrope:
+            self.rotary_emb = Qwen3InterleavedMultiRotaryEmbedding(config)
+        else:
+            self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,

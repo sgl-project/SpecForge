@@ -216,7 +216,9 @@ def preprocess_vlm_conversations(
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         source = examples["conversations"][i]
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
         if not source:
             # if the source is None, skip it
             continue
