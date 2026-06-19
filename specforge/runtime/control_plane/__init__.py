@@ -9,6 +9,7 @@ from specforge.runtime.control_plane.controller import DataFlowController, Train
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
+    SQLiteMetadataStore,
 )
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "TrainLease",
     "MetadataStore",
     "InMemoryMetadataStore",
+    "SQLiteMetadataStore",
     "BackpressureConfig",
     "BackpressureController",
 ]

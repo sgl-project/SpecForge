@@ -265,6 +265,53 @@ class DataFlowController:
         ]
         self.sample_queue.fail(refs, reason, retryable)
 
+    # -- restart reconciliation (B4) --------------------------------------
+    def reconcile_on_restart(self, feature_store: Optional[Any] = None) -> Dict[str, Any]:
+        """Rebuild queue + release state from the single durable marker.
+
+        Call once on a fresh controller backed by a *durable* metadata store
+        (e.g. ``SQLiteMetadataStore`` reopened on the same DB file) after a crash.
+        In-process lease state did not survive the crash, so release state is
+        *derived* solely from the durable ``{acked, global_step}`` marker — never
+        a separate fact that could disagree with the optimizer step.
+
+        Per ``failure_recovery.md`` (B4), each committed sample lands in one row:
+
+        | durable state                | action                              |
+        |------------------------------|-------------------------------------|
+        | acked AND step committed     | released (idempotent free)          |
+        | committed, not durably acked | replay/requeue (at-least-once)      |
+        | never committed (in-flight)  | not here; rollout retries on id     |
+
+        Re-training a leased-but-unacked sample is allowed (idempotent effects);
+        the guarantee is **no data loss** (every committed-unacked sample is
+        requeued) and **no duplicate train** (an acked+stepped sample is never
+        requeued — the exact crash window "after ack, before release" is safe
+        because the durable ack already records it as trained).
+        """
+        marker = self.store.durable_marker()
+        acked = marker["acked"]
+        step_committed = marker["global_step"] is not None
+        requeued: List[str] = []
+        released: List[str] = []
+        for sid in self.store.all_committed_ids():
+            if sid in acked and step_committed:
+                released.append(sid)
+                if feature_store is not None:
+                    # idempotent free; safe if the sample was already freed
+                    feature_store.abort(sid, reason="reconciled-released")
+            else:
+                ref = self.store.get_committed(sid)
+                if ref is not None:
+                    self.sample_queue.put([ref])  # idempotent on sample_id
+                    requeued.append(sid)
+        return {
+            "requeued": requeued,
+            "released": released,
+            "global_step": marker["global_step"],
+            "optimizer_durable": marker["optimizer_durable"],
+        }
+
     # NOTE: weight publishing (publish_weight_version / latest_weight_version) is
     # not yet implemented; it lands with the rest of the weight-version lifecycle.
 
