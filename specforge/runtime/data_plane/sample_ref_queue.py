@@ -15,12 +15,28 @@ touching callers. Carries no tensors — only ``SampleRef`` metadata.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
+
+
+def dp_partition(sample_id: str, num_partitions: int) -> int:
+    """Stable DP-rank assignment for a sample under a given partition count.
+
+    The resharding contract (M6): partitioning is a *consumer* decision computed
+    from a stable key (``sample_id``), NOT pinned by the producer. So the same
+    committed pool re-distributes cleanly when the consumer's DP width changes —
+    a sample produced under one layout is consumable under another. Hash-based so
+    it is balanced and deterministic across ranks/restarts.
+    """
+    if num_partitions <= 1:
+        return 0
+    digest = hashlib.sha1(sample_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % num_partitions
 
 
 class SampleRefQueue:
@@ -52,20 +68,42 @@ class SampleRefQueue:
         timeout_s: Optional[float] = None,
         *,
         partition_key: Optional[str] = None,
+        partition: Optional[Tuple[int, int]] = None,
     ) -> List[SampleRef]:
+        """Lease up to ``max_refs`` pending refs.
+
+        ``partition=(index, num_partitions)`` restricts the lease to the DP shard
+        a consumer owns under its *current* layout (resharding contract): only
+        refs whose ``dp_partition(sample_id, num_partitions) == index`` are
+        leased, so changing ``num_partitions`` re-distributes the same pool. A
+        partitioned get does not block waiting for a cross-partition match (that
+        would let one shard starve another); it returns whatever its shard has.
+        ``partition_key`` remains the reserved per-DP-rank seam (unused today).
+        """
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         with self._cv:
             while True:
                 self._reclaim_expired_locked()
                 if self._pending:
                     out: List[SampleRef] = []
-                    for _ in range(max_refs):
-                        if not self._pending:
+                    if partition is None:
+                        for _ in range(max_refs):
+                            if not self._pending:
+                                break
+                            sid, ref = self._pending.popitem(last=False)
+                            self._leased[sid] = (ref, time.monotonic())
+                            out.append(ref)
+                        return out
+                    # partitioned lease: take this shard's matching refs only.
+                    index, num_partitions = partition
+                    for sid in list(self._pending.keys()):
+                        if len(out) >= max_refs:
                             break
-                        sid, ref = self._pending.popitem(last=False)
-                        self._leased[sid] = (ref, time.monotonic())
-                        out.append(ref)
-                    return out
+                        if dp_partition(sid, num_partitions) == index:
+                            ref = self._pending.pop(sid)
+                            self._leased[sid] = (ref, time.monotonic())
+                            out.append(ref)
+                    return out  # may be empty if this shard has nothing pending
                 if deadline is None:
                     return []
                 remaining = deadline - time.monotonic()
