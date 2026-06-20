@@ -36,7 +36,12 @@ from specforge.modeling.target.dflash_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+from specforge.utils import (
+    get_last_checkpoint,
+    get_training_state_path,
+    print_on_rank0,
+    print_with_rank,
+)
 
 
 def parse_args():
@@ -306,17 +311,17 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
             if "draft_model." in k
         }
 
-        if dist.get_rank() == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": step,
-                    "args": args,
-                    **optimizer.state_dict(),
-                },
-                os.path.join(save_dir, "training_state.pt"),
-            )
+        torch.save(
+            {
+                "epoch": epoch,
+                "global_step": step,
+                "args": args,
+                **optimizer.state_dict(),
+            },
+            get_training_state_path(save_dir),
+        )
 
+        if dist.get_rank() == 0:
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
             modeling_src = os.path.join(
@@ -406,17 +411,14 @@ def main():
         del loaded_model
         print("Loaded draft model weights from checkpoint")
 
-        training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+        training_state_path = get_training_state_path(draft_model_last_checkpoint)
+        resume_state = torch.load(
+            training_state_path, map_location="cpu", weights_only=False
         )
-        if os.path.exists(training_state_path):
-            resume_state = torch.load(
-                training_state_path, map_location="cpu", weights_only=False
-            )
-            print(
-                f"Will resume from epoch {resume_state['epoch']}, "
-                f"step {resume_state['global_step']}"
-            )
+        print(
+            f"Will resume from epoch {resume_state['epoch']}, "
+            f"step {resume_state['global_step']}"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 

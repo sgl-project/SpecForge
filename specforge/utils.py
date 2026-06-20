@@ -118,6 +118,11 @@ def get_last_checkpoint(folder, prefix="epoch"):
     return os.path.join(folder, last_checkpoint), (epoch, step)
 
 
+def get_training_state_path(checkpoint_dir):
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    return os.path.join(checkpoint_dir, f"training_state_rank_{rank}.pt")
+
+
 def generate_draft_model_config(
     target_model_path: str, template_config_path: str = None, cache_dir: str = None
 ):

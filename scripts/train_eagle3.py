@@ -48,6 +48,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
+    get_training_state_path,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
@@ -532,17 +533,14 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     # Load training state (optimizer, scheduler, epoch, step) for true resume
     resume_state = None
     if is_resume_checkpoint and draft_model_last_checkpoint:
-        training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+        training_state_path = get_training_state_path(draft_model_last_checkpoint)
+        resume_state = torch.load(
+            training_state_path, map_location="cpu", weights_only=False
         )
-        if os.path.exists(training_state_path):
-            resume_state = torch.load(
-                training_state_path, map_location="cpu", weights_only=False
-            )
-            print_on_rank0(
-                f"Loaded training state from {training_state_path}: "
-                f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
-            )
+        print_on_rank0(
+            f"Loaded training state from {training_state_path}: "
+            f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
+        )
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
@@ -699,13 +697,10 @@ def save_checkpoints(
         state_to_save.update(optimizer.state_dict())
         draft_model_state_dict = filter_draft_state_dict(model_state_dict)
 
+        torch.save(state_to_save, get_training_state_path(epoch_output_dir))
         if dist.get_rank() == 0:
-            torch.save(
-                state_to_save,
-                os.path.join(epoch_output_dir, "training_state.pt"),
-            )
             print_on_rank0(
-                f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                f"Saved full training state to {epoch_output_dir}/training_state_rank_*.pt"
             )
             eagle3_model.draft_model.save_pretrained(
                 epoch_output_dir,

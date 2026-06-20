@@ -63,6 +63,7 @@ class BF16Optimizer:
         return {
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "lr": self.get_learning_rate(),
         }
 
     def get_learning_rate(self):
