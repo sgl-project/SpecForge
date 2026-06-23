@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import gzip
 import io
 import json
@@ -27,7 +28,7 @@ import os
 import re
 import warnings
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -57,6 +58,161 @@ Conversation = List[Dict[str, str]]
 # ==============================
 # This file is for preprocessing the data
 # ==============================
+
+
+def _maybe_json_loads(value: Any) -> Any:
+    """Decode JSON strings used to preserve nested message content in JSONL."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def _decode_base64_image(value: str):
+    """Decode a base64/data-URI image into a PIL image for qwen_vl_utils."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise ImportError(
+            "Pillow is required to decode base64 images in VLM datasets."
+        ) from exc
+
+    if value.startswith("data:image"):
+        value = value.split(",", 1)[1]
+    image_bytes = base64.b64decode(value, validate=True)
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
+def _resolve_image_ref(image: Any, image_root: Optional[str] = None) -> Any:
+    """Normalize image path/url/base64/dict inputs for qwen_vl_utils."""
+    image = _maybe_json_loads(image)
+    if image is None:
+        return None
+
+    if isinstance(image, dict):
+        for key in (
+            "image",
+            "image_url",
+            "path",
+            "file_path",
+            "filename",
+            "url",
+            "base64",
+        ):
+            if key in image and image[key] is not None:
+                return _resolve_image_ref(image[key], image_root=image_root)
+        return image
+
+    if isinstance(image, str):
+        value = image.strip()
+        if not value:
+            return None
+        if value.startswith(("http://", "https://", "file://")):
+            return value
+        if value.startswith("data:image"):
+            return _decode_base64_image(value)
+        if image_root and not os.path.isabs(value):
+            rooted = os.path.join(image_root, value)
+            if os.path.exists(rooted):
+                return rooted
+        if os.path.exists(value):
+            return value
+        try:
+            return _decode_base64_image(value)
+        except Exception:
+            return value
+
+    return image
+
+
+def _normalize_images(images: Any, image_root: Optional[str] = None) -> List[Any]:
+    images = _maybe_json_loads(images)
+    if images is None:
+        return []
+    if isinstance(images, (list, tuple)):
+        normalized = []
+        for image in images:
+            normalized.extend(_normalize_images(image, image_root=image_root))
+        return normalized
+    image = _resolve_image_ref(images, image_root=image_root)
+    return [] if image is None else [image]
+
+
+def _message_role(message: Dict[str, Any]) -> str:
+    role = message.get("role", message.get("from", ""))
+    role = str(role).lower()
+    if role in {"human", "user"}:
+        return "user"
+    if role in {"gpt", "assistant", "model"}:
+        return "assistant"
+    return role
+
+
+def _message_content(message: Dict[str, Any]) -> Any:
+    return _maybe_json_loads(
+        message.get("content", message.get("value", message.get("text", "")))
+    )
+
+
+def _content_items(
+    content: Any,
+    image_root: Optional[str] = None,
+    prepend_images: Optional[List[Any]] = None,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Build Qwen-VL message content items and report whether images are present."""
+    items: List[Dict[str, Any]] = []
+    has_image = False
+    for image in prepend_images or []:
+        items.append({"type": "image", "image": image})
+        has_image = True
+
+    if isinstance(content, list):
+        for item in content:
+            item = _maybe_json_loads(item)
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if (
+                    item_type in {"image", "image_url"}
+                    or "image" in item
+                    or "image_url" in item
+                    or "path" in item
+                    or "base64" in item
+                ):
+                    image = _resolve_image_ref(item, image_root=image_root)
+                    if image is not None:
+                        items.append({"type": "image", "image": image})
+                        has_image = True
+                elif item_type == "text":
+                    items.append({"type": "text", "text": str(item.get("text", ""))})
+                else:
+                    text = item.get("text", item.get("content", item.get("value", "")))
+                    if text:
+                        items.append({"type": "text", "text": str(text)})
+            else:
+                items.append({"type": "text", "text": str(item)})
+    else:
+        items.append({"type": "text", "text": str(content)})
+
+    return items, has_image
+
+
+def _assistant_text(content: Any) -> str:
+    content = _maybe_json_loads(content)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            item = _maybe_json_loads(item)
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", item.get("content", ""))))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content)
 
 
 def _apply_loss_mask_from_chat_template(
@@ -182,6 +338,7 @@ def preprocess_vlm_conversations(
     examples: List[Conversation],
     chat_template: ChatTemplate,
     max_length: int = 2048,
+    image_root: Optional[str] = None,
 ) -> Dict[str, List[torch.Tensor]]:
     """
     Preprocess a batch of ShareGPT style conversations.
@@ -213,38 +370,42 @@ def preprocess_vlm_conversations(
         "image_grid_thw": [],
     }
 
-    # Note: currently, we assume that each example has only one image
-    for i, image in enumerate(examples["image"]):
+    row_images = examples.get("images", examples.get("image", None))
+    num_examples = len(examples["conversations"])
+
+    for i in range(num_examples):
+        image_refs = (
+            _normalize_images(row_images[i], image_root=image_root)
+            if row_images is not None
+            else []
+        )
         source = examples["conversations"][i]
         messages = [{"role": "system", "content": system_prompt}]
         if not source:
             # if the source is None, skip it
             continue
 
-        if source[0]["role"] != "user":
+        if _message_role(source[0]) != "user":
             # if the first message is not from user, skip it
             source = source[1:]
 
         convroles = ["user", "assistant"]
+        images_attached = False
         for j, sentence in enumerate(source):
-            role = sentence["role"]
+            role = _message_role(sentence)
             assert role == convroles[j % 2], f"unexpected role {role}"
             if role == "user":
-                # if the message is from user and has image, process the image
-                messages.append(
-                    {
-                        "role": role,
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": image,
-                            },
-                            {"type": "text", "text": sentence["content"]},
-                        ],
-                    }
+                content, has_inline_image = _content_items(
+                    _message_content(sentence),
+                    image_root=image_root,
+                    prepend_images=[] if images_attached else image_refs,
                 )
+                images_attached = images_attached or has_inline_image
+                messages.append({"role": role, "content": content})
             else:
-                messages.append({"role": role, "content": sentence["content"]})
+                messages.append(
+                    {"role": role, "content": _assistant_text(_message_content(sentence))}
+                )
 
         conversation = processor.tokenizer.apply_chat_template(
             messages,
@@ -273,7 +434,9 @@ def preprocess_vlm_conversations(
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
         pixel_values = encoding.pixel_values
-        image_grid_thw = encoding.image_grid_thw[0]
+        image_grid_thw = encoding.image_grid_thw
+        if image_grid_thw.dim() == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
 
         # get conversation with image info for loss mask generation
         decoded_conversation = processor.tokenizer.decode(
@@ -289,7 +452,7 @@ def preprocess_vlm_conversations(
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
         results["pixel_values"].append(pixel_values)
-        results["image_grid_thw"].append(image_grid_thw[None, :])
+        results["image_grid_thw"].append(image_grid_thw)
     return results
 
 
@@ -304,6 +467,7 @@ def build_eagle3_dataset(
     cache_key: Optional[str] = None,
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
+    image_root: Optional[str] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
 ) -> HFDataset:
@@ -324,6 +488,7 @@ def build_eagle3_dataset(
         cache_key: The key to use for caching the processed dataset.
         is_vlm: Whether the dataset is for VLM models.
         processor: The image processor to use for processing images.
+        image_root: Optional root directory for relative VLM image paths.
         is_preformatted: Whether the dataset contains preformatted text of the conversation
                         (e.g. includes system prompt, user and assistant start and end tokens)
                         and doesn't need to have the chat template applied.
@@ -361,6 +526,7 @@ def build_eagle3_dataset(
                 examples,
                 template,
                 max_length,
+                image_root=image_root,
             )
         elif is_preformatted:
             # Handle pre-formatted text (should be in "text" column)

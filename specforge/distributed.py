@@ -1,4 +1,5 @@
 from datetime import timedelta
+import os
 from typing import Any, Optional
 
 import torch
@@ -64,7 +65,12 @@ def get_sp_ring_group():
 
 
 def init_distributed(
-    timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
+    timeout: int = 10,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    backend: Optional[str] = None,
+    device_type: str = "cuda",
 ):
     """Initialize distributed training.
 
@@ -72,9 +78,21 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
+    if device_type == "npu":
+        import torch_npu  # noqa: F401
+
+    if backend is None:
+        backend = "hccl" if device_type == "npu" else "nccl"
+
+    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
+    device_module = getattr(torch, device_type)
+    local_rank = int(
+        os.environ.get("LOCAL_RANK", dist.get_rank() % device_module.device_count())
+    )
+    if device_type == "npu":
+        device_module.set_device(f"npu:{local_rank}")
+    else:
+        device_module.set_device(local_rank)
     print_with_rank(f"bind to device {local_rank}")
 
     world_size = dist.get_world_size()
@@ -84,7 +102,7 @@ def init_distributed(
     ), f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
 
     device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+        device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
 
     assert (
@@ -93,7 +111,7 @@ def init_distributed(
 
     draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
     draft_device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda",
+        device_type,
         (draft_dp_size, sp_ulysses_size * sp_ring_size),
         mesh_dim_names=("draft_dp", "sp"),
     )
@@ -106,7 +124,7 @@ def init_distributed(
     sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
     sp_ring_group = PROCESS_GROUP.RING_PG
     # we need to create a 1D submesh
-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
+    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
     global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
@@ -117,7 +135,7 @@ def init_distributed(
     _DP_GROUP = dp_group
     _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
     _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
 
 def destroy_distributed():
