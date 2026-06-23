@@ -49,6 +49,36 @@ def load_config_from_file(config_path: str):
     return PretrainedConfig.from_dict(config)
 
 
+def get_device_type() -> str:
+    """Auto-detect the available accelerator type.
+
+    Priority:
+    1. SPECFORGE_DEVICE environment variable
+    2. NVIDIA CUDA (torch.cuda)
+    3. Ascend NPU (torch.npu)
+    4. CPU fallback
+    """
+    dt = os.environ.get("SPECFORGE_DEVICE", None)
+    if dt:
+        return dt
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
+    return "cpu"
+
+
+def get_local_device() -> torch.device:
+    """Return the local torch.device for the current process rank."""
+    device_type = get_device_type()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if device_type == "cuda":
+        return torch.device("cuda", local_rank)
+    if device_type == "npu":
+        return torch.device("npu", local_rank)
+    return torch.device("cpu")
+
+
 def print_with_rank(message):
     if dist.is_available() and dist.is_initialized():
         logger.info(f"rank {dist.get_rank()}: {message}")
