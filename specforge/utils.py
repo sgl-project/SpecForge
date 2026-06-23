@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from contextlib import contextmanager
 
 import torch
@@ -146,6 +147,59 @@ def get_last_checkpoint(folder, prefix="epoch"):
     step = int(match.group(2)) if match.group(2) else 0
 
     return os.path.join(folder, last_checkpoint), (epoch, step)
+
+
+def cleanup_checkpoints(output_dir, save_total_limit, prefix="epoch"):
+    """
+    Remove oldest checkpoint directories exceeding save_total_limit.
+
+    Only rank 0 performs deletion. Callers should invoke ``dist.barrier()``
+    after this function in distributed settings.
+
+    Args:
+        output_dir: Directory containing checkpoint folders.
+        save_total_limit: Maximum number of checkpoints to keep.
+            ``None`` or non-positive means no cleanup (backward compatible).
+        prefix: Checkpoint directory prefix, default is "epoch".
+
+    Returns:
+        Number of checkpoints removed.
+    """
+    if save_total_limit is None or save_total_limit <= 0:
+        return 0
+
+    if not os.path.isdir(output_dir):
+        return 0
+
+    content = os.listdir(output_dir)
+    _re_checkpoint = re.compile(rf"^{re.escape(prefix)}_(\d+)(?:_step_(\d+))?$")
+
+    checkpoints = [
+        path
+        for path in content
+        if _re_checkpoint.search(path) is not None
+        and os.path.isdir(os.path.join(output_dir, path))
+    ]
+
+    if len(checkpoints) <= save_total_limit:
+        return 0
+
+    def sort_key(x):
+        match = _re_checkpoint.search(x)
+        epoch = int(match.group(1))
+        step = int(match.group(2)) if match.group(2) else 0
+        return (epoch, step)
+
+    checkpoints.sort(key=sort_key)
+    num_to_remove = len(checkpoints) - save_total_limit
+    removed = 0
+    for ckpt in checkpoints[:num_to_remove]:
+        ckpt_path = os.path.join(output_dir, ckpt)
+        shutil.rmtree(ckpt_path)
+        print_on_rank0(f"Removed old checkpoint: {ckpt_path}")
+        removed += 1
+
+    return removed
 
 
 def generate_draft_model_config(

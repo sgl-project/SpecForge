@@ -46,6 +46,7 @@ from specforge.modeling.target import (
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
+    cleanup_checkpoints,
     create_draft_config_from_target,
     get_last_checkpoint,
     print_args_with_dots,
@@ -188,6 +189,13 @@ def build_parser() -> ArgumentParser:
     )
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
+    training_group.add_argument(
+        "--save-total-limit",
+        type=int,
+        default=None,
+        help="Maximum number of checkpoints to keep. Older checkpoints are "
+        "removed when this limit is exceeded. None (default) keeps all.",
+    )
     training_group.add_argument(
         "--log-interval",
         type=int,
@@ -1345,6 +1353,10 @@ def main():
             if global_step % (args.save_interval * args.draft_accumulation_steps) == 0:
                 # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+                cleanup_checkpoints(
+                    args.output_dir, args.save_total_limit
+                )
+                dist.barrier()
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
