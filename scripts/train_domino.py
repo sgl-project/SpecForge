@@ -33,7 +33,12 @@ from specforge.modeling.target.dflash_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+from specforge.utils import (
+    cleanup_checkpoints,
+    get_last_checkpoint,
+    print_on_rank0,
+    print_with_rank,
+)
 
 
 def parse_args():
@@ -135,6 +140,13 @@ def parse_args():
     output_group.add_argument("--log-interval", type=int, default=50)
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
+    output_group.add_argument(
+        "--save-total-limit",
+        type=int,
+        default=None,
+        help="Maximum number of checkpoints to keep. Older checkpoints are "
+        "removed when this limit is exceeded. None (default) keeps all.",
+    )
 
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
@@ -650,6 +662,10 @@ def main():
                 save_checkpoint(
                     args, epoch, global_step, domino_model, draft_model, optimizer
                 )
+                cleanup_checkpoints(
+                    args.output_dir, args.save_total_limit
+                )
+                dist.barrier()
 
     save_checkpoint(
         args, args.num_epochs, global_step, domino_model, draft_model, optimizer
