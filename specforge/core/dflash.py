@@ -210,8 +210,7 @@ class OnlineDFlashModel(nn.Module):
             torch.full_like(prefix_ids, self.prefix_weight_base, dtype=torch.float32),
             prefix_ids.float(),
         )
-        weights = weights / weights.sum()
-        samples = torch.distributions.Categorical(weights).sample((bsz, n_blocks))
+        samples = torch.multinomial(weights, num_samples=bsz * n_blocks, replacement=True).reshape(bsz, n_blocks)
         return samples + min_prefix
 
     def prepare_noise_input(
