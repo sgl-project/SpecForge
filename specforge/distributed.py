@@ -1,25 +1,11 @@
-import os
 from datetime import timedelta
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
+from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
-# yunchang is CUDA-only; provide a no-op fallback so init still works on NPU.
-try:
-    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
-
-    _YUNCHANG_AVAILABLE = True
-except ImportError:
-    PROCESS_GROUP = None
-    _YUNCHANG_AVAILABLE = False
-
-    def set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, rank, world_size):
-        """No-op fallback when yunchang is not installed (e.g. Ascend NPU)."""
-        return
-
-
-from specforge.utils import get_device_type, print_with_rank
+from specforge.utils import print_with_rank
 
 _DEVICE_MESH = None
 _TP_DEVICE_MESH = None
@@ -77,21 +63,6 @@ def get_sp_ring_group():
     return _SP_RING_GROUP
 
 
-def _detect_device_and_backend():
-    """Return (device_type, collective_backend) for the current accelerator."""
-    device_type = get_device_type()
-
-    backend = os.environ.get("SPECFORGE_DIST_BACKEND")
-    if not backend:
-        backend = {
-            "cuda": "nccl",
-            "npu": "hccl",
-            "cpu": "gloo",
-        }[device_type]
-
-    return device_type, backend
-
-
 def init_distributed(
     timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
 ):
@@ -100,122 +71,63 @@ def init_distributed(
     Args:
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
-        sp_ulysses_size(int): Ulysses sequence-parallel size
-        sp_ring_size(int): Ring sequence-parallel size
     """
-    device_type, backend = _detect_device_and_backend()
-
-    # NPU/HCCL requires `set_device` BEFORE `init_process_group`, and there is
-    # no equivalent of NCCL's "rank % cuda.device_count()" auto-binding, so on
-    # NPU we honour LOCAL_RANK from the launcher (torchrun / mpirun export it).
-    if device_type == "npu":
-        try:
-            import torch_npu  # noqa: F401
-        except ImportError:
-            pass
-        torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-
-    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
-
-    # CUDA derives local_rank from the global rank, matching upstream behaviour
-    # so that mp.spawn-based tests (which do not export LOCAL_RANK) keep
-    # working.
-    if device_type == "cuda":
-        local_rank = dist.get_rank() % torch.cuda.device_count()
-        torch.cuda.set_device(local_rank)
-    else:
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
+    local_rank = dist.get_rank() % torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
     print_with_rank(f"bind to device {local_rank}")
 
-    rank = dist.get_rank()
     world_size = dist.get_world_size()
-
     dp_size = world_size // tp_size
     assert (
         world_size == tp_size * dp_size
     ), f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
 
     device_mesh = dist.device_mesh.init_device_mesh(
-        device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+        "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
-    tp_group = device_mesh.get_group("tp")
-    dp_group = device_mesh.get_group("dp")
-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
-    dp_device_mesh = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
-    sp_total = sp_ulysses_size * sp_ring_size
     assert (
-        world_size % sp_total == 0
-    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_total})"
+        world_size % (sp_ulysses_size * sp_ring_size) == 0
+    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
 
-    draft_dp_size = world_size // sp_total
+    draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
     draft_device_mesh = dist.device_mesh.init_device_mesh(
-        device_type,
-        (draft_dp_size, sp_total),
+        "cuda",
+        (draft_dp_size, sp_ulysses_size * sp_ring_size),
         mesh_dim_names=("draft_dp", "sp"),
     )
-    draft_dp_group = draft_device_mesh.get_group("draft_dp")
-    draft_sp_group = draft_device_mesh.get_group("sp")
-
-    if _YUNCHANG_AVAILABLE:
-        set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, rank, world_size)
-        sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
-        sp_ring_group = PROCESS_GROUP.RING_PG
-    else:
-        # On NPU (or any environment without yunchang) we fall back to the
-        # draft SP group as a unified sequence-parallel group. Pure Ulysses /
-        # Ring kernels are CUDA-only, so callers must guard against using
-        # SP > 1 in that case.
-        if sp_total > 1:
-            print_with_rank(
-                "[dist] yunchang is unavailable; sequence parallelism > 1 will "
-                "fall back to the draft SP group only."
-            )
-        sp_ulysses_group = draft_sp_group
-        sp_ring_group = draft_sp_group
+    set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
 
     print_with_rank(f"device mesh: {device_mesh}")
+    tp_group = device_mesh.get_group("tp")
+    dp_group = device_mesh.get_group("dp")
 
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH
-    global _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
+    sp_ring_group = PROCESS_GROUP.RING_PG
+    # we need to create a 1D submesh
+    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
+
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
     _TP_DEVICE_MESH = tp_device_mesh
-    _DP_GROUP = dp_group
-    _DP_DEVICE_MESH = dp_device_mesh
     _SP_ULYSSES_GROUP = sp_ulysses_group
     _SP_RING_GROUP = sp_ring_group
-    _DRAFT_DP_GROUP = draft_dp_group
-    _DRAFT_SP_GROUP = draft_sp_group
+    _DP_GROUP = dp_group
+    _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
+    _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
 
 
 def destroy_distributed():
-    """Tear down the process groups created by ``init_distributed``."""
-    if not dist.is_initialized():
-        return
-
-    seen_ids = set()
-    # The default group must be destroyed last, so collect the others first.
-    for group in (
-        _TP_GROUP,
-        _DP_GROUP,
-        _SP_ULYSSES_GROUP,
-        _SP_RING_GROUP,
-        _DRAFT_DP_GROUP,
-        _DRAFT_SP_GROUP,
-    ):
-        if group is None:
-            continue
-        gid = id(group)
-        if gid in seen_ids:
-            continue
-        seen_ids.add(gid)
-        try:
-            dist.destroy_process_group(group)
-        except Exception:
-            # Best-effort cleanup; ignore double-destroy on shared groups.
-            pass
-
+    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
+    dist.destroy_process_group(_TP_GROUP)
+    dist.destroy_process_group(_DP_GROUP)
+    dist.destroy_process_group(_SP_ULYSSES_GROUP)
+    dist.destroy_process_group(_SP_RING_GROUP)
+    dist.destroy_process_group(_DRAFT_DP_GROUP)
+    dist.destroy_process_group(_DRAFT_SP_GROUP)
     dist.destroy_process_group()
 
 
@@ -311,15 +223,13 @@ def gather_outputs_and_unpad(
         gather_dim (int): Dimension along which to gather across ranks.
         grad_scaler (bool): Whether to apply gradient scaling during gather. Defaults to True.
         group (ProcessGroup, optional): Process group for gathering. If None, uses
-            `get_draft_sp_group()`. If still None or its world size is 1, returns `x` unchanged.
+            `get_ulysses_sequence_parallel_group()`. If still None, returns `x` unchanged.
 
     Returns:
         Tensor: The gathered tensor, with padding removed if requested.
     """
-    if group is None:
+    if not group:
         group = get_draft_sp_group()
-    if group is None:
-        return x
     if torch.distributed.get_world_size(group) == 1:
         return x
     x = Gather.apply(group, x, gather_dim, grad_scaler)
