@@ -131,6 +131,8 @@ class OnlineDFlashModel(nn.Module):
             )
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        if prefix_weight_base is None:
+            prefix_weight_base = 0.9
         if prefix_weight_base <= 0.0:
             raise ValueError(
                 f"prefix_weight_base must be positive, got {prefix_weight_base}"
