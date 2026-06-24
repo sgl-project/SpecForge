@@ -18,6 +18,10 @@ except ImportError:
     BlockMask = None
     create_block_mask = None
 
+# NPU workaround: flex_attention is not available on Ascend NPU.
+if hasattr(torch, "npu") and torch.npu.is_available():
+    FLEX_ATTENTION_AVAILABLE = False
+
 
 _VALID_LOSS_TYPES = {
     "dflash",
@@ -270,6 +274,10 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
+        if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
+            raise ValueError(
+                "flex_attention is not available on this device; use sdpa/eager."
+            )
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
