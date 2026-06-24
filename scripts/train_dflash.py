@@ -144,8 +144,15 @@ def parse_args():
     output_group.add_argument("--output-dir", type=str, required=True)
     output_group.add_argument("--cache-dir", type=str, default="./cache")
     output_group.add_argument("--log-interval", type=int, default=50)
-    output_group.add_argument("--eval-interval", type=int, default=1000)
-    output_group.add_argument("--save-interval", type=int, default=1000)
+    output_group.add_argument(
+        "--eval-interval", type=int, default=1000, help="Set to 0 to disable eval."
+    )
+    output_group.add_argument(
+        "--save-interval",
+        type=int,
+        default=1000,
+        help="Set to 0 to disable periodic checkpoint saves.",
+    )
 
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
@@ -233,6 +240,21 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     """Build train and eval dataloaders."""
     import hashlib
 
+    # Choose the data-parallel group for sharding samples across ranks.
+    # With the SGLang backend in DP-attention mode the target runs data-parallel
+    # across ALL ranks (each rank computes its own sequences' attention; experts
+    # are expert-parallel), so the draft must also see a distinct shard per rank
+    # -> shard over the whole world (process_group=None). Otherwise the target is
+    # TP-replicated and ranks within a TP group must consume identical data, so we
+    # shard over the DP group only.
+    use_dp_attention = (
+        args.target_model_backend == "sglang" and args.sglang_enable_dp_attention
+    )
+    data_parallel_group = None if use_dp_attention else get_dp_group()
+    print_on_rank0(
+        f"Data-parallel sharding over {'WORLD (dp-attention)' if use_dp_attention else 'DP group'}"
+    )
+
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
@@ -267,7 +289,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=data_parallel_group,
     )
 
     eval_dataloader = None
@@ -280,12 +302,19 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
         )
+        original_size = len(eval_eagle3_dataset)
+        eval_eagle3_dataset = eval_eagle3_dataset.filter(
+            lambda x: x["loss_mask"].sum() >= min_loss_tokens
+        )
+        print_on_rank0(
+            f"Filtered eval dataset: {original_size} -> {len(eval_eagle3_dataset)} samples"
+        )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=data_parallel_group,
         )
 
     return train_dataloader, eval_dataloader
@@ -354,11 +383,66 @@ def record_metrics(
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
 
+    progress = ""
+    if mode == "train" and train_dataloader is not None:
+        total_steps = args.num_epochs * math.ceil(
+            len(train_dataloader) / args.accumulation_steps
+        )
+        progress = f" [{global_step}/{total_steps}]"
+
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step}{progress}, "
+        f"Loss: {loss:.4f}, Acc: {accuracy:.4f}"
     )
 
     tracker.log(logdict, step=global_step)
+
+
+@torch.no_grad()
+def evaluate(args, dflash_model, target_model, eval_dataloader, global_step, tracker):
+    """Run online evaluation by recomputing target hidden states."""
+    if eval_dataloader is None:
+        return
+
+    dflash_model.eval()
+    loss_sum = torch.zeros((), device="cuda")
+    acc_sum = torch.zeros((), device="cuda")
+    count = torch.zeros((), device="cuda")
+
+    for data in eval_dataloader:
+        input_ids = data["input_ids"].cuda()
+        attention_mask = data["attention_mask"].cuda()
+        loss_mask = data["loss_mask"].cuda()
+        target_output = target_model.generate_dflash_data(
+            input_ids, attention_mask, loss_mask
+        )
+        hidden_states = target_output.hidden_states.cuda()
+
+        loss, accuracy = dflash_model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+        )
+
+        loss_sum += loss.detach()
+        acc_sum += accuracy.detach()
+        count += 1
+
+    dist.all_reduce(loss_sum)
+    dist.all_reduce(acc_sum)
+    dist.all_reduce(count)
+    if count.item() > 0:
+        record_metrics(
+            args,
+            (loss_sum / count).item(),
+            (acc_sum / count).item(),
+            global_step,
+            tracker,
+            optimizer=None,
+            mode="eval",
+        )
+
+    dflash_model.train()
 
 
 def main():
@@ -418,7 +502,9 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
@@ -592,10 +678,29 @@ def main():
                     }
                 )
 
-            if global_step % args.save_interval == 0:
+            if args.save_interval > 0 and global_step % args.save_interval == 0:
                 save_checkpoint(
                     args, epoch, global_step, dflash_model, draft_model, optimizer
                 )
+
+            if (
+                eval_dataloader is not None
+                and args.eval_interval > 0
+                and global_step % args.eval_interval == 0
+            ):
+                evaluate(
+                    args,
+                    dflash_model,
+                    target_model,
+                    eval_dataloader,
+                    global_step,
+                    tracker,
+                )
+
+    if eval_dataloader is not None and args.eval_interval > 0:
+        evaluate(
+            args, dflash_model, target_model, eval_dataloader, global_step, tracker
+        )
 
     save_checkpoint(
         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
