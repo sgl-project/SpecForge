@@ -92,20 +92,33 @@ def parse_args():
     model_group.add_argument(
         "--loss-type",
         type=str,
-        default="dflash",
+        default=None,
         choices=[
             "dflash",
+            "vp_drafter",
             "dpace",
             "dpace-cumulative-confidence-only",
             "dpace-continuation-value-only",
         ],
-        help=("Loss variant. Use dpace for Dynamic Position-Aware Cross-Entropy."),
+        help=(
+            "Training objective. If omitted, reads dflash_config.training_mode or "
+            "dflash_config.loss_type from the draft config, defaulting to dflash."
+        ),
     )
     model_group.add_argument(
         "--dpace-alpha",
         type=float,
         default=0.5,
         help="Smoothing alpha for D-PACE position weights.",
+    )
+    model_group.add_argument(
+        "--prefix-weight-base",
+        type=float,
+        default=None,
+        help=(
+            "VP-Drafter prefix length sampling base. Values below 1 prefer shorter "
+            "visible prefixes; defaults to dflash_config.prefix_weight_base or 0.9."
+        ),
     )
     model_group.add_argument(
         "--embedding-key",
@@ -218,8 +231,20 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
 
+    args.loss_type = (
+        args.loss_type
+        or draft_config.dflash_config.get("training_mode")
+        or draft_config.dflash_config.get("loss_type")
+        or "dflash"
+    )
+    if args.prefix_weight_base is None:
+        args.prefix_weight_base = draft_config.dflash_config.get(
+            "prefix_weight_base", 0.9
+        )
+
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
+    print_on_rank0(f"Using DFlash training loss_type: {args.loss_type}")
 
     draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
 
@@ -453,6 +478,8 @@ def main():
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
+    device = get_local_device()
+    device_type = device.type
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key=args.embedding_key,
@@ -472,6 +499,7 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
         loss_type=args.loss_type,
         dpace_alpha=args.dpace_alpha,
+        prefix_weight_base=args.prefix_weight_base,
     )
 
     # Wrap each transformer block as its own FSDP unit so that all-gather /
