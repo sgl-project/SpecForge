@@ -15,14 +15,14 @@ ROOT_DIR=$(dirname "$SCRIPT_DIR")
 : "${TRAIN_DATA_PATH:?Set TRAIN_DATA_PATH to the training jsonl file}"
 
 NPU_DEVICES=${1:-0,1,2,3,4,5,6,7}
-NUM_GPUS=$(echo "$NPU_DEVICES" | tr ',' '\n' | wc -l)
+NUM_DEVICES=$(echo "$NPU_DEVICES" | tr ',' '\n' | wc -l)
 
 export ASCEND_RT_VISIBLE_DEVICES=$NPU_DEVICES
 export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:32
 
 torchrun \
     --standalone \
-    --nproc_per_node "$NUM_GPUS" \
+    --nproc_per_node "$NUM_DEVICES" \
     "$ROOT_DIR/scripts/train_domino.py" \
     --target-model-path "$TARGET_MODEL_PATH" \
     --draft-config-path "$ROOT_DIR/configs/qwen3.5-4b-domino.json" \
