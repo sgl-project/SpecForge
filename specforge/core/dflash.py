@@ -205,14 +205,18 @@ class OnlineDFlashModel(nn.Module):
         min_prefix = min(2, self.block_size - 1)
         max_prefix = self.block_size - 1
         if max_prefix <= min_prefix:
-            return torch.full((bsz, n_blocks), min_prefix, dtype=torch.long, device=device)
+            return torch.full(
+                (bsz, n_blocks), min_prefix, dtype=torch.long, device=device
+            )
 
         prefix_ids = torch.arange(min_prefix, max_prefix + 1, device=device)
         weights = torch.pow(
             torch.full_like(prefix_ids, self.prefix_weight_base, dtype=torch.float32),
             prefix_ids.float(),
         )
-        samples = torch.multinomial(weights, num_samples=bsz * n_blocks, replacement=True).reshape(bsz, n_blocks)
+        samples = torch.multinomial(
+            weights, num_samples=bsz * n_blocks, replacement=True
+        ).reshape(bsz, n_blocks)
         return samples + min_prefix
 
     def prepare_noise_input(
@@ -412,9 +416,9 @@ class OnlineDFlashModel(nn.Module):
 
         pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
         if self.loss_type == "vp_drafter":
-            weight_mask = weight_mask * (
-                pos_in_block >= prefix_lengths.unsqueeze(-1)
-            ).float()
+            weight_mask = (
+                weight_mask * (pos_in_block >= prefix_lengths.unsqueeze(-1)).float()
+            )
         else:
             weight_mask = weight_mask * (pos_in_block > 0).float()
 
