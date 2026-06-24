@@ -122,13 +122,37 @@ def init_distributed(
 
 def destroy_distributed():
     global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
-    dist.destroy_process_group()
+
+    def _safe_destroy(group):
+        # Newer torch (>=2.x) is strict about destroy_process_group:
+        #   - a None group (e.g. the Ulysses/Ring groups when sp size == 1)
+        #     raises AssertionError("Process group cannot be None");
+        #   - an already-destroyed group raises ValueError("Invalid process
+        #     group specified").
+        # Additionally, a sub-group that spans every rank (e.g. the dp group
+        # when tp_size == 1) can *be* GroupMember.WORLD, so destroying it tears
+        # down the default group and nulls WORLD. Swallow these so a clean run
+        # tears down without a spurious crash.
+        if group is None:
+            return
+        try:
+            dist.destroy_process_group(group)
+        except (ValueError, AssertionError):
+            pass
+
+    _safe_destroy(_TP_GROUP)
+    _safe_destroy(_DP_GROUP)
+    _safe_destroy(_SP_ULYSSES_GROUP)
+    _safe_destroy(_SP_RING_GROUP)
+    _safe_destroy(_DRAFT_DP_GROUP)
+    _safe_destroy(_DRAFT_SP_GROUP)
+    # Destroy the default/world group only if it is still initialized; one of
+    # the sub-group destroys above may already have torn it down.
+    if dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+        except (ValueError, AssertionError):
+            pass
 
 
 def shard_tensor(

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from array import array
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -6,8 +7,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    prepare_mlp_sync_batch_raw,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -114,7 +119,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         super().set_capture_layers(layer_ids)
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(self.model_runner.model.model.layers_to_capture)
 
     @torch.no_grad
     def _extend(self, reqs):
@@ -137,16 +141,20 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         )
         batch.prepare_for_extend()
 
+        # sglang >=0.5.10: prepare_mlp_sync_batch_raw moved from a Scheduler
+        # staticmethod to a free function in scheduler_components.dp_attn, and the
+        # signature changed (dropped spec_algorithm/speculative_num_draft_tokens,
+        # added attn_cp_size; attn_tp_size now comes from get_attention_tp_size()).
+        # Mirror sglang's own bench_one_batch._maybe_prepare_mlp_sync_batch.
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
-                attn_tp_size=1,
+                attn_tp_size=get_attention_tp_size(),
+                attn_cp_size=getattr(self.model_runner, "attn_cp_size", 1),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
@@ -154,8 +162,20 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 offload_tags=set(),
             )
 
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        # sglang >=0.5.10 may stage prefill tokens in prefill_input_ids_cpu instead
+        # of input_ids (see bench_one_batch.extend); materialize before forward.
+        if (
+            batch.input_ids is None
+            and getattr(batch, "prefill_input_ids_cpu", None) is not None
+        ):
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+
+        # sglang >=0.5.10: ForwardBatch.init_new takes the ScheduleBatch directly;
+        # the old ScheduleBatch.get_model_worker_batch() indirection was removed.
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
         output = self.model_runner.forward(forward_batch)
@@ -205,7 +225,25 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            # We request no logprobs for capture. logprob_start_len defaults to 0,
+            # which makes extend_logprob_start_len 0 and breaks
+            # prepare_mlp_sync_batch_raw's assert
+            #   (return_logprob or num_tokens_for_logprob == batch_size).
+            # Setting -1 places extend_logprob_start_len at the sequence end so
+            # each req contributes exactly 1 -> the assert holds.
+            req.logprob_start_len = -1
+            # sglang >=0.5.10 tracks the prefill via full_untruncated_fill_ids +
+            # fill_len (and get_fill_ids()); prepare_for_extend asserts
+            #   fill_len - len(prefix_indices) == extend_input_len.
+            # This hand-built batch bypasses the scheduler/PrefillAdder that
+            # normally sets fill_len, so set the new fields explicitly. Fall back
+            # to the old single-field bookkeeping on sglang <=0.5.9.
+            if hasattr(req, "full_untruncated_fill_ids"):
+                req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
+                req.fill_len = len(req.full_untruncated_fill_ids)
+                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+            else:
+                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
