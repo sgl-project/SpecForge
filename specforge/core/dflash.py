@@ -295,7 +295,7 @@ class OnlineDFlashModel(nn.Module):
 
         mask_tokens = torch.full_like(real_tokens, self.mask_token_id)
         noise_ids = torch.where(fill_mask, real_tokens, mask_tokens)
-        return self.embed_tokens(noise_ids.view(bsz, n * bs))
+        return self.embed_tokens(noise_ids.reshape(bsz, n * bs))
 
     def _dpace_weight(
         self,
