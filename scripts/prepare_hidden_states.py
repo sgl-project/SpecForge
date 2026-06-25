@@ -72,6 +72,8 @@ class DataPoint:
     loss_mask: torch.Tensor
     hidden_state: torch.Tensor
     aux_hidden_state: Optional[torch.Tensor] = None
+    pixel_values: Optional[torch.Tensor] = None
+    image_grid_thw: Optional[torch.Tensor] = None
 
 
 def parse_args():
@@ -187,14 +189,19 @@ def build_target_model(
         )
     else:
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+        if hasattr(model_config, "dtype") and model_config.dtype is not None:
+            torch_dtype = model_config.dtype
+        elif hasattr(model_config, "text_config") and hasattr(
+            model_config.text_config, "dtype"
+        ):
+            torch_dtype = model_config.text_config.dtype
+        else:
+            torch_dtype = getattr(model_config, "torch_dtype", "bfloat16")
+
         target_model = get_eagle3_target_model(
             pretrained_model_name_or_path=args.target_model_path,
             backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
-            torch_dtype=(
-                model_config.dtype
-                if hasattr(model_config, "dtype")
-                else model_config.torch_dtype
-            ),
+            torch_dtype=torch_dtype,
             device="cuda",
             cache_dir=args.model_download_dir,
             trust_remote_code=args.trust_remote_code,
@@ -488,6 +495,8 @@ class HiddenStatesGenerator:
                 "attention_mask": batch["attention_mask"][valid_indices_in_batch],
                 "loss_mask": batch["loss_mask"][valid_indices_in_batch],
             }
+            pixel_values = batch["pixel_values"][valid_indices_in_batch]
+            image_grid_thw = batch["image_grid_thw"][valid_indices_in_batch]
             del batch
             if num_valid == 0:
                 # Data has already been generated, no sample processing, update progress bar.
@@ -542,6 +551,8 @@ class HiddenStatesGenerator:
                     data_point = DataPoint(
                         input_ids=filtered_batch["input_ids"][i].clone(),
                         loss_mask=filtered_batch["loss_mask"][i].clone(),
+                        pixel_values=pixel_values[i].clone(),
+                        image_grid_thw=image_grid_thw[i].clone(),
                         hidden_state=last_hidden_states,
                         aux_hidden_state=aux_hidden_states,
                     )
