@@ -282,6 +282,18 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
+    def rebuild_buffers(self, device):
+        """Rebuild non-persistent RoPE buffers corrupted by transformers 5.x meta-device init."""
+        self.inv_freq = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim)
+        )
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings + 20,
+            device=device,
+            dtype=torch.get_default_dtype(),
+        )
+
     @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
@@ -1628,6 +1640,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
+    def _init_weights(self, module):
+        # Override the transformers 5.x default _init_weights which would
+        # re-randomize all Linear/Embedding weights with normal_(0, 0.02).
+        # Draft model weights come from checkpoint, not random init.
+        #
+        # For RotaryEmbedding: rebuild non-persistent buffers (inv_freq,
+        # cos_cached, sin_cached) corrupted by meta-device materialization.
+        if isinstance(module, LlamaRotaryEmbedding):
+            module.rebuild_buffers(module.inv_freq.device)
+
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
         self.config = config
@@ -1659,6 +1681,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+        self.post_init()
 
     def forward(
         self,

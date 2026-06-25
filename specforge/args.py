@@ -96,7 +96,7 @@ class SGLangBackendArgs:
     sglang_enable_torch_compile: bool = True
     sglang_enable_dp_attention: bool = False
     sglang_enable_dp_lm_head: bool = False
-    sglang_enable_piecewise_cuda_graph: bool = False
+    sglang_enforce_piecewise_cuda_graph: bool = False
     sglang_piecewise_cuda_graph_max_tokens: int = 4096
     sglang_piecewise_cuda_graph_tokens: List[int] = None
     sglang_ep_size: int = 1
@@ -151,9 +151,9 @@ class SGLangBackendArgs:
             help="Enable piecewise CUDA graph for SGLang backend",
         )
         parser.add_argument(
-            "--sglang-enable-piecewise-cuda-graph",
+            "--sglang-enforce-piecewise-cuda-graph",
             action="store_true",
-            help="Enable piecewise CUDA graph for SGLang backend's prefill",
+            help="Enforce piecewise CUDA graph for SGLang backend's prefill",
         )
         parser.add_argument(
             "--sglang-piecewise-cuda-graph-max-tokens",
@@ -186,7 +186,7 @@ class SGLangBackendArgs:
             sglang_enable_torch_compile=args.sglang_enable_torch_compile,
             sglang_enable_dp_attention=args.sglang_enable_dp_attention,
             sglang_enable_dp_lm_head=args.sglang_enable_dp_lm_head,
-            sglang_enable_piecewise_cuda_graph=args.sglang_enable_piecewise_cuda_graph,
+            sglang_enforce_piecewise_cuda_graph=args.sglang_enforce_piecewise_cuda_graph,
             sglang_piecewise_cuda_graph_max_tokens=args.sglang_piecewise_cuda_graph_max_tokens,
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
@@ -210,7 +210,7 @@ class SGLangBackendArgs:
             enable_torch_compile=self.sglang_enable_torch_compile,
             enable_dp_attention=self.sglang_enable_dp_attention,
             enable_dp_lm_head=self.sglang_enable_dp_lm_head,
-            enable_piecewise_cuda_graph=self.sglang_enable_piecewise_cuda_graph,
+            enforce_piecewise_cuda_graph=self.sglang_enforce_piecewise_cuda_graph,
             piecewise_cuda_graph_max_tokens=self.sglang_piecewise_cuda_graph_max_tokens,
             piecewise_cuda_graph_tokens=self.sglang_piecewise_cuda_graph_tokens,
             ep_size=self.sglang_ep_size,

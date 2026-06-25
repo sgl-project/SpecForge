@@ -140,7 +140,6 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
-        pynccl_use_current_stream=duplicate_tp_group,
     )
 
     if duplicate_tp_group:
@@ -156,7 +155,6 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
-            pynccl_use_current_stream=True,
         )
         # NOTE: Check pynccl_comm exists before accessing it (may be None in sglang 0.5.9)
         if parallel_state._TP.pynccl_comm is not None:
