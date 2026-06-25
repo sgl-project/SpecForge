@@ -122,13 +122,27 @@ def init_distributed(
 
 def destroy_distributed():
     global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
-    dist.destroy_process_group()
+    # Teardown must never crash the process: a group may be None (e.g. a trivial
+    # single-rank world) or already destroyed. Destroy each defensively so a
+    # successful run does not exit non-zero on cleanup.
+    for group in (
+        _TP_GROUP,
+        _DP_GROUP,
+        _SP_ULYSSES_GROUP,
+        _SP_RING_GROUP,
+        _DRAFT_DP_GROUP,
+        _DRAFT_SP_GROUP,
+    ):
+        if group is None:
+            continue
+        try:
+            dist.destroy_process_group(group)
+        except Exception:
+            pass
+    try:
+        dist.destroy_process_group()
+    except Exception:
+        pass
 
 
 def shard_tensor(

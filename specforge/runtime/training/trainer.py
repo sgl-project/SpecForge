@@ -64,23 +64,10 @@ class StepResult:
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
-# strategy metric name -> reported metric name. EAGLE3's per-position ``acces``
-# and DFlash's scalar ``accuracy`` both report as ``acc`` so downstream logging
-# stays strategy-agnostic; the rest pass through unchanged.
-_METRIC_NAMES = {
-    "acces": "acc",
-    "acceptance_rates": "acceptance_rates",
-    "plosses": "plosses",
-    "accuracy": "acc",
-}
-
-
 def _scalar(x: Any) -> float:
     if isinstance(x, torch.Tensor):
         return float(x.detach().float().mean().item())
-    if isinstance(x, (list, tuple)):
-        if not x:
-            return 0.0
+    if isinstance(x, (list, tuple)) and x:
         return float(torch.stack([t.detach().float() for t in x]).mean().item())
     return float(x)
 
@@ -120,9 +107,13 @@ class TrainerCore:
         self, out: StepOutput, grad_norm, stepped: bool, mode: str
     ) -> StepResult:
         metrics: Dict[str, Any] = {"loss": _scalar(out.loss), "mode": mode}
-        for src, dst in _METRIC_NAMES.items():
-            if src in out.metrics:
-                metrics[dst] = _scalar(out.metrics[src])
+        for key in ("acces", "acceptance_rates", "plosses"):
+            if key in out.metrics:
+                metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
+                    out.metrics[key]
+                )
+        if "accuracy" in out.metrics:
+            metrics["acc"] = _scalar(out.metrics["accuracy"])
         gn = _scalar(grad_norm) if grad_norm is not None else None
         if gn is not None:
             metrics["grad_norm"] = gn
@@ -217,12 +208,6 @@ class TrainerController:
                     self.save_checkpoint(self.global_step)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
-        # NOTE: a partial accumulation window at end-of-data (or when max_steps cuts
-        # mid-window) leaves the trailing micro-batches' grads un-stepped and their
-        # sample_ids in pending_ack un-flushed — those leases simply expire and are
-        # re-leased on resume (at-least-once), never double-counted into an
-        # optimizer step. Standard grad-accum behavior; called out so it is not
-        # mistaken for a dropped-ack bug.
         return self.global_step
 
     @torch.no_grad()

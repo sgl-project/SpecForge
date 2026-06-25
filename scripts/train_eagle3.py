@@ -1,3 +1,8 @@
+# NOTE: core EAGLE3 training is being migrated to the DataFlow runtime launcher
+# scripts/train_eagle3_dataflow.py (offline + online; validated old-vs-new on 7B).
+# That launcher does not YET cover the following, so this script remains the path
+# for them: VLM (--is-vlm), USP sequence parallelism (--attention-backend usp),
+# the eval loop (--eval-*-path), --resume, and experiment trackers (--report-to).
 import argparse
 import hashlib
 import math

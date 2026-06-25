@@ -14,9 +14,8 @@ A strategy is the only place that knows how a particular draft model
 on online/offline — the strategy owns the target projection (applying
 ``TargetHead`` / the ``t2d`` vocab map).
 
-This module imports ``torch`` and is constructed with already-built SpecForge
-model objects (the draft model is injected, not imported here), so it is imported
-by training entry points rather than at ``specforge.runtime`` package load.
+This module imports the SpecForge model code, so it is imported by training
+entry points, not at ``specforge.runtime`` package load.
 """
 
 from __future__ import annotations
