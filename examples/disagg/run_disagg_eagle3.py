@@ -41,7 +41,10 @@ from specforge.runtime.data_plane.disagg_ingest import (
     write_ref_manifest,
 )
 from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
-from specforge.runtime.launch import build_disagg_eagle3_runtime
+from specforge.runtime.launch import (
+    build_disagg_eagle3_runtime,
+    build_offline_eagle3_runtime,
+)
 
 # reuse the existing builders so model construction matches the offline path
 from train_eagle3 import (
@@ -92,22 +95,13 @@ def run_producer(args) -> None:
     )
 
 
-def run_consumer(args) -> None:
-    manifest = os.environ["DISAGG_MANIFEST"]
-    init_distributed(
-        timeout=args.dist_timeout,
-        tp_size=args.tp_size,
-        sp_ring_size=args.sp_ring_size,
-        sp_ulysses_size=args.sp_ulysses_size,
-    )
-    sanity_check(args)  # derives target_batch_size/dp_size the builders read (needs dist)
-    # wait for the producer to publish the manifest (shared mount)
-    deadline = time.monotonic() + 1800
-    while not os.path.exists(manifest + ".done"):
-        if time.monotonic() > deadline:
-            raise SystemExit(f"[consumer] timed out waiting for {manifest}.done")
-        time.sleep(2)
+def _build_model_and_optimizer(args):
+    """Identical EAGLE3 model/optimizer build for both consumer and colocated.
 
+    Sharing this keeps the disaggregated and colocated runs apples-to-apples
+    (same draft, same target_head, same optimizer) so any metric difference can
+    only come from the feature transport, not the model.
+    """
     draft_config, draft_model, _ckpt, _resume = build_draft_model(args)
     target_head, _ = build_target_model(args, draft_config, is_online=False)
     _train, vocab_mapping_path, _eval = build_dataloaders(args, draft_config)
@@ -133,6 +127,70 @@ def run_consumer(args) -> None:
             total_steps=args.total_steps or 10_000,
         )
 
+    return eagle3_model, target_head, optimizer_factory
+
+
+def _log_interval() -> int:
+    return int(os.environ.get("DISAGG_LOG_INTERVAL", "25"))
+
+
+def run_colocated(args) -> None:
+    """Baseline: same model + assembly via build_offline (LocalFeatureStore).
+
+    For a head-to-head accept-length/loss comparison against the disaggregated
+    consumer on identical features/seed.
+    """
+    init_distributed(
+        timeout=args.dist_timeout,
+        tp_size=args.tp_size,
+        sp_ring_size=args.sp_ring_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+    )
+    sanity_check(args)
+    eagle3_model, target_head, optimizer_factory = _build_model_and_optimizer(args)
+    print(f"[colocated] training from {args.train_hidden_states_path}", flush=True)
+    trainer, loader = build_offline_eagle3_runtime(
+        hidden_states_path=args.train_hidden_states_path,
+        eagle3_model=eagle3_model,
+        target_head=target_head,
+        optimizer_factory=optimizer_factory,
+        run_id="eagle3-colocated",
+        output_dir=args.output_dir,
+        ttt_length=args.ttt_length,
+        max_len=args.max_length,
+        batch_size=args.target_batch_size,
+        accumulation_steps=args.draft_accumulation_steps,
+        num_epochs=args.num_epochs,
+        max_steps=args.max_num_steps,
+        save_interval=args.save_interval,
+        tp_size=args.tp_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+        sp_ring_size=args.sp_ring_size,
+        logger=lambda m, s: print(f"step {s}: {m}", flush=True),
+        log_interval=_log_interval(),
+    )
+    trainer.fit(loader)
+    destroy_distributed()
+
+
+def run_consumer(args) -> None:
+    manifest = os.environ["DISAGG_MANIFEST"]
+    init_distributed(
+        timeout=args.dist_timeout,
+        tp_size=args.tp_size,
+        sp_ring_size=args.sp_ring_size,
+        sp_ulysses_size=args.sp_ulysses_size,
+    )
+    sanity_check(args)  # derives target_batch_size/dp_size the builders read (needs dist)
+    # wait for the producer to publish the manifest (shared mount)
+    deadline = time.monotonic() + 1800
+    while not os.path.exists(manifest + ".done"):
+        if time.monotonic() > deadline:
+            raise SystemExit(f"[consumer] timed out waiting for {manifest}.done")
+        time.sleep(2)
+
+    eagle3_model, target_head, optimizer_factory = _build_model_and_optimizer(args)
+
     # offline ref set is re-iterated across epochs -> retain on release (read-only)
     store = _store(args, retain_on_release=True)
     refs = read_ref_manifest(manifest)
@@ -156,7 +214,7 @@ def run_consumer(args) -> None:
         sp_ulysses_size=args.sp_ulysses_size,
         sp_ring_size=args.sp_ring_size,
         logger=lambda m, s: print(f"step {s}: {m}", flush=True),
-        log_interval=int(os.environ.get("DISAGG_LOG_INTERVAL", "25")),
+        log_interval=_log_interval(),
     )
     trainer.fit(loader)
     destroy_distributed()
@@ -171,6 +229,8 @@ def main() -> None:
     print(f"[disagg] role={role} node_rank={os.environ.get('RCLI_NODE_RANK', '0')}", flush=True)
     if role == "producer":
         run_producer(args)
+    elif role == "colocated":
+        run_colocated(args)  # baseline for head-to-head comparison
     else:
         run_consumer(args)
 
