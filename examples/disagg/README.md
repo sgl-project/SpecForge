@@ -49,3 +49,24 @@ DISAGG_ROLE=consumer  torchrun --standalone --nproc_per_node 1 \
 
 The bit-exact equivalence to the colocated path is covered by
 `tests/test_runtime/test_disagg_launch.py`.
+
+## Head-to-head vs colocated (Qwen2.5-7B, 2-node H200)
+
+`DISAGG_ROLE=colocated` runs the same model build + assembly through
+`build_offline_eagle3_runtime` (`LocalFeatureStore`). On identical features/seed,
+the disaggregated consumer and the colocated baseline produce the same training
+metrics to ~5 significant figures (residual ~1e-6–1e-8 is GPU run-to-run
+floating-point noise, not the transport — feature tensors are byte-identical):
+
+| step | metric | disagg | colocated |
+|---|---|---|---|
+| 20 | acceptance_rate | 0.0013300 | 0.0013300 |
+| 20 | ploss | 5.386736 | 5.386740 |
+| 20 | acc | 0.0272590 | 0.0272590 |
+| 120 | acceptance_rate | 0.0223610 | 0.0223505 |
+| 180 | acceptance_rate | 0.0337013 | 0.0336982 |
+
+acc / acceptance_rate climb over training in both (baseline direction). Per-step
+values are noisy at `batch_size=1` over 64 diverse samples. Note this is the
+training-time acceptance proxy; the serving accept-length (τ via spec-decoding) is
+a separate eval gate.
