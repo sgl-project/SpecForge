@@ -23,11 +23,13 @@ plane; see ``inference/`` for the equivalent assembly.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
+from specforge.runtime.contracts import SampleRef
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.data_plane import (
     FeatureDataLoader,
+    FeatureStore,
     LocalFeatureStore,
     OfflineManifestReader,
 )
@@ -36,46 +38,39 @@ from specforge.runtime.training.strategy import Eagle3TrainStrategy
 from specforge.runtime.training.trainer import TrainerController, TrainerCore
 
 
-def build_offline_eagle3_runtime(
+def _assemble_offline_eagle3(
     *,
-    hidden_states_path: str,
+    controller: DataFlowController,
+    store: FeatureStore,
+    refs: List[SampleRef],
     eagle3_model,
     target_head,
     optimizer_factory,
     run_id: str,
     output_dir: str,
-    ttt_length: int = 7,
-    max_len: int = 2048,
-    batch_size: int = 1,
-    accumulation_steps: int = 1,
-    num_epochs: int = 1,
-    max_steps: Optional[int] = None,
-    save_interval: int = 0,
-    eval_interval: int = 0,
-    tp_size: int = 1,
-    sp_ulysses_size: int = 1,
-    sp_ring_size: int = 1,
-    logger=None,
+    max_len: int,
+    batch_size: int,
+    accumulation_steps: int,
+    num_epochs: int,
+    max_steps: Optional[int],
+    save_interval: int,
+    eval_interval: int,
+    tp_size: int,
+    sp_ulysses_size: int,
+    sp_ring_size: int,
+    logger,
 ):
-    """Assemble the offline-EAGLE3 dataflow and return (trainer, loader).
+    """Shared trainer/loader assembly for the offline-shaped EAGLE3 dataflow.
 
-    ``optimizer_factory(draft_module) -> optimizer`` is invoked AFTER the model is
-    FSDP-wrapped, over the wrapped module's inner draft, so the optimizer owns the
-    FSDP-managed parameters.
+    Identical for the colocated (``LocalFeatureStore``) and disaggregated
+    (``SharedDirFeatureStore``) paths — only the (store, refs) source differs, so
+    both produce byte-identical batches and training. ``optimizer_factory`` runs
+    AFTER FSDP-wrap, over the wrapped module's inner draft.
     """
     from specforge.data.preprocessing import OfflineEagle3Dataset
     from specforge.data.utils import DataCollatorWithPadding
 
-    controller = DataFlowController(run_id)
-    refs = OfflineManifestReader(
-        hidden_states_path,
-        run_id=run_id,
-        ttt_length=ttt_length,
-        max_len=max_len,
-        target_repr="hidden_state",
-    ).read()
     controller.enqueue_offline_refs(refs)  # record committed state (enables ack lookup)
-    store = LocalFeatureStore(run_id)
     trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
     # Offline = a fixed, re-iterable ref set (so num_epochs > 1 actually trains
     # multiple epochs). The trainer acks at the optimizer-step boundary via ack_fn.
@@ -84,9 +79,7 @@ def build_offline_eagle3_runtime(
         refs=refs,
         batch_size=batch_size,
         collate_fn=DataCollatorWithPadding(),
-        per_sample_transform=lambda raw: OfflineEagle3Dataset.process_data(
-            raw, max_len
-        ),
+        per_sample_transform=lambda raw: OfflineEagle3Dataset.process_data(raw, max_len),
         drop_last=True,
         strategy="eagle3",
     )
@@ -117,6 +110,115 @@ def build_offline_eagle3_runtime(
         ),
     )
     return trainer, loader
+
+
+def build_offline_eagle3_runtime(
+    *,
+    hidden_states_path: str,
+    eagle3_model,
+    target_head,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    ttt_length: int = 7,
+    max_len: int = 2048,
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    num_epochs: int = 1,
+    max_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    logger=None,
+):
+    """Assemble the offline-EAGLE3 dataflow (colocated ``LocalFeatureStore``)."""
+    controller = DataFlowController(run_id)
+    refs = OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+        target_repr="hidden_state",
+    ).read()
+    store = LocalFeatureStore(run_id)
+    return _assemble_offline_eagle3(
+        controller=controller,
+        store=store,
+        refs=refs,
+        eagle3_model=eagle3_model,
+        target_head=target_head,
+        optimizer_factory=optimizer_factory,
+        run_id=run_id,
+        output_dir=output_dir,
+        max_len=max_len,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        num_epochs=num_epochs,
+        max_steps=max_steps,
+        save_interval=save_interval,
+        eval_interval=eval_interval,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        logger=logger,
+    )
+
+
+def build_disagg_eagle3_runtime(
+    *,
+    feature_store: FeatureStore,
+    refs: List[SampleRef],
+    eagle3_model,
+    target_head,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    max_len: int = 2048,
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    num_epochs: int = 1,
+    max_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    logger=None,
+):
+    """Consumer side of a disaggregated EAGLE3 run.
+
+    Trains from a ``feature_store`` whose tensors were produced by a *different
+    process* (the rollout/ingest pool) on a shared mount — typically a
+    :class:`SharedDirFeatureStore`. ``refs`` are the ``disagg://`` ``SampleRef``s
+    the producer published to the manifest
+    (:func:`data_plane.disagg_ingest.read_ref_manifest`). The trainer assembly is
+    identical to the colocated offline path, so results match within determinism
+    tolerance — the only difference is where the feature tensors live.
+    """
+    controller = DataFlowController(run_id)
+    return _assemble_offline_eagle3(
+        controller=controller,
+        store=feature_store,
+        refs=refs,
+        eagle3_model=eagle3_model,
+        target_head=target_head,
+        optimizer_factory=optimizer_factory,
+        run_id=run_id,
+        output_dir=output_dir,
+        max_len=max_len,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        num_epochs=num_epochs,
+        max_steps=max_steps,
+        save_interval=save_interval,
+        eval_interval=eval_interval,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        logger=logger,
+    )
 
 
 def build_online_eagle3_runtime(
@@ -279,5 +381,6 @@ build_offline_eagle3_controller = build_offline_eagle3_runtime
 __all__ = [
     "build_offline_eagle3_controller",
     "build_offline_eagle3_runtime",
+    "build_disagg_eagle3_runtime",
     "build_online_eagle3_runtime",
 ]
