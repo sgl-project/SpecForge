@@ -107,7 +107,10 @@ def write_ref_manifest(refs: List[SampleRef], path: str) -> None:
     then publishes with a single rename so a reader never sees a partial file.
     """
     assert_no_tensors(refs)
-    payload = {"schema_version": SCHEMA_VERSION, "refs": [_ref_to_dict(r) for r in refs]}
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "refs": [_ref_to_dict(r) for r in refs],
+    }
     tmp = path + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(tmp, "w") as f:

@@ -20,13 +20,12 @@ import torch
 
 from specforge.runtime.contracts import assert_no_tensors
 from specforge.runtime.data_plane import LocalFeatureStore, OfflineManifestReader
-from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
 from specforge.runtime.data_plane.disagg_ingest import (
     ingest_offline_features,
     read_ref_manifest,
     write_ref_manifest,
 )
-
+from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()
@@ -51,7 +50,9 @@ class TestDisaggDataEquivalence(unittest.TestCase):
         disagg_refs = ingest_offline_features(shared, self.feat_dir, run_id="off")
 
         self.assertEqual(len(offline_refs), len(disagg_refs))
-        self.assertTrue(all(r.feature_store_uri.startswith("disagg://") for r in disagg_refs))
+        self.assertTrue(
+            all(r.feature_store_uri.startswith("disagg://") for r in disagg_refs)
+        )
 
         for off_ref, dis_ref in zip(offline_refs, disagg_refs):
             off_t, off_h = local.get(off_ref)
@@ -66,7 +67,9 @@ class TestDisaggDataEquivalence(unittest.TestCase):
             shared.release(dis_h)
 
     def test_manifest_roundtrips_and_carries_no_tensors(self):
-        shared = SharedDirFeatureStore(os.path.join(self.work, "store2"), store_id="st2")
+        shared = SharedDirFeatureStore(
+            os.path.join(self.work, "store2"), store_id="st2"
+        )
         refs = ingest_offline_features(shared, self.feat_dir, run_id="run7")
         manifest = os.path.join(self.work, "refs.json")
         write_ref_manifest(refs, manifest)  # asserts no-tensor internally
@@ -83,7 +86,9 @@ class TestDisaggDataEquivalence(unittest.TestCase):
                 self.assertEqual(a.feature_specs[k].shape, b.feature_specs[k].shape)
                 self.assertEqual(a.feature_specs[k].dtype, b.feature_specs[k].dtype)
             self.assertEqual(a.strategy, b.strategy)
-            self.assertEqual(a.metadata.get("target_repr"), b.metadata.get("target_repr"))
+            self.assertEqual(
+                a.metadata.get("target_repr"), b.metadata.get("target_repr")
+            )
 
         # a consumer can fetch the reconstructed refs from the shared store
         t, h = shared.get(loaded[0])
@@ -107,7 +112,9 @@ class TestDisaggDataEquivalence(unittest.TestCase):
 
     def test_default_release_is_consume_once(self):
         # Online default (retain_on_release=False) still frees on last release.
-        store = SharedDirFeatureStore(os.path.join(self.work, "store_co"), store_id="co")
+        store = SharedDirFeatureStore(
+            os.path.join(self.work, "store_co"), store_id="co"
+        )
         refs = ingest_offline_features(store, self.feat_dir, run_id="co")
         _t, h = store.get(refs[0])
         store.release(h)
@@ -142,7 +149,9 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
         eagle3_model, target_head = fx.build_eagle3(work, ttt=TTT)
 
         # producer: ingest the files into a shared-dir store (simulates the other pool)
-        store = SharedDirFeatureStore(os.path.join(work, "shared_store"), store_id="e2e")
+        store = SharedDirFeatureStore(
+            os.path.join(work, "shared_store"), store_id="e2e"
+        )
         refs = ingest_offline_features(store, feat_dir, run_id="e2e", max_len=512)
         manifest = os.path.join(work, "refs.json")
         write_ref_manifest(refs, manifest)
@@ -152,7 +161,11 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
 
         def optimizer_factory(draft_module):
             return BF16Optimizer(
-                draft_module, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
+                draft_module,
+                lr=1e-3,
+                max_grad_norm=0.5,
+                warmup_ratio=0.0,
+                total_steps=10,
             )
 
         trainer, loader = build_disagg_eagle3_runtime(
@@ -171,7 +184,9 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
         )
 
         module = trainer.core.strategy.trainable_module()
-        self.assertIsInstance(module, FSDP, "strategy must hold the FSDP-wrapped module")
+        self.assertIsInstance(
+            module, FSDP, "strategy must hold the FSDP-wrapped module"
+        )
 
         step = trainer.fit(loader)
         self.assertEqual(step, MAX_OPT_STEPS)

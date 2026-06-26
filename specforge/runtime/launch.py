@@ -80,7 +80,9 @@ def _assemble_offline_eagle3(
         refs=refs,
         batch_size=batch_size,
         collate_fn=DataCollatorWithPadding(),
-        per_sample_transform=lambda raw: OfflineEagle3Dataset.process_data(raw, max_len),
+        per_sample_transform=lambda raw: OfflineEagle3Dataset.process_data(
+            raw, max_len
+        ),
         drop_last=True,
         strategy="eagle3",
     )

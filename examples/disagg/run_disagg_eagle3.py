@@ -33,6 +33,15 @@ import time
 
 from accelerate.utils import set_seed
 
+# reuse the existing builders so model construction matches the offline path
+from train_eagle3 import (
+    build_dataloaders,
+    build_draft_model,
+    build_target_model,
+    parse_args,
+    sanity_check,
+)
+
 from specforge.distributed import destroy_distributed, init_distributed
 from specforge.optimizer import BF16Optimizer
 from specforge.runtime.data_plane.disagg_ingest import (
@@ -44,15 +53,6 @@ from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeat
 from specforge.runtime.launch import (
     build_disagg_eagle3_runtime,
     build_offline_eagle3_runtime,
-)
-
-# reuse the existing builders so model construction matches the offline path
-from train_eagle3 import (
-    build_dataloaders,
-    build_draft_model,
-    build_target_model,
-    parse_args,
-    sanity_check,
 )
 
 RUN_ID = "eagle3-disagg"
@@ -181,7 +181,9 @@ def run_consumer(args) -> None:
         sp_ring_size=args.sp_ring_size,
         sp_ulysses_size=args.sp_ulysses_size,
     )
-    sanity_check(args)  # derives target_batch_size/dp_size the builders read (needs dist)
+    sanity_check(
+        args
+    )  # derives target_batch_size/dp_size the builders read (needs dist)
     # wait for the producer to publish the manifest (shared mount)
     deadline = time.monotonic() + 1800
     while not os.path.exists(manifest + ".done"):
@@ -194,7 +196,9 @@ def run_consumer(args) -> None:
     # offline ref set is re-iterated across epochs -> retain on release (read-only)
     store = _store(args, retain_on_release=True)
     refs = read_ref_manifest(manifest)
-    print(f"[consumer] training from {len(refs)} disagg refs in {store.root}", flush=True)
+    print(
+        f"[consumer] training from {len(refs)} disagg refs in {store.root}", flush=True
+    )
 
     trainer, loader = build_disagg_eagle3_runtime(
         feature_store=store,
@@ -224,9 +228,14 @@ def main() -> None:
     parser, args = parse_args()
     set_seed(args.seed)
     if args.train_hidden_states_path is None:
-        raise SystemExit("disagg example wires the OFFLINE path; pass --train-hidden-states-path")
+        raise SystemExit(
+            "disagg example wires the OFFLINE path; pass --train-hidden-states-path"
+        )
     role = _role()
-    print(f"[disagg] role={role} node_rank={os.environ.get('RCLI_NODE_RANK', '0')}", flush=True)
+    print(
+        f"[disagg] role={role} node_rank={os.environ.get('RCLI_NODE_RANK', '0')}",
+        flush=True,
+    )
     if role == "producer":
         run_producer(args)
     elif role == "colocated":
