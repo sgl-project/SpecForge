@@ -44,7 +44,13 @@ from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeat
 from specforge.runtime.launch import build_disagg_eagle3_runtime
 
 # reuse the existing builders so model construction matches the offline path
-from train_eagle3 import build_dataloaders, build_draft_model, build_target_model, parse_args
+from train_eagle3 import (
+    build_dataloaders,
+    build_draft_model,
+    build_target_model,
+    parse_args,
+    sanity_check,
+)
 
 RUN_ID = "eagle3-disagg"
 
@@ -93,6 +99,7 @@ def run_consumer(args) -> None:
         sp_ring_size=args.sp_ring_size,
         sp_ulysses_size=args.sp_ulysses_size,
     )
+    sanity_check(args)  # derives target_batch_size/dp_size the builders read (needs dist)
     # wait for the producer to publish the manifest (shared mount)
     deadline = time.monotonic() + 1800
     while not os.path.exists(manifest + ".done"):
@@ -129,8 +136,6 @@ def run_consumer(args) -> None:
     refs = read_ref_manifest(manifest)
     print(f"[consumer] training from {len(refs)} disagg refs in {store.root}", flush=True)
 
-    # sanity_check() (which the thin launchers skip) derives this; mirror its formula.
-    target_batch_size = args.tp_size * args.batch_size
     trainer, loader = build_disagg_eagle3_runtime(
         feature_store=store,
         refs=refs,
@@ -140,7 +145,7 @@ def run_consumer(args) -> None:
         run_id=RUN_ID,
         output_dir=args.output_dir,
         max_len=args.max_length,
-        batch_size=target_batch_size,
+        batch_size=args.target_batch_size,
         accumulation_steps=args.draft_accumulation_steps,
         num_epochs=args.num_epochs,
         max_steps=args.max_num_steps,

@@ -11,7 +11,7 @@ set -euo pipefail
 
 : "${SF_HOME:=/root/SpecForge}"
 : "${TARGET_MODEL:=Qwen/Qwen2.5-7B-Instruct}"
-: "${DRAFT_CONFIG:=$SF_HOME/configs/qwen2-5-7B-eagle3.json}"
+: "${DRAFT_CONFIG:=$SF_HOME/configs/qwen2.5-7b-eagle3.json}"
 : "${PROMPTS:=/root/disagg/prompts.jsonl}"
 : "${FEATURES_DIR:=/root/disagg/features}"
 : "${OUTPUT_DIR:=/root/disagg/out}"
@@ -19,6 +19,9 @@ set -euo pipefail
 : "${NUM_EPOCHS:=10}"
 : "${TTT_LENGTH:=7}"
 : "${NPROC:=1}"
+: "${CHAT_TEMPLATE:=qwen}"
+: "${LEARNING_RATE:=5e-5}"
+: "${CACHE_DIR:=$SF_HOME/cache}"
 : "${DISAGG_STORE_ROOT:=/workspace/disagg_store}"
 : "${DISAGG_MANIFEST:=/workspace/disagg_store/refs.json}"
 
@@ -38,11 +41,14 @@ COMMON=(
   --train-data-path "$PROMPTS"
   --train-hidden-states-path "$FEATURES_DIR"
   --output-dir "$OUTPUT_DIR"
+  --chat-template "$CHAT_TEMPLATE"
+  --cache-dir "$CACHE_DIR"
   --attention-backend flex_attention
   --ttt-length "$TTT_LENGTH"
   --max-num-steps "$MAX_STEPS"
   --num-epochs "$NUM_EPOCHS"
   --batch-size 1
+  --learning-rate "$LEARNING_RATE"
   --seed 0
 )
 
