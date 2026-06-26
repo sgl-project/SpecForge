@@ -598,6 +598,11 @@ class GptOssModel(GptOssPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
@@ -757,9 +762,14 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
+from ._tp_loading import TPShardedFromPretrainedMixin
+
+
 @auto_docstring
-class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+class GptOssForCausalLM(
+    TPShardedFromPretrainedMixin, GptOssPreTrainedModel, GenerationMixin
+):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -802,6 +812,9 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
 
         Example:
 

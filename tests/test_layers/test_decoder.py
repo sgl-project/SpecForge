@@ -19,6 +19,19 @@ from specforge.utils import padding
 from tests.utils import get_available_port
 
 
+def _standard_flash_attn_available():
+    """The FA golden run and the USP run both call flash_attn's varlen kernel."""
+    try:
+        from flash_attn import flash_attn_varlen_func  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+_HAS_FLASH_ATTN = _standard_flash_attn_available()
+_HAS_2_GPUS = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+
+
 def get_model_config():
     """Create and return the model configuration."""
     config_dict = {
@@ -385,6 +398,12 @@ def run_test_case(rank, world_size, port):
 
 
 class TestTTTDistributed(unittest.TestCase):
+    @unittest.skipUnless(
+        _HAS_FLASH_ATTN,
+        "standard flash-attn interface (flash_attn_varlen_func) is required by both "
+        "the FA golden run and the USP run",
+    )
+    @unittest.skipUnless(_HAS_2_GPUS, "requires >=2 CUDA devices")
     def test_llama_usp_decoder(self):
         world_size = 2
         port = get_available_port()

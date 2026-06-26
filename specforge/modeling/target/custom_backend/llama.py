@@ -352,8 +352,13 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
 
-class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+from ._tp_loading import TPShardedFromPretrainedMixin
+
+
+class LlamaForCausalLM(
+    TPShardedFromPretrainedMixin, LlamaPreTrainedModel, GenerationMixin
+):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
