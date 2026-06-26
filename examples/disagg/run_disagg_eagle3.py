@@ -62,13 +62,14 @@ def _role() -> str:
     return "producer" if os.environ.get("RCLI_NODE_RANK", "0") == "0" else "consumer"
 
 
-def _store(args) -> SharedDirFeatureStore:
+def _store(args, *, retain_on_release: bool = False) -> SharedDirFeatureStore:
     token = os.environ.get("DISAGG_AUTH_TOKEN") or None
     return SharedDirFeatureStore(
         os.environ["DISAGG_STORE_ROOT"],
         store_id=os.environ.get("DISAGG_STORE_ID", RUN_ID),
         auth=AuthPolicy(token),
         credential=token,
+        retain_on_release=retain_on_release,
     )
 
 
@@ -132,7 +133,8 @@ def run_consumer(args) -> None:
             total_steps=args.total_steps or 10_000,
         )
 
-    store = _store(args)
+    # offline ref set is re-iterated across epochs -> retain on release (read-only)
+    store = _store(args, retain_on_release=True)
     refs = read_ref_manifest(manifest)
     print(f"[consumer] training from {len(refs)} disagg refs in {store.root}", flush=True)
 

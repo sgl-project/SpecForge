@@ -90,6 +90,30 @@ class TestDisaggDataEquivalence(unittest.TestCase):
         self.assertIn("hidden_state", t)
         shared.release(h)
 
+    def test_retain_on_release_keeps_features_for_reiteration(self):
+        # Offline training re-iterates the ref set across epochs, so the disagg
+        # store must NOT consume-once-free on release (mirrors LocalFeatureStore's
+        # file:// no-op release). Without retain, epoch 2 get() would KeyError.
+        store = SharedDirFeatureStore(
+            os.path.join(self.work, "store_ro"), store_id="ro", retain_on_release=True
+        )
+        refs = ingest_offline_features(store, self.feat_dir, run_id="ro")
+        for _epoch in range(3):
+            for r in refs:
+                t, h = store.get(r)
+                self.assertIn("hidden_state", t)
+                store.release(h)  # retained: file kept for the next epoch
+        self.assertEqual(store.health()["resident_samples"], len(refs))
+
+    def test_default_release_is_consume_once(self):
+        # Online default (retain_on_release=False) still frees on last release.
+        store = SharedDirFeatureStore(os.path.join(self.work, "store_co"), store_id="co")
+        refs = ingest_offline_features(store, self.feat_dir, run_id="co")
+        _t, h = store.get(refs[0])
+        store.release(h)
+        with self.assertRaises(KeyError):
+            store.get(refs[0])
+
     def test_auth_required_consumer_must_present_token(self):
         root = os.path.join(self.work, "store3")
         producer = SharedDirFeatureStore(
