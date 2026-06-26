@@ -154,6 +154,7 @@ def run_consumer(args) -> None:
         sp_ulysses_size=args.sp_ulysses_size,
         sp_ring_size=args.sp_ring_size,
         logger=lambda m, s: print(f"step {s}: {m}", flush=True),
+        log_interval=int(os.environ.get("DISAGG_LOG_INTERVAL", "25")),
     )
     trainer.fit(loader)
     destroy_distributed()

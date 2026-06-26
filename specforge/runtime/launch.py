@@ -59,6 +59,7 @@ def _assemble_offline_eagle3(
     sp_ulysses_size: int,
     sp_ring_size: int,
     logger,
+    log_interval: int,
 ):
     """Shared trainer/loader assembly for the offline-shaped EAGLE3 dataflow.
 
@@ -104,6 +105,7 @@ def _assemble_offline_eagle3(
         max_steps=max_steps,
         save_interval=save_interval,
         eval_interval=eval_interval,
+        log_interval=log_interval,
         logger=logger,
         ack_fn=lambda ids, step: controller.ack_train_refs(
             trainer_id, ids, global_step=step, optimizer_durable=True
@@ -132,6 +134,7 @@ def build_offline_eagle3_runtime(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     logger=None,
+    log_interval: int = 50,
 ):
     """Assemble the offline-EAGLE3 dataflow (colocated ``LocalFeatureStore``)."""
     controller = DataFlowController(run_id)
@@ -163,6 +166,7 @@ def build_offline_eagle3_runtime(
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         logger=logger,
+        log_interval=log_interval,
     )
 
 
@@ -186,6 +190,7 @@ def build_disagg_eagle3_runtime(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     logger=None,
+    log_interval: int = 50,
 ):
     """Consumer side of a disaggregated EAGLE3 run.
 
@@ -218,6 +223,7 @@ def build_disagg_eagle3_runtime(
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         logger=logger,
+        log_interval=log_interval,
     )
 
 
