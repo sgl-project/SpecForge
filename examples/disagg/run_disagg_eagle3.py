@@ -96,14 +96,23 @@ def _store(args, *, retain_on_release: bool = False) -> FeatureStore:
         # Fast path: producer put()s and consumer get()s by key across nodes over
         # the Mooncake object store -- no shared *data* mount. store_id namespaces
         # the keys, so producer and consumer must agree on it (as with shared_dir).
+        setup_kwargs = {
+            "local_hostname": os.environ["MOONCAKE_LOCAL_HOSTNAME"],
+            "metadata_server": os.environ["MOONCAKE_METADATA_SERVER"],
+            "master_server_addr": os.environ["MOONCAKE_MASTER_SERVER_ADDR"],
+            "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
+        }
+        # The contributed segment must hold the hard-pinned feature set, so size
+        # it for the workload (default 1 GiB is fine only for tiny sets).
+        for env_key, kw in (
+            ("MOONCAKE_GLOBAL_SEGMENT_SIZE", "global_segment_size"),
+            ("MOONCAKE_LOCAL_BUFFER_SIZE", "local_buffer_size"),
+        ):
+            if os.environ.get(env_key):
+                setup_kwargs[kw] = int(os.environ[env_key])
         return MooncakeFeatureStore(
             store_id=store_id,
-            setup_kwargs={
-                "local_hostname": os.environ["MOONCAKE_LOCAL_HOSTNAME"],
-                "metadata_server": os.environ["MOONCAKE_METADATA_SERVER"],
-                "master_server_addr": os.environ["MOONCAKE_MASTER_SERVER_ADDR"],
-                "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
-            },
+            setup_kwargs=setup_kwargs,
             auth=AuthPolicy(token),
             credential=token,
             retain_on_release=retain_on_release,

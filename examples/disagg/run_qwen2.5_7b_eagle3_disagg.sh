@@ -40,6 +40,7 @@ export DISAGG_AUTH_TOKEN="${DISAGG_AUTH_TOKEN:-disagg-secret}"
 # export MOONCAKE_METADATA_SERVER="http://<metadata-host>:8080/metadata"
 # export MOONCAKE_MASTER_SERVER_ADDR="<master-host>:50051"
 # export MOONCAKE_PROTOCOL=tcp   # or "rdma"
+# export MOONCAKE_GLOBAL_SEGMENT_SIZE=$((8*1024*1024*1024))  # >= total feature bytes
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export HOME=/root HF_HOME=/root/.cache/huggingface TRITON_CACHE_DIR=/root/.triton
 export PYTHONPATH="$SF_HOME:$SF_HOME/scripts:${PYTHONPATH:-}"
