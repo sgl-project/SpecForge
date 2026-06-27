@@ -34,9 +34,77 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    head_dim = q.shape[-1]
+    if rotary_dim < head_dim:
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+        q_rot = (q_rot * cos[..., -q_len:, :]) + (rotate_half(q_rot) * sin[..., -q_len:, :])
+        k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
+        q_embed = torch.cat([q_rot, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot, k_pass], dim=-1)
+    else:
+        q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
+        k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def get_rope_scaling_value(config: Qwen3Config, key: str, default=None):
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is None:
+        return default
+    if isinstance(rope_scaling, dict):
+        return rope_scaling.get(key, default)
+    return getattr(rope_scaling, key, default)
+
+
+class Qwen3InterleavedMultiRotaryEmbedding(Qwen3RotaryEmbedding):
+    """Interleaved mRoPE for Qwen3-VL style multimodal position ids."""
+
+    def __init__(self, config: Qwen3Config):
+        super().__init__(config)
+        self.mrope_section = get_rope_scaling_value(
+            config, "mrope_section", [24, 20, 20]
+        )
+
+    def _apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
+        freqs_t = freqs[0]
+        for dim_idx, offset in enumerate((1, 2), start=1):
+            length = self.mrope_section[dim_idx] * 3
+            idx_slice = slice(offset, length, 3)
+            freqs_t[..., idx_slice] = freqs[dim_idx, ..., idx_slice]
+        return freqs_t
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(2, 3)
+            interleaved_freqs = self._apply_interleaved_mrope(freqs)
+            emb = torch.cat((interleaved_freqs, interleaved_freqs), dim=-1)
+            scaling = getattr(self, "attention_scaling", 1.0)
+            cos = emb.cos() * scaling
+            sin = emb.sin() * scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class Qwen3DFlashAttention(nn.Module):
@@ -228,7 +296,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.use_interleaved_mrope = bool(
+            get_rope_scaling_value(config, "mrope_interleaved", False)
+        )
+        if self.use_interleaved_mrope:
+            self.rotary_emb = Qwen3InterleavedMultiRotaryEmbedding(config)
+        else:
+            self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,
@@ -237,28 +311,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
-        self.projector_type = dflash_config.get("projector_type", None)
-        self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
-        self.shift_label = dflash_config.get("shift_label", False)
-
-        if self.projector_type == "domino":
-            self.emb_dim = dflash_config["emb_dim"]
-            self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
-            self.prefix_gru = nn.GRU(
-                input_size=config.hidden_size,
-                hidden_size=self.gru_hidden_dim,
-                num_layers=1,
-                batch_first=True,
-                bias=False,
-            )
-            in_dim = config.hidden_size + self.gru_hidden_dim
-            self.embed_proj = nn.Sequential(
-                nn.Linear(in_dim, self.emb_dim, bias=False),
-                nn.SiLU(),
-                nn.Linear(self.emb_dim, config.vocab_size, bias=False),
-            )
-        elif self.projector_type is not None:
-            raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
         self.post_init()
 
     def forward(
