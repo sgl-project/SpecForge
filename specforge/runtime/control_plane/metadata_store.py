@@ -235,7 +235,11 @@ class SQLiteMetadataStore(MetadataStore):
         return [r[0] for r in rows]
 
     def record_train_ack(
-        self, sample_ids: List[str], *, global_step: Optional[int], optimizer_durable: bool
+        self,
+        sample_ids: List[str],
+        *,
+        global_step: Optional[int],
+        optimizer_durable: bool,
     ) -> None:
         # ONE transaction commits {acked ids, global_step, optimizer marker}
         # together — never split, so a restart reconciles against a single fact.
@@ -258,11 +262,16 @@ class SQLiteMetadataStore(MetadataStore):
     def durable_marker(self) -> Dict[str, Any]:
         with self._lock:
             acked = {
-                r[0] for r in self._conn.execute("SELECT sample_id FROM acked").fetchall()
+                r[0]
+                for r in self._conn.execute("SELECT sample_id FROM acked").fetchall()
             }
             rows = dict(self._conn.execute("SELECT k, v FROM marker").fetchall())
         gs = json.loads(rows["global_step"]) if "global_step" in rows else None
-        od = json.loads(rows["optimizer_durable"]) if "optimizer_durable" in rows else False
+        od = (
+            json.loads(rows["optimizer_durable"])
+            if "optimizer_durable" in rows
+            else False
+        )
         return {"acked": acked, "global_step": gs, "optimizer_durable": od}
 
     def close(self) -> None:

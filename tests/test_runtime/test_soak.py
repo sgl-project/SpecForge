@@ -88,7 +88,9 @@ class TestSoak(unittest.TestCase):
         # under capacity the whole time, then return to baseline once the trainer
         # is allowed to catch up — the leak/soak gate.
         hard_cap = 32 * _KB
-        store, bp, ctrl = _build_pipeline(hard_cap=hard_cap, high=24 * _KB, low=12 * _KB)
+        store, bp, ctrl = _build_pipeline(
+            hard_cap=hard_cap, high=24 * _KB, low=12 * _KB
+        )
         ctrl.ingest_prompts([{"task_id": f"t{i}", "payload": {}} for i in range(6000)])
         lease = ctrl.train_lease("trainer")
         baseline = store.health()["resident_bytes"]

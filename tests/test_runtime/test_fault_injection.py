@@ -79,7 +79,9 @@ class TestFeatureStoreFailures(unittest.TestCase):
         store.put({"x": torch.zeros(1, 8)}, sample_id="s0", metadata={})  # 32 bytes
         before = store.health()["resident_bytes"]
         with self.assertRaises(MemoryError):
-            store.put({"x": torch.zeros(1, 16)}, sample_id="s1", metadata={})  # +64 > 64
+            store.put(
+                {"x": torch.zeros(1, 16)}, sample_id="s1", metadata={}
+            )  # +64 > 64
         self.assertEqual(store.health()["resident_bytes"], before)  # no partial write
         self.assertEqual(store.health()["resident_samples"], 1)
 

@@ -102,7 +102,9 @@ class TestRestartReconciliation(unittest.TestCase):
     def test_controller_dies_between_ack_and_release(self):
         # --- pre-crash controller ---
         store = SQLiteMetadataStore(self.path)
-        ctrl = DataFlowController("run", sample_queue=SampleRefQueue(), metadata_store=store)
+        ctrl = DataFlowController(
+            "run", sample_queue=SampleRefQueue(), metadata_store=store
+        )
         ctrl.commit_samples("w0", [_ref(f"s{i}") for i in range(4)])
         leased = ctrl.lease_train_refs("trainer", 4)
         self.assertEqual(len(leased), 4)
@@ -134,13 +136,17 @@ class TestRestartReconciliation(unittest.TestCase):
 
     def test_crash_before_any_ack_replays_everything(self):
         store = SQLiteMetadataStore(self.path)
-        ctrl = DataFlowController("run", sample_queue=SampleRefQueue(), metadata_store=store)
+        ctrl = DataFlowController(
+            "run", sample_queue=SampleRefQueue(), metadata_store=store
+        )
         ctrl.commit_samples("w0", [_ref(f"s{i}") for i in range(3)])
         ctrl.lease_train_refs("trainer", 3)
         store.close()  # crash with no durable ack
 
         store2 = SQLiteMetadataStore(self.path)
-        ctrl2 = DataFlowController("run", sample_queue=SampleRefQueue(), metadata_store=store2)
+        ctrl2 = DataFlowController(
+            "run", sample_queue=SampleRefQueue(), metadata_store=store2
+        )
         report = ctrl2.reconcile_on_restart()
         self.assertEqual(set(report["requeued"]), {"s0", "s1", "s2"})  # nothing lost
         self.assertEqual(report["released"], [])
@@ -150,14 +156,18 @@ class TestRestartReconciliation(unittest.TestCase):
         # Reconciling twice on a fresh (post-crash) queue must not double-enqueue;
         # queue.put is idempotent on sample_id.
         store = SQLiteMetadataStore(self.path)
-        pre = DataFlowController("run", sample_queue=SampleRefQueue(), metadata_store=store)
+        pre = DataFlowController(
+            "run", sample_queue=SampleRefQueue(), metadata_store=store
+        )
         pre.commit_samples("w0", [_ref(f"s{i}") for i in range(3)])
         store.record_train_ack(["s0"], global_step=1, optimizer_durable=True)
         store.close()
 
         # restart with a fresh, empty queue (the crash dropped the old one)
         store2 = SQLiteMetadataStore(self.path)
-        ctrl = DataFlowController("run", sample_queue=SampleRefQueue(), metadata_store=store2)
+        ctrl = DataFlowController(
+            "run", sample_queue=SampleRefQueue(), metadata_store=store2
+        )
         ctrl.reconcile_on_restart()
         ctrl.reconcile_on_restart()  # second time must be a no-op for the queue
         out = ctrl.lease_train_refs("trainer", 8)

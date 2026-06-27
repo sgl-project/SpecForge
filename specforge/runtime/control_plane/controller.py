@@ -266,7 +266,9 @@ class DataFlowController:
         self.sample_queue.fail(refs, reason, retryable)
 
     # -- restart reconciliation (B4) --------------------------------------
-    def reconcile_on_restart(self, feature_store: Optional[Any] = None) -> Dict[str, Any]:
+    def reconcile_on_restart(
+        self, feature_store: Optional[Any] = None
+    ) -> Dict[str, Any]:
         """Rebuild queue + release state from the single durable marker.
 
         Call once on a fresh controller backed by a *durable* metadata store
