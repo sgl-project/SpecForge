@@ -1,0 +1,24 @@
+# Use the PyTorch CPU wheel index cause torch_npu depends on a CPU version of PyTorch
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+pre-commit
+torch==2.8.0+cpu
+torch_npu==2.8.0.post2
+torchaudio==2.8.0
+torchvision==0.23.0
+transformers==4.57.1
+qwen-vl-utils==0.0.11
+datasets
+setuptools
+tqdm
+wandb
+psutil
+numpy
+accelerate
+pydantic
+sglang==0.5.9
+openai-harmony
+ninja
+packaging
+yunchang
+tensorboard

@@ -7,6 +7,8 @@ from torch.nn.attention.flex_attention import (
 )
 from transformers.utils import is_torchdynamo_compiling
 
+from specforge.utils import get_compile_backend
+
 dynamo.config.recompile_limit = 64
 
 
@@ -35,7 +37,7 @@ class WrappedFlexAttention:
             # Enable dynamic shapes to handle different input sizes
             self._compiled_flex_attention = torch.compile(
                 flex_attention,
-                # mode="max-autotune-no-cudagraphs",
+                backend=get_compile_backend(),
             )
             self._is_flex_compiled = True
 
@@ -75,7 +77,9 @@ class WrappedCreateBlockMask:
     @torch.compiler.disable(recursive=False)
     def __init__(self):
         if not self._is_create_block_mask_compiled:
-            self._compiled_create_block_mask = torch.compile(create_block_mask)
+            self._compiled_create_block_mask = torch.compile(
+                create_block_mask, backend=get_compile_backend()
+            )
             self._is_create_block_mask_compiled = True
 
     def __call__(self):

@@ -52,26 +52,36 @@ from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
+    current_device,
+    get_device_module,
+    get_device_type,
     get_last_checkpoint,
+    get_local_device,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
     safe_conversations_generator,
+    synchronize,
 )
 
 
 def print_cuda_memory_debug(label: str) -> None:
-    if os.getenv("SPECFORGE_CI_MEMORY_DEBUG") != "1" or not torch.cuda.is_available():
+    device_type = get_device_type()
+    if os.getenv("SPECFORGE_CI_MEMORY_DEBUG") != "1" or device_type == "cpu":
         return
 
     try:
-        torch.cuda.synchronize()
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        allocated_bytes = torch.cuda.memory_allocated()
-        reserved_bytes = torch.cuda.memory_reserved()
+        synchronize()
+        device_module = get_device_module()
+        free_bytes, total_bytes = device_module.mem_get_info()
+        allocated_bytes = device_module.memory_allocated()
+        reserved_bytes = device_module.memory_reserved()
     except Exception as exc:
-        print(f"[memory-debug] {label}: failed to query CUDA memory: {exc}", flush=True)
+        print(
+            f"[memory-debug] {label}: failed to query {device_type} memory: {exc}",
+            flush=True,
+        )
         return
 
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "NA"
@@ -387,7 +397,7 @@ def build_target_model(
                     torch_dtype=torch.bfloat16,
                 )
                 .eval()
-                .cuda()
+                .to(get_local_device())
             )
         else:
             if args.target_model_backend == "sglang":
@@ -398,7 +408,7 @@ def build_target_model(
                 pretrained_model_name_or_path=args.target_model_path,
                 backend=args.target_model_backend,
                 torch_dtype=torch.bfloat16,
-                device="cuda",
+                device=get_device_type(),
                 cache_dir=args.model_download_dir,
                 **target_model_kwargs,
                 trust_remote_code=args.trust_remote_code,
@@ -526,13 +536,13 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
-        ).cuda()
+        ).to(get_local_device())
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
-        ).cuda()
+        ).to(get_local_device())
 
     # Load training state (optimizer, scheduler, epoch, step) for true resume
     resume_state = None
@@ -745,11 +755,11 @@ def run_forward(
             metric_losses,
             metric_loss_denoms,
         ) = eagle3_model(
-            input_ids=data["input_ids"].cuda(),
-            attention_mask=data["attention_mask"].cuda(),
-            loss_mask=data["loss_mask"].cuda(),
-            pixel_values=data["pixel_values"].cuda(),
-            image_grid_thw=data["image_grid_thw"].cuda(),
+            input_ids=data["input_ids"].to(get_local_device()),
+            attention_mask=data["attention_mask"].to(get_local_device()),
+            loss_mask=data["loss_mask"].to(get_local_device()),
+            pixel_values=data["pixel_values"].to(get_local_device()),
+            image_grid_thw=data["image_grid_thw"].to(get_local_device()),
         )
     else:
         image_grid_thw = None
@@ -757,27 +767,30 @@ def run_forward(
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
             # Handle VLM data: pixel_values and image_grid_thw are lists
-            # pixel_values = [pv.cuda() for pv in data["pixel_values"]] if args.is_vlm else None
+            # pixel_values = [pv.to(get_local_device()) for pv in data["pixel_values"]] if args.is_vlm else None
             if args.is_vlm:
                 image_grid_thw = (
-                    [thw.cuda().squeeze() for thw in data["image_grid_thw"]]
+                    [
+                        thw.to(get_local_device()).squeeze()
+                        for thw in data["image_grid_thw"]
+                    ]
                     if args.is_vlm
                     else None
                 )
-                pixel_values = data["pixel_values"].cuda()
+                pixel_values = data["pixel_values"].to(get_local_device())
                 eagle3_data = target_model.generate_eagle3_data(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                    input_ids=data["input_ids"].to(get_local_device()),
+                    attention_mask=data["attention_mask"].to(get_local_device()),
+                    loss_mask=data["loss_mask"].to(get_local_device()),
                     is_vlm=args.is_vlm,
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                 )
             else:
                 eagle3_data = target_model.generate_eagle3_data(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                    input_ids=data["input_ids"].to(get_local_device()),
+                    attention_mask=data["attention_mask"].to(get_local_device()),
+                    loss_mask=data["loss_mask"].to(get_local_device()),
                     shard_returns=args.shard_target_output,
                 )
 
@@ -798,19 +811,19 @@ def run_forward(
             )
         else:
             # we generate the logits using the hidden states loaded from disk
-            attention_mask = data["attention_mask"].cuda()
-            hidden_states = data["hidden_state"].cuda()
+            attention_mask = data["attention_mask"].to(get_local_device())
+            hidden_states = data["hidden_state"].to(get_local_device())
             input_ids, target, loss_mask = target_model.preprocess(
                 data["input_ids"], data["target"], data["loss_mask"]
             )
-            input_ids = input_ids.cuda()
-            loss_mask = loss_mask.cuda()
+            input_ids = input_ids.to(get_local_device())
+            loss_mask = loss_mask.to(get_local_device())
             from specforge.core.compact_teacher import build_offline_teacher_inputs
 
             target, offline_compact_kwargs = build_offline_teacher_inputs(
                 compact=args.compact_teacher,
                 target_model=target_model,
-                target_hidden=target.cuda(),
+                target_hidden=target.to(get_local_device()),
                 chunk_size_arg=args.compact_teacher_chunk_size,
             )
             compact_kwargs.update(offline_compact_kwargs)
@@ -829,7 +842,9 @@ def run_forward(
             target=target,
             hidden_states=hidden_states,
             position_ids=(
-                data["position_ids"].cuda() if "position_ids" in data else None
+                data["position_ids"].to(get_local_device())
+                if "position_ids" in data
+                else None
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
@@ -860,8 +875,8 @@ def run_backward_and_update(
         grad_norm = optimizer.step()
         if dist.is_initialized():
             grad_norm = grad_norm.detach().float()
-            if torch.cuda.is_available():
-                grad_norm = grad_norm.to(torch.cuda.current_device())
+            if get_device_type() != "cpu":
+                grad_norm = grad_norm.to(current_device())
             grad_norm = grad_norm.pow(2)
             dist.all_reduce(grad_norm, op=dist.ReduceOp.SUM)
             grad_norm = grad_norm.sqrt()

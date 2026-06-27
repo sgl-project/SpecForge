@@ -201,19 +201,19 @@ class GeneralParser(Parser):
                         warnings.warn(
                             f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
                         )
-                        break
+                        return None, None
                 else:
                     prev_role = conversation[j - 1]["role"]
                     if role == "tool" and prev_role not in ["assistant", "tool"]:
                         warnings.warn(
                             f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
-                        break
+                        return None, None
                     if role == "assistant" and prev_role not in ["user", "tool"]:
                         warnings.warn(
                             f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
-                        break
+                        return None, None
                 sentence = self._sanitize_message(sentence)
                 messages.append(sentence)
             try:
