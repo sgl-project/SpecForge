@@ -124,7 +124,7 @@ class GeneralParser(Parser):
             messages,
             tokenize=False,
             add_generation_prompt=False,
-            tools=tool,
+            tools=tool if tool else None,
             **kwargs,
         )
         return conversation
@@ -426,12 +426,14 @@ class ThinkingParser(GeneralParser):
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         """Apply chat template to all messages, handling reasoning_content and tool_calls."""
+        # See GeneralParser.apply_chat_template: pass `None` rather than an empty
+        # list so templates don't enter tool-use mode when there are no tools.
         conversation = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
             add_special_tokens=False,
-            tools=tool,
+            tools=tool if tool else None,
             **kwargs,
         )
         return conversation
