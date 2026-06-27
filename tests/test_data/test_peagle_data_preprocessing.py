@@ -1,10 +1,10 @@
 import unittest
 
 import torch
-from datasets import Dataset
 
+from datasets import Dataset
 from specforge.data.preprocessing import build_eagle3_dataset
-from specforge.data.template import ChatTemplate, TEMPLATE_REGISTRY
+from specforge.data.template import TEMPLATE_REGISTRY, ChatTemplate
 
 
 class DummyTokenizer:
@@ -21,8 +21,7 @@ class DummyTokenizer:
         **kwargs,
     ):
         return "".join(
-            f"<{message['role']}>{message['content']}</eot>"
-            for message in messages
+            f"<{message['role']}>{message['content']}</eot>" for message in messages
         )
 
     def __call__(

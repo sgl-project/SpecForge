@@ -171,7 +171,9 @@ class GeneralParser(Parser):
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if not preformatted:
-            conversation = [self._normalize_message(message) for message in conversation]
+            conversation = [
+                self._normalize_message(message) for message in conversation
+            ]
             messages = []
 
             if conversation[0]["role"] == "system":

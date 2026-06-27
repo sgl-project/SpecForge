@@ -22,8 +22,7 @@ class DummyTokenizer:
     ):
         self.messages = messages
         return "".join(
-            f"<{message['role']}>{message['content']}</eot>"
-            for message in messages
+            f"<{message['role']}>{message['content']}</eot>" for message in messages
         )
 
     def __call__(

@@ -834,7 +834,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         if target_out is not None:
             target_out = padding(target_out, left=False)
         input_ids_out = padding(input_ids_out, left=False)
-        loss_mask_out = padding(loss_mask_out, left=False)
         loss_mask_out = loss_mask_out[..., None]
 
         return Eagle3TargetOutput(
