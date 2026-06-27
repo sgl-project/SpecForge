@@ -25,6 +25,7 @@ class _FakeMooncakeStore:
         self._d = {}
         self.last_config = None
         self.fail_remove = False
+        self.lease_defer = False  # remove() returns ok but keeps bytes (Mooncake lease)
         self.put_calls = 0
         self.remove_calls = 0
 
@@ -44,6 +45,8 @@ class _FakeMooncakeStore:
         self.remove_calls += 1
         if self.fail_remove:
             return -1
+        if self.lease_defer:
+            return 0  # report success but keep the object (lease-deferred free)
         self._d.pop(key, None)
         return 0
 
@@ -112,6 +115,19 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         fs.release(handle)
         with self.assertRaises(KeyError):
             fs.get(ref)
+
+    def test_get_after_release_raises_even_if_remote_lingers(self):
+        # Mooncake's remove() is lease-deferred: it can report success while the
+        # bytes linger under a read-lease. The ref must still not resolve (B5).
+        fake = _FakeMooncakeStore()
+        fake.lease_defer = True
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+        fs.release(handle)
+        self.assertEqual(fake.is_exist("run0/s0"), 1)  # bytes still physically there
+        with self.assertRaises(KeyError):
+            fs.get(ref)  # but the ref is logically freed -> KeyError
 
     def test_abort_frees(self):
         fs = _store()

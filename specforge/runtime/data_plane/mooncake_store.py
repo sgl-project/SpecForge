@@ -168,6 +168,14 @@ class MooncakeFeatureStore(FeatureStore):
         self._active_leases: Dict[str, FeatureHandle] = {}
         # samples whose remote remove() failed; retried/force-freed by gc()
         self._release_pending: Dict[str, int] = {}
+        # (sample_id, generation) logically freed in THIS process. Mooncake's
+        # remove() is lease-deferred (an object keeps a short read-lease), so the
+        # bytes can linger after release/abort; this makes the B5 "no
+        # use-after-free" guarantee immediate — get() of a freed ref raises even
+        # while physical reclamation is still pending. Grows with consume-once
+        # frees within a run (empty in retain_on_release/offline mode); a durable
+        # shared index would own this in the online multi-node follow-up.
+        self._freed: set = set()
         self._lock = threading.RLock()
         self._counter = 0
         self._gen_counter = 0
@@ -266,6 +274,15 @@ class MooncakeFeatureStore(FeatureStore):
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         self.auth.check(self._credential)
         sid = sample_ref.sample_id
+        ref_gen = sample_ref.metadata.get("generation")
+        with self._lock:
+            if ref_gen is not None and (sid, int(ref_gen)) in self._freed:
+                # logically freed here; the remote bytes may still linger under
+                # Mooncake's read-lease, but this ref must not resolve (B5)
+                raise KeyError(
+                    f"sample {sid} generation {ref_gen} was released/aborted; "
+                    f"refusing use-after-free"
+                )
         key = self._key(sid)
         if not self._store_exists(key):
             # freed by release/abort, or never written -> never hand back stale
@@ -340,16 +357,22 @@ class MooncakeFeatureStore(FeatureStore):
                 return  # stale lease -> no-op
             if self._still_leased_locked(sid, cur):
                 return
+            self._freed.add((sid, handle.generation))  # immediate logical free
             if self._try_physical_free(sid):
                 self._free_bookkeeping_locked(sid)
             else:
-                # remote free failed -> park for gc() to retry/force-free
+                # remote free deferred (lease) / failed -> gc() retries
                 self._release_pending.setdefault(sid, 0)
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:
-            self._try_physical_free(sample_id)
-            self._free_bookkeeping_locked(sample_id)
+            gen = self._generation.get(sample_id)
+            if gen is not None:
+                self._freed.add((sample_id, gen))  # immediate logical free
+            if self._try_physical_free(sample_id):
+                self._free_bookkeeping_locked(sample_id)
+            else:
+                self._release_pending.setdefault(sample_id, 0)
 
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         now = self._clock() if now is None else now
