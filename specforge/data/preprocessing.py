@@ -306,6 +306,7 @@ def build_eagle3_dataset(
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
+    minimum_valid_tokens: Optional[int] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -333,10 +334,14 @@ def build_eagle3_dataset(
                         If False, expects "conversations" column with ShareGPT format.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
                              Useful for thinking models where history may not contain thoughts.
+        minimum_valid_tokens: If set, drops samples with fewer trainable tokens.
 
     Returns:
         The processed HF dataset.
     """
+    if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
+        raise ValueError("minimum_valid_tokens must be >= 0")
+
     if is_vlm:
         assert processor is not None, "processor must be provided when is_vlm is True"
 
@@ -459,6 +464,30 @@ def build_eagle3_dataset(
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
+
+    if minimum_valid_tokens is not None:
+        before_filter = len(dataset)
+
+        def has_minimum_valid_tokens(example):
+            loss_mask = example["loss_mask"]
+            if isinstance(loss_mask, torch.Tensor):
+                valid_tokens = int(loss_mask.sum().item())
+            else:
+                valid_tokens = sum(
+                    int(token)
+                    for row in loss_mask
+                    for token in (row if isinstance(row, list) else [row])
+                )
+            return valid_tokens >= minimum_valid_tokens
+
+        dataset = dataset.filter(
+            has_minimum_valid_tokens,
+            num_proc=num_proc,
+            desc=f"Filtering samples with >= {minimum_valid_tokens} trainable tokens",
+        )
+        print(
+            f"Filtered dataset by trainable tokens: {before_filter} -> {len(dataset)}"
+        )
 
     dataset.set_format(type="torch")
     return dataset
