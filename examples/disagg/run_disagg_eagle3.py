@@ -18,14 +18,32 @@ feature tensors travel through the shared store. Disaggregation changes *where*
 features live, not their values, so the training curve matches the colocated
 offline baseline.
 
-Role is taken from ``DISAGG_ROLE`` (``producer``/``consumer``); if unset it is
-derived from ``RCLI_NODE_RANK`` (0 -> producer, else consumer). Shared paths +
-auth come from the environment so one wrapper can drive both nodes:
+Backend is selected by ``DISAGG_BACKEND`` (default ``shared_dir``):
 
-    DISAGG_STORE_ROOT=/workspace/disagg_store   # shared mount, both pools
-    DISAGG_MANIFEST=/workspace/disagg_store/refs.json
+* ``shared_dir`` — ``SharedDirFeatureStore`` over a shared POSIX mount.
+* ``mooncake`` — ``MooncakeFeatureStore``, the M6 fast path: a network object
+  store (RDMA/TCP), so the feature tensors need **no shared data mount**. Caveat:
+  a Mooncake object lives in the *producer's* memory segment, so the producer
+  process must stay alive until the consumer has read everything — this example
+  holds the producer open until the consumer writes ``<manifest>.consumed`` (or
+  ``DISAGG_PRODUCER_HOLD_S`` seconds elapse). The small ref manifest + sentinels
+  still travel through ``DISAGG_MANIFEST``.
+
+Role is taken from ``DISAGG_ROLE`` (``producer``/``consumer``/``colocated``); if
+unset it is derived from ``RCLI_NODE_RANK`` (0 -> producer, else consumer).
+Config comes from the environment so one wrapper can drive both nodes:
+
+    DISAGG_MANIFEST=/workspace/disagg_store/refs.json  # small shared control plane
     DISAGG_STORE_ID=eagle3-disagg               # producer/consumer must match
     DISAGG_AUTH_TOKEN=<secret>                   # optional (B9 auth)
+    # backend=shared_dir (default):
+    DISAGG_STORE_ROOT=/workspace/disagg_store    # shared *data* mount
+    # backend=mooncake:
+    DISAGG_BACKEND=mooncake
+    MOONCAKE_LOCAL_HOSTNAME=<this-node-ip>
+    MOONCAKE_METADATA_SERVER=<metadata server url>
+    MOONCAKE_MASTER_SERVER_ADDR=<master host:port>
+    MOONCAKE_PROTOCOL=tcp                         # or "rdma"
 """
 
 import os
@@ -50,6 +68,8 @@ from specforge.runtime.data_plane.disagg_ingest import (
     write_ref_manifest,
 )
 from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
+from specforge.runtime.data_plane.feature_store import FeatureStore
+from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.launch import (
     build_disagg_eagle3_runtime,
     build_offline_eagle3_runtime,
@@ -65,15 +85,61 @@ def _role() -> str:
     return "producer" if os.environ.get("RCLI_NODE_RANK", "0") == "0" else "consumer"
 
 
-def _store(args, *, retain_on_release: bool = False) -> SharedDirFeatureStore:
+def _backend() -> str:
+    return os.environ.get("DISAGG_BACKEND", "shared_dir")
+
+
+def _store(args, *, retain_on_release: bool = False) -> FeatureStore:
     token = os.environ.get("DISAGG_AUTH_TOKEN") or None
+    store_id = os.environ.get("DISAGG_STORE_ID", RUN_ID)
+    if _backend() == "mooncake":
+        # Fast path: producer put()s and consumer get()s by key across nodes over
+        # the Mooncake object store -- no shared *data* mount. store_id namespaces
+        # the keys, so producer and consumer must agree on it (as with shared_dir).
+        return MooncakeFeatureStore(
+            store_id=store_id,
+            setup_kwargs={
+                "local_hostname": os.environ["MOONCAKE_LOCAL_HOSTNAME"],
+                "metadata_server": os.environ["MOONCAKE_METADATA_SERVER"],
+                "master_server_addr": os.environ["MOONCAKE_MASTER_SERVER_ADDR"],
+                "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
+            },
+            auth=AuthPolicy(token),
+            credential=token,
+            retain_on_release=retain_on_release,
+        )
     return SharedDirFeatureStore(
         os.environ["DISAGG_STORE_ROOT"],
-        store_id=os.environ.get("DISAGG_STORE_ID", RUN_ID),
+        store_id=store_id,
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
     )
+
+
+def _hold_producer_until_consumed(manifest: str) -> None:
+    """Keep the producer (and its Mooncake memory segment) alive until the
+    consumer signals completion, since a Mooncake object lives in the producing
+    process's segment. shared_dir does not need this (files persist on the mount).
+    """
+    consumed = manifest + ".consumed"
+    hold_s = float(os.environ.get("DISAGG_PRODUCER_HOLD_S", "3600"))
+    deadline = time.monotonic() + hold_s
+    print(
+        f"[producer] mooncake backend: holding segment until {consumed} "
+        f"(<= {hold_s:.0f}s)",
+        flush=True,
+    )
+    while not os.path.exists(consumed):
+        if time.monotonic() > deadline:
+            print(
+                "[producer] hold timed out before consumer signalled; exiting "
+                "(consumer may lose features)",
+                flush=True,
+            )
+            return
+        time.sleep(2)
+    print("[producer] consumer signalled done; releasing segment", flush=True)
 
 
 def run_producer(args) -> None:
@@ -88,11 +154,14 @@ def run_producer(args) -> None:
     )
     write_ref_manifest(refs, manifest)
     open(manifest + ".done", "w").close()  # liveness marker the consumer waits on
+    location = getattr(store, "root", f"mooncake://{store.store_id}")
     print(
-        f"[producer] ingested {len(refs)} samples into {store.root}; "
+        f"[producer] ingested {len(refs)} samples into {location}; "
         f"manifest -> {manifest}",
         flush=True,
     )
+    if _backend() == "mooncake":
+        _hold_producer_until_consumed(manifest)
 
 
 def _build_model_and_optimizer(args):
@@ -196,8 +265,9 @@ def run_consumer(args) -> None:
     # offline ref set is re-iterated across epochs -> retain on release (read-only)
     store = _store(args, retain_on_release=True)
     refs = read_ref_manifest(manifest)
+    location = getattr(store, "root", f"mooncake://{store.store_id}")
     print(
-        f"[consumer] training from {len(refs)} disagg refs in {store.root}", flush=True
+        f"[consumer] training from {len(refs)} disagg refs in {location}", flush=True
     )
 
     trainer, loader = build_disagg_eagle3_runtime(
@@ -222,6 +292,9 @@ def run_consumer(args) -> None:
     )
     trainer.fit(loader)
     destroy_distributed()
+    if _backend() == "mooncake":
+        # release the producer holding its Mooncake segment open (see docstring)
+        open(manifest + ".consumed", "w").close()
 
 
 def main() -> None:
