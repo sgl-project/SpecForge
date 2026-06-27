@@ -13,8 +13,8 @@ import unittest
 
 import torch
 
-from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
+from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
 
@@ -202,9 +202,7 @@ class TestMooncakeFeatureStore(unittest.TestCase):
 
     def test_release_pending_retry_then_reconcile(self):
         fake = _FakeMooncakeStore()
-        fs = MooncakeFeatureStore(
-            store=fake, store_id="run0", max_release_attempts=3
-        )
+        fs = MooncakeFeatureStore(store=fake, store_id="run0", max_release_attempts=3)
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
         _, handle = fs.get(ref)
         fake.fail_remove = True
@@ -221,13 +219,19 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         src = _tensors()
         local = LocalFeatureStore("run0")
         mooncake = _store()
-        lref = local.put({k: v.clone() for k, v in src.items()}, sample_id="s0", metadata=_meta())
-        mref = mooncake.put({k: v.clone() for k, v in src.items()}, sample_id="s0", metadata=_meta())
+        lref = local.put(
+            {k: v.clone() for k, v in src.items()}, sample_id="s0", metadata=_meta()
+        )
+        mref = mooncake.put(
+            {k: v.clone() for k, v in src.items()}, sample_id="s0", metadata=_meta()
+        )
         lout, _ = local.get(lref)
         mout, _ = mooncake.get(mref)
         self.assertEqual(set(lout), set(mout))
         for k in lout:
-            self.assertTrue(torch.equal(lout[k], mout[k]), f"{k} differs local vs mooncake")
+            self.assertTrue(
+                torch.equal(lout[k], mout[k]), f"{k} differs local vs mooncake"
+            )
 
 
 @unittest.skipUnless(
@@ -242,7 +246,11 @@ class TestMooncakeFeatureStoreReal(unittest.TestCase):
     def _setup_kwargs(self):
         import os
 
-        req = ("MOONCAKE_LOCAL_HOSTNAME", "MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
+        req = (
+            "MOONCAKE_LOCAL_HOSTNAME",
+            "MOONCAKE_METADATA_SERVER",
+            "MOONCAKE_MASTER_SERVER_ADDR",
+        )
         if not all(os.environ.get(k) for k in req):
             self.skipTest(f"set {req} to run the real Mooncake e2e test")
         return {

@@ -275,9 +275,7 @@ def run_consumer(args) -> None:
     store = _store(args, retain_on_release=True)
     refs = read_ref_manifest(manifest)
     location = getattr(store, "root", f"mooncake://{store.store_id}")
-    print(
-        f"[consumer] training from {len(refs)} disagg refs in {location}", flush=True
-    )
+    print(f"[consumer] training from {len(refs)} disagg refs in {location}", flush=True)
 
     trainer, loader = build_disagg_eagle3_runtime(
         feature_store=store,

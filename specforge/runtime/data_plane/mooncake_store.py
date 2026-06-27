@@ -82,7 +82,10 @@ class _PinConfig:
     config exposes so the injected backend can assert on them."""
 
     def __init__(
-        self, replica_num: int = 1, with_hard_pin: bool = True, with_soft_pin: bool = False
+        self,
+        replica_num: int = 1,
+        with_hard_pin: bool = True,
+        with_soft_pin: bool = False,
     ) -> None:
         self.replica_num = replica_num
         self.with_hard_pin = with_hard_pin
@@ -114,7 +117,9 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Any:
     store = MooncakeDistributedStore()
     rc = store.setup(**setup_kwargs)
     if rc is not None and int(rc) != 0:
-        raise RuntimeError(f"Mooncake setup failed (status {rc}); kwargs={setup_kwargs}")
+        raise RuntimeError(
+            f"Mooncake setup failed (status {rc}); kwargs={setup_kwargs}"
+        )
     return store
 
 
@@ -310,7 +315,9 @@ class MooncakeFeatureStore(FeatureStore):
             raw_key = sample_ref.feature_keys.get(n, n)
             raw_key = raw_key.split("/")[-1] if "/" in raw_key else raw_key
             if raw_key not in raw:
-                raise KeyError(f"sample {sid} missing key {raw_key!r} for feature {n!r}")
+                raise KeyError(
+                    f"sample {sid} missing key {raw_key!r} for feature {n!r}"
+                )
             # clone-on-fetch (B5): returned tensor is independent of the transport
             out[n] = raw[raw_key].clone()
         if str(device) != "cpu":
