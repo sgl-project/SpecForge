@@ -33,13 +33,12 @@ def _worker(rank, world_size, workdir, results_dir):
         rank, world_size, tp_size=2, sp_ulysses_size=2, sp_ring_size=1, port="29573"
     )
 
+    from scripts.train_eagle3 import run_backward_and_update, run_forward
     from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
     from specforge.data.preprocessing import OfflineEagle3Dataset
     from specforge.data.utils import DataCollatorWithPadding
     from specforge.modeling.target import TargetHead
     from specforge.optimizer import BF16Optimizer
-    from scripts.train_eagle3 import run_backward_and_update, run_forward
-
     from specforge.runtime.contracts import TrainBatch
     from specforge.runtime.training.backend import FSDPTrainingBackend, ParallelConfig
     from specforge.runtime.training.strategy import Eagle3TrainStrategy
@@ -78,20 +77,34 @@ def _worker(rank, world_size, workdir, results_dir):
     data = DataCollatorWithPadding()([ds[j] for j in range(BS)])
 
     args = types.SimpleNamespace(
-        is_vlm=False, target_model_backend="hf",
-        shard_target_output=False, draft_accumulation_steps=1,
+        is_vlm=False,
+        target_model_backend="hf",
+        shard_target_output=False,
+        draft_accumulation_steps=1,
     )
 
     # --- legacy path ---
-    opt_a = BF16Optimizer(model_a.draft_model, lr=1e-4, max_grad_norm=0.5,
-                          warmup_ratio=0.0, total_steps=10)
-    plosses_a, _, _, _, _, _, _ = run_forward(args, model_a, data, head, is_online=False)
+    opt_a = BF16Optimizer(
+        model_a.draft_model,
+        lr=1e-4,
+        max_grad_norm=0.5,
+        warmup_ratio=0.0,
+        total_steps=10,
+    )
+    plosses_a, _, _, _, _, _, _ = run_forward(
+        args, model_a, data, head, is_online=False
+    )
     loss_old = sum(0.8**i * plosses_a[i] for i in range(len(plosses_a))).item()
     gn_old = run_backward_and_update(args, plosses_a, opt_a, global_step=1)
 
     # --- new path under the real 4-rank ParallelConfig ---
-    opt_b = BF16Optimizer(model_b.draft_model, lr=1e-4, max_grad_norm=0.5,
-                          warmup_ratio=0.0, total_steps=10)
+    opt_b = BF16Optimizer(
+        model_b.draft_model,
+        lr=1e-4,
+        max_grad_norm=0.5,
+        warmup_ratio=0.0,
+        total_steps=10,
+    )
     pc = ParallelConfig.from_distributed(tp_size=2, sp_ulysses_size=2, sp_ring_size=1)
     backend = FSDPTrainingBackend(pc)
     backend.prepare_model(model_b, wrap=False, optimizer_target=model_b.draft_model)
@@ -99,7 +112,9 @@ def _worker(rank, world_size, workdir, results_dir):
     strategy = Eagle3TrainStrategy(model_b, target_head=head)
     core = TrainerCore(strategy, backend, accumulation_steps=1)
     batch = TrainBatch(
-        sample_ids=["a", "b"], strategy="eagle3", tensors=dict(data),
+        sample_ids=["a", "b"],
+        strategy="eagle3",
+        tensors=dict(data),
         metadata={"target_repr": "hidden_state", "ttt_length": TTT},
     )
     rep = core.train_step(batch)
@@ -151,12 +166,16 @@ class TestEquiv4Rank(unittest.TestCase):
             self.assertEqual(res["sp"], 2)
             # per-rank: new path reproduces legacy loss on the same SP slice
             self.assertAlmostEqual(
-                res["loss_old"], res["loss_new"], places=3,
+                res["loss_old"],
+                res["loss_new"],
+                places=3,
                 msg=f"rank {res['rank']} loss: old={res['loss_old']} new={res['loss_new']}",
             )
             # grad-norm reduction matches (both reduce across the world group)
             self.assertAlmostEqual(
-                res["gn_old"], res["gn_new"], places=2,
+                res["gn_old"],
+                res["gn_new"],
+                places=2,
                 msg=f"rank {res['rank']} grad_norm: old={res['gn_old']} new={res['gn_new']}",
             )
 

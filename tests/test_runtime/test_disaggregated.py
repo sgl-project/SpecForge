@@ -30,7 +30,9 @@ class TestDisaggregatedStore(unittest.TestCase):
         # The consumer resolves the sample from the ref + filesystem alone.
         producer = SharedDirFeatureStore(self.root, store_id="st")
         t = torch.randn(1, 4, 8)
-        ref = producer.put({"hidden_state": t}, sample_id="s0", metadata={"strategy": "eagle3"})
+        ref = producer.put(
+            {"hidden_state": t}, sample_id="s0", metadata={"strategy": "eagle3"}
+        )
         self.assertTrue(ref.feature_store_uri.startswith("disagg://"))
         assert_no_tensors(ref)  # control plane stays metadata-only across the boundary
 
@@ -52,7 +54,9 @@ class TestDisaggregatedStore(unittest.TestCase):
     def test_stale_generation_is_rejected(self):
         store = SharedDirFeatureStore(self.root)
         ref_old = store.put({"x": torch.zeros(1, 4)}, sample_id="s0", metadata={})
-        store.put({"x": torch.ones(1, 4)}, sample_id="s0", metadata={})  # re-put -> gen+1
+        store.put(
+            {"x": torch.ones(1, 4)}, sample_id="s0", metadata={}
+        )  # re-put -> gen+1
         with self.assertRaises(KeyError):  # old handle must not alias new data
             store.get(ref_old)
 

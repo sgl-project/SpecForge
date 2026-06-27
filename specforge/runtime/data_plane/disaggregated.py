@@ -45,11 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from specforge.runtime.contracts import (
-    SCHEMA_VERSION,
-    FeatureHandle,
-    SampleRef,
-)
+from specforge.runtime.contracts import SCHEMA_VERSION, FeatureHandle, SampleRef
 from specforge.runtime.data_plane.feature_store import (
     FeatureStore,
     load_feature_file,
@@ -258,7 +254,11 @@ class SharedDirFeatureStore(FeatureStore):
                     freed += 1
             self._stats["force_freed"] += freed
             self._stats["force_freed_bytes"] += freed_bytes
-        return {"force_freed": freed, "force_freed_bytes": freed_bytes, "release_pending": 0}
+        return {
+            "force_freed": freed,
+            "force_freed_bytes": freed_bytes,
+            "release_pending": 0,
+        }
 
     def health(self) -> Dict[str, Any]:
         with self._lock:
