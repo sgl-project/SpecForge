@@ -41,6 +41,15 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
     the abstract methods to support training with TTT.
     """
 
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.num_aux_hidden_states = getattr(config, "num_aux_hidden_states", None)
+        if self.num_aux_hidden_states is None:
+            eagle_config = getattr(config, "eagle_config", None) or {}
+            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+            self.num_aux_hidden_states = len(layer_ids) if layer_ids else 3
+
     @abstractmethod
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
