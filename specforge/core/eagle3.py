@@ -27,6 +27,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
+from specforge.core.compact_teacher import (
+    DEFAULT_VOCAB_CHUNK_SIZE,
+    compute_target_p_padded_from_hidden,
+)
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
 from specforge.core.loss import LogSoftmaxLoss
@@ -239,6 +243,9 @@ class OnlineEagle3Model(Eagle3Model):
         position_ids: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        target_hidden_for_compact: Optional[torch.Tensor] = None,
+        target_head_weight: Optional[torch.Tensor] = None,
+        compact_teacher_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
         **kwargs,
     ) -> Tuple[
         List[torch.Tensor],
@@ -258,20 +265,39 @@ class OnlineEagle3Model(Eagle3Model):
             loss_mask: (batch, seq_len)
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
+            target_hidden_for_compact, target_head_weight, compact_teacher_chunk_size:
+                when the first two are given, the padded teacher is built from hidden
+                states in draft-vocab space and ``target`` is ignored.
         """
         # Step 1: handle vocab size
-        (
-            target_p_padded,
-            target_p_on_draft_padded,
-            target_token_ids_padded,
-            position_mask,
-        ) = _compute_target_p_padded(
-            target=target,
-            t2d=self.draft_model.t2d,
-            loss_mask=loss_mask,
-            length=self.length,
-        )
-        del target
+        if target_hidden_for_compact is not None:
+            (
+                target_p_padded,
+                target_p_on_draft_padded,
+                target_token_ids_padded,
+                position_mask,
+            ) = compute_target_p_padded_from_hidden(
+                hidden=target_hidden_for_compact,
+                lm_head_weight=target_head_weight,
+                t2d=self.draft_model.t2d,
+                loss_mask=loss_mask,
+                length=self.length,
+                chunk_size=compact_teacher_chunk_size,
+            )
+            del target_hidden_for_compact
+        else:
+            (
+                target_p_padded,
+                target_p_on_draft_padded,
+                target_token_ids_padded,
+                position_mask,
+            ) = _compute_target_p_padded(
+                target=target,
+                t2d=self.draft_model.t2d,
+                loss_mask=loss_mask,
+                length=self.length,
+            )
+            del target
         torch.cuda.empty_cache()
 
         # basic info

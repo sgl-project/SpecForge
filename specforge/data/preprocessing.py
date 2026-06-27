@@ -630,13 +630,15 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["attention_mask"] = attention_mask
 
         # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Local seq_len (per sp_rank) = local_len; attention uses (local_len - ttt_length).
+        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
+        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size
-        ring_start = ring_rank * ring_chunk
+        ulysses_rank = sp_rank % sp_ulysses_size
+        ring_start = ring_rank * ring_chunk + ulysses_rank * usp_chunk_size
         new_data["position_ids"] = torch.arange(
-            ring_start, ring_start + ring_chunk, dtype=torch.long
+            ring_start, ring_start + usp_chunk_size, dtype=torch.long
         ).unsqueeze(0)
 
         if transform:

@@ -36,7 +36,12 @@ from specforge.modeling.target.dflash_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+from specforge.utils import (
+    get_last_checkpoint,
+    get_local_device,
+    print_on_rank0,
+    print_with_rank,
+)
 
 
 def parse_args():
@@ -81,7 +86,26 @@ def parse_args():
         type=float,
         default=None,
         help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables. "
+        "Only applies when --loss-type dflash.",
+    )
+    model_group.add_argument(
+        "--loss-type",
+        type=str,
+        default="dflash",
+        choices=[
+            "dflash",
+            "dpace",
+            "dpace-cumulative-confidence-only",
+            "dpace-continuation-value-only",
+        ],
+        help=("Loss variant. Use dpace for Dynamic Position-Aware Cross-Entropy."),
+    )
+    model_group.add_argument(
+        "--dpace-alpha",
+        type=float,
+        default=0.5,
+        help="Smoothing alpha for D-PACE position weights.",
     )
     model_group.add_argument(
         "--embedding-key",
@@ -159,11 +183,14 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
 
+    device = get_local_device()
+    device_type = device.type
+
     target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
         backend=args.target_model_backend,
         torch_dtype=torch.bfloat16,
-        device="cuda" if args.target_model_backend == "hf" else None,
+        device=device_type if args.target_model_backend == "hf" else None,
         trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
@@ -194,7 +221,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
+    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -426,7 +453,7 @@ def main():
         args.target_model_path,
         embed_key=args.embedding_key,
         lm_head_key=args.lm_head_key,
-        device="cuda",
+        device=device_type,
         trust_remote_code=args.trust_remote_code,
     )
 
@@ -439,6 +466,8 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        loss_type=args.loss_type,
+        dpace_alpha=args.dpace_alpha,
     )
 
     # Wrap each transformer block as its own FSDP unit so that all-gather /
@@ -487,7 +516,7 @@ def main():
     )
 
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        optimizer.load_state_dict(resume_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
@@ -522,13 +551,13 @@ def main():
                 continue
             global_step += 1
 
-            input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
+            input_ids = data["input_ids"].to(device, non_blocking=True)
+            attention_mask = data["attention_mask"].to(device, non_blocking=True)
+            loss_mask = data["loss_mask"].to(device, non_blocking=True)
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            hidden_states = target_output.hidden_states.to(device, non_blocking=True)
 
             loss, accuracy = dflash_model(
                 input_ids=input_ids,

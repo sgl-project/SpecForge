@@ -1,3 +1,8 @@
+# NOTE: core EAGLE3 training is being migrated to the DataFlow runtime launcher
+# scripts/train_eagle3_dataflow.py (offline + online; validated old-vs-new on 7B).
+# That launcher does not YET cover the following, so this script remains the path
+# for them: VLM (--is-vlm), USP sequence parallelism (--attention-backend usp),
+# the eval loop (--eval-*-path), --resume, and experiment trackers (--report-to).
 import argparse
 import hashlib
 import math
@@ -83,10 +88,8 @@ def print_cuda_memory_debug(label: str) -> None:
     )
 
 
-def parse_args() -> Tuple[ArgumentParser, Namespace]:
-    """
-    This function is used to parse the arguments for the training script.
-    """
+def build_parser() -> ArgumentParser:
+    """Build the training argument parser (import-safe seam for tests)."""
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
 
     # add model-related arguments
@@ -233,6 +236,25 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
     optimization_group.add_argument("--sp-ring-size", type=int, default=1)
     optimization_group.add_argument(
+        "--compact-teacher",
+        action="store_true",
+        help=(
+            "Offline only: compute the EAGLE-3 teacher distribution from target "
+            "hidden states via a draft-vocab-sliced head plus a streaming "
+            "logsumexp/argmax, avoiding the full-vocab [B, S, vocab] fp32 logits. "
+            "Default off; training behavior is unchanged when off."
+        ),
+    )
+    optimization_group.add_argument(
+        "--compact-teacher-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Vocabulary chunk size for the compact-teacher streaming reduction. "
+            "Defaults to compact_teacher.DEFAULT_VOCAB_CHUNK_SIZE when unset."
+        ),
+    )
+    optimization_group.add_argument(
         "--attention-backend",
         type=str,
         default="flex_attention",
@@ -282,8 +304,40 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
+    return parser
+
+
+def parse_args() -> Tuple[ArgumentParser, Namespace]:
+    """Parse CLI arguments for the training script."""
+    parser = build_parser()
     args = parser.parse_args()
     return parser, args
+
+
+def validate_compact_teacher_args(
+    args: Namespace,
+    is_online: bool,
+    target_model,
+    draft_model,
+    draft_model_config,
+) -> None:
+    """Validate compact-teacher settings before training (offline exact mode)."""
+    from specforge.core.compact_teacher import (
+        validate_compact_teacher_enabled,
+        validate_vocab_mapping_consistency,
+    )
+
+    target_head_weight = getattr(getattr(target_model, "fc", None), "weight", None)
+    validate_compact_teacher_enabled(
+        is_online=is_online,
+        is_vlm=args.is_vlm,
+        draft_vocab_size=draft_model_config.draft_vocab_size,
+        vocab_size=draft_model_config.vocab_size,
+        t2d=draft_model.t2d,
+        target_head_weight=target_head_weight,
+        chunk_size=args.compact_teacher_chunk_size,
+    )
+    validate_vocab_mapping_consistency(draft_model.t2d, draft_model.d2t)
 
 
 def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
@@ -613,6 +667,21 @@ def build_dataloaders(
     )
 
 
+def filter_draft_state_dict(model_state_dict: dict) -> dict:
+    """Keep only draft-model weights for the serving checkpoint (drop embeddings).
+
+    Embeddings are intentionally excluded (SGLang loads them from the target); the
+    target ``TargetHead`` is never part of the wrapped draft model, so no teacher state
+    can leak. The compact-teacher flag adds no new draft-model state, so its export is
+    identical to the full path.
+    """
+    return {
+        k.replace("draft_model.", ""): v
+        for k, v in model_state_dict.items()
+        if "draft_model." in k and "embed" not in k.lower()
+    }
+
+
 def save_checkpoints(
     args: Namespace,
     epoch: int,
@@ -633,11 +702,7 @@ def save_checkpoints(
             "args": args,
         }
         state_to_save.update(optimizer.state_dict())
-        draft_model_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
-        }
+        draft_model_state_dict = filter_draft_state_dict(model_state_dict)
 
         if dist.get_rank() == 0:
             torch.save(
@@ -688,6 +753,7 @@ def run_forward(
         )
     else:
         image_grid_thw = None
+        compact_kwargs = {}
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
             # Handle VLM data: pixel_values and image_grid_thw are lists
@@ -738,10 +804,16 @@ def run_forward(
                 data["input_ids"], data["target"], data["loss_mask"]
             )
             input_ids = input_ids.cuda()
-            target = target_model(
-                target.cuda()
-            )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
+            from specforge.core.compact_teacher import build_offline_teacher_inputs
+
+            target, offline_compact_kwargs = build_offline_teacher_inputs(
+                compact=args.compact_teacher,
+                target_model=target_model,
+                target_hidden=target.cuda(),
+                chunk_size_arg=args.compact_teacher_chunk_size,
+            )
+            compact_kwargs.update(offline_compact_kwargs)
         (
             plosses,
             acceptance_rates,
@@ -761,6 +833,7 @@ def run_forward(
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
+            **compact_kwargs,
         )
     return (
         plosses,
@@ -956,6 +1029,12 @@ def main():
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
     print_cuda_memory_debug("after load_vocab_mapping")
+
+    if args.compact_teacher:
+        validate_compact_teacher_args(
+            args, is_online, target_model, draft_model, draft_model_config
+        )
+        print_with_rank("Validated compact-teacher configuration (offline exact mode)")
 
     # Calculate total steps if not provided
     if args.total_steps is None:
@@ -1264,10 +1343,11 @@ def main():
                     tracker,
                     mode="eval",
                 )
+                draft_model.train()
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
-            if global_step % args.save_interval == 0:
+            if global_step % (args.save_interval * args.draft_accumulation_steps) == 0:
                 # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
