@@ -48,7 +48,8 @@ jobs:
           source sf/bin/activate
           uv pip install setuptools
           python -c "import torch" || uv pip install torch==2.11.0
-          MAX_JOBS=8 uv pip install -v ".[fa]" --no-build-isolation --prerelease=allow
+          uv pip install flash-attn --no-build-isolation
+          MAX_JOBS=8 uv pip install -v . --prerelease=allow
 
       - name: Kill GPU processes
         shell: bash
