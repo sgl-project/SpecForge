@@ -599,11 +599,17 @@ class SGLangCaptureBackend:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
     ):
         """DFlash extend: capture the concatenated layer hidden states, no logits.
 
-        Returns ``(data_cache, hidden_states_list)`` — the per-sample raw hidden
-        states the DFlash engine stacks into a batch.
+        Returns ``(data_cache, hidden_states_list, last_hidden_states_list)`` — the
+        per-sample raw hidden states the DFlash engine stacks into a batch.
+        ``hidden_states_list`` is the captured (aux) mid-layer concat DFlash trains
+        on. ``last_hidden_states_list`` is the target's post-norm final hidden state
+        (the LM-head input), surfaced for DSpark's L1 / confidence losses when
+        ``return_last_hidden_states=True`` and the runner returned both streams;
+        otherwise every entry is ``None``.
         """
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
@@ -633,6 +639,12 @@ class SGLangCaptureBackend:
         # Capture lengths before the forward: 0.5.13+ releases origin_input_ids in it.
         input_lens = [len(req.origin_input_ids) for req in reqs]
         output = self._forward_extend(reqs)
+        # context = the captured (aux) mid-layer concat used by DFlash; final = the
+        # post-norm last-layer hidden, surfaced for DSpark's L1 / confidence losses.
+        has_final = (
+            hasattr(output, "hidden_states") and output.hidden_states is not None
+        )
+        last_hidden_states_list = [None] * len(reqs)
         if (
             hasattr(output, "aux_hidden_states")
             and output.aux_hidden_states is not None
@@ -640,13 +652,23 @@ class SGLangCaptureBackend:
             hidden_states_list = torch.split(
                 output.aux_hidden_states, input_lens, dim=0
             )
-        elif hasattr(output, "hidden_states") and output.hidden_states is not None:
+            # The aux stream is the DFlash context; the final post-norm hidden is a
+            # separate stream, only available when the runner returned both.
+            if return_last_hidden_states and has_final:
+                last_hidden_states_list = torch.split(
+                    output.hidden_states, input_lens, dim=0
+                )
+        elif has_final:
+            # Only one stream: treat it as the DFlash context. We can't tell a
+            # single stream apart from a multi-layer concat, so we do NOT surface
+            # it as last_hidden_states (stays None -> DSpark falls back to CE-only
+            # or errors, matching the HF-backend guidance).
             hidden_states_list = torch.split(output.hidden_states, input_lens, dim=0)
         else:
             raise ValueError("SGLang output does not contain hidden states.")
         self._clear_pools()
 
-        return data_cache, hidden_states_list
+        return data_cache, hidden_states_list, last_hidden_states_list
 
 
 __all__ = ["SGLangCaptureBackend"]
