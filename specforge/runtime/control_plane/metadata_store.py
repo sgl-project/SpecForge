@@ -188,6 +188,9 @@ class SQLiteMetadataStore(MetadataStore):
         self.path = path
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")  # durable + concurrent reads
+        self._conn.execute(
+            "PRAGMA synchronous=FULL"
+        )  # ack survives power loss, not just process crash
         self._lock = threading.RLock()
         with self._lock:
             self._conn.execute(
@@ -231,7 +234,10 @@ class SQLiteMetadataStore(MetadataStore):
 
     def all_committed_ids(self) -> List[str]:
         with self._lock:
-            rows = self._conn.execute("SELECT sample_id FROM committed").fetchall()
+            # rowid order == commit (insertion) order, matching InMemory's dict.
+            rows = self._conn.execute(
+                "SELECT sample_id FROM committed ORDER BY rowid"
+            ).fetchall()
         return [r[0] for r in rows]
 
     def record_train_ack(

@@ -9,7 +9,12 @@ offline EAGLE3 step through both the legacy path (``run_forward`` +
 so any divergence is the new path failing to preserve the math under real TP+SP —
 the "scale-out claim met, not FSDP-only" gate.
 
-GPU-only and needs >=4 visible GPUs. Run on the H200 box via rcli.
+GPU-only; needs >=4 visible GPUs AND flash-attn **v2** (the Ulysses/USP attention
+path resolves flash-attn v2 varlen kernels in ``llama3_eagle`` — there is no SP
+fallback). The cached ``sglang:dev`` image used for the other gates ships
+flash-attn **v4**, whose API differs, so SpecForge's USP path is non-functional
+there and this test skips. Run on a training image with flash-attn v2. Validated
+up to the USP-engages point on 8xH200; full numerical assertion needs v2.
 """
 
 import json
@@ -23,6 +28,20 @@ import torch
 CUDA = torch.cuda.is_available()
 NGPU = torch.cuda.device_count() if CUDA else 0
 WORLD = 4
+
+
+def _has_usp_flash_attn() -> bool:
+    # Authoritative check: the USP attention path resolves flash-attn *v2* varlen
+    # kernels in llama3_eagle. Probe that exact symbol — it is None when flash-attn
+    # is absent OR when an API-incompatible major version is installed (e.g. the
+    # cached sglang:dev image ships flash-attn v4, whose API differs, so SpecForge's
+    # USP path is non-functional there). A bare `import flash_attn` is NOT enough.
+    try:
+        from specforge.modeling.draft.llama3_eagle import _std_flash_unpad_input
+
+        return _std_flash_unpad_input is not None
+    except Exception:
+        return False
 
 
 def _worker(rank, world_size, workdir, results_dir):
@@ -55,13 +74,17 @@ def _worker(rank, world_size, workdir, results_dir):
     draft_config = AutoDraftModelConfig.from_file(cfg)
 
     def build_model():
+        # attention_backend="usp" so the forward actually exercises Ulysses SP
+        # (UspAdapter + SeqAllToAll cross-rank attention), matching production
+        # when sp>1; flex_attention would silently run per-rank-local attention
+        # and the use_usp_preprocess-sharded data would shape-mismatch.
         dm = AutoEagle3DraftModel.from_config(
-            draft_config, attention_backend="flex_attention", torch_dtype=torch.bfloat16
+            draft_config, attention_backend="usp", torch_dtype=torch.bfloat16
         ).cuda()
         dm.load_vocab_mapping(vocab_path)
         dm.freeze_embedding()
         return OnlineEagle3Model(
-            draft_model=dm, length=TTT, attention_backend="flex_attention"
+            draft_model=dm, length=TTT, attention_backend="usp"
         ).cuda()
 
     model_a = build_model()
@@ -135,7 +158,10 @@ def _worker(rank, world_size, workdir, results_dir):
         )
 
 
-@unittest.skipUnless(CUDA and NGPU >= WORLD, f"requires >={WORLD} GPUs")
+@unittest.skipUnless(
+    CUDA and NGPU >= WORLD and _has_usp_flash_attn(),
+    f"requires >={WORLD} GPUs and flash-attn v2 (USP/Ulysses attention path)",
+)
 class TestEquiv4Rank(unittest.TestCase):
     def test_equiv_tp2_sp2(self):
         import torch.multiprocessing as mp

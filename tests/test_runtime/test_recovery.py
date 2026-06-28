@@ -152,6 +152,29 @@ class TestRestartReconciliation(unittest.TestCase):
         self.assertEqual(report["released"], [])
         store2.close()
 
+    def test_durable_ack_without_global_step_still_releases(self):
+        # A durable ack (optimizer_durable=True) with global_step omitted must
+        # still release the acked samples on restart — not replay them.
+        store = SQLiteMetadataStore(self.path)
+        ctrl = DataFlowController(
+            "run", sample_queue=SampleRefQueue(), metadata_store=store
+        )
+        ctrl.commit_samples("w0", [_ref(f"s{i}") for i in range(2)])
+        ctrl.lease_train_refs("trainer", 2)
+        store.record_train_ack(["s0", "s1"], global_step=None, optimizer_durable=True)
+        store.close()
+
+        store2 = SQLiteMetadataStore(self.path)
+        ctrl2 = DataFlowController(
+            "run", sample_queue=SampleRefQueue(), metadata_store=store2
+        )
+        report = ctrl2.reconcile_on_restart()
+        self.assertEqual(
+            set(report["released"]), {"s0", "s1"}
+        )  # released, not replayed
+        self.assertEqual(report["requeued"], [])
+        store2.close()
+
     def test_reconcile_is_idempotent(self):
         # Reconciling twice on a fresh (post-crash) queue must not double-enqueue;
         # queue.put is idempotent on sample_id.
