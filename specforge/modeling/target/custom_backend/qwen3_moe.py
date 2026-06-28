@@ -38,6 +38,8 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeRotaryEmbedding as HFQwen3MoeRotaryEmbedding,
+)
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
