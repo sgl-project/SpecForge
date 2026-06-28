@@ -9,7 +9,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
-from specforge.utils import padding
+from specforge.utils import current_device, padding
 
 # SGLang internals back the *sglang* target backend only. Keep these imports
 # optional so `import specforge` (and the HF / offline / draft paths) still works
@@ -358,7 +358,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=torch.cuda.current_device(),
+            gpu_id=current_device(),
             tp_rank=dist.get_rank(get_tp_group()),
             tp_size=server_args.tp_size,
             moe_ep_rank=moe_ep_rank,

@@ -33,9 +33,9 @@ from specforge.core.compact_teacher import (
 )
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import log_softmax_loss
 from specforge.modeling.draft import Eagle3DraftModel
-from specforge.utils import padding
+from specforge.utils import empty_cache, get_compile_backend, padding
 
 
 class Eagle3Model(nn.Module):
@@ -69,7 +69,7 @@ def _compute_loss_and_acceptance_rate(
         reduce_metrics_fn: Optional distributed reducer for metric numer/denom.
         reduce_loss_fn: Optional distributed reducer for KL loss.
     """
-    kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    kl_loss = log_softmax_loss(logits, target_p, position_mask)
     if reduce_loss_fn is not None:
         kl_loss = reduce_loss_fn(kl_loss)
 
@@ -298,7 +298,7 @@ class OnlineEagle3Model(Eagle3Model):
                 length=self.length,
             )
             del target
-        torch.cuda.empty_cache()
+        empty_cache()
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -832,7 +832,7 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
         )
 
 
-@torch.compile(dynamic=None)
+@torch.compile(dynamic=None, backend=get_compile_backend())
 def _compute_target_p(target, t2d, loss_mask):
     target_head = target.float()
     target_token_ids = target_head.argmax(-1)
@@ -849,13 +849,13 @@ def _compute_target_p(target, t2d, loss_mask):
     return target_p, target_p_on_draft, target_token_ids, position_mask
 
 
-@torch.compile(dynamic=None)
+@torch.compile(dynamic=None, backend=get_compile_backend())
 def _compute_metric_acc(logits, target_token_ids, loss_mask, d2t):
     correct, denom = _compute_metric_counts(logits, target_token_ids, loss_mask, d2t)
     return correct / denom
 
 
-@torch.compile(dynamic=None)
+@torch.compile(dynamic=None, backend=get_compile_backend())
 def _compute_metric_counts(logits, target_token_ids, loss_mask, d2t):
     pred_draft_token_ids = logits.argmax(-1)
     pred_target_token_ids = pred_draft_token_ids + d2t[pred_draft_token_ids]

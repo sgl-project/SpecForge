@@ -171,6 +171,9 @@ def preprocess_conversations(
             tool=tool,
             **kwargs_item,
         )
+        if input_ids is None or loss_mask is None:
+            # if parsing failed, skip this conversation
+            continue
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])

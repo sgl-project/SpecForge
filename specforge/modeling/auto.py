@@ -18,6 +18,8 @@ from transformers import (
     modeling_utils,
 )
 
+from specforge.utils import get_local_device
+
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .target.custom_backend import (
     GptOssForCausalLM,
@@ -125,7 +127,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
         if device is not None:
             model = model.to(device)
         else:
-            model = model.cuda()
+            model = model.to(get_local_device())
         return model
 
 

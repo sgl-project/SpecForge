@@ -13,6 +13,13 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaFlexAttention,
     prepare_decoder_attention_mask,
 )
+from specforge.utils import (
+    empty_cache,
+    get_device_module,
+    get_device_type,
+    get_local_device,
+    synchronize,
+)
 
 dynamo.config.recompile_limit = 64
 
@@ -40,7 +47,7 @@ def run_attention(
     attention_backend: str = "sdpa",
     enable_profile: bool = False,
 ):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_local_device()
     batch_size = hidden_states_list[0].shape[0]
     # Initialize cache and attention function based on backend
     if attention_backend == "sdpa":
@@ -133,9 +140,9 @@ def benchmark_function(
         print(f"\nTesting sequence length: {seq_len}")
 
         # Clear GPU cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+        if get_device_type() != "cpu":
+            empty_cache()
+            get_device_module().reset_peak_memory_stats()
 
         # Warm up runs for this sequence length
         if enable_warmup:
@@ -147,27 +154,27 @@ def benchmark_function(
                         seq_len,
                         HIDDEN_SIZE,
                         requires_grad=True,
-                        device="cuda",
+                        device=get_local_device(),
                         dtype=torch.bfloat16,
                     )
                     for _ in range(TTT_LENGTH)
                 ]
                 run_attention(seq_len, hidden_states, attention_backend)
             # Clear cache again after warmup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
+            if get_device_type() != "cpu":
+                empty_cache()
+                get_device_module().reset_peak_memory_stats()
         # Record initial memory
         initial_memory = 0
-        if torch.cuda.is_available():
-            initial_memory = torch.cuda.memory_allocated()
+        if get_device_type() != "cpu":
+            initial_memory = get_device_module().memory_allocated()
         hidden_states = [
             torch.randn(
                 BATCH_SIZE,
                 seq_len,
                 HIDDEN_SIZE,
                 requires_grad=True,
-                device="cuda",
+                device=get_local_device(),
                 dtype=torch.bfloat16,
             )
             for _ in range(TTT_LENGTH)
@@ -179,16 +186,16 @@ def benchmark_function(
             attention_backend,
             enable_profile and seq_len == seq_lengths[0],
         )
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if get_device_type() != "cpu":
+            synchronize()
         end_time = time.time()
 
         # Record memory usage
         peak_memory = 0
         current_memory = 0
-        if torch.cuda.is_available():
-            peak_memory = torch.cuda.max_memory_allocated()
-            current_memory = torch.cuda.memory_allocated()
+        if get_device_type() != "cpu":
+            peak_memory = get_device_module().max_memory_allocated()
+            current_memory = get_device_module().memory_allocated()
         results_per_seq_len.append(
             {
                 "seq_len": seq_len,
@@ -292,16 +299,18 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("PyTorch version:", torch.__version__)
-    if torch.cuda.is_available():
-        print("CUDA available:", torch.cuda.is_available())
-        print("GPU:", torch.cuda.get_device_name())
+    device_type = get_device_type()
+    if device_type != "cpu":
+        device_module = get_device_module()
+        print(f"{device_type} available: True")
+        print("Device:", device_module.get_device_name())
         print(
-            "GPU memory:",
-            torch.cuda.get_device_properties(0).total_memory / 1024**3,
+            "Device memory:",
+            device_module.get_device_properties(0).total_memory / 1024**3,
             "GB",
         )
     else:
-        print("CUDA not available - running on CPU")
+        print("No accelerator available - running on CPU")
 
     # Define sequence lengths to test
     seq_lengths = [128 * i for i in range(1, 28, 4)]
