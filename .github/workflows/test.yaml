@@ -51,11 +51,6 @@ jobs:
           uv pip install flash-attn --no-build-isolation
           MAX_JOBS=8 uv pip install -v . --prerelease=allow
 
-      - name: Kill GPU processes
-        shell: bash
-        run: |
-          bash .github/workflows/scripts/delete_gpu_process.sh
-
       - name: Run test
         timeout-minutes: 45
         shell: bash
