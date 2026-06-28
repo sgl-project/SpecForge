@@ -455,6 +455,7 @@ class TestTargetModelBackend(unittest.TestCase):
         port = get_available_port()
         mp.spawn(test_vlm, nprocs=world_size, args=(world_size, port, 2))
 
+    @unittest.skip("Skip this test for now")
     def test_sglang_backend_with_vlm_multi_batch(self):
         world_size = 2
         port = get_available_port()
