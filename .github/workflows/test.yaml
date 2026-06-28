@@ -46,7 +46,7 @@ jobs:
             uv venv sf -p 3.11
           fi
           source sf/bin/activate
-          uv pip install setuptools psutil
+          uv pip install setuptools psutil packaging ninja
           uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
           uv pip install flash-attn --no-build-isolation
           MAX_JOBS=8 uv pip install -v . --prerelease=allow
