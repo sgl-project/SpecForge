@@ -101,8 +101,11 @@ class StreamingRefChannel:
         return self._published - self.consumed_remote()
 
     # -- consumer ----------------------------------------------------------
-    def _is_closed(self) -> bool:
+    def is_closed(self) -> bool:
+        """True once the producer has dropped the EOF sentinel."""
         return os.path.exists(self.path + _CLOSED_SUFFIX)
+
+    _is_closed = is_closed  # backwards-compatible alias
 
     def poll(self, max_n: Optional[int] = None) -> List[SampleRef]:
         """Return refs appended since the last poll (complete lines only).
@@ -179,4 +182,69 @@ class StreamingRefChannel:
             sleep(poll_s)
 
 
-__all__ = ["StreamingRefChannel"]
+class StreamingRefQueue:
+    """Adapts a :class:`StreamingRefChannel` to the ``SampleRefQueue`` protocol
+    (``get``/``ack``/``fail``) the ``FeatureDataLoader`` consumes in queue mode.
+
+    ``get(n)`` BLOCKS (polling) until ``n`` refs are buffered or the channel is
+    closed-and-drained, so the trainer streams the whole online run and only sees
+    an empty batch (-> loop ends) once the producer has closed. ``ack`` advances
+    the channel's consumed counter (the producer's backpressure signal); the
+    feature-store free already happened in the loader's materialize (get ->
+    release) for a consume-once store.
+    """
+
+    def __init__(
+        self,
+        channel: StreamingRefChannel,
+        *,
+        poll_s: float = 0.1,
+        idle_timeout_s: Optional[float] = None,
+        clock=time.monotonic,
+        sleep=time.sleep,
+    ) -> None:
+        self.channel = channel
+        self.poll_s = poll_s
+        self.idle_timeout_s = idle_timeout_s
+        self._clock = clock
+        self._sleep = sleep
+        self._buf: List[SampleRef] = []
+
+    def get(self, n: int, timeout_s: float = 0.0) -> List[SampleRef]:
+        last_progress = self._clock()
+        while len(self._buf) < n:
+            new = self.channel.poll()
+            if new:
+                self._buf.extend(new)
+                last_progress = self._clock()
+                continue
+            if self.channel.is_closed():
+                self._buf.extend(self.channel.poll())  # final drain
+                break
+            if (
+                self.idle_timeout_s is not None
+                and self._clock() - last_progress > self.idle_timeout_s
+            ):
+                raise TimeoutError(
+                    f"StreamingRefQueue {self.channel.path}: idle "
+                    f"{self.idle_timeout_s:.0f}s with the channel still open"
+                )
+            self._sleep(self.poll_s)
+        take = min(n, len(self._buf))
+        out, self._buf = self._buf[:take], self._buf[take:]
+        return out
+
+    def ack(self, refs: List[SampleRef]) -> None:
+        self.channel.mark_consumed(len(refs))  # backpressure: producer reads this
+
+    def fail(self, refs: List[SampleRef], reason: str, retryable: bool) -> None:
+        if retryable:
+            self._buf[:0] = refs  # re-buffer at the front for the next get()
+        else:
+            self.channel.mark_consumed(len(refs))
+
+    def depth(self) -> int:
+        return len(self._buf)
+
+
+__all__ = ["StreamingRefChannel", "StreamingRefQueue"]
