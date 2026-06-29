@@ -44,6 +44,20 @@ class TestDisaggregatedStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             producer.get(ref)
 
+    def test_consumer_release_of_stale_handle_does_not_free_fresh_reput(self):
+        # finding [1]/[2]: a consumer-only instance releasing a stale handle must
+        # NOT delete the freshly re-put generation's data.
+        producer = SharedDirFeatureStore(self.root, store_id="st")
+        consumer = SharedDirFeatureStore(self.root, store_id="st")
+        ref1 = producer.put({"x": torch.zeros(1, 4)}, sample_id="s0", metadata={})
+        _, h_old = consumer.get(ref1)  # consumer leases gen1
+        ref2 = producer.put(
+            {"x": torch.ones(1, 4)}, sample_id="s0", metadata={}
+        )  # gen2
+        consumer.release(h_old)  # stale gen1 handle; must not touch gen2
+        out, _ = consumer.get(ref2)  # gen2 must still be intact
+        self.assertEqual(out["x"].sum().item(), 4.0)  # ones(1,4) intact
+
     def test_use_after_free_get_raises(self):
         store = SharedDirFeatureStore(self.root)
         ref = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})

@@ -6,38 +6,36 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Disaggregated FeatureStore: producer and consumer in different processes.
+"""Disaggregated FeatureStore over a shared directory (M6 seam).
 
-``SharedDirFeatureStore`` is the M6 disaggregation seam. Producer (rollout) and
-consumer (trainer) run as separate processes that share only a directory — the
-control plane still carries nothing but ``SampleRef`` metadata (the URI points at
-the shared store), exactly as in the colocated case. ``get()`` resolves a sample
-from the shared filesystem *and the ref alone*, with no shared in-process state,
-which is what makes it a true cross-process boundary.
+Producer (rollout) and consumer (trainer) run as separate processes that share
+only a directory. The control plane still carries only ``SampleRef`` metadata;
+``get()`` resolves a sample from the ref + filesystem alone, with no shared
+in-process state. A real ``MooncakeFeatureStore`` later swaps the shared-dir
+transport for RDMA behind this same API.
 
-This is the framework, not the fast path. A real ``MooncakeFeatureStore`` swaps
-the shared-dir transport for RDMA zero-copy **behind this same API**; everything
-the control/training planes see is unchanged. What this reference backend exists
-to lock down *now* is the contract the fast backend must honor:
+Scope: this is the CPU-testable *reference* backend that pins the contract, not
+the fast path. The read/data path is genuinely cross-process, but the
+generation/lease index is in-process — so the B5 guarantees below hold for the
+single-host (single-producer) case. True multi-node liveness needs that index
+lifted into a shared/durable metadata store (a later milestone).
 
-* **B5 — no use-after-free.** ``get()`` after ``release``/``abort`` raises
-  loudly (``KeyError``) instead of returning stale data, and a generation guard
-  rejects a stale ref after a re-``put``. Clone-on-fetch is the default, so a
-  consumer never holds a pointer a free could invalidate.
-* **B9 — auth required in disaggregated mode.** A process must present the
-  shared credential to attach to and use the store; a missing/mismatched token
-  is a ``PermissionError``, not a silent open door.
+Contract this backend locks down:
 
-Cross-node note: the per-sample generation/lease *index* here is in-process for
-the single-host case. A true multi-node deployment moves that index to the
-durable metadata store (so liveness survives a process restart); the on-disk
-payload + URI contract is already cross-process.
+* **B5 — no use-after-free.** Each generation is a distinct file
+  (``{sample_id}.g{gen}.ckpt``) published by a single atomic rename, and a
+  re-``put`` removes superseded generations — so a stale ref's file is gone and
+  its ``get()`` raises ``KeyError`` rather than aliasing fresh data. ``release()``
+  is generation-aware (frees only the generation its lease held); clone-on-fetch
+  is the default.
+* **B9 — auth in disaggregated mode.** A missing/mismatched shared credential is
+  a ``PermissionError`` at attach time and on the data path.
 """
 
 from __future__ import annotations
 
-import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -81,6 +79,7 @@ class SharedDirFeatureStore(FeatureStore):
         auth: Optional[AuthPolicy] = None,
         credential: Optional[str] = None,
         max_hold_age_s: Optional[float] = None,
+        retain_on_release: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.auth = auth or AuthPolicy()
@@ -90,6 +89,11 @@ class SharedDirFeatureStore(FeatureStore):
         self.root = os.path.join(root, self.store_id)
         os.makedirs(self.root, exist_ok=True)
         self.max_hold_age_s = max_hold_age_s
+        # Read-only re-iterable mode: an offline-imported feature set is consumed
+        # across multiple epochs, so release() must NOT physically free it (mirrors
+        # LocalFeatureStore's file:// no-op release). Cleanup is whole-store at run
+        # end; consume-once free (retain_on_release=False) is for online rollout.
+        self.retain_on_release = retain_on_release
         self._clock = clock
         # in-process liveness index (generation / put-time / active leases)
         self._generation: Dict[str, int] = {}
@@ -97,15 +101,31 @@ class SharedDirFeatureStore(FeatureStore):
         self._active_leases: Dict[str, FeatureHandle] = {}
         self._lock = threading.RLock()
         self._counter = 0
-        self._gen_counter = 0
         self._stats = {"force_freed": 0, "force_freed_bytes": 0}
 
     # -- paths -------------------------------------------------------------
-    def _data_path(self, sample_id: str) -> str:
-        return os.path.join(self.root, f"{sample_id}.ckpt")
+    # Generation is encoded in the FILENAME ({sid}.g{gen}.ckpt) so a generation
+    # is published with ONE atomic rename — a reader either sees a full
+    # generation file or none, never new data under an old generation's number.
+    _FNAME_RE = re.compile(r"^(?P<sid>.+)\.g(?P<gen>\d+)\.ckpt$")
 
-    def _gen_path(self, sample_id: str) -> str:
-        return os.path.join(self.root, f"{sample_id}.gen")
+    def _data_path(self, sample_id: str, gen: int) -> str:
+        return os.path.join(self.root, f"{sample_id}.g{gen}.ckpt")
+
+    def _disk_gens(self, sample_id: str) -> List[int]:
+        gens: List[int] = []
+        try:
+            for name in os.listdir(self.root):
+                m = self._FNAME_RE.match(name)
+                if m and m.group("sid") == sample_id:
+                    gens.append(int(m.group("gen")))
+        except FileNotFoundError:
+            pass
+        return sorted(gens)
+
+    def _current_gen(self, sample_id: str) -> Optional[int]:
+        gens = self._disk_gens(sample_id)
+        return gens[-1] if gens else None
 
     # -- write -------------------------------------------------------------
     def put(
@@ -121,16 +141,20 @@ class SharedDirFeatureStore(FeatureStore):
         staged = {k: v.detach().cpu() for k, v in tensors.items()}
         specs = {k: spec_from_tensor(k, v) for k, v in staged.items()}
         with self._lock:
-            self._gen_counter += 1
-            gen = self._gen_counter
-        # atomic publish: write data + generation sidecar, rename into place
-        data_tmp = self._data_path(sample_id) + f".{uuid.uuid4().hex}.tmp"
-        torch.save(staged, data_tmp)
-        os.replace(data_tmp, self._data_path(sample_id))
-        with open(self._gen_path(sample_id) + ".tmp", "w") as f:
-            json.dump({"generation": gen}, f)
-        os.replace(self._gen_path(sample_id) + ".tmp", self._gen_path(sample_id))
-        with self._lock:
+            # next generation, derived from disk so a re-put across instances is
+            # monotonic; the new file is published with a single atomic rename.
+            gen = (self._current_gen(sample_id) or 0) + 1
+            data_tmp = self._data_path(sample_id, gen) + f".{uuid.uuid4().hex}.tmp"
+            torch.save(staged, data_tmp)
+            os.replace(data_tmp, self._data_path(sample_id, gen))
+            # remove superseded generations so a stale ref's file is gone (its
+            # get() then raises -> no use-after-free on re-put).
+            for old in self._disk_gens(sample_id):
+                if old != gen:
+                    try:
+                        os.remove(self._data_path(sample_id, old))
+                    except FileNotFoundError:
+                        pass
             self._generation[sample_id] = gen
             self._put_time[sample_id] = self._clock()
         nbytes = sum(t.numel() * t.element_size() for t in staged.values())
@@ -164,19 +188,19 @@ class SharedDirFeatureStore(FeatureStore):
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         self.auth.check(self._credential)
         sid = sample_ref.sample_id
-        data_path = self._data_path(sid)
-        if not os.path.exists(data_path):
-            # freed by release/abort, or never written -> never hand back stale
-            raise KeyError(f"sample {sid} not available in store {self.store_id}")
-        on_disk_gen = self._read_gen(sid)
-        ref_gen = sample_ref.metadata.get("generation", on_disk_gen)
-        if on_disk_gen is not None and ref_gen != on_disk_gen:
-            # the sample was re-put after this ref was minted -> stale handle
+        gen = sample_ref.metadata.get("generation")
+        if gen is None:
+            gen = self._current_gen(sid)
+        data_path = self._data_path(sid, gen) if gen is not None else None
+        # A missing file means: freed (release/abort), superseded by a re-put, or
+        # never written. In every case refuse to hand back data (B5: no
+        # use-after-free, no stale generation).
+        if data_path is None or not os.path.exists(data_path):
             raise KeyError(
-                f"sample {sid} generation {ref_gen} is stale "
-                f"(current {on_disk_gen}); refusing use-after-free"
+                f"sample {sid} generation {gen} not available in store {self.store_id} "
+                f"(freed, stale, or never written)"
             )
-        raw = load_feature_file(data_path)
+        raw = load_feature_file(data_path)  # gen and data come from one file
         wanted = names or list(sample_ref.feature_keys.keys())
         out = {}
         for n in wanted:
@@ -192,51 +216,53 @@ class SharedDirFeatureStore(FeatureStore):
             self._counter += 1
             handle = FeatureHandle(
                 sample_id=sid,
-                generation=on_disk_gen or 0,
+                generation=int(gen),
                 lease_token=f"{sid}:{self._counter}",
             )
             self._active_leases[handle.lease_token] = handle
         return out, handle
 
-    def _read_gen(self, sample_id: str) -> Optional[int]:
-        try:
-            with open(self._gen_path(sample_id)) as f:
-                return int(json.load(f)["generation"])
-        except (FileNotFoundError, ValueError, KeyError):
-            return None
-
     # -- lifetime ----------------------------------------------------------
-    def _free_locked(self, sample_id: str) -> int:
-        nbytes = 0
-        data_path = self._data_path(sample_id)
-        if os.path.exists(data_path):
-            nbytes = os.path.getsize(data_path)
-        for p in (data_path, self._gen_path(sample_id)):
-            try:
-                os.remove(p)
-            except FileNotFoundError:
-                pass
-        self._generation.pop(sample_id, None)
-        self._put_time.pop(sample_id, None)
+    def _free_gen_locked(self, sample_id: str, gen: int) -> int:
+        path = self._data_path(sample_id, gen)
+        nbytes = os.path.getsize(path) if os.path.exists(path) else 0
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        if self._generation.get(sample_id) == gen:
+            self._generation.pop(sample_id, None)
+            self._put_time.pop(sample_id, None)
         return nbytes
 
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
+        # Free this generation's file once the last lease ON THAT generation
+        # drops. A stale handle (its generation already superseded + removed by a
+        # re-put) frees a file that is already gone -> harmless no-op; it can
+        # never delete the freshly re-put current generation (different filename).
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
-            cur = self._generation.get(handle.sample_id)
-            if cur is not None and handle.generation != cur:
-                return  # stale -> no-op
-            still_leased = any(
-                h.sample_id == handle.sample_id for h in self._active_leases.values()
-            )
-            if not still_leased:
-                self._free_locked(handle.sample_id)
+            if self.retain_on_release:
+                return  # offline re-iterable set: keep the file for the next epoch
+            sid, gen = handle.sample_id, handle.generation
+            if any(
+                h.sample_id == sid and h.generation == gen
+                for h in self._active_leases.values()
+            ):
+                return  # a lease on this generation still holds it
+            self._free_gen_locked(sid, gen)
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:
-            self._free_locked(sample_id)
+            for gen in self._disk_gens(sample_id):
+                self._free_gen_locked(sample_id, gen)
+            self._generation.pop(sample_id, None)
+            self._put_time.pop(sample_id, None)
 
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
+        # Max-hold force-free uses this instance's _put_time (single-host). A
+        # true cross-node sweeper reads the durable index / file mtime; that is
+        # the documented disaggregated follow-up.
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:
@@ -250,8 +276,10 @@ class SharedDirFeatureStore(FeatureStore):
                     )
                 ]
                 for sid in stale:
-                    freed_bytes += self._free_locked(sid)
-                    freed += 1
+                    gen = self._generation.get(sid)
+                    if gen is not None:
+                        freed_bytes += self._free_gen_locked(sid, gen)
+                        freed += 1
             self._stats["force_freed"] += freed
             self._stats["force_freed_bytes"] += freed_bytes
         return {
@@ -261,26 +289,38 @@ class SharedDirFeatureStore(FeatureStore):
         }
 
     def health(self) -> Dict[str, Any]:
+        # Residency is read from DISK (cross-process truth) and computed OUTSIDE
+        # the lock so a directory stat never serializes the put/get/release path.
+        sids_on_disk = set()
+        resident_bytes = 0
+        try:
+            for name in os.listdir(self.root):
+                m = self._FNAME_RE.match(name)
+                if m:
+                    sids_on_disk.add(m.group("sid"))
+                    try:
+                        resident_bytes += os.path.getsize(os.path.join(self.root, name))
+                    except FileNotFoundError:
+                        pass
+        except FileNotFoundError:
+            pass
         with self._lock:
             now = self._clock()
             ages = [now - t for t in self._put_time.values()]
-            resident = sum(
-                os.path.getsize(self._data_path(s))
-                for s in self._generation
-                if os.path.exists(self._data_path(s))
-            )
-            return {
-                "store_id": self.store_id,
-                "backend": "shared_dir",
-                "root": self.root,
-                "resident_samples": len(self._generation),
-                "active_leases": len(self._active_leases),
-                "resident_bytes": resident,
-                "auth_required": self.auth.required,
-                "oldest_age_s": max(ages) if ages else 0.0,
-                "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,
-                "force_freed_total": self._stats["force_freed"],
-            }
+            active_leases = len(self._active_leases)
+            force_freed = self._stats["force_freed"]
+        return {
+            "store_id": self.store_id,
+            "backend": "shared_dir",
+            "root": self.root,
+            "resident_samples": len(sids_on_disk),
+            "active_leases": active_leases,
+            "resident_bytes": resident_bytes,
+            "auth_required": self.auth.required,
+            "oldest_age_s": max(ages) if ages else 0.0,
+            "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,
+            "force_freed_total": force_freed,
+        }
 
 
 __all__ = ["AuthPolicy", "SharedDirFeatureStore"]
