@@ -293,7 +293,12 @@ class DataFlowController:
         """
         marker = self.store.durable_marker()
         acked = marker["acked"]
-        step_committed = marker["global_step"] is not None
+        # Release eligibility is gated on the optimizer-durable marker, NOT on a
+        # global_step scalar that the ack API leaves None by default — otherwise a
+        # durable ack with global_step omitted would force every acked sample to
+        # replay (duplicate train). (Coarse: optimizer_durable is a run-level
+        # flag; a per-sample durability column is the future refinement.)
+        step_committed = bool(marker["optimizer_durable"])
         requeued: List[str] = []
         released: List[str] = []
         for sid in self.store.all_committed_ids():
