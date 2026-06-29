@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Set
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.disagg_ingest import _ref_from_dict, _ref_to_dict
@@ -192,6 +192,14 @@ class StreamingRefQueue:
     the channel's consumed counter (the producer's backpressure signal); the
     feature-store free already happened in the loader's materialize (get ->
     release) for a consume-once store.
+
+    ``skip_ids`` is the restart contract (O1.1): the channel JSONL is append-only
+    and a restarted consumer re-reads it from offset 0, so without a skip set it
+    would re-train every already-durably-acked sample. The launcher derives this
+    set from the shared durable :class:`MetadataStore` (the samples
+    ``reconcile_on_restart`` reports as released) and passes it here; matching refs
+    are dropped on read and counted as consumed so the producer's backpressure
+    signal (``in_flight_remote``) stays exact across the restart.
     """
 
     def __init__(
@@ -200,26 +208,61 @@ class StreamingRefQueue:
         *,
         poll_s: float = 0.1,
         idle_timeout_s: Optional[float] = None,
+        skip_ids: Optional[Set[str]] = None,
         clock=time.monotonic,
         sleep=time.sleep,
     ) -> None:
         self.channel = channel
         self.poll_s = poll_s
         self.idle_timeout_s = idle_timeout_s
+        self._skip_ids = set(skip_ids) if skip_ids else None
         self._clock = clock
         self._sleep = sleep
         self._buf: List[SampleRef] = []
 
+    def _poll(self) -> "tuple[List[SampleRef], int]":
+        """Poll the channel, dropping already-trained refs (restart skip).
+
+        Returns ``(fresh_refs, raw_count)``. ``raw_count`` is the number of refs
+        the channel actually yielded (skipped or not), so the caller can tell
+        "made progress" from "nothing new" even when every polled ref was skipped.
+        """
+        raw = self.channel.poll()
+        if not self._skip_ids or not raw:
+            return raw, len(raw)
+        fresh: List[SampleRef] = []
+        skipped = 0
+        for ref in raw:
+            if ref.sample_id in self._skip_ids:
+                self._skip_ids.discard(ref.sample_id)
+                skipped += 1
+            else:
+                fresh.append(ref)
+        if skipped:
+            # already durably trained on a prior run: count them consumed so the
+            # producer's in_flight_remote backpressure stays exact across restart.
+            self.channel.mark_consumed(skipped)
+            if not self._skip_ids:
+                # The restart skip-ids are the already-trained FRONT prefix, so once
+                # they are all drained drop back to the zero-overhead fast path
+                # instead of hashing every ref for the rest of a long online run.
+                self._skip_ids = None
+        return fresh, len(raw)
+
     def get(self, n: int, timeout_s: float = 0.0) -> List[SampleRef]:
         last_progress = self._clock()
         while len(self._buf) < n:
-            new = self.channel.poll()
-            if new:
-                self._buf.extend(new)
+            new, raw = self._poll()
+            if raw:
+                # progress on the channel (even if all refs were skipped): buffer
+                # what survived the skip filter and poll again before sleeping.
                 last_progress = self._clock()
+                if new:
+                    self._buf.extend(new)
                 continue
             if self.channel.is_closed():
-                self._buf.extend(self.channel.poll())  # final drain
+                drain, _ = self._poll()
+                self._buf.extend(drain)  # final drain
                 break
             if (
                 self.idle_timeout_s is not None
