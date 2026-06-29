@@ -364,6 +364,21 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
         with self.assertRaises(KeyError):
             fs.get(ref1)  # gen-1 keys gone -> stale ref refused (B5)
 
+    def test_short_read_is_rejected(self):
+        # A get_into that transfers fewer bytes than the spec-sized receive buffer
+        # (a truncated / partially-written object the backend still reports
+        # present) must raise -- never return a tensor whose uninitialized tail is
+        # silent garbage. get_into returns the byte count, so a short count != nb
+        # is the signal. Simulate by truncating the stored blob.
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        key = "run0/s0/g1/hidden_state"
+        self.assertEqual(len(fake._d[key]), 4 * 8 * 4)  # full 4x8 float32
+        fake._d[key] = fake._d[key][:-4]  # drop 4 bytes -> short read on get_into
+        with self.assertRaises(KeyError):
+            fs.get(ref)
+
 
 def _shared_pair(**consumer_kw):
     """A producer + consumer backed by ONE fake store = the real disagg topology.
