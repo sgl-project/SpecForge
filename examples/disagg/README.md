@@ -20,6 +20,35 @@ The control plane carries only tensor-free `SampleRef` metadata (the manifest);
 feature tensors travel through the shared store. `build_disagg_eagle3_runtime`
 reuses the exact offline trainer assembly, so results align by construction.
 
+## Backends
+
+The feature transport is selected by `DISAGG_BACKEND` (default `shared_dir`):
+
+| backend | store | shared *data* mount? |
+|---|---|---|
+| `shared_dir` (default) | `SharedDirFeatureStore` (`torch.save` on a POSIX mount) | required |
+| `mooncake` | `MooncakeFeatureStore` (RDMA/TCP network object store) | not needed |
+
+`mooncake` is the M6 **fast path**: producer `put()`s and consumer `get()`s by key
+across nodes peer-to-peer, so feature tensors need no shared *data* mount (only the
+small ref manifest still uses `DISAGG_MANIFEST`). Each object is hard-pinned so
+Mooncake's cache LRU never drops a committed feature. Because a Mooncake object
+lives in the **producer's** memory segment, the producer must stay alive until the
+consumer finishes — the example holds it open until the consumer writes
+`<manifest>.consumed` (or `DISAGG_PRODUCER_HOLD_S` elapses). Enable with:
+
+```bash
+export DISAGG_BACKEND=mooncake
+export MOONCAKE_LOCAL_HOSTNAME=<this-node-ip>
+export MOONCAKE_METADATA_SERVER=<metadata url>
+export MOONCAKE_MASTER_SERVER_ADDR=<master host:port>
+export MOONCAKE_PROTOCOL=tcp   # or rdma
+```
+
+Requires the `mooncake` package and a running Mooncake master/metadata service
+(verify on a Mooncake-enabled GPU host). The contract itself is unit-tested
+backend-agnostically in `tests/test_runtime/test_mooncake_store.py`.
+
 ## Run it (rcli, 2 nodes)
 
 1. Generate offline features on node 0 (any EAGLE3 feature generator), e.g. into

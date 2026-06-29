@@ -9,6 +9,7 @@ from specforge.runtime.data_plane.feature_store import (
     load_feature_file,
     spec_from_tensor,
 )
+from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.offline_reader import (
     OfflineManifestReader,
     list_feature_files,
@@ -26,5 +27,6 @@ __all__ = [
     "OfflineManifestReader",
     "list_feature_files",
     "SharedDirFeatureStore",
+    "MooncakeFeatureStore",
     "AuthPolicy",
 ]

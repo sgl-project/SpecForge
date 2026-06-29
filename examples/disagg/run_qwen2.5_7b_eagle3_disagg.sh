@@ -29,6 +29,18 @@ set -euo pipefail
 export DISAGG_STORE_ROOT DISAGG_MANIFEST
 export DISAGG_STORE_ID="${DISAGG_STORE_ID:-eagle3-disagg}"
 export DISAGG_AUTH_TOKEN="${DISAGG_AUTH_TOKEN:-disagg-secret}"
+
+# --- Optional: Mooncake fast-path backend (network object store, no shared data
+# mount). Uncomment + point at your Mooncake master/metadata to route features
+# over Mooncake instead of $DISAGG_STORE_ROOT. The manifest still uses
+# $DISAGG_MANIFEST, and the producer holds its segment open until the consumer
+# finishes (see run_disagg_eagle3.py). ---
+# export DISAGG_BACKEND=mooncake
+# export MOONCAKE_LOCAL_HOSTNAME="$(hostname -i | awk '{print $1}')"
+# export MOONCAKE_METADATA_SERVER="http://<metadata-host>:8080/metadata"
+# export MOONCAKE_MASTER_SERVER_ADDR="<master-host>:50051"
+# export MOONCAKE_PROTOCOL=tcp   # or "rdma"
+# export MOONCAKE_GLOBAL_SEGMENT_SIZE=$((8*1024*1024*1024))  # >= total feature bytes
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export HOME=/root HF_HOME=/root/.cache/huggingface TRITON_CACHE_DIR=/root/.triton
 export PYTHONPATH="$SF_HOME:$SF_HOME/scripts:${PYTHONPATH:-}"
