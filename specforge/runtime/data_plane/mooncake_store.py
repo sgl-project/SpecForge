@@ -6,48 +6,15 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Mooncake-backed FeatureStore: the M6 *fast path* for disaggregated EAGLE3.
+"""Mooncake-backed FeatureStore for disaggregated EAGLE3.
 
-``SharedDirFeatureStore`` (``disaggregated.py``) locked down the disaggregation
-*contract* over a shared POSIX directory. ``MooncakeFeatureStore`` swaps that
-transport for the Mooncake distributed object store (RDMA zero-copy across
-nodes) **behind the exact same FeatureStore API** — the control/training planes
-see nothing new. The producer (rollout/ingest) ``put()``s feature tensors into
-the Mooncake store on one node; the consumer (trainer) ``get()``s them on
-another, peer-to-peer, with no shared filesystem. That is what makes this a
-genuine network object store rather than a shared mount.
+The backend stores feature tensors in Mooncake behind the unchanged
+``FeatureStore`` API. It uses Mooncake's raw-buffer API when available and falls
+back to the original pickle blob path for older or injected stores.
 
-Scope (PR-A, the offline path M6 ships): this backend is correct for a single
-consumer process with ``retain_on_release`` for re-iterable epochs and
-whole-store cleanup at run end. The per-sample generation/lease *index* is
-in-process, mirroring ``SharedDirFeatureStore``'s documented single-host
-limitation. A true online multi-node deployment lifts that index into a shared
-metadata service — a separate follow-up, not this PR.
-
-Contract carried from the reference backend:
-
-* **B5 — no use-after-free.** ``get()`` after ``release``/``abort`` raises
-  ``KeyError``; a generation guard rejects a stale ref after a re-``put``;
-  clone-on-fetch is the default.
-* **B9 — auth in disaggregated mode** (shared-secret :class:`AuthPolicy`).
-
-Lifetime: Mooncake's default eviction is approximate-LRU for a KV *cache*, which
-would silently drop a committed-but-unacked feature when the trainer lags hours
-(turning ``get()`` into a ``KeyError`` and violating the controller's
-no-data-loss guarantee). We therefore **hard-pin** every object on ``put`` and
-free it only by explicit ``remove()`` on consume/abort — SpecForge is the sole
-lifetime authority, not Mooncake's LRU. Because ``remove()`` is a real (fallible)
-RPC, ``release()`` parks a failed free in ``_release_pending`` and ``gc()``
-retries up to ``max_release_attempts`` before giving up — the
-``LocalFeatureStore`` reclamation seam that ``SharedDirFeatureStore`` dropped.
-
-Concurrency: ``release``/``abort``/``gc`` hold ``self._lock`` across the
-``remove()`` RPC. The lock is what makes consume-once free race-free against a
-concurrent ``get()`` (it prevents a re-lease between "decide to free" and the
-remote delete), exactly as ``SharedDirFeatureStore`` holds its lock across
-``os.remove``. For the offline single-consumer path this is fine; a high-fanout
-online deployment that wants the ``remove()`` RPC off the critical section needs
-a tombstone-then-free protocol — a follow-up tied to the shared metadata index.
+SpecForge owns object lifetime: puts are hard-pinned, and release/abort/gc call
+``remove()`` explicitly. The generation/lease index is still in-process; a shared
+metadata index is required for full online multi-node tombstones.
 """
 
 from __future__ import annotations
@@ -67,7 +34,6 @@ from specforge.runtime.data_plane.feature_store import FeatureStore, spec_from_t
 
 logger = logging.getLogger(__name__)
 
-# Defaults for MooncakeDistributedStore.setup(); override via ``setup_kwargs``.
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
     "local_buffer_size": 1 << 30,
@@ -77,9 +43,7 @@ _MOONCAKE_SETUP_DEFAULTS = {
 
 
 class _PinConfig:
-    """Fallback for Mooncake's ``ReplicateConfig`` when the package is absent
-    (local unit tests with an injected store). Mirrors the fields the real
-    config exposes so the injected backend can assert on them."""
+    """Fallback for tests when Mooncake is not importable."""
 
     def __init__(
         self,
@@ -123,9 +87,6 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Any:
     return store
 
 
-# FeatureSpec.dtype (a string) -> torch dtype, for allocating zero-copy receive
-# tensors from the ref alone (the ref carries shape+dtype, so get() needs no
-# serialized header).
 _TORCH_DTYPES = {
     "float32": torch.float32,
     "float64": torch.float64,
@@ -141,7 +102,6 @@ _TORCH_DTYPES = {
 
 
 def _alloc_from_spec(spec) -> torch.Tensor:
-    """A fresh contiguous tensor matching a FeatureSpec (the zero-copy dst)."""
     dtype = _TORCH_DTYPES.get(spec.dtype)
     if dtype is None:
         raise KeyError(f"unsupported feature dtype {spec.dtype!r} for zero-copy get")
@@ -155,22 +115,10 @@ def _nbytes(t: torch.Tensor) -> int:
 class MooncakeFeatureStore(FeatureStore):
     """A disaggregated :class:`FeatureStore` backed by the Mooncake store.
 
-    **Zero-copy transport (default).** One hard-pinned Mooncake object per
-    *tensor*, keyed ``{store_id}/{sample_id}/g{gen}/{name}``. ``put()`` writes each
-    tensor straight from its storage with ``put_from(ptr)``; ``get()`` reads each
-    straight into a tensor allocated from the ref's ``FeatureSpec`` with
-    ``get_into(ptr)``. There is no ``torch.save``/``torch.load`` pickle round-trip
-    on the hot path — shape/dtype travel on the ref, the bytes are the raw tensor
-    buffer. The generation lives in the key (like ``SharedDirFeatureStore``'s
-    filename generation), so a re-put supersedes the old key set and a stale ref's
-    keys are gone -> ``get()`` raises (B5).
-
-    Set ``zero_copy=False`` (or inject a backend without ``put_from``/``get_into``)
-    to fall back to the single-object ``torch.save`` blob path.
-
-    ``store`` may be injected (any object exposing the Mooncake method subset:
-    ``is_exist/remove`` plus either ``put_from``/``get_into`` or ``put``/``get``)
-    so the contract is unit-testable without a running master.
+    In zero-copy mode, each tensor is a hard-pinned object keyed by
+    ``{store_id}/{sample_id}/g{gen}/{name}``; shape and dtype travel in the
+    ``SampleRef``. ``zero_copy=False`` or a backend without ``put_from``/``get_into``
+    uses the pickle blob fallback.
     """
 
     def __init__(
@@ -200,11 +148,6 @@ class MooncakeFeatureStore(FeatureStore):
             store = _connect_store(kw)
         self._store = store
         self._put_config = _build_replicate_config(replica_num, hard_pin)
-        # Zero-copy transport: one Mooncake object per *tensor*, written straight
-        # from the tensor's storage via put_from(ptr) and read straight into a
-        # spec-allocated tensor via get_into(ptr) -- no torch.save/torch.load
-        # pickle round-trip. Falls back to the pickle path if the backend lacks
-        # the raw-buffer API (older mooncake / a fake without it).
         self._zero_copy = (
             bool(zero_copy)
             and callable(getattr(store, "put_from", None))
@@ -212,30 +155,16 @@ class MooncakeFeatureStore(FeatureStore):
         )
         self.max_resident_bytes = max_resident_bytes
         self.max_hold_age_s = max_hold_age_s
-        # Offline re-iterable mode: release() must NOT free (multi-epoch); mirrors
-        # SharedDirFeatureStore / LocalFeatureStore file:// no-op release.
         self.retain_on_release = retain_on_release
         self.max_release_attempts = max_release_attempts
         self._clock = clock
-        # in-process liveness index (single-host; see module docstring)
         self._generation: Dict[str, int] = {}
         self._put_time: Dict[str, float] = {}
         self._sample_bytes: Dict[str, int] = {}
-        # feature names per resident sample -> the per-tensor keys to remove on
-        # free (zero-copy mode). Cached on both put() (producer) and get()
-        # (consumer) so each side can free the sample it owns/consumed without the
-        # ref in hand at release() time.
         self._sample_names: Dict[str, List[str]] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
-        # samples whose remote remove() failed; retried/force-freed by gc()
         self._release_pending: Dict[str, int] = {}
-        # (sample_id, generation) logically freed in THIS process. Mooncake's
-        # remove() is lease-deferred (an object keeps a short read-lease), so the
-        # bytes can linger after release/abort; this makes the B5 "no
-        # use-after-free" guarantee immediate — get() of a freed ref raises even
-        # while physical reclamation is still pending. Grows with consume-once
-        # frees within a run (empty in retain_on_release/offline mode); a durable
-        # shared index would own this in the online multi-node follow-up.
+        # Same-process tombstones cover Mooncake's lease-deferred remove().
         self._freed: set = set()
         self._lock = threading.RLock()
         self._counter = 0
@@ -247,9 +176,6 @@ class MooncakeFeatureStore(FeatureStore):
         return f"{self.store_id}/{sample_id}"
 
     def _tkey(self, sample_id: str, gen: int, name: str) -> str:
-        # generation lives in the key (like SharedDirFeatureStore's filename gen):
-        # a re-put writes a new-gen key set and removes the old, so a stale ref's
-        # keys are gone -> get() raises (B5), no payload-carried gen needed.
         return f"{self.store_id}/{sample_id}/g{gen}/{name}"
 
     # -- store wrappers (status-code aware) --------------------------------
@@ -262,16 +188,9 @@ class MooncakeFeatureStore(FeatureStore):
             raise RuntimeError(f"mooncake put failed (status {rc}) for {key}")
 
     def _store_put_tensor(self, key: str, t: torch.Tensor) -> None:
-        """Zero-copy publish: DMA straight from the tensor's storage, hard-pinned.
-
-        ``t`` must be contiguous + CPU (caller stages it). No torch.save: the
-        bytes are the raw tensor buffer; shape/dtype travel on the ref's
-        FeatureSpec, so get() needs no header. The source is registered with the
-        transfer engine for the duration of the put -- RDMA transfers it by DMA
-        and rejects an unregistered address (AddressNotRegistered); TCP ignores
-        the registration.
-        """
+        """Publish one contiguous CPU tensor via Mooncake's raw-buffer API."""
         nb = _nbytes(t)
+        # RDMA requires registered source/destination buffers; TCP tolerates this.
         try:
             self._store.register_buffer(t.data_ptr(), nb)
         except Exception:  # pragma: no cover - some builds auto-register
@@ -287,11 +206,7 @@ class MooncakeFeatureStore(FeatureStore):
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
 
     def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
-        """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
-
-        The receive buffer is registered with the transfer engine for the get_into
-        (required by the raw-buffer path), then unregistered.
-        """
+        """Fetch one object into a pre-allocated tensor."""
         nb = _nbytes(out)
         try:
             self._store.register_buffer(out.data_ptr(), nb)
@@ -306,12 +221,6 @@ class MooncakeFeatureStore(FeatureStore):
                 pass
         if rc is None or int(rc) < 0:
             raise KeyError(f"mooncake get_into failed (status {rc}) for {key}")
-        # get_into returns the number of bytes read; a full read returns exactly
-        # nb. A short read (0 <= rc < nb) would leave the tail of this freshly
-        # torch.empty'd buffer as uninitialized garbage -- and unlike the pickle
-        # path (torch.load reconstructs whole tensors) the raw-buffer path cannot
-        # otherwise detect under-fill. Reject it rather than hand the trainer
-        # silently-corrupt data (B5: never serve wrong bytes).
         if int(rc) != nb:
             raise KeyError(
                 f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
@@ -353,12 +262,8 @@ class MooncakeFeatureStore(FeatureStore):
             prior_gen = self._generation.get(sample_id)
             prior_names = self._sample_names.get(sample_id, [])
         if self._zero_copy:
-            # One hard-pinned object per tensor, DMA'd straight from its storage.
-            # staged keeps the source tensors alive across the synchronous puts.
             for name, t in staged.items():
                 self._store_put_tensor(self._tkey(sample_id, gen, name), t)
-            # Overwrite-safe: drop the prior generation's tensor keys so a stale
-            # ref's keys are gone (its get() then raises -> no use-after-free).
             if prior_gen is not None and prior_gen != gen:
                 leaked = [
                     name
@@ -379,9 +284,6 @@ class MooncakeFeatureStore(FeatureStore):
             buf = io.BytesIO()
             torch.save({"generation": gen, "tensors": staged}, buf)
             key = self._key(sample_id)
-            # Overwrite-safe publish: a re-put bumps the generation. remove() first
-            # so the hard-pinned prior blob is released rather than orphaned; if
-            # that remove fails the old (pinned) blob may leak, so surface it.
             if self._store_exists(key) and not self._store_remove(key):
                 logger.warning(
                     "MooncakeFeatureStore re-put of %s: removing the stale blob "
@@ -410,7 +312,7 @@ class MooncakeFeatureStore(FeatureStore):
             estimated_bytes=nbytes,
             metadata={
                 **{k: v for k, v in metadata.items() if k != "num_tokens"},
-                "generation": gen,  # travels with the ref for the staleness guard
+                "generation": gen,
             },
         )
 
@@ -427,8 +329,6 @@ class MooncakeFeatureStore(FeatureStore):
         ref_gen = sample_ref.metadata.get("generation")
         with self._lock:
             if ref_gen is not None and (sid, int(ref_gen)) in self._freed:
-                # logically freed here; the remote bytes may still linger under
-                # Mooncake's read-lease, but this ref must not resolve (B5)
                 raise KeyError(
                     f"sample {sid} generation {ref_gen} was released/aborted; "
                     f"refusing use-after-free"
@@ -442,10 +342,6 @@ class MooncakeFeatureStore(FeatureStore):
             out = {k: v.to(device) for k, v in out.items()}
         with self._lock:
             self._counter += 1
-            # Consumer-side cache: a process that only get()s a sample (never
-            # put() it) still needs gen + feature names so its release()/abort()
-            # can free the per-tensor keys. setdefault keeps the producer's own
-            # entries authoritative when producer and consumer are one instance.
             self._generation.setdefault(sid, gen)
             self._sample_names.setdefault(sid, list(sample_ref.feature_keys.keys()))
             handle = FeatureHandle(
@@ -459,7 +355,6 @@ class MooncakeFeatureStore(FeatureStore):
     def _get_zero_copy(
         self, ref: SampleRef, wanted: List[str]
     ) -> Tuple[Dict[str, torch.Tensor], int]:
-        """Read each feature straight into a spec-allocated tensor (no pickle)."""
         sid = ref.sample_id
         gen = ref.metadata.get("generation")
         if gen is None:
@@ -472,12 +367,11 @@ class MooncakeFeatureStore(FeatureStore):
                 raise KeyError(f"sample {sid} ref has no spec for feature {n!r}")
             key = self._tkey(sid, gen, n)
             if not self._store_exists(key):
-                # freed (release/abort), superseded by a re-put, or never written
                 raise KeyError(
                     f"sample {sid} gen {gen} feature {n!r} not available "
                     f"(freed, stale, or never written)"
                 )
-            out[n] = _alloc_from_spec(spec)  # fresh -> clone-on-fetch for free (B5)
+            out[n] = _alloc_from_spec(spec)
             self._store_get_tensor(key, out[n])
         return out, gen
 
@@ -491,9 +385,7 @@ class MooncakeFeatureStore(FeatureStore):
         value = self._store.get(key)
         if not value:
             raise KeyError(f"sample {sid} not available in store {self.store_id}")
-        # weights_only=True: these bytes arrive over the wire from a producer node,
-        # so refuse arbitrary-pickle deserialization (the payload is only an int +
-        # a dict of tensors, all of which the safe unpickler supports).
+        # Payloads come from producer nodes; keep pickle deserialization restricted.
         payload = torch.load(io.BytesIO(value), weights_only=True)
         on_disk_gen = payload.get("generation")
         on_disk_gen = int(on_disk_gen) if on_disk_gen is not None else None
@@ -512,15 +404,14 @@ class MooncakeFeatureStore(FeatureStore):
                 raise KeyError(
                     f"sample {sid} missing key {raw_key!r} for feature {n!r}"
                 )
-            out[n] = raw[raw_key].clone()  # clone-on-fetch (B5)
+            out[n] = raw[raw_key].clone()
         return out, (on_disk_gen or 0)
 
     # -- lifetime ----------------------------------------------------------
     def _try_physical_free(self, sample_id: str) -> bool:
         """Remove the remote object(s). False on a (retryable) RPC failure.
 
-        Zero-copy: one object per tensor, so remove every per-tensor key of the
-        sample's current generation. Pickle: a single object.
+        Zero-copy uses one object per tensor; pickle mode uses one object per sample.
         """
         if not self._zero_copy:
             return self._store_remove(self._key(sample_id))
@@ -555,8 +446,6 @@ class MooncakeFeatureStore(FeatureStore):
         return nbytes
 
     def _still_leased_locked(self, sample_id: str, generation: Optional[int]) -> bool:
-        # generation-aware: a stale older-generation lease does not pin the
-        # current generation (matches LocalFeatureStore's invariant).
         return any(
             h.sample_id == sample_id and h.generation == generation
             for h in self._active_leases.values()
@@ -566,25 +455,24 @@ class MooncakeFeatureStore(FeatureStore):
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
             if self.retain_on_release:
-                return  # offline re-iterable set: keep for the next epoch
+                return
             sid = handle.sample_id
             cur = self._generation.get(sid)
             if cur is not None and handle.generation != cur:
-                return  # stale lease -> no-op
+                return
             if self._still_leased_locked(sid, cur):
                 return
-            self._freed.add((sid, handle.generation))  # immediate logical free
+            self._freed.add((sid, handle.generation))
             if self._try_physical_free(sid):
                 self._free_bookkeeping_locked(sid)
             else:
-                # remote free deferred (lease) / failed -> gc() retries
                 self._release_pending.setdefault(sid, 0)
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:
             gen = self._generation.get(sample_id)
             if gen is not None:
-                self._freed.add((sample_id, gen))  # immediate logical free
+                self._freed.add((sample_id, gen))
             if self._try_physical_free(sample_id):
                 self._free_bookkeeping_locked(sample_id)
             else:
@@ -594,7 +482,6 @@ class MooncakeFeatureStore(FeatureStore):
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:
-            # max-hold sweep: force-free abandoned samples (spare still-leased)
             if self.max_hold_age_s is not None:
                 stale = [
                     sid
@@ -608,7 +495,6 @@ class MooncakeFeatureStore(FeatureStore):
                         freed += 1
                     else:
                         self._release_pending.setdefault(sid, 0)
-            # reconcile release-pending: retry the fallible remote free
             for sid in list(self._release_pending):
                 if not self._sample_exists(sid):
                     freed_bytes += self._free_bookkeeping_locked(sid)
@@ -618,8 +504,6 @@ class MooncakeFeatureStore(FeatureStore):
                     freed_bytes += self._free_bookkeeping_locked(sid)
                     freed += 1
                 elif attempts >= self.max_release_attempts:
-                    # give up retrying the remote remove; stop tracking it. The
-                    # remote object may leak — surfaced via force_freed stats.
                     freed_bytes += self._free_bookkeeping_locked(sid)
                     freed += 1
                 else:
@@ -636,9 +520,6 @@ class MooncakeFeatureStore(FeatureStore):
         with self._lock:
             now = self._clock()
             ages = [now - t for t in self._put_time.values()]
-            # NOTE: resident_bytes is an in-process accounting sum, not a live
-            # Mooncake pool-usage query (the Python API exposes only per-key
-            # get_size). A cross-node pool-usage signal is a follow-up.
             return {
                 "store_id": self.store_id,
                 "backend": "mooncake",
