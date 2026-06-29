@@ -503,6 +503,10 @@ def build_disagg_online_consumer(
     sp_ring_size: int = 1,
     collate_fn=None,
     idle_timeout_s: Optional[float] = None,
+    weight_registry=None,
+    staleness_policy=None,
+    current_target_version: str = "unknown",
+    drift_monitor=None,
     logger=None,
     log_interval: int = 50,
 ):
@@ -516,11 +520,32 @@ def build_disagg_online_consumer(
     ``SampleRefQueue``, and the features are fetched cross-node from Mooncake. The
     loader frees each sample on read (consume-once) and acks the channel (the
     producer's backpressure signal).
+
+    Pass ``staleness_policy`` (+ ``weight_registry`` / ``current_target_version``)
+    to gate two-axis staleness: refs whose draft weights lag too far behind the
+    registry's newest version, or that were produced against a superseded target,
+    are dropped (their features aborted) before the trainer ever sees them, so an
+    un-hot-swapped rollout that drifts behind can't poison training. Without it,
+    every streamed ref is trained.
     """
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
     controller = DataFlowController(run_id)
     queue = StreamingRefQueue(channel, idle_timeout_s=idle_timeout_s)
+    if staleness_policy is not None:
+        from specforge.runtime.control_plane.version_policy import (
+            StalenessGatedQueue,
+            WeightRegistry,
+        )
+
+        queue = StalenessGatedQueue(
+            queue,
+            feature_store=feature_store,
+            registry=weight_registry or WeightRegistry(),
+            policy=staleness_policy,
+            current_target_version=current_target_version,
+            drift=drift_monitor,
+        )
     loader = FeatureDataLoader(
         feature_store,
         queue,

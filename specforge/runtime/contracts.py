@@ -130,11 +130,30 @@ class TrainBatch:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-# NOTE: the published-weight lifecycle (WeightVersion, WeightPublisher, hot
-# update, serving accept-length gate) is not implemented here — it is not needed
-# for the local train pipeline. SampleRef/PromptTask still carry a
-# ``draft_weight_version`` *string* as rollout provenance, but there is no
-# WeightVersion object or publisher here yet.
+WeightStatus = Literal["candidate", "active", "rolled_back"]
+
+
+@dataclass(frozen=True)
+class WeightVersion:
+    """A published draft-weight version. Metadata only — never the weights.
+
+    The weights live at ``checkpoint_uri`` (the data plane); this record is what
+    the control plane publishes, and a sample's provenance points back to it via
+    ``draft_weight_version``. Publish order is the *staleness axis*: a sample's
+    draft lag is its distance from the newest published version. (Hot-update,
+    rollback, and the serving accept-length gate are a separate concern and are
+    NOT implemented here — only the staleness provenance this needs.)
+    """
+
+    version_id: str
+    draft_weight_version: str  # the label rollout stamps onto produced samples
+    target_model_version: str  # which target these draft weights were trained on
+    global_step: int = 0
+    checkpoint_uri: Optional[str] = None
+    parent_version_id: Optional[str] = None
+    status: WeightStatus = "candidate"
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

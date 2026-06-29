@@ -11,6 +11,13 @@ from specforge.runtime.control_plane.metadata_store import (
     MetadataStore,
     SQLiteMetadataStore,
 )
+from specforge.runtime.control_plane.version_policy import (
+    DriftMonitor,
+    StalenessAssessment,
+    StalenessGatedQueue,
+    StalenessPolicy,
+    WeightRegistry,
+)
 
 __all__ = [
     "DataFlowController",
@@ -20,4 +27,9 @@ __all__ = [
     "SQLiteMetadataStore",
     "BackpressureConfig",
     "BackpressureController",
+    "WeightRegistry",
+    "StalenessPolicy",
+    "StalenessAssessment",
+    "DriftMonitor",
+    "StalenessGatedQueue",
 ]
