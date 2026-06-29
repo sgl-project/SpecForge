@@ -27,6 +27,10 @@ from typing import List, Optional
 
 from specforge.runtime.contracts import SampleRef
 from specforge.runtime.control_plane import DataFlowController
+from specforge.runtime.control_plane.metadata_store import (
+    MetadataStore,
+    SQLiteMetadataStore,
+)
 from specforge.runtime.data_plane import (
     FeatureDataLoader,
     FeatureStore,
@@ -391,6 +395,28 @@ def _online_cat_collate(feats):
     return {k: torch.cat([f[k] for f in feats], dim=0) for k in feats[0]}
 
 
+def _resolve_metadata_store(
+    metadata_store: Optional[MetadataStore],
+    metadata_db_path: Optional[str],
+) -> Optional[MetadataStore]:
+    """Pick the controller's metadata store for an online disaggregated process.
+
+    O1.1: the producer and consumer run in *separate* processes, so a shared,
+    durable store is what makes commit/dedup/ack cross-process (an in-process
+    ``InMemoryMetadataStore`` per process shares nothing). Pass an explicit
+    ``metadata_store`` (e.g. a future ``RedisMetadataStore`` for multi-node O2),
+    or a ``metadata_db_path`` and both processes open a ``SQLiteMetadataStore``
+    over the same file (enough for single-host O1; SQLite WAL serializes the
+    producer's commits against the consumer's ack transaction). ``None`` keeps the
+    pre-O1.1 behaviour: a private in-process store, control state un-shared.
+    """
+    if metadata_store is not None:
+        return metadata_store
+    if metadata_db_path is not None:
+        return SQLiteMetadataStore(metadata_db_path)
+    return None
+
+
 def build_disagg_online_producer(
     *,
     target_model,
@@ -410,6 +436,8 @@ def build_disagg_online_producer(
     lease: int = 8,
     in_flight_high_watermark: int = 256,
     backpressure_poll_s: float = 0.2,
+    metadata_store: Optional[MetadataStore] = None,
+    metadata_db_path: Optional[str] = None,
     sleep=None,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
@@ -419,6 +447,13 @@ def build_disagg_online_producer(
     :class:`MooncakeFeatureStore`) and the committed SampleRefs are streamed to
     the consumer through a :class:`StreamingRefChannel` instead of an in-process
     queue. The feature tensors never touch a shared mount.
+
+    ``metadata_store`` / ``metadata_db_path`` (O1.1) point the controller at the
+    *shared, durable* metadata store the consumer also opens, so the producer's
+    ``commit_samples`` (dedup, at-least-once) lands in the same store the consumer
+    reconciles against on restart. Omit both for the pre-O1.1 in-process store
+    (commit/ack state stays private to this process). See
+    :func:`_resolve_metadata_store`.
 
     Returns ``(workers, drive_producer)``. ``drive_producer()`` runs the workers
     until the prompt pool drains, publishing refs to the channel and applying
@@ -433,7 +468,10 @@ def build_disagg_online_producer(
     from specforge.runtime.inference.sglang_adapter import SGLangAdapter
 
     sleep = sleep or time.sleep
-    controller = DataFlowController(run_id)
+    controller = DataFlowController(
+        run_id,
+        metadata_store=_resolve_metadata_store(metadata_store, metadata_db_path),
+    )
     controller.ingest_prompts(prompts)
 
     if aux_hidden_state_layer_ids is None:
@@ -503,6 +541,9 @@ def build_disagg_online_consumer(
     sp_ring_size: int = 1,
     collate_fn=None,
     idle_timeout_s: Optional[float] = None,
+    metadata_store: Optional[MetadataStore] = None,
+    metadata_db_path: Optional[str] = None,
+    resume: bool = False,
     logger=None,
     log_interval: int = 50,
 ):
@@ -516,11 +557,41 @@ def build_disagg_online_consumer(
     ``SampleRefQueue``, and the features are fetched cross-node from Mooncake. The
     loader frees each sample on read (consume-once) and acks the channel (the
     producer's backpressure signal).
+
+    ``metadata_store`` / ``metadata_db_path`` (O1.1) point the controller at the
+    *shared, durable* store the producer commits to, so the per-optimizer-step
+    ack transaction (``ack_train_refs``) is recorded against the same committed
+    set the producer wrote — the precondition for a correct restart.
+
+    ``resume=True`` reconciles against that durable store before training: the
+    channel JSONL is append-only and a restarted consumer re-reads it from the
+    start, so ``reconcile_on_restart`` derives the already-durably-trained samples
+    and they are handed to the :class:`StreamingRefQueue` as ``skip_ids`` (dropped
+    on re-read, no duplicate train). The committed-but-unacked tail is *not*
+    skipped, so it is re-trained — that requeue is realized by the channel re-read
+    itself, which is why only the released set matters here. Requires a durable
+    ``metadata_store`` / ``metadata_db_path`` (an in-process store has no history
+    to reconcile).
     """
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
-    controller = DataFlowController(run_id)
-    queue = StreamingRefQueue(channel, idle_timeout_s=idle_timeout_s)
+    store = _resolve_metadata_store(metadata_store, metadata_db_path)
+    controller = DataFlowController(run_id, metadata_store=store)
+
+    skip_ids = None
+    if resume:
+        if store is None:
+            raise ValueError(
+                "resume=True needs a durable metadata_store/metadata_db_path; an "
+                "in-process store has no committed/ack history to reconcile against"
+            )
+        # Released == durably acked AND optimizer-step committed: the samples
+        # already trained on a prior run. Skip exactly those on the channel
+        # re-read; the committed-unacked tail re-streams and re-trains.
+        reconciled = controller.reconcile_on_restart(feature_store)
+        skip_ids = set(reconciled["released"])
+
+    queue = StreamingRefQueue(channel, idle_timeout_s=idle_timeout_s, skip_ids=skip_ids)
     loader = FeatureDataLoader(
         feature_store,
         queue,
