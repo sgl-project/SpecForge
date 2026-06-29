@@ -67,7 +67,7 @@ no code exists for; **(B) structural problems** — code that exists but the sha
 | Gap | Evidence in current tree | Fixed by |
 |---|---|---|
 | **MLA-aware EAGLE3 draft** | Zero references to `DeepseekV3Config` / `Eagle3Deepseek*` outside test data. `configs/deepseek-v3-671b-eagle3.json` is a *Llama* draft mislabeled as DeepSeek (`model_type: "llama"`, `architectures: ["LlamaForCausalLMEagle3"]`). | Phase 1 #2 — port `deepseek_eagle.py` from TorchSpec, register via `@register_draft`. |
-| **Backbone-agnostic DFlash** | `DFlashDraftModel` extends `Qwen3PreTrainedModel`; uses `Qwen3MLP`, `Qwen3DFlashAttention`, `Qwen3RMSNorm` directly (`specforge/modeling/draft/dflash.py:212`). All DFlash configs are Qwen3-only. | Phase 6 #25 — parameterize MLP/Norm/RoPE; add `dflash_llama.py`. |
+| **Backbone-agnostic DFlash** | `DFlashDraftModel` extends `Qwen3PreTrainedModel`; uses `Qwen3MLP`, `Qwen3DFlashAttention`, `Qwen3RMSNorm` directly (`specforge/modeling/draft/dflash.py:212`). All DFlash configs are Qwen3-only. | Phase 6 #25 — parameterize MLP/Norm/RoPE; add `llama_dflash.py`. |
 | **Remote / disaggregated target** | `modeling/target/sglang_backend/` only does in-process SGLang (target loaded on same node as trainer). No HTTP client. Online mode for 671B targets is infeasible. | Phase 4 #17 — `SGLangServerEngine` over HTTP. |
 | **Eval during training (proper)** | No `EvalCache`, no `simulated_acc_len`, no per-position-accuracy aggregation, no best-checkpoint tracking — grep is clean. | Phase 2 #9 — `Evaluator` + `EvalCache`. |
 | **Checkpoint rotation / best tracking** | `train_eagle3.py:552:def save_checkpoints(...)` just writes every N steps. No `max_checkpoints`, no `best_checkpointed_iteration.txt`, no `meta.json`. | Phase 2 #8 — `CheckpointManager`. |
@@ -164,12 +164,11 @@ specforge/
 │   └── adapters.py                  # BackendAdapter / UspAdapter (UNCHANGED)
 │
 ├── models/
-│   ├── drafts/                      # Plugin registry
+│   ├── drafts/                      # Draft model plugin registry (see §4.2 for the registry + naming contract)
 │   │   ├── __init__.py              # DRAFT_REGISTRY + @register_draft decorator
 │   │   ├── base.py                  # Eagle3DraftModel ABC (from modeling/draft/base.py)
-│   │   ├── llama_eagle3.py          # LlamaForCausalLMEagle3 (existing)
-│   │   ├── deepseek_eagle3.py       # Eagle3DeepseekV2ForCausalLM — MLA (NEW)
-│   │   ├── dflash_qwen3.py          # DFlashDraftModel (existing)
+│   │   ├── <model>_<strategy>.py    # one file per arch — ${model_name}_${strategy}
+│   │   │                            #   e.g. llama_eagle3, deepseek_eagle3, qwen3_dflash
 │   │   └── auto.py                  # AutoEagle3DraftModel (registry-backed, no hardcoded dicts)
 │   │
 │   └── targets/                     # Target engine abstraction
@@ -232,6 +231,11 @@ scripts/
 
 #### Draft model registry
 
+This is the single source of truth for the `models/drafts/` layout sketched in §4.1.
+One file per architecture, named `${model_name}_${strategy}` (strategy ∈ `eagle3`,
+`dflash`, `domino`, `dspark`) — e.g. `llama_eagle3.py`, `deepseek_eagle3.py`,
+`qwen3_dflash.py`; the registry key matches the filename stem.
+
 ```python
 # models/drafts/__init__.py
 DRAFT_REGISTRY: dict[str, type] = {}
@@ -248,10 +252,15 @@ def register_draft(name: str):
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
     ...
 
-# models/drafts/deepseek_eagle3.py
+# models/drafts/deepseek_eagle3.py — MLA (NEW)
 @register_draft("deepseek_v3_eagle3")
 class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
     config_class = DeepseekV3Config
+    ...
+
+# models/drafts/qwen3_dflash.py — DFlash (existing)
+@register_draft("qwen3_dflash")
+class DFlashDraftModel(Eagle3DraftModel):
     ...
 ```
 
@@ -1450,7 +1459,7 @@ Cheap enough to run on every PR that touches `core/`, `training/`, or `models/dr
 
 ### 10.2 Smoke tests (every phase)
 
-- One config per draft arch (`llama_eagle3`, `deepseek_v3_eagle3`, `dflash_qwen3`) trains
+- One config per draft arch (`llama_eagle3`, `deepseek_v3_eagle3`, `qwen3_dflash`) trains
   for 20 steps without crashing under TP=1, TP=2, and TP=2+SP=2.
 - Checkpoint save + resume produces the same loss curve as no-resume (validates
   `stream.seek()`).
