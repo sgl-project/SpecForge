@@ -31,7 +31,7 @@ Key SpecForge differences vs TorchSpec (see port notes in the PR):
     by ``generate_dflash_data`` and fed straight to the draft as ``target_hidden``.
 """
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -226,9 +226,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         # ---- Cross entropy (hard labels) ----
         flat_logits = logits_4d.reshape(-1, vocab_size)
         flat_targets = target_ids.reshape(-1)
-        ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none").view(
-            bsz, n_blocks, self.block_size
-        )
+        ce_per_token = F.cross_entropy(
+            flat_logits, flat_targets, reduction="none"
+        ).view(bsz, n_blocks, self.block_size)
         ce_num = (ce_per_token * decay_weight_mask).sum()
 
         # ---- L1 distribution distillation + accept rate ----
@@ -250,9 +250,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             hdim = last_hidden_states.size(-1)
             gather_idx = tgt_idx.reshape(bsz, -1, 1).expand(-1, -1, hdim)
             aligned_hidden = torch.gather(last_hidden_states, 1, gather_idx)
-            aligned_target_logits = F.linear(
-                aligned_hidden, self.lm_head.weight
-            ).view(bsz, n_blocks, self.block_size, vocab_size)
+            aligned_target_logits = F.linear(aligned_hidden, self.lm_head.weight).view(
+                bsz, n_blocks, self.block_size, vocab_size
+            )
             draft_probs = torch.softmax(logits_4d.float(), dim=-1)
             target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
             l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)  # [B, nb, bs]

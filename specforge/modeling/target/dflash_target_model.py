@@ -225,9 +225,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         hidden_states = torch.cat([h.unsqueeze(0) for h in context_list], dim=0)
         last_hidden_states = None
         if final_list is not None:
-            last_hidden_states = torch.cat(
-                [h.unsqueeze(0) for h in final_list], dim=0
-            )
+            last_hidden_states = torch.cat([h.unsqueeze(0) for h in final_list], dim=0)
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)

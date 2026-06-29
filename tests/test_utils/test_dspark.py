@@ -237,11 +237,11 @@ class TestDSparkForward(unittest.TestCase):
         loss.backward()
         draft = m.draft_model
         self.assertIsNotNone(draft.markov_head.markov_w2.weight.grad)
-        self.assertGreater(draft.markov_head.markov_w2.weight.grad.abs().sum().item(), 0)
-        self.assertIsNotNone(draft.confidence_head.proj.weight.grad)
         self.assertGreater(
-            draft.confidence_head.proj.weight.grad.abs().sum().item(), 0
+            draft.markov_head.markov_w2.weight.grad.abs().sum().item(), 0
         )
+        self.assertIsNotNone(draft.confidence_head.proj.weight.grad)
+        self.assertGreater(draft.confidence_head.proj.weight.grad.abs().sum().item(), 0)
         # backbone context projection (SpecForge's `fc`) gets gradient
         self.assertIsNotNone(draft.fc.weight.grad)
         self.assertGreater(draft.fc.weight.grad.abs().sum().item(), 0)
