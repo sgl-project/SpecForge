@@ -457,6 +457,15 @@ def main():
     device = get_local_device()
     device_type = device.type
 
+    # Ascend NPU does not support flex_attention; fall back to SDPA if the user
+    # left the default (or explicitly requested flex_attention) on NPU.
+    if device_type == "npu" and args.attention_backend == "flex_attention":
+        print_on_rank0(
+            "NPU detected: flex_attention is not supported on Ascend. "
+            "Switching attention backend to sdpa."
+        )
+        args.attention_backend = "sdpa"
+
     needs_target_hidden = (args.l1_loss_alpha > 0) or (
         args.enable_confidence_head and args.confidence_head_alpha > 0
     )
