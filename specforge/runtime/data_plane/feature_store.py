@@ -19,8 +19,7 @@ Other backends (shared memory, Mooncake/RDMA) slot in behind the same API; the
 lease/generation/clone-on-fetch primitives are carried here so the in-memory
 backend pays nothing for them but the contract is already exercised.
 
-This is the *minimal core*: relative to the first cut it adds exactly three
-correctness fixes and nothing else.
+This core carries three correctness fixes:
 
 * **generation-in-URI**: ``mem://`` refs carry their generation in the URI, and
   ``get()`` rejects a ref whose generation no longer matches the resident
@@ -31,6 +30,16 @@ correctness fixes and nothing else.
   between "I read the tensors" and "I registered my borrow".
 * **best-effort dump**: an optional debug dump failure no longer aborts an
   otherwise successful in-memory publish (mem is authoritative, disk is a tap).
+
+Memory is bounded by three cooperating mechanisms (M5; see ``DESIGN.md``):
+
+* **Consume-once free** — ``release()`` frees a ``mem://`` sample on its last
+  lease drop (the steady-state bound).
+* **Backpressure** — ``max_resident_bytes`` makes "consumer fell behind" a loud
+  ``MemoryError`` on ``put`` instead of a silent OOM (the controller pauses
+  rollout first via ``health()``; the cap is the backstop).
+* **GC / max-hold** — ``gc()`` reclaims abandoned samples backpressure cannot
+  free; see :meth:`gc`.
 """
 
 from __future__ import annotations
@@ -43,8 +52,9 @@ import itertools
 import logging
 import os
 import threading
+import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
 
 import torch
@@ -78,6 +88,10 @@ def _dtype_str(t: torch.Tensor) -> str:
 
 def spec_from_tensor(name: str, t: torch.Tensor, **kw: Any) -> FeatureSpec:
     return FeatureSpec(name=name, shape=tuple(t.shape), dtype=_dtype_str(t), **kw)
+
+
+def _tensors_bytes(tensors: Dict[str, torch.Tensor]) -> int:
+    return sum(t.numel() * t.element_size() for t in tensors.values())
 
 
 def _make_mem_uri(store_id: str, sample_id: str, generation: int) -> str:
@@ -132,6 +146,15 @@ class FeatureStore(abc.ABC):
     @abc.abstractmethod
     def health(self) -> Dict[str, Any]: ...
 
+    def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
+        """Force-free abandoned/past-max-age features and reconcile cleanup.
+
+        Default backend has nothing to sweep (no max-hold configured); override
+        in backends with an independent reclamation policy. Returns a summary of
+        what was reclaimed so callers/monitors can log it.
+        """
+        return {"force_freed": 0, "force_freed_bytes": 0, "release_pending": 0}
+
 
 def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
     """Load a SpecForge offline feature file (mirrors OfflineEagle3Dataset)."""
@@ -160,6 +183,9 @@ class LocalFeatureStore(FeatureStore):
         dump_dir: Optional[str] = None,
         clone_on_get: bool = False,
         max_resident_bytes: Optional[int] = None,
+        max_hold_age_s: Optional[float] = None,
+        max_release_attempts: int = 3,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.store_id = store_id or uuid.uuid4().hex[:8]
         self.dump_dir = dump_dir
@@ -169,23 +195,53 @@ class LocalFeatureStore(FeatureStore):
         # Optional cap on mem:// residency. None = unbounded. When set, put()
         # raises loudly once exceeded — a defined failure instead of silent OOM.
         self.max_resident_bytes = max_resident_bytes
+        # gc() max-hold age (distinct from the SampleRefQueue lease timeout): an
+        # unleased sample older than this is force-freed by gc(). None = never.
+        self.max_hold_age_s = max_hold_age_s
+        # Bounded retry window for release-pending before a final force-free.
+        self.max_release_attempts = max_release_attempts
+        self._clock = clock
         self._mem: Dict[str, Dict[str, torch.Tensor]] = {}
         self._generation: Dict[str, int] = {}
+        self._put_time: Dict[str, float] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
+        # release-pending: sample_id -> retry attempts. A fallible backend parks
+        # frees here for gc() to retry; empty for the local (synchronous) backend.
+        self._release_pending: Dict[str, int] = {}
         self._lock = threading.RLock()
         self._counter = itertools.count()
         # Global monotonic generation: a re-put never reuses a prior generation,
         # so a stale handle can never alias freshly stored data. This lets
         # release() drop the _generation entry too (bounding metadata growth).
         self._gen_counter = itertools.count(1)
+        # Cumulative counters for observability (never reset).
+        self._stats = {"force_freed": 0, "force_freed_bytes": 0}
         if dump_dir:
             os.makedirs(dump_dir, exist_ok=True)
 
     def _resident_bytes_locked(self) -> int:
-        return sum(
-            t.numel() * t.element_size()
-            for feats in self._mem.values()
-            for t in feats.values()
+        return sum(_tensors_bytes(feats) for feats in self._mem.values())
+
+    def _free_sample_locked(self, sample_id: str) -> int:
+        """Drop a sample's tensors + bookkeeping. Returns bytes freed."""
+        feats = self._mem.pop(sample_id, None)
+        self._generation.pop(sample_id, None)
+        self._put_time.pop(sample_id, None)
+        self._release_pending.pop(sample_id, None)
+        return _tensors_bytes(feats) if feats else 0
+
+    def _still_leased_locked(self, sample_id: str, generation: Optional[int]) -> bool:
+        """True if a lease on the CURRENT generation still holds ``sample_id``.
+
+        Counting only current-generation leases (not any lease) is what lets a
+        sample re-put while an older generation is still leased get freed when its
+        own last current-gen lease drops; a stale older-gen lease must not pin the
+        current generation. See
+        ``test_release_after_reput_while_leased_does_not_leak``.
+        """
+        return any(
+            h.sample_id == sample_id and h.generation == generation
+            for h in self._active_leases.values()
         )
 
     # -- write -------------------------------------------------------------
@@ -217,7 +273,7 @@ class LocalFeatureStore(FeatureStore):
                 target_meta={"vocab_map_version": vmv} if vmv else {},
             )
         num_tokens = int(metadata.get("num_tokens", 0))
-        staged_bytes = sum(t.numel() * t.element_size() for t in staged.values())
+        staged_bytes = _tensors_bytes(staged)
         with self._lock:
             if self.max_resident_bytes is not None:
                 projected = self._resident_bytes_locked() + staged_bytes
@@ -230,6 +286,7 @@ class LocalFeatureStore(FeatureStore):
             gen = next(self._gen_counter)
             self._generation[sample_id] = gen
             self._mem[sample_id] = staged
+            self._put_time[sample_id] = self._clock()
         # Best-effort capture/replay tap. mem is authoritative; a dump failure
         # must not undo a successful in-memory publish, so it is logged, not
         # raised.
@@ -364,27 +421,102 @@ class LocalFeatureStore(FeatureStore):
             # an older generation is still leased gets a fresh generation, so the
             # stale older-gen lease must not keep the current generation pinned —
             # otherwise the last current-gen release would leak it.
-            still_leased = any(
-                h.sample_id == handle.sample_id and h.generation == cur
-                for h in self._active_leases.values()
-            )
-            if not still_leased:
-                self._mem.pop(handle.sample_id, None)
-                self._generation.pop(handle.sample_id, None)
+            if self._still_leased_locked(handle.sample_id, cur):
+                return  # another (current-gen) lease still holds it
+            # Last current-gen lease dropped -> free. A fallible backend
+            # (Mooncake) parks it release-pending for gc() to retry; local frees
+            # synchronously.
+            if not self._try_physical_free(handle.sample_id):
+                self._release_pending.setdefault(handle.sample_id, 0)
+
+    def _try_physical_free(self, sample_id: str) -> bool:
+        """Physically free a sample. Returns True on success.
+
+        Override in a backend whose free is async/fallible. The local backend
+        owns its RAM so this always succeeds. Caller holds ``self._lock``.
+        """
+        self._free_sample_locked(sample_id)
+        return True
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
+        """Evict a sample immediately (e.g. failed put, terminal sample drop)."""
         with self._lock:
-            self._mem.pop(sample_id, None)
-            self._generation.pop(sample_id, None)
+            self._free_sample_locked(sample_id)
+
+    # -- garbage collection / reclamation ----------------------------------
+    def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
+        """Independent reclamation sweep. Idempotent; safe to call on a timer.
+
+        Does the two reclamations backpressure cannot: force-free abandoned
+        samples past ``max_hold_age_s``, and retry release-pending frees a
+        fallible backend left behind.
+        """
+        now = self._clock() if now is None else now
+        with self._lock:
+            freed, freed_bytes = self._sweep_max_hold_locked(now)
+            f2, b2 = self._reconcile_release_pending_locked()
+            freed, freed_bytes = freed + f2, freed_bytes + b2
+            self._stats["force_freed"] += freed
+            self._stats["force_freed_bytes"] += freed_bytes
+            return {
+                "force_freed": freed,
+                "force_freed_bytes": freed_bytes,
+                "release_pending": len(self._release_pending),
+            }
+
+    def _sweep_max_hold_locked(self, now: float) -> Tuple[int, int]:
+        """Force-free unleased samples older than ``max_hold_age_s``.
+
+        Still-leased samples are spared: force-freeing one is a use-after-free
+        for the holder (B5). "Still leased" is generation-aware — only a lease on
+        the sample's current generation spares it.
+        """
+        if self.max_hold_age_s is None:
+            return 0, 0
+        stale = [
+            sid
+            for sid, t in self._put_time.items()
+            if now - t > self.max_hold_age_s
+            and not self._still_leased_locked(sid, self._generation.get(sid))
+        ]
+        return len(stale), sum(self._free_sample_locked(sid) for sid in stale)
+
+    def _reconcile_release_pending_locked(self) -> Tuple[int, int]:
+        """Retry frees a fallible backend deferred; force-free after the window.
+
+        No-op for the local (synchronous) backend; only does work when
+        ``_try_physical_free`` is overridden to fail (e.g. Mooncake).
+        """
+        freed = freed_bytes = 0
+        for sid in list(self._release_pending):
+            if sid not in self._mem:
+                self._release_pending.pop(sid, None)
+                continue
+            attempts = self._release_pending[sid] + 1
+            if self._try_physical_free(sid):
+                self._release_pending.pop(sid, None)
+                freed += 1
+            elif attempts >= self.max_release_attempts:
+                freed_bytes += self._free_sample_locked(sid)  # final force-free
+                freed += 1
+            else:
+                self._release_pending[sid] = attempts
+        return freed, freed_bytes
 
     def health(self) -> Dict[str, Any]:
         with self._lock:
+            now = self._clock()
+            ages = [now - t for t in self._put_time.values()]
             return {
                 "store_id": self.store_id,
                 "resident_samples": len(self._mem),
                 "active_leases": len(self._active_leases),
                 "resident_bytes": self._resident_bytes_locked(),
                 "max_resident_bytes": self.max_resident_bytes,
+                "release_pending": len(self._release_pending),
+                "oldest_age_s": max(ages) if ages else 0.0,
+                "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,
+                "force_freed_total": self._stats["force_freed"],
             }
 
 
