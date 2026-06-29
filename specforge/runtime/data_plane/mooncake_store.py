@@ -306,6 +306,16 @@ class MooncakeFeatureStore(FeatureStore):
                 pass
         if rc is None or int(rc) < 0:
             raise KeyError(f"mooncake get_into failed (status {rc}) for {key}")
+        # get_into returns the number of bytes read; a full read returns exactly
+        # nb. A short read (0 <= rc < nb) would leave the tail of this freshly
+        # torch.empty'd buffer as uninitialized garbage -- and unlike the pickle
+        # path (torch.load reconstructs whole tensors) the raw-buffer path cannot
+        # otherwise detect under-fill. Reject it rather than hand the trainer
+        # silently-corrupt data (B5: never serve wrong bytes).
+        if int(rc) != nb:
+            raise KeyError(
+                f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
+            )
 
     def _store_remove(self, key: str) -> bool:
         """Best-effort physical free. Returns True on confirmed removal."""
@@ -314,11 +324,6 @@ class MooncakeFeatureStore(FeatureStore):
         except Exception:  # pragma: no cover - transient RPC failure
             return False
         return rc is None or int(rc) == 0
-
-    def _tensor_keys(self, sample_id: str, gen: int) -> List[str]:
-        return [
-            self._tkey(sample_id, gen, n) for n in self._sample_names.get(sample_id, [])
-        ]
 
     # -- write -------------------------------------------------------------
     def put(
