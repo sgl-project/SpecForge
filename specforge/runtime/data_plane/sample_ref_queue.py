@@ -70,46 +70,61 @@ class SampleRefQueue:
         partition_key: Optional[str] = None,
         partition: Optional[Tuple[int, int]] = None,
     ) -> List[SampleRef]:
-        """Lease up to ``max_refs`` pending refs.
+        """Lease up to ``max_refs`` pending refs; block until some arrive or
+        ``timeout_s`` elapses.
 
         ``partition=(index, num_partitions)`` restricts the lease to the DP shard
-        a consumer owns under its *current* layout (resharding contract): only
-        refs whose ``dp_partition(sample_id, num_partitions) == index`` are
-        leased, so changing ``num_partitions`` re-distributes the same pool. A
-        partitioned get does not block waiting for a cross-partition match (that
-        would let one shard starve another); it returns whatever its shard has.
-        ``partition_key`` remains the reserved per-DP-rank seam (unused today).
+        this consumer owns under its *current* layout (resharding contract), so
+        changing ``num_partitions`` re-distributes the same committed pool. See
+        :meth:`_lease_partition_locked` for the (non-blocking) shard semantics.
+
+        ``partition_key`` is a separate, still-reserved seam (a producer-side
+        routing hint); it is accepted and ignored today. ``partition`` is the
+        consumer-side resharding control — the two are unrelated.
         """
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         with self._cv:
             while True:
                 self._reclaim_expired_locked()
                 if self._pending:
-                    out: List[SampleRef] = []
                     if partition is None:
-                        for _ in range(max_refs):
-                            if not self._pending:
-                                break
-                            sid, ref = self._pending.popitem(last=False)
-                            self._leased[sid] = (ref, time.monotonic())
-                            out.append(ref)
-                        return out
-                    # partitioned lease: take this shard's matching refs only.
-                    index, num_partitions = partition
-                    for sid in list(self._pending.keys()):
-                        if len(out) >= max_refs:
-                            break
-                        if dp_partition(sid, num_partitions) == index:
-                            ref = self._pending.pop(sid)
-                            self._leased[sid] = (ref, time.monotonic())
-                            out.append(ref)
-                    return out  # may be empty if this shard has nothing pending
+                        return self._lease_any_locked(max_refs)
+                    return self._lease_partition_locked(max_refs, partition)
                 if deadline is None:
                     return []
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return []
                 self._cv.wait(timeout=remaining)
+
+    def _lease_any_locked(self, max_refs: int) -> List[SampleRef]:
+        """FIFO-lease up to ``max_refs`` pending refs (no partitioning)."""
+        out: List[SampleRef] = []
+        while self._pending and len(out) < max_refs:
+            sid, ref = self._pending.popitem(last=False)
+            self._leased[sid] = (ref, time.monotonic())
+            out.append(ref)
+        return out
+
+    def _lease_partition_locked(
+        self, max_refs: int, partition: Tuple[int, int]
+    ) -> List[SampleRef]:
+        """Lease only this shard's matching refs (resharding contract).
+
+        Returns whatever this shard has pending — possibly empty — and never
+        blocks waiting for a cross-partition match (that would starve one shard
+        behind another).
+        """
+        index, num_partitions = partition
+        out: List[SampleRef] = []
+        for sid in list(self._pending.keys()):
+            if len(out) >= max_refs:
+                break
+            if dp_partition(sid, num_partitions) == index:
+                ref = self._pending.pop(sid)
+                self._leased[sid] = (ref, time.monotonic())
+                out.append(ref)
+        return out
 
     def ack(self, refs: List[SampleRef]) -> None:
         with self._cv:
