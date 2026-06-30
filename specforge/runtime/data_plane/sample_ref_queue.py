@@ -15,12 +15,28 @@ touching callers. Carries no tensors — only ``SampleRef`` metadata.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
+
+
+def dp_partition(sample_id: str, num_partitions: int) -> int:
+    """Stable DP-rank assignment for a sample under a given partition count.
+
+    The resharding contract (M6): partitioning is a *consumer* decision computed
+    from a stable key (``sample_id``), NOT pinned by the producer. So the same
+    committed pool re-distributes cleanly when the consumer's DP width changes —
+    a sample produced under one layout is consumable under another. Hash-based so
+    it is balanced and deterministic across ranks/restarts.
+    """
+    if num_partitions <= 1:
+        return 0
+    digest = hashlib.sha1(sample_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % num_partitions
 
 
 class SampleRefQueue:
@@ -52,26 +68,63 @@ class SampleRefQueue:
         timeout_s: Optional[float] = None,
         *,
         partition_key: Optional[str] = None,
+        partition: Optional[Tuple[int, int]] = None,
     ) -> List[SampleRef]:
+        """Lease up to ``max_refs`` pending refs; block until some arrive or
+        ``timeout_s`` elapses.
+
+        ``partition=(index, num_partitions)`` restricts the lease to the DP shard
+        this consumer owns under its *current* layout (resharding contract), so
+        changing ``num_partitions`` re-distributes the same committed pool. See
+        :meth:`_lease_partition_locked` for the (non-blocking) shard semantics.
+
+        ``partition_key`` is a separate, still-reserved seam (a producer-side
+        routing hint); it is accepted and ignored today. ``partition`` is the
+        consumer-side resharding control — the two are unrelated.
+        """
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         with self._cv:
             while True:
                 self._reclaim_expired_locked()
                 if self._pending:
-                    out: List[SampleRef] = []
-                    for _ in range(max_refs):
-                        if not self._pending:
-                            break
-                        sid, ref = self._pending.popitem(last=False)
-                        self._leased[sid] = (ref, time.monotonic())
-                        out.append(ref)
-                    return out
+                    if partition is None:
+                        return self._lease_any_locked(max_refs)
+                    return self._lease_partition_locked(max_refs, partition)
                 if deadline is None:
                     return []
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return []
                 self._cv.wait(timeout=remaining)
+
+    def _lease_any_locked(self, max_refs: int) -> List[SampleRef]:
+        """FIFO-lease up to ``max_refs`` pending refs (no partitioning)."""
+        out: List[SampleRef] = []
+        while self._pending and len(out) < max_refs:
+            sid, ref = self._pending.popitem(last=False)
+            self._leased[sid] = (ref, time.monotonic())
+            out.append(ref)
+        return out
+
+    def _lease_partition_locked(
+        self, max_refs: int, partition: Tuple[int, int]
+    ) -> List[SampleRef]:
+        """Lease only this shard's matching refs (resharding contract).
+
+        Returns whatever this shard has pending — possibly empty — and never
+        blocks waiting for a cross-partition match (that would starve one shard
+        behind another).
+        """
+        index, num_partitions = partition
+        out: List[SampleRef] = []
+        for sid in list(self._pending.keys()):
+            if len(out) >= max_refs:
+                break
+            if dp_partition(sid, num_partitions) == index:
+                ref = self._pending.pop(sid)
+                self._leased[sid] = (ref, time.monotonic())
+                out.append(ref)
+        return out
 
     def ack(self, refs: List[SampleRef]) -> None:
         with self._cv:

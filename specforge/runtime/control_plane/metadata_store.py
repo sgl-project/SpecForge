@@ -22,10 +22,13 @@ Dependency-light (stdlib only) so it stays importable without torch.
 from __future__ import annotations
 
 import abc
+import dataclasses
+import json
+import sqlite3
 import threading
 from typing import Any, Dict, List, Optional, Set
 
-from specforge.runtime.contracts import SampleRef
+from specforge.runtime.contracts import FeatureSpec, SampleRef
 
 
 class MetadataStore(abc.ABC):
@@ -42,6 +45,10 @@ class MetadataStore(abc.ABC):
 
     @abc.abstractmethod
     def committed_count(self) -> int: ...
+
+    @abc.abstractmethod
+    def all_committed_ids(self) -> List[str]:
+        """Every committed sample_id. Restart reconciliation iterates this."""
 
     # -- durable ack transaction -------------------------------------------
     @abc.abstractmethod
@@ -93,6 +100,10 @@ class InMemoryMetadataStore(MetadataStore):
         with self._lock:
             return len(self._committed)
 
+    def all_committed_ids(self) -> List[str]:
+        with self._lock:
+            return list(self._committed.keys())
+
     def record_train_ack(
         self,
         sample_ids: List[str],
@@ -116,4 +127,168 @@ class InMemoryMetadataStore(MetadataStore):
             }
 
 
-__all__ = ["MetadataStore", "InMemoryMetadataStore"]
+# ---------------------------------------------------------------------------
+# SampleRef <-> JSON (the only metadata-store payload that needs persisting)
+# ---------------------------------------------------------------------------
+def sample_ref_to_json(ref: SampleRef) -> str:
+    # asdict() recurses into the nested FeatureSpec dataclasses + dicts; tuples
+    # (FeatureSpec.shape) degrade to lists, which from_json restores.
+    return json.dumps(dataclasses.asdict(ref))
+
+
+def sample_ref_from_json(blob: str) -> SampleRef:
+    d = json.loads(blob)
+    specs = {
+        name: FeatureSpec(
+            name=s["name"],
+            shape=tuple(s["shape"]),
+            dtype=s["dtype"],
+            device_hint=s.get("device_hint"),
+            required=s.get("required", True),
+            target_repr=s.get("target_repr"),
+            target_meta=s.get("target_meta", {}),
+        )
+        for name, s in d.get("feature_specs", {}).items()
+    }
+    return SampleRef(
+        sample_id=d["sample_id"],
+        run_id=d["run_id"],
+        source_task_id=d.get("source_task_id"),
+        feature_store_uri=d["feature_store_uri"],
+        feature_keys=d.get("feature_keys", {}),
+        feature_specs=specs,
+        strategy=d["strategy"],
+        schema_version=d.get("schema_version", 1),
+        target_model_version=d.get("target_model_version", "unknown"),
+        draft_weight_version=d.get("draft_weight_version"),
+        tokenizer_version=d.get("tokenizer_version", "unknown"),
+        num_tokens=d.get("num_tokens", 0),
+        estimated_bytes=d.get("estimated_bytes", 0),
+        metadata=d.get("metadata", {}),
+    )
+
+
+class SQLiteMetadataStore(MetadataStore):
+    """Durable metadata store: committed refs + the single ack transaction.
+
+    This is the recovery floor B4 requires: after a crash a fresh controller
+    reopens the same DB file and reconstructs *exactly* the durable state — the
+    committed refs and the ``{acked sample_ids, global_step, optimizer_durable}``
+    marker — so it matches today's checkpoint+seek resume rather than regressing
+    it. Release state is *derived* from this marker, never stored separately, so
+    it can never disagree with the optimizer step (the bug B4 names).
+
+    Same in-process API as ``InMemoryMetadataStore``; the controller does not
+    know which backend it holds. SQLite is the dev/single-host durable tier;
+    Redis/DB is a later subclass behind the same interface.
+    """
+
+    def __init__(self, path: str) -> None:
+        # check_same_thread=False + a guard lock: one connection, serialized.
+        self.path = path
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")  # durable + concurrent reads
+        self._conn.execute(
+            "PRAGMA synchronous=FULL"
+        )  # ack survives power loss, not just process crash
+        self._lock = threading.RLock()
+        with self._lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS committed "
+                "(sample_id TEXT PRIMARY KEY, ref_json TEXT NOT NULL)"
+            )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS acked (sample_id TEXT PRIMARY KEY)"
+            )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS marker (k TEXT PRIMARY KEY, v TEXT)"
+            )
+            self._conn.commit()
+
+    def commit_sample(self, ref: SampleRef) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO committed (sample_id, ref_json) VALUES (?, ?)",
+                (ref.sample_id, sample_ref_to_json(ref)),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1  # 0 == duplicate (idempotent, at-least-once)
+
+    def is_committed(self, sample_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM committed WHERE sample_id = ?", (sample_id,)
+            ).fetchone()
+            return row is not None
+
+    def get_committed(self, sample_id: str) -> Optional[SampleRef]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ref_json FROM committed WHERE sample_id = ?", (sample_id,)
+            ).fetchone()
+        return sample_ref_from_json(row[0]) if row else None
+
+    def committed_count(self) -> int:
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) FROM committed").fetchone()[0]
+
+    def all_committed_ids(self) -> List[str]:
+        with self._lock:
+            # rowid order == commit (insertion) order, matching InMemory's dict.
+            rows = self._conn.execute(
+                "SELECT sample_id FROM committed ORDER BY rowid"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def record_train_ack(
+        self,
+        sample_ids: List[str],
+        *,
+        global_step: Optional[int],
+        optimizer_durable: bool,
+    ) -> None:
+        # ONE transaction commits {acked ids, global_step, optimizer marker}
+        # together — never split, so a restart reconciles against a single fact.
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO acked (sample_id) VALUES (?)",
+                [(s,) for s in sample_ids],
+            )
+            if global_step is not None:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO marker (k, v) VALUES ('global_step', ?)",
+                    (json.dumps(global_step),),
+                )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO marker (k, v) VALUES ('optimizer_durable', ?)",
+                (json.dumps(bool(optimizer_durable)),),
+            )
+            self._conn.commit()
+
+    def durable_marker(self) -> Dict[str, Any]:
+        with self._lock:
+            acked = {
+                r[0]
+                for r in self._conn.execute("SELECT sample_id FROM acked").fetchall()
+            }
+            rows = dict(self._conn.execute("SELECT k, v FROM marker").fetchall())
+        gs = json.loads(rows["global_step"]) if "global_step" in rows else None
+        od = (
+            json.loads(rows["optimizer_durable"])
+            if "optimizer_durable" in rows
+            else False
+        )
+        return {"acked": acked, "global_step": gs, "optimizer_durable": od}
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
+__all__ = [
+    "MetadataStore",
+    "InMemoryMetadataStore",
+    "SQLiteMetadataStore",
+    "sample_ref_to_json",
+    "sample_ref_from_json",
+]

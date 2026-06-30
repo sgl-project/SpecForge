@@ -356,7 +356,9 @@ class LocalFeatureStore(FeatureStore):
         self, ref: SampleRef, wanted: List[str]
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         # The resident read and the lease registration share one lock so a
-        # concurrent abort() cannot reclaim the sample between them.
+        # concurrent gc()/abort() cannot free the sample between the existence
+        # check and the lease being recorded (otherwise max-hold gc could free a
+        # just-read sample whose lease was not yet visible).
         expected_generation = _mem_uri_generation(ref.feature_store_uri)
         with self._lock:
             if ref.sample_id not in self._mem:
@@ -406,28 +408,36 @@ class LocalFeatureStore(FeatureStore):
 
     # -- lifetime ----------------------------------------------------------
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
-        # mem:// samples are consume-once: when the LAST lease on the current
-        # generation is released, free the tensors. This is what bounds online
-        # residency — release() owns physical free here, so the consumer never
-        # needs to know the backend's memory policy. file:// samples never enter
-        # _mem, so the pops below are harmless no-ops and offline ref sets stay
-        # re-iterable across epochs. Idempotent + stale-generation safe.
+        # mem:// samples are consume-once: free the *current* resident generation
+        # once the last lease ON THAT generation drops. Freeing is keyed on the
+        # current generation via ``_still_leased_locked(sid, cur)`` — not on the
+        # released handle's own generation — so a sample re-put while an older
+        # lease is still outstanding (gen N held, gen N+1 leased+released, then the
+        # stale gen-N handle released) is still freed: the gen-N+1 lease was the
+        # last on the current generation. The reverse hazard — a stale release
+        # freeing a freshly re-put-but-never-consumed sample — is closed by the
+        # ``handle.generation != cur`` guard: to possess a handle for the current
+        # generation you must have got() it, so a never-leased re-put can only be
+        # targeted by an older-generation handle, which this guard turns into a
+        # no-op. file:// samples never enter _mem, so this is a harmless no-op for
+        # them. Idempotent + stale-safe.
+        sid = handle.sample_id
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
-            cur = self._generation.get(handle.sample_id)
+            cur = self._generation.get(sid)
             if cur is not None and handle.generation != cur:
                 return  # stale handle (sample was re-put) -> no-op
             # Count only leases on the CURRENT generation. A sample re-put while
             # an older generation is still leased gets a fresh generation, so the
             # stale older-gen lease must not keep the current generation pinned —
             # otherwise the last current-gen release would leak it.
-            if self._still_leased_locked(handle.sample_id, cur):
+            if self._still_leased_locked(sid, cur):
                 return  # another (current-gen) lease still holds it
             # Last current-gen lease dropped -> free. A fallible backend
             # (Mooncake) parks it release-pending for gc() to retry; local frees
             # synchronously.
-            if not self._try_physical_free(handle.sample_id):
-                self._release_pending.setdefault(handle.sample_id, 0)
+            if not self._try_physical_free(sid):
+                self._release_pending.setdefault(sid, 0)
 
     def _try_physical_free(self, sample_id: str) -> bool:
         """Physically free a sample. Returns True on success.
@@ -493,9 +503,13 @@ class LocalFeatureStore(FeatureStore):
                 self._release_pending.pop(sid, None)
                 continue
             attempts = self._release_pending[sid] + 1
+            # Bytes the sample is holding now; counted if this retry frees it.
+            # _try_physical_free drops the tensors, so capture the size first.
+            sample_bytes = _tensors_bytes(self._mem.get(sid, {}))
             if self._try_physical_free(sid):
                 self._release_pending.pop(sid, None)
                 freed += 1
+                freed_bytes += sample_bytes
             elif attempts >= self.max_release_attempts:
                 freed_bytes += self._free_sample_locked(sid)  # final force-free
                 freed += 1
