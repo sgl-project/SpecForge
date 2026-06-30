@@ -29,12 +29,14 @@ class FakeStrategy(DraftTrainStrategy):
 
     def __init__(self):
         self.model = TinyModel()
+        self.last_ctx = None
 
     def trainable_module(self):
         return self.model
 
-    def forward_loss(self, batch: TrainBatch) -> StepOutput:
+    def forward_loss(self, batch: TrainBatch, ctx=None) -> StepOutput:
         self.validate_batch(batch)
+        self.last_ctx = ctx  # capture what fit() threads in (StepContext regression)
         loss = (self.model.w * batch.tensors["x"].sum()).abs()
         return StepOutput(loss=loss, metrics={"accuracy": torch.tensor(0.5)})
 
@@ -114,6 +116,38 @@ class TestTrainerController(unittest.TestCase):
             self.assertIsInstance(ckpt, Checkpoint)
             self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
             self.assertEqual(ckpt.global_step, 3)
+
+
+class TestStepContextThreading(unittest.TestCase):
+    """Regression for the Domino schedule bug: fit() must thread a real schedule
+    horizon into StepContext.total_steps (falling back to max_steps), not None —
+    otherwise DominoTrainStrategy._lambda_base is pinned to 0 for the whole run and
+    the base-loss warmup silently never happens."""
+
+    def _last_ctx(self, **controller_kw):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core, run_id="r", output_dir=d, num_epochs=1, **controller_kw
+            )
+            ctrl.fit([_batch() for _ in range(3)])
+        return strat.last_ctx
+
+    def test_explicit_total_steps_is_threaded(self):
+        ctx = self._last_ctx(total_steps=10, max_steps=3)
+        self.assertEqual(ctx.total_steps, 10)  # explicit horizon wins over the cap
+
+    def test_total_steps_falls_back_to_max_steps(self):
+        # the common case: only max_steps set -> use it as the horizon so a
+        # schedule-dependent loss is NOT silently disabled.
+        ctx = self._last_ctx(max_steps=5)
+        self.assertEqual(ctx.total_steps, 5)
+
+    def test_total_steps_none_when_unbounded(self):
+        ctx = self._last_ctx()  # neither total_steps nor max_steps set
+        self.assertIsNone(ctx.total_steps)
 
 
 if __name__ == "__main__":
