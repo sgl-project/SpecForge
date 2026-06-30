@@ -16,12 +16,34 @@ import unittest
 
 from specforge.runtime import launch
 from specforge.runtime.training.registry import available_strategies, resolve_strategy
-from specforge.runtime.training.strategy import Eagle3TrainStrategy
+from specforge.runtime.training.strategy import DFlashTrainStrategy, Eagle3TrainStrategy
 
 
 class TestStrategyRegistry(unittest.TestCase):
-    def test_eagle3_registered(self):
+    def test_builtins_registered(self):
         self.assertIn("eagle3", available_strategies())
+        self.assertIn("dflash", available_strategies())
+
+    def test_dflash_fully_wired(self):
+        spec = resolve_strategy("dflash")
+        self.assertEqual(
+            spec.required_features, frozenset(DFlashTrainStrategy.required_features)
+        )
+        # offline (reader/transform/collate) + online (adapter) both wired
+        self.assertIsNotNone(spec.make_offline_reader)
+        self.assertIsNotNone(spec.make_offline_transform)
+        self.assertIsNotNone(spec.make_offline_collate)
+        self.assertIsNotNone(spec.make_adapter)
+        self.assertTrue(spec.supports_online)
+        # DFlash owns its own (frozen) head -> builders pass target_head=None
+        self.assertFalse(spec.uses_target_head)
+
+        class _M:
+            draft_model = object()
+
+        self.assertIsInstance(
+            spec.make_strategy(_M(), target_head=None), DFlashTrainStrategy
+        )
 
     def test_required_features_track_the_strategy_class(self):
         # The registry's required_features is the single source of truth wired
