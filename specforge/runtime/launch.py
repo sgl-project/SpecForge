@@ -10,15 +10,27 @@
 
 The training *script* becomes a thin launcher: it parses args, calls one of
 these builders, and runs ``TrainerController.fit``. All training logic lives in
-the runtime components, not the script. This module wires the **offline EAGLE3**
-path end to end:
+the runtime components, not the script.
 
-    OfflineManifestReader -> DataFlowController -> SampleRefQueue
-        -> FeatureDataLoader(process_data, DataCollatorWithPadding)
-        -> TrainBatch -> Eagle3TrainStrategy -> TrainerCore/Controller -> FSDP
+Two orthogonal axes shape a run, and they are deliberately kept separate:
 
-Online wiring (RolloutWorker + SGLangAdapter) composes the same control/data
-plane; see ``inference/`` for the equivalent assembly.
+* **topology / data-source** — offline manifest vs online rollout, colocated vs
+  disaggregated (cross-process or one-process). This is what the *named* builders
+  below span; each carries genuinely different control flow (producer vs consumer
+  process, drain-then-fit vs streamed vs interleaved) and so earns its function.
+* **draft model / strategy** — eagle3 vs dflash vs ... This is NOT a per-builder
+  axis. Every builder takes ``strategy=`` and resolves a :class:`StrategySpec`
+  (``specforge.runtime.training.registry``) for the model-specific bits — the
+  per-step strategy, the required-feature contract, the offline reader/transform/
+  collate, the online collate, the capture adapter. Adding a model is a spec entry
+  beside its model code, not a new ``build_*`` family, so this file does not grow
+  as (topologies x models).
+
+The shared spine every path funnels through:
+
+    ref source (OfflineManifestReader | RolloutWorker | StreamingRefQueue)
+        -> DataFlowController -> FeatureDataLoader(transform, collate)
+        -> TrainBatch -> spec.make_strategy -> TrainerCore/Controller -> FSDP
 """
 
 from __future__ import annotations
@@ -36,24 +48,28 @@ from specforge.runtime.data_plane import (
     FeatureDataLoader,
     FeatureStore,
     LocalFeatureStore,
-    OfflineManifestReader,
 )
 from specforge.runtime.training.backend import FSDPTrainingBackend, ParallelConfig
-from specforge.runtime.training.strategy import Eagle3TrainStrategy
+from specforge.runtime.training.registry import StrategySpec, resolve_strategy
 from specforge.runtime.training.trainer import TrainerController, TrainerCore
 
+# ---------------------------------------------------------------------------
+# Shared assemblers — strategy- and topology-agnostic. Every builder is a thin
+# wrapper that resolves a spec, obtains a (store, ref source), and calls these.
+# ---------------------------------------------------------------------------
 
-def _assemble_offline_eagle3(
+
+def _assemble_trainer(
     *,
+    spec: StrategySpec,
     controller: DataFlowController,
     store: FeatureStore,
-    refs: List[SampleRef],
-    eagle3_model,
+    ref_source: dict,  # {"refs": [...]} re-iterable (offline) | {"queue": q} stream (online)
+    model,
     target_head,
     optimizer_factory,
     run_id: str,
     output_dir: str,
-    max_len: int,
     batch_size: int,
     accumulation_steps: int,
     num_epochs: int,
@@ -65,31 +81,31 @@ def _assemble_offline_eagle3(
     sp_ring_size: int,
     logger,
     log_interval: int,
+    collate_fn,
+    per_sample_transform=None,
 ):
-    """Shared trainer/loader assembly for the offline-shaped EAGLE3 dataflow.
+    """The trainer+loader assembly shared by offline / disagg / online / interleaved.
 
-    Identical for the colocated (``LocalFeatureStore``) and disaggregated
-    (``SharedDirFeatureStore``) paths — only the (store, refs) source differs, so
-    both produce byte-identical batches and training. ``optimizer_factory`` runs
-    AFTER FSDP-wrap, over the wrapped module's inner draft.
+    Only the (store, ref source, collate/transform, target_head) differ between
+    topologies; the FSDP wrap, optimizer-after-wrap, per-step strategy
+    (``spec.make_strategy``), ``TrainerCore`` and ``TrainerController`` — including
+    the optimizer-step ack — are identical. ``optimizer_factory`` runs AFTER
+    FSDP-wrap, over the wrapped module's inner draft.
     """
-    from specforge.data.preprocessing import OfflineEagle3Dataset
-    from specforge.data.utils import DataCollatorWithPadding
-
-    controller.enqueue_offline_refs(refs)  # record committed state (enables ack lookup)
+    # Offline = a fixed, re-iterable ref set: record committed state so the ack
+    # lookup works (num_epochs > 1 then re-iterates). Online streams refs through
+    # a queue and commits them elsewhere (rollout / channel).
+    if "refs" in ref_source:
+        controller.enqueue_offline_refs(ref_source["refs"])
     trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
-    # Offline = a fixed, re-iterable ref set (so num_epochs > 1 actually trains
-    # multiple epochs). The trainer acks at the optimizer-step boundary via ack_fn.
     loader = FeatureDataLoader(
         store,
-        refs=refs,
+        **ref_source,
         batch_size=batch_size,
-        collate_fn=DataCollatorWithPadding(),
-        per_sample_transform=lambda raw: OfflineEagle3Dataset.process_data(
-            raw, max_len
-        ),
+        collate_fn=collate_fn,
+        per_sample_transform=per_sample_transform,
         drop_last=True,
-        strategy="eagle3",
+        strategy=spec.name,
     )
 
     parallel = ParallelConfig.from_distributed(
@@ -99,10 +115,8 @@ def _assemble_offline_eagle3(
     # FSDP-wrap the composite model and build the optimizer over the inner draft
     # AFTER wrapping; the strategy MUST run forward through the wrapped module so
     # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-    wrapped = backend.prepare_model(
-        eagle3_model, optimizer_target=eagle3_model.draft_model
-    )
-    strategy = Eagle3TrainStrategy(wrapped, target_head=target_head)
+    wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+    strategy = spec.make_strategy(wrapped, target_head=target_head)
     core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
     trainer = TrainerController(
         core,
@@ -121,8 +135,138 @@ def _assemble_offline_eagle3(
     return trainer, loader
 
 
-def build_offline_eagle3_runtime(
+def _offline_io(spec: StrategySpec, max_len: int):
+    """Resolve (collate_fn, per_sample_transform) for an offline-shaped run.
+
+    Raises if the strategy has no offline data path wired yet.
+    """
+    if spec.make_offline_collate is None or spec.make_offline_transform is None:
+        raise NotImplementedError(
+            f"offline data path for strategy {spec.name!r} is not wired yet: its "
+            f"StrategySpec needs make_offline_transform + make_offline_collate "
+            f"(DFlash/Domino use their own feature schema). See "
+            f"specforge.runtime.training.registry."
+        )
+    return spec.make_offline_collate(), spec.make_offline_transform(max_len)
+
+
+def _online_collate(spec: StrategySpec, collate_fn):
+    """Resolve the online/streamed collate, or raise if the strategy has none wired.
+
+    Mirrors ``_offline_io``: a strategy registered ``supports_online`` but with no
+    ``make_online_collate`` (and no explicit ``collate_fn``) fails with an
+    actionable error instead of ``TypeError: 'NoneType' object is not callable``.
+    """
+    if collate_fn is not None:
+        return collate_fn
+    if spec.make_online_collate is None:
+        raise NotImplementedError(
+            f"online data path for strategy {spec.name!r} is not wired yet: its "
+            f"StrategySpec needs make_online_collate (or pass an explicit collate_fn). "
+            f"See specforge.runtime.training.registry."
+        )
+    return spec.make_online_collate()
+
+
+def _resolve_metadata_store(
+    metadata_store: Optional[MetadataStore],
+    metadata_db_path: Optional[str],
+) -> Optional[MetadataStore]:
+    """Pick the controller's metadata store for an online disaggregated process.
+
+    O1.1: producer and consumer run in *separate* processes, so a shared, durable
+    store is what makes commit/dedup/ack cross-process (an in-process
+    ``InMemoryMetadataStore`` per process shares nothing). Pass an explicit
+    ``metadata_store``, or a ``metadata_db_path`` and both processes open a
+    ``SQLiteMetadataStore`` over the same file. ``None`` keeps the pre-O1.1
+    behaviour: a private in-process store, control state un-shared.
+    """
+    if metadata_store is not None:
+        return metadata_store
+    if metadata_db_path is not None:
+        return SQLiteMetadataStore(metadata_db_path)
+    return None
+
+
+def _assemble_rollout_workers(
     *,
+    spec: StrategySpec,
+    target_model,
+    controller: DataFlowController,
+    store: FeatureStore,
+    run_id: str,
+    target_hidden_size: int,
+    target_vocab_size: Optional[int],
+    draft_vocab_size: Optional[int],
+    target_repr: str,
+    aux_hidden_state_layer_ids,
+    vocab_map_version: Optional[str],
+    t2d,
+    num_rollout_workers: int,
+    device: str,
+):
+    """Build the rollout producer workers shared by colocated-online and the
+    disaggregated-online producer.
+
+    The capture contract is derived from ``spec.required_features`` and verified
+    at the ``FeatureStore.put`` boundary (``verify_capture``). The adapter is
+    ``spec.make_adapter`` (default ``SGLangAdapter`` for eagle3). Strategies
+    without an online capture path (``supports_online=False``) raise here rather
+    than quietly emitting the wrong feature schema.
+    """
+    if not spec.supports_online:
+        raise NotImplementedError(
+            f"online capture for strategy {spec.name!r} is not wired yet: it needs "
+            f"a {spec.name} capture adapter. Set make_adapter + supports_online=True "
+            f"on its StrategySpec."
+        )
+    from specforge.runtime.inference.capture import CaptureConfig
+    from specforge.runtime.inference.rollout_worker import RolloutWorker
+
+    if aux_hidden_state_layer_ids is None:
+        aux_hidden_state_layer_ids = tuple(
+            getattr(target_model, "aux_hidden_states_layers", ()) or ()
+        )
+    if spec.make_adapter is not None:
+        adapter = spec.make_adapter(target_model, device=device, t2d=t2d)
+    else:
+        from specforge.runtime.inference.sglang_adapter import SGLangAdapter
+
+        adapter = SGLangAdapter(target_model, device=device, t2d=t2d)
+    capture = CaptureConfig.from_strategy(
+        required_features=spec.required_features,
+        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
+        target_repr=target_repr,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        vocab_map_version=vocab_map_version,
+    )
+    # strategy=spec.name so committed SampleRefs carry the right strategy tag and
+    # the loader's strategy check passes (the RolloutWorker default is "eagle3").
+    return [
+        RolloutWorker(
+            controller,
+            store,
+            adapter,
+            capture,
+            run_id=run_id,
+            worker_id=f"rollout-{i}",
+            strategy=spec.name,
+        )
+        for i in range(num_rollout_workers)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Offline (colocated + disaggregated). The named builders span the topology
+# axis; `strategy=` selects the model.
+# ---------------------------------------------------------------------------
+
+
+def build_offline_runtime(
+    *,
+    strategy: str = "eagle3",
     hidden_states_path: str,
     eagle3_model,
     target_head,
@@ -143,26 +287,35 @@ def build_offline_eagle3_runtime(
     logger=None,
     log_interval: int = 50,
 ):
-    """Assemble the offline-EAGLE3 dataflow (colocated ``LocalFeatureStore``)."""
+    """Assemble the colocated offline dataflow (``LocalFeatureStore``).
+
+    The model object is passed as ``eagle3_model`` for backward compatibility; it
+    is really "the composite draft model for ``strategy``" (it must expose an
+    inner ``.draft_model`` for the optimizer target).
+    """
+    spec = resolve_strategy(strategy)
+    if spec.make_offline_reader is None:
+        raise NotImplementedError(
+            f"offline data path for strategy {spec.name!r} is not wired yet: its "
+            f"StrategySpec needs make_offline_reader. See "
+            f"specforge.runtime.training.registry."
+        )
+    collate_fn, per_sample_transform = _offline_io(spec, max_len)
     controller = DataFlowController(run_id)
-    refs = OfflineManifestReader(
-        hidden_states_path,
-        run_id=run_id,
-        ttt_length=ttt_length,
-        max_len=max_len,
-        target_repr="hidden_state",
+    refs = spec.make_offline_reader(
+        hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
     store = LocalFeatureStore(run_id)
-    return _assemble_offline_eagle3(
+    return _assemble_trainer(
+        spec=spec,
         controller=controller,
         store=store,
-        refs=refs,
-        eagle3_model=eagle3_model,
-        target_head=target_head,
+        ref_source={"refs": refs},
+        model=eagle3_model,
+        target_head=target_head if spec.uses_target_head else None,
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
-        max_len=max_len,
         batch_size=batch_size,
         accumulation_steps=accumulation_steps,
         num_epochs=num_epochs,
@@ -174,11 +327,14 @@ def build_offline_eagle3_runtime(
         sp_ring_size=sp_ring_size,
         logger=logger,
         log_interval=log_interval,
+        collate_fn=collate_fn,
+        per_sample_transform=per_sample_transform,
     )
 
 
-def build_disagg_eagle3_runtime(
+def build_disagg_offline_runtime(
     *,
+    strategy: str = "eagle3",
     feature_store: FeatureStore,
     refs: List[SampleRef],
     eagle3_model,
@@ -199,27 +355,27 @@ def build_disagg_eagle3_runtime(
     logger=None,
     log_interval: int = 50,
 ):
-    """Consumer side of a disaggregated EAGLE3 run.
+    """Consumer side of a disaggregated OFFLINE run.
 
-    Trains from a ``feature_store`` whose tensors were produced by a *different
-    process* (the rollout/ingest pool) on a shared mount — typically a
-    :class:`SharedDirFeatureStore`. ``refs`` are the ``disagg://`` ``SampleRef``s
-    the producer published to the manifest
-    (:func:`data_plane.disagg_ingest.read_ref_manifest`). The trainer assembly is
-    identical to the colocated offline path, so results match within determinism
-    tolerance — the only difference is where the feature tensors live.
+    Trains from a caller-supplied ``feature_store`` (tensors produced by a
+    *different process* — typically a :class:`SharedDirFeatureStore` on a shared
+    mount) and ``disagg://`` ``SampleRef``s the producer published to the manifest.
+    The trainer assembly is identical to the colocated offline path — only the
+    (store, refs) source differs — so results match within determinism tolerance.
     """
+    spec = resolve_strategy(strategy)
+    collate_fn, per_sample_transform = _offline_io(spec, max_len)
     controller = DataFlowController(run_id)
-    return _assemble_offline_eagle3(
+    return _assemble_trainer(
+        spec=spec,
         controller=controller,
         store=feature_store,
-        refs=refs,
-        eagle3_model=eagle3_model,
-        target_head=target_head,
+        ref_source={"refs": refs},
+        model=eagle3_model,
+        target_head=target_head if spec.uses_target_head else None,
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
-        max_len=max_len,
         batch_size=batch_size,
         accumulation_steps=accumulation_steps,
         num_epochs=num_epochs,
@@ -231,11 +387,19 @@ def build_disagg_eagle3_runtime(
         sp_ring_size=sp_ring_size,
         logger=logger,
         log_interval=log_interval,
+        collate_fn=collate_fn,
+        per_sample_transform=per_sample_transform,
     )
 
 
-def build_online_eagle3_runtime(
+# ---------------------------------------------------------------------------
+# Online (colocated + disaggregated producer/consumer + one-process interleaved).
+# ---------------------------------------------------------------------------
+
+
+def build_online_runtime(
     *,
+    strategy: str = "eagle3",
     target_model,
     prompts,
     eagle3_model,
@@ -264,111 +428,67 @@ def build_online_eagle3_runtime(
     collate_fn=None,
     logger=None,
 ):
-    """Assemble the online-EAGLE3 dataflow and return
+    """Assemble the colocated online dataflow and return
     ``(trainer, loader, workers, controller, drive_rollout)``.
 
-    Mirror of :func:`build_offline_eagle3_runtime`; the only difference is the
-    *producer* of ``SampleRef``s. Instead of an ``OfflineManifestReader`` reading
-    ``.ckpt`` files, a ``RolloutWorker`` leases ``PromptTask``s, asks the
-    ``target_model`` (any backend exposing ``generate_eagle3_data`` — HF, SGLang,
-    or custom; **sglang is not required**) for per-sample features via
-    ``SGLangAdapter``, writes them to the ``mem://`` ``FeatureStore``, and commits
+    Mirror of :func:`build_offline_runtime`; the only difference is the *producer*
+    of ``SampleRef``s: a ``RolloutWorker`` leases ``PromptTask``s, asks the
+    ``target_model`` (any backend exposing the strategy's ``generate_*_data`` — HF,
+    SGLang, or custom; **sglang is not required**) for per-sample features via the
+    strategy's adapter, writes them to a ``mem://`` ``FeatureStore``, and commits
     ``SampleRef``s onto the controller's ``SampleRefQueue``. From ``SampleRef``
-    down (loader -> strategy -> trainer) the code path is identical to offline.
+    down the path is identical to offline.
 
-    ``prompts`` is the metadata-only PromptTask source (e.g.
-    ``[{"payload": {"input_ids": [...], "loss_mask": [...]}}]``). The returned
-    ``drive_rollout()`` runs the workers until the prompt pool is exhausted,
-    populating the queue the loader consumes; the launcher script calls it before
-    ``trainer.fit(loader)``. (Fully-async rollout/train interleaving with
-    backpressure is the control-plane's job — a follow-up, not this seam.)
-
-    ``target_head`` is ``None`` on purpose: online rollout already materialized the
-    ``target`` distribution, so the strategy consumes it directly rather than
-    re-running an lm-head (that is the offline ``hidden_state`` path's job).
+    The returned ``drive_rollout()`` runs the workers until the prompt pool drains,
+    populating the queue the loader consumes; the launcher calls it before
+    ``trainer.fit(loader)``. ``target_head`` is ``None`` on purpose: online rollout
+    already materialized the target distribution.
     """
-    import torch
-
-    from specforge.runtime.inference.capture import CaptureConfig
-    from specforge.runtime.inference.rollout_worker import RolloutWorker
-    from specforge.runtime.inference.sglang_adapter import SGLangAdapter
-
+    spec = resolve_strategy(strategy)
     controller = DataFlowController(run_id)
     controller.ingest_prompts(prompts)
-    # PR8 colocated store has no residency cap (max_resident_bytes is the M5
-    # backpressure follow-up); mirror the offline launcher's plain construction.
     store = LocalFeatureStore(run_id)
 
-    if aux_hidden_state_layer_ids is None:
-        aux_hidden_state_layer_ids = tuple(
-            getattr(target_model, "aux_hidden_states_layers", ()) or ()
-        )
-
-    adapter = SGLangAdapter(target_model, device=device, t2d=t2d)
-    capture = CaptureConfig.from_strategy(
-        required_features=Eagle3TrainStrategy.required_features,
-        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
-        target_repr=target_repr,
+    workers = _assemble_rollout_workers(
+        spec=spec,
+        target_model=target_model,
+        controller=controller,
+        store=store,
+        run_id=run_id,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
+        target_repr=target_repr,
+        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
         vocab_map_version=vocab_map_version,
-    )
-    workers = [
-        RolloutWorker(
-            controller,
-            store,
-            adapter,
-            capture,
-            run_id=run_id,
-            worker_id=f"rollout-{i}",
-        )
-        for i in range(num_rollout_workers)
-    ]
-
-    # Queue mode (online consume-once stream). Online features arrive from the
-    # adapter already in train form (input_ids/attention_mask/loss_mask/
-    # hidden_state/target), so there is no per_sample_transform (unlike offline).
-    def _cat_collate(feats):
-        # Concatenate per-sample features along the batch dim. The offline
-        # ``DataCollatorWithPadding`` assumes 2D (B,n) inputs and would choke on
-        # the 3D hidden_state/target tensors; online features are pre-formed, so
-        # a plain cat is correct for equal-length / batch_size=1 batches (the
-        # adapter already groups equal-length prompts). Variable-length padded
-        # batching is a follow-up; pass ``collate_fn`` to override.
-        return {k: torch.cat([f[k] for f in feats], dim=0) for k in feats[0]}
-
-    loader = FeatureDataLoader(
-        store,
-        controller.sample_queue,
-        batch_size=batch_size,
-        collate_fn=collate_fn or _cat_collate,
-        drop_last=True,
-        strategy="eagle3",
+        t2d=t2d,
+        num_rollout_workers=num_rollout_workers,
+        device=device,
     )
 
-    parallel = ParallelConfig.from_distributed(
-        tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
-    )
-    backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
-    wrapped = backend.prepare_model(
-        eagle3_model, optimizer_target=eagle3_model.draft_model
-    )
-    strategy = Eagle3TrainStrategy(wrapped, target_head=None)
-    core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
-    trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
-    trainer = TrainerController(
-        core,
+    trainer, loader = _assemble_trainer(
+        spec=spec,
+        controller=controller,
+        store=store,
+        ref_source={"queue": controller.sample_queue},
+        model=eagle3_model,
+        target_head=None,
+        optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
         num_epochs=num_epochs,
         max_steps=max_steps,
         save_interval=save_interval,
         eval_interval=eval_interval,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
         logger=logger,
-        ack_fn=lambda ids, step: controller.ack_train_refs(
-            trainer_id, ids, global_step=step, optimizer_durable=True
-        ),
+        log_interval=50,
+        collate_fn=_online_collate(spec, collate_fn),
+        per_sample_transform=None,
     )
 
     def drive_rollout(max_rounds: int = 100_000) -> int:
@@ -387,39 +507,9 @@ def build_online_eagle3_runtime(
     return trainer, loader, workers, controller, drive_rollout
 
 
-def _online_cat_collate(feats):
-    """Concatenate pre-formed online features along the batch dim (see
-    build_online_eagle3_runtime); online features are already in train form, so a
-    plain cat is correct for equal-length / batch_size=1 batches."""
-    import torch
-
-    return {k: torch.cat([f[k] for f in feats], dim=0) for k in feats[0]}
-
-
-def _resolve_metadata_store(
-    metadata_store: Optional[MetadataStore],
-    metadata_db_path: Optional[str],
-) -> Optional[MetadataStore]:
-    """Pick the controller's metadata store for an online disaggregated process.
-
-    O1.1: the producer and consumer run in *separate* processes, so a shared,
-    durable store is what makes commit/dedup/ack cross-process (an in-process
-    ``InMemoryMetadataStore`` per process shares nothing). Pass an explicit
-    ``metadata_store`` (e.g. a future ``RedisMetadataStore`` for multi-node O2),
-    or a ``metadata_db_path`` and both processes open a ``SQLiteMetadataStore``
-    over the same file (enough for single-host O1; SQLite WAL serializes the
-    producer's commits against the consumer's ack transaction). ``None`` keeps the
-    pre-O1.1 behaviour: a private in-process store, control state un-shared.
-    """
-    if metadata_store is not None:
-        return metadata_store
-    if metadata_db_path is not None:
-        return SQLiteMetadataStore(metadata_db_path)
-    return None
-
-
 def build_disagg_online_producer(
     *,
+    strategy: str = "eagle3",
     target_model,
     prompts,
     feature_store: FeatureStore,
@@ -443,36 +533,25 @@ def build_disagg_online_producer(
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
-    Mirrors the producer half of :func:`build_online_eagle3_runtime`, but the
+    Mirrors the producer half of :func:`build_online_runtime`, but the
     RolloutWorkers put() into a cross-node ``feature_store`` (a consume-once
-    :class:`MooncakeFeatureStore`) and the committed SampleRefs are streamed to
-    the consumer through a :class:`StreamingRefChannel` instead of an in-process
-    queue. The feature tensors never touch a shared mount.
+    :class:`MooncakeFeatureStore`) and committed SampleRefs are streamed to the
+    consumer through a :class:`StreamingRefChannel` instead of an in-process queue.
 
     ``metadata_store`` / ``metadata_db_path`` (O1.1) point the controller at the
-    *shared, durable* metadata store the consumer also opens, so the producer's
-    ``commit_samples`` (dedup, at-least-once) lands in the same store the consumer
-    reconciles against on restart. Omit both for the pre-O1.1 in-process store
-    (commit/ack state stays private to this process). See
-    :func:`_resolve_metadata_store`.
+    *shared, durable* store the consumer also opens, so the producer's
+    ``commit_samples`` lands where the consumer reconciles on restart.
 
     Returns ``(workers, drive_producer)``. ``drive_producer(should_stop=...)`` runs
     the workers until the prompt pool drains, publishing refs to the channel and
-    applying backpressure (it pauses while ``channel.in_flight_remote()`` exceeds
-    ``in_flight_high_watermark`` so a lagging trainer can't overrun the Mooncake
-    segment), then closes the channel so the consumer's loader terminates.
-    ``should_stop`` (a zero-arg predicate) lets a caller wind the producer down
-    early — e.g. the interleaved driver sets it once the trainer hits ``max_steps``
-    so the producer doesn't block forever on the watermark after the consumer
-    stops draining (O1.2). The channel is always closed on exit so the consumer
-    never hangs on a finished producer.
+    applying backpressure (pauses while ``channel.in_flight_remote()`` exceeds
+    ``in_flight_high_watermark``), then closes the channel so the consumer's loader
+    terminates. ``should_stop`` lets the interleaved driver wind the producer down
+    once the trainer hits ``max_steps``. The channel is always closed on exit.
     """
     import time
 
-    from specforge.runtime.inference.capture import CaptureConfig
-    from specforge.runtime.inference.rollout_worker import RolloutWorker
-    from specforge.runtime.inference.sglang_adapter import SGLangAdapter
-
+    spec = resolve_strategy(strategy)
     sleep = sleep or time.sleep
     controller = DataFlowController(
         run_id,
@@ -480,31 +559,22 @@ def build_disagg_online_producer(
     )
     controller.ingest_prompts(prompts)
 
-    if aux_hidden_state_layer_ids is None:
-        aux_hidden_state_layer_ids = tuple(
-            getattr(target_model, "aux_hidden_states_layers", ()) or ()
-        )
-    adapter = SGLangAdapter(target_model, device=device, t2d=t2d)
-    capture = CaptureConfig.from_strategy(
-        required_features=Eagle3TrainStrategy.required_features,
-        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
-        target_repr=target_repr,
+    workers = _assemble_rollout_workers(
+        spec=spec,
+        target_model=target_model,
+        controller=controller,
+        store=feature_store,
+        run_id=run_id,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
+        target_repr=target_repr,
+        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
         vocab_map_version=vocab_map_version,
+        t2d=t2d,
+        num_rollout_workers=num_rollout_workers,
+        device=device,
     )
-    workers = [
-        RolloutWorker(
-            controller,
-            feature_store,
-            adapter,
-            capture,
-            run_id=run_id,
-            worker_id=f"rollout-{i}",
-        )
-        for i in range(num_rollout_workers)
-    ]
 
     def drive_producer(max_rounds: int = 1_000_000, should_stop=None) -> int:
         for w in workers:
@@ -536,6 +606,7 @@ def build_disagg_online_producer(
 
 def build_disagg_online_consumer(
     *,
+    strategy: str = "eagle3",
     feature_store: FeatureStore,
     channel,
     eagle3_model,
@@ -563,30 +634,19 @@ def build_disagg_online_consumer(
 
     Trains from a streamed ``SampleRef`` channel + a consume-once
     ``feature_store`` produced by a *different pool*. The trainer assembly is the
-    online one (``target_head=None``: rollout already materialized the target
-    distribution); the only difference from colocated online is that refs arrive
-    from a :class:`StreamingRefQueue` over the channel rather than the in-process
-    ``SampleRefQueue``, and the features are fetched cross-node from Mooncake. The
-    loader frees each sample on read (consume-once) and acks the channel (the
-    producer's backpressure signal).
+    online one (``target_head=None``); refs arrive from a :class:`StreamingRefQueue`
+    over the channel rather than the in-process ``SampleRefQueue``, and features
+    are fetched cross-node from Mooncake.
 
     ``metadata_store`` / ``metadata_db_path`` (O1.1) point the controller at the
-    *shared, durable* store the producer commits to, so the per-optimizer-step
-    ack transaction (``ack_train_refs``) is recorded against the same committed
-    set the producer wrote — the precondition for a correct restart.
-
-    ``resume=True`` reconciles against that durable store before training: the
-    channel JSONL is append-only and a restarted consumer re-reads it from the
-    start, so ``reconcile_on_restart`` derives the already-durably-trained samples
-    and they are handed to the :class:`StreamingRefQueue` as ``skip_ids`` (dropped
-    on re-read, no duplicate train). The committed-but-unacked tail is *not*
-    skipped, so it is re-trained — that requeue is realized by the channel re-read
-    itself, which is why only the released set matters here. Requires a durable
-    ``metadata_store`` / ``metadata_db_path`` (an in-process store has no history
-    to reconcile).
+    *shared, durable* store the producer commits to. ``resume=True`` reconciles
+    against that store before training: already-durably-trained samples are handed
+    to the queue as ``skip_ids`` (dropped on the channel re-read); the
+    committed-but-unacked tail re-streams and re-trains. Requires a durable store.
     """
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
+    spec = resolve_strategy(strategy)
     store = _resolve_metadata_store(metadata_store, metadata_db_path)
     controller = DataFlowController(run_id, metadata_store=store)
 
@@ -604,40 +664,30 @@ def build_disagg_online_consumer(
         skip_ids = set(reconciled["released"])
 
     queue = StreamingRefQueue(channel, idle_timeout_s=idle_timeout_s, skip_ids=skip_ids)
-    loader = FeatureDataLoader(
-        feature_store,
-        queue,
-        batch_size=batch_size,
-        collate_fn=collate_fn or _online_cat_collate,
-        drop_last=True,
-        strategy="eagle3",
-    )
-
-    parallel = ParallelConfig.from_distributed(
-        tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
-    )
-    backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
-    wrapped = backend.prepare_model(
-        eagle3_model, optimizer_target=eagle3_model.draft_model
-    )
-    strategy = Eagle3TrainStrategy(wrapped, target_head=None)
-    core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
-    trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
-    trainer = TrainerController(
-        core,
+    return _assemble_trainer(
+        spec=spec,
+        controller=controller,
+        store=feature_store,
+        ref_source={"queue": queue},
+        model=eagle3_model,
+        target_head=None,
+        optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
         num_epochs=num_epochs,
         max_steps=max_steps,
         save_interval=save_interval,
         eval_interval=eval_interval,
-        log_interval=log_interval,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
         logger=logger,
-        ack_fn=lambda ids, step: controller.ack_train_refs(
-            trainer_id, ids, global_step=step, optimizer_durable=True
-        ),
+        log_interval=log_interval,
+        collate_fn=_online_collate(spec, collate_fn),
+        per_sample_transform=None,
     )
-    return trainer, loader
 
 
 def run_disagg_online_interleaved(
@@ -651,26 +701,16 @@ def run_disagg_online_interleaved(
 ) -> int:
     """Run an online producer and the trainer CONCURRENTLY (O1.2).
 
-    Replaces the synchronous drain-then-fit shape (generate the whole prompt
-    pool, *then* train) with a live loop: the producer streams refs on a
-    background thread while ``trainer.fit`` consumes them on this thread. The
-    consumer's :class:`StreamingRefQueue` blocks until the channel is
-    closed-and-drained, so the trainer tracks the producer instead of ending the
-    instant the stream is momentarily empty.
+    The producer streams refs on a background thread while ``trainer.fit`` consumes
+    them on this thread. The consumer's :class:`StreamingRefQueue` blocks until the
+    channel is closed-and-drained, so the trainer tracks the producer instead of
+    ending the instant the stream is momentarily empty.
 
-    Shutdown is symmetric and hang-free:
-
-    * trainer finishes first (e.g. ``max_steps``) -> ``should_stop`` is set, so
-      the producer stops generating instead of blocking on the in-flight
-      watermark after the consumer quit draining;
-    * producer finishes first (prompts drained) -> it closes the channel, so the
-      loader drains the tail and ``fit`` returns;
-    * producer raises -> the channel is closed (``drive_producer``'s ``finally``)
-      so the consumer cannot hang, and the exception is re-raised here once
-      ``fit`` has unwound.
-
-    Returns the trainer's final optimizer step. Single process, in-process
-    generator stub — no Ray, no live SGLang server (those are O1.3 / O2).
+    Shutdown is symmetric and hang-free: trainer finishes first -> ``should_stop``
+    is set so the producer stops generating; producer finishes first -> it closes
+    the channel so the loader drains the tail and ``fit`` returns; producer raises
+    -> the channel is closed so the consumer cannot hang, and the exception is
+    re-raised here once ``fit`` has unwound. Returns the trainer's final step.
     """
     import threading
 
@@ -721,8 +761,9 @@ def run_disagg_online_interleaved(
     return step
 
 
-def build_disagg_online_eagle3_runtime(
+def build_disagg_online_runtime(
     *,
+    strategy: str = "eagle3",
     target_model,
     prompts,
     eagle3_model,
@@ -761,24 +802,16 @@ def build_disagg_online_eagle3_runtime(
     logger=None,
     log_interval: int = 50,
 ):
-    """One-process online disaggregated EAGLE3 runtime (O1.2).
+    """One-process online disaggregated runtime (O1.2).
 
-    The single named builder the roadmap calls for: it wires the producer
-    (rollout pool, in-process ``generate_eagle3_data`` stub via ``SGLangAdapter``)
-    and the consumer (FSDP trainer) over ONE shared metadata store, ONE
-    consume-once ``feature_store``, and ONE streaming-ref channel (two
-    :class:`StreamingRefChannel` views over the same path — the proven
-    producer/consumer split), and returns ``(trainer, loader, run)``. Calling
-    ``run()`` drives both concurrently (:func:`run_disagg_online_interleaved`) —
-    the live loop that replaces drain-then-fit. No live SGLang server and no Ray
-    yet (O1.3 / O2); this proves the data + control paths live with a stubbed
-    generator.
-
-    Pass a ``channel`` or a ``ref_channel_path`` (a ``StreamingRefChannel`` is
-    built over it). The metadata store defaults to a shared in-process store
-    (enough for one process); pass ``metadata_store`` / ``metadata_db_path`` for a
-    durable, restart-reconcilable run (``resume=True`` then skips already-trained
-    refs on the channel re-read).
+    Wires the producer (rollout pool) and the consumer (FSDP trainer) over ONE
+    shared metadata store, ONE consume-once ``feature_store``, and ONE streaming-ref
+    channel (two :class:`StreamingRefChannel` views over the same path), and returns
+    ``(trainer, loader, run)``. Calling ``run()`` drives both concurrently
+    (:func:`run_disagg_online_interleaved`). Pass a ``channel`` or a
+    ``ref_channel_path``. The metadata store defaults to a shared in-process store;
+    pass ``metadata_store`` / ``metadata_db_path`` for a durable, restart-reconcilable
+    run (``resume=True`` then skips already-trained refs on the channel re-read).
     """
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
@@ -797,13 +830,12 @@ def build_disagg_online_eagle3_runtime(
 
     # One process: share a single metadata store instance across both halves so
     # the producer's commits and the consumer's acks land in the same store.
-    # (A metadata_db_path instead opens one SQLite connection per half over the
-    # same file — durable, and what a restart-reconcilable run needs.)
     shared_store = metadata_store
     if shared_store is None and metadata_db_path is None:
         shared_store = InMemoryMetadataStore()
 
     _workers, drive_producer = build_disagg_online_producer(
+        strategy=strategy,
         target_model=target_model,
         prompts=prompts,
         feature_store=feature_store,
@@ -824,6 +856,7 @@ def build_disagg_online_eagle3_runtime(
         metadata_db_path=metadata_db_path,
     )
     trainer, loader = build_disagg_online_consumer(
+        strategy=strategy,
         feature_store=feature_store,
         channel=consumer_channel,
         eagle3_model=eagle3_model,
@@ -860,17 +893,32 @@ def build_disagg_online_eagle3_runtime(
     return trainer, loader, run
 
 
-# Backward-compatible alias for early branch users.
-build_offline_eagle3_controller = build_offline_eagle3_runtime
+# ---------------------------------------------------------------------------
+# Backward-compatible names. The model used to live in the function name; it is
+# now the ``strategy=`` parameter (default "eagle3"), so these are plain aliases
+# of the strategy-neutral builders above. Existing callers are unchanged.
+# ---------------------------------------------------------------------------
+
+build_offline_eagle3_runtime = build_offline_runtime
+build_offline_eagle3_controller = build_offline_runtime
+build_disagg_eagle3_runtime = build_disagg_offline_runtime
+build_online_eagle3_runtime = build_online_runtime
+build_disagg_online_eagle3_runtime = build_disagg_online_runtime
 
 
 __all__ = [
-    "build_offline_eagle3_controller",
-    "build_offline_eagle3_runtime",
-    "build_disagg_eagle3_runtime",
-    "build_online_eagle3_runtime",
+    # strategy-neutral (preferred)
+    "build_offline_runtime",
+    "build_disagg_offline_runtime",
+    "build_online_runtime",
     "build_disagg_online_producer",
     "build_disagg_online_consumer",
-    "build_disagg_online_eagle3_runtime",
+    "build_disagg_online_runtime",
     "run_disagg_online_interleaved",
+    # back-compat aliases
+    "build_offline_eagle3_runtime",
+    "build_offline_eagle3_controller",
+    "build_disagg_eagle3_runtime",
+    "build_online_eagle3_runtime",
+    "build_disagg_online_eagle3_runtime",
 ]
