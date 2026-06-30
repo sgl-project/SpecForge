@@ -45,7 +45,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor
 
 from datasets import Dataset
 from specforge.args import SGLangBackendArgs
@@ -59,6 +59,7 @@ from specforge.distributed import (
 )
 from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
 from specforge.utils import (
+    load_tokenizer,
     print_args_with_dots,
     print_with_rank,
     rank_0_priority,
@@ -629,9 +630,7 @@ def main():
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_path, trust_remote_code=True
-    )
+    tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
     cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 

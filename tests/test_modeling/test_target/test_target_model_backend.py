@@ -16,7 +16,28 @@ from specforge.modeling.target.eagle3_target_model import (
 from tests.utils import get_available_port
 
 
+def _silence_sglang_allreduce_finalizer():
+    """Disable SGLang's custom all-reduce communicators before the worker exits.
+
+    Their ``__del__`` otherwise runs at interpreter shutdown, by which point the
+    ``torch`` module global is already ``None``, so ``free()`` logs an ignored
+    ``AttributeError: 'NoneType' object has no attribute 'distributed'``. Marking
+    them disabled makes the finalizer a no-op; the OS reclaims the buffers on
+    process exit. Reaching into SGLang internals is acceptable for test teardown.
+    """
+    try:
+        from sglang.srt.distributed import parallel_state as ps
+    except Exception:
+        return
+    for name in ("_TP", "_WORLD", "_PP", "_MOE_EP", "_MOE_TP", "_ATTN_TP", "_ATTN_CP"):
+        group = getattr(ps, name, None)
+        ca_comm = getattr(group, "ca_comm", None) if group is not None else None
+        if ca_comm is not None:
+            ca_comm.disabled = True
+
+
 def cleanup_distributed():
+    _silence_sglang_allreduce_finalizer()
     gc.collect()
     torch.cuda.empty_cache()
     if dist.is_available() and dist.is_initialized():
@@ -71,19 +92,29 @@ def test_target_model_backend(rank, world_size, port, tp_size):
         )
         custom_target_model = None
 
-        # compare weights
+        # Compare the custom backend against the HF reference. The integer/boolean
+        # fields (input_ids, loss_mask) must match exactly. The floating point
+        # fields (target logits, hidden states) match exactly only without tensor
+        # parallelism; with tp_size > 1 the tensor-parallel all-reduce reorders the
+        # fp16 accumulation, so a looser tolerance (matching the sglang comparison
+        # below) is used.
+        assert torch.equal(
+            hf_out.input_ids, custom_out.input_ids
+        ), f"input_ids differ:\ndiff: {(hf_out.input_ids - custom_out.input_ids).abs().max()}"
+        assert torch.equal(
+            hf_out.loss_mask, custom_out.loss_mask
+        ), f"loss_mask differ:\ndiff: {(hf_out.loss_mask - custom_out.loss_mask).abs().max()}"
+
+        float_atol, float_rtol = (1e-5, 1e-5) if tp_size == 1 else (1e-1, 1e-2)
         assert torch.allclose(
-            hf_out.target, custom_out.target, atol=1e-5, rtol=1e-5
-        ), f"Logits are not close: \nhf: {hf_out[0] - custom_out[0]}"
+            hf_out.target, custom_out.target, atol=float_atol, rtol=float_rtol
+        ), f"Target are not close:\ndiff: {(hf_out.target - custom_out.target).abs().max()}"
         assert torch.allclose(
-            hf_out.loss_mask, custom_out.loss_mask, atol=1e-5, rtol=1e-5
-        ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
-        assert torch.allclose(
-            hf_out.input_ids, custom_out.input_ids, atol=1e-5, rtol=1e-5
-        ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
-        assert torch.allclose(
-            hf_out.hidden_states, custom_out.hidden_states, atol=1e-5, rtol=1e-5
-        ), f"Logits are not close: \ndiff: {hf_out[1] - custom_out[1]}"
+            hf_out.hidden_states,
+            custom_out.hidden_states,
+            atol=float_atol,
+            rtol=float_rtol,
+        ), f"Hidden states are not close:\ndiff: {(hf_out.hidden_states - custom_out.hidden_states).abs().max()}"
 
         sgl_target_model = SGLangEagle3TargetModel.from_pretrained(
             "unsloth/Llama-3.2-1B", torch_dtype=torch.float16, device="cuda"
