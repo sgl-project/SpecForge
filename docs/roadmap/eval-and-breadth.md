@@ -34,7 +34,8 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
     per-position **sum/count** tensors that `Eagle3TrainStrategy.forward_loss` already emits
     (`acc_corrects`, `acc_denoms` in `StepOutput.metrics`) — do **not** reduce them to scalars in
     the eval path.
-  - Add `specforge/runtime/eval/evaluator.py` with `Evaluator` + `EvalConfig`, following the
+  - Add `specforge/eval/evaluator.py` (top-level domain layer, per plan.md §2.3 — **not** under
+    `runtime/`) with `Evaluator` + `EvalConfig`, following the
     sketch in ../../docs/redesign-draft-legacy.md (§4.4 Evaluation system). It consumes a
     `forward_fn` (a thin wrapper over `TrainerCore.eval_step`) and an eval stream that is a plain
     `FeatureDataLoader` over SampleRef+FeatureStore — there is no separate eval source of truth.
@@ -47,7 +48,7 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
   - Emit `{eval/avg_loss, eval/avg_acc, eval/simulated_acc_len}`; `avg_loss` is
     token-weighted (`Σ loss·num_tokens / Σ num_tokens`), `avg_acc` is the position-0 aggregated
     accuracy.
-  - Add `specforge/runtime/eval/cache.py` with `EvalCache`. Key on
+  - Add `specforge/eval/cache.py` with `EvalCache`. Key on
     **eval-data path + target path + target revision + tokenizer path + chat template +
     aux-layer ids + max seqlen** (§4.4 `cache_key`). Missing any field silently serves stale
     tensors after a target swap or template change. Keep this **separate** from the tokenization
@@ -105,8 +106,9 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
      `offline_target_repr`), `make_online_collate`, `make_adapter` (None ⇒ default `SGLangAdapter`),
      and `supports_online`. If a data path isn't wired yet, leave that factory `None` — the builder
      raises an actionable `NotImplementedError` instead of silently feeding EAGLE3-shaped features.
-  3. **Optionally, a draft architecture** under `specforge/modeling/draft/` (alongside
-     `dflash.py` / `llama3_eagle.py`) — only if the algorithm needs a network the existing draft
+  3. **Optionally, a draft architecture** under the draft-model package
+     (`specforge/modeling/draft/` today, `specforge/models/drafts/` after domain Phase E —
+     alongside `dflash.py` / `llama3_eagle.py`) — only if the algorithm needs a network the existing draft
      models don't provide. Medusa heads or MTP heads would live here; an algorithm that reuses an
      existing draft body (as Domino reuses DFlash's draft with a different head/loss) needs **no**
      new arch file.

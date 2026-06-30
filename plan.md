@@ -84,17 +84,19 @@ do not conflict.
 | **inference plane** (`runtime/inference`) | **Converge to the predecessor's `TargetEngine`.** | Today it conflates "wrap a target engine" + "capture" inside `SGLangAdapter`, and is bound to `generate_eagle3_data` / EAGLE3 names. The `FeatureSource` Protocol already exists (good); the gap is a real `TargetEngine` abstraction (hf / sglang / **sglang_server** / custom) + de-EAGLE3-ifying. This is the layer that most borrows the draft. |
 | **training plane** (`runtime/training`) | **Keep the seam; fill the managers.** | `DraftTrainStrategy` / `TrainerCore` / `TrainingBackend` (+ the `StepContext` added for Domino) is *already* the predecessor's `training/strategies` shape — keep it. What's missing are the **managers**, not the seam: `no_sync()` accumulation, full optimizer/scheduler/RNG resume, `CheckpointManager` (rotation/best), `Evaluator`. |
 
-**Already landed (the spine + first cleanup):**
+**Landed (merged — the spine):**
 
 - `runtime/` planes (M1–M7/O1): control/data/inference/training, `SampleRef`, `FeatureStore`
   (Local/SharedDir/Mooncake), `StreamingRefChannel`, durable `MetadataStore`, disagg
   producer/consumer + interleaved online loop.
+
+**In the stacked PRs #627/#628/#629 (validated, in review — not yet merged):**
+
 - **Composable launch** (`StrategySpec` registry + parameterized `launch.py`): adding a model
   is a spec entry, not a `build_*_runtime` family. eagle3 / **dflash** / **domino** all train
-  end-to-end through one strategy-parameterized path (PRs #627 / #628 / #629, validated:
-  197 `tests/test_runtime` OK on H200). Domino added `StepContext{global_step, total_steps}`
-  threaded through `forward_loss` — the one deliberate contract extension for schedule-dependent
-  loss.
+  end-to-end through one strategy-parameterized path (validated: 197 `tests/test_runtime` OK on
+  H200). Domino added `StepContext{global_step, total_steps}` threaded through `forward_loss` —
+  the one deliberate contract extension for schedule-dependent loss.
 
 **Explicitly not yet implemented in `runtime/`** (flagged in-source — `contracts.py`,
 `trainer.py`, `controller.py`, both `DESIGN.md`s, `runtime/README.md`): live frozen-target online
@@ -136,7 +138,13 @@ PRODUCE (inference):
   TargetEngine        ── the engine rollout wraps to produce features; the abstraction that
                          replaces the EAGLE3-bound SGLangAdapter.
      HFTargetEngine / SGLangTargetEngine / CustomTargetEngine (in-process)
-     SGLangServerEngine (frozen target as an HTTP/live service; the cross-node capture backend)
+     SGLangServerEngine (frozen target as a live SGLang server, cross-node). ONE engine, two
+       feature transports (the engine is identical; only WHERE features land differs):
+         · capture transport — engine-side hook writes hidden states INTO a FeatureStore
+           (Mooncake/SharedDir). This is W3 / online O1.3.
+         · inline-HTTP transport — features serialized in the HTTP response, no shared store
+           (RemoteStream-style). This is the light W3′ path, the one case features do NOT live
+           in a FeatureStore.
   RolloutWorker       ── drives a TargetEngine → writes tensors to FeatureStore → commits
                          SampleRef to the control plane. Stays at the domain↔substrate seam.
 
@@ -169,14 +177,18 @@ specforge/
 │   │                                #   SampleRefQueue, StreamingRefChannel
 │   ├── inference/                   # rollout: RolloutWorker, capture, adapters  ──┐ converge to
 │   │                                #                                              │  TargetEngine
-│   ├── training/                    # DraftTrainStrategy, TrainerCore/Controller, backend,
-│   │                                #   StepContext, strategy registry
+│   ├── training/                    # DraftTrainStrategy seam, TrainerCore/Controller, backend,
+│   │                                #   StepContext. (The StrategySpec registry converges into the
+│   │                                #   domain training/strategies/ in Phase E — see §6.)
 │   └── launch.py                    # spec-driven builders (topology = builder, model = strategy=)
 │
-├── models/
+├── models/                          # TARGET layout (today the draft/target code lives under
+│   │                                #   specforge/modeling/ — Phase E moves it here)
 │   ├── drafts/                      # DRAFT_REGISTRY + @register_draft (NEW — predecessor §4.2)
-│   │   ├── base.py  llama_eagle3.py  deepseek_eagle3.py(MLA)  dflash_qwen3.py  auto.py
-│   └── targets/                     # TargetEngine ABC (NEW — absorbs runtime/inference adapters)
+│   │   ├── base.py  llama3_eagle.py  deepseek_eagle3.py(MLA)  dflash.py  auto.py
+│   │   │                            #   (today: modeling/draft/{base,dflash,llama3_eagle,flex_attention}.py)
+│   └── targets/                     # TargetEngine ABC, EXTRACTED from modeling/target/*TargetModel
+│       │                            #   (runtime/inference adapters then wrap an engine, §G2)
 │       ├── base.py  hf_engine.py  sglang_engine.py  sglang_server_engine.py  custom_engine.py
 │
 │                                    # (NO separate data/streams package — FeatureDataLoader over
@@ -187,17 +199,19 @@ specforge/
 ├── training/                        # domain lifecycle + managers (WRAPS runtime/training)
 │   ├── trainer.py                   # owns loop/eval/checkpoint; delegates the step to runtime
 │   │                                #   TrainerCore + DraftTrainStrategy (kept seam)
-│   ├── checkpoint.py  lr_scheduler.py  fsdp.py   # NEW managers (§3). Strategies + StrategySpec
-│   │                                #   registry stay in runtime/training (the seam, unchanged).
+│   ├── checkpoint.py  lr_scheduler.py  fsdp.py   # NEW managers (§3).
+│   ├── strategies/                  # StrategySpec registry converges HERE in Phase E (§6); the
+│   │                                #   per-step DraftTrainStrategy seam stays in runtime/training.
 │
 ├── eval/  export/  config/  cli.py  # NEW — carried forward from predecessor §4.4–4.8
 └── core/  optimizer.py  tracker.py  distributed.py  # kept verbatim (predecessor §1)
 ```
 
-> The one real structural move is `runtime/inference` → `models/targets` (extract a
-> `TargetEngine` from the EAGLE3-bound adapter) plus a thin domain `training/` (Trainer +
-> managers) wrapping the kept `runtime/training` seam. The control + data planes stay exactly
-> where they are — they are the substrate, **not** re-housed behind a new stream package.
+> The one real structural move is extracting a `TargetEngine` from the EAGLE3-bound
+> `modeling/target/*TargetModel` into `models/targets` (the `runtime/inference` adapters then wrap
+> it) plus a thin domain `training/` (Trainer + managers) wrapping the kept `runtime/training`
+> seam. The control + data planes stay exactly where they are — they are the substrate, **not**
+> re-housed behind a new stream package.
 
 ---
 
@@ -218,9 +232,13 @@ from the in-source `NOTE`s. Each lands behind the canonical spine without re-plu
 - **lr WSD + per-strategy `fsdp_wrap_policy()`** (predecessor §4.6, §4.2).
 
 ### G2 — `TargetEngine` abstraction (inference convergence)
-- Introduce `TargetEngine` ABC; refactor `SGLangAdapter`/`DFlashAdapter` to wrap a
-  `TargetEngine` and stop binding to `generate_eagle3_data` / EAGLE3 names. Keep the existing
-  `FeatureSource` Protocol. Add `SGLangServerEngine` (HTTP) as the light cross-node engine.
+- Introduce a `TargetEngine` ABC **extracted from the `modeling/target/*TargetModel` classes**
+  (`Eagle3TargetModel`, `DFlashTargetModel`); the `runtime/inference` adapters
+  (`SGLangAdapter`/`DFlashAdapter`) then **wrap** a `TargetEngine` rather than being the engine,
+  and stop binding to `generate_eagle3_data` / EAGLE3 names. Keep the existing `FeatureSource`
+  Protocol. Add `SGLangServerEngine` (live SGLang server) as the cross-node engine — see §2.2 for
+  its two feature transports (capture-into-FeatureStore for W3/O1.3, inline-HTTP for the light
+  W3′).
 
 ### G3 — Live online capture (frozen target; **no** weight sync)
 - Replace the in-process generator with **live SGLang-server hidden-state capture**: a *frozen*
@@ -256,8 +274,8 @@ progress (no staleness, nothing to re-sync).
 |---|---|---|---|---|
 | W1 | Offline (precomputed) | `OfflineManifestReader` (refs) | Local (`file://`/`mem://`) | **no-op** |
 | W2 | In-process online (frozen target) | `RolloutWorker` → `SampleRefQueue` | Local (`mem://`) | **no-op** |
-| W3 | Disaggregated online (frozen target; isolated pools, high BW) | `RolloutWorker` (producer pool) → `StreamingRefChannel` | **Mooncake** | **active** (lease/ack/reconcile/backpressure) |
-| W3′ | Disaggregated online (light/cross-node) | `SGLangServerEngine` over HTTP (RemoteStream-style source) | n/a (HTTP) | minimal |
+| W3 | Disaggregated online (frozen target; isolated pools, high BW) | `RolloutWorker` (producer pool) → `StreamingRefChannel`, `SGLangServerEngine` *capture transport* | **Mooncake** | **active** (lease/ack/reconcile/backpressure) |
+| W3′ | Disaggregated online (light/cross-node) | `SGLangServerEngine` *inline-HTTP transport* (RemoteStream-style source) | n/a — features inline over HTTP, no shared store | minimal |
 
 > **"Train-with-decode" = live *frozen-target* generation** — i.e. W2 (colocated) or W3
 > (disaggregated), **not** a separate workload. The predecessor's dual-purpose
@@ -355,8 +373,9 @@ not a rewrite. Every phase that touches the training path passes the numerical-e
 in [`docs/roadmap/`](docs/roadmap/)** — the phases below are the index; the online track there
 also folds in the former online-disaggregation roadmap (#618).
 
-- **Phase A — composable launch (DONE / in review).** `StrategySpec` registry + parameterized
-  `launch.py`; eagle3/dflash/domino end-to-end (#627/#628/#629). 197 `tests/test_runtime` OK.
+- **Phase A — composable launch (in review).** `StrategySpec` registry + parameterized
+  `launch.py`; eagle3/dflash/domino end-to-end in the stacked PRs #627/#628/#629 (validated,
+  in review). 197 `tests/test_runtime` OK.
 - **Phase B — domain abstractions (no behavior change).** Introduce `TargetEngine` (wrap the
   existing adapters; de-EAGLE3 the names) and the domain `Trainer` wrapping the kept
   `runtime/training` core. No `HiddenStateStream` — `FeatureDataLoader` stays the stream. Gate:
@@ -401,7 +420,7 @@ statements (now §5/§6) so the code and the plan stop contradicting each other.
 ## 9. Success criteria
 | Area | Criterion |
 |---|---|
-| Composable launch (done) | eagle3/dflash/domino train via one strategy-parameterized path; full `test_runtime` green. |
+| Composable launch (in review) | eagle3/dflash/domino train via one strategy-parameterized path; full `test_runtime` green. |
 | Abstractions (B) | `TargetEngine` (wrapping existing adapters) + domain `Trainer` produce byte-identical batches/loss vs the direct spine path. |
 | Colocated (C) | W1/W2 run with control plane as no-op; colocated≡disagg equivalence gate passes. |
 | Managers (D) | resume reproduces the no-resume loss curve; one all-reduce per optimizer step; best-checkpoint tracked. |

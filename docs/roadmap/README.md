@@ -30,7 +30,7 @@ roadmap home. Each track doc gives, per phase: **Goal / Target state / Implement
 ## Phase status at a glance
 | Phase | Track | Size | Status |
 |---|---|---|---|
-| A — Composable launch | domain | L | **done / in review** (#627/#628/#629) |
+| A — Composable launch | domain | L | **in review** (#627/#628/#629) |
 | O1.1 — Shared cross-process control plane | online | M | in review (~#624) |
 | O1.2 — Async streaming loop + one-process builder | online | M | in review (~#625) |
 | B — Domain abstractions (`TargetEngine` + `Trainer`) | domain | L | next |
@@ -45,7 +45,7 @@ roadmap home. Each track doc gives, per phase: **Goal / Target state / Implement
 
 ## Dependencies (cross-track)
 ```
-domain:  A(done) ─┬─▶ B ─┬─▶ C
+domain:  A(rev.) ─┬─▶ B ─┬─▶ C
                   │       └─▶ D ─▶ E
                   └─▶ B.TargetEngine ─────────────┐
 online:  O1.1(review) ─▶ O1.2(review) ─▶ O1.3 ◀───┘ ─▶ O2(Ray=open) ─▶ O3

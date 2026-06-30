@@ -60,7 +60,7 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
 ### O1.1 — Shared cross-process control plane · size M · CPU · status: in-review
 - **Goal** Producer and consumer attach to **one** durable control plane instead of each building
   its own `InMemoryMetadataStore`, so commit/lease/ack/dedup and restart-reconcile work across
-  processes (~PR #624 / up-19).
+  processes (~PR #624).
 - **Target state** A separate producer and consumer share commit/lease/ack via a durable store;
   the "single-host in-process index" caveat is gone for the shared-store path; `reconcile_on_restart`
   is wired into the launcher and `resume=True` re-streams the committed-but-unacked tail.
@@ -85,7 +85,7 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
 
 ### O1.2 — Async streaming loop + one-process builder · size M · CPU / small-GPU · status: in-review
 - **Goal** Replace synchronous drain-then-fit with an async streaming loop, using the **existing
-  in-process generator** as a stub so this milestone carries no engine risk (~PR #625 / up-20).
+  in-process generator** as a stub so this milestone carries no engine risk (~PR #625).
 - **Target state** End-to-end live 1+1 run with in-process generation: producer pulls prompts →
   generates → `put` + commit ref; consumer leases → `get` → trains → acks at the optimizer step;
   a bounded sample pool throttles via the channel's in-flight watermark.

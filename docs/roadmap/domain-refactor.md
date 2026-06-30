@@ -14,13 +14,13 @@ Sibling tracks: [./online-disaggregation.md](./online-disaggregation.md),
 [../../plan.md](../../plan.md) (the detailed §4.2–4.8 sketches this track lands
 incrementally are mirrored in [../redesign-draft-legacy.md](../redesign-draft-legacy.md)).
 
-**Dependency order:** A (done) → B → {C, D} → E. B's `TargetEngine` extraction
-also unblocks the online O1.3 multi-backend producer in
+**Dependency order:** A (in review) → B → {C, D}; D → E (C is parallel — not a prerequisite of
+E). B's `TargetEngine` extraction also unblocks the online O1.3 multi-backend producer in
 [./online-disaggregation.md](./online-disaggregation.md).
 
 ---
 
-### A — Composable launch · size L · GPU · status: done (in review, PRs #627/#628/#629)
+### A — Composable launch · size L · GPU · status: in review (PRs #627/#628/#629, validated)
 - **Goal** One strategy-parameterized launch path so adding an algorithm is a
   registry entry, not a new `build_*` family — and so a schedule-dependent loss
   (domino) flows through the same `TrainerCore`.
@@ -52,7 +52,7 @@ also unblocks the online O1.3 multi-backend producer in
   `test_dflash_online_launch.py`; full suite **197 tests/test_runtime green on
   H200**.
 - **Done when** All three strategies run offline + online via the one parameterized
-  path with the suite green (DONE; in review).
+  path with the suite green (validated, in review).
 
 ---
 
@@ -81,7 +81,11 @@ also unblocks the online O1.3 multi-backend producer in
   2. Add an explicit `backend` attribute on each engine (today `SGLangAdapter.health`
      / `DFlashAdapter.health` read `getattr(target_model, "backend", "unknown")`
      — make it real), and add the `sglang_server` backend branch to the factory
-     (currently only `sglang` / `hf` / `custom`).
+     (currently only `sglang` / `hf` / `custom`). The *depth* of this `sglang_server`
+     branch is informed by the O1.3 capture spike (see
+     [online-disaggregation.md](./online-disaggregation.md) §O1.3): the de-EAGLE3
+     extraction (step 1) and the domain `Trainer` carry no engine risk and can land
+     regardless of the spike's outcome — only the live-server capture backend does.
   3. Keep the adapters (`SGLangAdapter`, `DFlashAdapter`) as the
      `FeatureSource` implementations over the engine; nothing in
      `rollout_worker.py` changes — its `FeatureSource` Protocol
