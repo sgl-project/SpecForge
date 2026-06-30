@@ -121,14 +121,35 @@ def init_distributed(
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
-    dist.destroy_process_group()
+    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    # Teardown must never crash the process. Several handles can alias the same
+    # underlying group (e.g. DP and draft-DP when there is no sequence
+    # parallelism), and degenerate single-rank SP groups (created when
+    # sp_ulysses_size == 1 or sp_ring_size == 1) are not registered in torch's
+    # process-group map and would raise on destroy. Destroy each distinct, valid
+    # sub-group at most once, then tear down the default group.
+    seen = set()
+    for group in (
+        _TP_GROUP,
+        _DP_GROUP,
+        _SP_ULYSSES_GROUP,
+        _SP_RING_GROUP,
+        _DRAFT_DP_GROUP,
+        _DRAFT_SP_GROUP,
+    ):
+        if group is None or id(group) in seen:
+            continue
+        seen.add(id(group))
+        try:
+            dist.destroy_process_group(group)
+        except Exception:
+            # Group not registered (e.g. degenerate single-rank SP group) or
+            # already destroyed.
+            pass
+    # The all-ranks DP group may alias the default group, in which case
+    # destroying it above already tore the default group down.
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def shard_tensor(
@@ -203,7 +224,6 @@ class Gather(torch.autograd.Function):
             grad_output.split(ctx.part_size, dim=ctx.gather_dim)[
                 ctx.sp_rank
             ].contiguous(),
-            None,
             None,
             None,
             None,

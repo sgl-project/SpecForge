@@ -34,8 +34,11 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3RMSNorm,
+    Qwen3RotaryEmbedding as HFQwen3RotaryEmbedding,
+)
+from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
@@ -261,7 +264,12 @@ class Qwen3RotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        # transformers 5.x dropped the "default" entry from ROPE_INIT_FUNCTIONS;
+        # the default parameters are now computed by the rotary class itself.
+        if self.rope_type == "default":
+            self.rope_init_fn = HFQwen3RotaryEmbedding.compute_default_rope_parameters
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -369,6 +377,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
+        """
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -481,9 +494,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
 
 
+from ._tp_loading import TPShardedFromPretrainedMixin
+
+
 @auto_docstring
-class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+class Qwen3ForCausalLM(
+    TPShardedFromPretrainedMixin, Qwen3PreTrainedModel, GenerationMixin
+):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -538,6 +556,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
 
         Example:
 

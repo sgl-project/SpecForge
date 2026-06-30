@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 
 from specforge.data.preprocessing import preprocess_conversations
 from specforge.data.template import TEMPLATE_REGISTRY
+from specforge.utils import load_tokenizer
 
 
 class TestTemplatePreprocessing(unittest.TestCase):
@@ -227,7 +228,7 @@ class TestTemplatePreprocessing(unittest.TestCase):
         print(f"\n>>> Running: {template_key} ({model_name}) {message_label}")
 
         # 1. Initialize tokenizer and template
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer = load_tokenizer(model_name, trust_remote_code=True)
         chat_template = TEMPLATE_REGISTRY.get(template_key)
 
         # 2. Preprocess conversations

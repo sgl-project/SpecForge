@@ -18,6 +18,19 @@ except ImportError:
     BlockMask = None
     create_block_mask = None
 
+# NPU workaround: flex_attention is not available on Ascend NPU.
+if hasattr(torch, "npu") and torch.npu.is_available():
+    FLEX_ATTENTION_AVAILABLE = False
+
+
+_VALID_LOSS_TYPES = {
+    "dflash",
+    "dpace",
+    "dpace-cumulative-confidence-only",
+    "dpace-continuation-value-only",
+}
+_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+
 
 def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
     B, N = anchor_positions.shape
@@ -94,7 +107,7 @@ def create_dflash_block_mask(
 
 
 class OnlineDFlashModel(nn.Module):
-    """DFlash online training wrapper with block-wise CE loss."""
+    """DFlash online training wrapper with DFlash and D-PACE losses."""
 
     def __init__(
         self,
@@ -106,8 +119,17 @@ class OnlineDFlashModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
     ):
         super().__init__()
+        if loss_type not in _VALID_LOSS_TYPES:
+            raise ValueError(
+                f"loss_type={loss_type!r}; must be one of {sorted(_VALID_LOSS_TYPES)}"
+            )
+        if not 0.0 <= dpace_alpha <= 1.0:
+            raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
+
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
@@ -116,6 +138,8 @@ class OnlineDFlashModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.loss_type = loss_type
+        self.dpace_alpha = dpace_alpha
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -211,6 +235,38 @@ class OnlineDFlashModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
+    def _dpace_weight(
+        self,
+        prob: torch.Tensor,
+        binary_mask: torch.Tensor,
+        binary_mask_b: torch.Tensor,
+        loss_type: str,
+    ) -> torch.Tensor:
+        """Compute detached D-PACE position weights.
+
+        ``prob`` is the draft probability on the target token at each draft
+        position. Invalid positions are treated as multiplicative no-ops inside
+        prefix products and excluded from suffix sums; the caller still
+        multiplies the returned weights by ``binary_mask`` before reduction.
+        """
+        smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
+        smooth = torch.where(binary_mask_b, smooth, torch.ones_like(smooth))
+        prefix = torch.cumprod(smooth, dim=-1)
+
+        if loss_type == "dpace-cumulative-confidence-only":
+            return prefix
+
+        suffix = torch.flip(
+            torch.cumsum(torch.flip(prefix * binary_mask, dims=[-1]), dim=-1),
+            dims=[-1],
+        )
+
+        if loss_type == "dpace":
+            return suffix
+        if loss_type == "dpace-continuation-value-only":
+            return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
+        raise ValueError(f"unknown D-PACE loss_type {loss_type!r}")
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -218,6 +274,10 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
+        if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
+            raise ValueError(
+                "flex_attention is not available on this device; use sdpa/eager."
+            )
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -291,22 +351,39 @@ class OnlineDFlashModel(nn.Module):
 
         binary_eval_mask = weight_mask.view(-1)
 
-        # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
-            )
-            weight_mask = weight_mask * decay_weights
-
         # --- Cross entropy ---
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+
+        if self.loss_type == "dflash":
+            # Preserve the existing DFlash weighted-mean behavior.
+            loss_weights = weight_mask
+            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+                k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+                decay_weights = torch.exp(
+                    -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
+                )
+                loss_weights = loss_weights * decay_weights
+
+            flat_weights = loss_weights.view(-1)
+            valid_token_count = flat_weights.sum() + 1e-6
+            loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        elif self.loss_type in _DPACE_LOSS_TYPES:
+            neg_log_q = loss_per_token.view_as(target_ids)
+            with torch.no_grad():
+                q = torch.exp(-neg_log_q)
+                dpace_weights = self._dpace_weight(
+                    q,
+                    weight_mask,
+                    weight_mask > 0,
+                    self.loss_type,
+                )
+            loss_weights = weight_mask * dpace_weights
+            loss = (neg_log_q * loss_weights).sum() / float(bsz)
+        else:
+            raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
         # --- Accuracy ---
         with torch.no_grad():

@@ -18,7 +18,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
@@ -33,7 +33,13 @@ from specforge.modeling.target.dflash_target_model import (
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
-from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
+from specforge.utils import (
+    get_last_checkpoint,
+    get_local_device,
+    load_tokenizer,
+    print_on_rank0,
+    print_with_rank,
+)
 
 
 def parse_args():
@@ -163,6 +169,9 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
     )
 
+    device = get_local_device()
+    device_type = device.type
+
     target_model_kwargs = {}
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -171,7 +180,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         pretrained_model_name_or_path=args.target_model_path,
         backend=args.target_model_backend,
         torch_dtype=torch.bfloat16,
-        device="cuda" if args.target_model_backend == "hf" else None,
+        device=device_type if args.target_model_backend == "hf" else None,
         trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
@@ -231,7 +240,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
+    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -431,6 +440,8 @@ def get_lambda_base(
 
 
 def main():
+    device = get_local_device()
+    device_type = device.type
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -487,10 +498,14 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = load_tokenizer(args.target_model_path)
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
+    elif (
+        dflash_config := getattr(draft_model.config, "dflash_config", {})
+    ) and dflash_config.get("mask_token_id") is not None:
+        mask_token_id = dflash_config["mask_token_id"]
     elif tokenizer.mask_token_id is not None:
         mask_token_id = tokenizer.mask_token_id
     else:
@@ -514,7 +529,7 @@ def main():
         args.target_model_path,
         embed_key=args.embedding_key,
         lm_head_key=args.lm_head_key,
-        device="cuda",
+        device=device_type,
         trust_remote_code=args.trust_remote_code,
     )
 
@@ -588,13 +603,13 @@ def main():
                 continue
             global_step += 1
 
-            input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
+            input_ids = data["input_ids"].to(device, non_blocking=True)
+            attention_mask = data["attention_mask"].to(device, non_blocking=True)
+            loss_mask = data["loss_mask"].to(device, non_blocking=True)
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            hidden_states = target_output.hidden_states.to(device, non_blocking=True)
             lambda_base = get_lambda_base(
                 global_step=global_step,
                 total_steps=total_steps,

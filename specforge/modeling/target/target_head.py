@@ -9,7 +9,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from specforge.utils import padding
+from specforge.utils import get_local_device, padding
 
 
 class TargetHead(nn.Module):
@@ -18,6 +18,7 @@ class TargetHead(nn.Module):
         self.config = AutoConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
+        # Fall back to ``text_config`` when present so that VLM models load correctly.
         self.text_config = getattr(self.config, "text_config", self.config)
 
         self.hidden_size = self.text_config.hidden_size
@@ -40,7 +41,9 @@ class TargetHead(nn.Module):
             cache_dir=cache_dir,
         )
         target_head.freeze_weights()
-        target_head = target_head.eval().cuda().to(torch.bfloat16)
+        target_head = target_head.eval().to(
+            device=get_local_device(), dtype=torch.bfloat16
+        )
         return target_head
 
     @torch.no_grad()
