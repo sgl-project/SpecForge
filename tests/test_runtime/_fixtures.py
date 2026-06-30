@@ -54,6 +54,38 @@ def build_single_rank_distributed(port="29561"):
     init_distributed(timeout=10, tp_size=1, sp_ulysses_size=1, sp_ring_size=1)
 
 
+def init_rank_distributed(
+    rank,
+    world_size,
+    *,
+    tp_size=1,
+    sp_ulysses_size=1,
+    sp_ring_size=1,
+    port="29571",
+):
+    """Init one rank of a multi-process group (for the M6 >=4-rank tests).
+
+    Each spawned process calls this with its own rank; together they form a
+    world_size group with the requested TP x SP layout. Mirrors the env that
+    torchrun sets, so SpecForge's ``init_distributed`` builds the real TP +
+    Ulysses/Ring SP groups.
+    """
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = port
+    torch.cuda.set_device(rank)
+    from specforge.distributed import init_distributed
+
+    init_distributed(
+        timeout=60,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+    )
+
+
 def write_draft_config(path):
     with open(path, "w") as f:
         json.dump(TINY_DRAFT_CONFIG, f)
