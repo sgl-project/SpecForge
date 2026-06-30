@@ -276,6 +276,32 @@ class TestFeatureStoreGC(unittest.TestCase):
         self.assertEqual(store.gc()["force_freed"], 0)
         self.assertEqual(store.health()["resident_samples"], 1)
 
+    def test_release_after_reput_while_leased_does_not_leak(self):
+        # Regression for the consume-once leak: re-put a sample_id while an older
+        # lease is still outstanding, then release the newest handle and finally
+        # the stale old handle. The current generation MUST be freed.
+        store = LocalFeatureStore("st")
+        ref1 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        _, h1 = store.get(ref1)  # lease on gen1
+        ref2 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})  # gen2
+        _, h2 = store.get(ref2)  # lease on gen2
+        store.release(h2)  # newest released first (h1/gen1 still active)
+        store.release(h1)  # stale gen1 handle released last
+        h = store.health()
+        self.assertEqual(h["resident_samples"], 0)  # was leaking before the fix
+        self.assertEqual(h["resident_bytes"], 0)
+
+    def test_stale_release_does_not_free_unconsumed_reput(self):
+        # The reverse guard: a stale double-release must NOT free a freshly
+        # re-put sample that nobody has consumed (leased) yet.
+        store = LocalFeatureStore("st")
+        ref1 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        _, h1 = store.get(ref1)
+        store.release(h1)  # frees gen1
+        store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})  # gen2, no get
+        store.release(h1)  # stale double-release of the gen1 handle
+        self.assertEqual(store.health()["resident_samples"], 1)  # gen2 preserved
+
     def test_release_pending_reconciled_by_gc(self):
         # A backend whose physical free fails parks the sample release-pending;
         # gc() retries within the bounded window, then force-frees.
