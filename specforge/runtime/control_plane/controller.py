@@ -30,6 +30,7 @@ from collections import OrderedDict, deque
 from typing import Any, Deque, Dict, List, Optional
 
 from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
+from specforge.runtime.control_plane.backpressure import BackpressureController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
@@ -80,10 +81,15 @@ class DataFlowController:
         *,
         sample_queue: Optional[SampleRefQueue] = None,
         metadata_store: Optional[MetadataStore] = None,
+        backpressure: Optional[BackpressureController] = None,
     ) -> None:
         self.run_id = run_id
         self.sample_queue = sample_queue or SampleRefQueue()
         self.store = metadata_store or InMemoryMetadataStore()
+        # Optional backpressure policy. None = never pause / no caps (M1-M4
+        # behavior). The controller owns the pause decision; the policy only
+        # reads capacity (FeatureStore.health) — no tensors cross this seam.
+        self.backpressure = backpressure
         self._prompts: "OrderedDict[str, PromptTask]" = OrderedDict()
         self._prompt_pending: Deque[str] = deque()
         self._prompt_leased: Dict[str, str] = {}  # task_id -> worker_id
@@ -139,9 +145,22 @@ class DataFlowController:
         return task_ids
 
     def lease_prompt_tasks(self, worker_id: str, max_tasks: int) -> List[PromptTask]:
+        # Backpressure: pause leasing entirely above the high watermark (a paused
+        # rollout that asks for work is "rollout starvation" — logged distinctly
+        # from trainer starvation). Consult the policy *outside* the controller
+        # lock; it takes the store lock internally.
+        if self.backpressure is not None and self.backpressure.should_pause_prompts():
+            self.backpressure.note_rollout_starved()
+            return []
         out: List[PromptTask] = []
         with self._lock:
-            for _ in range(max_tasks):
+            grant = max_tasks
+            if self.backpressure is not None:
+                inflight = sum(
+                    1 for w in self._prompt_leased.values() if w == worker_id
+                )
+                grant = self.backpressure.cap_prompt_grant(inflight, max_tasks)
+            for _ in range(grant):
                 if not self._prompt_pending:
                     break
                 task_id = self._prompt_pending.popleft()
@@ -203,7 +222,14 @@ class DataFlowController:
     def lease_train_refs(
         self, trainer_id: str, max_refs: int, timeout_s: Optional[float] = None
     ) -> List[SampleRef]:
-        return self.sample_queue.get(max_refs, timeout_s=timeout_s)
+        if self.backpressure is not None:
+            max_refs = self.backpressure.cap_train_lease(max_refs)
+        refs = self.sample_queue.get(max_refs, timeout_s=timeout_s)
+        # Empty lease == trainer outran rollout (or rollout is paused). Logged as
+        # trainer starvation — the opposite condition from rollout starvation.
+        if not refs and self.backpressure is not None:
+            self.backpressure.note_trainer_starved()
+        return refs
 
     def ack_train_refs(
         self,
@@ -251,20 +277,28 @@ class DataFlowController:
             workers = len(self._workers)
             trainers = len(self._trainers)
         marker = self.store.durable_marker()
-        return {
+        committed = self.store.committed_count()
+        acked = len(marker["acked"])
+        status = {
             "run_id": self.run_id,
             "prompts": prompts,
             "prompts_pending": pending,
             "prompts_leased": leased,
             "prompts_failed": failed,
-            "samples_committed": self.store.committed_count(),
+            "samples_committed": committed,
+            # train_backlog = samples produced but not yet acked-as-trained: the
+            # count-based "trainer behind rollout" signal for backpressure.
+            "train_backlog": committed - acked,
             "queue_depth": self.sample_queue.depth(),
             "queue_in_flight": self.sample_queue.in_flight(),
             "rollout_workers": workers,
             "trainers": trainers,
             "durable_global_step": marker["global_step"],
-            "durable_acked": len(marker["acked"]),
+            "durable_acked": acked,
         }
+        if self.backpressure is not None:
+            status["backpressure"] = self.backpressure.snapshot()
+        return status
 
 
 __all__ = ["DataFlowController", "TrainLease"]

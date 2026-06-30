@@ -160,7 +160,7 @@ The store has five lifetime ops:
 | `put`       | `rollout_worker` (online only)        | adds the sample             |
 | `get`       | `FeatureDataLoader`                   | none (hands out a lease)    |
 | `release`   | `FeatureDataLoader` after fetch       | frees on the last lease     |
-| `abort`     | `rollout_worker` / terminal drop      | evicts (or debug-retains)   |
+| `abort`     | `rollout_worker` / terminal drop      | evicts (frees the sample)   |
 | `gc`        | controller/orchestrator on a timer    | force-frees abandoned bytes |
 
 ### Consume-once free (the design point worth remembering)
@@ -190,7 +190,40 @@ re-put is a safe no-op and can never alias freshly stored data. This is what let
 `LocalFeatureStore(max_resident_bytes=…)` (opt-in, default unbounded) makes
 `put()` raise a descriptive `MemoryError` once residency would exceed the budget
 — a defined failure instead of a silent OOM when the consumer falls behind.
-Residency is observable via `health()`.
+Residency is observable via `health()`. The *controller* reads `health()` and
+pauses prompt leasing at a high watermark **before** this trips (see
+`control_plane/backpressure.py`); the cap is the backstop, not the primary
+mechanism.
+
+### GC and max-hold (M5)
+
+Backpressure only pauses *new* rollout — it cannot free bytes a slow trainer left
+*leased-then-stranded* or *committed-but-never-leased*. The store therefore needs
+an independent reclamation path. `gc()` (idempotent, safe on a timer) does two
+things:
+
+1. **Max-hold force-free.** `max_hold_age_s` (distinct from the *queue* lease
+   timeout) makes a sample eligible for force-free once it is older than the
+   bound **and** no active lease references it. A still-leased old sample is
+   spared — force-freeing it would be a use-after-free for the holder. This is
+   the "trainer lags for hours" backstop.
+2. **Release-pending reconciliation.** A backend whose physical free is
+   async/fallible (Mooncake later) parks the sample release-pending on
+   `release()`; `gc()` retries within a bounded window (`max_release_attempts`)
+   then force-frees, so a stuck cleanup never pins bytes forever. The local
+   backend frees synchronously, so this path is exercised by a fault-injecting
+   subclass in the tests.
+
+`abort()` drops a sample immediately (failed `put`, terminal-sample drop); it
+frees the tensors and all per-sample bookkeeping, which is what the leak gate
+relies on.
+
+**Deadlock-avoidance rule.** In the local-colocated profile the *primary* bound
+is rollout-pause backpressure + trainer-priority dispatch draining the backlog;
+`gc()` max-hold is the *backstop* that evicts the oldest abandoned (unleased)
+refs. A force-freed ref's later `get()` raises `KeyError`, which the loader turns
+into a sample failure the controller retries or marks terminal — the failure
+paths compose.
 
 ## Tests
 
@@ -198,7 +231,10 @@ CPU-only, in [`tests/test_runtime/`](../../../tests/test_runtime):
 
 - `test_feature_store.py` — atomic put, get/handle, idempotent + stale-safe
   release, **consume-once free**, refcounted multi-lease, **bounded online
-  loop**, `max_resident_bytes`, abort, disk dump, `file://` mode.
+  loop**, `max_resident_bytes`, abort, disk dump, `file://` mode. The
+  `TestFeatureStoreGC` class adds the M5 reclamation surface: **leak gate**
+  (`test_abort_returns_bytes_to_baseline`), **max-hold force-free** (sparing
+  leased samples), and **release-pending reconciliation** via `gc()`.
 - `test_sample_ref_queue.py` — lease / ack / fail / depth, idempotent put.
 - `test_feature_dataloader.py` — queue and refs modes, drop_last, batch
   homogeneity validation, offline re-iteration across epochs.
