@@ -117,9 +117,13 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             self.assertTrue(torch.equal(param1, param2))
 
     def test_config_validation(self):
+        # A dimensionally-valid config (hidden_size divisible by num_attention_heads
+        # so it passes transformers' strict config validation) that is still missing
+        # the required `draft_vocab_size` attribute. Building the Eagle3 model from it
+        # should raise AttributeError.
         invalid_config = LlamaConfig(
             vocab_size=1000,
-            hidden_size=127,
+            hidden_size=128,
             num_attention_heads=4,
             num_key_value_heads=2,
         )
