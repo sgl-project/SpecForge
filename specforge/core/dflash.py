@@ -1,7 +1,7 @@
 # coding=utf-8
 """DFlash Training Wrapper."""
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -121,6 +121,7 @@ class OnlineDFlashModel(nn.Module):
         loss_decay_gamma: Optional[float] = None,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        flex_kernel_options: Optional[Dict] = None,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -140,6 +141,7 @@ class OnlineDFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.flex_kernel_options = flex_kernel_options
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -312,11 +314,19 @@ class OnlineDFlashModel(nn.Module):
                 device=device,
             )
 
+        draft_forward_kwargs = {}
+        if (
+            self.attention_backend == "flex_attention"
+            and self.flex_kernel_options is not None
+        ):
+            draft_forward_kwargs["kernel_options"] = self.flex_kernel_options
+
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **draft_forward_kwargs,
         )
 
         logits = self.lm_head(output_hidden)
