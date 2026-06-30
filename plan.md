@@ -54,6 +54,21 @@ This is, in the predecessor's own terms, pulling **feature #32 ("Mooncake stream
 forward from Phase 7 to now** because the requirement demands it — and implementing it with the
 already-built `runtime/` work, behind the clean domain interfaces.
 
+**Two scope decisions that bound this plan** (consolidating with the online-disaggregation
+roadmap, #618):
+
+1. **Frozen target — no weight sync.** "Train-with-decode" means a *frozen* target streams
+   hidden states; the draft is never in the generation loop. Weight sync / hot draft-update /
+   weight-version registry / on-policy are **out of scope**; `draft_weight_version` is provenance
+   only. (This removes the predecessor's W4 weight-lifecycle workload.)
+2. **Ray is an open decision, not a non-goal.** It is a *candidate* for the O2 scale-out
+   orchestrator (multi-node N-producer/M-trainer) — likely necessary, but not committed. Until the
+   decision gate fires we keep the home-grown metadata-only control plane and add nothing.
+
+**Per-phase target/implementation detail lives in [`docs/roadmap/`](docs/roadmap/)** (domain,
+online-disaggregation [folds in #618], eval & breadth); this document is the architecture; the
+roadmap is the build order.
+
 ---
 
 ## 1. Why each side is right (and where each is incomplete)
@@ -82,9 +97,10 @@ do not conflict.
   loss.
 
 **Explicitly not yet implemented in `runtime/`** (flagged in-source — `contracts.py`,
-`trainer.py`, `controller.py`, both `DESIGN.md`s, `runtime/README.md`): the weight-publication
-lifecycle (`WeightVersion`, `WeightPublisher`, `update_draft_weights`, serving accept-length
-gate), full optimizer/scheduler resume, and `no_sync()` accumulation. These are the §3 gaps.
+`trainer.py`, `controller.py`, both `DESIGN.md`s, `runtime/README.md`): live frozen-target online
+capture from a real SGLang server (O1.3), full optimizer/scheduler resume, and `no_sync()`
+accumulation. These are the §3 gaps. (The in-source weight-publication NOTEs — `WeightVersion` /
+`WeightPublisher` / `update_draft_weights` — are **descoped**: the target is frozen, see §8.)
 
 ---
 
@@ -120,13 +136,14 @@ PRODUCE (inference):
   TargetEngine        ── the engine rollout wraps to produce features; the abstraction that
                          replaces the EAGLE3-bound SGLangAdapter.
      HFTargetEngine / SGLangTargetEngine / CustomTargetEngine (in-process)
-     SGLangServerEngine (HTTP service; owns update_draft_weights + serving_metrics for W4)
+     SGLangServerEngine (frozen target as an HTTP/live service; the cross-node capture backend)
   RolloutWorker       ── drives a TargetEngine → writes tensors to FeatureStore → commits
                          SampleRef to the control plane. Stays at the domain↔substrate seam.
 
 CONSUME (training):
-  Trainer             ── owns the lifecycle: loop / eval / checkpoint / weight-sync. WRAPS the
-                         runtime TrainerController/TrainerCore; does NOT replace them.
+  Trainer             ── owns the lifecycle: loop / eval / checkpoint. WRAPS the runtime
+                         TrainerController/TrainerCore; does NOT replace them. (No weight-sync —
+                         the target is frozen, §8.)
   DraftTrainStrategy  ── per-algorithm forward+loss (eagle3 TTT / dflash block / domino). Kept
                          in runtime/training (the seam) — already plan-shaped.
   CheckpointManager / Evaluator / lr_scheduler / fsdp seam  ── the managers (G1).
@@ -165,11 +182,11 @@ specforge/
 │                                    # (NO separate data/streams package — FeatureDataLoader over
 │                                    #  SampleRef+FeatureStore IS the stream. Ref sources
 │                                    #  (offline/rollout/streaming) live in runtime/data_plane;
-│                                    #  ServingTrafficStream (W4) is just another prompt/ref source)
+│                                    #  live frozen-target capture is just another ref source)
 │
 ├── training/                        # domain lifecycle + managers (WRAPS runtime/training)
-│   ├── trainer.py                   # owns loop/eval/checkpoint/weight-sync; delegates the step
-│   │                                #   to runtime TrainerCore + DraftTrainStrategy (kept seam)
+│   ├── trainer.py                   # owns loop/eval/checkpoint; delegates the step to runtime
+│   │                                #   TrainerCore + DraftTrainStrategy (kept seam)
 │   ├── checkpoint.py  lr_scheduler.py  fsdp.py   # NEW managers (§3). Strategies + StrategySpec
 │   │                                #   registry stay in runtime/training (the seam, unchanged).
 │
@@ -205,10 +222,15 @@ from the in-source `NOTE`s. Each lands behind the canonical spine without re-plu
   `TargetEngine` and stop binding to `generate_eagle3_data` / EAGLE3 names. Keep the existing
   `FeatureSource` Protocol. Add `SGLangServerEngine` (HTTP) as the light cross-node engine.
 
-### G3 — W4 weight lifecycle (explicit gap, flagged in `runtime/` source)
-- `WeightVersion`, `WeightPublisher`, `TargetEngine.update_draft_weights`,
-  `SGLangServerEngine` decode-mode + `serving_metrics()`, `ServingTrafficStream`, and the
-  serving accept-length gate (predecessor §4.10). One trainer ↔ one server scope.
+### G3 — Live online capture (frozen target; **no** weight sync)
+- Replace the in-process generator with **live SGLang-server hidden-state capture**: a *frozen*
+  target streams aux+final hidden states into `MooncakeFeatureStore`; the producer commits
+  `SampleRef`s. The cross-process control plane + async loop are in-review; live capture (the
+  gating spike) is next; scale-out (Ray = **open**) and hardening follow.
+- **Weight sync / hot draft-update / on-policy are explicitly out of scope.** The target is
+  frozen, so the streamed data is independent of draft weights — there is nothing to re-sync and
+  no staleness. `draft_weight_version` is kept **only as provenance**.
+- Detailed phases (O1–O3): [`docs/roadmap/online-disaggregation.md`](docs/roadmap/online-disaggregation.md).
 
 ### G4 — Composition + models (predecessor Phase 1)
 - `models/drafts` `DRAFT_REGISTRY` (`@register_draft`) for draft **architectures** (separate
@@ -224,17 +246,23 @@ from the in-source `NOTE`s. Each lands behind the canonical spine without re-plu
 
 ## 4. Topologies & the colocated lightweight path
 
-The four workloads are unchanged; they differ only in which *ref source* + `FeatureStore` +
-`TargetEngine` compose. All consume **one** `FeatureDataLoader → TrainBatch` iterator; the
-trainer/strategy/backend are identical regardless (no per-topology stream class).
+The workloads differ only in which *ref source* + `FeatureStore` + `TargetEngine` compose. All
+consume **one** `FeatureDataLoader → TrainBatch` iterator; the trainer/strategy/backend are
+identical regardless (no per-topology stream class). **In every case the target is frozen** — the
+draft is never in the generation loop, so the streamed features do not depend on draft training
+progress (no staleness, nothing to re-sync).
 
 | # | Workload | Ref source (→ FeatureDataLoader) | FeatureStore | Control plane |
 |---|---|---|---|---|
 | W1 | Offline (precomputed) | `OfflineManifestReader` (refs) | Local (`file://`/`mem://`) | **no-op** |
-| W2 | In-process online | `RolloutWorker` → `SampleRefQueue` | Local (`mem://`) | **no-op** |
-| W3 | Disaggregated online (isolated pools, high BW) | `RolloutWorker` (producer pool) → `StreamingRefChannel` | **Mooncake** | **active** (lease/ack/reconcile/backpressure) |
+| W2 | In-process online (frozen target) | `RolloutWorker` → `SampleRefQueue` | Local (`mem://`) | **no-op** |
+| W3 | Disaggregated online (frozen target; isolated pools, high BW) | `RolloutWorker` (producer pool) → `StreamingRefChannel` | **Mooncake** | **active** (lease/ack/reconcile/backpressure) |
 | W3′ | Disaggregated online (light/cross-node) | `SGLangServerEngine` over HTTP (RemoteStream-style source) | n/a (HTTP) | minimal |
-| W4 | Train-with-decode | `RolloutWorker` / `ServingTrafficStream` + `SGLangServerEngine` | per above | per above |
+
+> **"Train-with-decode" = live *frozen-target* generation** — i.e. W2 (colocated) or W3
+> (disaggregated), **not** a separate workload. The predecessor's dual-purpose
+> serve-and-push-weights "W4" is **out of scope**: a frozen target means there is nothing to push.
+> See [`docs/roadmap/online-disaggregation.md`](docs/roadmap/online-disaggregation.md).
 
 **Colocated lightweight path (W1/W2): keep it, but as a *no-op control plane*, not a fork.**
 The control-plane machinery (lease/ack/reconcile/backpressure/durable metadata/cross-process
@@ -259,8 +287,10 @@ process) it is pure overhead. Resolution:
 1. **"No Mooncake in Phase 1-6" → revised.** The Mooncake control/data plane is now the
    **canonical** disaggregation backend, because the isolated-pool / >100 GB/s requirement is
    real and HTTP cannot serve it. The predecessor's `RemoteStream`-over-HTTP remains as the
-   **light** second backend (W3′), and the "Ray actor topology" non-goal still holds (we use
-   Mooncake transport, not Ray scheduling).
+   **light** second backend (W3′). Mooncake is used as a *transport*; the scale-out
+   **orchestration** layer (Ray vs. home-grown) is an **open decision** (see §6, §8 and
+   [`docs/roadmap/online-disaggregation.md`](docs/roadmap/online-disaggregation.md) §O2), no longer
+   a flat non-goal.
 2. **Primary abstraction / `HiddenStateStream` dropped.** Predecessor: a coarse
    `HiddenStateStream` produces `TrainBatch` and is the source of truth. Reconciled:
    `SampleRef` + `FeatureStore` + `FeatureDataLoader` is canonical, and `FeatureDataLoader`
@@ -273,23 +303,34 @@ process) it is pure overhead. Resolution:
 4. **Module layout** gains a top-level `runtime/` (the spine) under the domain layer; `models/`
    (drafts + targets), `training/` (Trainer + managers), `eval/`, `export/`, `config/`, `cli.py`
    are the layer on top. No separate `data/streams/` package — the loader is the stream.
-5. **W4 weight lifecycle** is reframed from "additive HTTP-only" to "an interface that has both
-   an HTTP (`SGLangServerEngine`) and, where needed, a Mooncake-backed implementation."
+5. **W4 weight lifecycle → dropped.** The predecessor's serve-and-push-weights workload + weight
+   registry are **out of scope**. "Train-with-decode" is *frozen-target* live generation (W2/W3);
+   weight sync / hot draft-update / staleness gate / on-policy are explicitly cut, aligning with
+   #618. `draft_weight_version` survives only as provenance metadata.
+6. **Ray reframed from non-goal → open.** It is a *candidate* for the O2 scale-out orchestrator
+   (multi-node N-producer/M-trainer), not committed and not forbidden; the decision gate lives in
+   the roadmap.
 
-Everything else in the predecessor (workloads W1–W4, the domain abstractions, the testing
+Everything else in the predecessor (workloads W1–W3, the domain abstractions, the testing
 discipline, the MLA/export/eval/config detail) **carries forward unchanged**.
 
 ---
 
 ## 6. Tradeoffs (updated)
 
-### Ray + Mooncake vs HTTP/gRPC  — *bet partially reversed*
+### Mooncake transport vs HTTP/gRPC — *transport bet reversed*
 The predecessor bet "HTTP is sufficient, Mooncake is gated behind profiling." For the **data
 transport** that bet is now wrong (isolated-pool / >100 GB/s requirement) — Mooncake is in,
-canonically. For **scheduling/orchestration**, the bet still holds: we use Mooncake as a
-*transport*, with our own metadata-only control plane, **not** Ray actors. Multi-job inference-
-pool sharing (Ray's real value, predecessor T2 / #34) stays a non-goal until ≥5 concurrent jobs
-share one target.
+canonically. The `RemoteStream`-over-HTTP path stays as the light cross-node backend (W3′).
+
+### Scale-out orchestration: Ray vs. home-grown — *OPEN*
+Today's metadata-only control plane handles a single producer-pool ↔ trainer scope. **O2**
+(multi-node N-producer/M-trainer scale-out) needs an orchestration layer, and **whether that is
+Ray or a home-grown scheduler is undecided** — likely necessary, but not committed. It is **not**
+a non-goal anymore; the decision gate (when ≥1 of: >1 producer pool, cross-node failover,
+multi-job pool sharing) lives in
+[`docs/roadmap/online-disaggregation.md`](docs/roadmap/online-disaggregation.md) §O2. Until then
+we keep the home-grown control plane and add nothing.
 
 ### One canonical path vs a light colocated fork
 Chosen: **one path** (spine everywhere) + control-plane-as-no-op for colocated. Keeps
@@ -310,7 +351,9 @@ registry vs HF AutoModel — are unchanged and carry forward.)*
 
 The spine is already landed, so migration is "grow the domain layer on top + close the gaps,"
 not a rewrite. Every phase that touches the training path passes the numerical-equivalence gate
-(below) against the prior commit.
+(below) against the prior commit. **Per-phase target/implementation/tests/done-when detail lives
+in [`docs/roadmap/`](docs/roadmap/)** — the phases below are the index; the online track there
+also folds in the former online-disaggregation roadmap (#618).
 
 - **Phase A — composable launch (DONE / in review).** `StrategySpec` registry + parameterized
   `launch.py`; eagle3/dflash/domino end-to-end (#627/#628/#629). 197 `tests/test_runtime` OK.
@@ -324,8 +367,12 @@ not a rewrite. Every phase that touches the training path passes the numerical-e
   `CheckpointManager`, `Evaluator`. Gate: loss/eval parity at fixed steps.
 - **Phase E — `models/drafts` registry + MLA draft + config/CLI/export (G4/G5).** Adding a
   draft arch = one decorated file; one validated YAML per run; export-loop test.
-- **Phase F — W4 weight lifecycle (G3).** `update_draft_weights`, `SGLangServerEngine`
-  decode-mode + serving metrics, `ServingTrafficStream`, accept-length gate.
+- **Online track (parallel; G3) — live *frozen-target* capture.** O1.1 shared control plane +
+  O1.2 async loop (in review) → **O1.3** live SGLang-server hidden-state capture (next; gated by a
+  throughput spike) → **O2** scale-out (orchestrator: Ray = open) → **O3** hardening. **No weight
+  sync.** Detail: [`docs/roadmap/online-disaggregation.md`](docs/roadmap/online-disaggregation.md).
+- **Eval track (parallel) — E1** acceptance-length eval harness → **E2** algorithm breadth (new
+  algo = a `StrategySpec` + loss). Detail: [`docs/roadmap/eval-and-breadth.md`](docs/roadmap/eval-and-breadth.md).
 
 Doc debt to fix alongside Phase B: revise the predecessor's "No Mooncake / HTTP is sufficient"
 statements (now §5/§6) so the code and the plan stop contradicting each other.
@@ -333,15 +380,21 @@ statements (now §5/§6) so the code and the plan stop contradicting each other.
 ---
 
 ## 8. Non-goals (updated)
-- **No Ray dependency / no multi-engine load balancing.** One trainer ↔ one serving engine
-  (incl. W4). Multi-job pool sharing is gated behind ≥5 concurrent jobs.
+- **No weight sync / hot draft-update / on-policy training.** The target is **frozen**; the
+  draft is never in the generation loop. No `WeightPublisher`, no weight-version registry, no
+  staleness gate. `draft_weight_version` is provenance metadata only.
 - **No two-stack fork for colocated.** One canonical data path; colocated is the spine with the
   control plane as a no-op, not a parallel implementation.
 - **No vLLM target backend** (possible via `TargetEngine`, not prioritized).
-- **No in-trainer serving-prompt interception** — `ServingTrafficStream` reads an external
-  buffer the serving cluster populates.
+- **No multi-engine load balancing / multi-job inference-pool sharing** for now — gated behind
+  ≥5 concurrent jobs sharing one target.
 
-*(Reversed from the predecessor: "No Mooncake" — Mooncake transport is now canonical for W3.)*
+**Open decisions (NOT non-goals):**
+- **Ray (or a home-grown scheduler) for O2 scale-out** — likely necessary for multi-node
+  N-producer/M-trainer; undecided. Decision gate in §6 / the online roadmap.
+
+*(Reversed from the predecessor: "No Mooncake" → Mooncake transport is now canonical for W3;
+"No Ray" → Ray is now an open scale-out decision, not a flat non-goal.)*
 
 ---
 
@@ -353,7 +406,7 @@ statements (now §5/§6) so the code and the plan stop contradicting each other.
 | Colocated (C) | W1/W2 run with control plane as no-op; colocated≡disagg equivalence gate passes. |
 | Managers (D) | resume reproduces the no-resume loss curve; one all-reduce per optimizer step; best-checkpoint tracked. |
 | Drafts/MLA (E) | MLA Eagle3 trains + loads in SGLang; new draft arch = one `@register_draft` file. |
-| W4 (F) | one server serves spec-decode traffic + produces training data; weight push every N steps; serving acceptance rate trends up; weight-sync parity gate passes. |
+| Online (O1.3) | a live **frozen-target** SGLang server feeds training with zero precomputed features; loss/eval matches the offline baseline on the same prompts+seed. (Scale-out O2 / Ray = open.) |
 
 ---
 
@@ -374,5 +427,7 @@ Carries the predecessor's gates, plus the reconciliation-specific one.
   accumulation = one all-reduce per `optimizer.step()`.
 - **10.5 Export-loop test:** train MLA draft 100 steps → export → load in SGLang → 32 gens,
   acceptance > 0 (catches weight-name-map regressions).
-- **10.6 Weight-sync correctness gate (W4):** after `update_draft_weights`, served draft logits
-  match trainer draft within tolerance; serving acceptance non-decreasing across a sync.
+- **10.6 Online-capture parity gate (O1.3):** a live frozen-target capture run produces
+  features + loss matching the offline-precomputed baseline on the same prompts/seed (the target
+  is frozen, so this must hold exactly up to nondeterminism tolerance). No weight-sync gate —
+  weight sync is out of scope.
