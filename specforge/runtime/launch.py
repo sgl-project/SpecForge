@@ -382,6 +382,181 @@ def build_online_eagle3_runtime(
     return trainer, loader, workers, controller, drive_rollout
 
 
+def _online_cat_collate(feats):
+    """Concatenate pre-formed online features along the batch dim (see
+    build_online_eagle3_runtime); online features are already in train form, so a
+    plain cat is correct for equal-length / batch_size=1 batches."""
+    import torch
+
+    return {k: torch.cat([f[k] for f in feats], dim=0) for k in feats[0]}
+
+
+def build_disagg_online_producer(
+    *,
+    target_model,
+    prompts,
+    feature_store: FeatureStore,
+    channel,
+    run_id: str,
+    target_hidden_size: int,
+    target_vocab_size: Optional[int] = None,
+    draft_vocab_size: Optional[int] = None,
+    target_repr: str = "logits",
+    aux_hidden_state_layer_ids=None,
+    vocab_map_version: Optional[str] = None,
+    t2d=None,
+    num_rollout_workers: int = 1,
+    device: str = "cuda",
+    lease: int = 8,
+    in_flight_high_watermark: int = 256,
+    backpressure_poll_s: float = 0.2,
+    sleep=None,
+):
+    """Producer side of an ONLINE disaggregated run (rollout pool).
+
+    Mirrors the producer half of :func:`build_online_eagle3_runtime`, but the
+    RolloutWorkers put() into a cross-node ``feature_store`` (a consume-once
+    :class:`MooncakeFeatureStore`) and the committed SampleRefs are streamed to
+    the consumer through a :class:`StreamingRefChannel` instead of an in-process
+    queue. The feature tensors never touch a shared mount.
+
+    Returns ``(workers, drive_producer)``. ``drive_producer()`` runs the workers
+    until the prompt pool drains, publishing refs to the channel and applying
+    backpressure (it pauses while ``channel.in_flight_remote()`` exceeds
+    ``in_flight_high_watermark`` so a lagging trainer can't overrun the Mooncake
+    segment), then closes the channel so the consumer's loader terminates.
+    """
+    import time
+
+    from specforge.runtime.inference.capture import CaptureConfig
+    from specforge.runtime.inference.rollout_worker import RolloutWorker
+    from specforge.runtime.inference.sglang_adapter import SGLangAdapter
+
+    sleep = sleep or time.sleep
+    controller = DataFlowController(run_id)
+    controller.ingest_prompts(prompts)
+
+    if aux_hidden_state_layer_ids is None:
+        aux_hidden_state_layer_ids = tuple(
+            getattr(target_model, "aux_hidden_states_layers", ()) or ()
+        )
+    adapter = SGLangAdapter(target_model, device=device, t2d=t2d)
+    capture = CaptureConfig.from_strategy(
+        required_features=Eagle3TrainStrategy.required_features,
+        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
+        target_repr=target_repr,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        vocab_map_version=vocab_map_version,
+    )
+    workers = [
+        RolloutWorker(
+            controller,
+            feature_store,
+            adapter,
+            capture,
+            run_id=run_id,
+            worker_id=f"rollout-{i}",
+        )
+        for i in range(num_rollout_workers)
+    ]
+
+    def drive_producer(max_rounds: int = 1_000_000) -> int:
+        for w in workers:
+            w.start()
+        produced = 0
+        for _ in range(max_rounds):
+            # backpressure: don't let the producer outrun the consumer (and the
+            # Mooncake segment). in_flight_remote = published - consumer-acked.
+            while channel.in_flight_remote() >= in_flight_high_watermark:
+                sleep(backpressure_poll_s)
+            refs = []
+            for w in workers:
+                refs.extend(w.run_once(max_tasks=lease))
+            if not refs:
+                break  # prompt pool drained
+            channel.publish_many(refs)
+            produced += len(refs)
+        channel.close()  # EOF -> the consumer's loader terminates once drained
+        return produced
+
+    return workers, drive_producer
+
+
+def build_disagg_online_consumer(
+    *,
+    feature_store: FeatureStore,
+    channel,
+    eagle3_model,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    num_epochs: int = 1,
+    max_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    collate_fn=None,
+    idle_timeout_s: Optional[float] = None,
+    logger=None,
+    log_interval: int = 50,
+):
+    """Consumer (trainer) side of an ONLINE disaggregated run.
+
+    Trains from a streamed ``SampleRef`` channel + a consume-once
+    ``feature_store`` produced by a *different pool*. The trainer assembly is the
+    online one (``target_head=None``: rollout already materialized the target
+    distribution); the only difference from colocated online is that refs arrive
+    from a :class:`StreamingRefQueue` over the channel rather than the in-process
+    ``SampleRefQueue``, and the features are fetched cross-node from Mooncake. The
+    loader frees each sample on read (consume-once) and acks the channel (the
+    producer's backpressure signal).
+    """
+    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
+
+    controller = DataFlowController(run_id)
+    queue = StreamingRefQueue(channel, idle_timeout_s=idle_timeout_s)
+    loader = FeatureDataLoader(
+        feature_store,
+        queue,
+        batch_size=batch_size,
+        collate_fn=collate_fn or _online_cat_collate,
+        drop_last=True,
+        strategy="eagle3",
+    )
+
+    parallel = ParallelConfig.from_distributed(
+        tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
+    )
+    backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+    wrapped = backend.prepare_model(
+        eagle3_model, optimizer_target=eagle3_model.draft_model
+    )
+    strategy = Eagle3TrainStrategy(wrapped, target_head=None)
+    core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
+    trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
+    trainer = TrainerController(
+        core,
+        run_id=run_id,
+        output_dir=output_dir,
+        num_epochs=num_epochs,
+        max_steps=max_steps,
+        save_interval=save_interval,
+        eval_interval=eval_interval,
+        log_interval=log_interval,
+        logger=logger,
+        ack_fn=lambda ids, step: controller.ack_train_refs(
+            trainer_id, ids, global_step=step, optimizer_durable=True
+        ),
+    )
+    return trainer, loader
+
+
 # Backward-compatible alias for early branch users.
 build_offline_eagle3_controller = build_offline_eagle3_runtime
 
@@ -391,4 +566,6 @@ __all__ = [
     "build_offline_eagle3_runtime",
     "build_disagg_eagle3_runtime",
     "build_online_eagle3_runtime",
+    "build_disagg_online_producer",
+    "build_disagg_online_consumer",
 ]
