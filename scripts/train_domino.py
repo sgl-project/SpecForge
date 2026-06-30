@@ -18,7 +18,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
@@ -36,6 +36,7 @@ from specforge.tracker import create_tracker
 from specforge.utils import (
     get_last_checkpoint,
     get_local_device,
+    load_tokenizer,
     print_on_rank0,
     print_with_rank,
 )
@@ -497,10 +498,14 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    tokenizer = load_tokenizer(args.target_model_path)
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
+    elif (
+        dflash_config := getattr(draft_model.config, "dflash_config", {})
+    ) and dflash_config.get("mask_token_id") is not None:
+        mask_token_id = dflash_config["mask_token_id"]
     elif tokenizer.mask_token_id is not None:
         mask_token_id = tokenizer.mask_token_id
     else:

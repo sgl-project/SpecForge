@@ -32,7 +32,7 @@ def test_llama3_tp(rank, world_size, temp_dir, port):
             intermediate_size=512,
             num_hidden_layers=2,
             max_position_embeddings=1024,
-            num_attention_heads=10,
+            num_attention_heads=6,
             num_key_value_heads=2,
             initializer_range=0.02,
             hidden_act="silu",

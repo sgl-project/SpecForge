@@ -1,3 +1,8 @@
+# NOTE: core EAGLE3 training is being migrated to the DataFlow runtime launcher
+# scripts/train_eagle3_dataflow.py (offline + online; validated old-vs-new on 7B).
+# That launcher does not YET cover the following, so this script remains the path
+# for them: VLM (--is-vlm), USP sequence parallelism (--attention-backend usp),
+# the eval loop (--eval-*-path), --resume, and experiment trackers (--report-to).
 import argparse
 import hashlib
 import math
@@ -15,7 +20,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor
 
 from datasets import Dataset
 from specforge import (
@@ -48,6 +53,7 @@ from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
+    load_tokenizer,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
@@ -555,18 +561,24 @@ def build_dataloaders(
     processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     # build dataloaders
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = load_tokenizer(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
 
     # convert to dataloader
-    cache_params_string = (
+    dataset_cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
     )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    vocab_cache_params_string = (
+        f"{dataset_cache_params_string}-"
+        f"{draft_model_config.draft_vocab_size}-"
+        f"{draft_model_config.vocab_size}"
+    )
+    cache_key = hashlib.md5(dataset_cache_params_string.encode()).hexdigest()
+    vocab_cache_key = hashlib.md5(vocab_cache_params_string.encode()).hexdigest()
     train_dataset = Dataset.from_generator(
         generator=safe_conversations_generator,
         gen_kwargs={"file_path": args.train_data_path},
@@ -593,7 +605,7 @@ def build_dataloaders(
             target_vocab_size=draft_model_config.vocab_size,
             draft_vocab_size=draft_model_config.draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
+            cache_key=vocab_cache_key,
         )
 
         if not is_online:

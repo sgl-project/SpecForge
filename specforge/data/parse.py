@@ -102,6 +102,20 @@ class Parser(ABC):
 
         return cleaned
 
+    def _normalize_message(self, message: dict) -> dict:
+        role = message.get("role", message.get("from", ""))
+        content = message.get("content") or message.get("value") or ""
+
+        if role in ("human", "user"):
+            role = "user"
+        elif role in ("gpt", "assistant"):
+            role = "assistant"
+
+        normalized = {**message, "role": role, "content": content}
+        normalized.pop("from", None)
+        normalized.pop("value", None)
+        return normalized
+
 
 _harmony_encoding = None
 
@@ -124,7 +138,7 @@ class GeneralParser(Parser):
             messages,
             tokenize=False,
             add_generation_prompt=False,
-            tools=tool,
+            tools=tool if tool else None,
             **kwargs,
         )
         return conversation
@@ -157,6 +171,9 @@ class GeneralParser(Parser):
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if not preformatted:
+            conversation = [
+                self._normalize_message(message) for message in conversation
+            ]
             messages = []
 
             if conversation[0]["role"] == "system":
@@ -170,6 +187,12 @@ class GeneralParser(Parser):
             else:
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
+
+            while conversation and conversation[0]["role"] != "user":
+                warnings.warn(
+                    f"Dropping leading '{conversation[0]['role']}' message before the first user turn."
+                )
+                conversation = conversation[1:]
 
             for j, sentence in enumerate(conversation):
                 role = sentence["role"]
@@ -426,12 +449,14 @@ class ThinkingParser(GeneralParser):
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         """Apply chat template to all messages, handling reasoning_content and tool_calls."""
+        # See GeneralParser.apply_chat_template: pass `None` rather than an empty
+        # list so templates don't enter tool-use mode when there are no tools.
         conversation = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
             add_special_tokens=False,
-            tools=tool,
+            tools=tool if tool else None,
             **kwargs,
         )
         return conversation

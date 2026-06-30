@@ -297,6 +297,11 @@ class Phi3Model(Phi3PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
@@ -369,9 +374,14 @@ class Phi3Model(Phi3PreTrainedModel):
         )
 
 
+from ._tp_loading import TPShardedFromPretrainedMixin
+
+
 @auto_docstring
-class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+class Phi3ForCausalLM(
+    TPShardedFromPretrainedMixin, Phi3PreTrainedModel, GenerationMixin
+):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -402,6 +412,10 @@ class Phi3ForCausalLM(Phi3PreTrainedModel, GenerationMixin):
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
+
         Example:
 
         ```python
