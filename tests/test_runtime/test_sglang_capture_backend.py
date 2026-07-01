@@ -22,7 +22,7 @@ import unittest
 
 _TARGET_DIR = os.path.normpath(
     os.path.join(
-        os.path.dirname(__file__), "..", "..", "specforge", "inference", "target_engine"
+        os.path.dirname(__file__), "..", "..", "specforge", "modeling", "target"
     )
 )
 
@@ -80,7 +80,7 @@ class SglangServerBackendTest(unittest.TestCase):
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        from specforge.inference.target_engine import (
+        from specforge.modeling.target import (
             SGLangServerEagle3TargetEngine,
             get_eagle3_target_model,
         )

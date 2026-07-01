@@ -36,7 +36,6 @@ for target capture; keep it that way.
 
 from __future__ import annotations
 
-from array import array
 from typing import List, Optional, Tuple
 
 import sglang.srt.managers.mm_utils as mm_utils
@@ -56,9 +55,8 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 
-# 0.5.14 relocated prepare_mlp_sync_batch_raw to scheduler_components.dp_attn
-# (module-level function, not a Scheduler method).
-from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
+# prepare_mlp_sync_batch_raw is a module-level function, not a Scheduler method
+from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -121,18 +119,15 @@ class SGLangCaptureBackend:
         original eagle3 path).
         """
         tp_size = dist.get_world_size(get_tp_group())
-        # 0.5.13+ requires a non-None dtype; "auto" lets sglang decide.
+        # NOTE: sglang 0.5.9 requires dtype to be non-None. If torch_dtype is None,
+        # use "auto" to let sglang decide the dtype.
         dtype_arg = torch_dtype if torch_dtype is not None else "auto"
-        # We prefill the whole batch in one forward, so disable chunked prefill:
-        # 0.5.14's eager runner otherwise caps per-call buffers at chunked_prefill_size
-        # (default 8192) and errors when our token count exceeds it.
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
             dtype=dtype_arg,
             enable_return_hidden_states=True,
             disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
-            chunked_prefill_size=-1,
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -157,12 +152,6 @@ class SGLangCaptureBackend:
             nccl_port=None,
             is_draft_worker=False,
         )
-        # 0.5.14 moved post-load setup out of ModelRunner.initialize() (now
-        # weights-only). We drive the runner directly, so run it here: pools for
-        # forward(), attention backend, and the (eager) runner.
-        model_runner.alloc_memory_pool()
-        model_runner.init_attention_backends()
-        model_runner.init_cuda_graphs()
         if wrap_eagle3_logits:
             wrap_eagle3_logits_processors_in_module(
                 model_runner.model, return_full_logits=return_full_logits
@@ -267,17 +256,8 @@ class SGLangCaptureBackend:
         )
         batch.prepare_for_extend()
         self._maybe_prepare_mlp_sync_batch(batch)
-        # 0.5.13+ stages input_ids on pinned CPU and leaves batch.input_ids=None;
-        # the scheduler normally does this H2D copy, but we bypass it.
-        if getattr(batch, "prefill_input_ids_cpu", None) is not None:
-            batch.input_ids = batch.prefill_input_ids_cpu.to(
-                batch.device, non_blocking=True
-            )
-            batch.prefill_input_ids_cpu = None
-        # 0.5.13+ dropped ModelWorkerBatch; ForwardBatch.init_new reads
-        # capture_hidden_mode off the ScheduleBatch, so set it first.
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        model_worker_batch = batch.get_model_worker_batch()
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         output = self.model_runner.forward(forward_batch)
         return output.logits_output if hasattr(output, "logits_output") else output
@@ -300,7 +280,7 @@ class SGLangCaptureBackend:
     # --- EAGLE3 extend (text) ----------------------------------------------
 
     @torch.no_grad
-    def _forward_eagle3_reqs(
+    def _extend_eagle3(
         self,
         reqs,
         capture_aux_hidden_states: bool = True,
@@ -311,9 +291,8 @@ class SGLangCaptureBackend:
         self._set_eagle3_logits_flags(
             return_last_hidden_states, return_logits, shard_returns
         )
-        # Capture lengths before the forward: 0.5.13+ releases origin_input_ids in it.
-        input_lens = [len(req.origin_input_ids) for req in reqs]
         eagle3_output = self._forward_extend(reqs)
+        input_lens = [len(req.origin_input_ids) for req in reqs]
 
         logits = eagle3_output.logits
         aux_hidden_states = eagle3_output.aux_hidden_states
@@ -361,7 +340,7 @@ class SGLangCaptureBackend:
         self._clear_pools()
         return logits, aux_hidden_states, last_hidden_states
 
-    def extend_eagle3(
+    def extend(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -391,17 +370,14 @@ class SGLangCaptureBackend:
                 origin_input_ids=input_id_.view(-1).tolist(),
                 sampling_params=sampling_params,
             )
-            # 0.5.13+ replaced Req.fill_ids with full_untruncated_fill_ids + int
-            # fill_len (set by PrefillAdder, which we bypass; no prefix reuse).
-            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             req.logprob_start_len = len(req.origin_input_ids) - 1
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            self._forward_eagle3_reqs(
+            self._extend_eagle3(
                 reqs,
                 capture_aux_hidden_states=True,
                 return_last_hidden_states=return_last_hidden_states,
@@ -442,7 +418,7 @@ class SGLangCaptureBackend:
 
         return position_ids, rope_deltas
 
-    def extend_eagle3_vlm(
+    def extend_vlm(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -520,7 +496,7 @@ class SGLangCaptureBackend:
 
             # Count image tokens
             num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
-            # print(f"[extend_eagle3_vlm] num_img_tokens in input_ids: {num_img_tokens}")
+            # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
 
             mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
                 spatial_merge_size=self.spatial_merge_size,
@@ -566,18 +542,15 @@ class SGLangCaptureBackend:
                 origin_input_ids=input_id_list,
                 sampling_params=sampling_params,
             )
-            # 0.5.13+ replaced Req.fill_ids with full_untruncated_fill_ids + int
-            # fill_len (set by PrefillAdder, which we bypass; no prefix reuse).
-            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             req.logprob_start_len = len(req.origin_input_ids) - 1
             req.multimodal_inputs = mm_inputs
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            self._forward_eagle3_reqs(
+            self._extend_eagle3(
                 reqs,
                 capture_aux_hidden_states=True,
                 return_last_hidden_states=return_last_hidden_states,
@@ -586,10 +559,6 @@ class SGLangCaptureBackend:
         )
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
-
-    # Back-compat aliases for the pre-B2 SGLangEagle3TargetEngine method surface.
-    extend = extend_eagle3
-    extend_vlm = extend_eagle3_vlm
 
     # --- DFlash extend ------------------------------------------------------
 
@@ -622,17 +591,13 @@ class SGLangCaptureBackend:
                 origin_input_ids=curr_ids.view(-1).tolist(),
                 sampling_params=sampling_params,
             )
-            # 0.5.13+ replaced Req.fill_ids with full_untruncated_fill_ids + int
-            # fill_len (set by PrefillAdder, which we bypass; no prefix reuse).
-            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
-        # Capture lengths before the forward: 0.5.13+ releases origin_input_ids in it.
-        input_lens = [len(req.origin_input_ids) for req in reqs]
         output = self._forward_extend(reqs)
+        input_lens = [len(req.origin_input_ids) for req in reqs]
         if (
             hasattr(output, "aux_hidden_states")
             and output.aux_hidden_states is not None
