@@ -66,6 +66,8 @@ class Trainer:
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
+        resume_from: Optional[str] = None,
+        max_checkpoints: int = 0,
     ):
         # ``durable_ack`` gates the control-plane bookkeeping a colocated run does
         # not need (Phase C, local_colocated): with it off there is no durable ack
@@ -88,6 +90,15 @@ class Trainer:
             strategy=spec.name,
         )
 
+        # Resume restores the trainable draft weights BEFORE the FSDP wrap so the
+        # optimizer's fp32 master (cloned at build) starts from them; the optimizer
+        # + scheduler + RNG are restored just after the wrap builds the optimizer.
+        resume_state = self._load_resume_state(resume_from) if resume_from else None
+        if resume_state is not None:
+            model.draft_model.load_state_dict(
+                resume_state["draft_state_dict"], strict=False
+            )
+
         parallel = ParallelConfig.from_distributed(
             tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
         )
@@ -96,6 +107,13 @@ class Trainer:
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+        if resume_state is not None:
+            backend.load_state_dict(
+                {
+                    "optimizer": resume_state.get("optimizer_state_dict"),
+                    "rng": resume_state.get("rng_state"),
+                }
+            )
         strategy = spec.make_strategy(wrapped, target_head=target_head)
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
         # Durable ack transaction at each optimizer-step boundary. Off for
@@ -120,6 +138,9 @@ class Trainer:
             log_interval=log_interval,
             logger=logger,
             ack_fn=ack_fn,
+            max_checkpoints=max_checkpoints,
+            start_step=resume_state["global_step"] if resume_state else 0,
+            start_epoch=resume_state["epoch"] if resume_state else 0,
         )
 
         # The runtime pieces, exposed for callers that still want them directly
@@ -133,6 +154,22 @@ class Trainer:
         self.controller = controller_obj
         #: the FeatureDataLoader -> TrainBatch iterator (the canonical "stream")
         self.loader = loader
+
+    @staticmethod
+    def _load_resume_state(resume_from: str) -> dict:
+        """Read a checkpoint's ``training_state.pt`` (accepts a dir or ``file://`` uri)."""
+        import os
+
+        import torch
+
+        path = (
+            resume_from[len("file://") :]
+            if resume_from.startswith("file://")
+            else resume_from
+        )
+        if os.path.isdir(path):
+            path = os.path.join(path, "training_state.pt")
+        return torch.load(path, map_location="cpu", weights_only=False)
 
     @classmethod
     def from_strategy_name(cls, strategy: str, **kwargs) -> "Trainer":

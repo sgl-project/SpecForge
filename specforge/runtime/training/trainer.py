@@ -96,12 +96,12 @@ class TrainerCore:
     ) -> StepResult:
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
         loss = out.loss / self.accumulation_steps
-        self.backend.backward(loss)
         self._micro += 1
-        grad_norm = None
+        # The boundary is known before backward so the backend can defer the FSDP
+        # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
-        if stepped:
-            grad_norm = self.backend.step()
+        self.backend.backward(loss, is_boundary=stepped)
+        grad_norm = self.backend.step() if stepped else None
         return self._result(out, grad_norm, stepped, mode="train")
 
     @torch.no_grad()
@@ -156,6 +156,8 @@ class TrainerController:
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
         start_step: int = 0,
         start_epoch: int = 0,
+        max_checkpoints: int = 0,
+        checkpoint_manager: Optional[Any] = None,
     ) -> None:
         self.core = core
         self.run_id = run_id
@@ -163,6 +165,8 @@ class TrainerController:
         self.save_interval = save_interval
         self.eval_interval = eval_interval
         self.log_interval = log_interval
+        self.max_checkpoints = max_checkpoints
+        self._checkpoint_mgr = checkpoint_manager
         self.max_steps = max_steps
         # Schedule horizon for step-dependent losses (Domino's lambda_base decay).
         # Distinct from max_steps (an optional early-stop CAP): a run may stop early
@@ -184,6 +188,7 @@ class TrainerController:
         self.micro_step = 0
         self.epoch = start_epoch
         self.last_metrics: Dict[str, Any] = {}
+        self.last_eval_metrics: Dict[str, float] = {}
 
     def fit(
         self, data: Iterable[TrainBatch], eval_data: Optional[Iterable] = None
@@ -217,6 +222,7 @@ class TrainerController:
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     self.logger(result.metrics, self.global_step)
+                did_eval = False
                 if (
                     self.eval_interval
                     and eval_data is not None
@@ -224,47 +230,58 @@ class TrainerController:
                 ):
                     self.evaluate(eval_data)
                     module.train()
+                    did_eval = True
                 if self.save_interval and self.global_step % self.save_interval == 0:
                     self.save_checkpoint(self.global_step)
+                    # Track the best checkpoint among those just saved AND evaluated.
+                    if did_eval:
+                        self._checkpoint_manager().update_best(
+                            self.global_step, self.last_eval_metrics
+                        )
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
         return self.global_step
 
     @torch.no_grad()
     def evaluate(self, data: Iterable[TrainBatch]) -> Dict[str, float]:
+        """Correct acceptance-length eval: per-position accuracy is aggregated over
+        the whole pass before the geometric sum (see :class:`Evaluator`)."""
+        from specforge.eval import Evaluator
+
         module = self.core.strategy.trainable_module()
         module.eval()
-        agg: Dict[str, list] = {}
-        n = 0
-        for batch in data:
-            rep = self.core.eval_step(batch)
-            n += 1
-            for k, v in rep.metrics.items():
-                if isinstance(v, (int, float)):
-                    agg.setdefault(k, []).append(v)
-        return {k: sum(vs) / len(vs) for k, vs in agg.items() if vs}
+        metrics = Evaluator().run(
+            lambda batch: self.core.strategy.forward_loss(batch), data
+        )
+        self.last_eval_metrics = metrics
+        return metrics
+
+    def _checkpoint_manager(self):
+        # Lazily built in its S-home so the runtime seam does not import the domain
+        # layer at module load (mirrors _assemble_trainer's lazy Trainer import).
+        if self._checkpoint_mgr is None:
+            from specforge.training.checkpoint import CheckpointManager
+
+            self._checkpoint_mgr = CheckpointManager(
+                self.output_dir, self.run_id, max_checkpoints=self.max_checkpoints
+            )
+        return self._checkpoint_mgr
 
     def save_checkpoint(self, step: int) -> Checkpoint:
-        ckpt_dir = os.path.join(self.output_dir, f"{self.run_id}-step{step}")
-        is_rank0 = (
-            not torch.distributed.is_initialized()
-        ) or torch.distributed.get_rank() == 0
-        full_state = self.core.backend.state_dict()
-        draft_state = self.core.strategy.checkpoint_state_filter(full_state)
-        if is_rank0:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(
-                {
-                    "draft_state_dict": draft_state,
-                    "global_step": step,
-                    "epoch": self.epoch,
-                    "strategy": self.core.strategy.name,
-                    "run_id": self.run_id,
-                },
-                os.path.join(ckpt_dir, "training_state.pt"),
-            )
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        full = self.core.backend.state_dict()
+        draft_state = self.core.strategy.checkpoint_state_filter(full["model"])
+        ckpt_dir = self._checkpoint_manager().save(
+            {
+                "draft_state_dict": draft_state,
+                "optimizer_state_dict": full["optimizer"],
+                "rng_state": full["rng"],
+                "global_step": step,
+                "epoch": self.epoch,
+                "strategy": self.core.strategy.name,
+                "run_id": self.run_id,
+            },
+            step,
+        )
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
             global_step=step,
