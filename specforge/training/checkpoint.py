@@ -113,16 +113,22 @@ class CheckpointManager:
         s = self.score(eval_metrics)
         return s is not None and (self.best_score is None or s > self.best_score)
 
-    def update_best(self, step: int, eval_metrics: Dict[str, Any]) -> bool:
+    def update_best(
+        self, step: int, eval_metrics: Dict[str, Any], *, force: bool = False
+    ) -> bool:
         """Track ``step`` as the best checkpoint if its metrics beat the record.
 
         Assumes ``step`` was already ``save``-d (the ``best`` pointer needs a
         directory to point at). Persists ``best_meta.json`` so the record — and
-        rotation protection — survive a restart. Returns True on a new best.
+        rotation protection — survive a restart. ``force=True`` records
+        unconditionally: used after a rank-agreed (broadcast) verdict, where a
+        rank whose stale local record disagrees must still follow rank0.
+        Returns True on a new best.
         """
-        if not self.is_better(eval_metrics):
+        score = self.score(eval_metrics)
+        if score is None or (not force and not self.is_better(eval_metrics)):
             return False
-        self.best_score, self.best_step = self.score(eval_metrics), step
+        self.best_score, self.best_step = score, step
         if self.is_rank0():
             ckpt_dir = self.checkpoint_dir(step)
             self._point("best", ckpt_dir)

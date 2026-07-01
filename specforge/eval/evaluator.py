@@ -21,9 +21,13 @@ per-position structure, so their ``simulated_acc_len`` degenerates to that scala
 
 Data-parallel eval: **every** reported metric — loss, per-position counts, and
 the scalar-accuracy sums — is reduced across ranks, so the numbers cover the
-whole eval set regardless of sharding. The collective schedule is decided
-*globally*, never from rank-local state (a rank whose shard is empty issues the
-same collectives as its peers), so a ragged shard cannot desynchronize NCCL.
+whole eval set regardless of sharding. The evaluator's OWN collective schedule
+is decided *globally*, never from rank-local shard content: a rank whose shard
+yields only scalar batches — or nothing — issues exactly the same reductions as
+its peers. NB this covers the evaluator's reductions, not the caller's
+``forward_fn``: when the forward itself is collective (an FSDP-wrapped module
+all-gathers parameters per forward), every rank must iterate the SAME NUMBER of
+eval batches — shard by equal counts, or hand every rank the same eval set.
 Accumulation stays on-device; the single host sync happens after the loop.
 """
 
@@ -144,11 +148,13 @@ class Evaluator:
 
     @staticmethod
     def _comm_device() -> torch.device:
-        """The device collectives must use: the local CUDA device for NCCL, CPU else."""
+        """The device collectives must use: this rank's BOUND CUDA device for NCCL,
+        CPU otherwise. ``current_device`` (set by ``init_distributed`` on every
+        launch path) rather than the LOCAL_RANK env var, which non-torchrun
+        launchers may not export — an unset LOCAL_RANK would put every rank's
+        reduction tensor on cuda:0 and break the NCCL communicator."""
         if "nccl" in str(dist.get_backend()):
-            from specforge.utils import get_local_device
-
-            return get_local_device()
+            return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")
 
     @staticmethod

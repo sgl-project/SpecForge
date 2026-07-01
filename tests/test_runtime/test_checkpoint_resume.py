@@ -258,6 +258,8 @@ class TestCheckpointResume(unittest.TestCase):
 
         state = CheckpointManager.read_resume_state(ck.checkpoint_uri)
         self.assertEqual(state["epoch_batch"], CUT)
+        # position is also persisted batch-size-independently, in samples
+        self.assertEqual(state["epoch_samples"], CUT * BS)
         # Same seed as the reference: the draft's FROZEN embedding is set at
         # construction and is not in the checkpoint (it is loaded from the target,
         # not trained), so it must be reconstructed identically — exactly as a real

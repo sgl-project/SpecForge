@@ -154,6 +154,7 @@ class TrainerController:
         start_step: int = 0,
         start_epoch: int = 0,
         start_batch: int = 0,
+        start_samples: int = 0,
         checkpoint_manager: Optional[Any] = None,
     ) -> None:
         self.core = core
@@ -185,12 +186,17 @@ class TrainerController:
         self.global_step = start_step
         self.micro_step = 0
         self.epoch = start_epoch
-        # Resume position within the interrupted epoch, in micro-batches:
-        # ``fit`` skips this many batches of its FIRST epoch (via ``data.seek``
-        # when the stream supports it) so a resumed run continues on the data
-        # the uninterrupted run would have seen — the plan's seek()-equivalent.
+        # Resume position within the interrupted epoch: ``fit`` skips
+        # ``start_batch`` batches of its FIRST epoch (via ``data.seek`` when the
+        # stream supports it) so a resumed run continues on the data the
+        # uninterrupted run would have seen — the plan's seek()-equivalent. The
+        # position is also tracked (and persisted) in SAMPLES, which is
+        # batch-size independent; the domain Trainer converts samples back to
+        # batches and fails fast on a batch-size drift it cannot divide.
         self._start_batch = start_batch
+        self._start_samples = start_samples
         self.epoch_batch = start_batch
+        self.epoch_samples = start_samples
         self.last_metrics: Dict[str, Any] = {}
 
     def fit(
@@ -209,6 +215,7 @@ class TrainerController:
             stream: Iterable[TrainBatch] = data
             skip, self._start_batch = self._start_batch, 0
             self.epoch_batch = skip
+            self.epoch_samples, self._start_samples = self._start_samples, 0
             if skip:
                 if hasattr(data, "seek"):
                     data.seek(skip)
@@ -219,6 +226,7 @@ class TrainerController:
                     stream = it
             for batch in stream:
                 self.epoch_batch += 1
+                self.epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
@@ -255,17 +263,20 @@ class TrainerController:
                 # Best tracking is part of checkpointing (save_interval > 0) but
                 # not tied to cadence alignment: ANY eval that beats the record
                 # persists a checkpoint (if this step isn't already saved) and
-                # repoints ``best``.
-                if (
-                    self.save_interval
-                    and eval_metrics is not None
-                    and self._checkpoint_manager().is_better(eval_metrics)
-                ):
-                    if not saved:
-                        self.save_checkpoint(self.global_step)
-                    self._checkpoint_manager().update_best(
-                        self.global_step, eval_metrics
+                # repoints ``best``. save_checkpoint bears collectives, so the
+                # is-better verdict MUST be identical on every rank — best_score
+                # is rehydrated from rank-local filesystem reads, so rank0 is
+                # the single authority and its verdict is broadcast.
+                if self.save_interval and eval_metrics is not None:
+                    is_best = self._rank0_decision(
+                        self._checkpoint_manager().is_better(eval_metrics)
                     )
+                    if is_best:
+                        if not saved:
+                            self.save_checkpoint(self.global_step)
+                        self._checkpoint_manager().update_best(
+                            self.global_step, eval_metrics, force=True
+                        )
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
         return self.global_step
@@ -282,6 +293,24 @@ class TrainerController:
         return Evaluator().run(
             lambda batch: self.core.strategy.forward_loss(batch), data
         )
+
+    @staticmethod
+    def _rank0_decision(flag: bool) -> bool:
+        """Make a collective-bearing branch decision identical on every rank.
+
+        Rank0's verdict is broadcast; without this, a rank whose local
+        filesystem view diverges (best_meta.json attribute-cache lag,
+        node-local dirs) would enter or skip ``save_checkpoint``'s collectives
+        alone and hang the group.
+        """
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() == 1
+        ):
+            return bool(flag)
+        verdict = [bool(flag)]
+        torch.distributed.broadcast_object_list(verdict, src=0)
+        return bool(verdict[0])
 
     def _checkpoint_manager(self):
         # Lazily built in its S-home so the runtime seam does not import the domain
@@ -307,6 +336,7 @@ class TrainerController:
                 "global_step": step,
                 "epoch": self.epoch,
                 "epoch_batch": self.epoch_batch,
+                "epoch_samples": self.epoch_samples,
                 "strategy": self.core.strategy.name,
                 "run_id": self.run_id,
                 "world_size": (

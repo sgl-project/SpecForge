@@ -109,16 +109,34 @@ class Trainer:
         if resume_from:
             state = CheckpointManager.read_resume_state(resume_from)
             model.draft_model.load_state_dict(state["draft_state_dict"], strict=False)
+            # Mid-epoch data position; only an offline (refs) stream can be
+            # repositioned — the online queue resumes via the control plane.
+            # The position is persisted in SAMPLES (batch-size independent):
+            # convert to this run's batches, failing fast on a batch-size drift
+            # that does not divide (a silent mis-seek would skip or re-train
+            # data with no error).
+            start_batch = start_samples = 0
+            if "refs" in ref_source:
+                samples = state.get("epoch_samples")
+                if samples is None:  # pre-epoch_samples checkpoint: batch units
+                    start_batch = state.get("epoch_batch", 0)
+                    start_samples = start_batch * batch_size
+                else:
+                    if samples % batch_size:
+                        raise ValueError(
+                            f"checkpoint {resume_from} stopped mid-epoch after "
+                            f"{samples} samples, which is not a whole number of "
+                            f"batches at batch_size={batch_size}; resume with the "
+                            f"batch size the checkpoint was written with"
+                        )
+                    start_batch, start_samples = samples // batch_size, samples
             resume = {
                 "optimizer": state.get("optimizer_state_dict"),
                 "rng": state.get("rng_state"),
                 "global_step": state["global_step"],
                 "epoch": state.get("epoch", 0),
-                # Mid-epoch data position; only an offline (refs) stream can be
-                # repositioned — the online queue resumes via the control plane.
-                "epoch_batch": (
-                    state.get("epoch_batch", 0) if "refs" in ref_source else 0
-                ),
+                "epoch_batch": start_batch,
+                "epoch_samples": start_samples,
             }
             del state
 
@@ -164,6 +182,7 @@ class Trainer:
             start_step=resume["global_step"] if resume else 0,
             start_epoch=resume["epoch"] if resume else 0,
             start_batch=resume["epoch_batch"] if resume else 0,
+            start_samples=resume["epoch_samples"] if resume else 0,
         )
 
         # The runtime pieces, exposed for callers that still want them directly
