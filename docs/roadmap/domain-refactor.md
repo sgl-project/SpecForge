@@ -125,11 +125,23 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
     `TrainerController.ack_fn` is `None` (already supported — the loader is
     assumed to ack) so the durable ack transaction is skipped.
   - Keep the trainer/loader code identical between colocated and disagg.
+- **Scope note (as landed, #636)** The no-op axis is the *(metadata store +
+  durable-ack transaction)* — the pieces with real I/O/txn cost. Prompt leasing
+  and the in-process `SampleRefQueue` bookkeeping stay shared across modes
+  (single-process lock-guarded dict/deque ops, no I/O; forking them per mode
+  would reintroduce the divergence this phase removes), and backpressure was
+  already opt-in (`None` default) everywhere. Consequences of a store that
+  retains nothing are documented on `NoOpMetadataStore` (`status()` counts read
+  0; no `TrainLease` ref reconstruction). `deployment_mode` is selectable on the
+  offline builder; the colocated ONLINE builder stays pinned to
+  `local_colocated` because its rank-private queue is fed by commit dedup — a
+  shared durable store there belongs to the disagg online builders.
 - **Tests / gates** A **colocated == disagg numerical-equivalence gate**: same
-  seed + fixed prompt set produce identical loss curves whether run through the
-  no-op colocated control plane or the full disagg control plane.
-- **Done when** Colocated runs with zero SQLite/lease/ack/backpressure overhead
-  and the equivalence gate is green.
+  seed + fixed feature set produce bit-identical loss curves through the one
+  builder (`build_offline_runtime(deployment_mode=...)`), no-op colocated plane
+  vs full disagg plane over SQLite, with the durable ack marker asserted.
+- **Done when** Colocated runs with zero metadata-store/durable-ack overhead
+  (leasing/backpressure per the scope note) and the equivalence gate is green.
 
 ---
 
@@ -145,8 +157,15 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
     non-boundary micro-steps so the reduction fires once per optimizer step.
   - **Full resume.** `TrainerController.save_checkpoint` persists only
     `draft_state_dict` + step/epoch; `FSDPTrainingBackend.load_state_dict` only
-    half-loads the optimizer. Add optimizer + LR-scheduler + RNG state to the
-    saved/loaded state so a resumed run is bit-continuous.
+    half-loads the optimizer. Add optimizer + LR-scheduler + RNG state — per
+    rank (they are FSDP-shard-local) — plus the mid-epoch data position, and a
+    seek()-equivalent on the offline stream, so a resumed run continues on the
+    same data with the same state. *Continuity precision (as landed, #637):*
+    draft weights restore bit-for-bit and the data stream repositions exactly;
+    the loss curve is tolerance-continuous, not bit-exact, because
+    `BF16Optimizer` rebuilds its fp32 master from the persisted bf16 weights
+    (matches the legacy trainer; persisting the master would change the
+    optimizer itself and is out of scope here).
   - **CheckpointManager** — rotation (keep-last-N), `best` (by eval metric) and
     `latest` symlinks; owns the `output_dir` layout the controller writes today.
   - **Evaluator** — `simulated_acc_len` and per-position acceptance, with
@@ -171,9 +190,11 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
   a `no_sync` gate asserting one all-reduce per optimizer step (and identical
   grads to per-step reduction); an evaluator test asserting per-position
   aggregation precedes the geometric sum.
-- **Done when** A run can be killed and resumed bit-continuously, accumulation
-  reduces once per optimizer step, checkpoints rotate with best/latest, and the
-  evaluator reports correct `simulated_acc_len`.
+- **Done when** A run can be killed and resumed continuously (weights + data
+  position exact; loss within the documented bf16 fp32-master tolerance) at the
+  same world size, accumulation reduces once per optimizer step, checkpoints
+  rotate with best/latest surviving restarts, and the evaluator reports correct
+  `simulated_acc_len` with all metrics DP-reduced.
 
 ---
 
