@@ -19,6 +19,7 @@ from transformers import (
 )
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .draft.registry import DRAFT_REGISTRY, available_drafts
 from .target.custom_backend import (
     GptOssForCausalLM,
     Llama4ForCausalLM,
@@ -31,7 +32,8 @@ from .target.custom_backend import (
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
-    # the model mapping is currently hardcoded, we should support lazy model mapping via registry
+    # legacy config-type dispatch, kept as the fallback for configs that carry
+    # no ``architectures``; new drafts register via @register_draft instead.
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
     }
@@ -39,8 +41,9 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
-        This class method takes a configuration object and create its model based on the
-        _model_mapping class variable.
+        This class method takes a configuration object and creates its model,
+        resolving the class from DRAFT_REGISTRY via ``config.architectures``
+        first, then falling back to the legacy config-type mapping.
 
         Args:
             config (PretrainedConfig): A configuration object.
@@ -48,8 +51,11 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         Returns:
             A model instance.
         """
-        # get the model class from the
-        _model_cls = cls._model_mapping[type(config)]
+        archs = getattr(config, "architectures", None) or []
+        if len(archs) == 1 and archs[0] in DRAFT_REGISTRY:
+            _model_cls = DRAFT_REGISTRY[archs[0]]
+        else:
+            _model_cls = cls._model_mapping[type(config)]
         model = _model_cls(config, **config_kwargs)
 
         # Convert model to specified dtype if provided
@@ -166,11 +172,18 @@ class AutoDraftModelConfig:
 
         architecture = architectures[0]
 
-        if architecture not in cls._config_mapping:
-            raise ValueError(f"Architecture {architecture} not supported")
+        if architecture in DRAFT_REGISTRY:
+            config_cls = DRAFT_REGISTRY[architecture].config_class
+        elif architecture in cls._config_mapping:
+            config_cls = cls._config_mapping[architecture]
+        else:
+            raise ValueError(
+                f"Architecture {architecture} not registered; "
+                f"available: {available_drafts()}"
+            )
 
         # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
         if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
             config["draft_vocab_size"] = config.get("vocab_size", None)
 
-        return cls._config_mapping[architecture].from_dict(config)
+        return config_cls.from_dict(config)
