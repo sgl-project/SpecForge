@@ -38,7 +38,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from specforge.runtime.contracts import SampleRef
-from specforge.runtime.control_plane import DataFlowController
+from specforge.runtime.control_plane import DataFlowController, resolve_control_plane
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
@@ -82,6 +82,7 @@ def _assemble_trainer(
     log_interval: int,
     collate_fn,
     per_sample_transform=None,
+    durable_ack: bool = True,
 ):
     """The trainer+loader assembly shared by offline / disagg / online / interleaved.
 
@@ -122,6 +123,7 @@ def _assemble_trainer(
         log_interval=log_interval,
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
+        durable_ack=durable_ack,
     )
     return trainer.controller, trainer.loader
 
@@ -293,7 +295,7 @@ def build_offline_runtime(
             f"specforge.runtime.training.registry."
         )
     collate_fn, per_sample_transform = _offline_io(spec, max_len)
-    controller = DataFlowController(run_id)
+    controller, durable_ack = resolve_control_plane("local_colocated", run_id)
     refs = spec.make_offline_reader(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
@@ -322,6 +324,7 @@ def build_offline_runtime(
         log_interval=log_interval,
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
+        durable_ack=durable_ack,
     )
 
 
@@ -441,7 +444,7 @@ def build_online_runtime(
     already materialized the target distribution.
     """
     spec = resolve_strategy(strategy)
-    controller = DataFlowController(run_id)
+    controller, durable_ack = resolve_control_plane("local_colocated", run_id)
     controller.ingest_prompts(prompts)
     store = LocalFeatureStore(run_id)
 
@@ -486,6 +489,7 @@ def build_online_runtime(
         log_interval=50,
         collate_fn=_online_collate(spec, collate_fn),
         per_sample_transform=None,
+        durable_ack=durable_ack,
     )
 
     def drive_rollout(max_rounds: int = 100_000) -> int:
