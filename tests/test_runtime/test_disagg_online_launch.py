@@ -44,7 +44,7 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         from specforge.runtime.data_plane.streaming_ref_channel import (
             StreamingRefChannel,
         )
-        from specforge.runtime.launch import (
+        from specforge.launch import (
             build_disagg_online_consumer,
             build_disagg_online_producer,
         )
@@ -150,7 +150,7 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         )
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
-        from specforge.runtime.launch import build_disagg_online_eagle3_runtime
+        from specforge.launch import build_disagg_online_eagle3_runtime
 
         H, V, SEQ, TTT, ACC, MAX_OPT_STEPS, N = fx.H, fx.V, 12, 3, 2, 2, 8
         workdir = tempfile.mkdtemp(prefix="disagg_online_named_")

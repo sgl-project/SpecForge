@@ -21,7 +21,7 @@ class TestDominoLambdaSchedule(unittest.TestCase):
     """CPU: the StepContext-driven lambda_base schedule (no model needed)."""
 
     def test_lambda_base_decays_over_total_steps(self):
-        from specforge.runtime.training.strategy import DominoTrainStrategy, StepContext
+        from specforge.training.strategies.base import DominoTrainStrategy, StepContext
 
         # _lambda_base reads only ctx + lambda_start/decay_ratio, not the model.
         s = DominoTrainStrategy(None, lambda_start=1.0, decay_ratio=0.5)
@@ -53,7 +53,7 @@ class TestDominoOfflineLaunch(unittest.TestCase):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.launch import build_offline_runtime
+        from specforge.launch import build_offline_runtime
 
         HIDDEN, SEQ, N, MAX_OPT_STEPS = 64, 32, 4, 2
         workdir = tempfile.mkdtemp(prefix="domino_launch_")
@@ -117,7 +117,7 @@ class TestDominoOnlineLaunch(unittest.TestCase):
 
         from specforge.modeling.target import get_target_engine
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.launch import build_online_runtime
+        from specforge.launch import build_online_runtime
 
         HIDDEN, V, SEQ, ACC, MAX_OPT_STEPS, N = 64, fx.V, 16, 2, 2, 8
         workdir = tempfile.mkdtemp(prefix="domino_online_")

@@ -25,7 +25,7 @@ from specforge.runtime.data_plane.streaming_ref_channel import (
     StreamingRefChannel,
     StreamingRefQueue,
 )
-from specforge.runtime.launch import run_disagg_online_interleaved
+from specforge.launch import run_disagg_online_interleaved
 
 
 def _ref(i: int) -> SampleRef:

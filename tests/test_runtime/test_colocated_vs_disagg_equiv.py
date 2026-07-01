@@ -33,8 +33,8 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
         fx.build_single_rank_distributed(port="29571")
 
         from specforge.optimizer import BF16Optimizer
+        from specforge.launch import build_offline_runtime
         from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
-        from specforge.runtime.launch import build_offline_runtime
 
         TTT, N, MAX_LEN = 3, 8, 512
         workdir = tempfile.mkdtemp(prefix="coloc_disagg_")

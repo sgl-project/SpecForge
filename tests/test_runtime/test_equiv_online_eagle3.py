@@ -36,10 +36,10 @@ class TestEquivOnlineEagle3(unittest.TestCase):
         from specforge.runtime.contracts import assert_no_tensors
         from specforge.runtime.control_plane import DataFlowController
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
-        from specforge.runtime.inference.capture import CaptureConfig
-        from specforge.runtime.inference.rollout_worker import RolloutWorker
-        from specforge.runtime.inference.sglang_adapter import SGLangAdapter
-        from specforge.runtime.training.strategy import Eagle3TrainStrategy
+        from specforge.inference.capture import CaptureConfig
+        from specforge.inference.rollout_worker import RolloutWorker
+        from specforge.inference.adapters.eagle3 import SGLangAdapter
+        from specforge.training.strategies.base import Eagle3TrainStrategy
 
         H, V, SEQ, TTT = fx.H, fx.V, 12, 3
         workdir = tempfile.mkdtemp(prefix="equiv_online_")
