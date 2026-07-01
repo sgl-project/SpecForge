@@ -60,15 +60,17 @@ class Evaluator:
             for batch in batches:
                 out = forward_fn(batch)
                 m = out.metrics
+                # .mean() normalizes to 0-dim (a shape-[1] loss would not
+                # broadcast into the 0-dim accumulator slot).
                 loss = (
-                    out.loss.detach()
+                    out.loss.detach().double().mean()
                     if isinstance(out.loss, torch.Tensor)
-                    else torch.tensor(float(out.loss))
+                    else torch.tensor(float(out.loss), dtype=torch.float64)
                 )
                 if sums is None:
                     sums = torch.zeros(4, dtype=torch.float64, device=loss.device)
                 tokens = self._token_count(batch, m, device=sums.device)
-                sums[0] += loss.double().to(sums.device) * tokens
+                sums[0] += loss.to(sums.device) * tokens
                 sums[1] += tokens
 
                 if "acc_corrects" in m and "acc_denoms" in m:
@@ -86,7 +88,7 @@ class Evaluator:
                 elif "accuracy" in m:
                     acc = m["accuracy"]
                     acc = (
-                        acc.detach().double().to(sums.device)
+                        acc.detach().double().mean().to(sums.device)
                         if isinstance(acc, torch.Tensor)
                         else torch.tensor(
                             float(acc), dtype=torch.float64, device=sums.device
