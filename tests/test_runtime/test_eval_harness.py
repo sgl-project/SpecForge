@@ -61,6 +61,15 @@ class TestEvalCacheKey(unittest.TestCase):
         self.assertEqual(
             base_key, cache.key(EvalConfig(**BASE, micro_batch_size=16))
         )
+        # The encoding is injective: a delimiter inside one field cannot
+        # realign the boundaries into a different identity's key.
+        shifted_a = EvalConfig(
+            **{**BASE, "eval_data_path": "/data/eval.jsonl|x", "target_model_path": "/models/llama"}
+        )
+        shifted_b = EvalConfig(
+            **{**BASE, "eval_data_path": "/data/eval.jsonl", "target_model_path": "x|/models/llama"}
+        )
+        self.assertNotEqual(cache.key(shifted_a), cache.key(shifted_b))
 
     def test_hit_produce_once_and_invalidate(self):
         cache = EvalCache(tempfile.mkdtemp(prefix="evalcache_"))
@@ -136,16 +145,25 @@ class TestEvalStreamEquivalence(unittest.TestCase):
         from specforge.runtime.data_plane import LocalFeatureStore
         from specforge.runtime.data_plane.disaggregated import SharedDirFeatureStore
 
+        # mem:// put() is consume-once by design (online rollout), so the local
+        # leg evaluates once; a REPEATABLE eval stream uses file:// offline refs
+        # colocated, or a shared-dir store with retain_on_release=True — which
+        # the disagg leg constructs and proves below by evaluating twice.
         local = LocalFeatureStore("eval-local")
         m_local = self._metrics_over(local, _put_features(local))
 
         shared = SharedDirFeatureStore(
-            tempfile.mkdtemp(prefix="evalshared_"), store_id="eval-shared"
+            tempfile.mkdtemp(prefix="evalshared_"),
+            store_id="eval-shared",
+            retain_on_release=True,
         )
-        m_shared = self._metrics_over(shared, _put_features(shared))
-
+        shared_refs = _put_features(shared)
+        m_shared = self._metrics_over(shared, shared_refs)
         self.assertEqual(m_local, m_shared)
         self.assertGreater(m_local["eval/avg_loss"], 0.0)
+        # eval_interval re-runs evaluate() over the same stream: the retained
+        # store must serve the identical pass again, not a freed-feature error.
+        self.assertEqual(m_shared, self._metrics_over(shared, shared_refs))
 
 
 @unittest.skipUnless(CUDA, "loader-level batch-size gate requires CUDA")

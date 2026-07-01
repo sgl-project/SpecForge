@@ -26,6 +26,12 @@ Deliberately **separate** from the tokenization cache under ``specforge/data``
 — different key fields, different lifecycle; do not merge (plan §4.4). The
 cache is process-local: multi-rank callers should produce on rank 0 and
 barrier before reading (it does no cross-rank coordination itself).
+
+Scope note: the launch builders currently take a pre-produced
+``hidden_states_path`` directly, so nothing in the run surface constructs an
+``EvalCache`` yet — it is consumed programmatically (``EvalCache.for_config``
++ ``get_or_produce``) until Phase E's typed config + CLI own eval-data
+production and wire the cache in front of it (roadmap E1 note).
 """
 
 from __future__ import annotations
@@ -44,11 +50,21 @@ class EvalCache:
     def __init__(self, cache_dir: str) -> None:
         self.root = os.path.join(cache_dir, "eval_cache")
 
+    @classmethod
+    def for_config(cls, config: EvalConfig) -> "EvalCache":
+        """The cache rooted at ``config.cache_dir`` (the §4.4 Evaluator wiring)."""
+        if not config.cache_dir:
+            raise ValueError("EvalConfig.cache_dir is not set")
+        return cls(config.cache_dir)
+
     # -- identity ------------------------------------------------------------
     def key(self, config: EvalConfig) -> str:
         """Digest of the eval identity — flipping ANY identity field changes it,
-        and execution knobs (micro-batch size) deliberately do not."""
-        content = "|".join(config.identity_fields())
+        and execution knobs (micro-batch size) deliberately do not. The fields
+        are JSON-encoded before hashing so the encoding is injective — a
+        delimiter character inside one field can never realign the boundaries
+        into another identity's digest."""
+        content = json.dumps(config.identity_fields(), ensure_ascii=True)
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
     def dir_for(self, config: EvalConfig) -> str:
