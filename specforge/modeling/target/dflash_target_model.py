@@ -1,4 +1,4 @@
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -19,6 +19,7 @@ from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
 
+from .base import TargetEngine
 from .sglang_backend import SGLangRunner
 
 
@@ -30,9 +31,14 @@ class DFlashTargetOutput:
     loss_mask: torch.Tensor  # [batch, seq_len]
 
 
-class DFlashTargetModel(ABC):
-    """
-    Abstract base class for DFlash target model backend.
+class DFlashTargetEngine(TargetEngine):
+    """DFlash target engine — the algorithm ABC over a frozen target backend.
+
+    DFlash captures the concatenated hidden states of an arbitrary list of
+    target layers (``set_capture_layers``) and trains on hard real-token labels,
+    so — unlike EAGLE3 — there is no target distribution / vocab map. The generic
+    :meth:`TargetEngine.capture` hook dispatches to ``generate_dflash_data``, so
+    the extraction is byte-identical to the pre-Phase-B path.
     """
 
     def __init__(self):
@@ -47,7 +53,7 @@ class DFlashTargetModel(ABC):
         device: str = None,
         cache_dir: Optional[str] = None,
         **kwargs,
-    ) -> "DFlashTargetModel":
+    ) -> "DFlashTargetEngine":
         """Initialize the target model backend."""
 
     @abstractmethod
@@ -59,12 +65,33 @@ class DFlashTargetModel(ABC):
     ) -> DFlashTargetOutput:
         """Generate context hidden states for DFlash training."""
 
-    def set_capture_layers(self, layer_ids: List[int]) -> None:
-        """Set which layers' hidden states to capture."""
+    def capture(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        **kwargs,
+    ) -> DFlashTargetOutput:
+        """Generic extraction entry point (see :meth:`TargetEngine.capture`).
+
+        Dispatches to the DFlash-specific ``generate_dflash_data``. DFlash takes
+        no extra extraction kwargs, so any are ignored.
+        """
+        return self.generate_dflash_data(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+        )
+
+    def set_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
+        """Set which layers' hidden states to capture (TargetEngine hook)."""
         self.capture_layer_ids = layer_ids
 
 
-class SGLangDFlashTargetModel(DFlashTargetModel):
+class SGLangDFlashTargetEngine(DFlashTargetEngine):
+
+    backend = "sglang"
+
     def __init__(self, model_runner: SGLangRunner):
         super().__init__()
         self.model_runner = model_runner
@@ -78,7 +105,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
         **kwargs,
-    ) -> "SGLangDFlashTargetModel":
+    ) -> "SGLangDFlashTargetEngine":
         tp_size = dist.get_world_size(get_tp_group())
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
@@ -225,7 +252,10 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         )
 
 
-class HFDFlashTargetModel(DFlashTargetModel):
+class HFDFlashTargetEngine(DFlashTargetEngine):
+
+    backend = "hf"
+
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
@@ -239,7 +269,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = True,
         **kwargs,
-    ) -> "HFDFlashTargetModel":
+    ) -> "HFDFlashTargetEngine":
 
         target_model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path,
@@ -294,9 +324,9 @@ def get_dflash_target_model(
     device: str = None,
     cache_dir: Optional[str] = None,
     **kwargs,
-) -> DFlashTargetModel:
+) -> DFlashTargetEngine:
     if backend == "sglang":
-        return SGLangDFlashTargetModel.from_pretrained(
+        return SGLangDFlashTargetEngine.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
@@ -304,7 +334,7 @@ def get_dflash_target_model(
             **kwargs,
         )
     elif backend == "hf":
-        return HFDFlashTargetModel.from_pretrained(
+        return HFDFlashTargetEngine.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
@@ -313,3 +343,11 @@ def get_dflash_target_model(
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
+
+
+# --- Back-compat aliases (pre-Phase-B names) -------------------------------
+# See the note in eagle3_target_model.py: the ``*TargetModel`` -> ``*TargetEngine``
+# rename is import-compatible; these aliases keep existing callers working.
+DFlashTargetModel = DFlashTargetEngine
+SGLangDFlashTargetModel = SGLangDFlashTargetEngine
+HFDFlashTargetModel = HFDFlashTargetEngine
