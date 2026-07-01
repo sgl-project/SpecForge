@@ -94,6 +94,12 @@ def _fixed_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
     )
 
 
+def _fixed_vp_noise_embed(
+    self, input_ids, anchor_positions, block_keep_mask, prefix_lengths
+):
+    return _fixed_noise_embed(self, input_ids, anchor_positions, block_keep_mask)
+
+
 def _fixed_anchor_sampler(anchors, keep_mask):
     def _sample(self, seq_len, loss_mask, device):
         return anchors.to(device), keep_mask.to(device)
@@ -101,7 +107,14 @@ def _fixed_anchor_sampler(anchors, keep_mask):
     return _sample
 
 
-def _make_model(logits, anchors, keep_mask, **kwargs):
+def _fixed_prefix_sampler(prefix_lengths):
+    def _sample(self, bsz, n_blocks, device):
+        return prefix_lengths.to(device)
+
+    return _sample
+
+
+def _make_model(logits, anchors, keep_mask, prefix_lengths=None, **kwargs):
     bsz, n_blocks, block_size, vocab_size = logits.shape
     model = OnlineDFlashModel(
         draft_model=_FixedDraft(hidden_size=4),
@@ -119,6 +132,11 @@ def _make_model(logits, anchors, keep_mask, **kwargs):
         _fixed_anchor_sampler(anchors, keep_mask), model
     )
     model._create_noise_embed = types.MethodType(_fixed_noise_embed, model)
+    model._create_vp_noise_embed = types.MethodType(_fixed_vp_noise_embed, model)
+    if prefix_lengths is not None:
+        model._sample_prefix_lengths = types.MethodType(
+            _fixed_prefix_sampler(prefix_lengths), model
+        )
     return model
 
 
@@ -166,6 +184,31 @@ def _targets_and_mask(input_ids, loss_mask, anchors, keep_mask, block_size):
     return targets, binary_mask
 
 
+def _vp_targets_and_mask(
+    input_ids, loss_mask, anchors, keep_mask, prefix_lengths, block_size
+):
+    bsz, seq_len = input_ids.shape
+    n_blocks = anchors.shape[1]
+    offsets = torch.arange(block_size).view(1, 1, -1)
+    label_indices = anchors.unsqueeze(-1) + offsets
+    safe_indices = label_indices.clamp(max=seq_len - 1)
+    targets = torch.gather(
+        input_ids.unsqueeze(1).expand(-1, n_blocks, -1),
+        2,
+        safe_indices,
+    )
+    binary_mask = keep_mask.unsqueeze(-1).expand(-1, -1, block_size).double()
+    binary_mask = binary_mask * (label_indices < seq_len).double()
+    binary_mask = binary_mask * (offsets >= prefix_lengths.unsqueeze(-1)).double()
+    gathered_loss_mask = torch.gather(
+        loss_mask.unsqueeze(1).expand(-1, n_blocks, -1),
+        2,
+        safe_indices,
+    )
+    binary_mask = binary_mask * gathered_loss_mask
+    return targets, binary_mask
+
+
 def _neg_log_q(logits, targets):
     return F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
@@ -197,6 +240,17 @@ def _naive_dflash_loss(neg_log_q, binary_mask, gamma):
         block_size = neg_log_q.shape[-1]
         positions = torch.arange(block_size, dtype=neg_log_q.dtype).view(1, 1, -1)
         decay = torch.exp(-(positions - 1).clamp(min=0) / gamma)
+        weight = weight * decay
+    return (neg_log_q * weight).sum() / (weight.sum() + 1e-6)
+
+
+def _naive_vp_drafter_loss(neg_log_q, binary_mask, prefix_lengths, gamma):
+    weight = binary_mask
+    if gamma is not None and gamma > 0:
+        block_size = neg_log_q.shape[-1]
+        positions = torch.arange(block_size, dtype=neg_log_q.dtype).view(1, 1, -1)
+        prefix = prefix_lengths.unsqueeze(-1).to(dtype=neg_log_q.dtype)
+        decay = torch.exp(-(positions - prefix).clamp(min=0) / gamma)
         weight = weight * decay
     return (neg_log_q * weight).sum() / (weight.sum() + 1e-6)
 
@@ -241,6 +295,35 @@ class TestDFlashLosses(unittest.TestCase):
         gamma = 7.0
         got = self._forward_loss(loss_type="dflash", loss_decay_gamma=gamma)
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=gamma)
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-8)
+
+    def test_vp_drafter_masks_visible_prefix_and_decays_from_first_mask(self):
+        gamma = 7.0
+        prefix_lengths = torch.tensor([[2, 3], [2, 4]], dtype=torch.long)
+        targets, binary_mask = _vp_targets_and_mask(
+            self.input_ids,
+            self.loss_mask,
+            self.anchors,
+            self.keep_mask,
+            prefix_lengths,
+            self.logits.shape[2],
+        )
+        neg_log_q = _neg_log_q(self.logits, targets)
+        model = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            prefix_lengths=prefix_lengths,
+            loss_type="vp_drafter",
+            loss_decay_gamma=gamma,
+        )
+        got, accuracy = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
+        want = _naive_vp_drafter_loss(neg_log_q, binary_mask, prefix_lengths, gamma)
+        self.assertTrue(torch.isfinite(accuracy))
         torch.testing.assert_close(got, want, rtol=0, atol=1e-8)
 
     def test_dpace_full_matches_naive_reference(self):
