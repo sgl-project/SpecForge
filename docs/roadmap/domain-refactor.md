@@ -14,9 +14,10 @@ Sibling tracks: [./online-disaggregation.md](./online-disaggregation.md),
 [../../plan.md](../../plan.md) (the detailed §4.2–4.8 sketches this track lands
 incrementally are mirrored in [../redesign-draft-legacy.md](../redesign-draft-legacy.md)).
 
-**Dependency order:** A (in review) → B → {C, D}; D → E (C is parallel — not a prerequisite of
-E). B's `TargetEngine` extraction also unblocks the online O1.3 multi-backend producer in
-[./online-disaggregation.md](./online-disaggregation.md).
+**Dependency order:** A (in review) → B → {C, D}; D → E0 → E (C is parallel — not a prerequisite
+of E). `E0` is a move-only layout consolidation (zero functional change) that runs at the front of
+E so E's composition work lands in the final layout. B's `TargetEngine` extraction also unblocks
+the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-disaggregation.md).
 
 ---
 
@@ -176,17 +177,63 @@ E). B's `TargetEngine` extraction also unblocks the online O1.3 multi-backend pr
 
 ---
 
-### E — Composition & run surface · size L · GPU · status: later
-- **Goal** A real product surface: a draft-architecture registry (separate axis
-  from the strategy registry), MLA Eagle3, a typed config + CLI, and exporters.
+### E0 — Layout consolidation (move-only) · size M · CPU · status: later (front of E)
+- **Goal** Collapse the scattered execution code into **one implementation home per concern** with
+  **zero functional change**, so E's composition work is written in the final layout rather than
+  re-moved afterward. This is the §2.3 target tree in [../../plan.md](../../plan.md): `runtime/` =
+  substrate only; top-level `training/` and `inference/` are the single execution homes; `modeling/`
+  is model definitions only; no facade package.
+- **Target state** `runtime/` contains only `contracts.py` + `control_plane/` + `data_plane/`.
+  Every training symbol resolves from top-level `training/`, every rollout/capture symbol from
+  top-level `inference/`.
+- **Implementation** — pure `git mv` + import fixes, one reviewable **rename-only** diff:
+
+  | From (today) | To (consolidated) |
+  |---|---|
+  | `runtime/training/trainer.py` (`TrainerCore`+`TrainerController`) | `training/controller.py` (kept as one file — not split) |
+  | `runtime/training/backend.py` | `training/backend.py` |
+  | `runtime/training/strategy.py` | `training/strategies/base.py` |
+  | `runtime/training/registry.py` | `training/strategies/registry.py` |
+  | `specforge/training/trainer.py` (B3 domain `Trainer`) | stays `training/trainer.py` |
+  | `modeling/target/base.py` · `factory.py` | `inference/target_engine/base.py` · `factory.py` |
+  | `modeling/target/{eagle3,dflash}_target_model.py` | `inference/target_engine/` (relocated as-is; **collapsed to per-backend engines in E, not here**) |
+  | `modeling/target/sglang_backend/capture.py` | `inference/target_engine/sglang_capture_backend.py` |
+  | `runtime/inference/rollout_worker.py` · `capture.py` | `inference/rollout_worker.py` · `capture.py` |
+  | `runtime/inference/{sglang,dflash}_adapter.py` | `inference/adapters/{eagle3,dflash}.py` |
+  | `runtime/launch.py` | `launch.py` (top-level; topology assembly only) |
+  | `modeling/target/{target_head.py, custom_backend/}` | **stays** in `modeling/target/` (model defs) |
+
+  Keep import shims at the old module paths for one release (re-export from the new location) so
+  in-flight branches and legacy scripts don't break.
+- **Tests / gates** The full `tests/test_runtime` suite stays green **unchanged** (only import paths
+  move); the Phase-B byte-identical gate (`test_phase_b_gate.py`) still passes bit-for-bit — a
+  move-only change must not alter a single tensor or loss value.
+- **Done when** `runtime/` is substrate-only (`contracts.py` + `control_plane/` + `data_plane/`);
+  every training/inference symbol resolves from its top-level home; suite + B-gate green; no
+  functional diff.
+
+---
+
+### E — Composition & run surface · size L · GPU · status: later (after E0)
+- **Goal** A real product surface, built **on the consolidated layout from `E0`**: a
+  draft-architecture registry (separate axis from the strategy registry), the (algorithm × backend)
+  target-engine collapse, MLA Eagle3, a typed config + CLI, and exporters.
 - **Target state**
   - **`DRAFT_REGISTRY` / `@register_draft`** for draft *architecture* classes
-    (`models/drafts/`), a **distinct axis** from the per-algorithm strategy
+    (`modeling/draft/`), a **distinct axis** from the per-algorithm strategy
     registry. Today there is neither: draft model classes live ungoverned in
     `specforge/modeling/draft/` (`base.py`, `dflash.py`, `llama3_eagle.py`,
-    `flex_attention.py`) and `StrategySpec` lives in `training/registry.py`.
-    Converge today's `StrategySpec` into a `training/strategies/` package so the
-    two registries (architecture vs algorithm) are cleanly separate.
+    `flex_attention.py`). Add a `modeling/draft/registry.py`; the strategy registry stays in
+    top-level `training/strategies/` (relocated in `E0`) so the two registries (architecture vs
+    algorithm) are cleanly separate.
+  - **Collapse the (algorithm × backend) engine matrix** in `inference/target_engine/`: the
+    per-algorithm files relocated by `E0` converge into per-backend generic engines
+    (`hf.py` / `sglang.py` / `custom.py`) parameterized by a per-algorithm `CaptureSpec` /
+    capture-policy, so adding an algorithm is a spec, not a class-per-backend. NB the SGLang side
+    merges cleanly (shared backend; only `wrap_eagle3_logits` + returned fields + shaping differ),
+    but the **HF side is a real code difference** (eagle3 = forward hooks on 3 aux layers + concat +
+    logits; dflash = `output_hidden_states=True` + layer select, no logits) — so it MUST be a policy
+    object, not a data table.
   - **MLA Eagle3 draft** — an MLA-attention draft architecture registered via
     `@register_draft`.
   - **Pydantic config + `specforge` CLI** — a typed run config (Pydantic is
@@ -196,11 +243,14 @@ E). B's `TargetEngine` extraction also unblocks the online O1.3 multi-backend pr
   - **Exporters** — `export/to_sglang` (with a documented MLA weight-name map)
     and `export/to_hf`.
 - **Implementation**
-  - `models/drafts/__init__.py` (new) — `DRAFT_REGISTRY` + `register_draft`
+  - `modeling/draft/registry.py` (new) — `DRAFT_REGISTRY` + `register_draft`
     decorator; register the existing eagle3 / dflash drafts and the new MLA
-    eagle3 draft. See [../../plan.md](../../plan.md) §4.2 (`models/drafts/…`).
-  - `training/strategies/` (new package) — move the `StrategySpec` registry here;
-    keep `register_strategy` / `resolve_strategy` import-compatible.
+    eagle3 draft. See [../../plan.md](../../plan.md) §4.2.
+  - `inference/target_engine/` — collapse the `eagle3.py` / `dflash.py` per-algorithm files
+    (relocated in `E0`) into `hf.py` / `sglang.py` / `custom.py` + a per-algorithm `CaptureSpec`;
+    `sglang_server.py` is filled by online O1.3.
+  - `training/strategies/` (relocated in `E0`) — finalize the `StrategySpec` registry + the
+    per-algorithm specs; keep `register_strategy` / `resolve_strategy` import-compatible.
   - `config/schema.py` (new) — Pydantic config; `specforge` CLI entry in
     `pyproject.toml` `[project.scripts]`. See [../../plan.md](../../plan.md)
     §4.6 (`config/schema.py`).
@@ -215,4 +265,4 @@ E). B's `TargetEngine` extraction also unblocks the online O1.3 multi-backend pr
   `Trainer` the programmatic path does).
 - **Done when** A user trains via `specforge <config>`, registers a new draft
   architecture with `@register_draft`, trains an MLA Eagle3 draft, and exports a
-  checkpoint that loads in both sglang and HF.
+  checkpoint that loads in both sglang and HF — all from the consolidated layout.

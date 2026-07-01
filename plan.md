@@ -149,15 +149,16 @@ PRODUCE (inference):
                          SampleRef to the control plane. Stays at the domain↔substrate seam.
 
 CONSUME (training):
-  Trainer             ── owns the lifecycle: loop / eval / checkpoint. WRAPS the runtime
-                         TrainerController/TrainerCore; does NOT replace them. (No weight-sync —
+  Trainer             ── owns the lifecycle: loop / eval / checkpoint. WRAPS the
+                         TrainerCore/TrainerController seam; does NOT replace it. (No weight-sync —
                          the target is frozen, §8.)
-  DraftTrainStrategy  ── per-algorithm forward+loss (eagle3 TTT / dflash block / domino). Kept
-                         in runtime/training (the seam) — already plan-shaped.
+  DraftTrainStrategy  ── per-algorithm forward+loss (eagle3 TTT / dflash block / domino). The
+                         per-step seam; lives in training/strategies (relocated from
+                         runtime/training in E0) — already plan-shaped.
   CheckpointManager / Evaluator / lr_scheduler / fsdp seam  ── the managers (G1).
 
 COMPOSE:
-  models/drafts       ── DRAFT_REGISTRY (@register_draft) for draft *architecture* classes
+  modeling/draft      ── DRAFT_REGISTRY (@register_draft) for draft *architecture* classes
                          (llama / deepseek-MLA / dflash-qwen3). Separate axis from strategy.
   StrategyRegistry    ── per-algorithm spec (today's StrategySpec, converged here).
   config / cli / export ── first-class run surface (predecessor §4.3–4.8, carried forward).
@@ -170,48 +171,59 @@ is fully absorbed by (ref source + `FeatureStore`) behind `FeatureDataLoader →
 
 ```
 specforge/
-├── runtime/                         # CANONICAL DataFlow spine (keep)
+├── runtime/                         # SUBSTRATE ONLY — the canonical DataFlow spine (keep as-is)
 │   ├── contracts.py                 # SampleRef, TrainBatch, PromptTask, *Strategy literal
 │   ├── control_plane/               # metadata-only: controller, metadata_store, backpressure
-│   ├── data_plane/                  # FeatureStore (Local/SharedDir/Mooncake), loader, readers,
-│   │                                #   SampleRefQueue, StreamingRefChannel
-│   ├── inference/                   # rollout: RolloutWorker, capture, adapters  ──┐ converge to
-│   │                                #                                              │  TargetEngine
-│   ├── training/                    # DraftTrainStrategy seam, TrainerCore/Controller, backend,
-│   │                                #   StepContext. (The StrategySpec registry converges into the
-│   │                                #   domain training/strategies/ in Phase E — see §6.)
-│   └── launch.py                    # spec-driven builders (topology = builder, model = strategy=)
+│   └── data_plane/                  # FeatureStore (Local/SharedDir/Mooncake), FeatureDataLoader,
+│                                    #   SampleRefQueue, StreamingRefChannel, offline/disagg readers
 │
-├── models/                          # TARGET layout (today the draft/target code lives under
-│   │                                #   specforge/modeling/ — Phase E moves it here)
-│   ├── drafts/                      # DRAFT_REGISTRY + @register_draft (NEW — predecessor §4.2)
-│   │   ├── base.py  llama3_eagle.py  deepseek_eagle3.py(MLA)  dflash.py  auto.py
-│   │   │                            #   (today: modeling/draft/{base,dflash,llama3_eagle,flex_attention}.py)
-│   └── targets/                     # TargetEngine ABC, EXTRACTED from modeling/target/*TargetModel
-│       │                            #   (runtime/inference adapters then wrap an engine, §G2)
-│       ├── base.py  hf_engine.py  sglang_engine.py  sglang_server_engine.py  custom_engine.py
+├── inference/                       # TOP-LEVEL — the single home for all rollout/capture execution
+│   ├── rollout_worker.py            #   (from runtime/inference/rollout_worker.py)
+│   ├── capture.py                   #   CaptureConfig (from runtime/inference/capture.py)
+│   ├── feature_source.py            #   the FeatureSource Protocol (the worker's only contract)
+│   ├── target_engine/               #   TargetEngine, EXTRACTED from modeling/target/*TargetModel
+│   │   ├── base.py  factory.py       #     (adapters then wrap an engine, §G2)
+│   │   ├── hf.py  sglang.py  sglang_server.py  custom.py   # per-backend generic engines
+│   │   └── sglang_capture_backend.py                       # sglang version-pinned glue
+│   └── adapters/
+│       └── eagle3.py  dflash.py     #   (from runtime/inference/{sglang,dflash}_adapter.py)
+│
+├── training/                        # TOP-LEVEL — the single home for all training execution (NO facade)
+│   ├── trainer.py                   # domain Trainer: owns loop/eval/checkpoint (B3)
+│   ├── controller.py                # TrainerCore + TrainerController seam (from runtime/training/trainer.py)
+│   ├── backend.py                   # FSDPTrainingBackend + no_sync (from runtime/training/backend.py)
+│   ├── checkpoint.py  resume.py  evaluator.py   # NEW managers (§3) — born here
+│   └── strategies/                  # StrategySpec registry + per-algorithm strategies (converges HERE)
+│       ├── base.py                   #   DraftTrainStrategy ABC + StepContext (from runtime/training/strategy.py)
+│       ├── registry.py               #   StrategySpec / resolve_strategy (from runtime/training/registry.py)
+│       └── eagle3.py  dflash.py  domino.py
+│
+├── modeling/                        # MODEL DEFINITIONS ONLY — no orchestration, no capture factory
+│   ├── draft/                       # DRAFT_REGISTRY + @register_draft (NEW registry.py — predecessor §4.2)
+│   │   └── base.py  registry.py  llama3_eagle.py  deepseek_eagle3.py(MLA)  dflash.py  flex_attention.py
+│   └── target/                      # target model nn.Modules + model-specific glue ONLY
+│       └── target_head.py  custom_backend/  sglang_backend/   # (capture orchestration moved to inference/)
 │
 │                                    # (NO separate data/streams package — FeatureDataLoader over
 │                                    #  SampleRef+FeatureStore IS the stream. Ref sources
 │                                    #  (offline/rollout/streaming) live in runtime/data_plane;
 │                                    #  live frozen-target capture is just another ref source)
 │
-├── training/                        # domain lifecycle + managers (WRAPS runtime/training)
-│   ├── trainer.py                   # owns loop/eval/checkpoint; delegates the step to runtime
-│   │                                #   TrainerCore + DraftTrainStrategy (kept seam)
-│   ├── checkpoint.py  lr_scheduler.py  fsdp.py   # NEW managers (§3).
-│   ├── strategies/                  # StrategySpec registry converges HERE in Phase E (§6); the
-│   │                                #   per-step DraftTrainStrategy seam stays in runtime/training.
-│
+├── launch.py                        # TOP-LEVEL — topology assembly only (spec-driven builders; from runtime/launch.py)
 ├── eval/  export/  config/  cli.py  # NEW — carried forward from predecessor §4.4–4.8
-└── core/  optimizer.py  tracker.py  distributed.py  # kept verbatim (predecessor §1)
+└── core/  optimizer.py  tracker.py  distributed.py  lr_scheduler.py  # kept verbatim (predecessor §1)
 ```
 
-> The one real structural move is extracting a `TargetEngine` from the EAGLE3-bound
-> `modeling/target/*TargetModel` into `models/targets` (the `runtime/inference` adapters then wrap
-> it) plus a thin domain `training/` (Trainer + managers) wrapping the kept `runtime/training`
-> seam. The control + data planes stay exactly where they are — they are the substrate, **not**
-> re-housed behind a new stream package.
+> **One implementation home per concern; `runtime/` is substrate-only.** The two structural moves
+> (both gated by the byte-identical suite, executed as the move-only step `E0` — see
+> [docs/roadmap/domain-refactor.md](docs/roadmap/domain-refactor.md)): (1) extract `TargetEngine`
+> out of the EAGLE3-bound `modeling/target/*TargetModel` into top-level `inference/target_engine/`
+> (the `adapters/` then wrap an engine); (2) lift the training seam
+> (`TrainerCore`/`TrainerController`/`TrainingBackend`/strategy+registry) up into top-level
+> `training/`. `runtime/` shrinks to the substrate (control + data plane + contracts) — it is
+> **not** a home for domain/algorithm code, and there is **no facade package**. The control + data
+> planes stay exactly where they are; the online/offline/disaggregated distinction stays absorbed
+> by (ref source + `FeatureStore`) behind `FeatureDataLoader`, invisible to `training/`.
 
 ---
 
@@ -251,7 +263,7 @@ from the in-source `NOTE`s. Each lands behind the canonical spine without re-plu
 - Detailed phases (O1–O3): [`docs/roadmap/online-disaggregation.md`](docs/roadmap/online-disaggregation.md).
 
 ### G4 — Composition + models (predecessor Phase 1)
-- `models/drafts` `DRAFT_REGISTRY` (`@register_draft`) for draft **architectures** (separate
+- `modeling/draft` `DRAFT_REGISTRY` (`@register_draft`) for draft **architectures** (separate
   axis from strategy); **MLA Eagle3 draft** (deepseek/Kimi); converge `StrategySpec` →
   `training/strategies` registry. Note: draft-arch registry and strategy registry are two
   registries, not one.
@@ -355,10 +367,10 @@ Chosen: **one path** (spine everywhere) + control-plane-as-no-op for colocated. 
 byte-identical free and avoids two implementations; costs an equivalence gate. (See §4.)
 
 ### Two registries, not one
-`models/drafts` `DRAFT_REGISTRY` (architecture) and `training/strategies` (algorithm) are
+`modeling/draft` `DRAFT_REGISTRY` (architecture) and `training/strategies` (algorithm) are
 **separate** axes — an algorithm (eagle3) runs on multiple draft architectures. Don't merge
 them; the current `StrategySpec` is the *strategy* registry and should converge there, not into
-`models/drafts`.
+`modeling/draft`.
 
 *(The predecessor's other tradeoffs — Pydantic vs OmegaConf, MLA cache compressed vs expanded,
 registry vs HF AutoModel — are unchanged and carry forward.)*
@@ -384,7 +396,10 @@ also folds in the former online-disaggregation roadmap (#618).
   opt-in; add the colocated≡disagg equivalence test.
 - **Phase D — training managers (G1).** `no_sync()`, full optimizer/scheduler/RNG resume,
   `CheckpointManager`, `Evaluator`. Gate: loss/eval parity at fixed steps.
-- **Phase E — `models/drafts` registry + MLA draft + config/CLI/export (G4/G5).** Adding a
+- **Phase E0 — layout consolidation (move-only).** Relocate the training seam + target engine
+  into the top-level `training/` / `inference/` homes; `runtime/` shrinks to substrate. Pure
+  `git mv` + import shims; gate: suite + B byte-identical gate unchanged (no functional diff).
+- **Phase E — `modeling/draft` registry + MLA draft + config/CLI/export (G4/G5).** Adding a
   draft arch = one decorated file; one validated YAML per run; export-loop test.
 - **Online track (parallel; G3) — live *frozen-target* capture.** O1.1 shared control plane +
   O1.2 async loop (in review) → **O1.3** live SGLang-server hidden-state capture (next; gated by a
@@ -433,8 +448,8 @@ statements (now §5/§6) so the code and the plan stop contradicting each other.
 
 Carries the predecessor's gates, plus the reconciliation-specific one.
 
-- **10.1 Numerical-equivalence gate** (per PR touching `core/` / `runtime/training/` /
-  `runtime/data_plane/` / `models/drafts`): fixed seed, 3×4 batches; per-step loss
+- **10.1 Numerical-equivalence gate** (per PR touching `core/` / `training/` /
+  `runtime/data_plane/` / `modeling/draft`): fixed seed, 3×4 batches; per-step loss
   `atol/rtol=1e-4` at steps 0/1/100/500/1000; per-position eval acc + `simulated_acc_len`
   `atol=1e-3`.
 - **10.2 Colocated ≡ disaggregated gate (NEW):** same data through the colocated (no-op control

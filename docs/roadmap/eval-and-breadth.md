@@ -107,7 +107,7 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
      and `supports_online`. If a data path isn't wired yet, leave that factory `None` — the builder
      raises an actionable `NotImplementedError` instead of silently feeding EAGLE3-shaped features.
   3. **Optionally, a draft architecture** under the draft-model package
-     (`specforge/modeling/draft/` today, `specforge/models/drafts/` after domain Phase E —
+     (`specforge/modeling/draft/`; domain Phase E adds a `registry.py` there —
      alongside `dflash.py` / `llama3_eagle.py`) — only if the algorithm needs a network the existing draft
      models don't provide. Medusa heads or MTP heads would live here; an algorithm that reuses an
      existing draft body (as Domino reuses DFlash's draft with a different head/loss) needs **no**

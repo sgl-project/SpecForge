@@ -17,8 +17,17 @@ roadmap home. Each track doc gives, per phase: **Goal / Target state / Implement
 - **Ray is OPEN.** A *candidate* for the O2 scale-out orchestration layer — likely needed for
   multi-node N-producer/M-trainer scale-out — but **not committed and not a non-goal**. See the
   decision gate in [online-disaggregation.md](./online-disaggregation.md) §O2.
-- **Keep the runtime training seam** (`TrainerCore` / `DraftTrainStrategy` / `TrainingBackend` +
-  `StepContext`); a domain `Trainer` + managers *wrap* it, they do not replace it.
+- **Preserve the training seam** (`TrainerCore` / `DraftTrainStrategy` / `TrainingBackend` +
+  `StepContext`); a domain `Trainer` + managers *wrap* it, they do not replace it. It is relocated
+  **intact** (not rewritten) from `runtime/training` to top-level `training/` in the move-only
+  step `E0` — see [domain-refactor.md](./domain-refactor.md).
+- **One implementation home per concern; `runtime/` is substrate-only.** `runtime/` holds only the
+  DataFlow spine (`control_plane` + `data_plane` + `contracts`). All training-execution code lives
+  in top-level `training/`, all rollout/capture-execution code in top-level `inference/`, and
+  `modeling/` holds model definitions only (no orchestration, no capture factory). **New code is
+  born in its final home** — the Phase-D managers land directly in `training/`, never deeper in
+  `runtime/`; the existing seam and target engine are relocated once, in `E0`. There is **no facade
+  package**.
 
 ## Tracks
 | Track | Doc | Scope |
@@ -38,6 +47,7 @@ roadmap home. Each track doc gives, per phase: **Goal / Target state / Implement
 | E1 — Acceptance-length eval harness | eval | M | next |
 | C — Colocated lightweight path | domain | M | later |
 | D — Training managers (no_sync / resume / ckpt / eval) | domain | L | later |
+| E0 — Layout consolidation (move-only: seam + target engine → top-level homes) | domain | M | later (front of E) |
 | E — Composition & run surface (drafts registry, config/CLI, export) | domain | L | later |
 | O2 — Scale-out orchestration (Ray = open) | online | L | later |
 | O3 — Hardening (RDMA pool, restart, observability) | online | L | later |
@@ -46,7 +56,7 @@ roadmap home. Each track doc gives, per phase: **Goal / Target state / Implement
 ## Dependencies (cross-track)
 ```
 domain:  A(rev.) ─┬─▶ B ─┬─▶ C
-                  │       └─▶ D ─▶ E
+                  │       └─▶ D ─▶ E0 ─▶ E
                   └─▶ B.TargetEngine ─────────────┐
 online:  O1.1(review) ─▶ O1.2(review) ─▶ O1.3 ◀───┘ ─▶ O2(Ray=open) ─▶ O3
 eval:    E1 ─▶ E2          (parallel / orthogonal to both tracks)
