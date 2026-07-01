@@ -24,10 +24,16 @@ from .sglang_backend import SGLangRunner
 
 @dataclass
 class DFlashTargetOutput:
-    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size]
+    hidden_states: torch.Tensor  # [batch, seq_len, n_capture*hidden_size]
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    # Target model's FINAL hidden state [batch, seq_len, hidden_size]. Optional:
+    # DFlash never reads it, but DSpark's L1 distribution-distillation and
+    # confidence-head losses need it (the frozen target LM head is applied to it
+    # to form the soft next-token distribution). None when the backend does not
+    # surface it (then DSpark must run CE-only).
+    last_hidden_states: Optional[torch.Tensor] = None
 
 
 class DFlashTargetModel(ABC):
@@ -163,22 +169,26 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             output = output.logits_output
 
         input_lens = [len(req.origin_input_ids) for req in reqs]
+        # context = the captured (aux) mid-layer concat used by DFlash; final = the
+        # post-norm last-layer hidden, surfaced for DSpark's L1 / confidence losses
+        # (None if the runner only returned a single hidden stream).
+        final_list = None
         if (
             hasattr(output, "aux_hidden_states")
             and output.aux_hidden_states is not None
         ):
-            hidden_states_list = torch.split(
-                output.aux_hidden_states, input_lens, dim=0
-            )
+            context_list = torch.split(output.aux_hidden_states, input_lens, dim=0)
+            if hasattr(output, "hidden_states") and output.hidden_states is not None:
+                final_list = torch.split(output.hidden_states, input_lens, dim=0)
         elif hasattr(output, "hidden_states") and output.hidden_states is not None:
-            hidden_states_list = torch.split(output.hidden_states, input_lens, dim=0)
+            context_list = torch.split(output.hidden_states, input_lens, dim=0)
         else:
             raise ValueError("SGLang output does not contain hidden states.")
 
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
 
-        return hidden_states_list
+        return context_list, final_list
 
     @torch.no_grad()
     def generate_dflash_data(
@@ -209,10 +219,13 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
-        hidden_states_list = self._extend(reqs)
+        context_list, final_list = self._extend(reqs)
 
         # Stack back to batch
-        hidden_states = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
+        hidden_states = torch.cat([h.unsqueeze(0) for h in context_list], dim=0)
+        last_hidden_states = None
+        if final_list is not None:
+            last_hidden_states = torch.cat([h.unsqueeze(0) for h in final_list], dim=0)
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
@@ -222,6 +235,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            last_hidden_states=last_hidden_states,
         )
 
 
@@ -269,7 +283,8 @@ class HFDFlashTargetModel(DFlashTargetModel):
             use_cache=False,
         )
 
-        # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
+        # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output;
+        # hidden_states[-1] = final (post-norm) hidden, i.e. the LM-head input.
         offset = 1
         selected = []
         if self.capture_layer_ids is not None:
@@ -279,11 +294,15 @@ class HFDFlashTargetModel(DFlashTargetModel):
         else:
             hidden_states = outputs.hidden_states[-1]
 
+        # Final hidden state for DSpark's L1 / confidence losses (DFlash ignores it).
+        last_hidden_states = outputs.hidden_states[-1]
+
         return DFlashTargetOutput(
             hidden_states=hidden_states,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            last_hidden_states=last_hidden_states,
         )
 
 
