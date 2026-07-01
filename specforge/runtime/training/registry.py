@@ -153,6 +153,118 @@ register_strategy(
 )
 
 
+# --- DFlash -----------------------------------------------------------------
+# DFlash uses its own feature schema ('hidden_states' = the concatenated target
+# capture layers, NO eagle3 aux/target swap, NO target distribution / vocab map).
+# Offline: the reader reuses OfflineManifestReader with dflash feature_keys; the
+# transform slices to max_len (no swap); the collate pads + emits {input_ids,
+# hidden_states, loss_mask}. Online: a DFlashAdapter wraps generate_dflash_data
+# and emits the same schema. The DFlashTrainStrategy already drops into the
+# unchanged TrainerCore/Backend/Loader.
+
+from specforge.runtime.training.strategy import DFlashTrainStrategy
+
+
+def _dflash_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    # OfflineManifestReader is schema-agnostic; only its EAGLE3 defaults
+    # (feature_keys/strategy/target_repr) must be overridden. DFlash has no target
+    # distribution, so target_repr=None (only stored in ref metadata).
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+        strategy="dflash",
+        feature_keys=("input_ids", "loss_mask", "hidden_states"),
+        target_repr=None,
+    )
+
+
+def _dflash_process_data(raw, max_len):
+    """Offline DFlash per-sample normalization.
+
+    Slices to ``max_len`` and restores a leading batch dim. NO eagle3-style
+    aux->input / hidden->target swap and NO last-position loss zeroing (the online
+    DFlash path does neither), so offline matches online training.
+    """
+    input_ids = raw["input_ids"][:max_len]
+    loss_mask = raw["loss_mask"][:max_len]
+    hidden_states = raw["hidden_states"]
+    if hidden_states.dim() == 3:  # stored as [1, seq, W]; drop the saved batch dim
+        hidden_states = hidden_states.squeeze(0)
+    hidden_states = hidden_states[:max_len]
+    return {
+        "input_ids": input_ids[None, :],
+        "loss_mask": loss_mask[None, :],
+        "hidden_states": hidden_states[None, :, :],
+    }
+
+
+def _dflash_offline_transform(max_len):
+    return lambda raw: _dflash_process_data(raw, max_len)
+
+
+def _dflash_offline_collate():
+    """Right-pad ragged samples to the batch max length and concat along batch.
+
+    DataCollatorWithPadding is eagle3-specific (hardwires attention_mask + the
+    hidden_state/target keys), so DFlash uses this minimal collate. loss_mask is
+    zero-padded, so padded positions contribute no loss. (Single-rank; no SP
+    sharding multiple — sequence-parallel offline DFlash is a follow-up.)
+    """
+
+    def collate(feats):
+        maxlen = max(f["input_ids"].shape[-1] for f in feats)
+
+        def pad2d(t):  # [1, n] -> [1, maxlen]
+            n = t.shape[-1]
+            if n == maxlen:
+                return t
+            return torch.cat([t, t.new_zeros(t.shape[0], maxlen - n)], dim=-1)
+
+        def pad3d(t):  # [1, n, W] -> [1, maxlen, W]
+            n = t.shape[1]
+            if n == maxlen:
+                return t
+            return torch.cat(
+                [t, t.new_zeros(t.shape[0], maxlen - n, t.shape[2])], dim=1
+            )
+
+        return {
+            "input_ids": torch.cat([pad2d(f["input_ids"]) for f in feats], dim=0),
+            "loss_mask": torch.cat([pad2d(f["loss_mask"]) for f in feats], dim=0),
+            "hidden_states": torch.cat(
+                [pad3d(f["hidden_states"]) for f in feats], dim=0
+            ),
+        }
+
+    return collate
+
+
+def _dflash_adapter(target_model, *, device="cuda", t2d=None):
+    from specforge.runtime.inference.dflash_adapter import DFlashAdapter
+
+    return DFlashAdapter(target_model, device=device, t2d=t2d)
+
+
+register_strategy(
+    StrategySpec(
+        name="dflash",
+        required_features=frozenset(DFlashTrainStrategy.required_features),
+        make_strategy=lambda wrapped, *, target_head=None: DFlashTrainStrategy(wrapped),
+        uses_target_head=False,
+        make_offline_reader=_dflash_offline_reader,
+        make_offline_transform=_dflash_offline_transform,
+        make_offline_collate=_dflash_offline_collate,
+        make_online_collate=lambda: concat_collate,
+        make_adapter=_dflash_adapter,
+        supports_online=True,
+    )
+)
+
+
 __all__ = [
     "StrategySpec",
     "concat_collate",
