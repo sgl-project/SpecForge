@@ -96,6 +96,8 @@ class TestEvaluatorAggregation(unittest.TestCase):
     def test_scalar_strategy_degenerates_gracefully(self):
         from specforge.eval import Evaluator
 
+        # equal token counts (loss_mask of 4 each) -> the token-weighted
+        # aggregate equals the plain mean here.
         outs = [
             StepOutput(loss=torch.tensor(1.0), metrics={"accuracy": torch.tensor(0.5)}),
             StepOutput(loss=torch.tensor(1.0), metrics={"accuracy": torch.tensor(0.7)}),
@@ -104,6 +106,24 @@ class TestEvaluatorAggregation(unittest.TestCase):
         m = Evaluator().run(lambda b: next(it), [_batch(), _batch()])
         self.assertAlmostEqual(m["eval/avg_acc"], 0.6, places=6)
         self.assertAlmostEqual(m["eval/simulated_acc_len"], 0.6, places=6)
+
+    def test_scalar_accuracy_is_batch_size_invariant(self):
+        from specforge.eval import Evaluator
+
+        # A batch's scalar accuracy is a per-token mean, so the aggregate must
+        # weight by token count: (3-of-4) + (1-of-2) regrouped as one 4-of-6
+        # batch must give the same number — a plain mean of per-batch means
+        # would not (the ragged batch would skew it: (0.75+0.5)/2 = 0.625).
+        split = [
+            _scalar_out(1.0, 3 / 4, tokens=4),
+            _scalar_out(1.0, 1 / 2, tokens=2),
+        ]
+        combined = [_scalar_out(1.0, 4 / 6, tokens=6)]
+        for outs, n in ((split, 2), (combined, 1)):
+            it = iter(outs)
+            m = Evaluator().run(lambda b: next(it), [_batch() for _ in range(n)])
+            self.assertAlmostEqual(m["eval/avg_acc"], 4 / 6, places=6)
+            self.assertAlmostEqual(m["eval/simulated_acc_len"], 4 / 6, places=6)
 
     def test_reports_per_position_acceptance(self):
         # The roadmap asks for per-position acceptance, not just the folded sum.
@@ -168,8 +188,10 @@ class TestEvaluatorDataParallel(unittest.TestCase):
         # identical metrics on every rank
         self.assertEqual(results[0], results[1])
         scalar, ragged = results[0]["scalar"], results[0]["ragged"]
-        # global scalar accuracy = mean over ALL 3 batches, not the rank shard
-        self.assertAlmostEqual(scalar["eval/avg_acc"], (0.5 + 0.7 + 0.9) / 3, places=6)
+        # global scalar accuracy = token-weighted over ALL 3 batches (8/2/10
+        # tokens) — not a rank-shard number and not a mean of per-batch means:
+        # (0.5*8 + 0.7*2 + 0.9*10) / 20 = 0.72
+        self.assertAlmostEqual(scalar["eval/avg_acc"], 0.72, places=6)
         # global token-weighted loss: (2*8 + 8*2 + 4*10) / 20 = 3.6
         self.assertAlmostEqual(scalar["eval/avg_loss"], 3.6, places=6)
         # the ragged pass completed (no hang) with rank0's counts as the total
