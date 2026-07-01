@@ -437,8 +437,6 @@ def build_online_runtime(
     sp_ring_size: int = 1,
     collate_fn=None,
     logger=None,
-    deployment_mode: DeploymentMode = "local_colocated",
-    metadata_db_path: Optional[str] = None,
 ):
     """Assemble the colocated online dataflow and return
     ``(trainer, loader, workers, controller, drive_rollout)``.
@@ -457,9 +455,15 @@ def build_online_runtime(
     already materialized the target distribution.
     """
     spec = resolve_strategy(strategy)
-    controller, durable_ack = resolve_control_plane(
-        deployment_mode, run_id, metadata_db_path=metadata_db_path
-    )
+    # Deliberately PINNED to local_colocated (unlike build_offline_runtime, which
+    # takes deployment_mode): the online loader consumes this process's private
+    # SampleRefQueue, fed only by commit_sample()==True — pointing several ranks
+    # at one shared durable store would dedup each sample onto a single rank's
+    # queue (divergent batch counts -> mismatched FSDP collectives), and a reused
+    # db file would starve a restarted run to zero steps. A durable-store online
+    # run is what the disagg online builders are for (one shared store + a
+    # streamed ref channel designed to be consumed once across processes).
+    controller, durable_ack = resolve_control_plane("local_colocated", run_id)
     controller.ingest_prompts(prompts)
     store = LocalFeatureStore(run_id)
 
