@@ -6,7 +6,15 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Registry for draft model architectures."""
+"""Draft-architecture registry: the extension point for new draft model classes.
+
+A draft *architecture* (the model class) is a separate axis from the
+per-algorithm training strategy (``specforge.training.strategies.registry``):
+one architecture can train under several algorithms and vice versa. Registering
+a class here makes it constructible from a draft-config JSON whose
+``architectures[0]`` names it — adding an architecture is a new file plus
+``@register_draft``, not an edit to ``modeling/auto.py``.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +24,13 @@ DRAFT_REGISTRY: Dict[str, type] = {}
 
 
 def register_draft(cls: Optional[type] = None, *, name: Optional[str] = None):
-    """Register a draft model class by architecture name."""
+    """Class decorator registering a draft architecture.
+
+    The key defaults to the class name — exactly what draft-config JSONs carry
+    in ``architectures``. The class must declare ``config_class`` (the HF
+    ``PretrainedConfig`` subclass it is built from) so the auto loaders can
+    resolve both the model and its config from the one registry entry.
+    """
 
     def _register(cls: type) -> type:
         key = name or cls.__name__
