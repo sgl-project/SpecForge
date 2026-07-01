@@ -27,13 +27,20 @@ import dataclasses
 import threading
 import uuid
 from collections import OrderedDict, deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
+from specforge.runtime.contracts import (
+    DeploymentMode,
+    PromptTask,
+    SampleRef,
+    assert_no_tensors,
+)
 from specforge.runtime.control_plane.backpressure import BackpressureController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
+    NoOpMetadataStore,
+    SQLiteMetadataStore,
 )
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
@@ -355,4 +362,31 @@ class DataFlowController:
         return status
 
 
-__all__ = ["DataFlowController", "TrainLease"]
+def resolve_control_plane(
+    deployment_mode: DeploymentMode,
+    run_id: str,
+    *,
+    metadata_db_path: Optional[str] = None,
+) -> Tuple[DataFlowController, bool]:
+    """Build the controller for a deployment mode; return ``(controller, durable_ack)``.
+
+    This is where ``DeploymentMode`` becomes load-bearing rather than
+    decorative. ``local_colocated`` pays nothing for the disagg control plane: a
+    ``NoOpMetadataStore`` and ``durable_ack=False`` (the trainer skips the durable
+    ack transaction — the loader releases features as it consumes them). The
+    ``dataflow_colocated`` / ``disaggregated`` modes keep the durable store and
+    the optimizer-boundary ack: SQLite when ``metadata_db_path`` is given,
+    otherwise the controller's own default (a private in-process store) — the
+    store-selection policy lives in one place, not here.
+    """
+    if deployment_mode == "local_colocated":
+        store: Optional[MetadataStore] = NoOpMetadataStore()
+        durable_ack = False
+    else:
+        store = SQLiteMetadataStore(metadata_db_path) if metadata_db_path else None
+        durable_ack = True
+    controller = DataFlowController(run_id, metadata_store=store)
+    return controller, durable_ack
+
+
+__all__ = ["DataFlowController", "TrainLease", "resolve_control_plane"]

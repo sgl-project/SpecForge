@@ -127,6 +127,60 @@ class InMemoryMetadataStore(MetadataStore):
             }
 
 
+class NoOpMetadataStore(MetadataStore):
+    """A store that records nothing — for ``local_colocated`` runs.
+
+    Colocated training keeps rollout and trainer in one process over an
+    in-memory FeatureStore, so it needs neither dedup, a committed-ref index, nor
+    the durable ack transaction those buy (the loader releases each feature the
+    moment it materializes a batch, and a colocated crash is not reconciled).
+    Every method is the cheapest answer that keeps the controller's contract:
+    ``commit_sample`` always reports "new" so the caller enqueues once, and the
+    recovery surface is empty.
+
+    Known, deliberate limits of retaining nothing:
+
+    * **Observability** — ``DataFlowController.status()`` reports
+      ``samples_committed`` / ``durable_acked`` / ``train_backlog`` as 0 for the
+      whole run (there is no committed index to count). Use the trainer's own
+      step/loss logging for colocated progress.
+    * **No commit dedup** — a re-committed ``sample_id`` re-enqueues. In one
+      process the rollout worker commits each sample exactly once, so there is
+      no redelivery path; do not pair this store with an at-least-once producer.
+    * **No ref reconstruction** — ``get_committed`` is always ``None``, so a
+      ``TrainLease`` (or ``fail_refs``) over this store cannot re-deliver refs;
+      the ack/fail paths degrade to safe no-ops. Cross-process trainers need a
+      retaining store.
+    """
+
+    def commit_sample(self, ref: SampleRef) -> bool:
+        return True
+
+    def is_committed(self, sample_id: str) -> bool:
+        return False
+
+    def get_committed(self, sample_id: str) -> Optional[SampleRef]:
+        return None
+
+    def committed_count(self) -> int:
+        return 0
+
+    def all_committed_ids(self) -> List[str]:
+        return []
+
+    def record_train_ack(
+        self,
+        sample_ids: List[str],
+        *,
+        global_step: Optional[int],
+        optimizer_durable: bool,
+    ) -> None:
+        pass
+
+    def durable_marker(self) -> Dict[str, Any]:
+        return {"acked": set(), "global_step": None, "optimizer_durable": False}
+
+
 # ---------------------------------------------------------------------------
 # SampleRef <-> JSON (the only metadata-store payload that needs persisting)
 # ---------------------------------------------------------------------------
@@ -288,6 +342,7 @@ class SQLiteMetadataStore(MetadataStore):
 __all__ = [
     "MetadataStore",
     "InMemoryMetadataStore",
+    "NoOpMetadataStore",
     "SQLiteMetadataStore",
     "sample_ref_to_json",
     "sample_ref_from_json",

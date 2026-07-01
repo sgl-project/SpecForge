@@ -65,12 +65,26 @@ class Trainer:
         collate_fn,
         total_steps: Optional[int] = None,
         per_sample_transform=None,
+        durable_ack: bool = True,
     ):
+        # ``durable_ack`` gates the control-plane bookkeeping a colocated run does
+        # not need (Phase C, local_colocated): with it off there is no durable ack
+        # transaction — the loader releases each feature as it consumes it — so we
+        # skip the offline enqueue too (nothing acks or reads that queue).
+        #
         # Offline = a fixed, re-iterable ref set: record committed state so the ack
         # lookup works (num_epochs > 1 then re-iterates). Online streams refs through
         # a queue and commits them elsewhere (rollout / channel).
         if "refs" in ref_source:
-            controller.enqueue_offline_refs(ref_source["refs"])
+            if durable_ack:
+                controller.enqueue_offline_refs(ref_source["refs"])
+            else:
+                # No durable enqueue, but the control plane's metadata-only
+                # contract still holds for every ref entering the trainer path.
+                from specforge.runtime.contracts import assert_no_tensors
+
+                for ref in ref_source["refs"]:
+                    assert_no_tensors(ref)
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
         loader = FeatureDataLoader(
             store,
@@ -92,6 +106,16 @@ class Trainer:
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
         strategy = spec.make_strategy(wrapped, target_head=target_head)
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
+        # Durable ack transaction at each optimizer-step boundary. Off for
+        # local_colocated: the loader releases features as it consumes them.
+        ack_fn = None
+        if durable_ack:
+
+            def ack_fn(ids, step):
+                controller.ack_train_refs(
+                    trainer_id, ids, global_step=step, optimizer_durable=True
+                )
+
         controller_obj = TrainerController(
             core,
             run_id=run_id,
@@ -103,9 +127,7 @@ class Trainer:
             eval_interval=eval_interval,
             log_interval=log_interval,
             logger=logger,
-            ack_fn=lambda ids, step: controller.ack_train_refs(
-                trainer_id, ids, global_step=step, optimizer_durable=True
-            ),
+            ack_fn=ack_fn,
         )
 
         # The runtime pieces, exposed for callers that still want them directly
