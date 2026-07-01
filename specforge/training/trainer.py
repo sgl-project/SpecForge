@@ -77,8 +77,16 @@ class Trainer:
         # Offline = a fixed, re-iterable ref set: record committed state so the ack
         # lookup works (num_epochs > 1 then re-iterates). Online streams refs through
         # a queue and commits them elsewhere (rollout / channel).
-        if durable_ack and "refs" in ref_source:
-            controller.enqueue_offline_refs(ref_source["refs"])
+        if "refs" in ref_source:
+            if durable_ack:
+                controller.enqueue_offline_refs(ref_source["refs"])
+            else:
+                # No durable enqueue, but the control plane's metadata-only
+                # contract still holds for every ref entering the trainer path.
+                from specforge.runtime.contracts import assert_no_tensors
+
+                for ref in ref_source["refs"]:
+                    assert_no_tensors(ref)
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
         loader = FeatureDataLoader(
             store,
