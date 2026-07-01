@@ -280,7 +280,7 @@ class SGLangCaptureBackend:
     # --- EAGLE3 extend (text) ----------------------------------------------
 
     @torch.no_grad
-    def _extend_eagle3(
+    def _forward_eagle3_reqs(
         self,
         reqs,
         capture_aux_hidden_states: bool = True,
@@ -340,7 +340,7 @@ class SGLangCaptureBackend:
         self._clear_pools()
         return logits, aux_hidden_states, last_hidden_states
 
-    def extend(
+    def extend_eagle3(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -377,7 +377,7 @@ class SGLangCaptureBackend:
             reqs.append(req)
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            self._extend_eagle3(
+            self._forward_eagle3_reqs(
                 reqs,
                 capture_aux_hidden_states=True,
                 return_last_hidden_states=return_last_hidden_states,
@@ -418,7 +418,7 @@ class SGLangCaptureBackend:
 
         return position_ids, rope_deltas
 
-    def extend_vlm(
+    def extend_eagle3_vlm(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -496,7 +496,7 @@ class SGLangCaptureBackend:
 
             # Count image tokens
             num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
-            # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
+            # print(f"[extend_eagle3_vlm] num_img_tokens in input_ids: {num_img_tokens}")
 
             mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
                 spatial_merge_size=self.spatial_merge_size,
@@ -550,7 +550,7 @@ class SGLangCaptureBackend:
             reqs.append(req)
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            self._extend_eagle3(
+            self._forward_eagle3_reqs(
                 reqs,
                 capture_aux_hidden_states=True,
                 return_last_hidden_states=return_last_hidden_states,
@@ -559,6 +559,10 @@ class SGLangCaptureBackend:
         )
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+
+    # Back-compat aliases for the pre-B2 SGLangEagle3TargetEngine method surface.
+    extend = extend_eagle3
+    extend_vlm = extend_eagle3_vlm
 
     # --- DFlash extend ------------------------------------------------------
 

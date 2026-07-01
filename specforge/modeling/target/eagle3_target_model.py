@@ -327,14 +327,21 @@ class SGLangEagle3TargetEngine(Eagle3TargetEngine):
     ) -> None:
         self._backend.set_eagle3_capture_layers(aux_hidden_states_layers)
 
-    # The extend / extend_vlm / get_rope_index forwards live in SGLangCaptureBackend
-    # (the version-pinned boundary); these delegators keep the engine's method
-    # surface stable while the engine itself imports no sglang internals.
+    # The extend_eagle3 / extend_eagle3_vlm / get_rope_index forwards live in
+    # SGLangCaptureBackend (the version-pinned boundary); the legacy extend /
+    # extend_vlm aliases keep the engine's method surface stable while the engine
+    # itself imports no sglang internals.
+    def extend_eagle3(self, *args, **kwargs):
+        return self._backend.extend_eagle3(*args, **kwargs)
+
+    def extend_eagle3_vlm(self, *args, **kwargs):
+        return self._backend.extend_eagle3_vlm(*args, **kwargs)
+
     def extend(self, *args, **kwargs):
-        return self._backend.extend(*args, **kwargs)
+        return self.extend_eagle3(*args, **kwargs)
 
     def extend_vlm(self, *args, **kwargs):
-        return self._backend.extend_vlm(*args, **kwargs)
+        return self.extend_eagle3_vlm(*args, **kwargs)
 
     def get_rope_index(self, *args, **kwargs):
         return self._backend.get_rope_index(*args, **kwargs)
@@ -367,7 +374,7 @@ class SGLangEagle3TargetEngine(Eagle3TargetEngine):
 
         if is_vlm:
             data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                self.extend_vlm(
+                self.extend_eagle3_vlm(
                     input_ids,
                     attention_mask,
                     loss_mask,
@@ -379,7 +386,7 @@ class SGLangEagle3TargetEngine(Eagle3TargetEngine):
             )
         else:
             data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                self.extend(
+                self.extend_eagle3(
                     input_ids,
                     attention_mask,
                     loss_mask,
