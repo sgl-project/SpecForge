@@ -8,8 +8,9 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """DFlashAdapter: the DFlash counterpart of SGLangAdapter.
 
-Wraps a ``DFlashTargetModel`` (sglang / hf, both expose ``generate_dflash_data``)
-and returns per-sample feature dicts for the DataFlow rollout. DFlash's schema is
+Wraps a DFlash ``TargetEngine`` (sglang / hf), calling its generic ``capture(...)``
+(the legacy ``generate_dflash_data`` is kept as a back-compat alias), and returns
+per-sample feature dicts for the DataFlow rollout. DFlash's schema is
 ``{input_ids, hidden_states, loss_mask}`` — note ``hidden_states`` is the
 concatenated target capture layers, and there is NO ``target`` distribution / no
 vocab projection (DFlash trains on hard real-token labels), so unlike
@@ -43,7 +44,7 @@ def _as_2d_long(values, device) -> torch.Tensor:
 
 
 class DFlashAdapter:
-    """Adapter over a SpecForge ``DFlashTargetModel`` (any ``generate_dflash_data``)."""
+    """Adapter over a SpecForge DFlash ``TargetEngine`` (via its generic ``capture()``)."""
 
     SUPPORTED_FEATURE_NAMES = {"input_ids", "hidden_states", "loss_mask"}
 
@@ -63,8 +64,8 @@ class DFlashAdapter:
     ) -> List[Dict[str, Any]]:
         """Extract per-sample DFlash features, batching equal-length prompts.
 
-        Mirrors SGLangAdapter's length-grouped batching, but calls
-        ``generate_dflash_data`` and emits the DFlash schema. The target must have
+        Mirrors SGLangAdapter's length-grouped batching, but calls the engine's
+        generic ``capture(...)`` and emits the DFlash schema. The target must have
         had ``set_capture_layers`` called so ``hidden_states`` width matches the
         draft's ``len(target_layer_ids) * hidden_size``.
         """
@@ -95,7 +96,7 @@ class DFlashAdapter:
                 dim=0,
             )
             attention_mask = torch.ones_like(input_ids)
-            data = self.target_model.generate_dflash_data(
+            data = self.target_model.capture(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 loss_mask=loss_mask,

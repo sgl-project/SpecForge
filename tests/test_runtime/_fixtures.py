@@ -153,7 +153,7 @@ def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4
     """Build a tiny HF Llama target wrapped by the SpecForge HF eagle3 backend."""
     from transformers import LlamaConfig, LlamaForCausalLM
 
-    from specforge.modeling.target import get_eagle3_target_model
+    from specforge.modeling.target import get_target_engine
 
     cfg = LlamaConfig(
         hidden_size=hidden,
@@ -170,8 +170,9 @@ def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4
     model = LlamaForCausalLM(cfg)
     target_dir = os.path.join(workdir, "hf_target")
     model.save_pretrained(target_dir)
-    target = get_eagle3_target_model(
-        pretrained_model_name_or_path=target_dir,
+    target = get_target_engine(
+        target_dir,
+        strategy="eagle3",
         backend="hf",
         torch_dtype=torch.bfloat16,
         device="cuda",

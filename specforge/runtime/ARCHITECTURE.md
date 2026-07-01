@@ -14,7 +14,7 @@ its own design note (see "Per-plane internals" below).
 
 ## End-to-end flow
 
-**Online:** `RolloutWorker.run_once` leases prompts (`lease_prompt_tasks`), calls `generate_features` (which drives `generate_eagle3_data`), runs `verify_capture`, then `FeatureStore.put` writes tensors **directly to the data plane**. Only the resulting `SampleRef` metadata goes to the controller via `commit_samples`, which dedups through `MetadataStore.commit_sample` and enqueues fresh refs onto `SampleRefQueue`.
+**Online:** `RolloutWorker.run_once` leases prompts (`lease_prompt_tasks`), calls `generate_features` (which drives the engine's generic `TargetEngine.capture`), runs `verify_capture`, then `FeatureStore.put` writes tensors **directly to the data plane**. Only the resulting `SampleRef` metadata goes to the controller via `commit_samples`, which dedups through `MetadataStore.commit_sample` and enqueues fresh refs onto `SampleRefQueue`.
 
 **Offline:** `OfflineManifestReader.read()` emits in-place `file://` `SampleRef`s (no tensor copy) and the launcher calls `enqueue_offline_refs`, which dedups and enqueues onto the **same** `SampleRefQueue`.
 
@@ -36,7 +36,7 @@ flowchart TD
   subgraph COMPUTE[compute autonomous loops]
     RW[RolloutWorker run_once loop]
     SG[SGLangAdapter generate_features]
-    TGT[Eagle3TargetModel generate_eagle3_data]
+    TGT[TargetEngine capture via SGLangCaptureBackend]
     TR[TrainerController fit loop]
     CORE[TrainerCore train_step]
     STRAT[Eagle3TrainStrategy forward_loss]
@@ -59,7 +59,7 @@ flowchart TD
   RW -->|register_rollout_worker| CTRL
   RW -->|lease_prompt_tasks| CTRL
   RW -->|generate_features| SG
-  SG -->|generate_eagle3_data| TGT
+  SG -->|capture| TGT
   RW -.->|put| STORE
   RW -->|commit_samples| CTRL
   RW -->|fail_prompt_tasks| CTRL
@@ -97,7 +97,7 @@ flowchart TD
 | RolloutWorker | register_rollout_worker | control | Register worker, obtain authoritative worker_id (no-tensor guard on info) |
 | RolloutWorker | lease_prompt_tasks | control | Pop up to max_tasks pending PromptTasks, mark leased to worker_id |
 | RolloutWorker | generate_features | compute | Ask the FeatureSource (SGLangAdapter) for one feature dict per task |
-| SGLangAdapter | generate_eagle3_data | compute | Run the target engine's batched forward to extract hidden_states/target |
+| SGLangAdapter | TargetEngine.capture | compute | Run the target engine's batched forward (sglang glue in SGLangCaptureBackend) to extract hidden_states/target |
 | RolloutWorker | put | data | Persist verified feature tensors directly to FeatureStore, get back a SampleRef |
 | RolloutWorker | abort | data | Clean up a partial/failed write so no corrupt sample is left |
 | RolloutWorker | commit_samples | control | Commit metadata-only SampleRefs; dedup + enqueue fresh refs |
