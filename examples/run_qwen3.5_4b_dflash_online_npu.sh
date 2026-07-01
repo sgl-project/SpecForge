@@ -10,7 +10,7 @@ export SPECFORGE_DATA_NUM_PROC=64
 ATTENTION_BACKEND=${2:-flex_attention}
 NUM_GPUS=${1:-8}
 
-# Keep the method default for --num-anchors; lower it if OOM occurs on low-memory NPU/GPU devices.
+# If OOM occurs on low-memory NPU devices, retry with a smaller --num-anchors value.
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \

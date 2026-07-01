@@ -20,7 +20,7 @@ NUM_DEVICES=$(echo "$NPU_DEVICES" | tr ',' '\n' | wc -l)
 export ASCEND_RT_VISIBLE_DEVICES=$NPU_DEVICES
 export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:32
 
-# Keep the method default for --num-anchors; lower it if OOM occurs on low-memory NPU/GPU devices.
+# If OOM occurs on low-memory NPU devices, retry with a smaller --num-anchors value.
 torchrun \
     --standalone \
     --nproc_per_node "$NUM_DEVICES" \
