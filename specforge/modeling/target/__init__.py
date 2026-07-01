@@ -8,6 +8,7 @@ from .eagle3_target_model import (
     HFEagle3TargetModel,
     SGLangEagle3TargetEngine,
     SGLangEagle3TargetModel,
+    SGLangServerEagle3TargetEngine,
     get_eagle3_target_model,
 )
 from .factory import available_target_engines, get_target_engine
@@ -24,6 +25,7 @@ __all__ = [
     "SGLangEagle3TargetEngine",
     "HFEagle3TargetEngine",
     "CustomEagle3TargetEngine",
+    "SGLangServerEagle3TargetEngine",
     "get_eagle3_target_model",
     # Back-compat aliases (pre-Phase-B names)
     "Eagle3TargetModel",

@@ -1,10 +1,9 @@
 import logging
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
@@ -13,57 +12,12 @@ from specforge.utils import padding
 
 from .base import TargetEngine
 
-# SGLang internals back the *sglang* target backend only. Keep these imports
-# optional so `import specforge` (and the HF / offline / draft paths) still works
-# when the installed sglang version does not expose the exact symbols this file
-# pins. The SGLang backend then surfaces a clear error at construction time
-# (see SGLangEagle3TargetModel.from_pretrained). This keeps the engine behind a
-# replaceable boundary rather than a hard, version-locked import dependency.
-try:
-    import sglang.srt.managers.mm_utils as mm_utils
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-    from sglang.srt.managers.mm_utils import (
-        MultiModalityDataPaddingPatternMultimodalTokens,
-        init_mm_embedding_cache,
-    )
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalDataItem,
-        MultimodalInputs,
-        Req,
-        ScheduleBatch,
-    )
-
-    # prepare_mlp_sync_batch_raw is a module-level function, not a Scheduler method
-    from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.radix_cache import RadixCache
-    from sglang.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardBatch,
-    )
-    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-    from sglang.srt.sampling.sampling_params import SamplingParams
-    from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-    from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-
-    from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
-    from .sglang_backend.utils import LogitsProcessorForEAGLE3
-
-    _SGLANG_IMPORT_ERROR = None
-except Exception as _exc:  # pragma: no cover - depends on installed sglang version
-    _SGLANG_IMPORT_ERROR = _exc
-    mm_utils = ModelConfig = MRotaryEmbedding = None
-    MultiModalityDataPaddingPatternMultimodalTokens = init_mm_embedding_cache = None
-    Modality = MultimodalDataItem = MultimodalInputs = Req = ScheduleBatch = None
-    prepare_mlp_sync_batch_raw = CacheInitParams = RadixCache = None
-    CaptureHiddenMode = ForwardBatch = BaseMultimodalProcessor = None
-    SamplingParams = ServerArgs = SpeculativeAlgorithm = None
-    require_mlp_sync = require_mlp_tp_gather = None
-    SGLangRunner = wrap_eagle3_logits_processors_in_module = None
-    LogitsProcessorForEAGLE3 = None
+# NOTE (Phase B2): this module no longer imports sglang internals. The
+# SGLang-version-pinned capture path (ServerArgs / ModelConfig / SGLangRunner +
+# the extend/capture forward) lives entirely in
+# ``sglang_backend.SGLangCaptureBackend``; the SGLang engine below composes it
+# (imported lazily inside ``from_pretrained``). A sglang bump touches only that
+# module — the engine and ``import specforge`` are sglang-version-agnostic.
 
 logger = logging.getLogger(__name__)
 
@@ -324,42 +278,25 @@ class SGLangEagle3TargetEngine(Eagle3TargetEngine):
 
     backend = "sglang"
 
-    def __init__(self, model_runner: SGLangRunner, hf_config=None):
+    def __init__(self, backend):  # backend: sglang_backend.SGLangCaptureBackend
+        # super().__init__() sets aux_hidden_states_layers = None. The sglang
+        # backend records capture layers on the model, not on this attribute
+        # (unchanged from before: the adapter reads it and gets None for sglang).
         super().__init__()
-        self.model_runner = model_runner
-        self.hf_config = hf_config
+        self._backend = backend
 
-        # VLM-specific attributes (initialized from hf_config if available)
-        self._init_vlm_attributes()
+    @property
+    def model_runner(self):
+        """Kept for back-compat: the underlying sglang ModelRunner."""
+        return self._backend.model_runner
 
-    def _init_vlm_attributes(self):
-        """Initialize VLM-specific attributes from hf_config for models like Qwen2.5-VL"""
-        if self.hf_config is None:
-            self.is_vlm = False
-            return
+    @property
+    def hf_config(self):
+        return self._backend.hf_config
 
-        # Check if this is a VLM model by looking for vision_config
-        self.is_vlm = hasattr(self.hf_config, "vision_config")
-
-        if not self.is_vlm:
-            return
-
-        init_mm_embedding_cache(1024 * 1024 * 512)
-        # Model type (e.g., "qwen2_5_vl", "qwen2_vl")
-        self.model_type = getattr(self.hf_config, "model_type", None)
-
-        # Vision config attributes
-        vision_config = self.hf_config.vision_config
-        self.spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
-        self.tokens_per_second = getattr(vision_config, "tokens_per_second", None)
-
-        # Special token IDs from hf_config
-        self.image_token_id = getattr(self.hf_config, "image_token_id", None)
-        self.video_token_id = getattr(self.hf_config, "video_token_id", None)
-        self.vision_start_token_id = getattr(
-            self.hf_config, "vision_start_token_id", None
-        )
-        self.vision_end_token_id = getattr(self.hf_config, "vision_end_token_id", None)
+    @property
+    def is_vlm(self) -> bool:
+        return self._backend.is_vlm
 
     @classmethod
     def from_pretrained(
@@ -371,410 +308,36 @@ class SGLangEagle3TargetEngine(Eagle3TargetEngine):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangEagle3TargetEngine":
-        tp_size = dist.get_world_size(get_tp_group())
-        # NOTE: sglang 0.5.9 requires dtype to be non-None
-        # If torch_dtype is None, use "auto" to let sglang decide the dtype
-        dtype_arg = torch_dtype if torch_dtype is not None else "auto"
-        server_args = ServerArgs(
-            model_path=pretrained_model_name_or_path,
+        # Lazy import so `import specforge` still works without the pinned sglang:
+        # the entire sglang-version coupling lives in SGLangCaptureBackend.
+        from .sglang_backend import SGLangCaptureBackend
+
+        backend = SGLangCaptureBackend.build(
+            pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
             trust_remote_code=trust_remote_code,
-            dtype=dtype_arg,
-            enable_return_hidden_states=True,
-            disable_cuda_graph=True,  # we use piecewise cuda graph for prefill instead
-            tp_size=tp_size,
-            pp_size=1,
+            wrap_eagle3_logits=True,
+            return_full_logits=False,
             **kwargs,
         )
-
-        tp_rank = dist.get_rank(get_tp_group())
-        moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-        model_config = ModelConfig.from_server_args(server_args)
-        # - Added is_draft_worker=False parameter (new in 0.5.9)
-        # - Other new parameters (dp_rank, attn_cp_rank, moe_dp_rank, etc.) use default values
-        model_runner = SGLangRunner(
-            model_config=model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=torch.cuda.current_device(),
-            tp_rank=dist.get_rank(get_tp_group()),
-            tp_size=server_args.tp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            pp_rank=0,
-            pp_size=1,
-            server_args=server_args,
-            nccl_port=None,
-            is_draft_worker=False,
-        )
-        wrap_eagle3_logits_processors_in_module(
-            model_runner.model, return_full_logits=False
-        )
-
-        # Get hf_config from model_config for VLM attributes
-        hf_config = getattr(model_config, "hf_config", None)
-
-        return cls(model_runner, hf_config=hf_config)
+        return cls(backend)
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
-        self.model_runner.model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
+        self._backend.set_eagle3_capture_layers(aux_hidden_states_layers)
 
-    @torch.no_grad
-    def _extend(
-        self,
-        reqs,
-        capture_aux_hidden_states: bool = True,
-        return_last_hidden_states: bool = False,
-        return_logits: bool = False,
-        shard_returns: bool = False,
-    ):
-        # set the logits processor for the model runner
-        for name, module in self.model_runner.model.named_modules():
-            if isinstance(module, LogitsProcessorForEAGLE3):
-                module.return_last_hidden_states = return_last_hidden_states
-                module.return_logits = return_logits
-                module.shard_returns = shard_returns
+    # The extend / extend_vlm / get_rope_index forwards live in SGLangCaptureBackend
+    # (the version-pinned boundary); these delegators keep the engine's method
+    # surface stable while the engine itself imports no sglang internals.
+    def extend(self, *args, **kwargs):
+        return self._backend.extend(*args, **kwargs)
 
-        cache_params = CacheInitParams(
-            disable=False,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-            page_size=self.model_runner.server_args.page_size,
-        )
-        tree_cache = RadixCache(cache_params)
+    def extend_vlm(self, *args, **kwargs):
+        return self._backend.extend_vlm(*args, **kwargs)
 
-        batch = ScheduleBatch.init_new(
-            reqs=reqs,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            model_config=self.model_runner.model_config,
-            enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-        )
-        batch.prepare_for_extend()
-        self._maybe_prepare_mlp_sync_batch(batch)
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        eagle3_output = self.model_runner.forward(forward_batch).logits_output
-        input_lens = [len(req.origin_input_ids) for req in reqs]
-
-        logits = eagle3_output.logits
-        aux_hidden_states = eagle3_output.aux_hidden_states
-        last_hidden_states = eagle3_output.last_hidden_states
-
-        if shard_returns:
-            tp_rank = dist.get_rank(get_tp_group())
-            tp_size = dist.get_world_size(get_tp_group())
-            batch_size = len(input_lens) // tp_size
-            valid_indices = list(
-                range(tp_rank * batch_size, (tp_rank + 1) * batch_size)
-            )
-            valid_input_lens = [input_lens[i] for i in valid_indices]
-
-        if return_logits:
-            if shard_returns:
-                logits = _get_sharded_return(
-                    logits,
-                    input_lens,
-                    valid_input_lens,
-                    valid_indices,
-                )
-            else:
-                logits = torch.split(logits, input_lens, dim=0)
-        else:
-            logits = [None] * len(reqs)
-
-        if capture_aux_hidden_states:
-            if shard_returns:
-                aux_hidden_states = _get_sharded_return(
-                    aux_hidden_states,
-                    input_lens,
-                    valid_input_lens,
-                    valid_indices,
-                )
-            else:
-                aux_hidden_states = torch.split(aux_hidden_states, input_lens, dim=0)
-        else:
-            aux_hidden_states = [None] * len(reqs)
-
-        if return_last_hidden_states:
-            if shard_returns:
-                last_hidden_states = _get_sharded_return(
-                    last_hidden_states,
-                    input_lens,
-                    valid_input_lens,
-                    valid_indices,
-                )
-            else:
-                last_hidden_states = torch.split(last_hidden_states, input_lens, dim=0)
-        else:
-            last_hidden_states = [None] * len(reqs)
-
-        # TODO: can we not clear?
-        self.model_runner.req_to_token_pool.clear()
-        self.model_runner.token_to_kv_pool_allocator.clear()
-        return logits, aux_hidden_states, last_hidden_states
-
-    def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
-        if require_mlp_sync(self.model_runner.server_args):
-            # - Removed spec_algorithm and speculative_num_draft_tokens parameters
-            # - Added attn_cp_size parameter
-            # - Changed from Scheduler.prepare_mlp_sync_batch_raw to direct function call
-            prepare_mlp_sync_batch_raw(
-                batch,
-                dp_size=self.model_runner.server_args.dp_size,
-                attn_tp_size=1,
-                attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
-                tp_group=self.model_runner.tp_group,
-                get_idle_batch=None,
-                disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                require_mlp_tp_gather=require_mlp_tp_gather(
-                    self.model_runner.server_args
-                ),
-                disable_overlap_schedule=self.model_runner.server_args.disable_overlap_schedule,
-                offload_tags=set(),
-            )
-
-    def extend(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        return_last_hidden_states: bool = False,
-        return_logits: bool = True,
-        shard_returns: bool = False,
-    ):
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
-        reqs, data_cache = [], []
-
-        if isinstance(input_ids, torch.Tensor):
-            input_ids = torch.split(input_ids, 1, dim=0)
-            attention_mask = torch.split(attention_mask, 1, dim=0)
-            loss_mask = torch.split(loss_mask, 1, dim=0)
-
-        for idx, (input_id_, attention_mask_, loss_mask_) in enumerate(
-            zip(
-                input_ids,
-                attention_mask,
-                loss_mask,
-            )
-        ):
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=input_id_.view(-1).tolist(),
-                sampling_params=sampling_params,
-            )
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-            data_cache.append([input_id_, attention_mask_, loss_mask_])
-            reqs.append(req)
-
-        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
-            reqs,
-            capture_aux_hidden_states=True,
-            return_last_hidden_states=return_last_hidden_states,
-            return_logits=return_logits,
-            shard_returns=shard_returns,
-        )
-
-        return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
-
-    def get_rope_index(
-        self,
-        input_ids: torch.Tensor,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        video_grid_thw: Optional[torch.Tensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Get M-RoPE position indices for VLM models like Qwen2.5-VL.
-
-        This is a wrapper around MRotaryEmbedding.get_rope_index that uses
-        the VLM-specific attributes initialized from hf_config.
-
-        Args:
-            input_ids: (batch_size, seq_len) input token IDs
-            image_grid_thw: (num_images, 3) image grid dimensions (t, h, w)
-            video_grid_thw: (num_videos, 3) video grid dimensions (t, h, w)
-            second_per_grid_ts: Optional temporal information for videos
-            attention_mask: (batch_size, seq_len) attention mask
-
-        Returns:
-            position_ids: (3, batch_size, seq_len) M-RoPE position IDs
-            rope_deltas: Optional position deltas for incremental decoding
-        """
-        if not self.is_vlm:
-            raise ValueError("get_rope_index is only available for VLM models")
-
-        from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-
-        position_ids, rope_deltas = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.spatial_merge_size,
-            image_token_id=self.image_token_id,
-            video_token_id=self.video_token_id,
-            vision_start_token_id=self.vision_start_token_id,
-            model_type=self.model_type,
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-            attention_mask=attention_mask,
-            tokens_per_second=self.tokens_per_second,
-        )
-
-        return position_ids, rope_deltas
-
-    def extend_vlm(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        return_last_hidden_states: bool = False,
-        return_logits: bool = True,
-        pixel_values: Optional[List[torch.Tensor]] = None,
-        image_grid_thw: Optional[List[torch.Tensor]] = None,
-    ):
-        """
-        Args:
-            input_ids: (batch_size, seq_len) or List of (1, seq_len) tensors
-            attention_mask: (batch_size, seq_len) or List of (1, seq_len) tensors
-            loss_mask: (batch_size, seq_len) or List of (1, seq_len) tensors
-            pixel_values: List of pixel_values tensors, one per sample in batch
-            image_grid_thw: List of image_grid_thw tensors, one per sample in batch
-        """
-        mm_utils.embedding_cache.clear()
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
-        reqs, data_cache = [], []
-
-        # Split tensors if needed
-        if isinstance(input_ids, torch.Tensor):
-            batch_size = input_ids.shape[0]
-            input_ids = torch.split(input_ids, 1, dim=0)
-            attention_mask = torch.split(attention_mask, 1, dim=0)
-            loss_mask = torch.split(loss_mask, 1, dim=0)
-        else:
-            batch_size = len(input_ids)
-        # Process image_grid_thw - convert to list if needed
-        if image_grid_thw is None:
-            image_grid_thw = [None] * batch_size
-        elif not isinstance(image_grid_thw, (list, tuple)):
-            image_grid_thw = [image_grid_thw]
-
-        # pixel_values is a single 2D tensor (total_patches, patch_dim) for Qwen2.5-VL
-        # We need to track offset and slice it based on image_grid_thw for each sample
-        pixel_values_offset = 0  # Track current offset in pixel_values
-
-        for idx, (input_id_, attention_mask_, loss_mask_, image_grid_thw_) in enumerate(
-            zip(
-                input_ids,
-                attention_mask,
-                loss_mask,
-                image_grid_thw,
-            )
-        ):
-            # Compute num_patches for this sample from image_grid_thw_
-            # image_grid_thw_: (num_images, 3) where each row is (t, h, w)
-            if image_grid_thw_ is not None:
-                # Ensure image_grid_thw_ is 2D: (num_images, 3)
-                if image_grid_thw_.dim() == 1:
-                    image_grid_thw_ = image_grid_thw_.unsqueeze(0)  # (3,) -> (1, 3)
-                elif image_grid_thw_.dim() == 0:
-                    raise ValueError(
-                        f"image_grid_thw_ is 0-dim tensor, expected at least 1D. Value: {image_grid_thw_}"
-                    )
-
-                # Calculate num_patches for this sample: sum(t * h * w) for all images
-                num_patches = (
-                    (
-                        image_grid_thw_[:, 0]
-                        * image_grid_thw_[:, 1]
-                        * image_grid_thw_[:, 2]
-                    )
-                    .sum()
-                    .item()
-                )
-                num_patches = int(num_patches)
-
-                # Slice pixel_values for this sample
-                pixel_value_ = pixel_values[
-                    pixel_values_offset : pixel_values_offset + num_patches
-                ]
-                pixel_values_offset += num_patches
-            else:
-                pixel_value_ = None
-                num_patches = 0
-
-            # Compute mrope positions for VLM models (e.g., Qwen2.5-VL)
-            input_id_flat = input_id_.view(-1)
-
-            # Count image tokens
-            num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
-            # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
-
-            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-                spatial_merge_size=self.spatial_merge_size,
-                image_token_id=self.image_token_id,
-                video_token_id=self.video_token_id,
-                vision_start_token_id=self.vision_start_token_id,
-                model_type=self.model_type,
-                input_ids=input_id_flat.unsqueeze(0).cpu(),
-                image_grid_thw=(
-                    image_grid_thw_.cpu() if image_grid_thw_ is not None else None
-                ),
-                tokens_per_second=self.tokens_per_second,
-            )
-
-            offset = BaseMultimodalProcessor.get_mm_items_offset(
-                input_id_flat, self.image_token_id
-            )
-            mm_item = MultimodalDataItem(
-                modality=Modality.IMAGE,
-                feature=pixel_value_,  # torch.Tensor: (num_patches, patch_dim)
-                pad_value=self.image_token_id,  # Required for placeholder tensor creation
-                offsets=offset,  # List of (start, end) tuples
-            )
-            mm_item.set("image_grid_thw", image_grid_thw_.cpu())
-            mm_item.set_pad_value()
-            mm_inputs = MultimodalInputs(
-                mm_items=[mm_item],
-                im_token_id=self.image_token_id,
-                im_start_id=self.vision_start_token_id,
-                im_end_id=self.vision_end_token_id,
-                mrope_positions=(
-                    mrope_positions.squeeze(1) if mrope_positions is not None else None
-                ),
-                mrope_position_delta=mrope_position_delta,
-            )
-            pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-            input_id_list = pattern.pad_input_tokens(
-                input_id_.view(-1).tolist(), mm_inputs
-            )
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=input_id_list,
-                sampling_params=sampling_params,
-            )
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-            req.multimodal_inputs = mm_inputs
-            data_cache.append([input_id_, attention_mask_, loss_mask_])
-            reqs.append(req)
-
-        logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
-            reqs,
-            capture_aux_hidden_states=True,
-            return_last_hidden_states=return_last_hidden_states,
-            return_logits=return_logits,
-        )
-
-        return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+    def get_rope_index(self, *args, **kwargs):
+        return self._backend.get_rope_index(*args, **kwargs)
 
     @torch.no_grad()
     def generate_eagle3_data(
@@ -947,6 +510,50 @@ class CustomEagle3TargetEngine(Eagle3TargetEngine):
         )
 
 
+class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
+    """Live frozen-target SGLang *server* engine (cross-node) — W3 / W3′.
+
+    The fourth backend: instead of an in-process ``ModelRunner``, a *frozen*
+    target runs as a live SGLang server and streams hidden states (capture into a
+    FeatureStore for W3, or inline over HTTP for the light W3′). It is
+    ``backend="sglang_server"`` — selectable through the factory — but the live
+    capture implementation is gated by the O1.3 throughput spike (see
+    ``docs/roadmap/online-disaggregation.md`` §O1.3), so construction raises with an
+    actionable message until that lands. The de-EAGLE3 extraction and the domain
+    Trainer carry no engine risk and do not depend on this backend.
+    """
+
+    backend = "sglang_server"
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "sglang_server target engine (live cross-node frozen-target capture) is "
+            "not implemented yet; its depth is gated by the O1.3 capture spike "
+            "(docs/roadmap/online-disaggregation.md §O1.3). Use backend='sglang' "
+            "(in-process) or 'hf' for now."
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        torch_dtype: torch.dtype = None,
+        device: str = None,
+        cache_dir: Optional[str] = None,
+        **kwargs,
+    ) -> "SGLangServerEagle3TargetEngine":
+        return cls()
+
+    def generate_eagle3_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        **kwargs,
+    ) -> Eagle3TargetOutput:  # pragma: no cover - unreachable (ctor raises)
+        raise NotImplementedError
+
+
 def get_eagle3_target_model(
     pretrained_model_name_or_path: str,
     backend: str = "sglang",
@@ -979,21 +586,16 @@ def get_eagle3_target_model(
             cache_dir=cache_dir,
             **kwargs,
         )
+    elif backend == "sglang_server":
+        return SGLangServerEagle3TargetEngine.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
     else:
         raise ValueError(f"Invalid backend: {backend}")
-
-
-def _get_sharded_return(
-    input_: torch.Tensor,
-    input_lens: list[int],
-    valid_input_lens: list[int],
-    valid_indices: list[int],
-) -> list[Optional[torch.Tensor]]:
-    out: list[Optional[torch.Tensor]] = [None] * len(input_lens)
-    input_scatter = torch.split(input_, valid_input_lens, dim=0)
-    for j, idx in enumerate(valid_indices):
-        out[idx] = input_scatter[j]
-    return out
 
 
 # --- Back-compat aliases (pre-Phase-B names) -------------------------------
