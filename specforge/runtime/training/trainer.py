@@ -22,6 +22,7 @@ EAGLE3 and DFlash share this lifecycle unchanged — only the strategy differs.
 
 from __future__ import annotations
 
+import itertools
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -102,19 +103,15 @@ class TrainerCore:
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
         grad_norm = self.backend.step() if stepped else None
-        return self._result(out, grad_norm, stepped, mode="train")
+        return self._result(out, grad_norm, stepped)
 
-    @torch.no_grad()
-    def eval_step(
-        self, batch: TrainBatch, ctx: Optional[StepContext] = None
-    ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        return self._result(out, None, False, mode="eval")
+    # NB there is deliberately no eval_step: evaluation goes through
+    # ``Evaluator.run`` on raw ``strategy.forward_loss`` outputs, because correct
+    # acc-len aggregation needs the per-position count tensors that ``_result``'s
+    # scalarization strips.
 
-    def _result(
-        self, out: StepOutput, grad_norm, stepped: bool, mode: str
-    ) -> StepResult:
-        metrics: Dict[str, Any] = {"loss": _scalar(out.loss), "mode": mode}
+    def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
+        metrics: Dict[str, Any] = {"loss": _scalar(out.loss), "mode": "train"}
         for key in ("acces", "acceptance_rates", "plosses"):
             if key in out.metrics:
                 metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
@@ -156,7 +153,7 @@ class TrainerController:
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
         start_step: int = 0,
         start_epoch: int = 0,
-        max_checkpoints: int = 0,
+        start_batch: int = 0,
         checkpoint_manager: Optional[Any] = None,
     ) -> None:
         self.core = core
@@ -165,7 +162,8 @@ class TrainerController:
         self.save_interval = save_interval
         self.eval_interval = eval_interval
         self.log_interval = log_interval
-        self.max_checkpoints = max_checkpoints
+        # Inject a configured CheckpointManager (rotation, best metric) or let
+        # the lazy default own the plain layout — one configuration mechanism.
         self._checkpoint_mgr = checkpoint_manager
         self.max_steps = max_steps
         # Schedule horizon for step-dependent losses (Domino's lambda_base decay).
@@ -187,8 +185,13 @@ class TrainerController:
         self.global_step = start_step
         self.micro_step = 0
         self.epoch = start_epoch
+        # Resume position within the interrupted epoch, in micro-batches:
+        # ``fit`` skips this many batches of its FIRST epoch (via ``data.seek``
+        # when the stream supports it) so a resumed run continues on the data
+        # the uninterrupted run would have seen — the plan's seek()-equivalent.
+        self._start_batch = start_batch
+        self.epoch_batch = start_batch
         self.last_metrics: Dict[str, Any] = {}
-        self.last_eval_metrics: Dict[str, float] = {}
 
     def fit(
         self, data: Iterable[TrainBatch], eval_data: Optional[Iterable] = None
@@ -200,7 +203,22 @@ class TrainerController:
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
                 data.set_epoch(epoch)
-            for batch in data:
+            # Resume mid-epoch: reposition the stream past the batches the
+            # interrupted run already trained on. ``seek`` (FeatureDataLoader)
+            # skips without materializing features; a plain iterable is drained.
+            stream: Iterable[TrainBatch] = data
+            skip, self._start_batch = self._start_batch, 0
+            self.epoch_batch = skip
+            if skip:
+                if hasattr(data, "seek"):
+                    data.seek(skip)
+                else:
+                    it = iter(data)
+                    for _ in itertools.islice(it, skip):
+                        pass
+                    stream = it
+            for batch in stream:
+                self.epoch_batch += 1
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
@@ -222,39 +240,48 @@ class TrainerController:
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     self.logger(result.metrics, self.global_step)
-                did_eval = False
+                eval_metrics: Optional[Dict[str, Any]] = None
                 if (
                     self.eval_interval
                     and eval_data is not None
                     and self.global_step % self.eval_interval == 0
                 ):
-                    self.evaluate(eval_data)
+                    eval_metrics = self.evaluate(eval_data)
                     module.train()
-                    did_eval = True
+                saved = False
                 if self.save_interval and self.global_step % self.save_interval == 0:
                     self.save_checkpoint(self.global_step)
-                    # Track the best checkpoint among those just saved AND evaluated.
-                    if did_eval:
-                        self._checkpoint_manager().update_best(
-                            self.global_step, self.last_eval_metrics
-                        )
+                    saved = True
+                # Best tracking is part of checkpointing (save_interval > 0) but
+                # not tied to cadence alignment: ANY eval that beats the record
+                # persists a checkpoint (if this step isn't already saved) and
+                # repoints ``best``.
+                if (
+                    self.save_interval
+                    and eval_metrics is not None
+                    and self._checkpoint_manager().is_better(eval_metrics)
+                ):
+                    if not saved:
+                        self.save_checkpoint(self.global_step)
+                    self._checkpoint_manager().update_best(
+                        self.global_step, eval_metrics
+                    )
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
         return self.global_step
 
     @torch.no_grad()
-    def evaluate(self, data: Iterable[TrainBatch]) -> Dict[str, float]:
+    def evaluate(self, data: Iterable[TrainBatch]) -> Dict[str, Any]:
         """Correct acceptance-length eval: per-position accuracy is aggregated over
-        the whole pass before the geometric sum (see :class:`Evaluator`)."""
+        the whole pass (and across DP ranks) before the geometric sum, so the
+        returned metrics are identical on every rank (see :class:`Evaluator`)."""
         from specforge.eval import Evaluator
 
         module = self.core.strategy.trainable_module()
         module.eval()
-        metrics = Evaluator().run(
+        return Evaluator().run(
             lambda batch: self.core.strategy.forward_loss(batch), data
         )
-        self.last_eval_metrics = metrics
-        return metrics
 
     def _checkpoint_manager(self):
         # Lazily built in its S-home so the runtime seam does not import the domain
@@ -262,25 +289,34 @@ class TrainerController:
         if self._checkpoint_mgr is None:
             from specforge.training.checkpoint import CheckpointManager
 
-            self._checkpoint_mgr = CheckpointManager(
-                self.output_dir, self.run_id, max_checkpoints=self.max_checkpoints
-            )
+            self._checkpoint_mgr = CheckpointManager(self.output_dir, self.run_id)
         return self._checkpoint_mgr
 
     def save_checkpoint(self, step: int) -> Checkpoint:
+        # Every rank participates: the FSDP FULL_STATE_DICT gather is a
+        # collective, and the optimizer/RNG parts are rank-local so every rank
+        # persists its own (the manager writes the shared payload on rank0 only).
         full = self.core.backend.state_dict()
-        draft_state = self.core.strategy.checkpoint_state_filter(full["model"])
-        ckpt_dir = self._checkpoint_manager().save(
-            {
-                "draft_state_dict": draft_state,
-                "optimizer_state_dict": full["optimizer"],
-                "rng_state": full["rng"],
+        mgr = self._checkpoint_manager()
+        shared = None
+        if mgr.is_rank0():
+            shared = {
+                "draft_state_dict": self.core.strategy.checkpoint_state_filter(
+                    full["model"]
+                ),
                 "global_step": step,
                 "epoch": self.epoch,
+                "epoch_batch": self.epoch_batch,
                 "strategy": self.core.strategy.name,
                 "run_id": self.run_id,
-            },
-            step,
+                "world_size": (
+                    torch.distributed.get_world_size()
+                    if torch.distributed.is_initialized()
+                    else 1
+                ),
+            }
+        ckpt_dir = mgr.save(
+            shared, step, rank_state={"optimizer": full["optimizer"], "rng": full["rng"]}
         )
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",

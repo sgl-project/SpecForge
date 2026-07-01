@@ -83,6 +83,8 @@ def _assemble_trainer(
     collate_fn,
     per_sample_transform=None,
     durable_ack: bool = True,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """The trainer+loader assembly shared by offline / disagg / online / interleaved.
 
@@ -124,6 +126,8 @@ def _assemble_trainer(
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
     return trainer.controller, trainer.loader
 
@@ -282,6 +286,8 @@ def build_offline_runtime(
     log_interval: int = 50,
     deployment_mode: DeploymentMode = "local_colocated",
     metadata_db_path: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
@@ -336,6 +342,8 @@ def build_offline_runtime(
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
 
@@ -362,6 +370,8 @@ def build_disagg_offline_runtime(
     sp_ring_size: int = 1,
     logger=None,
     log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """Consumer side of a disaggregated OFFLINE run.
 
@@ -398,6 +408,8 @@ def build_disagg_offline_runtime(
         log_interval=log_interval,
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
 
@@ -439,6 +451,8 @@ def build_online_runtime(
     logger=None,
     deployment_mode: DeploymentMode = "local_colocated",
     metadata_db_path: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """Assemble the colocated online dataflow and return
     ``(trainer, loader, workers, controller, drive_rollout)``.
@@ -505,6 +519,8 @@ def build_online_runtime(
         collate_fn=_online_collate(spec, collate_fn),
         per_sample_transform=None,
         durable_ack=durable_ack,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
     def drive_rollout(max_rounds: int = 100_000) -> int:
@@ -646,6 +662,8 @@ def build_disagg_online_consumer(
     resume: bool = False,
     logger=None,
     log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -705,6 +723,8 @@ def build_disagg_online_consumer(
         log_interval=log_interval,
         collate_fn=_online_collate(spec, collate_fn),
         per_sample_transform=None,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
 
@@ -820,6 +840,8 @@ def build_disagg_online_runtime(
     join_timeout_s: Optional[float] = 30.0,
     logger=None,
     log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """One-process online disaggregated runtime (O1.2).
 
@@ -899,6 +921,8 @@ def build_disagg_online_runtime(
         resume=resume,
         logger=logger,
         log_interval=log_interval,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
     def run() -> int:

@@ -3,13 +3,16 @@
 
 Two checks (single rank, GPU):
 - ``test_checkpoint_resume`` — persisted draft weights + global step round-trip
-  exactly into a fresh model.
+  exactly into a fresh model, and the on-disk layout splits the rank0 shared
+  payload from the per-rank optimizer/RNG file.
 - ``test_resume_loss_curve_continuity`` — after save->resume (draft weights +
-  optimizer + LR scheduler + RNG restored), the loss curve continues to match an
-  uninterrupted run. Continuity is asserted to a tolerance, not bit-exact:
-  BF16Optimizer reconstructs its fp32 master from the persisted bf16 weights on
-  resume, exactly as the legacy trainer does, so the master loses the low mantissa
-  bits the uninterrupted run kept.
+  optimizer + LR scheduler + RNG + **data position** restored), the loss curve
+  continues to match an uninterrupted run over a sequence of DISTINCT batches —
+  so the resumed run demonstrably trains on the batches the interrupted run had
+  not reached, not on the epoch prefix again. Continuity is asserted to a
+  tolerance, not bit-exact: BF16Optimizer reconstructs its fp32 master from the
+  persisted bf16 weights on resume, exactly as the legacy trainer does, so the
+  master loses the low mantissa bits the uninterrupted run kept.
 
 GPU-only. Run on the H200 box via rcli.
 """
@@ -23,22 +26,28 @@ import torch
 CUDA = torch.cuda.is_available()
 
 
-def _fixed_batch(feat_dir, bs, ttt):
-    """One collated eagle3 batch, reused every step so resumed step k sees the
-    same data as the reference step k (isolating the resume state, not the data)."""
+def _make_batches(feat_dir, bs, ttt, count):
+    """``count`` DISTINCT collated eagle3 batches (batch i = samples [i*bs, (i+1)*bs))
+    so a resumed run only matches the reference if it resumes at the right batch."""
     from specforge.data.preprocessing import OfflineEagle3Dataset
     from specforge.data.utils import DataCollatorWithPadding
     from specforge.runtime.contracts import TrainBatch
 
     files = sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir))
     ds = OfflineEagle3Dataset(files, max_len=512)
-    data = DataCollatorWithPadding()([ds[j] for j in range(bs)])
-    return TrainBatch(
-        sample_ids=[str(j) for j in range(bs)],
-        strategy="eagle3",
-        tensors=dict(data),
-        metadata={"target_repr": "hidden_state", "ttt_length": ttt},
-    )
+    collate = DataCollatorWithPadding()
+    batches = []
+    for i in range(count):
+        data = collate([ds[j] for j in range(i * bs, (i + 1) * bs)])
+        batches.append(
+            TrainBatch(
+                sample_ids=[str(j) for j in range(i * bs, (i + 1) * bs)],
+                strategy="eagle3",
+                tensors=dict(data),
+                metadata={"target_repr": "hidden_state", "ttt_length": ttt},
+            )
+        )
+    return batches
 
 
 @unittest.skipUnless(CUDA, "checkpoint resume requires CUDA")
@@ -129,14 +138,24 @@ class TestCheckpointResume(unittest.TestCase):
         wv = ctrl.save_checkpoint(step)
 
         # reload into a fresh model and compare persisted (non-embedding) weights
-        ckpt = torch.load(
-            os.path.join(wv.checkpoint_uri[len("file://") :], "training_state.pt"),
+        from specforge.training.checkpoint import CheckpointManager
+
+        ckpt_dir = wv.checkpoint_uri[len("file://") :]
+        shared = torch.load(
+            os.path.join(ckpt_dir, "training_state.pt"),
             map_location="cpu",
             weights_only=False,
         )
-        self.assertEqual(ckpt["global_step"], 3)
-        self.assertEqual(ckpt["strategy"], "eagle3")
-        # full resume state is persisted alongside the export weights
+        self.assertEqual(shared["global_step"], 3)
+        self.assertEqual(shared["strategy"], "eagle3")
+        self.assertEqual(shared["world_size"], 1)
+        # rank-local state lives in per-rank files, NOT the shared payload
+        self.assertNotIn("optimizer_state_dict", shared)
+        self.assertTrue(
+            os.path.exists(os.path.join(ckpt_dir, "training_state_rank0.pt"))
+        )
+        # the one reader merges this rank's optimizer/RNG back in
+        ckpt = CheckpointManager.read_resume_state(wv.checkpoint_uri)
         self.assertIn("optimizer_state_dict", ckpt)
         self.assertIn("rng_state", ckpt)
 
@@ -168,8 +187,11 @@ class TestCheckpointResume(unittest.TestCase):
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
         workdir = tempfile.mkdtemp(prefix="ckpt_continuity_")
-        feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=BS)
-        batch = _fixed_batch(feat_dir, BS, TTT)
+        # TOTAL distinct batches: resuming on the wrong data cannot pass.
+        feat_dir = fx.write_offline_files(
+            os.path.join(workdir, "features"), n=BS * TOTAL
+        )
+        batches = _make_batches(feat_dir, BS, TTT, TOTAL)
 
         def build_run(run_id, out_dir):
             torch.manual_seed(0)
@@ -201,7 +223,7 @@ class TestCheckpointResume(unittest.TestCase):
             logger=lambda m, s: losses_ref.append(m["loss"]),
         )
         torch.manual_seed(0)
-        ctrl_r.fit([batch] * TOTAL)
+        ctrl_r.fit(batches)
         self.assertEqual(len(losses_ref), TOTAL)
 
         # Interrupted phase 1: CUT steps, then save.
@@ -217,8 +239,9 @@ class TestCheckpointResume(unittest.TestCase):
             logger=lambda m, s: losses_a.append(m["loss"]),
         )
         torch.manual_seed(0)
-        ctrl_a.fit([batch] * TOTAL)
+        ctrl_a.fit(batches)
         ck = ctrl_a.save_checkpoint(CUT)
+        self.assertEqual(ctrl_a.epoch_batch, CUT)  # data position at the cut
         # phase 1 mirrors the reference exactly for the first CUT steps
         for i in range(CUT):
             self.assertAlmostEqual(losses_a[i], losses_ref[i], places=4)
@@ -229,12 +252,12 @@ class TestCheckpointResume(unittest.TestCase):
             if "embed" not in k.lower()
         }
 
-        # Phase 2: fresh model, restore weights + optimizer + scheduler + RNG.
-        state = torch.load(
-            os.path.join(ck.checkpoint_uri[len("file://") :], "training_state.pt"),
-            map_location="cpu",
-            weights_only=False,
-        )
+        # Phase 2: fresh model, restore weights + optimizer + scheduler + RNG +
+        # data position — through the one checkpoint reader.
+        from specforge.training.checkpoint import CheckpointManager
+
+        state = CheckpointManager.read_resume_state(ck.checkpoint_uri)
+        self.assertEqual(state["epoch_batch"], CUT)
         # Same seed as the reference: the draft's FROZEN embedding is set at
         # construction and is not in the checkpoint (it is loaded from the target,
         # not trained), so it must be reconstructed identically — exactly as a real
@@ -279,11 +302,13 @@ class TestCheckpointResume(unittest.TestCase):
             output_dir=out_a,
             max_steps=TOTAL,
             start_step=CUT,
+            start_batch=state["epoch_batch"],  # reposition the data stream
             log_interval=1,
             logger=lambda m, s: losses_b.append(m["loss"]),
         )
-        # No reseed here — the RNG was restored from the checkpoint.
-        ctrl_b.fit([batch] * TOTAL)
+        # No reseed here — the RNG was restored from the checkpoint. fit skips
+        # the first CUT batches of the interrupted epoch and trains the rest.
+        ctrl_b.fit(batches)
         self.assertEqual(len(losses_b), TOTAL - CUT)
 
         # The resumed curve continues the reference curve. Not bit-exact: the

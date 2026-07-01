@@ -90,6 +90,17 @@ def _worker(rank, world_size, workdir, results_dir):
     # Path A: no_sync via TrainerCore accumulation (reduce once, on the boundary).
     backend_a = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
     backend_a.prepare_model(model_a, wrap=True, optimizer_target=model_a.draft_model)
+    # Count the deferrals: every NON-boundary micro-step must enter no_sync()
+    # (gradient reduction deferred), so the boundary backward is the single
+    # reduction per optimizer step — the roadmap's "one all-reduce per step".
+    no_sync_entries = {"n": 0}
+    _orig_no_sync = backend_a.module.no_sync
+
+    def _counting_no_sync(*args, **kwargs):
+        no_sync_entries["n"] += 1
+        return _orig_no_sync(*args, **kwargs)
+
+    backend_a.module.no_sync = _counting_no_sync
     strat_a = Eagle3TrainStrategy(backend_a.module, target_head=head)
     core_a = TrainerCore(strat_a, backend_a, accumulation_steps=ACC)
     for _ in range(ACC):
@@ -114,6 +125,8 @@ def _worker(rank, world_size, workdir, results_dir):
                 "max_weight_diff": max_diff,
                 "gn_a": rep_a.grad_norm,
                 "gn_b": float(gn_b.item()),
+                "no_sync_entries": no_sync_entries["n"],
+                "acc": ACC,
             },
             f,
         )
@@ -144,6 +157,14 @@ class TestNoSyncEquiv(unittest.TestCase):
                 res["max_weight_diff"],
                 1e-4,
                 msg=f"rank {r}: no_sync weights diverged by {res['max_weight_diff']}",
+            )
+            # every non-boundary micro-step deferred its reduction: exactly one
+            # gradient reduction (the boundary backward) per optimizer step.
+            self.assertEqual(
+                res["no_sync_entries"],
+                res["acc"] - 1,
+                msg=f"rank {r}: expected {res['acc'] - 1} no_sync deferrals, "
+                f"got {res['no_sync_entries']}",
             )
             self.assertAlmostEqual(res["gn_a"], res["gn_b"], places=2)
 
