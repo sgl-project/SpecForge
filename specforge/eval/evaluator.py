@@ -17,7 +17,10 @@ eval batch size. Summing counts first is batch-size invariant.
 
 EAGLE3 emits per-position ``acc_corrects`` / ``acc_denoms`` (one scalar per TTT
 position); DFlash / Domino emit a single scalar ``accuracy`` and have no
-per-position structure, so their ``simulated_acc_len`` degenerates to that scalar.
+per-position structure, so their ``simulated_acc_len`` degenerates to that
+scalar — aggregated token-weighted across batches (sum of correct over sum of
+tokens, the ttt_length=1 case of the same sum/count rule), so the scalar path
+is batch-size invariant too.
 
 Data-parallel eval: **every** reported metric — loss, per-position counts, and
 the scalar-accuracy sums — is reduced across ranks, so the numbers cover the
@@ -94,8 +97,13 @@ class Evaluator:
                             float(acc), dtype=torch.float64, device=sums.device
                         )
                     )
-                    sums[2] += acc
-                    sums[3] += 1.0
+                    # Token-weighted, like the loss: a batch's scalar accuracy is
+                    # a per-token mean, so weighting by its token count makes the
+                    # aggregate the eval-set-wide correct/total ratio — batch-size
+                    # invariant (a ragged last batch would otherwise skew a plain
+                    # mean of per-batch means).
+                    sums[2] += acc * tokens
+                    sums[3] += tokens
 
         # Aggregate across data-parallel ranks (each iterates its own eval shard)
         # so every metric is over the WHOLE eval set. The schedule is fixed and

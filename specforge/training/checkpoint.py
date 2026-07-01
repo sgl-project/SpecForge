@@ -258,7 +258,10 @@ class CheckpointManager:
             except OSError:
                 return  # a non-symlink collision: leave it, the dir is source of truth
         try:
-            os.symlink(os.path.abspath(ckpt_dir), link)
+            # Relative target: ckpt_dir is a direct child of output_dir, so the
+            # basename keeps the pointer valid when the whole output_dir is
+            # relocated (rsync to another box, different mount point on resume).
+            os.symlink(os.path.basename(ckpt_dir), link)
         except OSError:
             # e.g. a filesystem without symlink support: the step directories
             # (+ best_meta.json) remain the source of truth; latest_dir() falls
