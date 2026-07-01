@@ -10,6 +10,7 @@ export SPECFORGE_DATA_NUM_PROC=64
 ATTENTION_BACKEND=${2:-flex_attention}
 NUM_GPUS=${1:-8}
 
+# Keep the method default for --num-anchors; lower it if OOM occurs on low-memory NPU/GPU devices.
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
@@ -27,7 +28,7 @@ torchrun \
     --max-length 3072 \
     --chat-template qwen3.5 \
     --attention-backend $ATTENTION_BACKEND \
-    --num-anchors 186 \
+    --num-anchors 512 \
     --loss-decay-gamma 7.0 \
     --log-interval 50 \
     --save-interval 10000 \
