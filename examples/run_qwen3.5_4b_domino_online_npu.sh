@@ -20,6 +20,7 @@ NUM_DEVICES=$(echo "$NPU_DEVICES" | tr ',' '\n' | wc -l)
 export ASCEND_RT_VISIBLE_DEVICES=$NPU_DEVICES
 export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:32
 
+# If OOM occurs on low-memory NPU devices, retry with a smaller --num-anchors value.
 torchrun \
     --standalone \
     --nproc_per_node "$NUM_DEVICES" \
@@ -37,7 +38,7 @@ torchrun \
     --max-length 1024 \
     --chat-template qwen3.5 \
     --attention-backend sdpa \
-    --num-anchors 16 \
+    --num-anchors 256 \
     --loss-decay-gamma 7.0 \
     --log-interval 50 \
     --save-interval 3000 \
