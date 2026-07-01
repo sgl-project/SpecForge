@@ -447,12 +447,15 @@ def shard_optimizer_state_with_dtensor(bf16_optimizer, device_mesh):
                 )
 
 
-def safe_conversations_generator(file_path):
+def safe_conversations_generator(file_path, is_vlm=False):
     """
     Generator that:
     1. Extracts the 'conversations' field.
     2. Preserves all original fields within each message.
     3. [Key step] Converts all list/dict-type field values to strings to resolve mixed-type conflicts (e.g., for Arrow compatibility).
+    Args:
+        file_path: Path to the JSONL file.
+        is_vlm: If True, include 'image' field for vision-language models. Default False.
     """
     with open(file_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
@@ -495,8 +498,14 @@ def safe_conversations_generator(file_path):
 
                     cleaned_convs.append(new_msg)
 
-                # Build result with conversations
-                result = {"conversations": cleaned_convs}
+                if is_vlm:
+                    image = row.get("image", "")
+                    result = {
+                        "conversations": cleaned_convs,
+                        "image": image,
+                    }
+                else:
+                    result = {"conversations": cleaned_convs}
 
                 # Preserve 'tools' field if present
                 if "tools" in row:
