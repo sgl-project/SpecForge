@@ -75,6 +75,7 @@ class FeatureDataLoader:
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack
+        self._seek_batches = 0
 
     def _validate_refs(self, refs: List[SampleRef]) -> None:
         strategies = {ref.strategy for ref in refs}
@@ -155,11 +156,30 @@ class FeatureDataLoader:
     def _iter_refs(self) -> Iterator[TrainBatch]:
         # Offline: a fixed ref set, re-iterable every epoch. Acking (durable
         # marker) is the trainer's job via its ack callback, not the loader's.
-        for start in range(0, len(self._refs), self.batch_size):
+        skip, self._seek_batches = self._seek_batches, 0
+        for start in range(skip * self.batch_size, len(self._refs), self.batch_size):
             chunk = self._refs[start : start + self.batch_size]
             if self.drop_last and len(chunk) < self.batch_size:
                 break
             yield self._make_batch(chunk)
+
+    def seek(self, num_batches: int) -> None:
+        """Skip the first ``num_batches`` batches of the NEXT iteration (refs mode).
+
+        The resume seam: repositions the re-iterable offline stream to where an
+        interrupted epoch stopped, without materializing (or acking) a single
+        skipped feature. One-shot — consumed by the next ``__iter__`` pass, so
+        later epochs iterate from the start again. A queue stream has no
+        position to restore (online resume reconciles via the control plane's
+        durable store instead), so seeking it is a caller error.
+        """
+        if self._refs is None:
+            raise ValueError(
+                "seek() applies to refs mode only; a queue stream is consume-once "
+                "(online resume goes through the control plane's skip_ids "
+                "reconciliation, not a loader seek)"
+            )
+        self._seek_batches = max(0, int(num_batches))
 
     def _iter_queue(self) -> Iterator[TrainBatch]:
         while True:

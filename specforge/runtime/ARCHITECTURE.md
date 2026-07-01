@@ -118,7 +118,7 @@ flowchart TD
 | FeatureDataLoader | release | data | Release the lease immediately after clone-on-fetch so prefetch can't race |
 | TrainerController | for batch in loader (__iter__) | compute | Drive the loader to yield collated TrainBatch objects |
 | TrainerController | train_step | compute | Run each micro-batch; read optimizer_stepped boundary signal |
-| TrainerController | eval_step | compute | Run eval batches and aggregate metrics |
+| TrainerController | Evaluator.run (over forward_loss) | compute | Run eval batches; aggregate per-position counts across the pass and DP ranks |
 | TrainerController | ack_fn -> ack_train_refs | control | Close the ack loop: ack consumed sample_ids at the optimizer-step boundary |
 | TrainerCore | forward_loss | compute | Delegate model-specific forward + loss to the strategy |
 | TrainerCore | backward | compute | Run backward on the accumulation-scaled loss each micro-step |

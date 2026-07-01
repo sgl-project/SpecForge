@@ -3,13 +3,18 @@
 
 The evaluator correctness that scalar-averaging gets wrong: per-position accuracy
 must be aggregated over the whole eval pass (sum corrects / sum denoms) BEFORE the
-geometric sum, so ``simulated_acc_len`` does not depend on the eval batch size. No
+geometric sum, so ``simulated_acc_len`` does not depend on the eval batch size.
+The DP gate (2-process gloo) additionally pins the rank axis: scalar accuracy is
+reduced across ranks, and a rank with an EMPTY eval shard issues the same
+collectives as its peers (a ragged shard must not desynchronize the group). No
 CUDA required (fabricated per-step metrics); run anywhere torch imports.
 """
 
+import json
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 
 import torch
 
@@ -100,6 +105,77 @@ class TestEvaluatorAggregation(unittest.TestCase):
         self.assertAlmostEqual(m["eval/avg_acc"], 0.6, places=6)
         self.assertAlmostEqual(m["eval/simulated_acc_len"], 0.6, places=6)
 
+    def test_reports_per_position_acceptance(self):
+        # The roadmap asks for per-position acceptance, not just the folded sum.
+        m = self._run([_step_output(1.0, corrects=[3, 2], denoms=[4, 4])])
+        self.assertAlmostEqual(m["eval/per_position_acc"][0], 0.75, places=6)
+        self.assertAlmostEqual(m["eval/per_position_acc"][1], 0.5, places=6)
+        self.assertEqual(len(m["eval/per_position_acc"]), 2)
+
+
+def _scalar_out(loss, acc, tokens):
+    return StepOutput(
+        loss=torch.tensor(float(loss)),
+        metrics={
+            "accuracy": torch.tensor(float(acc)),
+            "metric_loss_denoms": [torch.tensor(float(tokens))],
+        },
+    )
+
+
+def _dp_worker(rank, world_size, port, results_dir):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    from specforge.eval import Evaluator
+
+    # Scenario 1 — scalar accuracy, uneven shards: every sum must be reduced.
+    if rank == 0:
+        outs = [_scalar_out(2.0, 0.5, tokens=8)]
+    else:
+        outs = [_scalar_out(8.0, 0.7, tokens=2), _scalar_out(4.0, 0.9, tokens=10)]
+    it = iter(outs)
+    scalar = Evaluator().run(lambda b: next(it), [_batch() for _ in outs])
+
+    # Scenario 2 — ragged per-position shards: rank 1's shard is EMPTY, so the
+    # collective schedule must be decided globally or the group desynchronizes.
+    outs2 = [_step_output(1.0, corrects=[3, 2], denoms=[4, 4])] if rank == 0 else []
+    it2 = iter(outs2)
+    ragged = Evaluator().run(lambda b: next(it2), [_batch() for _ in outs2])
+
+    with open(os.path.join(results_dir, f"rank{rank}.json"), "w") as fh:
+        json.dump({"scalar": scalar, "ragged": ragged}, fh)
+    dist.destroy_process_group()
+
+
+class TestEvaluatorDataParallel(unittest.TestCase):
+    def test_dp_reduction_and_ragged_shards(self):
+        import torch.multiprocessing as mp
+
+        results_dir = tempfile.mkdtemp(prefix="eval_dp_")
+        mp.spawn(_dp_worker, args=(2, "29591", results_dir), nprocs=2, join=True)
+
+        results = []
+        for r in range(2):
+            with open(os.path.join(results_dir, f"rank{r}.json")) as fh:
+                results.append(json.load(fh))
+        # identical metrics on every rank
+        self.assertEqual(results[0], results[1])
+        scalar, ragged = results[0]["scalar"], results[0]["ragged"]
+        # global scalar accuracy = mean over ALL 3 batches, not the rank shard
+        self.assertAlmostEqual(scalar["eval/avg_acc"], (0.5 + 0.7 + 0.9) / 3, places=6)
+        # global token-weighted loss: (2*8 + 8*2 + 4*10) / 20 = 3.6
+        self.assertAlmostEqual(scalar["eval/avg_loss"], 3.6, places=6)
+        # the ragged pass completed (no hang) with rank0's counts as the total
+        self.assertAlmostEqual(ragged["eval/avg_acc"], 0.75, places=6)
+        self.assertAlmostEqual(ragged["eval/simulated_acc_len"], 1.125, places=6)
+
 
 class TestCheckpointManager(unittest.TestCase):
     def _state(self, step):
@@ -134,6 +210,48 @@ class TestCheckpointManager(unittest.TestCase):
         loaded = mgr.load(step=2)
         self.assertEqual(loaded["global_step"], 2)
         self.assertEqual(mgr.load()["global_step"], 4)  # latest
+
+    def test_best_survives_restart(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_mgr_rehydrate_")
+        mgr = CheckpointManager(out, "run", max_checkpoints=2)
+        mgr.save(self._state(1), 1)
+        mgr.update_best(1, {"eval/simulated_acc_len": 5.0})
+
+        # A fresh process: a NEW manager over the same output_dir rehydrates the
+        # best record from best_meta.json instead of starting blind.
+        mgr2 = CheckpointManager(out, "run", max_checkpoints=2)
+        self.assertEqual(mgr2.best_step, 1)
+        self.assertEqual(mgr2.best_score, 5.0)
+
+        # rotation in the resumed process still protects the pre-restart best...
+        mgr2.save(self._state(2), 2)
+        mgr2.save(self._state(3), 3)
+        mgr2.save(self._state(4), 4)
+        self.assertTrue(os.path.exists(mgr2.checkpoint_dir(1)), "best rotated away")
+        self.assertFalse(os.path.exists(mgr2.checkpoint_dir(2)))
+        # ...and a worse post-restart score cannot overwrite it.
+        self.assertFalse(mgr2.update_best(4, {"eval/simulated_acc_len": 4.0}))
+        self.assertEqual(mgr2.best_step, 1)
+
+    def test_read_resume_state_merges_rank_file(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_mgr_rank_")
+        mgr = CheckpointManager(out, "run")
+        ckpt_dir = mgr.save(
+            {"draft_state_dict": {}, "global_step": 7, "world_size": 1},
+            7,
+            rank_state={"optimizer": {"lr": 1.0}, "rng": {"cpu": torch.get_rng_state()}},
+        )
+        state = CheckpointManager.read_resume_state(ckpt_dir)
+        self.assertEqual(state["global_step"], 7)
+        self.assertEqual(state["optimizer_state_dict"], {"lr": 1.0})
+        self.assertIn("rng_state", state)
+        # file:// URI form resolves identically
+        state2 = CheckpointManager.read_resume_state(f"file://{ckpt_dir}")
+        self.assertEqual(state2["global_step"], 7)
 
 
 if __name__ == "__main__":

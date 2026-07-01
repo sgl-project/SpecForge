@@ -22,6 +22,7 @@ this module stays importable in a CPU-only environment.
 from __future__ import annotations
 
 import abc
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -243,12 +244,17 @@ class FSDPTrainingBackend(TrainingBackend):
         return grad_norm
 
     def state_dict(self) -> dict:
-        """Full training state for a bit-continuous resume.
+        """Full training state for a continuous resume.
 
         ``{"model", "optimizer", "rng"}``: the module weights (FSDP full state
-        dict), the optimizer/scheduler state (``BF16Optimizer`` bundles both), and
-        the CPU+CUDA RNG. Callers that only want the persisted draft weights filter
-        ``state_dict()["model"]`` through ``strategy.checkpoint_state_filter``.
+        dict — identical on every rank), plus the **rank-local** optimizer/scheduler
+        state (``BF16Optimizer`` bundles both; under FSDP ``use_orig_params`` its
+        AdamW moments live on this rank's shard views) and this process's CPU+CUDA
+        RNG. Persist the optimizer/rng parts **per rank** (``CheckpointManager``
+        does) — writing only rank0's copy and restoring it everywhere corrupts the
+        other ranks' moments and collapses their RNG streams. Callers that only
+        want the persisted draft weights filter ``state_dict()["model"]`` through
+        ``strategy.checkpoint_state_filter``.
         """
         if self.module is None:
             raise RuntimeError("state_dict called before prepare_model")
@@ -269,23 +275,21 @@ class FSDPTrainingBackend(TrainingBackend):
         if state.get("rng") is not None:
             self._set_rng_state(state["rng"])
 
-    def _module_state_dict(self) -> dict:
+    def _full_state_ctx(self):
+        """FULL_STATE_DICT context for a wrapped module; a no-op when unwrapped."""
         if not self._wrapped:
-            return self.module.state_dict()
+            return contextlib.nullcontext()
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import StateDictType
 
-        with FSDP.state_dict_type(self.module, StateDictType.FULL_STATE_DICT):
+        return FSDP.state_dict_type(self.module, StateDictType.FULL_STATE_DICT)
+
+    def _module_state_dict(self) -> dict:
+        with self._full_state_ctx():
             return self.module.state_dict()
 
     def _load_module_state_dict(self, model_state: dict) -> None:
-        if not self._wrapped:
-            self.module.load_state_dict(model_state)
-            return
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import StateDictType
-
-        with FSDP.state_dict_type(self.module, StateDictType.FULL_STATE_DICT):
+        with self._full_state_ctx():
             self.module.load_state_dict(model_state)
 
     @staticmethod

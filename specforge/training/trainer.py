@@ -32,8 +32,9 @@ from typing import Optional
 
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-from specforge.training.strategies.registry import StrategySpec, resolve_strategy
+from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.strategies.registry import StrategySpec, resolve_strategy
 
 
 class Trainer:
@@ -77,8 +78,16 @@ class Trainer:
         # Offline = a fixed, re-iterable ref set: record committed state so the ack
         # lookup works (num_epochs > 1 then re-iterates). Online streams refs through
         # a queue and commits them elsewhere (rollout / channel).
-        if durable_ack and "refs" in ref_source:
-            controller.enqueue_offline_refs(ref_source["refs"])
+        if "refs" in ref_source:
+            if durable_ack:
+                controller.enqueue_offline_refs(ref_source["refs"])
+            else:
+                # No durable enqueue, but the control plane's metadata-only
+                # contract still holds for every ref entering the trainer path.
+                from specforge.runtime.contracts import assert_no_tensors
+
+                for ref in ref_source["refs"]:
+                    assert_no_tensors(ref)
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
         loader = FeatureDataLoader(
             store,
@@ -92,12 +101,44 @@ class Trainer:
 
         # Resume restores the trainable draft weights BEFORE the FSDP wrap so the
         # optimizer's fp32 master (cloned at build) starts from them; the optimizer
-        # + scheduler + RNG are restored just after the wrap builds the optimizer.
-        resume_state = self._load_resume_state(resume_from) if resume_from else None
-        if resume_state is not None:
-            model.draft_model.load_state_dict(
-                resume_state["draft_state_dict"], strict=False
-            )
+        # + scheduler + RNG (this rank's own, via the per-rank checkpoint files)
+        # are restored just after the wrap builds the optimizer. Only what the
+        # later stages need survives here — the loaded dict itself is dropped so
+        # the full draft state does not stay alive through the wrap.
+        resume = None
+        if resume_from:
+            state = CheckpointManager.read_resume_state(resume_from)
+            model.draft_model.load_state_dict(state["draft_state_dict"], strict=False)
+            # Mid-epoch data position; only an offline (refs) stream can be
+            # repositioned — the online queue resumes via the control plane.
+            # The position is persisted in SAMPLES (batch-size independent):
+            # convert to this run's batches, failing fast on a batch-size drift
+            # that does not divide (a silent mis-seek would skip or re-train
+            # data with no error).
+            start_batch = start_samples = 0
+            if "refs" in ref_source:
+                samples = state.get("epoch_samples")
+                if samples is None:  # pre-epoch_samples checkpoint: batch units
+                    start_batch = state.get("epoch_batch", 0)
+                    start_samples = start_batch * batch_size
+                else:
+                    if samples % batch_size:
+                        raise ValueError(
+                            f"checkpoint {resume_from} stopped mid-epoch after "
+                            f"{samples} samples, which is not a whole number of "
+                            f"batches at batch_size={batch_size}; resume with the "
+                            f"batch size the checkpoint was written with"
+                        )
+                    start_batch, start_samples = samples // batch_size, samples
+            resume = {
+                "optimizer": state.get("optimizer_state_dict"),
+                "rng": state.get("rng_state"),
+                "global_step": state["global_step"],
+                "epoch": state.get("epoch", 0),
+                "epoch_batch": start_batch,
+                "epoch_samples": start_samples,
+            }
+            del state
 
         parallel = ParallelConfig.from_distributed(
             tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
@@ -107,12 +148,9 @@ class Trainer:
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
-        if resume_state is not None:
+        if resume is not None:
             backend.load_state_dict(
-                {
-                    "optimizer": resume_state.get("optimizer_state_dict"),
-                    "rng": resume_state.get("rng_state"),
-                }
+                {"optimizer": resume["optimizer"], "rng": resume["rng"]}
             )
         strategy = spec.make_strategy(wrapped, target_head=target_head)
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
@@ -138,9 +176,13 @@ class Trainer:
             log_interval=log_interval,
             logger=logger,
             ack_fn=ack_fn,
-            max_checkpoints=max_checkpoints,
-            start_step=resume_state["global_step"] if resume_state else 0,
-            start_epoch=resume_state["epoch"] if resume_state else 0,
+            checkpoint_manager=CheckpointManager(
+                output_dir, run_id, max_checkpoints=max_checkpoints
+            ),
+            start_step=resume["global_step"] if resume else 0,
+            start_epoch=resume["epoch"] if resume else 0,
+            start_batch=resume["epoch_batch"] if resume else 0,
+            start_samples=resume["epoch_samples"] if resume else 0,
         )
 
         # The runtime pieces, exposed for callers that still want them directly
@@ -154,22 +196,6 @@ class Trainer:
         self.controller = controller_obj
         #: the FeatureDataLoader -> TrainBatch iterator (the canonical "stream")
         self.loader = loader
-
-    @staticmethod
-    def _load_resume_state(resume_from: str) -> dict:
-        """Read a checkpoint's ``training_state.pt`` (accepts a dir or ``file://`` uri)."""
-        import os
-
-        import torch
-
-        path = (
-            resume_from[len("file://") :]
-            if resume_from.startswith("file://")
-            else resume_from
-        )
-        if os.path.isdir(path):
-            path = os.path.join(path, "training_state.pt")
-        return torch.load(path, map_location="cpu", weights_only=False)
 
     @classmethod
     def from_strategy_name(cls, strategy: str, **kwargs) -> "Trainer":
