@@ -57,7 +57,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### B — Domain abstractions · size L · GPU · status: next
+### B — Domain abstractions · size L · GPU · status: in review (PRs #631/#632/#633/#635, validated)
 - **Goal** De-EAGLE3 the target boundary and give the runtime a domain `Trainer`
   that *wraps* (does not replace) the runtime controller, so the architecture
   reads in product terms while the seam stays intact.
@@ -107,7 +107,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### C — Colocated lightweight path · size M · CPU · status: later
+### C — Colocated lightweight path · size M · CPU · status: in review (PR #636, validated)
 - **Goal** Make colocated runs (W1/W2) pay nothing for the disagg control plane,
   on the *same* code path — not a fork.
 - **Target state** One canonical path. For colocated, the control plane is
@@ -145,7 +145,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### D — Training managers · size L · GPU · status: later
+### D — Training managers · size L · GPU · status: in review (PR #637, validated)
 - **Goal** Bring the training loop up to production parity: real grad
   accumulation, full resume, checkpoint lifecycle, and an evaluator — the pieces
   `runtime/training` does not have yet.
@@ -198,7 +198,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### E0 — Layout consolidation (move-only) · size M · CPU · status: later (front of E)
+### E0 — Layout consolidation (move-only) · size M · CPU · status: in review
 - **Goal** Collapse the scattered execution code into **one implementation home per concern** with
   **zero functional change**, so E's composition work is written in the final layout rather than
   re-moved afterward. This is the §2.3 target tree in [../../plan.md](../../plan.md): `runtime/` =

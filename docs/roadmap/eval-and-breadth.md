@@ -14,7 +14,7 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
 
 ---
 
-### E1 — Acceptance-length eval harness · size M · GPU · status: next
+### E1 — Acceptance-length eval harness · size M · GPU · status: in review
 - **Goal** Produce a correct, cache-backed `simulated_acc_len` / `avg_loss` / `avg_acc` eval
   pass that is batch-size-independent and tracks the best checkpoint. This is the same
   `Evaluator` the domain refactor's Phase D wires into the domain `Trainer` — see Phase D in
@@ -72,6 +72,13 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
 - **Done when** `evaluate` returns the three metrics from a single full-pass aggregation, the
   batch-size-invariance gate is green, the cache hits on an unchanged tuple and misses on any
   changed field, and the controller restores the best checkpoint by `eval/simulated_acc_len`.
+- **Landed split (July 2026):** the Evaluator (aggregate-before-geometric-sum, token-weighted
+  loss AND token-weighted scalar accuracy, DP-reduced, batch-size-invariance gates) and durable
+  best-checkpoint tracking landed with domain-refactor Phase D (#637); `EvalConfig` + `EvalCache`
+  (injective JSON-encoded key, atomic-rename produce-once) landed as the E1 PR. One scope note:
+  the launch builders still take a pre-produced `hidden_states_path`, so the cache is consumed
+  programmatically (`EvalCache.for_config` + `get_or_produce`) until Phase E's typed config + CLI
+  own eval-data production and wire it in front.
 
 ---
 
