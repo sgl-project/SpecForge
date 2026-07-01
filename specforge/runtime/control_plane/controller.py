@@ -366,9 +366,7 @@ def resolve_control_plane(
     deployment_mode: DeploymentMode,
     run_id: str,
     *,
-    sample_queue: Optional[SampleRefQueue] = None,
     metadata_db_path: Optional[str] = None,
-    backpressure: Optional[BackpressureController] = None,
 ) -> Tuple[DataFlowController, bool]:
     """Build the controller for a deployment mode; return ``(controller, durable_ack)``.
 
@@ -376,25 +374,18 @@ def resolve_control_plane(
     decorative. ``local_colocated`` pays nothing for the disagg control plane: a
     ``NoOpMetadataStore`` and ``durable_ack=False`` (the trainer skips the durable
     ack transaction — the loader releases features as it consumes them). The
-    ``dataflow_colocated`` / ``disaggregated`` modes keep the durable store
-    (SQLite when a path is given, else in-memory) and the optimizer-boundary ack.
+    ``dataflow_colocated`` / ``disaggregated`` modes keep the durable store and
+    the optimizer-boundary ack: SQLite when ``metadata_db_path`` is given,
+    otherwise the controller's own default (a private in-process store) — the
+    store-selection policy lives in one place, not here.
     """
     if deployment_mode == "local_colocated":
-        store: MetadataStore = NoOpMetadataStore()
+        store: Optional[MetadataStore] = NoOpMetadataStore()
         durable_ack = False
     else:
-        store = (
-            SQLiteMetadataStore(metadata_db_path)
-            if metadata_db_path
-            else InMemoryMetadataStore()
-        )
+        store = SQLiteMetadataStore(metadata_db_path) if metadata_db_path else None
         durable_ack = True
-    controller = DataFlowController(
-        run_id,
-        sample_queue=sample_queue,
-        metadata_store=store,
-        backpressure=backpressure,
-    )
+    controller = DataFlowController(run_id, metadata_store=store)
     return controller, durable_ack
 
 
