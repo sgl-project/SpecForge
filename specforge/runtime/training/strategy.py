@@ -42,6 +42,39 @@ class StepOutput:
     metrics: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class StepContext:
+    """Training-schedule state passed alongside the batch into ``forward_loss``.
+
+    Most strategies ignore it (their loss is a pure function of the batch). It
+    exists for objectives whose loss depends on *where in training* we are — e.g.
+    Domino blends a base loss with a weight ``lambda_base`` that decays over
+    ``total_steps``. Threading this explicitly keeps schedule-state out of ad-hoc
+    kwargs and off the model's forward signature at the runtime seam.
+    """
+
+    global_step: int = 0
+    total_steps: Optional[int] = None
+
+
+def linear_lambda_base(
+    global_step: int,
+    total_steps: int,
+    lambda_start: float = 1.0,
+    decay_ratio: float = 0.5,
+) -> float:
+    """Domino base-loss weight: linear decay from ``lambda_start`` to 0 over the
+    first ``total_steps * decay_ratio`` steps, then 0, clamped to ``[0, 1]``.
+
+    Single source of the schedule for both the runtime ``DominoTrainStrategy`` and
+    ``scripts/train_domino.py`` so the two cannot drift. Requires a real
+    ``total_steps`` (> 0); callers with no schedule horizon decide the fallback.
+    """
+    decay_steps = max(1, int(total_steps * decay_ratio))
+    progress = min(global_step / decay_steps, 1.0)
+    return max(0.0, min(1.0, lambda_start * (1.0 - progress)))
+
+
 class DraftTrainStrategy(abc.ABC):
     name: str
     required_features: set
@@ -59,7 +92,9 @@ class DraftTrainStrategy(abc.ABC):
             )
 
     @abc.abstractmethod
-    def forward_loss(self, batch: TrainBatch) -> StepOutput: ...
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional["StepContext"] = None
+    ) -> StepOutput: ...
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Select the keys this strategy persists as draft weights."""
@@ -128,7 +163,9 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         # applied any shift; use the tensors as delivered.
         return input_ids.to(device), target.to(device), loss_mask.to(device)
 
-    def forward_loss(self, batch: TrainBatch) -> StepOutput:
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
@@ -202,7 +239,9 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dflash_model.parameters()).device
 
-    def forward_loss(self, batch: TrainBatch) -> StepOutput:
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
@@ -223,9 +262,84 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         }
 
 
+class DominoTrainStrategy(DraftTrainStrategy):
+    """Domino block-parallel strategy wrapping ``OnlineDominoModel``.
+
+    Shares the trainer/backend/loader/checkpoint spine with DFlash and uses the
+    same feature schema ({input_ids, hidden_states, loss_mask}) and capture
+    adapter. The one thing Domino needs that the others don't: its loss blends a
+    base loss with a weight ``lambda_base`` that DECAYS over training, so it reads
+    the :class:`StepContext` to compute the schedule (every other strategy ignores
+    ctx). ``OnlineDominoModel.forward`` returns a (loss, accuracy, metrics) triple.
+    """
+
+    name = "domino"
+    required_features = {"input_ids", "hidden_states", "loss_mask"}
+
+    def __init__(
+        self,
+        domino_model: nn.Module,
+        *,
+        lambda_start: float = 1.0,
+        decay_ratio: float = 0.5,
+    ) -> None:
+        self.domino_model = domino_model
+        self.lambda_start = lambda_start
+        self.decay_ratio = decay_ratio
+
+    def trainable_module(self) -> nn.Module:
+        return self.domino_model
+
+    def _device(self) -> torch.device:
+        return next(self.domino_model.parameters()).device
+
+    def _lambda_base(self, ctx: Optional[StepContext]) -> float:
+        # Without schedule info (no ctx, or no known total_steps because neither
+        # total_steps nor max_steps was set on the controller) fall back to the pure
+        # final loss (lambda_base = 0). Otherwise use the shared linear schedule.
+        if ctx is None or not ctx.total_steps:
+            return 0.0
+        return linear_lambda_base(
+            ctx.global_step, ctx.total_steps, self.lambda_start, self.decay_ratio
+        )
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        self.validate_batch(batch)
+        t = batch.tensors
+        device = self._device()
+        lambda_base = self._lambda_base(ctx)
+        loss, accuracy, _metrics = self.domino_model(
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
+            lambda_base=lambda_base,
+        )
+        return StepOutput(
+            loss=loss,
+            metrics={
+                "accuracy": accuracy.detach(),
+                "lambda_base": torch.tensor(float(lambda_base)),
+            },
+        )
+
+    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Domino (like DFlash) keeps everything under draft_model.; the target
+        # embedding/head live in a separate module not persisted as draft weights.
+        return {
+            k.replace("draft_model.", ""): v
+            for k, v in state_dict.items()
+            if "draft_model." in k
+        }
+
+
 __all__ = [
     "DraftTrainStrategy",
     "Eagle3TrainStrategy",
     "DFlashTrainStrategy",
+    "DominoTrainStrategy",
     "StepOutput",
+    "StepContext",
+    "linear_lambda_base",
 ]

@@ -30,7 +30,11 @@ import torch
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.runtime.training.backend import TrainingBackend
-from specforge.runtime.training.strategy import DraftTrainStrategy, StepOutput
+from specforge.runtime.training.strategy import (
+    DraftTrainStrategy,
+    StepContext,
+    StepOutput,
+)
 
 
 @dataclass(frozen=True)
@@ -87,8 +91,10 @@ class TrainerCore:
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
 
-    def train_step(self, batch: TrainBatch) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch)
+    def train_step(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepResult:
+        out: StepOutput = self.strategy.forward_loss(batch, ctx)
         loss = out.loss / self.accumulation_steps
         self.backend.backward(loss)
         self._micro += 1
@@ -99,8 +105,10 @@ class TrainerCore:
         return self._result(out, grad_norm, stepped, mode="train")
 
     @torch.no_grad()
-    def eval_step(self, batch: TrainBatch) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch)
+    def eval_step(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepResult:
+        out: StepOutput = self.strategy.forward_loss(batch, ctx)
         return self._result(out, None, False, mode="eval")
 
     def _result(
@@ -142,6 +150,7 @@ class TrainerController:
         eval_interval: int = 0,
         log_interval: int = 50,
         max_steps: Optional[int] = None,
+        total_steps: Optional[int] = None,
         num_epochs: int = 1,
         logger: Optional[Callable[[Dict[str, Any], int], None]] = None,
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
@@ -155,6 +164,12 @@ class TrainerController:
         self.eval_interval = eval_interval
         self.log_interval = log_interval
         self.max_steps = max_steps
+        # Schedule horizon for step-dependent losses (Domino's lambda_base decay).
+        # Distinct from max_steps (an optional early-stop CAP): a run may stop early
+        # yet decay over the full planned length. Falls back to max_steps when unset;
+        # if BOTH are None a schedule-dependent strategy sees total_steps=None and
+        # decays nothing (StepContext-reading strategies must handle that).
+        self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
         self.logger = logger
         # ack_fn(sample_ids, global_step): acks consumed refs at the optimizer-step
@@ -184,7 +199,12 @@ class TrainerController:
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
-                result = self.core.train_step(batch)
+                result = self.core.train_step(
+                    batch,
+                    ctx=StepContext(
+                        global_step=self.global_step, total_steps=self.total_steps
+                    ),
+                )
                 self.last_metrics = result.metrics
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
