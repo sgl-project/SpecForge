@@ -27,13 +27,20 @@ import dataclasses
 import threading
 import uuid
 from collections import OrderedDict, deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
+from specforge.runtime.contracts import (
+    DeploymentMode,
+    PromptTask,
+    SampleRef,
+    assert_no_tensors,
+)
 from specforge.runtime.control_plane.backpressure import BackpressureController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
+    NoOpMetadataStore,
+    SQLiteMetadataStore,
 )
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
@@ -355,4 +362,40 @@ class DataFlowController:
         return status
 
 
-__all__ = ["DataFlowController", "TrainLease"]
+def resolve_control_plane(
+    deployment_mode: DeploymentMode,
+    run_id: str,
+    *,
+    sample_queue: Optional[SampleRefQueue] = None,
+    metadata_db_path: Optional[str] = None,
+    backpressure: Optional[BackpressureController] = None,
+) -> Tuple[DataFlowController, bool]:
+    """Build the controller for a deployment mode; return ``(controller, durable_ack)``.
+
+    This is where ``DeploymentMode`` becomes load-bearing rather than
+    decorative. ``local_colocated`` pays nothing for the disagg control plane: a
+    ``NoOpMetadataStore`` and ``durable_ack=False`` (the trainer skips the durable
+    ack transaction — the loader releases features as it consumes them). The
+    ``dataflow_colocated`` / ``disaggregated`` modes keep the durable store
+    (SQLite when a path is given, else in-memory) and the optimizer-boundary ack.
+    """
+    if deployment_mode == "local_colocated":
+        store: MetadataStore = NoOpMetadataStore()
+        durable_ack = False
+    else:
+        store = (
+            SQLiteMetadataStore(metadata_db_path)
+            if metadata_db_path
+            else InMemoryMetadataStore()
+        )
+        durable_ack = True
+    controller = DataFlowController(
+        run_id,
+        sample_queue=sample_queue,
+        metadata_store=store,
+        backpressure=backpressure,
+    )
+    return controller, durable_ack
+
+
+__all__ = ["DataFlowController", "TrainLease", "resolve_control_plane"]
