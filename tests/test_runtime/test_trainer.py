@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.runtime.training.backend import TrainingBackend
-from specforge.runtime.training.strategy import DraftTrainStrategy, StepOutput
-from specforge.runtime.training.trainer import (
+from specforge.training.backend import TrainingBackend
+from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
+from specforge.training.controller import (
     Checkpoint,
     TrainerController,
     TrainerCore,

@@ -31,9 +31,9 @@ from __future__ import annotations
 from typing import Optional
 
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
-from specforge.runtime.training.backend import FSDPTrainingBackend, ParallelConfig
-from specforge.runtime.training.registry import StrategySpec, resolve_strategy
-from specforge.runtime.training.trainer import TrainerController, TrainerCore
+from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.strategies.registry import StrategySpec, resolve_strategy
+from specforge.training.controller import TrainerController, TrainerCore
 
 
 class Trainer:

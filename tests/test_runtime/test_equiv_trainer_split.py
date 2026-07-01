@@ -46,12 +46,12 @@ class TestEquivTrainerSplit(unittest.TestCase):
         from specforge.modeling.target import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
-        from specforge.runtime.training.backend import (
+        from specforge.training.backend import (
             FSDPTrainingBackend,
             ParallelConfig,
         )
-        from specforge.runtime.training.strategy import Eagle3TrainStrategy
-        from specforge.runtime.training.trainer import TrainerCore
+        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from specforge.training.controller import TrainerCore
 
         TTT, BS = 3, 2
         workdir = tempfile.mkdtemp(prefix="equiv_split_")

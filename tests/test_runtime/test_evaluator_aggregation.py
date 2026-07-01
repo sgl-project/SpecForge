@@ -14,7 +14,7 @@ import unittest
 import torch
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.runtime.training.strategy import StepOutput
+from specforge.training.strategies.base import StepOutput
 
 
 def _batch():

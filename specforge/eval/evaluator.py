@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.runtime.training.strategy import StepOutput
+from specforge.training.strategies.base import StepOutput
 
 
 class Evaluator:

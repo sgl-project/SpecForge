@@ -15,8 +15,8 @@ No GPU / model environment required.
 import unittest
 
 from specforge.runtime import launch
-from specforge.runtime.training.registry import available_strategies, resolve_strategy
-from specforge.runtime.training.strategy import DFlashTrainStrategy, Eagle3TrainStrategy
+from specforge.training.strategies.registry import available_strategies, resolve_strategy
+from specforge.training.strategies.base import DFlashTrainStrategy, Eagle3TrainStrategy
 
 
 class TestStrategyRegistry(unittest.TestCase):
@@ -95,8 +95,8 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
         # A strategy with no offline reader must fail fast and actionably, before
         # any model/controller is touched. Register a throwaway unwired spec so
         # this stays valid regardless of which built-ins wire their offline path.
-        from specforge.runtime.training import registry as _reg
-        from specforge.runtime.training.registry import StrategySpec, register_strategy
+        from specforge.training.strategies import registry as _reg
+        from specforge.training.strategies.registry import StrategySpec, register_strategy
 
         register_strategy(
             StrategySpec(
@@ -119,8 +119,8 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
 
     def test_online_builder_rejects_unwired_strategy(self):
         # A strategy without an online capture path must fail fast and actionably.
-        from specforge.runtime.training import registry as _reg
-        from specforge.runtime.training.registry import StrategySpec, register_strategy
+        from specforge.training.strategies import registry as _reg
+        from specforge.training.strategies.registry import StrategySpec, register_strategy
 
         register_strategy(
             StrategySpec(

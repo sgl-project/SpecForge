@@ -32,8 +32,8 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import resolve_control_plane
         from specforge.runtime.data_plane import LocalFeatureStore
-        from specforge.runtime.launch import _offline_io
-        from specforge.runtime.training.registry import resolve_strategy
+        from specforge.launch import _offline_io
+        from specforge.training.strategies.registry import resolve_strategy
         from specforge.training import Trainer
 
         TTT, N, MAX_LEN = 3, 8, 512

@@ -28,7 +28,7 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.launch import build_offline_runtime
+        from specforge.launch import build_offline_runtime
 
         HIDDEN, SEQ, N, MAX_OPT_STEPS = 64, 32, 4, 2
         workdir = tempfile.mkdtemp(prefix="dflash_launch_")

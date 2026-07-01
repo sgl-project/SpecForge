@@ -59,12 +59,12 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.modeling.target import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
-        from specforge.runtime.training.backend import (
+        from specforge.training.backend import (
             FSDPTrainingBackend,
             ParallelConfig,
         )
-        from specforge.runtime.training.strategy import Eagle3TrainStrategy
-        from specforge.runtime.training.trainer import TrainerController, TrainerCore
+        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from specforge.training.controller import TrainerController, TrainerCore
 
         TTT, BS, N = 3, 2, 6
         workdir = tempfile.mkdtemp(prefix="ckpt_resume_")
@@ -159,12 +159,12 @@ class TestCheckpointResume(unittest.TestCase):
         fx.build_single_rank_distributed(port="29564")
 
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.training.backend import (
+        from specforge.training.backend import (
             FSDPTrainingBackend,
             ParallelConfig,
         )
-        from specforge.runtime.training.strategy import Eagle3TrainStrategy
-        from specforge.runtime.training.trainer import TrainerController, TrainerCore
+        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from specforge.training.controller import TrainerController, TrainerCore
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
         workdir = tempfile.mkdtemp(prefix="ckpt_continuity_")
