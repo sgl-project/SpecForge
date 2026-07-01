@@ -10,9 +10,10 @@
 
 ``generate_features(tasks, *, capture)`` is the single extraction entry point.
 ``capture`` is the typed :class:`CaptureConfig` derived from the active strategy,
-not an untyped dict. The adapter wraps the existing ``Eagle3TargetModel`` (sglang
-/ hf / custom backends all expose ``generate_eagle3_data``), records the exact
-aux-layer IDs it captured, applies the target→draft projection demanded by
+not an untyped dict. The adapter wraps an EAGLE3 ``TargetEngine`` (sglang / hf /
+custom backends), calling its generic ``capture(...)`` (the de-EAGLE3'd boundary;
+the legacy ``generate_eagle3_data`` is kept as a back-compat alias), records the
+exact aux-layer IDs it captured, applies the target→draft projection demanded by
 ``capture.target_repr`` (the only place pruning happens), and returns per-sample
 feature dicts. The RolloutWorker then runs :func:`verify_capture` before any
 store write, so a layer/name/width mismatch fails loudly at this boundary rather
@@ -39,7 +40,7 @@ def _as_2d_long(values, device) -> torch.Tensor:
 
 
 class SGLangAdapter:
-    """Adapter over a SpecForge ``Eagle3TargetModel`` (or any ``generate_eagle3_data``)."""
+    """Adapter over a SpecForge EAGLE3 ``TargetEngine`` (via its generic ``capture()``)."""
 
     SUPPORTED_FEATURE_NAMES = {
         "input_ids",
@@ -94,8 +95,8 @@ class SGLangAdapter:
         """Extract per-sample features, batching the engine call.
 
         Tasks are grouped by sequence length and each group is run through
-        ``generate_eagle3_data`` in ONE batched forward (the engine's native
-        batching), instead of a per-sample loop that would serialize N forwards.
+        the engine's generic ``capture(...)`` in ONE batched forward (the engine's
+        native batching), instead of a per-sample loop that would serialize N forwards.
         Equal-length grouping avoids intra-batch padding, so per-sample features
         are sliced out cleanly. The result preserves task order.
         """
@@ -125,7 +126,7 @@ class SGLangAdapter:
                 dim=0,
             )
             attention_mask = torch.ones_like(input_ids)
-            data = self.target_model.generate_eagle3_data(
+            data = self.target_model.capture(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 loss_mask=loss_mask,
