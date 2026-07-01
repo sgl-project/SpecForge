@@ -44,14 +44,12 @@ from specforge.runtime.control_plane.metadata_store import (
     MetadataStore,
     SQLiteMetadataStore,
 )
-from specforge.runtime.data_plane import (
-    FeatureDataLoader,
-    FeatureStore,
-    LocalFeatureStore,
-)
-from specforge.runtime.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.runtime.data_plane import FeatureStore, LocalFeatureStore
 from specforge.runtime.training.registry import StrategySpec, resolve_strategy
-from specforge.runtime.training.trainer import TrainerController, TrainerCore
+
+# The trainer/loader assembly (FeatureDataLoader + FSDPTrainingBackend +
+# TrainerCore + TrainerController) now lives in the domain ``Trainer``
+# (``specforge.training``); ``_assemble_trainer`` below delegates to it.
 
 # ---------------------------------------------------------------------------
 # Shared assemblers — strategy- and topology-agnostic. Every builder is a thin
@@ -93,48 +91,39 @@ def _assemble_trainer(
     the optimizer-step ack — are identical. ``optimizer_factory`` runs AFTER
     FSDP-wrap, over the wrapped module's inner draft.
     """
-    # Offline = a fixed, re-iterable ref set: record committed state so the ack
-    # lookup works (num_epochs > 1 then re-iterates). Online streams refs through
-    # a queue and commits them elsewhere (rollout / channel).
-    if "refs" in ref_source:
-        controller.enqueue_offline_refs(ref_source["refs"])
-    trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
-    loader = FeatureDataLoader(
-        store,
-        **ref_source,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        per_sample_transform=per_sample_transform,
-        drop_last=True,
-        strategy=spec.name,
-    )
+    # Delegates to the domain Trainer (``specforge.training``) — the canonical
+    # assembler for this seam since Phase B3. It performs the exact composition
+    # this function used to inline; we return the same
+    # (TrainerController, FeatureDataLoader) tuple so every build_* path is
+    # unchanged. New code can build a ``Trainer`` directly and call ``.fit()``.
+    from specforge.training import Trainer
 
-    parallel = ParallelConfig.from_distributed(
-        tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
-    )
-    backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
-    # FSDP-wrap the composite model and build the optimizer over the inner draft
-    # AFTER wrapping; the strategy MUST run forward through the wrapped module so
-    # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-    wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
-    strategy = spec.make_strategy(wrapped, target_head=target_head)
-    core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
-    trainer = TrainerController(
-        core,
+    trainer = Trainer(
+        spec=spec,
+        controller=controller,
+        store=store,
+        ref_source=ref_source,
+        model=model,
+        target_head=target_head,
+        optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
         num_epochs=num_epochs,
         max_steps=max_steps,
         total_steps=total_steps,
         save_interval=save_interval,
         eval_interval=eval_interval,
-        log_interval=log_interval,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
         logger=logger,
-        ack_fn=lambda ids, step: controller.ack_train_refs(
-            trainer_id, ids, global_step=step, optimizer_durable=True
-        ),
+        log_interval=log_interval,
+        collate_fn=collate_fn,
+        per_sample_transform=per_sample_transform,
     )
-    return trainer, loader
+    return trainer.controller, trainer.loader
 
 
 def _offline_io(spec: StrategySpec, max_len: int):
