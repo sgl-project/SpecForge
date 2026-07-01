@@ -1,5 +1,5 @@
 import logging
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from array import array
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -11,6 +11,8 @@ from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
+
+from .base import TargetEngine
 
 # SGLang internals back the *sglang* target backend only. Keep these imports
 # optional so `import specforge` (and the HF / offline / draft paths) still works
@@ -81,12 +83,20 @@ class Eagle3TargetOutput:
     last_hidden_states: Optional[torch.Tensor] = None
 
 
-class Eagle3TargetModel(ABC):
-    """
-    This  offers a layer of abstraction for the target model backend. The user can choose different backends to suit their needs:
+class Eagle3TargetEngine(TargetEngine):
+    """EAGLE3 target engine — the algorithm ABC over a frozen target backend.
+
+    Offers a layer of abstraction for the target model backend. The user can
+    choose different backends to suit their needs:
     1. SGLang backend: for the mainstream model support with the fastest inference speed
     2. HuggingFace backend: for models that are not supported by SGLang but can be loaded by HuggingFace.
     3. Custom backend: for models with customized architecture and inference plan.
+
+    EAGLE3 captures three *aux* hidden-state layers plus (optionally) target
+    logits. The generic :meth:`capture` / :meth:`set_capture_layers` hooks from
+    :class:`TargetEngine` are thin dispatchers onto the EAGLE3-specific
+    ``generate_eagle3_data`` / ``set_aux_hidden_states_layers`` below, so the
+    extraction is byte-identical to the pre-Phase-B path.
     """
 
     def __init__(self):
@@ -101,7 +111,7 @@ class Eagle3TargetModel(ABC):
         device: str = None,
         cache_dir: Optional[str] = None,
         **kwargs,
-    ) -> "Eagle3TargetModel":
+    ) -> "Eagle3TargetEngine":
         """
         Initialize the target model backend from a pretrained model path.
         """
@@ -117,6 +127,28 @@ class Eagle3TargetModel(ABC):
         """
         Generate the eagle3 data from the target model.
         """
+
+    def capture(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        **kwargs,
+    ) -> Eagle3TargetOutput:
+        """Generic extraction entry point (see :meth:`TargetEngine.capture`).
+
+        Dispatches to the EAGLE3-specific ``generate_eagle3_data``.
+        """
+        return self.generate_eagle3_data(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            **kwargs,
+        )
+
+    def set_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
+        """Generic alias for EAGLE3 aux-layer selection (TargetEngine hook)."""
+        self.set_aux_hidden_states_layers(layer_ids)
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
@@ -142,7 +174,9 @@ class Eagle3TargetModel(ABC):
         ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
 
 
-class HFEagle3TargetModel(Eagle3TargetModel):
+class HFEagle3TargetEngine(Eagle3TargetEngine):
+
+    backend = "hf"
 
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -156,7 +190,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         device: str = None,
         cache_dir: Optional[str] = None,
         **kwargs,
-    ) -> "HFEagle3TargetModel":
+    ) -> "HFEagle3TargetEngine":
         """
         Initialize the HuggingFace target model backend from a pretrained model path.
         """
@@ -291,7 +325,9 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         )
 
 
-class SGLangEagle3TargetModel(Eagle3TargetModel):
+class SGLangEagle3TargetEngine(Eagle3TargetEngine):
+
+    backend = "sglang"
 
     def __init__(self, model_runner: SGLangRunner, hf_config=None):
         super().__init__()
@@ -339,7 +375,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
         **kwargs,
-    ) -> "SGLangEagle3TargetModel":
+    ) -> "SGLangEagle3TargetEngine":
         tp_size = dist.get_world_size(get_tp_group())
         # NOTE: sglang 0.5.13 requires dtype to be non-None
         # If torch_dtype is None, use "auto" to let sglang decide the dtype
@@ -901,7 +937,9 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         )
 
 
-class CustomEagle3TargetModel(Eagle3TargetModel):
+class CustomEagle3TargetEngine(Eagle3TargetEngine):
+
+    backend = "custom"
 
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -915,7 +953,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         device: str = None,
         cache_dir: Optional[str] = None,
         **kwargs,
-    ) -> "CustomEagle3TargetModel":
+    ) -> "CustomEagle3TargetEngine":
         from specforge.modeling.auto import AutoDistributedTargetModel
 
         target_model = AutoDistributedTargetModel.from_pretrained(
@@ -971,9 +1009,9 @@ def get_eagle3_target_model(
     device: str = None,
     cache_dir: Optional[str] = None,
     **kwargs,
-) -> Eagle3TargetModel:
+) -> Eagle3TargetEngine:
     if backend == "sglang":
-        return SGLangEagle3TargetModel.from_pretrained(
+        return SGLangEagle3TargetEngine.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
@@ -981,7 +1019,7 @@ def get_eagle3_target_model(
             **kwargs,
         )
     elif backend == "hf":
-        return HFEagle3TargetModel.from_pretrained(
+        return HFEagle3TargetEngine.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
@@ -989,7 +1027,7 @@ def get_eagle3_target_model(
             **kwargs,
         )
     elif backend == "custom":
-        return CustomEagle3TargetModel.from_pretrained(
+        return CustomEagle3TargetEngine.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
@@ -1011,3 +1049,14 @@ def _get_sharded_return(
     for j, idx in enumerate(valid_indices):
         out[idx] = input_scatter[j]
     return out
+
+
+# --- Back-compat aliases (pre-Phase-B names) -------------------------------
+# The de-EAGLE3 rename (``*TargetModel`` -> ``*TargetEngine``, ``Eagle3TargetModel``
+# -> ``Eagle3TargetEngine``) is import-compatible: existing scripts, tests and
+# ``specforge.modeling`` re-exports keep importing the old names. These aliases
+# are removed once callers migrate (tracked in the Phase E model-layout move).
+Eagle3TargetModel = Eagle3TargetEngine
+HFEagle3TargetModel = HFEagle3TargetEngine
+SGLangEagle3TargetModel = SGLangEagle3TargetEngine
+CustomEagle3TargetModel = CustomEagle3TargetEngine
