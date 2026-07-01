@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from specforge.runtime.contracts import SampleRef
+from specforge.runtime.contracts import DeploymentMode, SampleRef
 from specforge.runtime.control_plane import DataFlowController, resolve_control_plane
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
@@ -280,12 +280,21 @@ def build_offline_runtime(
     sp_ring_size: int = 1,
     logger=None,
     log_interval: int = 50,
+    deployment_mode: DeploymentMode = "local_colocated",
+    metadata_db_path: Optional[str] = None,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
     The model object is passed as ``eagle3_model`` for backward compatibility; it
     is really "the composite draft model for ``strategy``" (it must expose an
     inner ``.draft_model`` for the optimizer target).
+
+    ``deployment_mode`` selects the control plane (Phase C): the default
+    ``local_colocated`` pays nothing for the disagg machinery (no-op metadata
+    store, no durable ack); any other mode keeps the durable store (SQLite when
+    ``metadata_db_path`` is given) and the optimizer-boundary ack — on the same
+    code path, so the training result is mode-independent
+    (``test_colocated_vs_disagg_equiv``).
     """
     spec = resolve_strategy(strategy)
     if spec.make_offline_reader is None:
@@ -295,7 +304,9 @@ def build_offline_runtime(
             f"specforge.runtime.training.registry."
         )
     collate_fn, per_sample_transform = _offline_io(spec, max_len)
-    controller, durable_ack = resolve_control_plane("local_colocated", run_id)
+    controller, durable_ack = resolve_control_plane(
+        deployment_mode, run_id, metadata_db_path=metadata_db_path
+    )
     refs = spec.make_offline_reader(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
@@ -426,6 +437,8 @@ def build_online_runtime(
     sp_ring_size: int = 1,
     collate_fn=None,
     logger=None,
+    deployment_mode: DeploymentMode = "local_colocated",
+    metadata_db_path: Optional[str] = None,
 ):
     """Assemble the colocated online dataflow and return
     ``(trainer, loader, workers, controller, drive_rollout)``.
@@ -444,7 +457,9 @@ def build_online_runtime(
     already materialized the target distribution.
     """
     spec = resolve_strategy(strategy)
-    controller, durable_ack = resolve_control_plane("local_colocated", run_id)
+    controller, durable_ack = resolve_control_plane(
+        deployment_mode, run_id, metadata_db_path=metadata_db_path
+    )
     controller.ingest_prompts(prompts)
     store = LocalFeatureStore(run_id)
 

@@ -6,6 +6,8 @@ plane: the no-op store honors the MetadataStore contract, retains nothing, and
 keeps the controller's ack path safe.
 """
 
+import os
+import tempfile
 import unittest
 
 from specforge.runtime.control_plane import (
@@ -14,7 +16,10 @@ from specforge.runtime.control_plane import (
     NoOpMetadataStore,
     resolve_control_plane,
 )
-from specforge.runtime.control_plane.metadata_store import MetadataStore
+from specforge.runtime.control_plane.metadata_store import (
+    MetadataStore,
+    SQLiteMetadataStore,
+)
 
 
 class TestNoOpMetadataStore(unittest.TestCase):
@@ -49,6 +54,23 @@ class TestResolveControlPlane(unittest.TestCase):
             controller, durable_ack = resolve_control_plane(mode, "run")
             self.assertTrue(durable_ack, mode)
             self.assertIsInstance(controller.store, InMemoryMetadataStore)
+
+    def test_metadata_db_path_selects_sqlite(self):
+        db = os.path.join(tempfile.mkdtemp(prefix="rcp_"), "meta.sqlite")
+        controller, durable_ack = resolve_control_plane(
+            "disaggregated", "run", metadata_db_path=db
+        )
+        try:
+            self.assertTrue(durable_ack)
+            self.assertIsInstance(controller.store, SQLiteMetadataStore)
+        finally:
+            controller.store.close()
+        # local_colocated deliberately ignores the path: it retains nothing.
+        controller, durable_ack = resolve_control_plane(
+            "local_colocated", "run", metadata_db_path=db
+        )
+        self.assertFalse(durable_ack)
+        self.assertIsInstance(controller.store, NoOpMetadataStore)
 
     def test_noop_ack_path_is_safe(self):
         # ack_train_refs reconstructs refs via get_committed (None under NoOp) and

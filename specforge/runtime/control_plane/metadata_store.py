@@ -137,6 +137,20 @@ class NoOpMetadataStore(MetadataStore):
     Every method is the cheapest answer that keeps the controller's contract:
     ``commit_sample`` always reports "new" so the caller enqueues once, and the
     recovery surface is empty.
+
+    Known, deliberate limits of retaining nothing:
+
+    * **Observability** — ``DataFlowController.status()`` reports
+      ``samples_committed`` / ``durable_acked`` / ``train_backlog`` as 0 for the
+      whole run (there is no committed index to count). Use the trainer's own
+      step/loss logging for colocated progress.
+    * **No commit dedup** — a re-committed ``sample_id`` re-enqueues. In one
+      process the rollout worker commits each sample exactly once, so there is
+      no redelivery path; do not pair this store with an at-least-once producer.
+    * **No ref reconstruction** — ``get_committed`` is always ``None``, so a
+      ``TrainLease`` (or ``fail_refs``) over this store cannot re-deliver refs;
+      the ack/fail paths degrade to safe no-ops. Cross-process trainers need a
+      retaining store.
     """
 
     def commit_sample(self, ref: SampleRef) -> bool:
