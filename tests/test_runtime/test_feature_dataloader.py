@@ -133,6 +133,33 @@ class TestFeatureDataLoader(unittest.TestCase):
             self.assertEqual(len(epoch1), 2)
             self.assertEqual(epoch1, epoch2)  # same fixed set each epoch
 
+    def test_seek_repositions_next_pass_only(self):
+        # resume: seek(k) skips the first k batches of the NEXT pass without
+        # materializing them, then later epochs iterate in full again.
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=6)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                refs=refs,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=_offline_eagle3_process_data,
+            )
+            full = [b.sample_ids for b in loader]
+            self.assertEqual(len(full), 3)
+            loader.seek(2)
+            self.assertEqual([b.sample_ids for b in loader], full[2:])
+            # one-shot: consumed by that pass, the next epoch is full again
+            self.assertEqual([b.sample_ids for b in loader], full)
+            # a queue stream has no position to restore
+            q = SampleRefQueue()
+            qloader = FeatureDataLoader(
+                LocalFeatureStore("st2"), q, collate_fn=_simple_collate
+            )
+            with self.assertRaises(ValueError):
+                qloader.seek(1)
+
     def test_requires_exactly_one_source(self):
         store = LocalFeatureStore("st")
         with self.assertRaises(ValueError):

@@ -22,6 +22,7 @@ this module stays importable in a CPU-only environment.
 from __future__ import annotations
 
 import abc
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -134,7 +135,7 @@ class TrainingBackend(abc.ABC):
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
     @abc.abstractmethod
-    def backward(self, loss: torch.Tensor) -> None: ...
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None: ...
 
     @abc.abstractmethod
     def step(self) -> Optional[torch.Tensor]: ...
@@ -210,8 +211,21 @@ class FSDPTrainingBackend(TrainingBackend):
     def set_optimizer(self, optimizer) -> None:
         self.optimizer = optimizer
 
-    def backward(self, loss: torch.Tensor) -> None:
-        loss.backward()
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
+        """Backward one micro-step; defer the gradient reduction until the boundary.
+
+        FSDP reduce-scatters gradients on every backward by default, so a bare
+        ``loss.backward()`` per micro-step would reduce ``accumulation_steps`` times
+        per optimizer step. ``no_sync()`` accumulates locally on the non-boundary
+        micro-steps and lets the boundary backward reduce the sum once — identical
+        math (reduction is linear), one collective per optimizer step. A single-rank
+        / unwrapped module has no reduction to defer.
+        """
+        if is_boundary or not self._wrapped:
+            loss.backward()
+        else:
+            with self.module.no_sync():
+                loss.backward()
 
     def step(self) -> Optional[torch.Tensor]:
         """Optimizer step + the distributed grad-norm reduction (run_backward_and_update)."""
@@ -230,19 +244,67 @@ class FSDPTrainingBackend(TrainingBackend):
         return grad_norm
 
     def state_dict(self) -> dict:
+        """Full training state for a continuous resume.
+
+        ``{"model", "optimizer", "rng"}``: the module weights (FSDP full state
+        dict — identical on every rank), plus the **rank-local** optimizer/scheduler
+        state (``BF16Optimizer`` bundles both; under FSDP ``use_orig_params`` its
+        AdamW moments live on this rank's shard views) and this process's CPU+CUDA
+        RNG. Persist the optimizer/rng parts **per rank** (``CheckpointManager``
+        does) — writing only rank0's copy and restoring it everywhere corrupts the
+        other ranks' moments and collapses their RNG streams. Callers that only
+        want the persisted draft weights filter ``state_dict()["model"]`` through
+        ``strategy.checkpoint_state_filter``.
+        """
         if self.module is None:
             raise RuntimeError("state_dict called before prepare_model")
+        return {
+            "model": self._module_state_dict(),
+            "optimizer": (
+                self.optimizer.state_dict() if self.optimizer is not None else None
+            ),
+            "rng": self._rng_state(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore whichever of module weights / optimizer / RNG the state carries."""
+        if state.get("model") is not None:
+            self._load_module_state_dict(state["model"])
+        if self.optimizer is not None and state.get("optimizer") is not None:
+            self.optimizer.load_state_dict(state["optimizer"])
+        if state.get("rng") is not None:
+            self._set_rng_state(state["rng"])
+
+    def _full_state_ctx(self):
+        """FULL_STATE_DICT context for a wrapped module; a no-op when unwrapped."""
         if not self._wrapped:
-            return self.module.state_dict()
+            return contextlib.nullcontext()
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import StateDictType
 
-        with FSDP.state_dict_type(self.module, StateDictType.FULL_STATE_DICT):
+        return FSDP.state_dict_type(self.module, StateDictType.FULL_STATE_DICT)
+
+    def _module_state_dict(self) -> dict:
+        with self._full_state_ctx():
             return self.module.state_dict()
 
-    def load_state_dict(self, state: dict) -> None:
-        if self.optimizer is not None and "optimizer_state_dict" in state:
-            self.optimizer.load_state_dict(state)
+    def _load_module_state_dict(self, model_state: dict) -> None:
+        with self._full_state_ctx():
+            self.module.load_state_dict(model_state)
+
+    @staticmethod
+    def _rng_state() -> dict:
+        rng = {"cpu": torch.get_rng_state()}
+        if torch.cuda.is_available():
+            rng["cuda"] = torch.cuda.get_rng_state_all()
+        return rng
+
+    @staticmethod
+    def _set_rng_state(rng: dict) -> None:
+        if rng.get("cpu") is not None:
+            torch.set_rng_state(rng["cpu"])
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng["cuda"])
 
 
 __all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend"]

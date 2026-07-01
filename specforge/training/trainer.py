@@ -34,6 +34,7 @@ from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.runtime.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.runtime.training.registry import StrategySpec, resolve_strategy
 from specforge.runtime.training.trainer import TrainerController, TrainerCore
+from specforge.training.checkpoint import CheckpointManager
 
 
 class Trainer:
@@ -66,6 +67,8 @@ class Trainer:
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
+        resume_from: Optional[str] = None,
+        max_checkpoints: int = 0,
     ):
         # ``durable_ack`` gates the control-plane bookkeeping a colocated run does
         # not need (Phase C, local_colocated): with it off there is no durable ack
@@ -96,6 +99,47 @@ class Trainer:
             strategy=spec.name,
         )
 
+        # Resume restores the trainable draft weights BEFORE the FSDP wrap so the
+        # optimizer's fp32 master (cloned at build) starts from them; the optimizer
+        # + scheduler + RNG (this rank's own, via the per-rank checkpoint files)
+        # are restored just after the wrap builds the optimizer. Only what the
+        # later stages need survives here — the loaded dict itself is dropped so
+        # the full draft state does not stay alive through the wrap.
+        resume = None
+        if resume_from:
+            state = CheckpointManager.read_resume_state(resume_from)
+            model.draft_model.load_state_dict(state["draft_state_dict"], strict=False)
+            # Mid-epoch data position; only an offline (refs) stream can be
+            # repositioned — the online queue resumes via the control plane.
+            # The position is persisted in SAMPLES (batch-size independent):
+            # convert to this run's batches, failing fast on a batch-size drift
+            # that does not divide (a silent mis-seek would skip or re-train
+            # data with no error).
+            start_batch = start_samples = 0
+            if "refs" in ref_source:
+                samples = state.get("epoch_samples")
+                if samples is None:  # pre-epoch_samples checkpoint: batch units
+                    start_batch = state.get("epoch_batch", 0)
+                    start_samples = start_batch * batch_size
+                else:
+                    if samples % batch_size:
+                        raise ValueError(
+                            f"checkpoint {resume_from} stopped mid-epoch after "
+                            f"{samples} samples, which is not a whole number of "
+                            f"batches at batch_size={batch_size}; resume with the "
+                            f"batch size the checkpoint was written with"
+                        )
+                    start_batch, start_samples = samples // batch_size, samples
+            resume = {
+                "optimizer": state.get("optimizer_state_dict"),
+                "rng": state.get("rng_state"),
+                "global_step": state["global_step"],
+                "epoch": state.get("epoch", 0),
+                "epoch_batch": start_batch,
+                "epoch_samples": start_samples,
+            }
+            del state
+
         parallel = ParallelConfig.from_distributed(
             tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
         )
@@ -104,6 +148,10 @@ class Trainer:
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+        if resume is not None:
+            backend.load_state_dict(
+                {"optimizer": resume["optimizer"], "rng": resume["rng"]}
+            )
         strategy = spec.make_strategy(wrapped, target_head=target_head)
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
         # Durable ack transaction at each optimizer-step boundary. Off for
@@ -128,6 +176,13 @@ class Trainer:
             log_interval=log_interval,
             logger=logger,
             ack_fn=ack_fn,
+            checkpoint_manager=CheckpointManager(
+                output_dir, run_id, max_checkpoints=max_checkpoints
+            ),
+            start_step=resume["global_step"] if resume else 0,
+            start_epoch=resume["epoch"] if resume else 0,
+            start_batch=resume["epoch_batch"] if resume else 0,
+            start_samples=resume["epoch_samples"] if resume else 0,
         )
 
         # The runtime pieces, exposed for callers that still want them directly
