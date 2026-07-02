@@ -43,8 +43,8 @@ def _worker(rank, world_size, workdir, results_dir):
     from specforge.optimizer import BF16Optimizer
     from specforge.runtime.contracts import TrainBatch
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-    from specforge.training.strategies.base import Eagle3TrainStrategy
     from specforge.training.controller import TrainerCore
+    from specforge.training.strategies.base import Eagle3TrainStrategy
 
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(True, warn_only=True)

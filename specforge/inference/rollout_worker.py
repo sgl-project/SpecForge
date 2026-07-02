@@ -21,12 +21,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol
 
-from specforge.runtime.contracts import PromptTask, SampleRef
 from specforge.inference.capture import (
     CaptureConfig,
     CaptureMismatchError,
     verify_capture,
 )
+from specforge.runtime.contracts import PromptTask, SampleRef
 
 # health states: a worker REPORTS health; the controller decides scheduling.
 HEALTH_STATES = ("starting", "ready", "paused", "draining", "unhealthy", "stopped")

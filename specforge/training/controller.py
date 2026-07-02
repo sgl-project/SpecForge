@@ -346,7 +346,9 @@ class TrainerController:
                 ),
             }
         ckpt_dir = mgr.save(
-            shared, step, rank_state={"optimizer": full["optimizer"], "rng": full["rng"]}
+            shared,
+            step,
+            rank_state={"optimizer": full["optimizer"], "rng": full["rng"]},
         )
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
