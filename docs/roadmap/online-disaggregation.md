@@ -110,7 +110,7 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
 - **Done when** An end-to-end live 1+1 run drives training from an in-process generator over the
   streaming channel, with no precomputed features.
 
-### O1.3 — Live SGLang-server hidden-state capture · size L · GPU + engine · status: next
+### O1.3 — Live SGLang-server hidden-state capture · size L · GPU + engine · status: in review (PR #641, reforward transport; spike findings + upstream proposal in ./o13-capture-spike.md)
 > 🔴 **GATING RISK — run the capture spike first.** The unknown is how far
 > `Eagle3TargetModel.generate_eagle3_data` is from server-backed capture. The spike is the
 > difference between O1.3 being days vs. a quarter; SpecForge is SGLang's own project so reuse is

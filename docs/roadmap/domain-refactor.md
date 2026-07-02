@@ -256,7 +256,8 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
     logits; dflash = `output_hidden_states=True` + layer select, no logits) — so it MUST be a policy
     object, not a data table.
   - **MLA Eagle3 draft** — an MLA-attention draft architecture registered via
-    `@register_draft`.
+    `@register_draft`. *(The draft itself landed early as PR #640 on the Auto* mapping;
+    E re-registers it through `@register_draft`.)*
   - **Pydantic config + `specforge` CLI** — a typed run config (Pydantic is
     already a dep in `pyproject.toml`) replacing the argparse-style launch knobs;
     a console-script entry point that builds the config and calls the domain
