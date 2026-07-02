@@ -5,10 +5,10 @@ import unittest
 
 import torch
 
-from specforge.runtime.control_plane import DataFlowController
-from specforge.runtime.data_plane import LocalFeatureStore
 from specforge.inference.capture import CaptureConfig
 from specforge.inference.rollout_worker import RolloutWorker
+from specforge.runtime.control_plane import DataFlowController
+from specforge.runtime.data_plane import LocalFeatureStore
 
 H = 8
 

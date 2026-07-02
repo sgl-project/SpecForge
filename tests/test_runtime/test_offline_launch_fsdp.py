@@ -28,8 +28,8 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge.optimizer import BF16Optimizer
         from specforge.launch import build_offline_eagle3_runtime
+        from specforge.optimizer import BF16Optimizer
 
         TTT, ACC, MAX_OPT_STEPS, N = 3, 2, 2, 8
         workdir = tempfile.mkdtemp(prefix="launch_fsdp_")
