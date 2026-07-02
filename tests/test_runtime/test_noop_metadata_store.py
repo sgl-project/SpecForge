@@ -11,7 +11,6 @@ import tempfile
 import unittest
 
 from specforge.runtime.control_plane import (
-    DataFlowController,
     InMemoryMetadataStore,
     NoOpMetadataStore,
     resolve_control_plane,
