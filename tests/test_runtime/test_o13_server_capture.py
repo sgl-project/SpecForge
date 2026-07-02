@@ -153,11 +153,14 @@ class TestO13ServerCapture(unittest.TestCase):
         H = 64
         self.assertEqual(out1.hidden_states.shape[-1], 3 * H)
         self.assertGreater(out1.input_ids.shape[1], maxlen)
-        # loss covers exactly the generated region of each row
+        # loss covers the generated region of each row, except the final
+        # position (left-shifted target: no next-token teacher there)
         for i, r in enumerate(rows):
             row_loss = out1.loss_mask[i].squeeze(-1)
             self.assertEqual(int(row_loss[: len(r)].sum()), 0)
             self.assertGreater(int(row_loss.sum()), 0)
+            last_real = int(out1.attention_mask[i].sum()) - 1
+            self.assertEqual(int(row_loss[last_real]), 0)
 
         # zero precomputed features -> one real train step
         from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model

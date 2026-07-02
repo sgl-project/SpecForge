@@ -561,6 +561,11 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.timeout_s = timeout_s
+        # Mirror the capture contract surface (adapters/launch read it off the
+        # engine to build + verify CaptureConfig).
+        self.aux_hidden_states_layers = getattr(
+            capture_engine, "aux_hidden_states_layers", None
+        )
 
     @classmethod
     def from_pretrained(
@@ -574,6 +579,7 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
         capture_backend: str = "hf",
         temperature: float = 0.0,
         max_new_tokens: int = 256,
+        timeout_s: float = 300.0,
         **kwargs,
     ) -> "SGLangServerEagle3TargetEngine":
         if not base_url:
@@ -596,11 +602,16 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
             base_url,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
+            timeout_s=timeout_s,
         )
 
-    # aux-layer selection etc. delegate to the capture engine (same weights)
+    # aux-layer selection delegates to the capture engine (same weights) and is
+    # mirrored here so the adapter's recorded-vs-requested verification sees it.
     def set_aux_hidden_states_layers(self, aux_hidden_states_layers=None) -> None:
         self.capture_engine.set_aux_hidden_states_layers(aux_hidden_states_layers)
+        self.aux_hidden_states_layers = getattr(
+            self.capture_engine, "aux_hidden_states_layers", aux_hidden_states_layers
+        )
 
     def health(self) -> bool:
         import requests
@@ -649,7 +660,13 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
             row[mask.bool()].tolist()
             for row, mask in zip(input_ids.cpu(), attention_mask.cpu())
         ]
-        completions = self._server_generate(prompt_rows, **kwargs)
+        # Split kwargs: sampling knobs go to the server; everything else
+        # (e.g. shard_returns) belongs to the inner capture call — dropping
+        # them would silently break the per-backend capture contract.
+        sampling = {
+            k: kwargs.pop(k) for k in ("temperature", "max_new_tokens") if k in kwargs
+        }
+        completions = self._server_generate(prompt_rows, **sampling)
 
         extended, ext_attn, ext_loss = [], [], []
         for prompt, completion in zip(prompt_rows, completions):
@@ -658,6 +675,11 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
             ext_attn.append(torch.ones(len(seq), dtype=torch.long))
             row_loss = torch.zeros(len(seq), dtype=torch.long)
             row_loss[len(prompt) :] = 1  # train on the generated region
+            # The capture backends left-shift target/input_ids (padding
+            # left=False): the row's FINAL position has no next-token teacher,
+            # so it must not carry loss — the offline pipeline's convention
+            # (preprocessing zeroes loss_mask[-1]) holds here too.
+            row_loss[-1] = 0
             ext_loss.append(row_loss)
 
         pad = torch.nn.utils.rnn.pad_sequence
@@ -666,7 +688,7 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
         ext_loss = pad(ext_loss, batch_first=True, padding_value=0).to(device)
 
         return self.capture_engine.capture(
-            input_ids=ext_ids, attention_mask=ext_attn, loss_mask=ext_loss
+            input_ids=ext_ids, attention_mask=ext_attn, loss_mask=ext_loss, **kwargs
         )
 
 
