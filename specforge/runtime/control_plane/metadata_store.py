@@ -128,29 +128,12 @@ class InMemoryMetadataStore(MetadataStore):
 
 
 class NoOpMetadataStore(MetadataStore):
-    """A store that records nothing — for ``local_colocated`` runs.
+    """MetadataStore implementation for ``local_colocated`` runs.
 
-    Colocated training keeps rollout and trainer in one process over an
-    in-memory FeatureStore, so it needs neither dedup, a committed-ref index, nor
-    the durable ack transaction those buy (the loader releases each feature the
-    moment it materializes a batch, and a colocated crash is not reconciled).
-    Every method is the cheapest answer that keeps the controller's contract:
-    ``commit_sample`` always reports "new" so the caller enqueues once, and the
-    recovery surface is empty.
-
-    Known, deliberate limits of retaining nothing:
-
-    * **Observability** — ``DataFlowController.status()`` reports
-      ``samples_committed`` / ``durable_acked`` / ``train_backlog`` as 0 for the
-      whole run (there is no committed index to count). Use the trainer's own
-      step/loss logging for colocated progress.
-    * **No commit dedup** — a re-committed ``sample_id`` re-enqueues. In one
-      process the rollout worker commits each sample exactly once, so there is
-      no redelivery path; do not pair this store with an at-least-once producer.
-    * **No ref reconstruction** — ``get_committed`` is always ``None``, so a
-      ``TrainLease`` (or ``fail_refs``) over this store cannot re-deliver refs;
-      the ack/fail paths degrade to safe no-ops. Cross-process trainers need a
-      retaining store.
+    It retains no committed refs or ack marker. ``commit_sample`` always reports
+    a fresh ref so the existing controller path still enqueues it; status and
+    recovery surfaces stay empty. Use a retaining store for cross-process or
+    restart-reconcilable runs.
     """
 
     def commit_sample(self, ref: SampleRef) -> bool:

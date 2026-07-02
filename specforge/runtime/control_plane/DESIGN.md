@@ -45,9 +45,9 @@ The `DataFlowController` is a passive metadata-only coordinator: it has no run l
 
 ## Deployment modes
 
-The same code path serves every `DeploymentMode`; `resolve_control_plane(mode, run_id)` picks the collaborators and returns `(controller, durable_ack)`. `local_colocated` pays nothing for the disagg machinery: a `NoOpMetadataStore` (no dedup index, no durable marker) and `durable_ack=False`, so the trainer skips the ack transaction and the loader releases each feature as it materializes a batch. `dataflow_colocated` / `disaggregated` keep the durable store (SQLite when a path is given, else the controller's in-memory default) and the optimizer-boundary ack. Only the (metadata store + ack policy) differ — the trainer, loader, and `SampleRefQueue` are identical, so the loss is provably independent of the mode (`test_colocated_vs_disagg_equiv`).
+The same code path serves every `DeploymentMode`; `build_control_plane_for_mode(mode, run_id)` builds the controller and durable-ack policy. `local_colocated` uses `NoOpMetadataStore` and `durable_ack=False`. `dataflow_colocated` / `disaggregated` keep the durable store (SQLite when a path is given, else the controller's in-memory default) and optimizer-boundary ack.
 
-Scope of the "no-op" axis: the *store + durable-ack transaction* are what colocated runs stop paying for. Prompt leasing and the in-process `SampleRefQueue` get/ack bookkeeping stay shared across modes — they are single-process, lock-guarded dict/deque operations with no I/O, and forking them per mode would reintroduce the divergence this plane exists to avoid. Backpressure is already opt-in (`backpressure=None` default) on every path. Two consequences of a store that retains nothing, documented on `NoOpMetadataStore`: `status()` reports zero committed/acked/backlog counts for `local_colocated` runs, and `TrainLease`/`fail_refs` cannot reconstruct refs (safe no-ops) — cross-process trainers need a retaining store.
+The no-op axis is the *store + durable-ack transaction*. Prompt leasing and in-process `SampleRefQueue` bookkeeping stay shared across modes, and backpressure remains opt-in. Because `NoOpMetadataStore` retains nothing, `status()` committed/acked/backlog counts read 0 and `TrainLease`/`fail_refs` cannot reconstruct refs; cross-process trainers need a retaining store.
 
 ## Endpoints
 
