@@ -20,6 +20,7 @@ import unittest
 
 import torch
 
+from specforge.inference.target_engine.base import KNOWN_BACKENDS
 from specforge.modeling.target import (
     CustomEagle3TargetEngine,
     CustomEagle3TargetModel,
@@ -33,7 +34,6 @@ from specforge.modeling.target import (
     available_target_engines,
     get_target_engine,
 )
-from specforge.inference.target_engine.base import KNOWN_BACKENDS
 
 
 class TargetEngineABCTest(unittest.TestCase):

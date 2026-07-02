@@ -265,7 +265,10 @@ class TestCheckpointManager(unittest.TestCase):
         ckpt_dir = mgr.save(
             {"draft_state_dict": {}, "global_step": 7, "world_size": 1},
             7,
-            rank_state={"optimizer": {"lr": 1.0}, "rng": {"cpu": torch.get_rng_state()}},
+            rank_state={
+                "optimizer": {"lr": 1.0},
+                "rng": {"cpu": torch.get_rng_state()},
+            },
         )
         state = CheckpointManager.read_resume_state(ckpt_dir)
         self.assertEqual(state["global_step"], 7)

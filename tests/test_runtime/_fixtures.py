@@ -149,6 +149,68 @@ def write_offline_files(d, n=4, seq=16, hidden=H, vocab=V, seed=0):
     return d
 
 
+TINY_MLA_DRAFT_CONFIG = {
+    "architectures": ["DeepseekV3ForCausalLMEagle3"],
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "hidden_act": "silu",
+    "hidden_size": 64,
+    "initializer_range": 0.02,
+    "intermediate_size": 128,
+    "max_position_embeddings": 512,
+    "model_type": "deepseek_v3",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 1,
+    # MLA geometry (tiny): compressed KV + split nope/rope head dims.
+    "q_lora_rank": 24,
+    "kv_lora_rank": 16,
+    "qk_nope_head_dim": 8,
+    "qk_rope_head_dim": 8,
+    "v_head_dim": 16,
+    "rope_scaling": None,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-5,
+    "tie_word_embeddings": False,
+    "torch_dtype": "bfloat16",
+    "vocab_size": 256,
+    "draft_vocab_size": 64,
+}
+
+
+def write_mla_draft_config(path):
+    with open(path, "w") as f:
+        json.dump(TINY_MLA_DRAFT_CONFIG, f)
+    return path
+
+
+def build_mla_eagle3(workdir, ttt=3):
+    """(eagle3_model, target_head) with the MLA (DeepSeek) draft, on cuda.
+
+    Mirrors :func:`build_eagle3`; the fixture dims (H/V/draft vocab) are shared,
+    so the same offline feature files and vocab mapping drive both drafts —
+    the algorithm surface is identical, only the draft ARCHITECTURE differs.
+    MLA supports the sdpa backend (see deepseek_eagle3.py).
+    """
+    from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
+    from specforge.modeling.target import TargetHead
+
+    cfg = write_mla_draft_config(os.path.join(workdir, "mla_draft.json"))
+    target_dir = write_target_head_dir(os.path.join(workdir, "target"))
+    vocab_path = write_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
+
+    draft_config = AutoDraftModelConfig.from_file(cfg)
+    draft_model = AutoEagle3DraftModel.from_config(
+        draft_config, attention_backend="sdpa", torch_dtype=torch.bfloat16
+    ).cuda()
+    draft_model.load_vocab_mapping(vocab_path)
+    draft_model.freeze_embedding()
+    target_head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
+    eagle3_model = OnlineEagle3Model(
+        draft_model=draft_model, length=ttt, attention_backend="sdpa"
+    ).cuda()
+    return eagle3_model, target_head
+
+
 def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4)):
     """Build a tiny HF Llama target wrapped by the SpecForge HF eagle3 backend."""
     from transformers import LlamaConfig, LlamaForCausalLM
