@@ -29,9 +29,9 @@ CUDA = torch.cuda.is_available()
 @unittest.skipUnless(CUDA, "MLA draft gates require CUDA")
 class TestMLADraft(unittest.TestCase):
     def test_suffix_cache_matches_causal_at_step0(self):
-        from tests.test_runtime import _fixtures as fx
-        from specforge.modeling.draft.deepseek_eagle3 import DeepseekMLAAttention
         from specforge.modeling.auto import AutoDraftModelConfig
+        from specforge.modeling.draft.deepseek_eagle3 import DeepseekMLAAttention
+        from tests.test_runtime import _fixtures as fx
 
         torch.manual_seed(0)
         workdir = tempfile.mkdtemp(prefix="mla_attn_")
@@ -70,9 +70,7 @@ class TestMLADraft(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29573")
 
-        from specforge.modeling.draft.deepseek_eagle3 import (
-            DeepseekV3ForCausalLMEagle3,
-        )
+        from specforge.modeling.draft.deepseek_eagle3 import DeepseekV3ForCausalLMEagle3
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore

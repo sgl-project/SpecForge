@@ -36,9 +36,8 @@ flex/fa/usp backends for MLA are not wired yet and raise with a pointer —
 they need an MLA-shaped kernel treatment (asymmetric q/k vs v head dims).
 """
 
-from typing import List, Optional, Tuple
-
 import math
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -127,9 +126,7 @@ class DeepseekMLAAttention(nn.Module):
 
         if self.q_lora_rank is not None:
             self.q_a_proj = nn.Linear(input_dim, self.q_lora_rank, bias=False)
-            self.q_a_layernorm = LlamaRMSNorm(
-                self.q_lora_rank, eps=config.rms_norm_eps
-            )
+            self.q_a_layernorm = LlamaRMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False
             )
