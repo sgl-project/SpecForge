@@ -36,13 +36,52 @@ Accumulation stays on-device; the single host sync happens after the loop.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Iterable, List
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import StepOutput
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    """The identity of an eval pass — every field that changes its numbers.
+
+    The identity fields are exactly the :class:`specforge.eval.cache.EvalCache`
+    key (plan §4.4 ``cache_key``): eval-data path, target path + revision,
+    tokenizer path, chat template, aux hidden-state layer ids, and max sequence
+    length. Omitting any one would silently serve stale hidden states after a
+    target swap or template change — that is the failure mode the key exists to
+    prevent. ``micro_batch_size`` is deliberately NOT identity: eval metrics
+    are batch-size invariant (the E1 gate), so re-batching the same eval set
+    must hit the same cache entry.
+    """
+
+    eval_data_path: str
+    target_model_path: str = ""
+    target_revision: str = ""
+    tokenizer_path: str = ""
+    chat_template: str = ""
+    aux_hidden_state_layer_ids: Tuple[int, ...] = ()
+    max_len: int = 2048
+    # Execution knobs — not part of the cache identity.
+    micro_batch_size: int = 1
+    cache_dir: Optional[str] = None
+
+    def identity_fields(self) -> Tuple[str, ...]:
+        """The ordered field tuple the cache key digests."""
+        return (
+            self.eval_data_path,
+            self.target_model_path,
+            self.target_revision or "",
+            self.tokenizer_path,
+            self.chat_template,
+            ",".join(str(i) for i in self.aux_hidden_state_layer_ids),
+            str(self.max_len),
+        )
 
 
 class Evaluator:
@@ -201,4 +240,4 @@ class Evaluator:
         return torch.ones((), dtype=torch.float64, device=device)
 
 
-__all__ = ["Evaluator"]
+__all__ = ["EvalConfig", "Evaluator"]
