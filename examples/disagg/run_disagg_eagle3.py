@@ -11,7 +11,7 @@ pools that share only a filesystem mount:
   manifest. No model, no trainer.
 * **consumer** (training pool): waits for the manifest, builds the EAGLE3 model
   exactly as the offline launcher does, and trains via
-  ``build_disagg_eagle3_runtime`` reading features from the shared store.
+  ``build_disagg_offline_runtime`` reading features from the shared store.
 
 The control plane carries only ``SampleRef`` metadata across the boundary; the
 feature tensors travel through the shared store. Disaggregation changes *where*
@@ -70,10 +70,7 @@ from specforge.runtime.data_plane.disagg_ingest import (
 from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
 from specforge.runtime.data_plane.feature_store import FeatureStore
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
-from specforge.runtime.launch import (
-    build_disagg_eagle3_runtime,
-    build_offline_eagle3_runtime,
-)
+from specforge.runtime.launch import build_disagg_offline_runtime, build_offline_runtime
 
 RUN_ID = "eagle3-disagg"
 
@@ -227,7 +224,8 @@ def run_colocated(args) -> None:
     sanity_check(args)
     eagle3_model, target_head, optimizer_factory = _build_model_and_optimizer(args)
     print(f"[colocated] training from {args.train_hidden_states_path}", flush=True)
-    trainer, loader = build_offline_eagle3_runtime(
+    trainer, loader = build_offline_runtime(
+        strategy="eagle3",
         hidden_states_path=args.train_hidden_states_path,
         eagle3_model=eagle3_model,
         target_head=target_head,
@@ -277,7 +275,8 @@ def run_consumer(args) -> None:
     location = getattr(store, "root", f"mooncake://{store.store_id}")
     print(f"[consumer] training from {len(refs)} disagg refs in {location}", flush=True)
 
-    trainer, loader = build_disagg_eagle3_runtime(
+    trainer, loader = build_disagg_offline_runtime(
+        strategy="eagle3",
         feature_store=store,
         refs=refs,
         eagle3_model=eagle3_model,
