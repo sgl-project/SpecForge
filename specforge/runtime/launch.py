@@ -38,7 +38,10 @@ from __future__ import annotations
 from typing import List, Optional
 
 from specforge.runtime.contracts import DeploymentMode, SampleRef
-from specforge.runtime.control_plane import DataFlowController, resolve_control_plane
+from specforge.runtime.control_plane import (
+    DataFlowController,
+    build_control_plane_for_mode,
+)
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
@@ -289,12 +292,7 @@ def build_offline_runtime(
     is really "the composite draft model for ``strategy``" (it must expose an
     inner ``.draft_model`` for the optimizer target).
 
-    ``deployment_mode`` selects the control plane (Phase C): the default
-    ``local_colocated`` pays nothing for the disagg machinery (no-op metadata
-    store, no durable ack); any other mode keeps the durable store (SQLite when
-    ``metadata_db_path`` is given) and the optimizer-boundary ack — on the same
-    code path, so the training result is mode-independent
-    (``test_colocated_vs_disagg_equiv``).
+    ``deployment_mode`` selects the metadata store and durable-ack policy.
     """
     spec = resolve_strategy(strategy)
     if spec.make_offline_reader is None:
@@ -304,7 +302,7 @@ def build_offline_runtime(
             f"specforge.runtime.training.registry."
         )
     collate_fn, per_sample_transform = _offline_io(spec, max_len)
-    controller, durable_ack = resolve_control_plane(
+    controller, durable_ack = build_control_plane_for_mode(
         deployment_mode, run_id, metadata_db_path=metadata_db_path
     )
     refs = spec.make_offline_reader(
@@ -455,15 +453,9 @@ def build_online_runtime(
     already materialized the target distribution.
     """
     spec = resolve_strategy(strategy)
-    # Deliberately PINNED to local_colocated (unlike build_offline_runtime, which
-    # takes deployment_mode): the online loader consumes this process's private
-    # SampleRefQueue, fed only by commit_sample()==True — pointing several ranks
-    # at one shared durable store would dedup each sample onto a single rank's
-    # queue (divergent batch counts -> mismatched FSDP collectives), and a reused
-    # db file would starve a restarted run to zero steps. A durable-store online
-    # run is what the disagg online builders are for (one shared store + a
-    # streamed ref channel designed to be consumed once across processes).
-    controller, durable_ack = resolve_control_plane("local_colocated", run_id)
+    # Keep colocated online on a private queue; durable online runs use the
+    # disagg builders with a shared store and streaming ref channel.
+    controller, durable_ack = build_control_plane_for_mode("local_colocated", run_id)
     controller.ingest_prompts(prompts)
     store = LocalFeatureStore(run_id)
 
