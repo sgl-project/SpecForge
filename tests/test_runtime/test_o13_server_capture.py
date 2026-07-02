@@ -109,6 +109,11 @@ class TestO13ServerCapture(unittest.TestCase):
                 cls.server.kill()
 
     def test_live_server_feeds_training(self):
+        from tests.test_runtime import _fixtures as fx
+
+        # the in-process capture engine reads the TP group at construction
+        fx.build_single_rank_distributed(port="29574")
+
         from specforge.inference.target_engine import get_eagle3_target_model
 
         engine = get_eagle3_target_model(
@@ -163,7 +168,6 @@ class TestO13ServerCapture(unittest.TestCase):
         from specforge.runtime.contracts import TrainBatch
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29574")
         torch.manual_seed(0)
         draft_cfg = AutoDraftModelConfig.from_file(
             fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
