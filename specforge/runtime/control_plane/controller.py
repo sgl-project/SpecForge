@@ -362,23 +362,13 @@ class DataFlowController:
         return status
 
 
-def resolve_control_plane(
+def build_control_plane_for_mode(
     deployment_mode: DeploymentMode,
     run_id: str,
     *,
     metadata_db_path: Optional[str] = None,
 ) -> Tuple[DataFlowController, bool]:
-    """Build the controller for a deployment mode; return ``(controller, durable_ack)``.
-
-    This is where ``DeploymentMode`` becomes load-bearing rather than
-    decorative. ``local_colocated`` pays nothing for the disagg control plane: a
-    ``NoOpMetadataStore`` and ``durable_ack=False`` (the trainer skips the durable
-    ack transaction — the loader releases features as it consumes them). The
-    ``dataflow_colocated`` / ``disaggregated`` modes keep the durable store and
-    the optimizer-boundary ack: SQLite when ``metadata_db_path`` is given,
-    otherwise the controller's own default (a private in-process store) — the
-    store-selection policy lives in one place, not here.
-    """
+    """Build the control-plane collaborators for a deployment mode."""
     if deployment_mode == "local_colocated":
         store: Optional[MetadataStore] = NoOpMetadataStore()
         durable_ack = False
@@ -389,4 +379,4 @@ def resolve_control_plane(
     return controller, durable_ack
 
 
-__all__ = ["DataFlowController", "TrainLease", "resolve_control_plane"]
+__all__ = ["DataFlowController", "TrainLease", "build_control_plane_for_mode"]
