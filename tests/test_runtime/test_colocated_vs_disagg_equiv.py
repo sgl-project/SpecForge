@@ -32,8 +32,8 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29571")
 
-        from specforge.optimizer import BF16Optimizer
         from specforge.launch import build_offline_runtime
+        from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
 
         TTT, N, MAX_LEN = 3, 8, 512

@@ -86,7 +86,9 @@ class CheckpointManager:
             os.makedirs(ckpt_dir, exist_ok=True)
         self._barrier()  # the dir exists before any rank writes into it
         if rank_state is not None:
-            torch.save(rank_state, os.path.join(ckpt_dir, self._rank_file(self._rank())))
+            torch.save(
+                rank_state, os.path.join(ckpt_dir, self._rank_file(self._rank()))
+            )
         self._barrier()  # every rank file is on disk before `latest` moves
         if self.is_rank0():
             if state is not None:
@@ -174,7 +176,9 @@ class CheckpointManager:
         )
 
     @classmethod
-    def read_resume_state(cls, path_or_uri: str, *, map_location="cpu") -> Dict[str, Any]:
+    def read_resume_state(
+        cls, path_or_uri: str, *, map_location="cpu"
+    ) -> Dict[str, Any]:
         """Read a checkpoint into the resume-state dict for **this rank**.
 
         Accepts a checkpoint directory, its ``training_state.pt``, or a

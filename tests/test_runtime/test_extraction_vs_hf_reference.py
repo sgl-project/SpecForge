@@ -28,9 +28,9 @@ class TestExtractionVsHFReference(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29564")
 
-        from specforge.runtime.contracts import PromptTask
-        from specforge.inference.capture import CaptureConfig, verify_capture
         from specforge.inference.adapters.eagle3 import SGLangAdapter
+        from specforge.inference.capture import CaptureConfig, verify_capture
+        from specforge.runtime.contracts import PromptTask
 
         H, V, SEQ = fx.H, fx.V, 12
         workdir = tempfile.mkdtemp(prefix="extract_")

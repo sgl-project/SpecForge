@@ -32,8 +32,8 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from specforge.runtime.contracts import PromptTask
 from specforge.inference.capture import CaptureConfig
+from specforge.runtime.contracts import PromptTask
 
 
 def _as_2d_long(values, device) -> torch.Tensor:

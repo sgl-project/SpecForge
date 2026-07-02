@@ -52,8 +52,8 @@ class TestDominoOfflineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge.optimizer import BF16Optimizer
         from specforge.launch import build_offline_runtime
+        from specforge.optimizer import BF16Optimizer
 
         HIDDEN, SEQ, N, MAX_OPT_STEPS = 64, 32, 4, 2
         workdir = tempfile.mkdtemp(prefix="domino_launch_")
@@ -115,9 +115,9 @@ class TestDominoOnlineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+        from specforge.launch import build_online_runtime
         from specforge.modeling.target import get_target_engine
         from specforge.optimizer import BF16Optimizer
-        from specforge.launch import build_online_runtime
 
         HIDDEN, V, SEQ, ACC, MAX_OPT_STEPS, N = 64, fx.V, 16, 2, 2, 8
         workdir = tempfile.mkdtemp(prefix="domino_online_")

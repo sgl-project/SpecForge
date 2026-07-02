@@ -6,9 +6,9 @@ import unittest
 
 import torch
 
-from specforge.runtime.contracts import PromptTask
-from specforge.inference.capture import CaptureConfig
 from specforge.inference.adapters.eagle3 import SGLangAdapter
+from specforge.inference.capture import CaptureConfig
+from specforge.runtime.contracts import PromptTask
 
 H, V = 4, 16
 

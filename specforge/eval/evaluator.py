@@ -181,7 +181,9 @@ class Evaluator:
         return total
 
     @staticmethod
-    def _token_count(batch: TrainBatch, metrics: Dict[str, Any], device) -> torch.Tensor:
+    def _token_count(
+        batch: TrainBatch, metrics: Dict[str, Any], device
+    ) -> torch.Tensor:
         """This batch's token weight as a 0-dim float64 tensor (no host sync)."""
         # Prefer the loss denom the strategy already computed; fall back to the
         # loss mask, then to a per-batch weight of 1.

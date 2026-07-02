@@ -36,9 +36,9 @@ class TestOnlineLaunch(unittest.TestCase):
             AutoEagle3DraftModel,
             OnlineEagle3Model,
         )
+        from specforge.launch import build_online_eagle3_runtime
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import assert_no_tensors
-        from specforge.launch import build_online_eagle3_runtime
 
         H, V, SEQ, TTT, ACC, MAX_OPT_STEPS, N = fx.H, fx.V, 12, 3, 2, 2, 8
         workdir = tempfile.mkdtemp(prefix="online_launch_")
