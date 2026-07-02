@@ -184,9 +184,7 @@ class TestResumeDataPosition(unittest.TestCase):
             )
             ctrl.fit([batch(i) for i in range(5)])
         # epoch 0 resumes at b3; epoch 1 is complete
-        self.assertEqual(
-            strat.seen, ["b3", "b4", "b0", "b1", "b2", "b3", "b4"]
-        )
+        self.assertEqual(strat.seen, ["b3", "b4", "b0", "b1", "b2", "b3", "b4"])
         self.assertEqual(ctrl.epoch_batch, 5)
 
 
