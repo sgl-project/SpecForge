@@ -163,12 +163,16 @@ class TestO13ServerCapture(unittest.TestCase):
             self.assertEqual(int(row_loss[last_real]), 0)
 
         # zero precomputed features -> one real train step
-        from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
+        from specforge import (
+            AutoDraftModelConfig,
+            AutoEagle3DraftModel,
+            OnlineEagle3Model,
+        )
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.strategies.base import Eagle3TrainStrategy
-        from specforge.training.controller import TrainerCore
         from specforge.runtime.contracts import TrainBatch
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.controller import TrainerCore
+        from specforge.training.strategies.base import Eagle3TrainStrategy
         from tests.test_runtime import _fixtures as fx
 
         torch.manual_seed(0)
@@ -191,9 +195,7 @@ class TestO13ServerCapture(unittest.TestCase):
                 dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
             )
         )
-        core = TrainerCore(
-            Eagle3TrainStrategy(model, target_head=None), backend
-        )
+        core = TrainerCore(Eagle3TrainStrategy(model, target_head=None), backend)
         batch = TrainBatch(
             sample_ids=["a", "b"],
             strategy="eagle3",

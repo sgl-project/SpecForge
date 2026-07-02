@@ -623,7 +623,9 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
         except requests.RequestException:
             return False
 
-    def _server_generate(self, prompt_rows: List[List[int]], **sampling) -> List[List[int]]:
+    def _server_generate(
+        self, prompt_rows: List[List[int]], **sampling
+    ) -> List[List[int]]:
         import requests
 
         params = {
