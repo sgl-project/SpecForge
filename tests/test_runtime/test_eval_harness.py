@@ -58,16 +58,22 @@ class TestEvalCacheKey(unittest.TestCase):
                 base_key, cache.key(flipped), f"{field} must be part of the key"
             )
         # Execution knobs are NOT identity: re-batching hits the same entry.
-        self.assertEqual(
-            base_key, cache.key(EvalConfig(**BASE, micro_batch_size=16))
-        )
+        self.assertEqual(base_key, cache.key(EvalConfig(**BASE, micro_batch_size=16)))
         # The encoding is injective: a delimiter inside one field cannot
         # realign the boundaries into a different identity's key.
         shifted_a = EvalConfig(
-            **{**BASE, "eval_data_path": "/data/eval.jsonl|x", "target_model_path": "/models/llama"}
+            **{
+                **BASE,
+                "eval_data_path": "/data/eval.jsonl|x",
+                "target_model_path": "/models/llama",
+            }
         )
         shifted_b = EvalConfig(
-            **{**BASE, "eval_data_path": "/data/eval.jsonl", "target_model_path": "x|/models/llama"}
+            **{
+                **BASE,
+                "eval_data_path": "/data/eval.jsonl",
+                "target_model_path": "x|/models/llama",
+            }
         )
         self.assertNotEqual(cache.key(shifted_a), cache.key(shifted_b))
 
@@ -181,7 +187,9 @@ class TestBatchSizeInvarianceOverLoader(unittest.TestCase):
         workdir = tempfile.mkdtemp(prefix="bs_inv_")
         # equal-length sequences: batching must not change padding, so any
         # metric difference would be an aggregation-ordering bug.
-        feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=N, seq=64)
+        feat_dir = fx.write_offline_files(
+            os.path.join(workdir, "features"), n=N, seq=64
+        )
 
         torch.manual_seed(0)
         model, head = fx.build_eagle3(workdir, ttt=TTT)

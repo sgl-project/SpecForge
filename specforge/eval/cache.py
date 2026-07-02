@@ -76,9 +76,7 @@ class EvalCache:
         path = self.dir_for(config)
         return path if os.path.isdir(path) else None
 
-    def get_or_produce(
-        self, config: EvalConfig, produce: Callable[[str], None]
-    ) -> str:
+    def get_or_produce(self, config: EvalConfig, produce: Callable[[str], None]) -> str:
         """Return the eval feature directory, producing it once on a miss.
 
         ``produce(staging_dir)`` materializes the eval set (e.g. runs the
