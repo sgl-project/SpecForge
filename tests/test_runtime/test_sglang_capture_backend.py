@@ -73,9 +73,9 @@ class EngineSglangDecouplingTest(unittest.TestCase):
 
 
 class SglangServerBackendTest(unittest.TestCase):
-    """sglang_server is selectable via the factory (capture gated by O1.3)."""
+    """sglang_server is selectable via the factory (O1.3 reforward transport)."""
 
-    def test_server_backend_tag_and_gated_construction(self):
+    def test_server_backend_tag_and_url_fail_fast(self):
         try:
             import torch  # noqa: F401
         except Exception:
@@ -86,9 +86,11 @@ class SglangServerBackendTest(unittest.TestCase):
         )
 
         self.assertEqual(SGLangServerEagle3TargetEngine.backend, "sglang_server")
-        # Selectable, but gated: construction raises an actionable NotImplementedError.
-        with self.assertRaises(NotImplementedError):
+        # Selectable; without a live server URL it fails fast and actionably
+        # (the O1.3 engine needs base_url= of a running SGLang server).
+        with self.assertRaises(ValueError) as ctx:
             get_eagle3_target_model("some/model", backend="sglang_server")
+        self.assertIn("base_url", str(ctx.exception))
 
 
 if __name__ == "__main__":

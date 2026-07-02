@@ -518,26 +518,53 @@ class CustomEagle3TargetEngine(Eagle3TargetEngine):
 
 
 class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
-    """Live frozen-target SGLang *server* engine (cross-node) — W3 / W3′.
+    """Live frozen-target SGLang *server* engine (O1.3, W3) — reforward transport.
 
-    The fourth backend: instead of an in-process ``ModelRunner``, a *frozen*
-    target runs as a live SGLang server and streams hidden states (capture into a
-    FeatureStore for W3, or inline over HTTP for the light W3′). It is
-    ``backend="sglang_server"`` — selectable through the factory — but the live
-    capture implementation is gated by the O1.3 throughput spike (see
-    ``docs/roadmap/online-disaggregation.md`` §O1.3), so construction raises with an
-    actionable message until that lands. The de-EAGLE3 extraction and the domain
-    Trainer carry no engine risk and do not depend on this backend.
+    The O1.3 capture spike (July 2026, sglang dev, H200) settled the transport
+    depth: a stock SGLang server exposes per-request ``return_hidden_states``
+    but returns the LAST layer only — the eagle3 aux three-layer capture is not
+    reachable over the stock HTTP surface (TorchSpec closed the same gap with a
+    17-file engine patch; SpecForge's plan is to upstream a capture API into
+    sglang instead — see the spike note in ``docs/roadmap/online-disaggregation.md``).
+
+    Until that API lands, this engine implements the **reforward transport**,
+    patch-free on a stock server:
+
+    1. the live server does what only it can do — the DECODING — via
+       ``POST /generate`` with raw ``input_ids`` (``--skip-tokenizer-init``
+       compatible), greedy by default so the frozen-target stream is
+       reproducible;
+    2. an in-process capture engine over the SAME weights (hf / sglang /
+       custom — the existing, extraction-gate-validated backends) runs ONE
+       extend over ``[prompt + completion]`` to produce aux + target features.
+
+    The training-side contract is byte-identical to every other backend:
+    ``capture()`` returns a normal :class:`Eagle3TargetOutput`, so
+    RolloutWorker → FeatureStore → SampleRef and the trainer see nothing new.
+    A future engine-side transport (upstreamed capture API) replaces step 2
+    without touching callers.
     """
 
     backend = "sglang_server"
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "sglang_server target engine (live cross-node frozen-target capture) is "
-            "not implemented yet; its depth is gated by the O1.3 capture spike "
-            "(docs/roadmap/online-disaggregation.md §O1.3). Use backend='sglang' "
-            "(in-process) or 'hf' for now."
+    def __init__(
+        self,
+        capture_engine: Eagle3TargetEngine,
+        base_url: str,
+        *,
+        temperature: float = 0.0,
+        max_new_tokens: int = 256,
+        timeout_s: float = 300.0,
+    ) -> None:
+        self.capture_engine = capture_engine
+        self.base_url = base_url.rstrip("/")
+        self.temperature = temperature
+        self.max_new_tokens = max_new_tokens
+        self.timeout_s = timeout_s
+        # Mirror the capture contract surface (adapters/launch read it off the
+        # engine to build + verify CaptureConfig).
+        self.aux_hidden_states_layers = getattr(
+            capture_engine, "aux_hidden_states_layers", None
         )
 
     @classmethod
@@ -547,9 +574,72 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
         torch_dtype: torch.dtype = None,
         device: str = None,
         cache_dir: Optional[str] = None,
+        *,
+        base_url: str = None,
+        capture_backend: str = "hf",
+        temperature: float = 0.0,
+        max_new_tokens: int = 256,
+        timeout_s: float = 300.0,
         **kwargs,
     ) -> "SGLangServerEagle3TargetEngine":
-        return cls()
+        if not base_url:
+            raise ValueError(
+                "sglang_server engine needs base_url=<http://host:port> of a "
+                "running SGLang server over the same weights as "
+                f"{pretrained_model_name_or_path!r} (launch with "
+                "--skip-tokenizer-init to feed raw input_ids)."
+            )
+        inner = get_eagle3_target_model(
+            pretrained_model_name_or_path,
+            backend=capture_backend,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+        return cls(
+            inner,
+            base_url,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            timeout_s=timeout_s,
+        )
+
+    # aux-layer selection delegates to the capture engine (same weights) and is
+    # mirrored here so the adapter's recorded-vs-requested verification sees it.
+    def set_aux_hidden_states_layers(self, aux_hidden_states_layers=None) -> None:
+        self.capture_engine.set_aux_hidden_states_layers(aux_hidden_states_layers)
+        self.aux_hidden_states_layers = getattr(
+            self.capture_engine, "aux_hidden_states_layers", aux_hidden_states_layers
+        )
+
+    def health(self) -> bool:
+        import requests
+
+        try:
+            return (
+                requests.get(f"{self.base_url}/health", timeout=10).status_code == 200
+            )
+        except requests.RequestException:
+            return False
+
+    def _server_generate(self, prompt_rows: List[List[int]], **sampling) -> List[List[int]]:
+        import requests
+
+        params = {
+            "temperature": sampling.get("temperature", self.temperature),
+            "max_new_tokens": sampling.get("max_new_tokens", self.max_new_tokens),
+        }
+        resp = requests.post(
+            f"{self.base_url}/generate",
+            json={"input_ids": prompt_rows, "sampling_params": params},
+            timeout=self.timeout_s,
+        )
+        resp.raise_for_status()
+        out = resp.json()
+        if isinstance(out, dict):
+            out = [out]
+        return [row["output_ids"] for row in out]
 
     def generate_eagle3_data(
         self,
@@ -557,8 +647,49 @@ class SGLangServerEagle3TargetEngine(Eagle3TargetEngine):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         **kwargs,
-    ) -> Eagle3TargetOutput:  # pragma: no cover - unreachable (ctor raises)
-        raise NotImplementedError
+    ) -> Eagle3TargetOutput:
+        """Live decode on the server, then one capture extend over the result.
+
+        ``input_ids``/``attention_mask`` describe the PROMPTS (right-padded);
+        the returned features cover ``[prompt + completion]`` with the loss
+        masked to the generated region — the online eagle3 convention (the
+        model learns to draft the frozen target's own continuations).
+        """
+        device = input_ids.device
+        prompt_rows = [
+            row[mask.bool()].tolist()
+            for row, mask in zip(input_ids.cpu(), attention_mask.cpu())
+        ]
+        # Split kwargs: sampling knobs go to the server; everything else
+        # (e.g. shard_returns) belongs to the inner capture call — dropping
+        # them would silently break the per-backend capture contract.
+        sampling = {
+            k: kwargs.pop(k) for k in ("temperature", "max_new_tokens") if k in kwargs
+        }
+        completions = self._server_generate(prompt_rows, **sampling)
+
+        extended, ext_attn, ext_loss = [], [], []
+        for prompt, completion in zip(prompt_rows, completions):
+            seq = prompt + list(completion)
+            extended.append(torch.tensor(seq, dtype=torch.long))
+            ext_attn.append(torch.ones(len(seq), dtype=torch.long))
+            row_loss = torch.zeros(len(seq), dtype=torch.long)
+            row_loss[len(prompt) :] = 1  # train on the generated region
+            # The capture backends left-shift target/input_ids (padding
+            # left=False): the row's FINAL position has no next-token teacher,
+            # so it must not carry loss — the offline pipeline's convention
+            # (preprocessing zeroes loss_mask[-1]) holds here too.
+            row_loss[-1] = 0
+            ext_loss.append(row_loss)
+
+        pad = torch.nn.utils.rnn.pad_sequence
+        ext_ids = pad(extended, batch_first=True, padding_value=0).to(device)
+        ext_attn = pad(ext_attn, batch_first=True, padding_value=0).to(device)
+        ext_loss = pad(ext_loss, batch_first=True, padding_value=0).to(device)
+
+        return self.capture_engine.capture(
+            input_ids=ext_ids, attention_mask=ext_attn, loss_mask=ext_loss, **kwargs
+        )
 
 
 def get_eagle3_target_model(
