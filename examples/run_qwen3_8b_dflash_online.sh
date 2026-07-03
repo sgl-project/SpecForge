@@ -12,12 +12,12 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_dflash.py \
-    --target-model-path Qwen/Qwen3-8B \
+    --target-model-path /disk3/wjp/pretrained_models/Qwen3-8B \
     --draft-config-path $ROOT_DIR/configs/qwen3-8b-dflash.json \
-    --train-data-path $ROOT_DIR/cache/dataset/perfectblend_qwen3-8b_regen.jsonl \
+    --train-data-path /disk3/wjp/datasets/nes/all_1w.jsonl \
     --output-dir $ROOT_DIR/outputs/qwen3-8b-perfectblend \
     --num-epochs 6 \
-    --batch-size 4 \
+    --batch-size 1 \
     --learning-rate 6e-4 \
     --warmup-ratio 0.04 \
     --max-grad-norm 1.0 \
