@@ -1,0 +1,890 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Online Disaggregation Roadmap &#8212; SGLang</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'roadmap/online-disaggregation';</script>
+    <link rel="icon" href="../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Jul 03, 2026"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/about.html">⚡️ About SpecForge</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">🚀 Training</a></li>
+
+
+
+
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">💡 Customize Your Own Training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/specbundle.html">🔥 SpecBundle</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/dashboard.html">📈 Performance Dashboard</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">Eagle3 for Llama3 - Online</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">Eagle3 for Llama3 - Offline</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking for Speculative Decoding</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/blob/main/roadmap/online-disaggregation.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/edit/main/roadmap/online-disaggregation.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/issues/new?title=Issue%20on%20page%20%2Froadmap/online-disaggregation.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/roadmap/online-disaggregation.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Online Disaggregation Roadmap</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-we-keep-do-not-rebuild">What we keep (do not rebuild)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#comparables-from-618">Comparables (from #618)</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o1-1-shared-cross-process-control-plane-size-m-cpu-status-in-review">O1.1 — Shared cross-process control plane · size M · CPU · status: in-review</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o1-2-async-streaming-loop-one-process-builder-size-m-cpu-small-gpu-status-in-review">O1.2 — Async streaming loop + one-process builder · size M · CPU / small-GPU · status: in-review</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o1-3-live-sglang-server-hidden-state-capture-size-l-gpu-engine-status-in-review-pr-641-reforward-transport-spike-findings-upstream-proposal-in-o13-capture-spike-md">O1.3 — Live SGLang-server hidden-state capture · size L · GPU + engine · status: in review (PR #641, reforward transport; spike findings + upstream proposal in ./o13-capture-spike.md)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o2-scale-out-orchestration-ray-open-size-l-infra-status-later">O2 — Scale-out orchestration (Ray = OPEN) · size L · infra · status: later</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#orchestration-ray-candidate-vs-lighter-alternative-decision-gate">Orchestration: Ray candidate vs. lighter alternative (decision gate)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dp-partition-leasing">dp_partition leasing</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-pool-backpressure">Cross-pool backpressure</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#streaming-pool-lifetime-known-online-mooncakefeaturestore-bugs">Streaming-pool lifetime + known online MooncakeFeatureStore bugs</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o3-hardening-size-l-infra-status-later">O3 — Hardening · size L · infra · status: later</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#provenance-not-weight-sync">Provenance, not weight sync</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dependency-graph">Dependency graph</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#explicitly-out-of-scope">Explicitly out of scope</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="online-disaggregation-roadmap">
+<h1>Online Disaggregation Roadmap<a class="headerlink" href="#online-disaggregation-roadmap" title="Link to this heading">#</a></h1>
+<p>Live disaggregated training: a rollout pool runs the <strong>frozen target</strong> model autoregressively
+over a fixed prompt set and streams its hidden states across the network into a separate trainer
+pool. This folds PR #618’s online roadmap into the consolidated tree and applies the shared
+decisions: <strong>train-with-decode only</strong> (the online target is frozen, so the streamed data is
+independent of draft weights — there is no staleness and nothing to re-sync, and the whole
+weight-sync / hot-update / on-policy axis is dropped here, kept only as the explicit out-of-scope
+note below); and <strong>Ray is OPEN/undecided</strong> for the O2 scale-out layer — presented as a candidate
+with a decision gate against a lighter torchrun/<code class="docutils literal notranslate"><span class="pre">rcli</span></code> alternative, not as a commitment.</p>
+<p>Substrate is canonical and shared with the sibling docs: <code class="docutils literal notranslate"><span class="pre">SampleRef</span></code> (control plane, tensor-free)</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">FeatureStore</span></code> (tensors: Local / SharedDir / Mooncake) + <code class="docutils literal notranslate"><span class="pre">FeatureDataLoader</span></code> → <code class="docutils literal notranslate"><span class="pre">TrainBatch</span></code>.
+There is no separate hidden-state stream source of truth — <code class="docutils literal notranslate"><span class="pre">FeatureDataLoader</span></code> over
+<code class="docutils literal notranslate"><span class="pre">SampleRef</span></code> + <code class="docutils literal notranslate"><span class="pre">FeatureStore</span></code> <em>is</em> the stream; online/offline/disagg vary only in the ref source +
+the <code class="docutils literal notranslate"><span class="pre">FeatureStore</span></code> backend, shielded from training. See <a class="reference internal" href="domain-refactor.html"><span class="std std-doc">domain-refactor</span></a>
+for the domain <code class="docutils literal notranslate"><span class="pre">Trainer</span></code>/managers that wrap the runtime training seam and for Phase B’s
+<code class="docutils literal notranslate"><span class="pre">TargetEngine</span></code> that O1.3 depends on, <a class="reference internal" href="eval-and-breadth.html"><span class="std std-doc">eval-and-breadth</span></a> for the orthogonal
+eval/algorithm track, and the top-level <span class="xref myst">plan</span>.</p></li>
+</ul>
+<hr class="docutils" />
+<section id="what-we-keep-do-not-rebuild">
+<h2>What we keep (do not rebuild)<a class="headerlink" href="#what-we-keep-do-not-rebuild" title="Link to this heading">#</a></h2>
+<p>The data plane is competitive — arguably ahead of the comparables on rigor (three backends behind
+one contract, contract-tested, with a durability seam). The gap is the <strong>orchestration +
+live-engine + async control loop</strong>. Reuse, do not rewrite:</p>
+<ul class="simple">
+<li><p><strong>Data plane</strong> — <code class="docutils literal notranslate"><span class="pre">MooncakeFeatureStore</span></code> zero-copy (<code class="docutils literal notranslate"><span class="pre">data_plane/mooncake_store.py</span></code>) with hard-pin
+replication and per-generation key sets; <code class="docutils literal notranslate"><span class="pre">LocalFeatureStore</span></code> / <code class="docutils literal notranslate"><span class="pre">SharedDirFeatureStore</span></code> behind the
+same <code class="docutils literal notranslate"><span class="pre">FeatureStore</span></code> contract (<code class="docutils literal notranslate"><span class="pre">data_plane/feature_store.py</span></code>).</p></li>
+<li><p><strong>Control-plane vocabulary</strong> — <code class="docutils literal notranslate"><span class="pre">SampleRef</span></code> (tensor-free; <code class="docutils literal notranslate"><span class="pre">assert_no_tensors</span></code> in <code class="docutils literal notranslate"><span class="pre">contracts.py</span></code>);
+<code class="docutils literal notranslate"><span class="pre">SampleRefQueue</span></code> with lease/ack and the reserved partition seam (<code class="docutils literal notranslate"><span class="pre">data_plane/sample_ref_queue.py</span></code>);
+<code class="docutils literal notranslate"><span class="pre">DataFlowController</span></code> commit/lease/ack + <code class="docutils literal notranslate"><span class="pre">reconcile_on_restart</span></code> (<code class="docutils literal notranslate"><span class="pre">control_plane/controller.py</span></code>);
+the <code class="docutils literal notranslate"><span class="pre">MetadataStore</span></code> ABC with <code class="docutils literal notranslate"><span class="pre">InMemoryMetadataStore</span></code> / <code class="docutils literal notranslate"><span class="pre">SQLiteMetadataStore</span></code>
+(<code class="docutils literal notranslate"><span class="pre">control_plane/metadata_store.py</span></code>).</p></li>
+<li><p><strong>Streaming seam</strong> — <code class="docutils literal notranslate"><span class="pre">StreamingRefChannel</span></code> / <code class="docutils literal notranslate"><span class="pre">StreamingRefQueue</span></code>
+(<code class="docutils literal notranslate"><span class="pre">data_plane/streaming_ref_channel.py</span></code>) already carry committed refs cross-process with
+in-flight accounting and a close-and-drain protocol.</p></li>
+<li><p><strong>Trainer seam</strong> — <code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code> / <code class="docutils literal notranslate"><span class="pre">DraftTrainStrategy</span></code> / <code class="docutils literal notranslate"><span class="pre">TrainingBackend</span></code> + <code class="docutils literal notranslate"><span class="pre">StepContext</span></code>
+(<code class="docutils literal notranslate"><span class="pre">training/</span></code>), wrapped (not replaced) by the domain <code class="docutils literal notranslate"><span class="pre">Trainer</span></code>.</p></li>
+</ul>
+</section>
+<section id="comparables-from-618">
+<h2>Comparables (from #618)<a class="headerlink" href="#comparables-from-618" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Axis</p></th>
+<th class="head"><p>SpecForge (today)</p></th>
+<th class="head"><p>TorchSpec</p></th>
+<th class="head"><p>DeepSpec</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Data plane (Mooncake zero-copy, tensor-free metadata)</p></td>
+<td><p><strong>At parity / cleaner</strong> — 3 backends, one contract, contract-tested, durability seam</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EagleMooncakeStore</span></code> (per-tensor keys)</p></td>
+<td><p>disk cache, no streaming</p></td>
+</tr>
+<tr class="row-odd"><td><p>Orchestration / scale-out</p></td>
+<td><p><strong>GAP</strong> — library + composable builders, controller in-process</p></td>
+<td><p>Ray actors + placement groups + async controllers + <code class="docutils literal notranslate"><span class="pre">EnginePool</span></code></p></td>
+<td><p>single 8-GPU node, no Ray</p></td>
+</tr>
+<tr class="row-even"><td><p>Live generation (train-with-decode)</p></td>
+<td><p><strong>GAP</strong> — in-process generator stub today; no server</p></td>
+<td><p>live autoregressive rollout streaming</p></td>
+<td><p>offline regen-to-disk</p></td>
+</tr>
+<tr class="row-odd"><td><p>Cross-pool backpressure</p></td>
+<td><p>policy exists, off by default</p></td>
+<td><p>pool-byte feedback + capacity await</p></td>
+<td><p>n/a</p></td>
+</tr>
+<tr class="row-even"><td><p>Online weight sync / staleness</p></td>
+<td><p>n/a — out of scope (frozen target)</p></td>
+<td><p><strong>also absent</strong> (not needed)</p></td>
+<td><p>absent</p></td>
+</tr>
+<tr class="row-odd"><td><p>Fault tolerance</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">reconcile_on_restart</span></code> + checkpoint resume</p></td>
+<td><p>checkpoint resume (≈ parity)</p></td>
+<td><p>n/a</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Read:</strong> the data plane is at or ahead of parity; the competitive gap is orchestration + the
+live engine + the async control loop. DeepSpec’s separate edge (breadth + eval) is orthogonal and
+lives in <a class="reference internal" href="eval-and-breadth.html"><span class="std std-doc">eval-and-breadth</span></a>.</p>
+<hr class="docutils" />
+<section id="o1-1-shared-cross-process-control-plane-size-m-cpu-status-in-review">
+<h3>O1.1 — Shared cross-process control plane · size M · CPU · status: in-review<a class="headerlink" href="#o1-1-shared-cross-process-control-plane-size-m-cpu-status-in-review" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Goal</strong> Producer and consumer attach to <strong>one</strong> durable control plane instead of each building
+its own <code class="docutils literal notranslate"><span class="pre">InMemoryMetadataStore</span></code>, so commit/lease/ack/dedup and restart-reconcile work across
+processes (~PR #624).</p></li>
+<li><p><strong>Target state</strong> A separate producer and consumer share commit/lease/ack via a durable store;
+the “single-host in-process index” caveat is gone for the shared-store path; <code class="docutils literal notranslate"><span class="pre">reconcile_on_restart</span></code>
+is wired into the launcher and <code class="docutils literal notranslate"><span class="pre">resume=True</span></code> re-streams the committed-but-unacked tail.</p></li>
+<li><p><strong>Implementation</strong></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">control_plane/metadata_store.py</span></code> — <code class="docutils literal notranslate"><span class="pre">SQLiteMetadataStore</span></code> is the end-to-end dev/single-host
+durable tier behind the existing <code class="docutils literal notranslate"><span class="pre">MetadataStore</span></code> ABC; a thin <code class="docutils literal notranslate"><span class="pre">RedisMetadataStore</span></code> is a later
+subclass behind the same interface (chosen at O2 if multi-node demands it).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">data_plane/sample_ref_queue.py</span></code> — <code class="docutils literal notranslate"><span class="pre">SampleRefQueue</span></code> operates over the shared store rather than
+purely in-process.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">control_plane/controller.py</span></code> — <code class="docutils literal notranslate"><span class="pre">DataFlowController(metadata_store=...)</span></code>; the producer’s
+<code class="docutils literal notranslate"><span class="pre">commit_samples</span></code> and the consumer’s <code class="docutils literal notranslate"><span class="pre">lease_train_refs</span></code> / <code class="docutils literal notranslate"><span class="pre">ack_train_refs</span></code> land in the same
+durable store; <code class="docutils literal notranslate"><span class="pre">reconcile_on_restart</span></code> resolves committed-but-unacked refs on attach.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">launch.py</span></code> — <code class="docutils literal notranslate"><span class="pre">build_disagg_online_producer</span></code> / <code class="docutils literal notranslate"><span class="pre">build_disagg_online_consumer</span></code> already accept
+<code class="docutils literal notranslate"><span class="pre">metadata_store</span></code> / <code class="docutils literal notranslate"><span class="pre">metadata_db_path</span></code> (O1.1 wiring); <code class="docutils literal notranslate"><span class="pre">_resolve_metadata_store</span></code> points both
+halves at the same durable path, and the consumer’s <code class="docutils literal notranslate"><span class="pre">resume=True</span></code> reconciles before training.</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> Two controllers over one store: producer commits, consumer leases/acks across
+processes; restart reconcile hands already-trained ids back as <code class="docutils literal notranslate"><span class="pre">skip_ids</span></code> and re-streams the tail;
+at-least-once dedup. <code class="docutils literal notranslate"><span class="pre">tests/test_runtime/test_disagg_online_launch.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">tests/test_runtime/test_disagg_online.py</span></code>.</p></li>
+<li><p><strong>Done when</strong> A separate producer and consumer share commit/lease/ack via the durable store, and
+the single-host-in-process-index caveat is removed for the shared-store path.</p></li>
+</ul>
+</section>
+<section id="o1-2-async-streaming-loop-one-process-builder-size-m-cpu-small-gpu-status-in-review">
+<h3>O1.2 — Async streaming loop + one-process builder · size M · CPU / small-GPU · status: in-review<a class="headerlink" href="#o1-2-async-streaming-loop-one-process-builder-size-m-cpu-small-gpu-status-in-review" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Goal</strong> Replace synchronous drain-then-fit with an async streaming loop, using the <strong>existing
+in-process generator</strong> as a stub so this milestone carries no engine risk (~PR #625).</p></li>
+<li><p><strong>Target state</strong> End-to-end live 1+1 run with in-process generation: producer pulls prompts →
+generates → <code class="docutils literal notranslate"><span class="pre">put</span></code> + commit ref; consumer leases → <code class="docutils literal notranslate"><span class="pre">get</span></code> → trains → acks at the optimizer step;
+a bounded sample pool throttles via the channel’s in-flight watermark.</p></li>
+<li><p><strong>Implementation</strong></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">launch.py</span></code> — the composable builders already exist today:
+<code class="docutils literal notranslate"><span class="pre">build_disagg_online_producer</span></code> returns <code class="docutils literal notranslate"><span class="pre">(workers,</span> <span class="pre">drive_producer)</span></code>;
+<code class="docutils literal notranslate"><span class="pre">build_disagg_online_consumer</span></code> returns <code class="docutils literal notranslate"><span class="pre">(trainer,</span> <span class="pre">loader)</span></code>;
+<code class="docutils literal notranslate"><span class="pre">run_disagg_online_interleaved</span></code> runs the producer on a background thread while <code class="docutils literal notranslate"><span class="pre">trainer.fit</span></code>
+consumes on the main thread, with symmetric hang-free shutdown (trainer-done sets <code class="docutils literal notranslate"><span class="pre">should_stop</span></code>;
+producer-done closes the channel; producer-raise closes the channel then re-raises).
+<code class="docutils literal notranslate"><span class="pre">build_disagg_online_runtime</span></code> (aliased <code class="docutils literal notranslate"><span class="pre">build_disagg_online_eagle3_runtime</span></code>) composes the two
+halves and dispatches to <code class="docutils literal notranslate"><span class="pre">run_disagg_online_interleaved</span></code>.</p></li>
+<li><p>The producer’s <code class="docutils literal notranslate"><span class="pre">drive_producer(should_stop=...)</span></code> applies channel backpressure (pauses while
+<code class="docutils literal notranslate"><span class="pre">channel.in_flight_remote()</span></code> exceeds <code class="docutils literal notranslate"><span class="pre">in_flight_high_watermark</span></code>) and closes the channel on exit.</p></li>
+<li><p>In-process generator stub: <code class="docutils literal notranslate"><span class="pre">SGLangAdapter.generate_features</span></code> over the SpecForge
+<code class="docutils literal notranslate"><span class="pre">Eagle3TargetModel.generate_eagle3_data</span></code> path (<code class="docutils literal notranslate"><span class="pre">inference/sglang_adapter.py</span></code>), driven by
+<code class="docutils literal notranslate"><span class="pre">RolloutWorker</span></code> (<code class="docutils literal notranslate"><span class="pre">inference/rollout_worker.py</span></code>).</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> Tiny-model 1+1 online run: trainer consumes a <strong>streamed</strong> (not precomputed)
+ref set; metrics align with the offline baseline on the same prompts/seed. Interleaved
+shutdown is hang-free in all three orderings. <code class="docutils literal notranslate"><span class="pre">tests/test_runtime/test_disagg_online_launch.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">tests/test_runtime/test_streaming_ref_channel.py</span></code>.</p></li>
+<li><p><strong>Done when</strong> An end-to-end live 1+1 run drives training from an in-process generator over the
+streaming channel, with no precomputed features.</p></li>
+</ul>
+</section>
+<section id="o1-3-live-sglang-server-hidden-state-capture-size-l-gpu-engine-status-in-review-pr-641-reforward-transport-spike-findings-upstream-proposal-in-o13-capture-spike-md">
+<h3>O1.3 — Live SGLang-server hidden-state capture · size L · GPU + engine · status: in review (PR #641, reforward transport; spike findings + upstream proposal in ./o13-capture-spike.md)<a class="headerlink" href="#o1-3-live-sglang-server-hidden-state-capture-size-l-gpu-engine-status-in-review-pr-641-reforward-transport-spike-findings-upstream-proposal-in-o13-capture-spike-md" title="Link to this heading">#</a></h3>
+<blockquote>
+<div><p>🔴 <strong>GATING RISK — run the capture spike first.</strong> The unknown is how far
+<code class="docutils literal notranslate"><span class="pre">Eagle3TargetModel.generate_eagle3_data</span></code> is from server-backed capture. The spike is the
+difference between O1.3 being days vs. a quarter; SpecForge is SGLang’s own project so reuse is
+plausible (TorchSpec needed an SGLang codebase patch). Run it before/with O1.1.</p>
+</div></blockquote>
+<ul class="simple">
+<li><p><strong>Goal</strong> Replace the in-process generator with a real SGLang <strong>server</strong> emitting aux + final
+hidden states straight into <code class="docutils literal notranslate"><span class="pre">MooncakeFeatureStore</span></code>.</p></li>
+<li><p><strong>Target state</strong> A live SGLang server feeds training with <strong>zero</strong> precomputed features: server
+generates → hidden states land in the store → consumer trains; acceptance metrics match the
+offline baseline.</p></li>
+<li><p><strong>Implementation</strong></p>
+<ul>
+<li><p>Depends on <a class="reference internal" href="domain-refactor.html"><span class="std std-doc">domain-refactor</span></a> Phase B’s <code class="docutils literal notranslate"><span class="pre">TargetEngine</span></code> abstraction
+(<code class="docutils literal notranslate"><span class="pre">SGLangServerEngine</span></code>) — O1.3 is the online consumer of that engine.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inference/sglang_adapter.py</span></code> — a server-backed <code class="docutils literal notranslate"><span class="pre">FeatureSource</span></code> (launch/attach an SGLang
+server) alongside the existing in-process <code class="docutils literal notranslate"><span class="pre">SGLangAdapter</span></code>; the capture hook is engine-side,
+writing aux + final hidden states to the <code class="docutils literal notranslate"><span class="pre">FeatureStore</span></code>. Reuse the <code class="docutils literal notranslate"><span class="pre">CaptureConfig</span></code> /
+<code class="docutils literal notranslate"><span class="pre">verify_capture</span></code> contract (<code class="docutils literal notranslate"><span class="pre">inference/capture.py</span></code>) so an aux-layer-id / width / target-dim
+mismatch fails loudly. See <code class="docutils literal notranslate"><span class="pre">inference/sglang_patch_inventory.md</span></code> for the patch surface.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inference/rollout_worker.py</span></code> — the producer uses the server-backed source; committed
+<code class="docutils literal notranslate"><span class="pre">SampleRef</span></code>s flow through the same <code class="docutils literal notranslate"><span class="pre">StreamingRefChannel</span></code>.</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> (gated GPU) Server generates → hidden states resident in the store → consumer
+trains; capture verification passes; acceptance vs. offline. <code class="docutils literal notranslate"><span class="pre">tests/test_runtime/test_mooncake_store.py</span></code>
+for the store path.</p></li>
+<li><p><strong>Done when</strong> A live SGLang server feeds training with zero precomputed features and acceptance
+metrics match the in-process / offline baseline.</p></li>
+</ul>
+</section>
+<section id="o2-scale-out-orchestration-ray-open-size-l-infra-status-later">
+<h3>O2 — Scale-out orchestration (Ray = OPEN) · size L · infra · status: later<a class="headerlink" href="#o2-scale-out-orchestration-ray-open-size-l-infra-status-later" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Goal</strong> Move from 1+1 to N producers + M trainers with per-DP-rank leasing, cross-pool
+backpressure, and a managed streaming-pool lifetime — and <strong>decide</strong> the orchestration layer.</p></li>
+<li><p><strong>Target state</strong> Independent N producers and M trainers scale without re-leasing or dropping
+samples; a slow trainer throttles the producer (bounded memory, not OOM); the online
+<code class="docutils literal notranslate"><span class="pre">MooncakeFeatureStore</span></code> bugs that become reachable at scale are closed; the orchestration layer is
+chosen against an explicit gate.</p></li>
+</ul>
+<section id="orchestration-ray-candidate-vs-lighter-alternative-decision-gate">
+<h4>Orchestration: Ray candidate vs. lighter alternative (decision gate)<a class="headerlink" href="#orchestration-ray-candidate-vs-lighter-alternative-decision-gate" title="Link to this heading">#</a></h4>
+<p>Ray is a <strong>candidate</strong> for the scale-out orchestration layer, not a commitment and not a non-goal.
+It is likely necessary for multi-node N-producer/M-trainer scale-out and high-bandwidth
+isolated-pool runs (its actor/placement model maps cleanly onto independent rollout and trainer
+pools with separate GPU counts/sharding, matching the comparables’ shape). The lighter alternative
+is <strong>torchrun + the existing <code class="docutils literal notranslate"><span class="pre">rcli</span></code> multi-node launch</strong> driving the already-composable
+<code class="docutils literal notranslate"><span class="pre">build_disagg_online_producer</span></code> / <code class="docutils literal notranslate"><span class="pre">build_disagg_online_consumer</span></code> builders across nodes, with the
+shared durable <code class="docutils literal notranslate"><span class="pre">MetadataStore</span></code> (O1.1) as the only cross-process coordination point — no actor
+framework.</p>
+<ul class="simple">
+<li><p><strong>Trade-off</strong> Ray buys dynamic placement, actor restart/health, and a uniform multi-pool control
+surface, at the cost of a heavy runtime dependency, a new failure surface, and packaging/operability
+overhead on the GPU boxes. torchrun + <code class="docutils literal notranslate"><span class="pre">rcli</span></code> keeps the dependency surface minimal and reuses the
+existing launch path, but leaves placement, fan-out, and restart as bespoke launcher logic.</p></li>
+<li><p><strong>Decision gate — adopt Ray only if</strong> the N+M / multi-node runs demonstrably need <em>dynamic</em>
+placement or per-actor restart that the static torchrun + <code class="docutils literal notranslate"><span class="pre">rcli</span></code> + shared-store path cannot
+deliver (e.g. heterogeneous pool sizes that must reshard at runtime, or actor-level fault recovery
+that bash-level relaunch cannot meet the availability target for). If a static launch over the
+shared store carries N+M with acceptable restart behaviour, stay on the lighter path. Re-evaluate
+at the first true multi-node scale-out run.</p></li>
+</ul>
+</section>
+<section id="dp-partition-leasing">
+<h4>dp_partition leasing<a class="headerlink" href="#dp-partition-leasing" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Implementation</strong> <code class="docutils literal notranslate"><span class="pre">data_plane/sample_ref_queue.py</span></code> — the partition seam exists today:
+<code class="docutils literal notranslate"><span class="pre">dp_partition(sample_id,</span> <span class="pre">num_partitions)</span></code> computes a stable DP-rank assignment, and
+<code class="docutils literal notranslate"><span class="pre">lease(...,</span> <span class="pre">partition=(index,</span> <span class="pre">num_partitions))</span></code> restricts a lease to a DP shard via
+<code class="docutils literal notranslate"><span class="pre">_lease_partition_locked</span></code>. The reserved <code class="docutils literal notranslate"><span class="pre">partition_key</span></code> producer-side routing hint is
+accepted-and-ignored today; turn on per-DP-rank leasing so every sample is leased exactly once
+across a reshard. <code class="docutils literal notranslate"><span class="pre">control_plane/controller.py</span></code> gains multi-trainer lease dispatch.</p></li>
+<li><p><strong>Tests / gates</strong> N+M run; every sample leased exactly once across a reshard; no double-train;
+changing <code class="docutils literal notranslate"><span class="pre">num_partitions</span></code> re-distributes the same committed pool without re-leasing or dropping.</p></li>
+</ul>
+</section>
+<section id="cross-pool-backpressure">
+<h4>Cross-pool backpressure<a class="headerlink" href="#cross-pool-backpressure" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Implementation</strong> <code class="docutils literal notranslate"><span class="pre">control_plane/backpressure.py</span></code> exists and is <strong>off by default</strong>:
+<code class="docutils literal notranslate"><span class="pre">BackpressureController</span></code> with <code class="docutils literal notranslate"><span class="pre">should_pause_prompts</span></code> / <code class="docutils literal notranslate"><span class="pre">cap_prompt_grant</span></code> / <code class="docutils literal notranslate"><span class="pre">cap_train_lease</span></code> and a
+high/low watermark <code class="docutils literal notranslate"><span class="pre">BackpressureConfig</span></code>. Wire the controller into the dispatch loop so it returns
+pool-size feedback and blocks granting when the pool is full; the producer throttles instead of
+OOM-ing the store. <code class="docutils literal notranslate"><span class="pre">control_plane/controller.py</span></code> reports capacity.</p></li>
+<li><p><strong>Tests / gates</strong> A slow trainer makes the producer throttle (bounded store memory) rather than
+OOM.</p></li>
+</ul>
+</section>
+<section id="streaming-pool-lifetime-known-online-mooncakefeaturestore-bugs">
+<h4>Streaming-pool lifetime + known online MooncakeFeatureStore bugs<a class="headerlink" href="#streaming-pool-lifetime-known-online-mooncakefeaturestore-bugs" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Implementation</strong> <code class="docutils literal notranslate"><span class="pre">data_plane/mooncake_store.py</span></code> — add consume-then-GC / TTL lifetime for the
+streaming pool, and close the two online-only bugs that become reachable at scale, both of which
+the shared metadata index (O1.1) unblocks:</p>
+<ul>
+<li><p><strong>release-pending re-put gc-clobber</strong> — a re-put bumps the per-sample generation and removes the
+prior key set; a parked failed-free in <code class="docutils literal notranslate"><span class="pre">_release_pending</span></code> plus <code class="docutils literal notranslate"><span class="pre">gc()</span></code> can clobber the fresh
+blob. Needs a tombstone-then-free protocol tied to the shared index.</p></li>
+<li><p><strong>cross-process abort tombstone</strong> — under a lease-deferred remove, <code class="docutils literal notranslate"><span class="pre">producer.abort</span></code> marks only
+its own <code class="docutils literal notranslate"><span class="pre">_freed</span></code>, so the bytes linger and a <em>separate</em> consumer (empty <code class="docutils literal notranslate"><span class="pre">_freed</span></code>) still resolves
+the aborted ref → stale. This is the <code class="docutils literal notranslate"><span class="pre">expectedFailure</span></code>
+<code class="docutils literal notranslate"><span class="pre">test_cross_process_abort_under_lease_defer_is_known_gap</span></code> in
+<code class="docutils literal notranslate"><span class="pre">tests/test_runtime/test_mooncake_store.py:445</span></code>; flip it to a hard assertion once the shared
+index lands.</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> Re-put-while-pending no longer deletes the fresh blob; cross-process abort
+blocks a separate consumer (the <code class="docutils literal notranslate"><span class="pre">expectedFailure</span></code> becomes a real assertion); consume-once
+streaming is correct cross-process.</p></li>
+<li><p><strong>Done when</strong> N producers and M trainers scale without re-leasing/dropping; trainer-behind-rollout
+is a bounded-memory backpressure signal; the streaming-pool bugs are closed; the orchestration
+decision gate has been evaluated against a real N+M run.</p></li>
+</ul>
+</section>
+</section>
+<section id="o3-hardening-size-l-infra-status-later">
+<h3>O3 — Hardening · size L · infra · status: later<a class="headerlink" href="#o3-hardening-size-l-infra-status-later" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Goal</strong> Make the live disaggregated path production-operable.</p></li>
+<li><p><strong>Target state</strong> RDMA path runs without per-op buffer churn; actor/process restart and health are
+handled; the run is observable.</p></li>
+<li><p><strong>Implementation</strong></p>
+<ul>
+<li><p>RDMA buffer-pool registration in <code class="docutils literal notranslate"><span class="pre">data_plane/mooncake_store.py</span></code> — replace the per-op
+<code class="docutils literal notranslate"><span class="pre">register_buffer</span></code> / <code class="docutils literal notranslate"><span class="pre">unregister_buffer</span></code> around <code class="docutils literal notranslate"><span class="pre">_store_put_tensor</span></code> / <code class="docutils literal notranslate"><span class="pre">_store_get_tensor</span></code> with a
+registered pool before flipping <code class="docutils literal notranslate"><span class="pre">DEFAULT</span></code> <code class="docutils literal notranslate"><span class="pre">protocol</span></code> from <code class="docutils literal notranslate"><span class="pre">tcp</span></code> to <code class="docutils literal notranslate"><span class="pre">rdma</span></code>.</p></li>
+<li><p>Actor / process restart + health: restart the rollout/trainer/controller processes (under
+whichever orchestration O2 selects) with <code class="docutils literal notranslate"><span class="pre">reconcile_on_restart</span></code> driving recovery from the shared
+store; health endpoints on <code class="docutils literal notranslate"><span class="pre">RolloutWorker.health</span></code> / <code class="docutils literal notranslate"><span class="pre">SGLangAdapter.health</span></code>.</p></li>
+<li><p>Observability: pool depth, in-flight, lease/ack rates, backpressure snapshots
+(<code class="docutils literal notranslate"><span class="pre">BackpressureController.snapshot</span></code>), capture-verification counts.</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> Kill-and-restore a producer/trainer mid-run and confirm no lost or
+double-trained samples; RDMA path registers buffers once; metrics emitted.</p></li>
+<li><p><strong>Done when</strong> The live disaggregated run survives a process restart with no data loss and runs the
+RDMA path with one-time buffer registration.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="provenance-not-weight-sync">
+<h2>Provenance, not weight sync<a class="headerlink" href="#provenance-not-weight-sync" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">draft_weight_version</span></code> is retained <strong>only as provenance metadata</strong> on each committed sample — it is
+recorded by <code class="docutils literal notranslate"><span class="pre">RolloutWorker._put_metadata</span></code> / <code class="docutils literal notranslate"><span class="pre">_offline_metadata</span></code> (<code class="docutils literal notranslate"><span class="pre">inference/rollout_worker.py</span></code>),
+threaded through <code class="docutils literal notranslate"><span class="pre">contracts.py</span></code>, the metadata store, the controller, and every <code class="docutils literal notranslate"><span class="pre">FeatureStore</span></code>
+backend’s metadata round-trip. It exists for debugging/audit. There is <strong>no</strong> staleness gate, no
+version registry, and no consumer-side check keyed on it. Because the online target is frozen, the
+streamed hidden states are independent of draft weights.</p>
+</section>
+<section id="dependency-graph">
+<h2>Dependency graph<a class="headerlink" href="#dependency-graph" title="Link to this heading">#</a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>                          capture spike (gates O1.3)
+                                   │
+O1.1 ──▶ O1.2 ──▶ O1.3 ──▶ O2 ──▶ O3
+ │                  │
+ │                  └─ depends on domain Phase B TargetEngine (SGLangServerEngine)
+ │
+ └─ shared MetadataStore unblocks the O2 online-store bug fixes (re-put gc-clobber,
+    cross-process abort tombstone)
+
+eval-and-breadth track ── independent (orthogonal to disaggregation)
+</pre></div>
+</div>
+</section>
+<section id="explicitly-out-of-scope">
+<h2>Explicitly out of scope<a class="headerlink" href="#explicitly-out-of-scope" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Draft-weight sync, weight-version registry, hot draft-update, staleness gate,
+<code class="docutils literal notranslate"><span class="pre">WeightPublisher</span></code> / <code class="docutils literal notranslate"><span class="pre">WeightVersion</span></code> / serving accept-length gate / <code class="docutils literal notranslate"><span class="pre">ServingTrafficStream</span></code> /
+serving-traffic capture</strong> — not needed for train-with-decode. The online target is frozen; the
+draft is not in the generation loop; the data is independent of draft weights, so there is no
+staleness and nothing to re-sync. <code class="docutils literal notranslate"><span class="pre">draft_weight_version</span></code> survives as provenance only (above).</p></li>
+<li><p><strong>True on-policy / draft-coupled training</strong> (draft proposes → target verifies → train on realized
+acceptance, requiring live draft-weight sync) — a separate research bet, not addressed here. No
+public framework ships it.</p></li>
+<li><p><strong>Elastic / dynamic engine scaling at runtime</strong> — engines are fixed at init; the comparables do
+the same.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-we-keep-do-not-rebuild">What we keep (do not rebuild)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#comparables-from-618">Comparables (from #618)</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o1-1-shared-cross-process-control-plane-size-m-cpu-status-in-review">O1.1 — Shared cross-process control plane · size M · CPU · status: in-review</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o1-2-async-streaming-loop-one-process-builder-size-m-cpu-small-gpu-status-in-review">O1.2 — Async streaming loop + one-process builder · size M · CPU / small-GPU · status: in-review</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o1-3-live-sglang-server-hidden-state-capture-size-l-gpu-engine-status-in-review-pr-641-reforward-transport-spike-findings-upstream-proposal-in-o13-capture-spike-md">O1.3 — Live SGLang-server hidden-state capture · size L · GPU + engine · status: in review (PR #641, reforward transport; spike findings + upstream proposal in ./o13-capture-spike.md)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o2-scale-out-orchestration-ray-open-size-l-infra-status-later">O2 — Scale-out orchestration (Ray = OPEN) · size L · infra · status: later</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#orchestration-ray-candidate-vs-lighter-alternative-decision-gate">Orchestration: Ray candidate vs. lighter alternative (decision gate)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dp-partition-leasing">dp_partition leasing</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-pool-backpressure">Cross-pool backpressure</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#streaming-pool-lifetime-known-online-mooncakefeaturestore-bugs">Streaming-pool lifetime + known online MooncakeFeatureStore bugs</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#o3-hardening-size-l-infra-status-later">O3 — Hardening · size L · infra · status: later</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#provenance-not-weight-sync">Provenance, not weight sync</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dependency-graph">Dependency graph</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#explicitly-out-of-scope">Explicitly out of scope</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SpecForge Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SpecForge.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Jul 03, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

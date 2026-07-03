@@ -1,0 +1,879 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Domain / Architecture Refactor Track &#8212; SGLang</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'roadmap/domain-refactor';</script>
+    <link rel="icon" href="../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Jul 03, 2026"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/about.html">⚡️ About SpecForge</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">🚀 Training</a></li>
+
+
+
+
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">💡 Customize Your Own Training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/specbundle.html">🔥 SpecBundle</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/dashboard.html">📈 Performance Dashboard</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">Eagle3 for Llama3 - Online</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">Eagle3 for Llama3 - Offline</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking for Speculative Decoding</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/blob/main/roadmap/domain-refactor.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/edit/main/roadmap/domain-refactor.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sgl-project.github.io/issues/new?title=Issue%20on%20page%20%2Froadmap/domain-refactor.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/roadmap/domain-refactor.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Domain / Architecture Refactor Track</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#a-composable-launch-size-l-gpu-status-in-review-prs-627-628-629-validated">A — Composable launch · size L · GPU · status: in review (PRs #627/#628/#629, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#b-domain-abstractions-size-l-gpu-status-in-review-prs-631-632-633-635-validated">B — Domain abstractions · size L · GPU · status: in review (PRs #631/#632/#633/#635, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#c-colocated-lightweight-path-size-m-cpu-status-in-review-pr-636-validated">C — Colocated lightweight path · size M · CPU · status: in review (PR #636, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#d-training-managers-size-l-gpu-status-in-review-pr-637-validated">D — Training managers · size L · GPU · status: in review (PR #637, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#e0-layout-consolidation-move-only-size-m-cpu-status-in-review">E0 — Layout consolidation (move-only) · size M · CPU · status: in review</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#e-composition-run-surface-size-l-gpu-status-later-after-e0">E — Composition &amp; run surface · size L · GPU · status: later (after E0)</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="domain-architecture-refactor-track">
+<h1>Domain / Architecture Refactor Track<a class="headerlink" href="#domain-architecture-refactor-track" title="Link to this heading">#</a></h1>
+<p>This is the <strong>domain/architecture</strong> track — making the runtime support multiple
+draft algorithms (eagle3 / dflash / domino / future) and a real product surface,
+<em>orthogonal</em> to the online-disaggregation scale-out work in
+<a class="reference internal" href="online-disaggregation.html"><span class="std std-doc">./online-disaggregation.md</span></a>. It builds on the
+canonical substrate (SampleRef + FeatureStore + FeatureDataLoader → TrainBatch),
+keeps the runtime training seam (<code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code> / <code class="docutils literal notranslate"><span class="pre">DraftTrainStrategy</span></code> /
+<code class="docutils literal notranslate"><span class="pre">TrainingBackend</span></code> + <code class="docutils literal notranslate"><span class="pre">StepContext</span></code>) and only <em>wraps</em> it with domain objects. The
+online target is FROZEN — there is <strong>no</strong> weight-sync, no <code class="docutils literal notranslate"><span class="pre">HiddenStateStream</span></code>
+source of truth, and <code class="docutils literal notranslate"><span class="pre">draft_weight_version</span></code> survives only as provenance metadata.
+Sibling tracks: <a class="reference internal" href="online-disaggregation.html"><span class="std std-doc">./online-disaggregation.md</span></a>,
+<a class="reference internal" href="eval-and-breadth.html"><span class="std std-doc">./eval-and-breadth.md</span></a>. Top-level plan:
+<span class="xref myst">../../plan.md</span> (the detailed §4.2–4.8 sketches this track lands
+incrementally are mirrored in <a class="reference internal" href="../redesign-draft-legacy.html"><span class="std std-doc">../redesign-draft-legacy.md</span></a>).</p>
+<p><strong>Dependency order:</strong> A (in review) → B → {C, D}; D → E0 → E (C is parallel — not a prerequisite
+of E). <code class="docutils literal notranslate"><span class="pre">E0</span></code> is a move-only layout consolidation (zero functional change) that runs at the front of
+E so E’s composition work lands in the final layout. B’s <code class="docutils literal notranslate"><span class="pre">TargetEngine</span></code> extraction also unblocks
+the online O1.3 multi-backend producer in <a class="reference internal" href="online-disaggregation.html"><span class="std std-doc">./online-disaggregation.md</span></a>.</p>
+<hr class="docutils" />
+<section id="a-composable-launch-size-l-gpu-status-in-review-prs-627-628-629-validated">
+<h2>A — Composable launch · size L · GPU · status: in review (PRs #627/#628/#629, validated)<a class="headerlink" href="#a-composable-launch-size-l-gpu-status-in-review-prs-627-628-629-validated" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Goal</strong> One strategy-parameterized launch path so adding an algorithm is a
+registry entry, not a new <code class="docutils literal notranslate"><span class="pre">build_*</span></code> family — and so a schedule-dependent loss
+(domino) flows through the same <code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code>.</p></li>
+<li><p><strong>Target state</strong> <code class="docutils literal notranslate"><span class="pre">eagle3</span></code>, <code class="docutils literal notranslate"><span class="pre">dflash</span></code>, <code class="docutils literal notranslate"><span class="pre">domino</span></code> all run end-to-end (offline +
+online) through a single set of topology builders that take <code class="docutils literal notranslate"><span class="pre">strategy=</span></code> and
+resolve a <code class="docutils literal notranslate"><span class="pre">StrategySpec</span></code>. <code class="docutils literal notranslate"><span class="pre">launch.py</span></code> grows as <code class="docutils literal notranslate"><span class="pre">topologies</span> <span class="pre">+</span> <span class="pre">one</span> <span class="pre">spec</span> <span class="pre">per</span> <span class="pre">model</span></code>, never <code class="docutils literal notranslate"><span class="pre">topologies</span> <span class="pre">×</span> <span class="pre">models</span></code>.</p></li>
+<li><p><strong>Implementation</strong> (landed)</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">training/registry.py</span></code> — <code class="docutils literal notranslate"><span class="pre">StrategySpec</span></code> dataclass + <code class="docutils literal notranslate"><span class="pre">register_strategy</span></code> /
+<code class="docutils literal notranslate"><span class="pre">resolve_strategy</span></code> / <code class="docutils literal notranslate"><span class="pre">available_strategies</span></code>; one entry each for <code class="docutils literal notranslate"><span class="pre">eagle3</span></code>,
+<code class="docutils literal notranslate"><span class="pre">dflash</span></code>, <code class="docutils literal notranslate"><span class="pre">domino</span></code>. Each spec carries <code class="docutils literal notranslate"><span class="pre">make_strategy</span></code>, <code class="docutils literal notranslate"><span class="pre">required_features</span></code>,
+the offline reader/transform/collate triple + <code class="docutils literal notranslate"><span class="pre">offline_target_repr</span></code>, the
+online collate (<code class="docutils literal notranslate"><span class="pre">concat_collate</span></code>), and <code class="docutils literal notranslate"><span class="pre">make_adapter</span></code> (None ⇒ default
+<code class="docutils literal notranslate"><span class="pre">SGLangAdapter</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">launch.py</span></code> — <code class="docutils literal notranslate"><span class="pre">_assemble_trainer</span></code> / <code class="docutils literal notranslate"><span class="pre">_offline_io</span></code> / <code class="docutils literal notranslate"><span class="pre">_assemble_rollout_workers</span></code>
+plus topology builders <code class="docutils literal notranslate"><span class="pre">build_offline_runtime</span></code>, <code class="docutils literal notranslate"><span class="pre">build_disagg_offline_runtime</span></code>,
+<code class="docutils literal notranslate"><span class="pre">build_online_runtime</span></code>, <code class="docutils literal notranslate"><span class="pre">build_disagg_online_{producer,consumer,runtime}</span></code>;
+every one resolves the spec. Legacy <code class="docutils literal notranslate"><span class="pre">build_*_eagle3_*</span></code> names are kept as
+aliases.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">training/strategy.py</span></code> — <code class="docutils literal notranslate"><span class="pre">DraftTrainStrategy</span></code> ABC + <code class="docutils literal notranslate"><span class="pre">Eagle3TrainStrategy</span></code>,
+<code class="docutils literal notranslate"><span class="pre">DFlashTrainStrategy</span></code>, <code class="docutils literal notranslate"><span class="pre">DominoTrainStrategy</span></code>; <code class="docutils literal notranslate"><span class="pre">StepContext</span></code>
+(<code class="docutils literal notranslate"><span class="pre">global_step</span></code> / <code class="docutils literal notranslate"><span class="pre">total_steps</span></code>) is threaded into <code class="docutils literal notranslate"><span class="pre">forward_loss</span></code> so domino’s
+<code class="docutils literal notranslate"><span class="pre">_lambda_base</span></code> decay reads the schedule without ad-hoc kwargs on the model
+forward.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inference/dflash_adapter.py</span></code> — <code class="docutils literal notranslate"><span class="pre">DFlashAdapter</span></code> over <code class="docutils literal notranslate"><span class="pre">generate_dflash_data</span></code>,
+emitting the <code class="docutils literal notranslate"><span class="pre">{input_ids,</span> <span class="pre">hidden_states,</span> <span class="pre">loss_mask}</span></code> schema (no
+<code class="docutils literal notranslate"><span class="pre">_project_target</span></code> / <code class="docutils literal notranslate"><span class="pre">t2d</span></code>); domino reuses it.</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> <code class="docutils literal notranslate"><span class="pre">tests/test_runtime/</span></code> incl. <code class="docutils literal notranslate"><span class="pre">test_dflash_launch.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">test_dflash_online_launch.py</span></code>; full suite <strong>197 tests/test_runtime green on
+H200</strong>.</p></li>
+<li><p><strong>Done when</strong> All three strategies run offline + online via the one parameterized
+path with the suite green (validated, in review).</p></li>
+</ul>
+<hr class="docutils" />
+</section>
+<section id="b-domain-abstractions-size-l-gpu-status-in-review-prs-631-632-633-635-validated">
+<h2>B — Domain abstractions · size L · GPU · status: in review (PRs #631/#632/#633/#635, validated)<a class="headerlink" href="#b-domain-abstractions-size-l-gpu-status-in-review-prs-631-632-633-635-validated" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Goal</strong> De-EAGLE3 the target boundary and give the runtime a domain <code class="docutils literal notranslate"><span class="pre">Trainer</span></code>
+that <em>wraps</em> (does not replace) the runtime controller, so the architecture
+reads in product terms while the seam stays intact.</p></li>
+<li><p><strong>Target state</strong> A backend-agnostic <code class="docutils literal notranslate"><span class="pre">TargetEngine</span></code> ABC sits where the
+EAGLE3-named <code class="docutils literal notranslate"><span class="pre">Eagle3TargetModel</span></code> is today; <code class="docutils literal notranslate"><span class="pre">hf</span></code> / <code class="docutils literal notranslate"><span class="pre">sglang</span></code> / <code class="docutils literal notranslate"><span class="pre">sglang_server</span></code> /
+<code class="docutils literal notranslate"><span class="pre">custom</span></code> are interchangeable backends behind it. A domain <code class="docutils literal notranslate"><span class="pre">Trainer</span></code> is the
+caller-facing object; under it the <code class="docutils literal notranslate"><span class="pre">TrainerController</span></code> / <code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code> /
+<code class="docutils literal notranslate"><span class="pre">DraftTrainStrategy</span></code> / <code class="docutils literal notranslate"><span class="pre">TrainingBackend</span></code> seam is byte-for-byte unchanged. The
+<code class="docutils literal notranslate"><span class="pre">FeatureSource</span></code> Protocol in <code class="docutils literal notranslate"><span class="pre">rollout_worker.py</span></code> stays the worker’s only
+contract. <strong>No <code class="docutils literal notranslate"><span class="pre">HiddenStateStream</span></code></strong> — <code class="docutils literal notranslate"><span class="pre">FeatureDataLoader</span></code> over
+SampleRef+FeatureStore <em>is</em> the stream.</p></li>
+<li><p><strong>Implementation</strong></p>
+<ol class="arabic simple">
+<li><p>Extract <code class="docutils literal notranslate"><span class="pre">TargetEngine</span></code> (ABC) from
+<code class="docutils literal notranslate"><span class="pre">specforge/modeling/target/eagle3_target_model.py:79</span></code> (<code class="docutils literal notranslate"><span class="pre">Eagle3TargetModel</span></code>).
+De-EAGLE3 the names: the ABC’s extraction method becomes a generic
+<code class="docutils literal notranslate"><span class="pre">generate_features(...)</span></code>-style capture call with EAGLE3 specifics
+(<code class="docutils literal notranslate"><span class="pre">generate_eagle3_data</span></code>, <code class="docutils literal notranslate"><span class="pre">aux_hidden_states_layers</span></code>,
+<code class="docutils literal notranslate"><span class="pre">set_aux_hidden_states_layers</span></code>) moved into an <code class="docutils literal notranslate"><span class="pre">Eagle3TargetEngine</span></code> subclass;
+<code class="docutils literal notranslate"><span class="pre">DFlashTargetModel</span></code> (<code class="docutils literal notranslate"><span class="pre">dflash_target_model.py:33</span></code>, <code class="docutils literal notranslate"><span class="pre">set_capture_layers</span></code>)
+becomes a sibling subclass. Keep <code class="docutils literal notranslate"><span class="pre">get_eagle3_target_model(backend=...)</span></code>
+working as a thin shim during migration, then rename to a generic factory.</p></li>
+<li><p>Add an explicit <code class="docutils literal notranslate"><span class="pre">backend</span></code> attribute on each engine (today <code class="docutils literal notranslate"><span class="pre">SGLangAdapter.health</span></code>
+/ <code class="docutils literal notranslate"><span class="pre">DFlashAdapter.health</span></code> read <code class="docutils literal notranslate"><span class="pre">getattr(target_model,</span> <span class="pre">&quot;backend&quot;,</span> <span class="pre">&quot;unknown&quot;)</span></code>
+— make it real), and add the <code class="docutils literal notranslate"><span class="pre">sglang_server</span></code> backend branch to the factory
+(currently only <code class="docutils literal notranslate"><span class="pre">sglang</span></code> / <code class="docutils literal notranslate"><span class="pre">hf</span></code> / <code class="docutils literal notranslate"><span class="pre">custom</span></code>). The <em>depth</em> of this <code class="docutils literal notranslate"><span class="pre">sglang_server</span></code>
+branch is informed by the O1.3 capture spike (see
+<a class="reference internal" href="online-disaggregation.html"><span class="std std-doc">online-disaggregation.md</span></a> §O1.3): the de-EAGLE3
+extraction (step 1) and the domain <code class="docutils literal notranslate"><span class="pre">Trainer</span></code> carry no engine risk and can land
+regardless of the spike’s outcome — only the live-server capture backend does.</p></li>
+<li><p>Keep the adapters (<code class="docutils literal notranslate"><span class="pre">SGLangAdapter</span></code>, <code class="docutils literal notranslate"><span class="pre">DFlashAdapter</span></code>) as the
+<code class="docutils literal notranslate"><span class="pre">FeatureSource</span></code> implementations over the engine; nothing in
+<code class="docutils literal notranslate"><span class="pre">rollout_worker.py</span></code> changes — its <code class="docutils literal notranslate"><span class="pre">FeatureSource</span></code> Protocol
+(<code class="docutils literal notranslate"><span class="pre">generate_features(tasks,</span> <span class="pre">*,</span> <span class="pre">capture)</span></code>) is already the seam.</p></li>
+<li><p>Introduce a domain <code class="docutils literal notranslate"><span class="pre">Trainer</span></code> (new <code class="docutils literal notranslate"><span class="pre">training/</span></code> module) that composes
+<code class="docutils literal notranslate"><span class="pre">resolve_strategy</span></code> → <code class="docutils literal notranslate"><span class="pre">FSDPTrainingBackend</span></code> → <code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code> →
+<code class="docutils literal notranslate"><span class="pre">TrainerController</span></code> (exactly what <code class="docutils literal notranslate"><span class="pre">launch._assemble_trainer</span></code> wires today)
+behind one object, and calls <code class="docutils literal notranslate"><span class="pre">.fit()</span></code>. The controller/core seam is wrapped,
+not edited.</p></li>
+</ol>
+</li>
+<li><p><strong>Tests / gates</strong> <strong>Byte-identical batches and loss vs the pre-refactor run</strong>
+for all three strategies (snapshot the first-N <code class="docutils literal notranslate"><span class="pre">TrainBatch.tensors</span></code> digests +
+per-step loss before refactor, assert equality after). <code class="docutils literal notranslate"><span class="pre">tests/test_runtime/</span></code>
+stays green; add a <code class="docutils literal notranslate"><span class="pre">TargetEngine</span></code> backend-parity test (hf vs sglang produce the
+same captured features on a fixed prompt set).</p></li>
+<li><p><strong>Done when</strong> The EAGLE3 name no longer appears in the target ABC or the
+trainer-facing API, <code class="docutils literal notranslate"><span class="pre">sglang_server</span></code> is selectable, and the byte-identical gate
+passes.</p></li>
+</ul>
+<hr class="docutils" />
+</section>
+<section id="c-colocated-lightweight-path-size-m-cpu-status-in-review-pr-636-validated">
+<h2>C — Colocated lightweight path · size M · CPU · status: in review (PR #636, validated)<a class="headerlink" href="#c-colocated-lightweight-path-size-m-cpu-status-in-review-pr-636-validated" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Goal</strong> Make colocated runs (W1/W2) pay nothing for the disagg control plane,
+on the <em>same</em> code path — not a fork.</p></li>
+<li><p><strong>Target state</strong> One canonical path. For colocated, the control plane is
+opt-in / no-op: <code class="docutils literal notranslate"><span class="pre">LocalFeatureStore</span></code> over <code class="docutils literal notranslate"><span class="pre">mem://</span></code>, no SQLite metadata store, no
+lease / ack / backpressure. Online / offline / disagg differ only in (ref
+source + FeatureStore), shielded from training.</p></li>
+<li><p><strong>Implementation</strong></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">control_plane/</span></code> — make the metadata store (<code class="docutils literal notranslate"><span class="pre">metadata_store.py</span></code>), leasing
+(<code class="docutils literal notranslate"><span class="pre">controller.py</span></code>), and backpressure (<code class="docutils literal notranslate"><span class="pre">backpressure.py</span></code>) selectable as no-op
+implementations rather than required collaborators. Drive the choice from a
+<code class="docutils literal notranslate"><span class="pre">DeploymentMode</span></code> (<code class="docutils literal notranslate"><span class="pre">contracts.py</span></code> already defines
+<code class="docutils literal notranslate"><span class="pre">local_colocated</span></code> / <code class="docutils literal notranslate"><span class="pre">dataflow_colocated</span></code> / <code class="docutils literal notranslate"><span class="pre">disaggregated</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">launch.py</span></code> — in the colocated builders, pass the no-op control plane and the
+<code class="docutils literal notranslate"><span class="pre">mem://</span></code> <code class="docutils literal notranslate"><span class="pre">LocalFeatureStore</span></code> (<code class="docutils literal notranslate"><span class="pre">data_plane/feature_store.py</span></code>); the
+<code class="docutils literal notranslate"><span class="pre">TrainerController.ack_fn</span></code> is <code class="docutils literal notranslate"><span class="pre">None</span></code> (already supported — the loader is
+assumed to ack) so the durable ack transaction is skipped.</p></li>
+<li><p>Keep the trainer/loader code identical between colocated and disagg.</p></li>
+</ul>
+</li>
+<li><p><strong>Scope note (as landed, #636)</strong> The no-op axis is the <em>(metadata store +
+durable-ack transaction)</em> — the pieces with real I/O/txn cost. Prompt leasing
+and the in-process <code class="docutils literal notranslate"><span class="pre">SampleRefQueue</span></code> bookkeeping stay shared across modes
+(single-process lock-guarded dict/deque ops, no I/O; forking them per mode
+would reintroduce the divergence this phase removes), and backpressure was
+already opt-in (<code class="docutils literal notranslate"><span class="pre">None</span></code> default) everywhere. Consequences of a store that
+retains nothing are documented on <code class="docutils literal notranslate"><span class="pre">NoOpMetadataStore</span></code> (<code class="docutils literal notranslate"><span class="pre">status()</span></code> counts read
+0; no <code class="docutils literal notranslate"><span class="pre">TrainLease</span></code> ref reconstruction). <code class="docutils literal notranslate"><span class="pre">deployment_mode</span></code> is selectable on the
+offline builder; the colocated ONLINE builder stays pinned to
+<code class="docutils literal notranslate"><span class="pre">local_colocated</span></code> because its rank-private queue is fed by commit dedup — a
+shared durable store there belongs to the disagg online builders.</p></li>
+<li><p><strong>Tests / gates</strong> A <strong>colocated == disagg numerical-equivalence gate</strong>: same
+seed + fixed feature set produce bit-identical loss curves through the one
+builder (<code class="docutils literal notranslate"><span class="pre">build_offline_runtime(deployment_mode=...)</span></code>), no-op colocated plane
+vs full disagg plane over SQLite, with the durable ack marker asserted.</p></li>
+<li><p><strong>Done when</strong> Colocated runs with zero metadata-store/durable-ack overhead
+(leasing/backpressure per the scope note) and the equivalence gate is green.</p></li>
+</ul>
+<hr class="docutils" />
+</section>
+<section id="d-training-managers-size-l-gpu-status-in-review-pr-637-validated">
+<h2>D — Training managers · size L · GPU · status: in review (PR #637, validated)<a class="headerlink" href="#d-training-managers-size-l-gpu-status-in-review-pr-637-validated" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Goal</strong> Bring the training loop up to production parity: real grad
+accumulation, full resume, checkpoint lifecycle, and an evaluator — the pieces
+<code class="docutils literal notranslate"><span class="pre">runtime/training</span></code> does not have yet.</p></li>
+<li><p><strong>Target state</strong></p>
+<ul>
+<li><p><strong>Grad accumulation with <code class="docutils literal notranslate"><span class="pre">no_sync()</span></code>.</strong> Today <code class="docutils literal notranslate"><span class="pre">runtime/training</span></code> has ZERO of
+this: <code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code> honors <code class="docutils literal notranslate"><span class="pre">accumulation_steps</span></code> for the optimizer boundary,
+but <code class="docutils literal notranslate"><span class="pre">FSDPTrainingBackend.backward</span></code> is a bare <code class="docutils literal notranslate"><span class="pre">loss.backward()</span></code>, so FSDP
+all-reduces gradients <strong>every micro-step</strong>. Add <code class="docutils literal notranslate"><span class="pre">no_sync()</span></code> over the
+non-boundary micro-steps so the reduction fires once per optimizer step.</p></li>
+<li><p><strong>Full resume.</strong> <code class="docutils literal notranslate"><span class="pre">TrainerController.save_checkpoint</span></code> persists only
+<code class="docutils literal notranslate"><span class="pre">draft_state_dict</span></code> + step/epoch; <code class="docutils literal notranslate"><span class="pre">FSDPTrainingBackend.load_state_dict</span></code> only
+half-loads the optimizer. Add optimizer + LR-scheduler + RNG state — per
+rank (they are FSDP-shard-local) — plus the mid-epoch data position, and a
+seek()-equivalent on the offline stream, so a resumed run continues on the
+same data with the same state. <em>Continuity precision (as landed, #637):</em>
+draft weights restore bit-for-bit and the data stream repositions exactly;
+the loss curve is tolerance-continuous, not bit-exact, because
+<code class="docutils literal notranslate"><span class="pre">BF16Optimizer</span></code> rebuilds its fp32 master from the persisted bf16 weights
+(matches the legacy trainer; persisting the master would change the
+optimizer itself and is out of scope here).</p></li>
+<li><p><strong>CheckpointManager</strong> — rotation (keep-last-N), <code class="docutils literal notranslate"><span class="pre">best</span></code> (by eval metric) and
+<code class="docutils literal notranslate"><span class="pre">latest</span></code> symlinks; owns the <code class="docutils literal notranslate"><span class="pre">output_dir</span></code> layout the controller writes today.</p></li>
+<li><p><strong>Evaluator</strong> — <code class="docutils literal notranslate"><span class="pre">simulated_acc_len</span></code> and per-position acceptance, with
+per-position accuracy aggregated <strong>before</strong> the geometric sum (the eagle3
+<code class="docutils literal notranslate"><span class="pre">acces</span></code> / <code class="docutils literal notranslate"><span class="pre">acc_corrects</span></code> / <code class="docutils literal notranslate"><span class="pre">acc_denoms</span></code> already flow through
+<code class="docutils literal notranslate"><span class="pre">StepOutput.metrics</span></code>; <code class="docutils literal notranslate"><span class="pre">TrainerController.evaluate</span></code> currently just means
+scalar metrics, which is wrong for acc-len).</p></li>
+</ul>
+</li>
+<li><p><strong>Implementation</strong></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">training/backend.py</span></code> — <code class="docutils literal notranslate"><span class="pre">FSDPTrainingBackend.backward(loss,</span> <span class="pre">*,</span> <span class="pre">is_boundary)</span></code>
+wrapping <code class="docutils literal notranslate"><span class="pre">self.module.no_sync()</span></code> on non-boundary micro-steps; extend
+<code class="docutils literal notranslate"><span class="pre">state_dict</span></code> / <code class="docutils literal notranslate"><span class="pre">load_state_dict</span></code> to round-trip optimizer + scheduler + RNG.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">training/trainer.py</span></code> — <code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code> passes the boundary flag into
+<code class="docutils literal notranslate"><span class="pre">backward</span></code>; <code class="docutils literal notranslate"><span class="pre">TrainerController</span></code> gains scheduler stepping and a real
+<code class="docutils literal notranslate"><span class="pre">evaluate</span></code> that aggregates per-position correct/denom across batches before
+computing acc-len. Replace the inline <code class="docutils literal notranslate"><span class="pre">save_checkpoint</span></code> body with a
+<code class="docutils literal notranslate"><span class="pre">CheckpointManager</span></code>.</p></li>
+<li><p>New <code class="docutils literal notranslate"><span class="pre">training/checkpoint.py</span></code> (<code class="docutils literal notranslate"><span class="pre">CheckpointManager</span></code>) and <code class="docutils literal notranslate"><span class="pre">eval/evaluator.py</span></code>
+(<code class="docutils literal notranslate"><span class="pre">Evaluator</span></code>) — see <span class="xref myst">../../plan.md</span> §4 (<code class="docutils literal notranslate"><span class="pre">training/checkpoint.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">eval/evaluator.py</span></code>, <code class="docutils literal notranslate"><span class="pre">eval/cache.py</span></code>).</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> <code class="docutils literal notranslate"><span class="pre">tests/test_runtime/test_checkpoint_resume.py</span></code> extended to
+assert loss-curve continuity across a save→resume boundary (optimizer + RNG);
+a <code class="docutils literal notranslate"><span class="pre">no_sync</span></code> gate asserting one all-reduce per optimizer step (and identical
+grads to per-step reduction); an evaluator test asserting per-position
+aggregation precedes the geometric sum.</p></li>
+<li><p><strong>Done when</strong> A run can be killed and resumed continuously (weights + data
+position exact; loss within the documented bf16 fp32-master tolerance) at the
+same world size, accumulation reduces once per optimizer step, checkpoints
+rotate with best/latest surviving restarts, and the evaluator reports correct
+<code class="docutils literal notranslate"><span class="pre">simulated_acc_len</span></code> with all metrics DP-reduced.</p></li>
+</ul>
+<hr class="docutils" />
+</section>
+<section id="e0-layout-consolidation-move-only-size-m-cpu-status-in-review">
+<h2>E0 — Layout consolidation (move-only) · size M · CPU · status: in review<a class="headerlink" href="#e0-layout-consolidation-move-only-size-m-cpu-status-in-review" title="Link to this heading">#</a></h2>
+<ul>
+<li><p><strong>Goal</strong> Collapse the scattered execution code into <strong>one implementation home per concern</strong> with
+<strong>zero functional change</strong>, so E’s composition work is written in the final layout rather than
+re-moved afterward. This is the §2.3 target tree in <span class="xref myst">../../plan.md</span>: <code class="docutils literal notranslate"><span class="pre">runtime/</span></code> =
+substrate only; top-level <code class="docutils literal notranslate"><span class="pre">training/</span></code> and <code class="docutils literal notranslate"><span class="pre">inference/</span></code> are the single execution homes; <code class="docutils literal notranslate"><span class="pre">modeling/</span></code>
+is model definitions only; no facade package.</p></li>
+<li><p><strong>Target state</strong> <code class="docutils literal notranslate"><span class="pre">runtime/</span></code> contains only <code class="docutils literal notranslate"><span class="pre">contracts.py</span></code> + <code class="docutils literal notranslate"><span class="pre">control_plane/</span></code> + <code class="docutils literal notranslate"><span class="pre">data_plane/</span></code>.
+Every training symbol resolves from top-level <code class="docutils literal notranslate"><span class="pre">training/</span></code>, every rollout/capture symbol from
+top-level <code class="docutils literal notranslate"><span class="pre">inference/</span></code>.</p></li>
+<li><p><strong>Implementation</strong> — pure <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">mv</span></code> + import fixes, one reviewable <strong>rename-only</strong> diff:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>From (today)</p></th>
+<th class="head"><p>To (consolidated)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">runtime/training/trainer.py</span></code> (<code class="docutils literal notranslate"><span class="pre">TrainerCore</span></code>+<code class="docutils literal notranslate"><span class="pre">TrainerController</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">training/controller.py</span></code> (kept as one file — not split)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">runtime/training/backend.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">training/backend.py</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">runtime/training/strategy.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">training/strategies/base.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">runtime/training/registry.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">training/strategies/registry.py</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">specforge/training/trainer.py</span></code> (B3 domain <code class="docutils literal notranslate"><span class="pre">Trainer</span></code>)</p></td>
+<td><p>stays <code class="docutils literal notranslate"><span class="pre">training/trainer.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">modeling/target/base.py</span></code> · <code class="docutils literal notranslate"><span class="pre">factory.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">inference/target_engine/base.py</span></code> · <code class="docutils literal notranslate"><span class="pre">factory.py</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">modeling/target/{eagle3,dflash}_target_model.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">inference/target_engine/</span></code> (relocated as-is; <strong>collapsed to per-backend engines in E, not here</strong>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">modeling/target/sglang_backend/capture.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">inference/target_engine/sglang_capture_backend.py</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">runtime/inference/rollout_worker.py</span></code> · <code class="docutils literal notranslate"><span class="pre">capture.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">inference/rollout_worker.py</span></code> · <code class="docutils literal notranslate"><span class="pre">capture.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">runtime/inference/{sglang,dflash}_adapter.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">inference/adapters/{eagle3,dflash}.py</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">runtime/launch.py</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">launch.py</span></code> (top-level; topology assembly only)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">modeling/target/{target_head.py,</span> <span class="pre">custom_backend/}</span></code></p></td>
+<td><p><strong>stays</strong> in <code class="docutils literal notranslate"><span class="pre">modeling/target/</span></code> (model defs)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Keep import shims at the old module paths for one release (re-export from the new location) so
+in-flight branches and legacy scripts don’t break.</p>
+</li>
+<li><p><strong>Tests / gates</strong> The full <code class="docutils literal notranslate"><span class="pre">tests/test_runtime</span></code> suite stays green <strong>unchanged</strong> (only import paths
+move); the Phase-B byte-identical gate (<code class="docutils literal notranslate"><span class="pre">test_phase_b_gate.py</span></code>) still passes bit-for-bit — a
+move-only change must not alter a single tensor or loss value.</p></li>
+<li><p><strong>Done when</strong> <code class="docutils literal notranslate"><span class="pre">runtime/</span></code> is substrate-only (<code class="docutils literal notranslate"><span class="pre">contracts.py</span></code> + <code class="docutils literal notranslate"><span class="pre">control_plane/</span></code> + <code class="docutils literal notranslate"><span class="pre">data_plane/</span></code>);
+every training/inference symbol resolves from its top-level home; suite + B-gate green; no
+functional diff.</p></li>
+</ul>
+<hr class="docutils" />
+</section>
+<section id="e-composition-run-surface-size-l-gpu-status-later-after-e0">
+<h2>E — Composition &amp; run surface · size L · GPU · status: later (after E0)<a class="headerlink" href="#e-composition-run-surface-size-l-gpu-status-later-after-e0" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Goal</strong> A real product surface, built <strong>on the consolidated layout from <code class="docutils literal notranslate"><span class="pre">E0</span></code></strong>: a
+draft-architecture registry (separate axis from the strategy registry), the (algorithm × backend)
+target-engine collapse, MLA Eagle3, a typed config + CLI, and exporters.</p></li>
+<li><p><strong>Target state</strong></p>
+<ul>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">DRAFT_REGISTRY</span></code> / <code class="docutils literal notranslate"><span class="pre">&#64;register_draft</span></code></strong> for draft <em>architecture</em> classes
+(<code class="docutils literal notranslate"><span class="pre">modeling/draft/</span></code>), a <strong>distinct axis</strong> from the per-algorithm strategy
+registry. Today there is neither: draft model classes live ungoverned in
+<code class="docutils literal notranslate"><span class="pre">specforge/modeling/draft/</span></code> (<code class="docutils literal notranslate"><span class="pre">base.py</span></code>, <code class="docutils literal notranslate"><span class="pre">dflash.py</span></code>, <code class="docutils literal notranslate"><span class="pre">llama3_eagle.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">flex_attention.py</span></code>). Add a <code class="docutils literal notranslate"><span class="pre">modeling/draft/registry.py</span></code>; the strategy registry stays in
+top-level <code class="docutils literal notranslate"><span class="pre">training/strategies/</span></code> (relocated in <code class="docutils literal notranslate"><span class="pre">E0</span></code>) so the two registries (architecture vs
+algorithm) are cleanly separate.</p></li>
+<li><p><strong>Collapse the (algorithm × backend) engine matrix</strong> in <code class="docutils literal notranslate"><span class="pre">inference/target_engine/</span></code>: the
+per-algorithm files relocated by <code class="docutils literal notranslate"><span class="pre">E0</span></code> converge into per-backend generic engines
+(<code class="docutils literal notranslate"><span class="pre">hf.py</span></code> / <code class="docutils literal notranslate"><span class="pre">sglang.py</span></code> / <code class="docutils literal notranslate"><span class="pre">custom.py</span></code>) parameterized by a per-algorithm <code class="docutils literal notranslate"><span class="pre">CaptureSpec</span></code> /
+capture-policy, so adding an algorithm is a spec, not a class-per-backend. NB the SGLang side
+merges cleanly (shared backend; only <code class="docutils literal notranslate"><span class="pre">wrap_eagle3_logits</span></code> + returned fields + shaping differ),
+but the <strong>HF side is a real code difference</strong> (eagle3 = forward hooks on 3 aux layers + concat +
+logits; dflash = <code class="docutils literal notranslate"><span class="pre">output_hidden_states=True</span></code> + layer select, no logits) — so it MUST be a policy
+object, not a data table.</p></li>
+<li><p><strong>MLA Eagle3 draft</strong> — an MLA-attention draft architecture registered via
+<code class="docutils literal notranslate"><span class="pre">&#64;register_draft</span></code>. <em>(The draft itself landed early as PR #640 on the Auto</em> mapping;
+E re-registers it through <code class="docutils literal notranslate"><span class="pre">&#64;register_draft</span></code>.)*</p></li>
+<li><p><strong>Pydantic config + <code class="docutils literal notranslate"><span class="pre">specforge</span></code> CLI</strong> — a typed run config (Pydantic is
+already a dep in <code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code>) replacing the argparse-style launch knobs;
+a console-script entry point that builds the config and calls the domain
+<code class="docutils literal notranslate"><span class="pre">Trainer</span></code> (from B).</p></li>
+<li><p><strong>Exporters</strong> — <code class="docutils literal notranslate"><span class="pre">export/to_sglang</span></code> (with a documented MLA weight-name map)
+and <code class="docutils literal notranslate"><span class="pre">export/to_hf</span></code>.</p></li>
+</ul>
+</li>
+<li><p><strong>Implementation</strong></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">modeling/draft/registry.py</span></code> (new) — <code class="docutils literal notranslate"><span class="pre">DRAFT_REGISTRY</span></code> + <code class="docutils literal notranslate"><span class="pre">register_draft</span></code>
+decorator; register the existing eagle3 / dflash drafts and the new MLA
+eagle3 draft. See <span class="xref myst">../../plan.md</span> §4.2.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inference/target_engine/</span></code> — collapse the <code class="docutils literal notranslate"><span class="pre">eagle3.py</span></code> / <code class="docutils literal notranslate"><span class="pre">dflash.py</span></code> per-algorithm files
+(relocated in <code class="docutils literal notranslate"><span class="pre">E0</span></code>) into <code class="docutils literal notranslate"><span class="pre">hf.py</span></code> / <code class="docutils literal notranslate"><span class="pre">sglang.py</span></code> / <code class="docutils literal notranslate"><span class="pre">custom.py</span></code> + a per-algorithm <code class="docutils literal notranslate"><span class="pre">CaptureSpec</span></code>;
+<code class="docutils literal notranslate"><span class="pre">sglang_server.py</span></code> is filled by online O1.3.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">training/strategies/</span></code> (relocated in <code class="docutils literal notranslate"><span class="pre">E0</span></code>) — finalize the <code class="docutils literal notranslate"><span class="pre">StrategySpec</span></code> registry + the
+per-algorithm specs; keep <code class="docutils literal notranslate"><span class="pre">register_strategy</span></code> / <code class="docutils literal notranslate"><span class="pre">resolve_strategy</span></code> import-compatible.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">config/schema.py</span></code> (new) — Pydantic config; <code class="docutils literal notranslate"><span class="pre">specforge</span></code> CLI entry in
+<code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code> <code class="docutils literal notranslate"><span class="pre">[project.scripts]</span></code>. See <span class="xref myst">../../plan.md</span>
+§4.6 (<code class="docutils literal notranslate"><span class="pre">config/schema.py</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">export/to_sglang.py</span></code>, <code class="docutils literal notranslate"><span class="pre">export/to_hf.py</span></code> (new) — exporters + the MLA
+weight-name map. See <span class="xref myst">../../plan.md</span> §4 (<code class="docutils literal notranslate"><span class="pre">export/to_sglang.py</span></code>).</p></li>
+<li><p>Detailed sketches for all of the above are in
+<a class="reference internal" href="../redesign-draft-legacy.html"><span class="std std-doc">../redesign-draft-legacy.md</span></a> (legacy redesign
+draft §4.2–4.8).</p></li>
+</ul>
+</li>
+<li><p><strong>Tests / gates</strong> A round-trip export test (train → <code class="docutils literal notranslate"><span class="pre">to_sglang</span></code> → load in
+sglang serving → speculative decode runs); a <code class="docutils literal notranslate"><span class="pre">to_hf</span></code> load test; an MLA-eagle3
+draft training smoke test; a CLI/config test (config parses → builds the same
+<code class="docutils literal notranslate"><span class="pre">Trainer</span></code> the programmatic path does).</p></li>
+<li><p><strong>Done when</strong> A user trains via <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">&lt;config&gt;</span></code>, registers a new draft
+architecture with <code class="docutils literal notranslate"><span class="pre">&#64;register_draft</span></code>, trains an MLA Eagle3 draft, and exports a
+checkpoint that loads in both sglang and HF — all from the consolidated layout.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#a-composable-launch-size-l-gpu-status-in-review-prs-627-628-629-validated">A — Composable launch · size L · GPU · status: in review (PRs #627/#628/#629, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#b-domain-abstractions-size-l-gpu-status-in-review-prs-631-632-633-635-validated">B — Domain abstractions · size L · GPU · status: in review (PRs #631/#632/#633/#635, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#c-colocated-lightweight-path-size-m-cpu-status-in-review-pr-636-validated">C — Colocated lightweight path · size M · CPU · status: in review (PR #636, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#d-training-managers-size-l-gpu-status-in-review-pr-637-validated">D — Training managers · size L · GPU · status: in review (PR #637, validated)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#e0-layout-consolidation-move-only-size-m-cpu-status-in-review">E0 — Layout consolidation (move-only) · size M · CPU · status: in review</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#e-composition-run-surface-size-l-gpu-status-later-after-e0">E — Composition &amp; run surface · size L · GPU · status: later (after E0)</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SpecForge Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SpecForge.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Jul 03, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
