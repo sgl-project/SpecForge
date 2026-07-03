@@ -429,13 +429,11 @@ def get_lambda_base(
     lambda_start: float = 1.0,
     decay_ratio: float = 0.5,
 ) -> float:
-    decay_steps = max(1, int(total_steps * decay_ratio))
-    progress = min(global_step / decay_steps, 1.0)
-    lambda_base = lambda_start * (1.0 - progress)
+    # Delegates to the runtime's single source of the Domino lambda schedule so the
+    # standalone script and DominoTrainStrategy cannot drift.
+    from specforge.runtime.training.strategy import linear_lambda_base
 
-    # Clamp to [0, 1].
-    lambda_base = max(0.0, min(1.0, lambda_base))
-    return lambda_base
+    return linear_lambda_base(global_step, total_steps, lambda_start, decay_ratio)
 
 
 def main():

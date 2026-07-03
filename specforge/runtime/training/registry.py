@@ -265,6 +265,47 @@ register_strategy(
 )
 
 
+# --- Domino -----------------------------------------------------------------
+# Domino reuses DFlash's draft model (projector_type="domino" head), feature
+# schema, offline transform/collate, and capture adapter (same
+# generate_dflash_data -> hidden_states). The ONE difference is the loss: it
+# blends a base loss with a step-decayed weight, so DominoTrainStrategy reads the
+# StepContext (forward_loss(batch, ctx)). That is the whole reason a new algorithm
+# needs anything beyond a spec entry here.
+
+from specforge.runtime.training.strategy import DominoTrainStrategy
+
+
+def _domino_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+        strategy="domino",
+        feature_keys=("input_ids", "loss_mask", "hidden_states"),
+        target_repr=None,
+    )
+
+
+register_strategy(
+    StrategySpec(
+        name="domino",
+        required_features=frozenset(DominoTrainStrategy.required_features),
+        make_strategy=lambda wrapped, *, target_head=None: DominoTrainStrategy(wrapped),
+        uses_target_head=False,
+        make_offline_reader=_domino_offline_reader,
+        make_offline_transform=_dflash_offline_transform,  # same schema as DFlash
+        make_offline_collate=_dflash_offline_collate,
+        make_online_collate=lambda: concat_collate,
+        make_adapter=_dflash_adapter,  # same generate_dflash_data capture
+        supports_online=True,
+    )
+)
+
+
 __all__ = [
     "StrategySpec",
     "concat_collate",
