@@ -449,6 +449,8 @@ def main():
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
+    device = get_local_device()
+    device_type = device.type
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key=args.embedding_key,
