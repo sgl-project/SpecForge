@@ -115,9 +115,7 @@ class TestDominoOnlineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge.modeling.target.dflash_target_model import (
-            get_dflash_target_model,
-        )
+        from specforge.modeling.target import get_target_engine
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.launch import build_online_runtime
 
@@ -135,8 +133,9 @@ class TestDominoOnlineLaunch(unittest.TestCase):
         self.assertEqual(width, HIDDEN)
 
         # domino captures the same hidden_states as DFlash -> reuse the DFlash target
-        target = get_dflash_target_model(
-            pretrained_model_name_or_path=target_dir,
+        target = get_target_engine(
+            target_dir,
+            strategy="domino",
             backend="hf",
             torch_dtype=torch.bfloat16,
             device="cuda",
