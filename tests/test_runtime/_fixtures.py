@@ -300,3 +300,77 @@ def build_dflash(
     ).cuda()
     width = len(draft_model.target_layer_ids) * hidden
     return dflash_model, width, target_dir, list(draft_model.target_layer_ids)
+
+
+def build_domino(
+    workdir,
+    *,
+    hidden=H,
+    vocab=V,
+    target_layers=4,
+    draft_layers=1,
+    block_size=4,
+    num_anchors=8,
+    mask_token_id=0,
+    attention_backend="sdpa",
+):
+    """Build a tiny OnlineDominoModel on cuda, mirroring scripts/train_domino.
+
+    Domino reuses the DFlash draft model with a projector_type="domino" head (GRU
+    prefix + embed projection). Returns
+    (domino_model, hidden_states_width, target_dir, target_layer_ids).
+    """
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    from specforge.core.domino import OnlineDominoModel
+    from specforge.modeling.draft.dflash import DFlashDraftModel
+    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+    tcfg = Qwen3Config(
+        hidden_size=hidden,
+        intermediate_size=2 * hidden,
+        num_hidden_layers=target_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=vocab,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(1234)
+    target_dir = os.path.join(workdir, "domino_target")
+    Qwen3ForCausalLM(tcfg).save_pretrained(target_dir)
+
+    draft_config = AutoConfig.from_pretrained(target_dir)
+    draft_config.num_hidden_layers = draft_layers
+    draft_config.block_size = block_size
+    draft_config.num_target_layers = target_layers
+    draft_config.dflash_config = {
+        "projector_type": "domino",  # builds the GRU prefix + embed_proj head
+        "emb_dim": hidden,
+        "gru_hidden_dim": hidden // 2,
+        "pure_draft_prefix_len": 0,
+        "shift_label": False,
+        "mask_token_id": mask_token_id,
+    }
+    draft_config._attn_implementation = attention_backend
+
+    draft_model = DFlashDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
+    draft_model.mask_token_id = mask_token_id
+
+    target_components = TargetEmbeddingsAndHead.from_pretrained(
+        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
+    )
+
+    domino_model = OnlineDominoModel(
+        draft_model=draft_model,
+        target_lm_head=target_components.lm_head,
+        target_embed_tokens=target_components.embed_tokens,
+        block_size=draft_model.block_size,
+        mask_token_id=mask_token_id,
+        attention_backend=attention_backend,
+        num_anchors=num_anchors,
+        shift_label=draft_model.shift_label,
+    ).cuda()
+    width = len(draft_model.target_layer_ids) * hidden
+    return domino_model, width, target_dir, list(draft_model.target_layer_ids)
