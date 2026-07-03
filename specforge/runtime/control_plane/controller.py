@@ -27,13 +27,20 @@ import dataclasses
 import threading
 import uuid
 from collections import OrderedDict, deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
+from specforge.runtime.contracts import (
+    DeploymentMode,
+    PromptTask,
+    SampleRef,
+    assert_no_tensors,
+)
 from specforge.runtime.control_plane.backpressure import BackpressureController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
+    NoOpMetadataStore,
+    SQLiteMetadataStore,
 )
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
@@ -355,4 +362,21 @@ class DataFlowController:
         return status
 
 
-__all__ = ["DataFlowController", "TrainLease"]
+def build_control_plane_for_mode(
+    deployment_mode: DeploymentMode,
+    run_id: str,
+    *,
+    metadata_db_path: Optional[str] = None,
+) -> Tuple[DataFlowController, bool]:
+    """Build the control-plane collaborators for a deployment mode."""
+    if deployment_mode == "local_colocated":
+        store: Optional[MetadataStore] = NoOpMetadataStore()
+        durable_ack = False
+    else:
+        store = SQLiteMetadataStore(metadata_db_path) if metadata_db_path else None
+        durable_ack = True
+    controller = DataFlowController(run_id, metadata_store=store)
+    return controller, durable_ack
+
+
+__all__ = ["DataFlowController", "TrainLease", "build_control_plane_for_mode"]
