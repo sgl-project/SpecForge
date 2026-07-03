@@ -5,18 +5,25 @@ from specforge.runtime.control_plane.backpressure import (
     BackpressureConfig,
     BackpressureController,
 )
-from specforge.runtime.control_plane.controller import DataFlowController, TrainLease
+from specforge.runtime.control_plane.controller import (
+    DataFlowController,
+    TrainLease,
+    build_control_plane_for_mode,
+)
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
+    NoOpMetadataStore,
     SQLiteMetadataStore,
 )
 
 __all__ = [
     "DataFlowController",
     "TrainLease",
+    "build_control_plane_for_mode",
     "MetadataStore",
     "InMemoryMetadataStore",
+    "NoOpMetadataStore",
     "SQLiteMetadataStore",
     "BackpressureConfig",
     "BackpressureController",
