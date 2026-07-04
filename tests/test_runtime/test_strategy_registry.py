@@ -14,7 +14,7 @@ No GPU / model environment required.
 
 import unittest
 
-from specforge.runtime import launch
+from specforge import launch
 from specforge.training.strategies.base import DFlashTrainStrategy, Eagle3TrainStrategy
 from specforge.training.strategies.registry import (
     available_strategies,
