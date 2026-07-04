@@ -6,14 +6,17 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""CaptureConfig: the typed contract for what a rollout must extract (B7/B8).
+"""FeatureContract: the typed contract for rollout-produced feature records.
 
-``capture`` is NOT an untyped ``dict[str, Any]``. It is a frozen config *derived
-from the active strategy* (``feature_names == DraftTrainStrategy.required_features``,
-``aux_hidden_state_layer_ids`` == the layers the draft config requested). Before
-any ``FeatureStore.put`` the rollout runs :func:`verify_capture`, which fails
-loudly on a name / aux-layer-id / width / target-dim mismatch — turning what
-would otherwise be a confusing downstream trainer bug into an immediate,
+This module is the runtime/data-plane counterpart to
+``target_engine.capture_policy``. Target-capture policies define how a backend
+produces a typed batched target output. A ``FeatureContract`` defines what the
+runtime adapter must turn that output into before any ``FeatureStore.put``:
+feature names, aux-layer ids, target representation, and expected dimensions.
+
+Before any store write the rollout runs :func:`verify_feature_contract`, which
+fails loudly on a name / aux-layer-id / width / target-dim mismatch — turning
+what would otherwise be a confusing downstream trainer bug into an immediate,
 localized error at the extraction boundary.
 
 Import-light (stdlib only) so the assertions are unit-testable without a GPU.
@@ -27,12 +30,12 @@ from typing import Any, Dict, FrozenSet, Optional, Tuple
 from specforge.runtime.contracts import TargetRepr
 
 
-class CaptureMismatchError(AssertionError):
-    """Raised when extracted features do not match the requested CaptureConfig."""
+class FeatureContractError(AssertionError):
+    """Raised when extracted features do not match the requested contract."""
 
 
 @dataclass(frozen=True)
-class CaptureConfig:
+class FeatureContract:
     feature_names: FrozenSet[str]
     aux_hidden_state_layer_ids: Tuple[int, ...]
     target_repr: TargetRepr
@@ -53,7 +56,7 @@ class CaptureConfig:
         target_vocab_size: Optional[int] = None,
         draft_vocab_size: Optional[int] = None,
         vocab_map_version: Optional[str] = None,
-    ) -> "CaptureConfig":
+    ) -> "FeatureContract":
         return cls(
             feature_names=frozenset(required_features),
             aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
@@ -78,62 +81,98 @@ class CaptureConfig:
         return None
 
 
-def verify_capture(
+def verify_feature_contract(
     tensors: Dict[str, Any],
-    capture: CaptureConfig,
+    contract: FeatureContract,
     *,
     sample_id: str,
     recorded_aux_layer_ids: Optional[Tuple[int, ...]] = None,
     aux_feature_name: str = "hidden_state",
     target_feature_name: str = "target",
 ) -> None:
-    """Loud, pre-put validation that extracted ``tensors`` match ``capture``.
+    """Loud, pre-put validation that extracted ``tensors`` match ``contract``.
 
-    Raises :class:`CaptureMismatchError` on the first mismatch with a
+    Raises :class:`FeatureContractError` on the first mismatch with a
     requested-vs-actual diff and the offending ``sample_id``.
     """
     # (1) all requested feature names present
-    missing = sorted(n for n in capture.feature_names if n not in tensors)
+    missing = sorted(n for n in contract.feature_names if n not in tensors)
     if missing:
-        raise CaptureMismatchError(
+        raise FeatureContractError(
             f"[{sample_id}] capture missing features {missing}; "
-            f"got {sorted(tensors)}; requested {sorted(capture.feature_names)}"
+            f"got {sorted(tensors)}; requested {sorted(contract.feature_names)}"
         )
 
     # (2) recorded aux-layer IDs == requested
     if recorded_aux_layer_ids is not None:
-        if tuple(recorded_aux_layer_ids) != capture.aux_hidden_state_layer_ids:
-            raise CaptureMismatchError(
+        if tuple(recorded_aux_layer_ids) != contract.aux_hidden_state_layer_ids:
+            raise FeatureContractError(
                 f"[{sample_id}] aux-layer id mismatch: recorded "
                 f"{tuple(recorded_aux_layer_ids)} != requested "
-                f"{capture.aux_hidden_state_layer_ids}"
+                f"{contract.aux_hidden_state_layer_ids}"
             )
 
     # (3) aux width == len(aux_layer_ids) * target_hidden_size
-    if aux_feature_name in tensors and capture.aux_hidden_state_layer_ids:
+    if aux_feature_name in tensors and contract.aux_hidden_state_layer_ids:
         width = int(tuple(tensors[aux_feature_name].shape)[-1])
-        if width != capture.expected_aux_width:
-            raise CaptureMismatchError(
+        if width != contract.expected_aux_width:
+            raise FeatureContractError(
                 f"[{sample_id}] aux width {width} != "
                 f"len(aux_layer_ids)*target_hidden_size="
-                f"{len(capture.aux_hidden_state_layer_ids)}*"
-                f"{capture.target_hidden_size}={capture.expected_aux_width}"
+                f"{len(contract.aux_hidden_state_layer_ids)}*"
+                f"{contract.target_hidden_size}={contract.expected_aux_width}"
             )
 
     # (4) target last-dim matches target_repr (+ vocab-map dim for pruned_logits)
-    expected = capture.expected_target_dim()
+    expected = contract.expected_target_dim()
     if target_feature_name in tensors and expected is not None:
         dim = int(tuple(tensors[target_feature_name].shape)[-1])
         if dim != expected:
-            raise CaptureMismatchError(
+            raise FeatureContractError(
                 f"[{sample_id}] target last-dim {dim} != expected {expected} "
-                f"for target_repr={capture.target_repr!r}"
+                f"for target_repr={contract.target_repr!r}"
             )
-        if capture.target_repr == "pruned_logits" and capture.vocab_map_version is None:
-            raise CaptureMismatchError(
+        if (
+            contract.target_repr == "pruned_logits"
+            and contract.vocab_map_version is None
+        ):
+            raise FeatureContractError(
                 f"[{sample_id}] target_repr='pruned_logits' requires a "
                 f"vocab_map_version so the trainer-side mapping is gated"
             )
 
 
-__all__ = ["CaptureConfig", "CaptureMismatchError", "verify_capture"]
+def verify_capture(
+    tensors: Dict[str, Any],
+    capture: FeatureContract,
+    *,
+    sample_id: str,
+    recorded_aux_layer_ids: Optional[Tuple[int, ...]] = None,
+    aux_feature_name: str = "hidden_state",
+    target_feature_name: str = "target",
+) -> None:
+    """Back-compat alias for :func:`verify_feature_contract`."""
+    verify_feature_contract(
+        tensors,
+        capture,
+        sample_id=sample_id,
+        recorded_aux_layer_ids=recorded_aux_layer_ids,
+        aux_feature_name=aux_feature_name,
+        target_feature_name=target_feature_name,
+    )
+
+
+# Back-compat aliases. New runtime code should prefer FeatureContract names to
+# distinguish feature-store contracts from target-capture policies.
+CaptureConfig = FeatureContract
+CaptureMismatchError = FeatureContractError
+
+
+__all__ = [
+    "FeatureContract",
+    "FeatureContractError",
+    "verify_feature_contract",
+    "CaptureConfig",
+    "CaptureMismatchError",
+    "verify_capture",
+]
