@@ -277,7 +277,7 @@ class TestDFlashLosses(unittest.TestCase):
 
     def _forward_loss(self, **kwargs):
         model = _make_model(self.logits, self.anchors, self.keep_mask, **kwargs)
-        loss, accuracy = model(
+        loss, accuracy, _metrics = model(
             input_ids=self.input_ids,
             hidden_states=self.hidden_states,
             loss_mask=self.loss_mask,

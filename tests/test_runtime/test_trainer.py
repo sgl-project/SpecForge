@@ -106,6 +106,12 @@ class TestTrainerCore(unittest.TestCase):
         # boundary known BEFORE backward so the backend can no_sync micro-steps
         self.assertEqual(backend.boundaries, [False, True])
 
+    def test_metrics_carry_no_mode(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        rep = core.train_step(_batch())
+        self.assertNotIn("mode", rep.metrics)
+
     def test_validate_batch_missing_feature(self):
         strat = FakeStrategy()
         bad = TrainBatch(sample_ids=["s"], strategy="fake", tensors={}, metadata={})
@@ -134,6 +140,35 @@ class TestTrainerController(unittest.TestCase):
             self.assertIsInstance(ckpt, Checkpoint)
             self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
             self.assertEqual(ckpt.global_step, 3)
+
+
+class TestEvalMetricsFlow(unittest.TestCase):
+    def test_eval_metrics_reach_logger_and_last_metrics(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        logged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=2,
+                num_epochs=1,
+                eval_interval=1,
+                log_interval=50,  # train metrics never hit the logger in 2 steps
+                logger=lambda m, s: logged.append((dict(m), s)),
+            )
+            ctrl.fit([_batch() for _ in range(3)], eval_data=[_batch()])
+        # eval metrics are logged at EVERY eval step, independent of log_interval
+        self.assertEqual([s for _, s in logged], [1, 2])
+        for m, _ in logged:
+            self.assertIn("eval/avg_loss", m)
+            self.assertAlmostEqual(m["eval/avg_acc"], 0.5, places=6)
+        # merged next to the train keys
+        self.assertIn("eval/avg_acc", ctrl.last_metrics)
+        self.assertIn("loss", ctrl.last_metrics)
+        self.assertNotIn("mode", ctrl.last_metrics)
 
 
 def _named_batch(i):

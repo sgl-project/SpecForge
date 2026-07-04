@@ -8,14 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """DraftTrainStrategy: per-draft-model required features + forward/loss + projection.
 
-A strategy is the only place that knows how a particular draft model
-(EAGLE3 / DFlash) turns a normalized ``TrainBatch`` into a loss. The
-``TrainerCore`` stays branch-free: it never inspects ``target_repr`` or branches
-on online/offline — the strategy owns the target projection (applying
-``TargetHead`` / the ``t2d`` vocab map).
-
-This module imports the SpecForge model code, so it is imported by training
-entry points, not at ``specforge.runtime`` package load.
+A strategy is the only place that knows how a draft model (EAGLE3 / DFlash /
+Domino) turns a normalized ``TrainBatch`` into a loss; ``TrainerCore`` stays
+branch-free and the strategy owns the target projection. Imports model code,
+so it is imported by training entry points, not at package load.
 """
 
 from __future__ import annotations
@@ -32,11 +28,8 @@ from specforge.runtime.contracts import TrainBatch
 
 @dataclass(frozen=True)
 class StepOutput:
-    """Opaque per-step result a strategy hands back for metric aggregation.
-
-    Kept generic so a TTT strategy (per-position lists) and a single-scalar
-    strategy (DFlash) share one trainer loop.
-    """
+    """Per-step result: loss + strategy-specific metrics, kept generic so
+    per-position (TTT) and single-scalar strategies share one trainer loop."""
 
     loss: torch.Tensor
     metrics: Dict[str, Any]
@@ -44,14 +37,9 @@ class StepOutput:
 
 @dataclass(frozen=True)
 class StepContext:
-    """Training-schedule state passed alongside the batch into ``forward_loss``.
-
-    Most strategies ignore it (their loss is a pure function of the batch). It
-    exists for objectives whose loss depends on *where in training* we are — e.g.
-    Domino blends a base loss with a weight ``lambda_base`` that decays over
-    ``total_steps``. Threading this explicitly keeps schedule-state out of ad-hoc
-    kwargs and off the model's forward signature at the runtime seam.
-    """
+    """Training-schedule state passed into ``forward_loss`` for objectives that
+    depend on where in training we are (e.g. Domino's decaying ``lambda_base``);
+    most strategies ignore it."""
 
     global_step: int = 0
     total_steps: Optional[int] = None
@@ -65,11 +53,8 @@ def linear_lambda_base(
 ) -> float:
     """Domino base-loss weight: linear decay from ``lambda_start`` to 0 over the
     first ``total_steps * decay_ratio`` steps, then 0, clamped to ``[0, 1]``.
-
-    Single source of the schedule for both the runtime ``DominoTrainStrategy`` and
-    ``scripts/train_domino.py`` so the two cannot drift. Requires a real
-    ``total_steps`` (> 0); callers with no schedule horizon decide the fallback.
-    """
+    Single source for the runtime strategy and ``scripts/train_domino.py``;
+    requires a real ``total_steps`` (> 0)."""
     decay_steps = max(1, int(total_steps * decay_ratio))
     progress = min(global_step / decay_steps, 1.0)
     return max(0.0, min(1.0, lambda_start * (1.0 - progress)))
@@ -104,12 +89,10 @@ class DraftTrainStrategy(abc.ABC):
 class Eagle3TrainStrategy(DraftTrainStrategy):
     """EAGLE3 TTT strategy wrapping the existing ``OnlineEagle3Model``.
 
-    Projection ownership: for ``target_repr == "hidden_state"`` the
-    strategy re-runs the frozen ``TargetHead`` (lm_head) over the stored target
-    last hidden state — exactly today's offline ``run_forward``. For
-    ``logits`` / ``pruned_logits`` the rollout already produced the distribution
-    and the strategy uses ``target`` as-is. The ``t2d`` vocab map is then applied
-    inside ``OnlineEagle3Model.forward`` (unchanged math).
+    For ``target_repr == "hidden_state"`` the strategy re-runs the frozen
+    ``TargetHead`` over the stored target hidden state; ``logits`` /
+    ``pruned_logits`` are used as delivered. The ``t2d`` vocab map is applied
+    inside ``OnlineEagle3Model.forward``.
     """
 
     name = "eagle3"
@@ -159,8 +142,8 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             )
             target = self.target_head(target.to(device))
             return input_ids.to(device), target, loss_mask.to(device)
-        # logits / pruned_logits: rollout already produced the distribution and
-        # applied any shift; use the tensors as delivered.
+        # logits / pruned_logits: rollout already produced (and shifted) the
+        # distribution.
         return input_ids.to(device), target.to(device), loss_mask.to(device)
 
     def forward_loss(
@@ -226,13 +209,10 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
 class DFlashTrainStrategy(DraftTrainStrategy):
     """DFlash block-parallel strategy wrapping the existing ``OnlineDFlashModel``.
 
-    Shares ``TrainerController`` / ``FSDPTrainingBackend`` / ``FeatureDataLoader``
-    / checkpoint with EAGLE3 — only the per-step forward/loss differs (a single
-    block-wise pass returning a scalar loss, vs EAGLE3's TTT unroll). DFlash uses
-    hard real-token labels + a separately-loaded target lm_head, so it needs no
-    target distribution and no vocab map. Schema names are DFlash's own (not
-    overloaded onto EAGLE3 names): ``hidden_states`` is the captured target
-    context, distinct from EAGLE3's ``hidden_state``.
+    Shares the trainer/backend/loader/checkpoint spine with EAGLE3; only the
+    per-step forward/loss differs (single block-wise pass, scalar loss, hard
+    real-token labels — no target distribution, no vocab map). ``hidden_states``
+    is DFlash's own schema name, distinct from EAGLE3's ``hidden_state``.
     """
 
     name = "dflash"
@@ -253,12 +233,19 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        loss, accuracy = self.dflash_model(
+        loss, accuracy, model_metrics = self.dflash_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
         )
-        return StepOutput(loss=loss, metrics={"accuracy": accuracy.detach()})
+        return StepOutput(
+            loss=loss,
+            metrics={
+                "accuracy": accuracy.detach(),
+                # the accuracy's own denominator, so eval can weight it exactly
+                "accuracy_denom": model_metrics["accuracy_denom"],
+            },
+        )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target
@@ -273,12 +260,9 @@ class DFlashTrainStrategy(DraftTrainStrategy):
 class DominoTrainStrategy(DraftTrainStrategy):
     """Domino block-parallel strategy wrapping ``OnlineDominoModel``.
 
-    Shares the trainer/backend/loader/checkpoint spine with DFlash and uses the
-    same feature schema ({input_ids, hidden_states, loss_mask}) and capture
-    adapter. The one thing Domino needs that the others don't: its loss blends a
-    base loss with a weight ``lambda_base`` that DECAYS over training, so it reads
-    the :class:`StepContext` to compute the schedule (every other strategy ignores
-    ctx). ``OnlineDominoModel.forward`` returns a (loss, accuracy, metrics) triple.
+    Shares the trainer/backend/loader/checkpoint spine and feature schema with
+    DFlash. Unlike the others, its loss blends a base loss with a weight
+    ``lambda_base`` that decays over training, so it reads :class:`StepContext`.
     """
 
     name = "domino"
@@ -302,9 +286,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
         return next(self.domino_model.parameters()).device
 
     def _lambda_base(self, ctx: Optional[StepContext]) -> float:
-        # Without schedule info (no ctx, or no known total_steps because neither
-        # total_steps nor max_steps was set on the controller) fall back to the pure
-        # final loss (lambda_base = 0). Otherwise use the shared linear schedule.
+        # No schedule horizon -> pure final loss (lambda_base = 0).
         if ctx is None or not ctx.total_steps:
             return 0.0
         return linear_lambda_base(
@@ -318,7 +300,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         lambda_base = self._lambda_base(ctx)
-        loss, accuracy, _metrics = self.domino_model(
+        loss, accuracy, model_metrics = self.domino_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
@@ -328,6 +310,8 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss=loss,
             metrics={
                 "accuracy": accuracy.detach(),
+                # the accuracy's own denominator, so eval can weight it exactly
+                "accuracy_denom": model_metrics["accuracy_denom"],
                 "lambda_base": torch.tensor(float(lambda_base)),
             },
         )

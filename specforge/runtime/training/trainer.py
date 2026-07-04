@@ -8,16 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainerCore + TrainerController: the trainer-boundary split.
 
-* ``TrainerCore`` owns exactly one train/eval step plus the grad-accumulation and
-  optimizer boundary. It is **branch-free**: it never inspects online/offline or
-  ``target_repr`` and never applies a projection — that is the strategy's job. It
-  consumes a normalized ``TrainBatch`` and delegates the forward/loss to the
-  strategy and the backward/step to the backend.
-* ``TrainerController`` owns the lifecycle: ``fit`` / ``evaluate`` /
-  ``save_checkpoint`` / weight publication. The training *script* becomes a thin
-  launcher that builds these and calls ``fit``.
-
-EAGLE3 and DFlash share this lifecycle unchanged — only the strategy differs.
+``TrainerCore`` runs exactly one branch-free step (strategy forward/loss, backend
+backward/step) plus the grad-accumulation boundary. ``TrainerController`` owns
+the lifecycle: fit / evaluate / save_checkpoint. EAGLE3 and DFlash share this
+unchanged — only the strategy differs.
 """
 
 from __future__ import annotations
@@ -98,19 +92,14 @@ class TrainerCore:
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
         grad_norm = self.backend.step() if stepped else None
-        return self._result(out, grad_norm, stepped, mode="train")
+        return self._result(out, grad_norm, stepped)
 
-    @torch.no_grad()
-    def eval_step(
-        self, batch: TrainBatch, ctx: Optional[StepContext] = None
-    ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        return self._result(out, None, False, mode="eval")
+    # Deliberately no eval_step: evaluation runs ``Evaluator.run`` on raw
+    # ``forward_loss`` outputs — ``_result`` scalarizes away the per-position
+    # count tensors that correct acc-len aggregation needs.
 
-    def _result(
-        self, out: StepOutput, grad_norm, stepped: bool, mode: str
-    ) -> StepResult:
-        metrics: Dict[str, Any] = {"loss": _scalar(out.loss), "mode": mode}
+    def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
+        metrics: Dict[str, Any] = {"loss": _scalar(out.loss)}
         for key in ("acces", "acceptance_rates", "plosses"):
             if key in out.metrics:
                 metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
@@ -208,6 +197,9 @@ class TrainerController:
             return self.global_step
         module = self.core.strategy.trainable_module()
         module.train()
+        # Rank0-broadcast once: a rank-local eval_data view must not let ranks
+        # enter or skip the evaluator's collectives alone.
+        eval_enabled = self._rank0_decision(eval_data is not None)
         pending_ack: List[str] = []
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
@@ -252,13 +244,18 @@ class TrainerController:
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     self.logger(result.metrics, self.global_step)
+                eval_metrics: Optional[Dict[str, Any]] = None
                 if (
                     self.eval_interval
-                    and eval_data is not None
+                    and eval_enabled
                     and self.global_step % self.eval_interval == 0
                 ):
-                    self.evaluate(eval_data)
+                    eval_metrics = self.evaluate(eval_data)
                     module.train()
+                    if eval_metrics:
+                        if self.logger:
+                            self.logger(eval_metrics, self.global_step)
+                        self.last_metrics = {**self.last_metrics, **eval_metrics}
                 if self.save_interval and self.global_step % self.save_interval == 0:
                     self.save_checkpoint(self.global_step)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
@@ -268,18 +265,33 @@ class TrainerController:
         return self.global_step
 
     @torch.no_grad()
-    def evaluate(self, data: Iterable[TrainBatch]) -> Dict[str, float]:
+    def evaluate(self, data: Optional[Iterable[TrainBatch]]) -> Dict[str, Any]:
+        """Full-pass eval via :class:`Evaluator`: rank-identical ``eval/*``
+        metrics, ``{}`` when zero batches were processed globally. ``data=None``
+        (empty local shard) still joins the evaluator's collectives."""
+        from specforge.eval import Evaluator
+
         module = self.core.strategy.trainable_module()
         module.eval()
-        agg: Dict[str, list] = {}
-        n = 0
-        for batch in data:
-            rep = self.core.eval_step(batch)
-            n += 1
-            for k, v in rep.metrics.items():
-                if isinstance(v, (int, float)):
-                    agg.setdefault(k, []).append(v)
-        return {k: sum(vs) / len(vs) for k, vs in agg.items() if vs}
+        # Same StepContext as the train path so schedule-dependent losses
+        # (Domino's lambda_base) evaluate at the live step, not at step 0.
+        ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
+        return Evaluator().run(
+            lambda batch: self.core.strategy.forward_loss(batch, ctx), data
+        )
+
+    @staticmethod
+    def _rank0_decision(flag: bool) -> bool:
+        """Broadcast rank0's verdict so a collective-bearing branch is entered by
+        every rank or by none."""
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() == 1
+        ):
+            return bool(flag)
+        verdict = [bool(flag)]
+        torch.distributed.broadcast_object_list(verdict, src=0)
+        return bool(verdict[0])
 
     def _checkpoint_manager(self):
         # Lazily built in its S-home so the runtime seam does not import the domain

@@ -141,9 +141,10 @@ class _FakeDFlashModel(nn.Module):
         self.w = nn.Parameter(torch.ones(1))
 
     def forward(self, input_ids, hidden_states, loss_mask):
+        # mirrors OnlineDFlashModel's (loss, accuracy, metrics) contract
         loss = (self.w * hidden_states.float().sum()).abs()
         acc = torch.tensor(0.5)
-        return loss, acc
+        return loss, acc, {"accuracy_denom": loss_mask.sum().detach()}
 
 
 class TestDFlashSharesLifecycle(unittest.TestCase):
@@ -166,6 +167,10 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         self.assertTrue(rep.optimizer_stepped)  # optimizer stepped via the shared core
         self.assertEqual(backend.steps, 1)
         self.assertAlmostEqual(rep.metrics["acc"], 0.5)
+        # the strategy exposes the accuracy's own denominator for exact eval
+        # weighting (Evaluator's accuracy_denom-weighted scalar path)
+        out = strat.forward_loss(batch)
+        self.assertAlmostEqual(float(out.metrics["accuracy_denom"]), 4.0)
 
     def test_dflash_validate_batch_rejects_missing(self):
         strat = DFlashTrainStrategy(_FakeDFlashModel())
