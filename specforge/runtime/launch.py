@@ -8,29 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Launch helpers that wire the DataFlow runtime from a RunConfig.
 
-The training *script* becomes a thin launcher: it parses args, calls one of
-these builders, and runs ``TrainerController.fit``. All training logic lives in
-the runtime components, not the script.
-
-Two orthogonal axes shape a run, and they are deliberately kept separate:
-
-* **topology / data-source** — offline manifest vs online rollout, colocated vs
-  disaggregated (cross-process or one-process). This is what the *named* builders
-  below span; each carries genuinely different control flow (producer vs consumer
-  process, drain-then-fit vs streamed vs interleaved) and so earns its function.
-* **draft model / strategy** — eagle3 vs dflash vs ... This is NOT a per-builder
-  axis. Every builder takes ``strategy=`` and resolves a :class:`StrategySpec`
-  (``specforge.runtime.training.registry``) for the model-specific bits — the
-  per-step strategy, the required-feature contract, the offline reader/transform/
-  collate, the online collate, the capture adapter. Adding a model is a spec entry
-  beside its model code, not a new ``build_*`` family, so this file does not grow
-  as (topologies x models).
-
-The shared spine every path funnels through:
-
-    ref source (OfflineManifestReader | RolloutWorker | StreamingRefQueue)
-        -> DataFlowController -> FeatureDataLoader(transform, collate)
-        -> TrainBatch -> spec.make_strategy -> TrainerCore/Controller -> FSDP
+The named builders span the topology axis (offline vs online, colocated vs
+disaggregated); the draft model is the ``strategy=`` parameter, resolved to a
+:class:`StrategySpec` (``specforge.runtime.training.registry``) — adding a model
+is a registry entry, not a new ``build_*`` family.
 """
 
 from __future__ import annotations
@@ -50,13 +31,8 @@ from specforge.runtime.control_plane.metadata_store import (
 from specforge.runtime.data_plane import FeatureStore, LocalFeatureStore
 from specforge.runtime.training.registry import StrategySpec, resolve_strategy
 
-# The trainer/loader assembly (FeatureDataLoader + FSDPTrainingBackend +
-# TrainerCore + TrainerController) now lives in the domain ``Trainer``
-# (``specforge.training``); ``_assemble_trainer`` below delegates to it.
-
 # ---------------------------------------------------------------------------
-# Shared assemblers — strategy- and topology-agnostic. Every builder is a thin
-# wrapper that resolves a spec, obtains a (store, ref source), and calls these.
+# Shared assemblers — strategy- and topology-agnostic.
 # ---------------------------------------------------------------------------
 
 
@@ -86,20 +62,13 @@ def _assemble_trainer(
     collate_fn,
     per_sample_transform=None,
     durable_ack: bool = True,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
-    """The trainer+loader assembly shared by offline / disagg / online / interleaved.
-
-    Only the (store, ref source, collate/transform, target_head) differ between
-    topologies; the FSDP wrap, optimizer-after-wrap, per-step strategy
-    (``spec.make_strategy``), ``TrainerCore`` and ``TrainerController`` — including
-    the optimizer-step ack — are identical. ``optimizer_factory`` runs AFTER
-    FSDP-wrap, over the wrapped module's inner draft.
+    """Delegate to the domain ``Trainer`` (``specforge.training``) — the one
+    assembly (FSDP wrap, optimizer-after-wrap, per-step strategy, loader, acks)
+    shared by every builder; returns ``(trainer.controller, trainer.loader)``.
     """
-    # Delegates to the domain Trainer (``specforge.training``) — the canonical
-    # assembler for this seam since Phase B3. It performs the exact composition
-    # this function used to inline; we return the same
-    # (TrainerController, FeatureDataLoader) tuple so every build_* path is
-    # unchanged. New code can build a ``Trainer`` directly and call ``.fit()``.
     from specforge.training import Trainer
 
     trainer = Trainer(
@@ -127,15 +96,14 @@ def _assemble_trainer(
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
     return trainer.controller, trainer.loader
 
 
 def _offline_io(spec: StrategySpec, max_len: int):
-    """Resolve (collate_fn, per_sample_transform) for an offline-shaped run.
-
-    Raises if the strategy has no offline data path wired yet.
-    """
+    """Resolve (collate_fn, per_sample_transform); raise if not wired for offline."""
     if spec.make_offline_collate is None or spec.make_offline_transform is None:
         raise NotImplementedError(
             f"offline data path for strategy {spec.name!r} is not wired yet: its "
@@ -147,12 +115,7 @@ def _offline_io(spec: StrategySpec, max_len: int):
 
 
 def _online_collate(spec: StrategySpec, collate_fn):
-    """Resolve the online/streamed collate, or raise if the strategy has none wired.
-
-    Mirrors ``_offline_io``: a strategy registered ``supports_online`` but with no
-    ``make_online_collate`` (and no explicit ``collate_fn``) fails with an
-    actionable error instead of ``TypeError: 'NoneType' object is not callable``.
-    """
+    """Resolve the online/streamed collate; raise if the strategy has none wired."""
     if collate_fn is not None:
         return collate_fn
     if spec.make_online_collate is None:
@@ -168,20 +131,35 @@ def _resolve_metadata_store(
     metadata_store: Optional[MetadataStore],
     metadata_db_path: Optional[str],
 ) -> Optional[MetadataStore]:
-    """Pick the controller's metadata store for an online disaggregated process.
+    """Pick the online-disagg controller's metadata store.
 
-    O1.1: producer and consumer run in *separate* processes, so a shared, durable
-    store is what makes commit/dedup/ack cross-process (an in-process
-    ``InMemoryMetadataStore`` per process shares nothing). Pass an explicit
-    ``metadata_store``, or a ``metadata_db_path`` and both processes open a
-    ``SQLiteMetadataStore`` over the same file. ``None`` keeps the pre-O1.1
-    behaviour: a private in-process store, control state un-shared.
+    Producer and consumer must open the SAME durable store for cross-process
+    commit/dedup/ack: an explicit ``metadata_store``, or a shared
+    ``metadata_db_path`` (SQLite). ``None`` = private in-process store, un-shared.
     """
     if metadata_store is not None:
         return metadata_store
     if metadata_db_path is not None:
         return SQLiteMetadataStore(metadata_db_path)
     return None
+
+
+def _checkpoint_global_step(resume_from: str) -> int:
+    """Read ``global_step`` from the shared payload of the checkpoint at
+    ``resume_from`` (a checkpoint dir, its state file, or a ``file://`` URI)."""
+    import os
+
+    import torch
+
+    from specforge.training.checkpoint import STATE_FILE
+
+    path = str(resume_from)
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+    if os.path.basename(path) != STATE_FILE:
+        path = os.path.join(path, STATE_FILE)
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    return int(state.get("global_step", 0) or 0)
 
 
 def _assemble_rollout_workers(
@@ -201,14 +179,10 @@ def _assemble_rollout_workers(
     num_rollout_workers: int,
     device: str,
 ):
-    """Build the rollout producer workers shared by colocated-online and the
-    disaggregated-online producer.
+    """Build the rollout producer workers (colocated-online + disagg producer).
 
-    The capture contract is derived from ``spec.required_features`` and verified
-    at the ``FeatureStore.put`` boundary (``verify_capture``). The adapter is
-    ``spec.make_adapter`` (default ``SGLangAdapter`` for eagle3). Strategies
-    without an online capture path (``supports_online=False``) raise here rather
-    than quietly emitting the wrong feature schema.
+    The capture contract derives from ``spec.required_features``; strategies with
+    ``supports_online=False`` raise here rather than emit the wrong feature schema.
     """
     if not spec.supports_online:
         raise NotImplementedError(
@@ -238,8 +212,7 @@ def _assemble_rollout_workers(
         draft_vocab_size=draft_vocab_size,
         vocab_map_version=vocab_map_version,
     )
-    # strategy=spec.name so committed SampleRefs carry the right strategy tag and
-    # the loader's strategy check passes (the RolloutWorker default is "eagle3").
+    # strategy=spec.name: committed refs must pass the loader's strategy check
     return [
         RolloutWorker(
             controller,
@@ -255,8 +228,7 @@ def _assemble_rollout_workers(
 
 
 # ---------------------------------------------------------------------------
-# Offline (colocated + disaggregated). The named builders span the topology
-# axis; `strategy=` selects the model.
+# Offline (colocated + disaggregated).
 # ---------------------------------------------------------------------------
 
 
@@ -285,14 +257,15 @@ def build_offline_runtime(
     log_interval: int = 50,
     deployment_mode: DeploymentMode = "local_colocated",
     metadata_db_path: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
-    The model object is passed as ``eagle3_model`` for backward compatibility; it
-    is really "the composite draft model for ``strategy``" (it must expose an
-    inner ``.draft_model`` for the optimizer target).
-
-    ``deployment_mode`` selects the metadata store and durable-ack policy.
+    ``eagle3_model`` is really "the composite draft model for ``strategy``"
+    (back-compat name; must expose ``.draft_model``). ``deployment_mode`` selects
+    the control plane: ``local_colocated`` skips the durable store/ack; other
+    modes keep both on the same code path (training result is mode-independent).
     """
     spec = resolve_strategy(strategy)
     if spec.make_offline_reader is None:
@@ -334,6 +307,8 @@ def build_offline_runtime(
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
 
@@ -360,14 +335,14 @@ def build_disagg_offline_runtime(
     sp_ring_size: int = 1,
     logger=None,
     log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """Consumer side of a disaggregated OFFLINE run.
 
-    Trains from a caller-supplied ``feature_store`` (tensors produced by a
-    *different process* — typically a :class:`SharedDirFeatureStore` on a shared
-    mount) and ``disagg://`` ``SampleRef``s the producer published to the manifest.
-    The trainer assembly is identical to the colocated offline path — only the
-    (store, refs) source differs — so results match within determinism tolerance.
+    Trains from a caller-supplied cross-process ``feature_store`` and the
+    ``disagg://`` refs its producer published. Same trainer assembly as the
+    colocated offline path, so results match within determinism tolerance.
     """
     spec = resolve_strategy(strategy)
     collate_fn, per_sample_transform = _offline_io(spec, max_len)
@@ -396,6 +371,8 @@ def build_disagg_offline_runtime(
         log_interval=log_interval,
         collate_fn=collate_fn,
         per_sample_transform=per_sample_transform,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
 
@@ -435,22 +412,15 @@ def build_online_runtime(
     sp_ring_size: int = 1,
     collate_fn=None,
     logger=None,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
-    """Assemble the colocated online dataflow and return
+    """Assemble the colocated online dataflow; return
     ``(trainer, loader, workers, controller, drive_rollout)``.
 
-    Mirror of :func:`build_offline_runtime`; the only difference is the *producer*
-    of ``SampleRef``s: a ``RolloutWorker`` leases ``PromptTask``s, asks the
-    ``target_model`` (any backend exposing the strategy's ``generate_*_data`` — HF,
-    SGLang, or custom; **sglang is not required**) for per-sample features via the
-    strategy's adapter, writes them to a ``mem://`` ``FeatureStore``, and commits
-    ``SampleRef``s onto the controller's ``SampleRefQueue``. From ``SampleRef``
-    down the path is identical to offline.
-
-    The returned ``drive_rollout()`` runs the workers until the prompt pool drains,
-    populating the queue the loader consumes; the launcher calls it before
-    ``trainer.fit(loader)``. ``target_head`` is ``None`` on purpose: online rollout
-    already materialized the target distribution.
+    Call ``drive_rollout()`` (runs the RolloutWorkers until the prompt pool
+    drains) before ``trainer.fit(loader)``. ``target_head`` is ``None`` on
+    purpose: online rollout already materialized the target distribution.
     """
     spec = resolve_strategy(strategy)
     # Keep colocated online on a private queue; durable online runs use the
@@ -501,6 +471,8 @@ def build_online_runtime(
         collate_fn=_online_collate(spec, collate_fn),
         per_sample_transform=None,
         durable_ack=durable_ack,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
     def drive_rollout(max_rounds: int = 100_000) -> int:
@@ -545,21 +517,12 @@ def build_disagg_online_producer(
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
-    Mirrors the producer half of :func:`build_online_runtime`, but the
-    RolloutWorkers put() into a cross-node ``feature_store`` (a consume-once
-    :class:`MooncakeFeatureStore`) and committed SampleRefs are streamed to the
-    consumer through a :class:`StreamingRefChannel` instead of an in-process queue.
-
-    ``metadata_store`` / ``metadata_db_path`` (O1.1) point the controller at the
-    *shared, durable* store the consumer also opens, so the producer's
-    ``commit_samples`` lands where the consumer reconciles on restart.
-
-    Returns ``(workers, drive_producer)``. ``drive_producer(should_stop=...)`` runs
-    the workers until the prompt pool drains, publishing refs to the channel and
-    applying backpressure (pauses while ``channel.in_flight_remote()`` exceeds
-    ``in_flight_high_watermark``), then closes the channel so the consumer's loader
-    terminates. ``should_stop`` lets the interleaved driver wind the producer down
-    once the trainer hits ``max_steps``. The channel is always closed on exit.
+    Workers put() into a cross-node ``feature_store``; committed refs stream to
+    the consumer via ``channel``. ``metadata_store``/``metadata_db_path`` must be
+    the same durable store the consumer opens. Returns ``(workers,
+    drive_producer)``: ``drive_producer(should_stop=...)`` runs until the prompt
+    pool drains, pauses above ``in_flight_high_watermark``, and always closes the
+    channel on exit (EOF terminates the consumer's loader).
     """
     import time
 
@@ -596,8 +559,7 @@ def build_disagg_online_producer(
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
                     break  # caller asked us to wind down (e.g. trainer finished)
-                # backpressure: don't let the producer outrun the consumer (and
-                # the Mooncake segment). in_flight = published - consumer-acked.
+                # backpressure: in_flight = published - consumer-acked
                 while channel.in_flight_remote() >= in_flight_high_watermark:
                     if should_stop is not None and should_stop():
                         return produced  # don't block on the watermark forever
@@ -642,23 +604,30 @@ def build_disagg_online_consumer(
     resume: bool = False,
     logger=None,
     log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
-    Trains from a streamed ``SampleRef`` channel + a consume-once
-    ``feature_store`` produced by a *different pool*. The trainer assembly is the
-    online one (``target_head=None``); refs arrive from a :class:`StreamingRefQueue`
-    over the channel rather than the in-process ``SampleRefQueue``, and features
-    are fetched cross-node from Mooncake.
-
-    ``metadata_store`` / ``metadata_db_path`` (O1.1) point the controller at the
-    *shared, durable* store the producer commits to. ``resume=True`` reconciles
-    against that store before training: already-durably-trained samples are handed
-    to the queue as ``skip_ids`` (dropped on the channel re-read); the
-    committed-but-unacked tail re-streams and re-trains. Requires a durable store.
+    Trains from a streamed ref ``channel`` + a consume-once ``feature_store``
+    produced by another pool; ``metadata_store``/``metadata_db_path`` must be the
+    durable store the producer commits to. Online resume needs BOTH knobs:
+    ``resume=True`` reconciles the durable marker (already-trained refs are
+    skipped on the channel re-read) and ``resume_from`` restores the trainer
+    state those acks correspond to. ``resume_from`` alone raises; a marker ahead
+    of the checkpoint raises (the skipped samples' weight updates were rolled
+    back — silent data loss).
     """
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
+    if resume_from and not resume:
+        raise ValueError(
+            "resume_from is set but resume is not: online resume requires BOTH — "
+            "resume=True reconciles the durable metadata store (skips "
+            "already-trained refs on the channel re-read) and resume_from restores "
+            "the trainer state those acks correspond to; a checkpoint restore "
+            "alone would re-train the whole re-streamed channel"
+        )
     spec = resolve_strategy(strategy)
     store = _resolve_metadata_store(metadata_store, metadata_db_path)
     controller = DataFlowController(run_id, metadata_store=store)
@@ -670,11 +639,23 @@ def build_disagg_online_consumer(
                 "resume=True needs a durable metadata_store/metadata_db_path; an "
                 "in-process store has no committed/ack history to reconcile against"
             )
-        # Released == durably acked AND optimizer-step committed: the samples
-        # already trained on a prior run. Skip exactly those on the channel
-        # re-read; the committed-unacked tail re-streams and re-trains.
+        # Released == durably acked AND optimizer-step committed: skip exactly
+        # those on the channel re-read; the committed-unacked tail re-trains.
         reconciled = controller.reconcile_on_restart(feature_store)
         skip_ids = set(reconciled["released"])
+        if resume_from:
+            marker_step = reconciled["global_step"]
+            ckpt_step = _checkpoint_global_step(resume_from)
+            if marker_step is not None and marker_step > ckpt_step:
+                raise RuntimeError(
+                    f"durable marker is at global_step={marker_step} but checkpoint "
+                    f"{resume_from!r} is at global_step={ckpt_step}: samples acked "
+                    f"after that checkpoint would be skipped on resume while the "
+                    f"weight updates they produced were rolled back (data loss); "
+                    f"resume from a checkpoint at step >= {marker_step} (the run's "
+                    f"latest), or start a fresh run_id + metadata store to re-train "
+                    f"from scratch"
+                )
 
     queue = StreamingRefQueue(channel, idle_timeout_s=idle_timeout_s, skip_ids=skip_ids)
     return _assemble_trainer(
@@ -701,6 +682,8 @@ def build_disagg_online_consumer(
         log_interval=log_interval,
         collate_fn=_online_collate(spec, collate_fn),
         per_sample_transform=None,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
 
@@ -715,16 +698,10 @@ def run_disagg_online_interleaved(
 ) -> int:
     """Run an online producer and the trainer CONCURRENTLY (O1.2).
 
-    The producer streams refs on a background thread while ``trainer.fit`` consumes
-    them on this thread. The consumer's :class:`StreamingRefQueue` blocks until the
-    channel is closed-and-drained, so the trainer tracks the producer instead of
-    ending the instant the stream is momentarily empty.
-
-    Shutdown is symmetric and hang-free: trainer finishes first -> ``should_stop``
-    is set so the producer stops generating; producer finishes first -> it closes
-    the channel so the loader drains the tail and ``fit`` returns; producer raises
-    -> the channel is closed so the consumer cannot hang, and the exception is
-    re-raised here once ``fit`` has unwound. Returns the trainer's final step.
+    Shutdown is symmetric and hang-free: trainer finishes -> ``should_stop`` winds
+    the producer down; producer finishes -> it closes the channel so ``fit``
+    drains the tail and returns; producer raises -> the channel is closed and the
+    exception re-raised here as root cause. Returns the trainer's final step.
     """
     import threading
 
@@ -753,9 +730,7 @@ def run_disagg_online_interleaved(
 
     producer_exc = err.get("exc")
     if thread.is_alive():
-        # The producer overran join_timeout_s and is still running: a daemon thread
-        # that would keep publishing into a store no consumer drains. Fail loudly
-        # instead of returning "success" with a leaked, still-live producer.
+        # Fail loudly rather than "succeed" while leaking a live daemon producer.
         msg = (
             f"disagg online producer did not wind down within {join_timeout_s}s of "
             "trainer exit (still alive); abandoning it would leak an active rollout"
@@ -763,9 +738,7 @@ def run_disagg_online_interleaved(
         if trainer_exc is not None:
             raise RuntimeError(msg) from trainer_exc
         raise RuntimeError(msg)
-    # A producer failure closes the channel, which is usually what makes trainer.fit
-    # fail downstream, so surface the producer exception as the root cause and chain
-    # the trainer error so neither is silently lost.
+    # A producer failure usually caused the trainer failure: producer = root cause.
     if producer_exc is not None:
         if trainer_exc is not None:
             raise producer_exc from trainer_exc
@@ -816,20 +789,25 @@ def build_disagg_online_runtime(
     join_timeout_s: Optional[float] = 30.0,
     logger=None,
     log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
 ):
     """One-process online disaggregated runtime (O1.2).
 
-    Wires the producer (rollout pool) and the consumer (FSDP trainer) over ONE
-    shared metadata store, ONE consume-once ``feature_store``, and ONE streaming-ref
-    channel (two :class:`StreamingRefChannel` views over the same path), and returns
-    ``(trainer, loader, run)``. Calling ``run()`` drives both concurrently
-    (:func:`run_disagg_online_interleaved`). Pass a ``channel`` or a
-    ``ref_channel_path``. The metadata store defaults to a shared in-process store;
-    pass ``metadata_store`` / ``metadata_db_path`` for a durable, restart-reconcilable
-    run (``resume=True`` then skips already-trained refs on the channel re-read).
+    Producer + consumer over ONE shared metadata store, ONE consume-once
+    ``feature_store``, and one streaming-ref path; returns ``(trainer, loader,
+    run)`` where ``run()`` drives both concurrently. Pass ``channel`` or
+    ``ref_channel_path``; pass ``metadata_store``/``metadata_db_path`` for a
+    durable, restart-reconcilable run (``resume=True`` + ``resume_from`` — see
+    :func:`build_disagg_online_consumer`).
     """
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
+    if resume_from and not resume:
+        raise ValueError(
+            "resume_from is set but resume is not: online resume requires both "
+            "knobs (see build_disagg_online_consumer)"
+        )
     if channel is not None:
         producer_channel = channel
         path = channel.path
@@ -838,13 +816,11 @@ def build_disagg_online_runtime(
         producer_channel = StreamingRefChannel(path)
     else:
         raise ValueError("provide either `channel` or `ref_channel_path`")
-    # The producer writes / the consumer reads through SEPARATE channel views over
-    # the same path (each holds its own read/write offset) — the same split the
-    # cross-process disagg path uses, here colocated in one process.
+    # Producer writes / consumer reads through SEPARATE channel views over one
+    # path (each holds its own offset) — the cross-process split, in one process.
     consumer_channel = StreamingRefChannel(path)
 
-    # One process: share a single metadata store instance across both halves so
-    # the producer's commits and the consumer's acks land in the same store.
+    # Both halves must share ONE store instance: commits and acks land together.
     shared_store = metadata_store
     if shared_store is None and metadata_db_path is None:
         shared_store = InMemoryMetadataStore()
@@ -895,6 +871,8 @@ def build_disagg_online_runtime(
         resume=resume,
         logger=logger,
         log_interval=log_interval,
+        resume_from=resume_from,
+        max_checkpoints=max_checkpoints,
     )
 
     def run() -> int:
@@ -909,11 +887,8 @@ def build_disagg_online_runtime(
     return trainer, loader, run
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatible names. The model used to live in the function name; it is
-# now the ``strategy=`` parameter (default "eagle3"), so these are plain aliases
-# of the strategy-neutral builders above. Existing callers are unchanged.
-# ---------------------------------------------------------------------------
+# Back-compat aliases: the model used to live in the function name; it is now
+# the ``strategy=`` parameter, so these are plain aliases.
 
 build_offline_eagle3_runtime = build_offline_runtime
 build_offline_eagle3_controller = build_offline_runtime

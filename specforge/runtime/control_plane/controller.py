@@ -276,35 +276,22 @@ class DataFlowController:
     def reconcile_on_restart(
         self, feature_store: Optional[Any] = None
     ) -> Dict[str, Any]:
-        """Rebuild queue + release state from the single durable marker.
+        """Rebuild queue + release state from the durable ``{acked, global_step,
+        optimizer_durable}`` marker; call once on a fresh controller over a
+        *durable* store after a crash.
 
-        Call once on a fresh controller backed by a *durable* metadata store
-        (e.g. ``SQLiteMetadataStore`` reopened on the same DB file) after a crash.
-        In-process lease state did not survive the crash, so release state is
-        *derived* solely from the durable ``{acked, global_step}`` marker — never
-        a separate fact that could disagree with the optimizer step.
-
-        Per ``failure_recovery.md`` (B4), each committed sample lands in one row:
-
-        | durable state                | action                              |
-        |------------------------------|-------------------------------------|
-        | acked AND step committed     | released (idempotent free)          |
-        | committed, not durably acked | replay/requeue (at-least-once)      |
-        | never committed (in-flight)  | not here; rollout retries on id     |
-
-        Re-training a leased-but-unacked sample is allowed (idempotent effects);
-        the guarantee is **no data loss** (every committed-unacked sample is
-        requeued) and **no duplicate train** (an acked+stepped sample is never
-        requeued — the exact crash window "after ack, before release" is safe
-        because the durable ack already records it as trained).
+        Committed-but-unacked samples are requeued (at-least-once; re-training an
+        unacked sample is safe). Acked samples under the optimizer-durable marker
+        are released and never requeued — trusting the marker ALONE: resuming a
+        checkpoint whose global_step is OLDER than the marker's still releases
+        samples whose weight updates that rollback discarded. That pairing is
+        data loss reconcile cannot repair; the caller must reject it (the
+        disagg-online builders raise on it).
         """
         marker = self.store.durable_marker()
         acked = marker["acked"]
-        # Release eligibility is gated on the optimizer-durable marker, NOT on a
-        # global_step scalar that the ack API leaves None by default — otherwise a
-        # durable ack with global_step omitted would force every acked sample to
-        # replay (duplicate train). (Coarse: optimizer_durable is a run-level
-        # flag; a per-sample durability column is the future refinement.)
+        # Release gates on the optimizer-durable flag, not the global_step scalar
+        # (acks may omit global_step; forcing replay then would duplicate-train).
         step_committed = bool(marker["optimizer_durable"])
         requeued: List[str] = []
         released: List[str] = []

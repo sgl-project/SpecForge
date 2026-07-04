@@ -22,6 +22,8 @@ EAGLE3 and DFlash share this lifecycle unchanged — only the strategy differs.
 
 from __future__ import annotations
 
+import itertools
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -36,16 +38,13 @@ from specforge.runtime.training.strategy import (
     StepOutput,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class Checkpoint:
-    """A saved training checkpoint location (resume target).
-
-    Deliberately NOT a published "weight version" — the published-weight
-    lifecycle (versioning, publisher, serving accept-length gate, hot update) is
-    not yet implemented. This record only says where a checkpoint is and at what
-    step.
-    """
+    """A saved training checkpoint location (resume target) — deliberately NOT a
+    published weight version (weight publication is not implemented)."""
 
     checkpoint_uri: str
     global_step: int
@@ -131,11 +130,9 @@ class TrainerCore:
 
 
 class TrainerController:
-    """Lifecycle: fit / evaluate / checkpoint. Script becomes a launcher.
-
-    Weight publishing + the serving accept-length gate are not yet implemented;
-    save_checkpoint just persists training state and returns a Checkpoint.
-    """
+    """Lifecycle: fit / evaluate / checkpoint. The training script becomes a
+    launcher; weight publishing is not implemented — ``save_checkpoint`` persists
+    resume state and returns a :class:`Checkpoint`."""
 
     def __init__(
         self,
@@ -153,38 +150,62 @@ class TrainerController:
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
         start_step: int = 0,
         start_epoch: int = 0,
+        start_batch: int = 0,
+        start_samples: int = 0,
+        checkpoint_manager: Optional[Any] = None,
+        checkpoint_extra: Optional[Dict[str, Any]] = None,
     ) -> None:
+        if (start_batch == 0) != (start_samples == 0):
+            raise ValueError(
+                f"start_batch={start_batch} and start_samples={start_samples} "
+                f"describe the same mid-epoch position and must be zero or "
+                f"nonzero together"
+            )
         self.core = core
         self.run_id = run_id
         self.output_dir = output_dir
         self.save_interval = save_interval
         self.eval_interval = eval_interval
         self.log_interval = log_interval
+        # Injected manager (rotation, best metric) or the lazy default layout.
+        self._checkpoint_mgr = checkpoint_manager
+        # Extra entries merged into the shared checkpoint payload at save
+        # (e.g. dataset_size / accumulation_steps, validated on resume).
+        self.checkpoint_extra = dict(checkpoint_extra or {})
         self.max_steps = max_steps
-        # Schedule horizon for step-dependent losses (Domino's lambda_base decay).
-        # Distinct from max_steps (an optional early-stop CAP): a run may stop early
-        # yet decay over the full planned length. Falls back to max_steps when unset;
-        # if BOTH are None a schedule-dependent strategy sees total_steps=None and
-        # decays nothing (StepContext-reading strategies must handle that).
+        # Schedule horizon for step-dependent losses (Domino's lambda_base decay);
+        # distinct from max_steps, an optional early-stop CAP. Falls back to
+        # max_steps; None means schedule-reading strategies decay nothing.
         self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
         self.logger = logger
-        # ack_fn(sample_ids, global_step): acks consumed refs at the optimizer-step
-        # boundary with the step number, so the controller records the durable
-        # {acked, global_step, optimizer marker} transaction. If None, the loader
-        # is assumed to ack (e.g. simple/equivalence runs).
+        # ack_fn(sample_ids, global_step) records the durable ack transaction at
+        # the optimizer-step boundary; None = the loader acks (simple runs).
         self.ack_fn = ack_fn
         # global_step counts OPTIMIZER steps (increments only at a grad-accum
-        # boundary), so ack / checkpoint / resume semantics are in true optimizer
-        # steps. micro_step counts forward/backward micro-batches.
+        # boundary) so ack/checkpoint/resume semantics are in true optimizer
+        # steps; micro_step counts forward/backward micro-batches.
         self.global_step = start_step
         self.micro_step = 0
         self.epoch = start_epoch
+        # Live position within the current epoch, in batches and in SAMPLES
+        # (batch-size independent, the persisted form). Nonzero at an epoch start
+        # — seeded here on resume, or left over from a mid-epoch max_steps return
+        # — makes fit() skip that prefix instead of re-training it.
+        self._epoch_batch = start_batch
+        self._epoch_samples = start_samples
         self.last_metrics: Dict[str, Any] = {}
 
     def fit(
         self, data: Iterable[TrainBatch], eval_data: Optional[Iterable] = None
     ) -> int:
+        if self.max_steps is not None and self.global_step >= self.max_steps:
+            logger.info(
+                "fit: global_step=%d already at max_steps=%d; nothing to train",
+                self.global_step,
+                self.max_steps,
+            )
+            return self.global_step
         module = self.core.strategy.trainable_module()
         module.train()
         pending_ack: List[str] = []
@@ -192,7 +213,24 @@ class TrainerController:
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
                 data.set_epoch(epoch)
-            for batch in data:
+            stream: Iterable[TrainBatch] = data
+            skip = self._epoch_batch
+            if skip:
+                if hasattr(data, "seek"):
+                    data.seek(skip)
+                else:
+                    it = iter(data)
+                    consumed = sum(1 for _ in itertools.islice(it, skip))
+                    if consumed < skip:
+                        raise ValueError(
+                            f"resume position skips past the end of the data: "
+                            f"epoch {epoch} yielded only {consumed} batches, "
+                            f"cannot skip {skip}"
+                        )
+                    stream = it
+            for batch in stream:
+                self._epoch_batch += 1
+                self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
@@ -225,6 +263,8 @@ class TrainerController:
                     self.save_checkpoint(self.global_step)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
+            self._epoch_batch = 0
+            self._epoch_samples = 0
         return self.global_step
 
     @torch.no_grad()
@@ -241,27 +281,45 @@ class TrainerController:
                     agg.setdefault(k, []).append(v)
         return {k: sum(vs) / len(vs) for k, vs in agg.items() if vs}
 
+    def _checkpoint_manager(self):
+        # Lazily built in its S-home so the runtime seam does not import the domain
+        # layer at module load (mirrors _assemble_trainer's lazy Trainer import).
+        if self._checkpoint_mgr is None:
+            from specforge.training.checkpoint import CheckpointManager
+
+            self._checkpoint_mgr = CheckpointManager(self.output_dir, self.run_id)
+        return self._checkpoint_mgr
+
     def save_checkpoint(self, step: int) -> Checkpoint:
-        ckpt_dir = os.path.join(self.output_dir, f"{self.run_id}-step{step}")
-        is_rank0 = (
-            not torch.distributed.is_initialized()
-        ) or torch.distributed.get_rank() == 0
-        full_state = self.core.backend.state_dict()
-        draft_state = self.core.strategy.checkpoint_state_filter(full_state)
-        if is_rank0:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(
-                {
-                    "draft_state_dict": draft_state,
-                    "global_step": step,
-                    "epoch": self.epoch,
-                    "strategy": self.core.strategy.name,
-                    "run_id": self.run_id,
-                },
-                os.path.join(ckpt_dir, "training_state.pt"),
-            )
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        # Every rank participates: the FSDP FULL_STATE_DICT gather is a
+        # collective, and the optimizer/RNG parts are rank-local so every rank
+        # persists its own (the manager writes the shared payload on rank0 only).
+        full = self.core.backend.state_dict()
+        mgr = self._checkpoint_manager()
+        shared = None
+        if mgr.is_rank0():
+            shared = {
+                "draft_state_dict": self.core.strategy.checkpoint_state_filter(
+                    full["model"]
+                ),
+                "global_step": step,
+                "epoch": self.epoch,
+                "epoch_batch": self._epoch_batch,
+                "epoch_samples": self._epoch_samples,
+                "strategy": self.core.strategy.name,
+                "run_id": self.run_id,
+                "world_size": (
+                    torch.distributed.get_world_size()
+                    if torch.distributed.is_initialized()
+                    else 1
+                ),
+                **self.checkpoint_extra,
+            }
+        ckpt_dir = mgr.save(
+            shared,
+            step,
+            rank_state={"optimizer": full["optimizer"], "rng": full["rng"]},
+        )
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
             global_step=step,

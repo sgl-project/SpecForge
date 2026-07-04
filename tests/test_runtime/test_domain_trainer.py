@@ -6,14 +6,9 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Phase B3 — the domain ``Trainer`` wires the seam exactly like _assemble_trainer.
-
-This verifies the *composition* (which runtime objects get built, with which
-args, and that ``.fit()`` delegates to the controller over the loader) with fakes
-in place of the FSDP/model-heavy runtime pieces — no GPU, no real model. The
-byte-identical loss gate is the full ``tests/test_runtime`` suite, which now runs
-through this Trainer because ``launch._assemble_trainer`` delegates to it.
-"""
+"""Domain ``Trainer`` wiring: which runtime seam objects get built, with which
+args, and that ``.fit()`` delegates to the controller — checked with fakes in
+place of the FSDP/model-heavy pieces (no GPU, no real model)."""
 
 import unittest
 from types import SimpleNamespace
@@ -145,6 +140,12 @@ class DomainTrainerWiringTest(unittest.TestCase):
         ack = cap["ctrl_kw"]["ack_fn"]
         ack(["s1"], 7)
         self.assertIn(("ack", "trainer-0", ["s1"], 7, True), dfc_calls)
+
+        # run identity rides the shared checkpoint payload, validated on resume
+        self.assertEqual(
+            cap["ctrl_kw"]["checkpoint_extra"],
+            {"dataset_size": 2, "accumulation_steps": 3},
+        )
 
     def test_fit_delegates_to_controller_over_loader(self):
         try:
