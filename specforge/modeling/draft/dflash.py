@@ -118,8 +118,18 @@ class Qwen3DFlashAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         attn_fn: Callable = eager_attention_forward
+        attn_kwargs = dict(kwargs)
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if self.config._attn_implementation == "flex_attention":
+            # Force the main (prefill) flex kernel. The draft's short query length
+            # (q_len < 128 with block-diffusion) otherwise routes flex_attention to
+            # its *decoding* kernel, whose autotune finds no valid Triton config for
+            # head_dim=128 -> "NoValidChoicesError ... target: flex_attention". The
+            # main kernel computes the same thing and compiles fine (verified on GPU).
+            kernel_options = dict(attn_kwargs.get("kernel_options") or {})
+            kernel_options.setdefault("FORCE_USE_FLEX_ATTENTION", True)
+            attn_kwargs["kernel_options"] = kernel_options
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -129,7 +139,7 @@ class Qwen3DFlashAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **kwargs,
+            **attn_kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
