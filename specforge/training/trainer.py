@@ -6,24 +6,13 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Domain ``Trainer``: the caller-facing training object (Phase B).
+"""Domain ``Trainer``: the caller-facing training object.
 
-``Trainer`` composes — behind one object with a ``.fit()`` — exactly what
-``launch._assemble_trainer`` wired inline before:
-
-    ref source + FeatureStore
-        -> FeatureDataLoader(transform, collate)              (the data path)
-    model + spec.make_strategy
-        -> FSDPTrainingBackend.prepare_model (FSDP wrap)
-        -> TrainerCore -> TrainerController                    (the trainer seam)
-
-The runtime seam (``TrainerController`` / ``TrainerCore`` /
-``DraftTrainStrategy`` / ``FSDPTrainingBackend``) is byte-for-byte unchanged —
-this is the domain facade over it, so ``launch._assemble_trainer`` now delegates
-here (one wiring path, no fork). The online / offline / disaggregated distinction
-is invisible to ``Trainer``: it is fully absorbed by the (ref source +
-``FeatureStore``) it is handed, behind ``FeatureDataLoader -> TrainBatch``. There
-is NO ``HiddenStateStream`` — the loader is the stream.
+Composes (ref source + FeatureStore) -> FeatureDataLoader (the data path) and
+model + spec.make_strategy -> FSDPTrainingBackend -> TrainerCore ->
+TrainerController (the trainer seam) behind one object with a ``.fit()``.
+Online / offline / disaggregated is invisible here: it is fully absorbed by the
+ref source + store the Trainer is handed — the loader IS the stream.
 """
 
 from __future__ import annotations
@@ -34,6 +23,7 @@ from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.runtime.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.runtime.training.registry import StrategySpec, resolve_strategy
 from specforge.runtime.training.trainer import TrainerController, TrainerCore
+from specforge.training.checkpoint import CheckpointManager
 
 
 class Trainer:
@@ -66,16 +56,19 @@ class Trainer:
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
+        resume_from: Optional[str] = None,
+        max_checkpoints: int = 0,
     ):
-        # Offline = a fixed, re-iterable ref set: record committed state so the ack
-        # lookup works (num_epochs > 1 then re-iterates). Online streams refs through
-        # a queue and commits them elsewhere (rollout / channel).
+        # durable_ack off (local_colocated): no durable ack transaction — the
+        # loader releases each feature as it consumes it — so the offline enqueue
+        # is skipped too (nothing acks or reads that queue).
         if "refs" in ref_source:
             if durable_ack:
                 controller.enqueue_offline_refs(ref_source["refs"])
             else:
                 from specforge.runtime.contracts import assert_no_tensors
 
+                # metadata-only contract still holds for refs entering the trainer
                 for ref in ref_source["refs"]:
                     assert_no_tensors(ref)
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
@@ -89,6 +82,67 @@ class Trainer:
             strategy=spec.name,
         )
 
+        dataset_size = len(ref_source["refs"]) if "refs" in ref_source else None
+        # Resume: draft weights load BEFORE the FSDP wrap so the optimizer's fp32
+        # masters (cloned at build) start from them; this rank's own optimizer/RNG
+        # shard (``state['backend']``) loads after the wrap builds the optimizer.
+        resume = None
+        if resume_from:
+            state = CheckpointManager.read_resume_state(resume_from)
+            saved_strategy = state.get("strategy")
+            if saved_strategy != spec.name:
+                raise ValueError(
+                    f"checkpoint {resume_from} was written by strategy "
+                    f"{saved_strategy!r}; this run trains {spec.name!r}"
+                )
+            for key, current in (
+                ("dataset_size", dataset_size),
+                ("accumulation_steps", accumulation_steps),
+            ):
+                persisted = state.get(key)
+                if persisted is not None and persisted != current:
+                    raise ValueError(
+                        f"checkpoint {resume_from} was written with "
+                        f"{key}={persisted} but this run has {key}={current}; "
+                        f"resume with the original configuration"
+                    )
+            saved_weights = state["draft_state_dict"]
+            load_result = model.draft_model.load_state_dict(
+                saved_weights, strict=False
+            )
+            loaded = len(saved_weights) - len(load_result.unexpected_keys)
+            # strict=False must not degrade into loading nothing silently.
+            if load_result.unexpected_keys or loaded == 0:
+                raise ValueError(
+                    f"checkpoint {resume_from} draft weights do not match this "
+                    f"model: {loaded}/{len(saved_weights)} keys loaded, "
+                    f"unexpected={sorted(load_result.unexpected_keys)}"
+                )
+            # Mid-epoch position persists in SAMPLES (batch-size independent);
+            # only an offline (refs) stream can be repositioned, and a batch-size
+            # drift that does not divide the count fails fast (a silent mis-seek
+            # would skip or re-train data).
+            start_batch = start_samples = 0
+            if "refs" in ref_source:
+                samples = state.get("epoch_samples", 0)
+                if samples % batch_size:
+                    raise ValueError(
+                        f"checkpoint {resume_from} stopped mid-epoch after "
+                        f"{samples} samples, which is not a whole number of "
+                        f"batches at batch_size={batch_size}; resume with the "
+                        f"batch size the checkpoint was written with"
+                    )
+                start_batch, start_samples = samples // batch_size, samples
+            resume = {
+                "backend": state["backend"],
+                "global_step": state["global_step"],
+                "epoch": state.get("epoch", 0),
+                "epoch_batch": start_batch,
+                "epoch_samples": start_samples,
+            }
+            # drop the full draft state before the wrap
+            del state, saved_weights
+
         parallel = ParallelConfig.from_distributed(
             tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
         )
@@ -97,6 +151,8 @@ class Trainer:
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+        if resume is not None:
+            backend.load_state_dict(resume["backend"])
         strategy = spec.make_strategy(wrapped, target_head=target_head)
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
         ack_fn = None
@@ -119,10 +175,21 @@ class Trainer:
             log_interval=log_interval,
             logger=logger,
             ack_fn=ack_fn,
+            checkpoint_manager=CheckpointManager(
+                output_dir, run_id, max_checkpoints=max_checkpoints
+            ),
+            checkpoint_extra={
+                "dataset_size": dataset_size,
+                "accumulation_steps": accumulation_steps,
+            },
+            start_step=resume["global_step"] if resume else 0,
+            start_epoch=resume["epoch"] if resume else 0,
+            start_batch=resume["epoch_batch"] if resume else 0,
+            start_samples=resume["epoch_samples"] if resume else 0,
         )
 
-        # The runtime pieces, exposed for callers that still want them directly
-        # (and for launch._assemble_trainer's (controller, loader) tuple).
+        # Runtime pieces exposed for direct callers (and for
+        # launch._assemble_trainer's (controller, loader) tuple).
         self.spec = spec
         self.dataflow_controller = controller
         self.trainer_id = trainer_id

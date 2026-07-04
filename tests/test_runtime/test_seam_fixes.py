@@ -125,7 +125,11 @@ class _FakeBackend(TrainingBackend):
         return torch.tensor(1.0)
 
     def state_dict(self):
-        return {"draft_model.w": self.model.w.detach().clone()}
+        return {
+            "model": {"draft_model.w": self.model.w.detach().clone()},
+            "optimizer": None,
+            "rng": {},
+        }
 
     def load_state_dict(self, state):
         pass
