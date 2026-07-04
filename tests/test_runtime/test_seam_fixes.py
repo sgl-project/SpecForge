@@ -13,9 +13,9 @@ import torch.nn as nn
 
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
-from specforge.runtime.training.backend import ParallelConfig, TrainingBackend
-from specforge.runtime.training.strategy import DFlashTrainStrategy
-from specforge.runtime.training.trainer import TrainerController, TrainerCore
+from specforge.training.backend import ParallelConfig, TrainingBackend
+from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.strategies.base import DFlashTrainStrategy
 
 
 def _ref(i):

@@ -146,8 +146,8 @@ class PhaseBLossReproducibilityTest(unittest.TestCase):
             AutoEagle3DraftModel,
             OnlineEagle3Model,
         )
+        from specforge.launch import build_online_runtime
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.launch import build_online_runtime
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port=port)
