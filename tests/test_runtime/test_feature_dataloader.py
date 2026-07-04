@@ -36,6 +36,18 @@ def _simple_collate(features):
     return {k: torch.cat([f[k] for f in features], dim=0) for k in keys}
 
 
+class _CountingStore(LocalFeatureStore):
+    """LocalFeatureStore that counts get() calls (seek must not materialize)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gets = 0
+
+    def get(self, sample_ref, *, device="cpu", names=None):
+        self.gets += 1
+        return super().get(sample_ref, device=device, names=names)
+
+
 class TestFeatureDataLoader(unittest.TestCase):
     def _write_offline_files(self, d, n=4, seq=8, h=4, aux=12):
         for i in range(n):
@@ -132,6 +144,93 @@ class TestFeatureDataLoader(unittest.TestCase):
             epoch2 = [b.sample_ids for b in loader]
             self.assertEqual(len(epoch1), 2)
             self.assertEqual(epoch1, epoch2)  # same fixed set each epoch
+
+    def test_seek_repositions_next_pass_only(self):
+        # resume: seek(k) skips the first k batches of the NEXT pass without
+        # materializing them, then later epochs iterate in full again.
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=6)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                refs=refs,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=_offline_eagle3_process_data,
+            )
+            full = [b.sample_ids for b in loader]
+            self.assertEqual(len(full), 3)
+            loader.seek(2)
+            self.assertEqual([b.sample_ids for b in loader], full[2:])
+            # one-shot: consumed by that pass, the next epoch is full again
+            self.assertEqual([b.sample_ids for b in loader], full)
+            # a queue stream has no position to restore
+            q = SampleRefQueue()
+            qloader = FeatureDataLoader(
+                LocalFeatureStore("st2"), q, collate_fn=_simple_collate
+            )
+            with self.assertRaises(ValueError):
+                qloader.seek(1)
+
+    def test_seek_past_end_raises(self):
+        # a resume position beyond the dataset must fail loudly, not yield a
+        # silent empty epoch; skip == available (fully consumed epoch) is fine.
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=6)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                refs=refs,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=_offline_eagle3_process_data,
+            )
+            with self.assertRaisesRegex(ValueError, "skips past the end of the data"):
+                loader.seek(4)  # 6 refs / batch 2 = 3 batches
+            loader.seek(3)  # boundary: allowed, next pass yields nothing
+            self.assertEqual(list(loader), [])
+            self.assertEqual(len(list(loader)), 3)  # one-shot, epoch after is full
+
+    def test_seek_bound_counts_partial_batch_without_drop_last(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=5)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                refs=refs,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=_offline_eagle3_process_data,
+                drop_last=False,
+            )
+            loader.seek(3)  # ceil(5/2) = 3: the trailing partial batch counts
+            with self.assertRaisesRegex(ValueError, "skips past the end of the data"):
+                loader.seek(4)
+
+    def test_seek_does_not_materialize_skipped_refs(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=6)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            store = _CountingStore("st")
+            transform_calls = []
+
+            def counting_transform(raw):
+                transform_calls.append(1)
+                return _offline_eagle3_process_data(raw)
+
+            loader = FeatureDataLoader(
+                store,
+                refs=refs,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=counting_transform,
+            )
+            loader.seek(2)
+            batches = list(loader)
+        self.assertEqual(len(batches), 1)
+        # only the yielded batch's 2 refs are fetched/transformed
+        self.assertEqual(store.gets, 2)
+        self.assertEqual(len(transform_calls), 2)
 
     def test_requires_exactly_one_source(self):
         store = LocalFeatureStore("st")
