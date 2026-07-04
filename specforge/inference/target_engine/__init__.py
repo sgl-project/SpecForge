@@ -2,6 +2,16 @@
 """Target engines: the backend-agnostic capture surface (TargetEngine + factory)."""
 
 from .base import KNOWN_BACKENDS, TargetEngine
+from .capture_policy import (
+    CAPTURE_POLICIES,
+    CapturePolicy,
+    CaptureSpec,
+    DFlashCapturePolicy,
+    Eagle3CapturePolicy,
+    register_capture_policy,
+    resolve_capture_policy,
+)
+from .custom import CustomTargetEngine
 from .eagle3_target_model import (
     CustomEagle3TargetEngine,
     CustomEagle3TargetModel,
@@ -15,12 +25,26 @@ from .eagle3_target_model import (
     get_eagle3_target_model,
 )
 from .factory import available_target_engines, get_target_engine
+from .hf import HFTargetEngine
+from .sglang import SGLangTargetEngine
 
 __all__ = [
     "TargetEngine",
     "KNOWN_BACKENDS",
     "get_target_engine",
     "available_target_engines",
+    # Capture policies (per-algorithm axis of the engine matrix)
+    "CaptureSpec",
+    "CapturePolicy",
+    "Eagle3CapturePolicy",
+    "DFlashCapturePolicy",
+    "CAPTURE_POLICIES",
+    "register_capture_policy",
+    "resolve_capture_policy",
+    # Generic per-backend engines (policy-parameterized)
+    "HFTargetEngine",
+    "SGLangTargetEngine",
+    "CustomTargetEngine",
     "Eagle3TargetEngine",
     "SGLangEagle3TargetEngine",
     "HFEagle3TargetEngine",
