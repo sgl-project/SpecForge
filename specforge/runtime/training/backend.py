@@ -134,7 +134,7 @@ class TrainingBackend(abc.ABC):
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
     @abc.abstractmethod
-    def backward(self, loss: torch.Tensor) -> None: ...
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None: ...
 
     @abc.abstractmethod
     def step(self) -> Optional[torch.Tensor]: ...
@@ -210,8 +210,16 @@ class FSDPTrainingBackend(TrainingBackend):
     def set_optimizer(self, optimizer) -> None:
         self.optimizer = optimizer
 
-    def backward(self, loss: torch.Tensor) -> None:
-        loss.backward()
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
+        """Backward one micro-step. FSDP reduce-scatters grads on every backward,
+        so non-boundary micro-steps run under ``no_sync()`` and the boundary
+        backward reduces the accumulated sum once — identical math, one
+        collective per optimizer step."""
+        if is_boundary or not self._wrapped:
+            loss.backward()
+        else:
+            with self.module.no_sync():
+                loss.backward()
 
     def step(self) -> Optional[torch.Tensor]:
         """Optimizer step + the distributed grad-norm reduction (run_backward_and_update)."""

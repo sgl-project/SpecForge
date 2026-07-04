@@ -117,7 +117,7 @@ class _FakeBackend(TrainingBackend):
         self.module = model
         return model
 
-    def backward(self, loss):
+    def backward(self, loss, *, is_boundary=True):
         loss.backward()
 
     def step(self):

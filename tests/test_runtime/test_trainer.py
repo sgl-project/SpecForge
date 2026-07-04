@@ -48,12 +48,14 @@ class FakeBackend(TrainingBackend):
         self.model = model
         self.steps = 0
         self.backwards = 0
+        self.boundaries = []  # is_boundary flag per backward (the no_sync gate)
 
     def prepare_model(self, model):
         return model
 
-    def backward(self, loss):
+    def backward(self, loss, *, is_boundary=True):
         self.backwards += 1
+        self.boundaries.append(is_boundary)
         loss.backward()
 
     def step(self):
@@ -87,6 +89,8 @@ class TestTrainerCore(unittest.TestCase):
         self.assertIsNotNone(m1.grad_norm)
         self.assertEqual(backend.steps, 1)
         self.assertEqual(backend.backwards, 2)
+        # boundary known BEFORE backward so the backend can no_sync micro-steps
+        self.assertEqual(backend.boundaries, [False, True])
 
     def test_validate_batch_missing_feature(self):
         strat = FakeStrategy()
