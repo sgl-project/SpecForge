@@ -6,7 +6,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Generic custom-backend target engine, parameterized by a CapturePolicy.
+"""Generic custom-backend target engine, parameterized by a TargetCapturePolicy.
 
 The custom backend loads architectures through ``AutoDistributedTargetModel``
 (SpecForge's own model implementations with a bespoke inference plan). Only
@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from .base import TargetEngine
-from .capture_policy import CapturePolicy, resolve_capture_policy
+from .target_capture_policy import TargetCapturePolicy, resolve_target_capture_policy
 
 
 class CustomTargetEngine(TargetEngine):
@@ -29,7 +29,7 @@ class CustomTargetEngine(TargetEngine):
 
     backend = "custom"
 
-    def __init__(self, model: nn.Module, policy: CapturePolicy):
+    def __init__(self, model: nn.Module, policy: TargetCapturePolicy):
         self.model = model
         self.policy = policy
         self.capture_layers: Optional[List[int]] = None
@@ -42,13 +42,13 @@ class CustomTargetEngine(TargetEngine):
         device: Optional[str] = None,
         cache_dir: Optional[str] = None,
         *,
-        policy: "CapturePolicy | str" = "eagle3",
+        policy: "TargetCapturePolicy | str" = "eagle3",
         **kwargs,
     ) -> "CustomTargetEngine":
         from specforge.modeling.auto import AutoDistributedTargetModel
 
         if isinstance(policy, str):
-            policy = resolve_capture_policy(policy)
+            policy = resolve_target_capture_policy(policy)
         model = AutoDistributedTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,

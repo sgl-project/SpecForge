@@ -1,13 +1,23 @@
 # coding=utf-8
-"""SGLangAdapter batches the engine call by sequence length (CPU, fake target)."""
+"""PolicyFeatureAdapter batches the engine call by sequence length (CPU, fake target)."""
 
 import types
 import unittest
 
 import torch
 
+from specforge.inference.adapters.dflash import DFlashAdapter
 from specforge.inference.adapters.eagle3 import SGLangAdapter
-from specforge.inference.capture import CaptureConfig
+from specforge.inference.adapters.policy import (
+    DFLASH_FEATURE_SCHEMA,
+    EAGLE3_FEATURE_SCHEMA,
+    PolicyFeatureAdapter,
+)
+from specforge.inference.capture import FeatureContract
+from specforge.inference.target_engine.target_capture_policy import (
+    DFlashTargetOutput,
+    Eagle3TargetOutput,
+)
 from specforge.runtime.contracts import PromptTask
 
 H, V = 4, 16
@@ -17,7 +27,8 @@ class FakeTarget:
     """Records each capture() call's batch size; encodes the first token id into
     hidden_states so per-sample slicing can be verified. Mirrors the TargetEngine
     contract the adapter now speaks: capture() dispatches to generate_eagle3_data
-    (the back-compat method), exactly like the real engine."""
+    (the back-compat method) and returns the typed TargetCaptureBatch, exactly
+    like the real engine."""
 
     aux_hidden_states_layers = [1, 2, 3]
 
@@ -37,19 +48,19 @@ class FakeTarget:
     ):
         G, L = input_ids.shape
         self.call_batch_sizes.append(G)
-        o = types.SimpleNamespace()
-        o.input_ids = input_ids
-        o.attention_mask = attention_mask
-        o.loss_mask = loss_mask.unsqueeze(-1)
         first_tok = input_ids[:, :1].float()  # (G,1)
-        o.hidden_states = first_tok.unsqueeze(-1).expand(G, L, 3 * H).clone()
-        o.target = torch.zeros(G, L, V)
-        return o
+        return Eagle3TargetOutput(
+            hidden_states=first_tok.unsqueeze(-1).expand(G, L, 3 * H).clone(),
+            target=torch.zeros(G, L, V),
+            loss_mask=loss_mask.unsqueeze(-1),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
 
 
 class TestAdapterBatching(unittest.TestCase):
     def _capture(self):
-        return CaptureConfig.from_strategy(
+        return FeatureContract.from_strategy(
             required_features={
                 "input_ids",
                 "attention_mask",
@@ -88,7 +99,7 @@ class TestAdapterBatching(unittest.TestCase):
     def test_rejects_unimplemented_target_repr(self):
         # the online adapter must only advertise reprs it implements
         adapter = SGLangAdapter(FakeTarget(), device="cpu")
-        cap = CaptureConfig.from_strategy(
+        cap = FeatureContract.from_strategy(
             required_features={
                 "input_ids",
                 "attention_mask",
@@ -104,6 +115,76 @@ class TestAdapterBatching(unittest.TestCase):
         task = PromptTask("t0", "r", "s", {"input_ids": [1, 2, 3, 4]}, 4)
         with self.assertRaises(NotImplementedError):
             adapter.generate_features([task], capture=cap)
+
+    def test_rejects_untyped_capture_output(self):
+        # the adapter accepts only a typed TargetCaptureBatch from the engine
+        class UntypedTarget(FakeTarget):
+            def capture(self, input_ids, attention_mask, loss_mask, **kwargs):
+                return types.SimpleNamespace(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    loss_mask=loss_mask,
+                    hidden_states=torch.zeros(1),
+                    target=torch.zeros(1),
+                )
+
+        adapter = SGLangAdapter(UntypedTarget(), device="cpu")
+        task = PromptTask("t0", "r", "s", {"input_ids": [1, 2, 3, 4]}, 4)
+        with self.assertRaises(TypeError):
+            adapter.generate_features([task], capture=self._capture())
+
+
+class TestPolicyFeatureAdapterSchemas(unittest.TestCase):
+    """One adapter, two schemas: the subclasses only pin the FeatureSchema."""
+
+    def test_subclasses_pin_the_canonical_schemas(self):
+        self.assertIsInstance(
+            SGLangAdapter(FakeTarget(), device="cpu"), PolicyFeatureAdapter
+        )
+        self.assertIs(
+            SGLangAdapter(FakeTarget(), device="cpu").schema, EAGLE3_FEATURE_SCHEMA
+        )
+        self.assertIs(
+            DFlashAdapter(FakeTarget(), device="cpu").schema, DFLASH_FEATURE_SCHEMA
+        )
+
+    def test_dflash_schema_shapes_the_dict(self):
+        class FakeDFlashTarget:
+            def __init__(self):
+                self.capture_kwargs = []
+
+            def capture(self, input_ids, attention_mask, loss_mask, **kwargs):
+                self.capture_kwargs.append(kwargs)
+                G, L = input_ids.shape
+                first_tok = input_ids[:, :1].float()
+                return DFlashTargetOutput(
+                    hidden_states=first_tok.unsqueeze(-1).expand(G, L, 2 * H).clone(),
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    loss_mask=loss_mask,
+                )
+
+        target = FakeDFlashTarget()
+        adapter = DFlashAdapter(target, device="cpu")
+        cap = FeatureContract.from_strategy(
+            required_features={"input_ids", "hidden_states", "loss_mask"},
+            aux_hidden_state_layer_ids=(),
+            target_repr=None,
+            target_hidden_size=H,
+        )
+        tasks = [
+            PromptTask("t0", "r", "s", {"input_ids": [10, 11, 12]}, 3),
+            PromptTask("t1", "r", "s", {"input_ids": [20, 21, 22, 23]}, 4),
+        ]
+        feats = adapter.generate_features(tasks, capture=cap)
+        self.assertEqual(len(feats), 2)
+        for f in feats:
+            # exact DFlash schema: no target, no attention_mask, no aux record
+            self.assertEqual(set(f), {"input_ids", "hidden_states", "loss_mask"})
+        self.assertEqual(int(feats[0]["hidden_states"][0, 0, 0]), 10)
+        self.assertEqual(int(feats[1]["hidden_states"][0, 0, 0]), 20)
+        # DFlash engines' capture() does not take shard_returns; never passed
+        self.assertTrue(all(kw == {} for kw in target.capture_kwargs))
 
 
 if __name__ == "__main__":
