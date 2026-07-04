@@ -58,9 +58,7 @@ class TestLayoutAndAtomicity(unittest.TestCase):
             f for _, _, files in os.walk(out) for f in files if f.endswith(".tmp")
         ]
         self.assertEqual(leftovers, [], "atomic writes must not leave .tmp files")
-        self.assertTrue(
-            os.path.isfile(os.path.join(mgr.checkpoint_dir(2), STATE_FILE))
-        )
+        self.assertTrue(os.path.isfile(os.path.join(mgr.checkpoint_dir(2), STATE_FILE)))
 
     def test_latest_requires_symlink_and_shadow_is_repaired(self):
         from specforge.training.checkpoint import STATE_FILE
@@ -205,7 +203,9 @@ class TestBestMeta(unittest.TestCase):
     def test_wrong_run_id_ignored(self):
         out, meta = self._seeded()
         with open(meta, "w") as fh:
-            json.dump({"run_id": "other", "metric": METRIC, "step": 1, "score": 5.0}, fh)
+            json.dump(
+                {"run_id": "other", "metric": METRIC, "step": 1, "score": 5.0}, fh
+            )
         self._assert_blind(out)
 
     def test_wrong_metric_ignored(self):

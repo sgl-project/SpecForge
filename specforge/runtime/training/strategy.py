@@ -201,8 +201,7 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         return {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
-            if "draft_model." in k
-            and not (embed_frozen and "embed" in k.lower())
+            if "draft_model." in k and not (embed_frozen and "embed" in k.lower())
         }
 
 
