@@ -92,16 +92,168 @@ own dump).
 
 ## Reproduction
 
-Experiment kit (launchers, patches, drivers, parser) lives at `/root/exp/expkit`
-on the pod. Per-run shape:
+The full experiment kit (launchers, dumpers, patch scripts, drivers, parser,
+draft configs) is committed next to this report in
+[`scripts/e2e-qwen05b/`](scripts/e2e-qwen05b/). Layout on the test node:
+`$EXP=/root/exp`, `$EXP/sf-main` = main checkout, `$EXP/sf-ours` = this PR's
+head; launchers are copied into each tree's `scripts/` so they can reuse the
+native model/data builders. Every run is
+`CUDA_VISIBLE_DEVICES=<gpu> torchrun --rdzv-backend c10d --rdzv-endpoint
+localhost:<port> --nnodes 1 --nproc_per_node 1 <script> <args>` with
+`PYTHONPATH=<tree>` and `FLASHINFER_DISABLE_VERSION_CHECK=1`.
+
+### 0. One-time setup
 
 ```bash
-# ours, any cell: topology/mode via env, native arg parsers untouched
-EXP_MODE=online|offline EXP_TOPO=colo|disagg|disagg2p [EXP_ROLE=producer|consumer] \
-EXP_PROMPTS_FROM=dump:<e3-hs>|jsonl:<df_tokens> \
-CUDA_VISIBLE_DEVICES=<g> torchrun --rdzv-backend c10d --rdzv-endpoint localhost:<p> \
-  --nnodes 1 --nproc_per_node 1 exp_{eagle3,dflash}_dataflow.py <shared args>
+# experiment-only patches, applied IDENTICALLY where noted so they cancel out
+python patch_main.py      $EXP/sf-main   # per-step "CURVE step= loss=" prints; EXP_MAX_STEPS/EXP_TOTAL_STEPS for dflash (main has no --max-num-steps there)
+python patch_noshuffle.py $EXP/sf-main   # train-loader shuffle=False (step alignment)
+python patch_noshuffle.py $EXP/sf-ours
 
-# main baselines: scripts/train_eagle3.py / scripts/train_dflash.py with the
-# same shared args (+ print-only per-step CURVE patch, shuffle=False patch)
+# model + raw data
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-0.5B-Instruct')"
+cd $EXP/sf-main && python scripts/prepare_data.py --dataset sharegpt --output-path $EXP/data --sample-size 3000
+
+# untied sharded model copy for the OFFLINE eagle3 runs (TargetHead needs an
+# explicit lm_head.weight in a *.index.json; Qwen2.5-0.5B is single-file + tied)
+python - <<'PY'
+import torch, torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+src, dst = 'Qwen/Qwen2.5-0.5B-Instruct', '/root/exp/models/qwen2.5-0.5b-untied'
+m = AutoModelForCausalLM.from_pretrained(src, torch_dtype=torch.bfloat16)
+w = m.get_output_embeddings().weight
+head = nn.Linear(w.shape[1], w.shape[0], bias=False); head.weight = nn.Parameter(w.detach().clone())
+m.config.tie_word_embeddings = False; m.set_output_embeddings(head)
+m.save_pretrained(dst, max_shard_size='300MB'); AutoTokenizer.from_pretrained(src).save_pretrained(dst)
+PY
+
+# keep only jsonl rows BOTH branches render identically (see finding 1);
+# run render_stats.py once per tree, then intersect
+cd $EXP/sf-ours/scripts && EXP_STATS_OUT=$EXP/data/stats_ours.json PYTHONPATH=$EXP/sf-ours \
+  CUDA_VISIBLE_DEVICES=0 torchrun --rdzv-backend c10d --rdzv-endpoint localhost:29430 --nnodes 1 --nproc_per_node 1 \
+  render_stats.py --target-model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --draft-model-config $EXP/configs/qwen2.5-0.5b-eagle3.json \
+  --train-data-path $EXP/data/sharegpt_train.jsonl --chat-template qwen \
+  --max-length 512 --batch-size 1 --seed 0 --num-epochs 1 --output-dir $EXP/out/stats
+cd $EXP/sf-main/scripts && EXP_STATS_OUT=$EXP/data/stats_main.json PYTHONPATH=$EXP/sf-main \
+  CUDA_VISIBLE_DEVICES=0 torchrun ...same args... render_stats.py ...
+python intersect_filter.py   # -> $EXP/data/sharegpt_final.jsonl (150 rows)
+```
+
+> Caching gotcha: HF `datasets` and the trees' `./cache` key on the data file
+> *path*, not content — when regenerating the jsonl, use a NEW filename and
+> `rm -rf ~/.cache/huggingface/datasets <tree>/cache <tree>/scripts/cache`.
+
+### 1. Shared feature dumps
+
+```bash
+# EAGLE3 offline hidden states (HF forward; consumed by main-offline AND ours-offline)
+cd $EXP/sf-main/scripts
+EXP_HS_PATH=$EXP/dumps/e3-hs EXP_NUM_SAMPLES=130 PYTHONPATH=$EXP/sf-main \
+CUDA_VISIBLE_DEVICES=0 torchrun --rdzv-backend c10d --rdzv-endpoint localhost:29431 --nnodes 1 --nproc_per_node 1 \
+  exp_dump_e3_hs.py --target-model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --draft-model-config $EXP/configs/qwen2.5-0.5b-eagle3.json \
+  --train-data-path $EXP/data/sharegpt_final.jsonl --chat-template qwen \
+  --max-length 512 --batch-size 1 --seed 0 --num-epochs 1 --output-dir $EXP/out/e3-dump
+
+# main's dflash token render (so ours consumes identical tokens)
+EXP_TOKENS_OUT=$EXP/data/df_tokens.jsonl PYTHONPATH=$EXP/sf-main \
+CUDA_VISIBLE_DEVICES=0 torchrun --rdzv-backend c10d --rdzv-endpoint localhost:29440 --nnodes 1 --nproc_per_node 1 \
+  dump_df_tokens.py $DF_ARGS --output-dir $EXP/out/df-tokens
+
+# dflash offline features from those tokens (ours capture)
+cd $EXP/sf-ours/scripts
+EXP_MODE=dump EXP_HS_PATH=$EXP/dumps/dflash-hs EXP_MAX_PROMPTS=130 \
+EXP_PROMPTS_FROM=jsonl:$EXP/data/df_tokens.jsonl PYTHONPATH=$EXP/sf-ours \
+CUDA_VISIBLE_DEVICES=0 torchrun --rdzv-backend c10d --rdzv-endpoint localhost:29441 --nnodes 1 --nproc_per_node 1 \
+  exp_dflash_dataflow.py $DF_ARGS --output-dir $EXP/out/df-dump
+```
+
+### 2. The 11-run matrix (`run_rerun7.sh` runs these in GPU-parallel waves)
+
+```bash
+E3_ARGS="--target-model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --draft-model-config $EXP/configs/qwen2.5-0.5b-eagle3.json \
+  --train-data-path $EXP/data/sharegpt_final.jsonl \
+  --chat-template qwen --max-length 512 --batch-size 1 --learning-rate 1e-4 \
+  --ttt-length 7 --seed 0 --num-epochs 1 --max-num-steps 100 --total-steps 10000 \
+  --target-model-backend hf"
+DF_ARGS="--target-model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --draft-config-path $EXP/configs/qwen2.5-0.5b-dflash.json \
+  --train-data-path $EXP/data/sharegpt_final.jsonl \
+  --chat-template qwen --max-length 512 --batch-size 1 --learning-rate 6e-4 \
+  --seed 0 --num-epochs 1 --mask-token-id 151669 --target-model-backend hf \
+  --log-interval 1 --save-interval 1000000"
+UNTIED=/root/exp/models/qwen2.5-0.5b-untied
+
+# --- main baselines (cwd $EXP/sf-main, PYTHONPATH=$EXP/sf-main) ---
+scripts/train_eagle3.py $E3_ARGS --output-dir $EXP/out/main-e3-online
+scripts/train_eagle3.py $E3_ARGS --target-model-path $UNTIED \
+  --train-hidden-states-path $EXP/dumps/e3-hs --output-dir $EXP/out/main-e3-offline
+EXP_MAX_STEPS=100 EXP_TOTAL_STEPS=1000 \
+  scripts/train_dflash.py $DF_ARGS --output-dir $EXP/out/main-df-online
+# (main has no offline dflash mode)
+
+# --- ours (cwd $EXP/sf-ours/scripts, PYTHONPATH=$EXP/sf-ours) ---
+# eagle3 online: colocate / disagg
+EXP_TOPO=colo   EXP_MAX_PROMPTS=130 EXP_PROMPTS_FROM=dump:$EXP/dumps/e3-hs \
+  exp_eagle3_dataflow.py $E3_ARGS --output-dir $EXP/out/ours-e3-online-colo
+EXP_TOPO=disagg EXP_MAX_PROMPTS=130 EXP_PROMPTS_FROM=dump:$EXP/dumps/e3-hs \
+  EXP_STORE_ROOT=$EXP/store \
+  exp_eagle3_dataflow.py $E3_ARGS --output-dir $EXP/out/ours-e3-online-disagg
+# eagle3 offline: colocate / disagg
+EXP_TOPO=colo   exp_eagle3_dataflow.py $E3_ARGS --target-model-path $UNTIED \
+  --train-hidden-states-path $EXP/dumps/e3-hs --output-dir $EXP/out/ours-e3-offline-colo
+EXP_TOPO=disagg EXP_STORE_ROOT=$EXP/store \
+  exp_eagle3_dataflow.py $E3_ARGS --target-model-path $UNTIED \
+  --train-hidden-states-path $EXP/dumps/e3-hs --output-dir $EXP/out/ours-e3-offline-disagg
+# dflash online: colocate / disagg
+EXP_MODE=online EXP_TOPO=colo   EXP_MAX_PROMPTS=130 EXP_MAX_STEPS=100 EXP_TOTAL_STEPS=1000 \
+  EXP_PROMPTS_FROM=jsonl:$EXP/data/df_tokens.jsonl \
+  exp_dflash_dataflow.py $DF_ARGS --output-dir $EXP/out/ours-df-online-colo
+EXP_MODE=online EXP_TOPO=disagg EXP_MAX_PROMPTS=130 EXP_MAX_STEPS=100 EXP_TOTAL_STEPS=1000 \
+  EXP_PROMPTS_FROM=jsonl:$EXP/data/df_tokens.jsonl EXP_STORE_ROOT=$EXP/store \
+  exp_dflash_dataflow.py $DF_ARGS --output-dir $EXP/out/ours-df-online-disagg
+# dflash offline: colocate / disagg
+EXP_MODE=offline EXP_TOPO=colo   EXP_HS_PATH=$EXP/dumps/dflash-hs EXP_MAX_STEPS=100 EXP_TOTAL_STEPS=1000 \
+  EXP_PROMPTS_FROM=jsonl:$EXP/data/df_tokens.jsonl \
+  exp_dflash_dataflow.py $DF_ARGS --output-dir $EXP/out/ours-df-offline-colo
+EXP_MODE=offline EXP_TOPO=disagg EXP_HS_PATH=$EXP/dumps/dflash-hs EXP_MAX_STEPS=100 EXP_TOTAL_STEPS=1000 \
+  EXP_PROMPTS_FROM=jsonl:$EXP/data/df_tokens.jsonl EXP_STORE_ROOT=$EXP/store \
+  exp_dflash_dataflow.py $DF_ARGS --output-dir $EXP/out/ours-df-offline-disagg
+```
+
+### 3. Two-process disagg placement (`run_2proc.sh`)
+
+```bash
+# eagle3 online: inference pool (GPU0) || trainer pool (GPU1), CONCURRENT
+EXP_TOPO=disagg2p EXP_ROLE=producer EXP_STORE_ROOT=$EXP/store2p EXP_DB=$EXP/store2p/e3-online.db \
+  EXP_MAX_PROMPTS=130 EXP_PROMPTS_FROM=dump:$EXP/dumps/e3-hs \
+  CUDA_VISIBLE_DEVICES=0 torchrun ... exp_eagle3_dataflow.py $E3_ARGS --output-dir $EXP/out/e3-2p-prod
+EXP_TOPO=disagg2p EXP_ROLE=consumer EXP_STORE_ROOT=$EXP/store2p EXP_DB=$EXP/store2p/e3-online.db \
+  CUDA_VISIBLE_DEVICES=1 torchrun ... exp_eagle3_dataflow.py $E3_ARGS --output-dir $EXP/out/e3-2p-cons
+
+# dflash online: same pattern on GPU2/GPU3 (concurrent across processes)
+EXP_MODE=online EXP_TOPO=disagg2p EXP_ROLE=producer EXP_STORE_ROOT=$EXP/store2p EXP_DB=$EXP/store2p/df-online.db \
+  EXP_MAX_PROMPTS=130 EXP_MAX_STEPS=100 EXP_TOTAL_STEPS=1000 EXP_PROMPTS_FROM=jsonl:$EXP/data/df_tokens.jsonl \
+  CUDA_VISIBLE_DEVICES=2 torchrun ... exp_dflash_dataflow.py $DF_ARGS --output-dir $EXP/out/df-2p-prod
+EXP_MODE=online EXP_TOPO=disagg2p EXP_ROLE=consumer EXP_STORE_ROOT=$EXP/store2p EXP_DB=$EXP/store2p/df-online.db \
+  EXP_MAX_STEPS=100 EXP_TOTAL_STEPS=1000 EXP_PROMPTS_FROM=jsonl:$EXP/data/df_tokens.jsonl \
+  CUDA_VISIBLE_DEVICES=3 torchrun ... exp_dflash_dataflow.py $DF_ARGS --output-dir $EXP/out/df-2p-cons
+
+# offline (both algos): producer PROCESS ingests dump -> store + ref manifest,
+# then consumer PROCESS trains from it (same env pattern, EXP_ROLE=producer then consumer)
+```
+
+### 4. Collect
+
+```bash
+python parse_curves.py /root/exp/logs /root/exp/curves.json   # greps "CURVE step= loss="
+```
+
+Correctness gate (run before the e2e matrix):
+
+```bash
+FLASHINFER_DISABLE_VERSION_CHECK=1 PYTHONPATH=$PWD \
+  python -m unittest discover -s tests/test_runtime -p 'test_*.py'
 ```
