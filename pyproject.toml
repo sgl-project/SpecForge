@@ -25,6 +25,7 @@ dependencies = [
     "numpy",
     "accelerate",
     "pydantic",
+    "pyyaml",
     "sglang==0.5.9",
     "openai-harmony",
     "ninja",
@@ -32,6 +33,9 @@ dependencies = [
     "yunchang",
     "tensorboard",
 ]
+
+[project.scripts]
+specforge = "specforge.cli:main"
 
 [tool.setuptools.packages.find]
 exclude = ["configs*", "scripts*", "tests*"]
