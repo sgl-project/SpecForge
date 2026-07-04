@@ -6,10 +6,10 @@ import torch
 import torch.nn as nn
 
 from .base import TargetEngine
-from .capture_policy import Eagle3CapturePolicy, Eagle3TargetOutput
+from .target_capture_policy import Eagle3CapturePolicy, Eagle3TargetOutput
 
 # NOTE: the capture/load implementations for every backend live in
-# ``capture_policy.Eagle3CapturePolicy`` — shared with the generic
+# ``target_capture_policy.Eagle3CapturePolicy`` — shared with the generic
 # per-backend engines (``hf.py`` / ``sglang.py`` / ``custom.py``). The classes
 # below keep the existing hierarchy, tags and method surfaces (scripts,
 # adapters and tests import them) and delegate every body to the one policy.
