@@ -34,7 +34,7 @@ class TestEquivOnlineEagle3(unittest.TestCase):
             OnlineEagle3Model,
         )
         from specforge.inference.adapters.eagle3 import SGLangAdapter
-        from specforge.inference.capture import FeatureContract
+        from specforge.inference.capture import CaptureConfig
         from specforge.inference.rollout_worker import RolloutWorker
         from specforge.runtime.contracts import assert_no_tensors
         from specforge.runtime.control_plane import DataFlowController
@@ -86,7 +86,7 @@ class TestEquivOnlineEagle3(unittest.TestCase):
             )
             store = LocalFeatureStore("online")
             adapter = SGLangAdapter(target, device="cuda")
-            capture = FeatureContract.from_strategy(
+            capture = CaptureConfig.from_strategy(
                 required_features=Eagle3TrainStrategy.required_features,
                 aux_hidden_state_layer_ids=tuple(aux_ids),
                 target_repr="logits",

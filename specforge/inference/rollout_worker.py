@@ -11,10 +11,10 @@
 The worker is deliberately small and strategy-agnostic: it leases prompt tasks,
 asks a ``feature_source`` (e.g. a wrapper over the target model's
 ``generate_eagle3_data``, or ``SGLangAdapter``) for per-sample features,
-verifies them against the typed ``FeatureContract`` *before* writing, writes them
+verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. It never hands a tensor to the controller. Strategy-specific capture
-requirements live in ``FeatureContract`` + the feature schema, not here.
+requirements live in ``CaptureConfig`` + the feature schema, not here.
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Protocol
 
 from specforge.inference.capture import (
-    FeatureContract,
-    FeatureContractError,
-    verify_feature_contract,
+    CaptureConfig,
+    CaptureMismatchError,
+    verify_capture,
 )
 from specforge.runtime.contracts import PromptTask, SampleRef
 
@@ -34,23 +34,8 @@ HEALTH_STATES = ("starting", "ready", "paused", "draining", "unhealthy", "stoppe
 
 class FeatureSource(Protocol):
     def generate_features(
-        self, tasks: List[PromptTask], *, capture: FeatureContract
+        self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Dict[str, Any]]: ...
-
-
-class RefSource(Protocol):
-    """A source whose features are ALREADY in the feature store.
-
-    Server-side capture transports (e.g. ``SGLangServerCaptureAdapter``) write
-    tensors into the store from the inference server and return
-    committed-ready ``SampleRef``s (or per-task failure markers with
-    ``task_id``/``reason``/``retryable`` attributes). The worker then commits
-    refs without any local put — tensors never pass through this process.
-    """
-
-    def produce_refs(
-        self, tasks: List[PromptTask], *, capture: FeatureContract
-    ) -> List[Any]: ...
 
 
 class RolloutWorker:
@@ -59,7 +44,7 @@ class RolloutWorker:
         controller,
         feature_store,
         feature_source: FeatureSource,
-        capture: FeatureContract,
+        capture: CaptureConfig,
         *,
         run_id: str,
         worker_id: Optional[str] = None,
@@ -71,9 +56,7 @@ class RolloutWorker:
         self.controller = controller
         self.feature_store = feature_store
         self.feature_source = feature_source
-        self.feature_contract = capture
-        # Back-compat for code/tests that read RolloutWorker.capture directly.
-        self.capture = self.feature_contract
+        self.capture = capture
         self.run_id = run_id
         self.strategy = strategy
         self.target_model_version = target_model_version
@@ -105,11 +88,9 @@ class RolloutWorker:
             return []
         self._inflight = len(tasks)
         self._state = "ready"
-        if hasattr(self.feature_source, "produce_refs"):
-            return self._run_once_refs(tasks)
         try:
             feats_list = self.feature_source.generate_features(
-                tasks, capture=self.feature_contract
+                tasks, capture=self.capture
             )
         except Exception as exc:  # rollout failure before any feature write
             self._state = "unhealthy"
@@ -139,18 +120,18 @@ class RolloutWorker:
             raise ValueError(reason)
 
         refs: List[SampleRef] = []
-        capture_error: Optional[FeatureContractError] = None
+        capture_error: Optional[CaptureMismatchError] = None
         for task, feats in zip(tasks, feats_list):
             sample_id = self._sample_id(task)
             recorded = feats.pop("__aux_layer_ids__", None)
             try:
-                verify_feature_contract(
+                verify_capture(
                     feats,
-                    self.feature_contract,
+                    self.capture,
                     sample_id=sample_id,
                     recorded_aux_layer_ids=recorded,
                 )
-            except FeatureContractError as exc:
+            except CaptureMismatchError as exc:
                 # Loud failure: do not persist a corrupt sample, but keep this
                 # batch's other prompt leases moving so no lease is stranded.
                 self._recent_failures.append(str(exc))
@@ -183,74 +164,14 @@ class RolloutWorker:
             raise capture_error
         return refs
 
-    def _run_once_refs(self, tasks: List[PromptTask]) -> List[SampleRef]:
-        """Lease -> produce_refs -> commit for ref-producing sources.
-
-        The source verified each ref against the FeatureContract and wrote the
-        tensors store-side, so the worker's job reduces to terminal-state
-        bookkeeping: every leased task still ends in exactly one controller
-        action — ``commit_samples`` for a returned ref, ``fail_prompt_tasks``
-        for a per-task failure marker or a transport error.
-        """
-        try:
-            results = self.feature_source.produce_refs(
-                tasks, capture=self.feature_contract
-            )
-        except Exception as exc:  # transport failure before any commit
-            self._state = "unhealthy"
-            self._recent_failures.append(f"produce_refs: {exc}")
-            self.controller.fail_prompt_tasks(
-                self.worker_id,
-                [t.task_id for t in tasks],
-                reason=f"produce_refs:{exc}",
-                retryable=True,
-            )
-            self._inflight = 0
-            raise
-        if len(results) != len(tasks):
-            reason = (
-                f"produce_refs returned {len(results)} results for "
-                f"{len(tasks)} tasks"
-            )
-            self._state = "unhealthy"
-            self._recent_failures.append(reason)
-            self.controller.fail_prompt_tasks(
-                self.worker_id,
-                [t.task_id for t in tasks],
-                reason=reason,
-                retryable=False,
-            )
-            self._inflight = 0
-            raise ValueError(reason)
-
-        refs: List[SampleRef] = []
-        for task, result in zip(tasks, results):
-            if isinstance(result, SampleRef):
-                refs.append(result)
-                continue
-            # per-task failure marker (duck-typed: reason/retryable)
-            reason = getattr(result, "reason", f"produce_refs:{result!r}")
-            self._recent_failures.append(reason)
-            self.controller.fail_prompt_tasks(
-                self.worker_id,
-                [task.task_id],
-                reason=reason,
-                retryable=bool(getattr(result, "retryable", True)),
-            )
-        if refs:
-            self.controller.commit_samples(self.worker_id, refs)
-            self._last_commit_count += len(refs)
-        self._inflight = 0
-        return refs
-
     def _put_metadata(self, task: PromptTask) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
             "source_task_id": task.task_id,
             "strategy": self.strategy,
-            "target_repr": self.feature_contract.target_repr,
-            "vocab_map_version": self.feature_contract.vocab_map_version,
-            "ttt_length": self.feature_contract.extra.get("ttt_length"),
+            "target_repr": self.capture.target_repr,
+            "vocab_map_version": self.capture.vocab_map_version,
+            "ttt_length": self.capture.extra.get("ttt_length"),
             "target_model_version": self.target_model_version,
             "tokenizer_version": self.tokenizer_version,
             "draft_weight_version": self.draft_weight_version,
@@ -276,4 +197,4 @@ class RolloutWorker:
         }
 
 
-__all__ = ["RolloutWorker", "FeatureSource", "RefSource", "HEALTH_STATES"]
+__all__ = ["RolloutWorker", "FeatureSource", "HEALTH_STATES"]

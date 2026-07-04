@@ -16,13 +16,10 @@ once per strategy, instead of being hardcoded into every ``build_*`` function:
   * ``make_strategy``        — build the per-step strategy over the FSDP-wrapped
                                model (the seam ``TrainerCore`` consumes),
   * ``required_features``    — the feature contract (drives
-                               ``FeatureContract.from_strategy`` + loader validation),
+                               ``CaptureConfig.from_strategy`` + loader validation),
   * the offline data path    — reader + per-sample transform + collate + target_repr,
   * ``make_online_collate``  — the online/streamed collate,
-  * ``feature_schema``       — the store-ready dict shape the shared
-                               ``PolicyFeatureAdapter`` emits online,
-  * ``make_adapter``         — escape hatch for a bespoke online capture adapter
-                               (None => PolicyFeatureAdapter over feature_schema),
+  * ``make_adapter``         — the online capture adapter (None => SGLangAdapter),
   * ``supports_online``      — whether an online capture path exists yet.
 
 Registering a new model (dflash, domino, ...) is a ``StrategySpec`` entry next
@@ -45,11 +42,6 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 import torch
 
-from specforge.inference.adapters.policy import (
-    DFLASH_FEATURE_SCHEMA,
-    EAGLE3_FEATURE_SCHEMA,
-    FeatureSchema,
-)
 from specforge.training.strategies.base import DraftTrainStrategy, Eagle3TrainStrategy
 
 
@@ -87,11 +79,7 @@ class StrategySpec:
     make_offline_collate: Optional[Callable[[], Callable]] = None
     # Online data path.
     make_online_collate: Optional[Callable[[], Callable]] = None
-    # The store-ready dict shape the shared PolicyFeatureAdapter emits online.
-    # None with supports_online=True falls back to the EAGLE3 schema.
-    feature_schema: Optional[FeatureSchema] = None
-    # Escape hatch: (target_model, *, device, t2d) -> bespoke capture adapter.
-    # None => PolicyFeatureAdapter over feature_schema.
+    # (target_model, *, device, t2d) -> capture adapter. None => default SGLangAdapter.
     make_adapter: Optional[Callable[..., Any]] = None
     supports_online: bool = False
 
@@ -159,7 +147,7 @@ register_strategy(
         make_offline_transform=_eagle3_offline_transform,
         make_offline_collate=_eagle3_offline_collate,
         make_online_collate=lambda: concat_collate,
-        feature_schema=EAGLE3_FEATURE_SCHEMA,
+        make_adapter=None,  # default SGLangAdapter
         supports_online=True,
     )
 )
@@ -170,9 +158,9 @@ register_strategy(
 # capture layers, NO eagle3 aux/target swap, NO target distribution / vocab map).
 # Offline: the reader reuses OfflineManifestReader with dflash feature_keys; the
 # transform slices to max_len (no swap); the collate pads + emits {input_ids,
-# hidden_states, loss_mask}. Online: DFLASH_FEATURE_SCHEMA drives the shared
-# PolicyFeatureAdapter to emit the same schema. The DFlashTrainStrategy already
-# drops into the unchanged TrainerCore/Backend/Loader.
+# hidden_states, loss_mask}. Online: a DFlashAdapter wraps generate_dflash_data
+# and emits the same schema. The DFlashTrainStrategy already drops into the
+# unchanged TrainerCore/Backend/Loader.
 
 from specforge.training.strategies.base import DFlashTrainStrategy
 
@@ -255,6 +243,12 @@ def _dflash_offline_collate():
     return collate
 
 
+def _dflash_adapter(target_model, *, device="cuda", t2d=None):
+    from specforge.inference.adapters.dflash import DFlashAdapter
+
+    return DFlashAdapter(target_model, device=device, t2d=t2d)
+
+
 register_strategy(
     StrategySpec(
         name="dflash",
@@ -265,7 +259,7 @@ register_strategy(
         make_offline_transform=_dflash_offline_transform,
         make_offline_collate=_dflash_offline_collate,
         make_online_collate=lambda: concat_collate,
-        feature_schema=DFLASH_FEATURE_SCHEMA,
+        make_adapter=_dflash_adapter,
         supports_online=True,
     )
 )
@@ -273,11 +267,11 @@ register_strategy(
 
 # --- Domino -----------------------------------------------------------------
 # Domino reuses DFlash's draft model (projector_type="domino" head), feature
-# schema, offline transform/collate, and capture path (same DFLASH_FEATURE_SCHEMA
-# -> hidden_states). The ONE difference is the loss: it blends a base loss with a
-# step-decayed weight, so DominoTrainStrategy reads the StepContext
-# (forward_loss(batch, ctx)). That is the whole reason a new algorithm needs
-# anything beyond a spec entry here.
+# schema, offline transform/collate, and capture adapter (same
+# generate_dflash_data -> hidden_states). The ONE difference is the loss: it
+# blends a base loss with a step-decayed weight, so DominoTrainStrategy reads the
+# StepContext (forward_loss(batch, ctx)). That is the whole reason a new algorithm
+# needs anything beyond a spec entry here.
 
 from specforge.training.strategies.base import DominoTrainStrategy
 
@@ -306,7 +300,7 @@ register_strategy(
         make_offline_transform=_dflash_offline_transform,  # same schema as DFlash
         make_offline_collate=_dflash_offline_collate,
         make_online_collate=lambda: concat_collate,
-        feature_schema=DFLASH_FEATURE_SCHEMA,  # same capture path as DFlash
+        make_adapter=_dflash_adapter,  # same generate_dflash_data capture
         supports_online=True,
     )
 )
