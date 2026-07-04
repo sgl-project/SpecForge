@@ -5,10 +5,10 @@ import unittest
 
 import torch
 
+from specforge.inference.capture import CaptureConfig
+from specforge.inference.rollout_worker import RolloutWorker
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.data_plane import LocalFeatureStore
-from specforge.runtime.inference.capture import CaptureConfig
-from specforge.runtime.inference.rollout_worker import RolloutWorker
 
 H = 8
 
@@ -98,7 +98,7 @@ class TestRolloutWorker(unittest.TestCase):
             ctrl, store, FakeSource(bad_layers=True), _capture(), run_id="run"
         )
         w.start()
-        from specforge.runtime.inference.capture import CaptureMismatchError
+        from specforge.inference.capture import CaptureMismatchError
 
         with self.assertRaises(CaptureMismatchError):
             w.run_once(max_tasks=8)
@@ -113,7 +113,7 @@ class TestRolloutWorker(unittest.TestCase):
         store = LocalFeatureStore("st")
         w = RolloutWorker(ctrl, store, MixedLayerSource(), _capture(), run_id="run")
         w.start()
-        from specforge.runtime.inference.capture import CaptureMismatchError
+        from specforge.inference.capture import CaptureMismatchError
 
         with self.assertRaises(CaptureMismatchError):
             w.run_once(max_tasks=8)

@@ -48,8 +48,8 @@ def _fake_seam():
     """CPU fakes over the real seam ABCs (imported lazily: specforge is heavy)."""
     import torch.nn as nn
 
-    from specforge.runtime.training.backend import TrainingBackend
-    from specforge.runtime.training.strategy import DraftTrainStrategy, StepOutput
+    from specforge.training.backend import TrainingBackend
+    from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
     class Draft(nn.Module):
         def __init__(self):
@@ -120,7 +120,7 @@ def _fake_seam():
 @contextlib.contextmanager
 def _no_fsdp_wrap():
     """Force the production backend to register without FSDP (CPU, world 1)."""
-    from specforge.runtime.training.backend import FSDPTrainingBackend
+    from specforge.training.backend import FSDPTrainingBackend
 
     orig = FSDPTrainingBackend.prepare_model
 
@@ -330,7 +330,7 @@ class TestFitReentry(unittest.TestCase):
     """fit() at/after max_steps and re-entry after a mid-epoch return (CPU fakes)."""
 
     def _controller(self, seen, max_steps, out_dir, **kw):
-        from specforge.runtime.training.trainer import TrainerController, TrainerCore
+        from specforge.training.controller import TrainerController, TrainerCore
 
         Composite, Strategy, Backend = _fake_seam()
         model = Composite()
@@ -406,12 +406,9 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.modeling.target import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
-        from specforge.runtime.training.backend import (
-            FSDPTrainingBackend,
-            ParallelConfig,
-        )
-        from specforge.runtime.training.strategy import Eagle3TrainStrategy
-        from specforge.runtime.training.trainer import TrainerController, TrainerCore
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.controller import TrainerController, TrainerCore
+        from specforge.training.strategies.base import Eagle3TrainStrategy
 
         TTT, BS, N = 3, 2, 6
         workdir = tempfile.mkdtemp(prefix="ckpt_resume_")
@@ -550,12 +547,9 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.data.utils import DataCollatorWithPadding
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
-        from specforge.runtime.training.backend import (
-            FSDPTrainingBackend,
-            ParallelConfig,
-        )
-        from specforge.runtime.training.strategy import Eagle3TrainStrategy
-        from specforge.runtime.training.trainer import TrainerController, TrainerCore
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.controller import TrainerController, TrainerCore
+        from specforge.training.strategies.base import Eagle3TrainStrategy
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
         workdir = tempfile.mkdtemp(prefix="ckpt_continuity_")
