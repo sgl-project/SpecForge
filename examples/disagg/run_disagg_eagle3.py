@@ -61,6 +61,7 @@ from train_eagle3 import (
 )
 
 from specforge.distributed import destroy_distributed, init_distributed
+from specforge.launch import build_disagg_offline_runtime, build_offline_runtime
 from specforge.optimizer import BF16Optimizer
 from specforge.runtime.data_plane.disagg_ingest import (
     ingest_offline_features,
@@ -70,7 +71,6 @@ from specforge.runtime.data_plane.disagg_ingest import (
 from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
 from specforge.runtime.data_plane.feature_store import FeatureStore
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
-from specforge.runtime.launch import build_disagg_offline_runtime, build_offline_runtime
 
 RUN_ID = "eagle3-disagg"
 

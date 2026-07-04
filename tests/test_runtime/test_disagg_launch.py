@@ -140,8 +140,8 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+        from specforge.launch import build_disagg_eagle3_runtime
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.launch import build_disagg_eagle3_runtime
 
         TTT, ACC, MAX_OPT_STEPS, N = 3, 2, 2, 8
         work = tempfile.mkdtemp(prefix="disagg_fsdp_")
