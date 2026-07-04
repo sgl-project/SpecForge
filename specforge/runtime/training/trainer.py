@@ -256,8 +256,23 @@ class TrainerController:
                         if self.logger:
                             self.logger(eval_metrics, self.global_step)
                         self.last_metrics = {**self.last_metrics, **eval_metrics}
-                if self.save_interval and self.global_step % self.save_interval == 0:
+                # is_better is a collective (rank0 verdict broadcast inside the
+                # manager); its guard is rank-identical because eval_metrics is
+                # DP-reduced. Empty ({}) eval metrics skip best entirely.
+                interval_hit = bool(
+                    self.save_interval and self.global_step % self.save_interval == 0
+                )
+                is_best = bool(
+                    self.save_interval
+                    and eval_metrics
+                    and self._checkpoint_manager().is_better(eval_metrics)
+                )
+                if interval_hit or is_best:
                     self.save_checkpoint(self.global_step)
+                if is_best:
+                    self._checkpoint_manager().update_best(
+                        self.global_step, eval_metrics
+                    )
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
             self._epoch_batch = 0
