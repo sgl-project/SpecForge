@@ -6,14 +6,14 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Generic target-engine factory (Phase B).
+"""Generic target-engine factory.
 
-``get_target_engine(strategy=..., backend=...)`` is the de-EAGLE3'd factory: it
-dispatches on the *algorithm* (``eagle3`` / ``dflash``) and delegates to the
-per-algorithm loaders, which in turn dispatch on the *backend* (sglang / hf /
-custom / sglang_server). The legacy ``get_eagle3_target_model`` /
-``get_dflash_target_model`` remain as thin shims (they ARE the per-algorithm
-loaders this factory calls), so nothing that imports them breaks.
+``get_target_engine(strategy=..., backend=...)`` dispatches on the *algorithm*
+and the *backend*. The built-in algorithms (``eagle3`` / ``dflash`` / ``domino``)
+route through their per-algorithm loaders (kept import-compatible); any other
+strategy with a registered :class:`~.capture_policy.CapturePolicy` gets the
+generic per-backend engine — adding an algorithm is a policy registration, not a
+new engine class per backend.
 """
 
 from __future__ import annotations
@@ -24,18 +24,46 @@ import torch
 
 from .base import TargetEngine
 
-# strategy name -> per-algorithm engine. Domino reuses the DFlash engine (same
-# capture: concatenated layer hidden states, no target distribution). The loaders
-# are imported LAZILY inside the factory: dflash_target_model imports sglang
-# internals unconditionally, so eager import here would break the design property
-# that ``import specforge`` works even when the installed sglang lacks the pinned
-# symbols (eagle3_target_model guards its imports; see its module docstring).
+# Built-in strategies with a dedicated per-algorithm loader. Domino reuses the
+# DFlash engine (same capture: concatenated layer hidden states, no target
+# distribution). Loaders are imported LAZILY inside the factory so ``import
+# specforge`` works even when the installed sglang lacks the pinned symbols.
 _ENGINE_STRATEGIES = ("eagle3", "dflash", "domino")
 
 
 def available_target_engines():
-    """Strategy names with a registered target-engine loader."""
-    return sorted(_ENGINE_STRATEGIES)
+    """Strategy names with a target-engine loader (built-in or via policy)."""
+    from .capture_policy import CAPTURE_POLICIES
+
+    return sorted(set(_ENGINE_STRATEGIES) | set(CAPTURE_POLICIES))
+
+
+def _generic_loader(strategy: str):
+    """Loader over the generic per-backend engines for a registered policy."""
+    from .capture_policy import resolve_capture_policy
+
+    try:
+        policy = resolve_capture_policy(strategy)
+    except KeyError:
+        raise ValueError(
+            f"no target engine for strategy {strategy!r}; "
+            f"registered: {available_target_engines()}"
+        ) from None
+
+    def load(pretrained_model_name_or_path, backend="sglang", **kwargs):
+        if backend == "sglang":
+            from .sglang import SGLangTargetEngine as engine_cls
+        elif backend == "hf":
+            from .hf import HFTargetEngine as engine_cls
+        elif backend == "custom":
+            from .custom import CustomTargetEngine as engine_cls
+        else:
+            raise ValueError(f"Invalid backend: {backend}")
+        return engine_cls.from_pretrained(
+            pretrained_model_name_or_path, policy=policy, **kwargs
+        )
+
+    return load
 
 
 def _resolve_loader(strategy: str):
@@ -47,10 +75,7 @@ def _resolve_loader(strategy: str):
         from .dflash_target_model import get_dflash_target_model
 
         return get_dflash_target_model
-    raise ValueError(
-        f"no target engine for strategy {strategy!r}; "
-        f"registered: {available_target_engines()}"
-    )
+    return _generic_loader(strategy)
 
 
 def get_target_engine(
