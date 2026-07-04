@@ -56,11 +56,8 @@ class Checkpoint:
 
 @dataclass(frozen=True)
 class StepResult:
-    """Result of one TrainerCore step.
-
-    ``optimizer_stepped`` is the authoritative grad-accumulation boundary signal —
-    callers branch on it rather than sniffing the metrics dict.
-    """
+    """Result of one TrainerCore step; ``optimizer_stepped`` is the authoritative
+    grad-accumulation boundary signal."""
 
     optimizer_stepped: bool
     loss: float
@@ -96,12 +93,12 @@ class TrainerCore:
     ) -> StepResult:
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
         loss = out.loss / self.accumulation_steps
-        self.backend.backward(loss)
         self._micro += 1
-        grad_norm = None
+        # The boundary is known before backward so the backend can defer the FSDP
+        # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
-        if stepped:
-            grad_norm = self.backend.step()
+        self.backend.backward(loss, is_boundary=stepped)
+        grad_norm = self.backend.step() if stepped else None
         return self._result(out, grad_norm, stepped, mode="train")
 
     @torch.no_grad()
