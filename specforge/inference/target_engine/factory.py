@@ -11,9 +11,9 @@
 ``get_target_engine(strategy=..., backend=...)`` dispatches on the *algorithm*
 and the *backend*. The built-in algorithms (``eagle3`` / ``dflash`` / ``domino``)
 route through their per-algorithm loaders (kept import-compatible); any other
-strategy with a registered :class:`~.capture_policy.CapturePolicy` gets the
-generic per-backend engine — adding an algorithm is a policy registration, not a
-new engine class per backend.
+strategy with a registered :class:`~.target_capture_policy.TargetCapturePolicy` gets
+the generic per-backend engine — adding an algorithm is a policy registration,
+not a new engine class per backend.
 """
 
 from __future__ import annotations
@@ -33,17 +33,17 @@ _ENGINE_STRATEGIES = ("eagle3", "dflash", "domino")
 
 def available_target_engines():
     """Strategy names with a target-engine loader (built-in or via policy)."""
-    from .capture_policy import CAPTURE_POLICIES
+    from .target_capture_policy import TARGET_CAPTURE_POLICIES
 
-    return sorted(set(_ENGINE_STRATEGIES) | set(CAPTURE_POLICIES))
+    return sorted(set(_ENGINE_STRATEGIES) | set(TARGET_CAPTURE_POLICIES))
 
 
 def _generic_loader(strategy: str):
     """Loader over the generic per-backend engines for a registered policy."""
-    from .capture_policy import resolve_capture_policy
+    from .target_capture_policy import resolve_target_capture_policy
 
     try:
-        policy = resolve_capture_policy(strategy)
+        policy = resolve_target_capture_policy(strategy)
     except KeyError:
         raise ValueError(
             f"no target engine for strategy {strategy!r}; "
