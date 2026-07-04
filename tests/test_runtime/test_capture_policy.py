@@ -1,10 +1,11 @@
 # coding=utf-8
 """Gate: the (algorithm x backend) engine matrix collapses onto policies.
 
-The per-algorithm capture/load code lives once, in ``capture_policy``; the
-legacy per-algorithm leaf classes delegate to it (their behavior gates are the
-existing ``test_phase_b_gate`` / backend-parity tests), and a NEW algorithm gets
-hf/sglang/custom engines by registering a policy — no engine classes.
+The per-algorithm target-capture/load code lives once, in
+``target_capture_policy``; the legacy per-algorithm leaf classes delegate to it
+(their behavior gates are the existing ``test_phase_b_gate`` / backend-parity
+tests), and a NEW algorithm gets hf/sglang/custom engines by registering a
+target-capture policy — no engine classes.
 """
 
 import ast
@@ -15,17 +16,25 @@ import torch
 
 from specforge.inference.target_engine import (
     CAPTURE_POLICIES,
+    TARGET_CAPTURE_POLICIES,
     CapturePolicy,
     CaptureSpec,
     DFlashCapturePolicy,
     Eagle3CapturePolicy,
     HFTargetEngine,
+    TargetCaptureBatch,
+    TargetCapturePolicy,
+    TargetCaptureSpec,
     available_target_engines,
     get_target_engine,
-    register_capture_policy,
+    register_target_capture_policy,
     resolve_capture_policy,
+    resolve_target_capture_policy,
 )
-from specforge.inference.target_engine.capture_policy import Eagle3TargetOutput
+from specforge.inference.target_engine.target_capture_policy import (
+    DFlashTargetOutput,
+    Eagle3TargetOutput,
+)
 
 _ENGINE_DIR = os.path.normpath(
     os.path.join(
@@ -36,25 +45,51 @@ _ENGINE_DIR = os.path.normpath(
 
 class PolicyRegistryTest(unittest.TestCase):
     def test_builtin_policies_registered(self):
-        self.assertIsInstance(resolve_capture_policy("eagle3"), Eagle3CapturePolicy)
-        self.assertIsInstance(resolve_capture_policy("dflash"), DFlashCapturePolicy)
+        self.assertIsInstance(
+            resolve_target_capture_policy("eagle3"), Eagle3CapturePolicy
+        )
+        self.assertIsInstance(
+            resolve_target_capture_policy("dflash"), DFlashCapturePolicy
+        )
         # Domino trains on DFlash-captured features: same policy object.
         self.assertIs(
-            resolve_capture_policy("domino"), resolve_capture_policy("dflash")
+            resolve_target_capture_policy("domino"),
+            resolve_target_capture_policy("dflash"),
         )
 
     def test_unknown_policy_raises(self):
         with self.assertRaises(KeyError):
-            resolve_capture_policy("does-not-exist")
+            resolve_target_capture_policy("does-not-exist")
 
     def test_specs_carry_the_backend_flags(self):
-        e3 = resolve_capture_policy("eagle3").spec
-        df = resolve_capture_policy("dflash").spec
+        e3 = resolve_target_capture_policy("eagle3").spec
+        df = resolve_target_capture_policy("dflash").spec
         self.assertEqual(e3.num_capture_layers, 3)
         self.assertTrue(e3.sglang_build_kwargs["wrap_eagle3_logits"])
         self.assertTrue(e3.sglang_strict_capture_layers)
         self.assertFalse(df.sglang_build_kwargs["wrap_eagle3_logits"])
         self.assertFalse(df.sglang_strict_capture_layers)
+
+    def test_legacy_policy_names_are_aliases(self):
+        self.assertIs(CaptureSpec, TargetCaptureSpec)
+        self.assertIs(CapturePolicy, TargetCapturePolicy)
+        self.assertIs(CAPTURE_POLICIES, TARGET_CAPTURE_POLICIES)
+        self.assertIs(
+            resolve_capture_policy("eagle3"), resolve_target_capture_policy("eagle3")
+        )
+
+    def test_legacy_module_path_is_a_shim(self):
+        # the old module name keeps working and resolves to the same objects
+        from specforge.inference.target_engine import capture_policy as legacy
+
+        self.assertIs(legacy.TargetCapturePolicy, TargetCapturePolicy)
+        self.assertIs(legacy.CAPTURE_POLICIES, TARGET_CAPTURE_POLICIES)
+        self.assertIs(legacy.Eagle3TargetOutput, Eagle3TargetOutput)
+
+    def test_policy_outputs_are_typed_capture_batches(self):
+        # the policy layer's contract with the runtime adapter: typed batches
+        self.assertTrue(issubclass(Eagle3TargetOutput, TargetCaptureBatch))
+        self.assertTrue(issubclass(DFlashTargetOutput, TargetCaptureBatch))
 
     def test_eagle3_default_layers_rule(self):
         class Cfg:
@@ -66,10 +101,10 @@ class PolicyRegistryTest(unittest.TestCase):
             Eagle3CapturePolicy().resolve_capture_layers(None, [1, 2])
 
 
-class _RecordingPolicy(CapturePolicy):
+class _RecordingPolicy(TargetCapturePolicy):
     """A minimal fake algorithm: records calls, returns sentinels."""
 
-    spec = CaptureSpec(name="fake_algo")
+    spec = TargetCaptureSpec(name="fake_algo")
 
     def __init__(self):
         self.calls = []
@@ -92,8 +127,8 @@ class _RecordingPolicy(CapturePolicy):
 class GenericEngineTest(unittest.TestCase):
     def _register(self, name="fake_algo"):
         policy = _RecordingPolicy()
-        register_capture_policy(name, policy)
-        self.addCleanup(CAPTURE_POLICIES.pop, name, None)
+        register_target_capture_policy(name, policy)
+        self.addCleanup(TARGET_CAPTURE_POLICIES.pop, name, None)
         return policy
 
     def test_new_algorithm_needs_no_engine_class(self):
@@ -136,7 +171,7 @@ class PolicyModuleIsSglangFreeTest(unittest.TestCase):
     """The policy module keeps the B2 invariant: no module-level sglang imports."""
 
     def test_no_toplevel_sglang_import(self):
-        path = os.path.join(_ENGINE_DIR, "capture_policy.py")
+        path = os.path.join(_ENGINE_DIR, "target_capture_policy.py")
         with open(path, "r", encoding="utf-8") as f:
             tree = ast.parse(f.read(), filename=path)
         hits = []
@@ -150,7 +185,9 @@ class PolicyModuleIsSglangFreeTest(unittest.TestCase):
                     and node.module.split(".")[0] == "sglang"
                 ):
                     hits.append(node.module)
-        self.assertEqual(hits, [], f"capture_policy leaks sglang imports: {hits}")
+        self.assertEqual(
+            hits, [], f"target_capture_policy leaks sglang imports: {hits}"
+        )
 
 
 class LegacyDelegationTest(unittest.TestCase):
