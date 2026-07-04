@@ -207,11 +207,19 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        # EAGLE3 owns a frozen embedding loaded from the target; do not persist it.
+        # The target-copied embedding is skipped only when actually frozen; a
+        # trainable embedding must be persisted (checked on the live module —
+        # state_dict tensors are detached and carry no requires_grad).
+        embed_frozen = all(
+            not p.requires_grad
+            for n, p in self.eagle3_model.named_parameters()
+            if "embed" in n.lower()
+        )
         return {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
+            if "draft_model." in k
+            and not (embed_frozen and "embed" in k.lower())
         }
 
 
@@ -253,8 +261,8 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         return StepOutput(loss=loss, metrics={"accuracy": accuracy.detach()})
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        # DFlash keeps everything under draft_model.; the embedding/head live in
-        # a separate target module that is NOT persisted as draft weights.
+        # Everything trainable lives under draft_model.; the target
+        # embedding/head are a separate module, not persisted as draft weights.
         return {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
@@ -325,8 +333,8 @@ class DominoTrainStrategy(DraftTrainStrategy):
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        # Domino (like DFlash) keeps everything under draft_model.; the target
-        # embedding/head live in a separate module not persisted as draft weights.
+        # Everything trainable lives under draft_model.; the target
+        # embedding/head are a separate module, not persisted as draft weights.
         return {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
