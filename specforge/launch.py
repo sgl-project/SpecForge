@@ -420,6 +420,7 @@ def build_online_runtime(
     sp_ring_size: int = 1,
     collate_fn=None,
     logger=None,
+    log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
 ):
@@ -475,7 +476,7 @@ def build_online_runtime(
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         logger=logger,
-        log_interval=50,
+        log_interval=log_interval,
         collate_fn=_online_collate(spec, collate_fn),
         per_sample_transform=None,
         durable_ack=durable_ack,
