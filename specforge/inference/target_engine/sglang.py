@@ -6,7 +6,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Generic SGLang target engine, parameterized by a CapturePolicy.
+"""Generic SGLang target engine, parameterized by a TargetCapturePolicy.
 
 Composes :class:`SGLangCaptureBackend` (the sglang-version-pinned boundary) and
 imports zero sglang itself; the policy's ``spec.sglang_build_kwargs`` carries
@@ -20,7 +20,7 @@ from typing import List, Optional
 import torch
 
 from .base import TargetEngine
-from .capture_policy import CapturePolicy, resolve_capture_policy
+from .target_capture_policy import TargetCapturePolicy, resolve_target_capture_policy
 
 
 class SGLangTargetEngine(TargetEngine):
@@ -28,7 +28,7 @@ class SGLangTargetEngine(TargetEngine):
 
     backend = "sglang"
 
-    def __init__(self, backend, policy: CapturePolicy):
+    def __init__(self, backend, policy: TargetCapturePolicy):
         self._backend = backend  # sglang_backend.SGLangCaptureBackend
         self.policy = policy
         self.capture_layers: Optional[List[int]] = None
@@ -54,7 +54,7 @@ class SGLangTargetEngine(TargetEngine):
         device: Optional[str] = None,
         cache_dir: Optional[str] = None,
         *,
-        policy: "CapturePolicy | str" = "eagle3",
+        policy: "TargetCapturePolicy | str" = "eagle3",
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangTargetEngine":
@@ -62,7 +62,7 @@ class SGLangTargetEngine(TargetEngine):
         from .sglang_backend import SGLangCaptureBackend
 
         if isinstance(policy, str):
-            policy = resolve_capture_policy(policy)
+            policy = resolve_target_capture_policy(policy)
         backend = SGLangCaptureBackend.build(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,

@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from specforge.inference.capture import CaptureConfig
+from specforge.inference.capture import FeatureContract
 from specforge.inference.rollout_worker import RolloutWorker
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.data_plane import LocalFeatureStore
@@ -14,7 +14,7 @@ H = 8
 
 
 def _capture(layer_ids=(1, 2, 3)):
-    return CaptureConfig.from_strategy(
+    return FeatureContract.from_strategy(
         required_features={
             "input_ids",
             "attention_mask",
@@ -98,9 +98,9 @@ class TestRolloutWorker(unittest.TestCase):
             ctrl, store, FakeSource(bad_layers=True), _capture(), run_id="run"
         )
         w.start()
-        from specforge.inference.capture import CaptureMismatchError
+        from specforge.inference.capture import FeatureContractError
 
-        with self.assertRaises(CaptureMismatchError):
+        with self.assertRaises(FeatureContractError):
             w.run_once(max_tasks=8)
         self.assertEqual(ctrl.status()["samples_committed"], 0)
         self.assertEqual(ctrl.sample_queue.depth(), 0)
@@ -113,9 +113,9 @@ class TestRolloutWorker(unittest.TestCase):
         store = LocalFeatureStore("st")
         w = RolloutWorker(ctrl, store, MixedLayerSource(), _capture(), run_id="run")
         w.start()
-        from specforge.inference.capture import CaptureMismatchError
+        from specforge.inference.capture import FeatureContractError
 
-        with self.assertRaises(CaptureMismatchError):
+        with self.assertRaises(FeatureContractError):
             w.run_once(max_tasks=8)
         st = ctrl.status()
         self.assertEqual(st["samples_committed"], 1)
