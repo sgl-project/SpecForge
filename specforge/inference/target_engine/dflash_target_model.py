@@ -5,10 +5,10 @@ import torch
 import torch.nn as nn
 
 from .base import TargetEngine
-from .capture_policy import DFlashCapturePolicy, DFlashTargetOutput
+from .target_capture_policy import DFlashCapturePolicy, DFlashTargetOutput
 
 # NOTE: the capture/load implementations live in
-# ``capture_policy.DFlashCapturePolicy``, shared with the generic per-backend
+# ``target_capture_policy.DFlashCapturePolicy``, shared with the generic per-backend
 # engines. The classes below keep the existing hierarchy and delegate.
 
 _DFLASH = DFlashCapturePolicy()
