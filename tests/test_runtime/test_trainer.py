@@ -251,9 +251,7 @@ class TestResumeDataPosition(unittest.TestCase):
                 start_batch=7,
                 start_samples=7,
             )
-            with self.assertRaisesRegex(
-                ValueError, "skips past the end of the data"
-            ):
+            with self.assertRaisesRegex(ValueError, "skips past the end of the data"):
                 ctrl.fit([_batch() for _ in range(5)])
 
     def test_islice_skip_of_exactly_all_batches_is_allowed(self):

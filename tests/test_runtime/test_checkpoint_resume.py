@@ -231,7 +231,9 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         ck = t1.save_checkpoint()
         self.assertEqual(ck.global_step, 2)
         w_cut = model1.draft_model.w.detach().clone()
-        masters_cut = [t.detach().cpu().clone() for t in t1.backend.optimizer.fp32_params]
+        masters_cut = [
+            t.detach().cpu().clone() for t in t1.backend.optimizer.fp32_params
+        ]
 
         # Phase 2: resume through the production entrypoint (file:// URI).
         t2, model2, seen2 = self._make_trainer(
@@ -335,7 +337,12 @@ class TestFitReentry(unittest.TestCase):
         backend = Backend(model)
         core = TrainerCore(Strategy(model, seen), backend, accumulation_steps=1)
         ctrl = TrainerController(
-            core, run_id="r", output_dir=out_dir, max_steps=max_steps, num_epochs=1, **kw
+            core,
+            run_id="r",
+            output_dir=out_dir,
+            max_steps=max_steps,
+            num_epochs=1,
+            **kw,
         )
         return ctrl, backend
 
@@ -476,9 +483,7 @@ class TestCheckpointResume(unittest.TestCase):
         self.assertTrue(os.path.islink(os.path.join(out_dir, "r-latest")))
         self.assertFalse(os.path.exists(os.path.join(out_dir, "latest")))
         mgr = CheckpointManager(out_dir, "r")
-        self.assertEqual(
-            os.path.realpath(mgr.latest_dir()), os.path.realpath(ckpt_dir)
-        )
+        self.assertEqual(os.path.realpath(mgr.latest_dir()), os.path.realpath(ckpt_dir))
 
         shared = torch.load(
             os.path.join(ckpt_dir, "training_state.pt"),
@@ -523,9 +528,7 @@ class TestCheckpointResume(unittest.TestCase):
         self.assertEqual(set(persisted), set(trained_sd) - embed_keys)
 
         fresh = build_model()
-        missing, unexpected = fresh.draft_model.load_state_dict(
-            persisted, strict=False
-        )
+        missing, unexpected = fresh.draft_model.load_state_dict(persisted, strict=False)
         self.assertEqual(unexpected, [])
         self.assertEqual(set(missing), embed_keys)
         fresh_sd = fresh.draft_model.state_dict()
@@ -661,9 +664,7 @@ class TestCheckpointResume(unittest.TestCase):
             self.assertTrue(torch.equal(mb.detach().cpu(), ma.detach().cpu()))
         # scheduler position restored — a reset would read 0 (warmup 0: the
         # cosine after_scheduler carries the position, not the outer wrapper)
-        self.assertEqual(
-            backend_b.optimizer.scheduler.after_scheduler.last_epoch, CUT
-        )
+        self.assertEqual(backend_b.optimizer.scheduler.after_scheduler.last_epoch, CUT)
         self.assertAlmostEqual(
             backend_b.optimizer.get_learning_rate(), lrs_ref[CUT - 1], places=12
         )

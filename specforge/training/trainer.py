@@ -107,9 +107,7 @@ class Trainer:
                         f"resume with the original configuration"
                     )
             saved_weights = state["draft_state_dict"]
-            load_result = model.draft_model.load_state_dict(
-                saved_weights, strict=False
-            )
+            load_result = model.draft_model.load_state_dict(saved_weights, strict=False)
             loaded = len(saved_weights) - len(load_result.unexpected_keys)
             # strict=False must not degrade into loading nothing silently.
             if load_result.unexpected_keys or loaded == 0:
