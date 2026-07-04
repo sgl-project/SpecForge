@@ -91,7 +91,8 @@ class CheckpointManager:
                 os.makedirs(ckpt_dir, exist_ok=True)
                 if rank_state is not None:
                     self._atomic_save(
-                        rank_state, os.path.join(ckpt_dir, self._rank_file(self._rank()))
+                        rank_state,
+                        os.path.join(ckpt_dir, self._rank_file(self._rank())),
                     )
                 if self.is_rank0() and state is not None:
                     self._atomic_save(state, self._state_path(ckpt_dir))
@@ -210,9 +211,7 @@ class CheckpointManager:
         self.best_score, self.best_step = float(score), int(step)
 
     # -- load --------------------------------------------------------------
-    def load(
-        self, step: Optional[int] = None, *, map_location="cpu"
-    ) -> Dict[str, Any]:
+    def load(self, step: Optional[int] = None, *, map_location="cpu") -> Dict[str, Any]:
         """Load a checkpoint's shared state dict (``latest`` when ``step`` is None)."""
         target = self.checkpoint_dir(step) if step is not None else self.latest_dir()
         if target is None:

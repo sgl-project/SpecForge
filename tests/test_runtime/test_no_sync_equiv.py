@@ -66,9 +66,7 @@ def _worker(rank, world_size, workdir, results_dir):
     ds = OfflineEagle3Dataset(files, max_len=512, ttt_length=TTT)
     # DISTINCT shard per rank — with identical shards a broken (skipped/no-op)
     # cross-rank reduction would be invisible.
-    data = DataCollatorWithPadding()(
-        [ds[j] for j in range(rank * BS, (rank + 1) * BS)]
-    )
+    data = DataCollatorWithPadding()([ds[j] for j in range(rank * BS, (rank + 1) * BS)])
     batch = TrainBatch(
         sample_ids=[f"r{rank}-{j}" for j in range(BS)],
         strategy="eagle3",
