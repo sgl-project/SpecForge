@@ -187,10 +187,10 @@ def _assemble_rollout_workers(
     if not spec.supports_online:
         raise NotImplementedError(
             f"online capture for strategy {spec.name!r} is not wired yet: it needs "
-            f"a {spec.name} capture adapter. Set make_adapter + supports_online=True "
-            f"on its StrategySpec."
+            f"a {spec.name} capture path. Set feature_schema (or make_adapter) + "
+            f"supports_online=True on its StrategySpec."
         )
-    from specforge.inference.capture import CaptureConfig
+    from specforge.inference.capture import FeatureContract
     from specforge.inference.rollout_worker import RolloutWorker
 
     if aux_hidden_state_layer_ids is None:
@@ -200,10 +200,18 @@ def _assemble_rollout_workers(
     if spec.make_adapter is not None:
         adapter = spec.make_adapter(target_model, device=device, t2d=t2d)
     else:
-        from specforge.inference.adapters.eagle3 import SGLangAdapter
+        from specforge.inference.adapters.policy import (
+            EAGLE3_FEATURE_SCHEMA,
+            PolicyFeatureAdapter,
+        )
 
-        adapter = SGLangAdapter(target_model, device=device, t2d=t2d)
-    capture = CaptureConfig.from_strategy(
+        adapter = PolicyFeatureAdapter(
+            target_model,
+            schema=spec.feature_schema or EAGLE3_FEATURE_SCHEMA,
+            device=device,
+            t2d=t2d,
+        )
+    feature_contract = FeatureContract.from_strategy(
         required_features=spec.required_features,
         aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
         target_repr=target_repr,
@@ -218,7 +226,7 @@ def _assemble_rollout_workers(
             controller,
             store,
             adapter,
-            capture,
+            feature_contract,
             run_id=run_id,
             worker_id=f"rollout-{i}",
             strategy=spec.name,

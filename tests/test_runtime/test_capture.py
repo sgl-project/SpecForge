@@ -1,14 +1,14 @@
 # coding=utf-8
-"""CaptureConfig assertions, incl. the M4 gate test_capture_layer_mismatch_fails (CPU)."""
+"""FeatureContract assertions, incl. the M4 layer-mismatch gate (CPU)."""
 
 import unittest
 
 import torch
 
 from specforge.inference.capture import (
-    CaptureConfig,
-    CaptureMismatchError,
-    verify_capture,
+    FeatureContract,
+    FeatureContractError,
+    verify_feature_contract,
 )
 
 H = 8
@@ -17,7 +17,7 @@ TARGET_V = 64
 
 
 def _capture(layer_ids=(10, 15, 20), target_repr="hidden_state", **kw):
-    return CaptureConfig.from_strategy(
+    return FeatureContract.from_strategy(
         required_features={"input_ids", "loss_mask", "hidden_state", "target"},
         aux_hidden_state_layer_ids=layer_ids,
         target_repr=target_repr,
@@ -39,7 +39,7 @@ def _good_tensors(target_dim=H):
 
 class TestCapture(unittest.TestCase):
     def test_ok(self):
-        verify_capture(
+        verify_feature_contract(
             _good_tensors(),
             _capture(),
             sample_id="s0",
@@ -48,8 +48,8 @@ class TestCapture(unittest.TestCase):
 
     def test_capture_layer_mismatch_fails(self):
         """Requested aux layers [10,15,20] vs recorded [10,15,21] -> loud failure."""
-        with self.assertRaises(CaptureMismatchError) as ctx:
-            verify_capture(
+        with self.assertRaises(FeatureContractError) as ctx:
+            verify_feature_contract(
                 _good_tensors(),
                 _capture(layer_ids=(10, 15, 20)),
                 sample_id="s0",
@@ -60,35 +60,39 @@ class TestCapture(unittest.TestCase):
     def test_missing_feature_fails(self):
         t = _good_tensors()
         del t["target"]
-        with self.assertRaises(CaptureMismatchError):
-            verify_capture(t, _capture(), sample_id="s0")
+        with self.assertRaises(FeatureContractError):
+            verify_feature_contract(t, _capture(), sample_id="s0")
 
     def test_aux_width_mismatch_fails(self):
         t = _good_tensors()
         t["hidden_state"] = torch.randn(1, 4, 2 * H)  # only 2 layers' worth
-        with self.assertRaises(CaptureMismatchError) as ctx:
-            verify_capture(t, _capture(), sample_id="s0")
+        with self.assertRaises(FeatureContractError) as ctx:
+            verify_feature_contract(t, _capture(), sample_id="s0")
         self.assertIn("aux width", str(ctx.exception))
 
     def test_target_dim_mismatch_pruned_logits(self):
         cap = _capture(target_repr="pruned_logits", vocab_map_version="v1")
         # pruned_logits expects draft_vocab_size on the last dim
         ok = _good_tensors(target_dim=DRAFT_V)
-        verify_capture(ok, cap, sample_id="s0")
+        verify_feature_contract(ok, cap, sample_id="s0")
         bad = _good_tensors(target_dim=TARGET_V)  # full vocab, wrong for pruned
-        with self.assertRaises(CaptureMismatchError):
-            verify_capture(bad, cap, sample_id="s0")
+        with self.assertRaises(FeatureContractError):
+            verify_feature_contract(bad, cap, sample_id="s0")
 
     def test_pruned_logits_requires_vocab_map_version(self):
         cap = _capture(target_repr="pruned_logits")  # no vocab_map_version
-        with self.assertRaises(CaptureMismatchError):
-            verify_capture(_good_tensors(target_dim=DRAFT_V), cap, sample_id="s0")
+        with self.assertRaises(FeatureContractError):
+            verify_feature_contract(
+                _good_tensors(target_dim=DRAFT_V), cap, sample_id="s0"
+            )
 
     def test_logits_expects_full_vocab(self):
         cap = _capture(target_repr="logits")
-        verify_capture(_good_tensors(target_dim=TARGET_V), cap, sample_id="s0")
-        with self.assertRaises(CaptureMismatchError):
-            verify_capture(_good_tensors(target_dim=DRAFT_V), cap, sample_id="s0")
+        verify_feature_contract(_good_tensors(target_dim=TARGET_V), cap, sample_id="s0")
+        with self.assertRaises(FeatureContractError):
+            verify_feature_contract(
+                _good_tensors(target_dim=DRAFT_V), cap, sample_id="s0"
+            )
 
 
 if __name__ == "__main__":
