@@ -8,20 +8,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainerCore + TrainerController: the trainer-boundary split.
 
-* ``TrainerCore`` owns exactly one train/eval step plus the grad-accumulation and
-  optimizer boundary. It is **branch-free**: it never inspects online/offline or
-  ``target_repr`` and never applies a projection — that is the strategy's job. It
-  consumes a normalized ``TrainBatch`` and delegates the forward/loss to the
-  strategy and the backward/step to the backend.
-* ``TrainerController`` owns the lifecycle: ``fit`` / ``evaluate`` /
-  ``save_checkpoint`` / weight publication. The training *script* becomes a thin
-  launcher that builds these and calls ``fit``.
-
-EAGLE3 and DFlash share this lifecycle unchanged — only the strategy differs.
+``TrainerCore`` runs exactly one branch-free step (strategy forward/loss, backend
+backward/step) plus the grad-accumulation boundary. ``TrainerController`` owns
+the lifecycle: fit / evaluate / save_checkpoint. EAGLE3 and DFlash share this
+unchanged — only the strategy differs.
 """
 
 from __future__ import annotations
 
+import itertools
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -36,16 +32,13 @@ from specforge.runtime.training.strategy import (
     StepOutput,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class Checkpoint:
-    """A saved training checkpoint location (resume target).
-
-    Deliberately NOT a published "weight version" — the published-weight
-    lifecycle (versioning, publisher, serving accept-length gate, hot update) is
-    not yet implemented. This record only says where a checkpoint is and at what
-    step.
-    """
+    """A saved training checkpoint location (resume target) — deliberately NOT a
+    published weight version (weight publication is not implemented)."""
 
     checkpoint_uri: str
     global_step: int
@@ -56,11 +49,8 @@ class Checkpoint:
 
 @dataclass(frozen=True)
 class StepResult:
-    """Result of one TrainerCore step.
-
-    ``optimizer_stepped`` is the authoritative grad-accumulation boundary signal —
-    callers branch on it rather than sniffing the metrics dict.
-    """
+    """Result of one TrainerCore step; ``optimizer_stepped`` is the authoritative
+    grad-accumulation boundary signal."""
 
     optimizer_stepped: bool
     loss: float
@@ -96,25 +86,20 @@ class TrainerCore:
     ) -> StepResult:
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
         loss = out.loss / self.accumulation_steps
-        self.backend.backward(loss)
         self._micro += 1
-        grad_norm = None
+        # The boundary is known before backward so the backend can defer the FSDP
+        # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
-        if stepped:
-            grad_norm = self.backend.step()
-        return self._result(out, grad_norm, stepped, mode="train")
+        self.backend.backward(loss, is_boundary=stepped)
+        grad_norm = self.backend.step() if stepped else None
+        return self._result(out, grad_norm, stepped)
 
-    @torch.no_grad()
-    def eval_step(
-        self, batch: TrainBatch, ctx: Optional[StepContext] = None
-    ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        return self._result(out, None, False, mode="eval")
+    # Deliberately no eval_step: evaluation runs ``Evaluator.run`` on raw
+    # ``forward_loss`` outputs — ``_result`` scalarizes away the per-position
+    # count tensors that correct acc-len aggregation needs.
 
-    def _result(
-        self, out: StepOutput, grad_norm, stepped: bool, mode: str
-    ) -> StepResult:
-        metrics: Dict[str, Any] = {"loss": _scalar(out.loss), "mode": mode}
+    def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
+        metrics: Dict[str, Any] = {"loss": _scalar(out.loss)}
         for key in ("acces", "acceptance_rates", "plosses"):
             if key in out.metrics:
                 metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
@@ -134,11 +119,9 @@ class TrainerCore:
 
 
 class TrainerController:
-    """Lifecycle: fit / evaluate / checkpoint. Script becomes a launcher.
-
-    Weight publishing + the serving accept-length gate are not yet implemented;
-    save_checkpoint just persists training state and returns a Checkpoint.
-    """
+    """Lifecycle: fit / evaluate / checkpoint. The training script becomes a
+    launcher; weight publishing is not implemented — ``save_checkpoint`` persists
+    resume state and returns a :class:`Checkpoint`."""
 
     def __init__(
         self,
@@ -156,46 +139,90 @@ class TrainerController:
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
         start_step: int = 0,
         start_epoch: int = 0,
+        start_batch: int = 0,
+        start_samples: int = 0,
+        checkpoint_manager: Optional[Any] = None,
+        checkpoint_extra: Optional[Dict[str, Any]] = None,
     ) -> None:
+        if (start_batch == 0) != (start_samples == 0):
+            raise ValueError(
+                f"start_batch={start_batch} and start_samples={start_samples} "
+                f"describe the same mid-epoch position and must be zero or "
+                f"nonzero together"
+            )
         self.core = core
         self.run_id = run_id
         self.output_dir = output_dir
         self.save_interval = save_interval
         self.eval_interval = eval_interval
         self.log_interval = log_interval
+        # Injected manager (rotation, best metric) or the lazy default layout.
+        self._checkpoint_mgr = checkpoint_manager
+        # Extra entries merged into the shared checkpoint payload at save
+        # (e.g. dataset_size / accumulation_steps, validated on resume).
+        self.checkpoint_extra = dict(checkpoint_extra or {})
         self.max_steps = max_steps
-        # Schedule horizon for step-dependent losses (Domino's lambda_base decay).
-        # Distinct from max_steps (an optional early-stop CAP): a run may stop early
-        # yet decay over the full planned length. Falls back to max_steps when unset;
-        # if BOTH are None a schedule-dependent strategy sees total_steps=None and
-        # decays nothing (StepContext-reading strategies must handle that).
+        # Schedule horizon for step-dependent losses (Domino's lambda_base decay);
+        # distinct from max_steps, an optional early-stop CAP. Falls back to
+        # max_steps; None means schedule-reading strategies decay nothing.
         self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
         self.logger = logger
-        # ack_fn(sample_ids, global_step): acks consumed refs at the optimizer-step
-        # boundary with the step number, so the controller records the durable
-        # {acked, global_step, optimizer marker} transaction. If None, the loader
-        # is assumed to ack (e.g. simple/equivalence runs).
+        # ack_fn(sample_ids, global_step) records the durable ack transaction at
+        # the optimizer-step boundary; None = the loader acks (simple runs).
         self.ack_fn = ack_fn
         # global_step counts OPTIMIZER steps (increments only at a grad-accum
-        # boundary), so ack / checkpoint / resume semantics are in true optimizer
-        # steps. micro_step counts forward/backward micro-batches.
+        # boundary) so ack/checkpoint/resume semantics are in true optimizer
+        # steps; micro_step counts forward/backward micro-batches.
         self.global_step = start_step
         self.micro_step = 0
         self.epoch = start_epoch
+        # Live position within the current epoch, in batches and in SAMPLES
+        # (batch-size independent, the persisted form). Nonzero at an epoch start
+        # — seeded here on resume, or left over from a mid-epoch max_steps return
+        # — makes fit() skip that prefix instead of re-training it.
+        self._epoch_batch = start_batch
+        self._epoch_samples = start_samples
         self.last_metrics: Dict[str, Any] = {}
 
     def fit(
         self, data: Iterable[TrainBatch], eval_data: Optional[Iterable] = None
     ) -> int:
+        if self.max_steps is not None and self.global_step >= self.max_steps:
+            logger.info(
+                "fit: global_step=%d already at max_steps=%d; nothing to train",
+                self.global_step,
+                self.max_steps,
+            )
+            return self.global_step
         module = self.core.strategy.trainable_module()
         module.train()
+        # Rank0-broadcast once: a rank-local eval_data view must not let ranks
+        # enter or skip the evaluator's collectives alone.
+        eval_enabled = self._rank0_decision(eval_data is not None)
         pending_ack: List[str] = []
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
                 data.set_epoch(epoch)
-            for batch in data:
+            stream: Iterable[TrainBatch] = data
+            skip = self._epoch_batch
+            if skip:
+                if hasattr(data, "seek"):
+                    data.seek(skip)
+                else:
+                    it = iter(data)
+                    consumed = sum(1 for _ in itertools.islice(it, skip))
+                    if consumed < skip:
+                        raise ValueError(
+                            f"resume position skips past the end of the data: "
+                            f"epoch {epoch} yielded only {consumed} batches, "
+                            f"cannot skip {skip}"
+                        )
+                    stream = it
+            for batch in stream:
+                self._epoch_batch += 1
+                self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
@@ -217,54 +244,109 @@ class TrainerController:
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     self.logger(result.metrics, self.global_step)
+                eval_metrics: Optional[Dict[str, Any]] = None
                 if (
                     self.eval_interval
-                    and eval_data is not None
+                    and eval_enabled
                     and self.global_step % self.eval_interval == 0
                 ):
-                    self.evaluate(eval_data)
+                    eval_metrics = self.evaluate(eval_data)
                     module.train()
-                if self.save_interval and self.global_step % self.save_interval == 0:
+                    if eval_metrics:
+                        if self.logger:
+                            self.logger(eval_metrics, self.global_step)
+                        self.last_metrics = {**self.last_metrics, **eval_metrics}
+                # is_better is a collective (rank0 verdict broadcast inside the
+                # manager); its guard is rank-identical because eval_metrics is
+                # DP-reduced. Empty ({}) eval metrics skip best entirely.
+                interval_hit = bool(
+                    self.save_interval and self.global_step % self.save_interval == 0
+                )
+                is_best = bool(
+                    self.save_interval
+                    and eval_metrics
+                    and self._checkpoint_manager().is_better(eval_metrics)
+                )
+                if interval_hit or is_best:
                     self.save_checkpoint(self.global_step)
+                if is_best:
+                    self._checkpoint_manager().update_best(
+                        self.global_step, eval_metrics
+                    )
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
+            self._epoch_batch = 0
+            self._epoch_samples = 0
         return self.global_step
 
     @torch.no_grad()
-    def evaluate(self, data: Iterable[TrainBatch]) -> Dict[str, float]:
+    def evaluate(self, data: Optional[Iterable[TrainBatch]]) -> Dict[str, Any]:
+        """Full-pass eval via :class:`Evaluator`: rank-identical ``eval/*``
+        metrics, ``{}`` when zero batches were processed globally. ``data=None``
+        (empty local shard) still joins the evaluator's collectives."""
+        from specforge.eval import Evaluator
+
         module = self.core.strategy.trainable_module()
         module.eval()
-        agg: Dict[str, list] = {}
-        n = 0
-        for batch in data:
-            rep = self.core.eval_step(batch)
-            n += 1
-            for k, v in rep.metrics.items():
-                if isinstance(v, (int, float)):
-                    agg.setdefault(k, []).append(v)
-        return {k: sum(vs) / len(vs) for k, vs in agg.items() if vs}
+        # Same StepContext as the train path so schedule-dependent losses
+        # (Domino's lambda_base) evaluate at the live step, not at step 0.
+        ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
+        return Evaluator().run(
+            lambda batch: self.core.strategy.forward_loss(batch, ctx), data
+        )
+
+    @staticmethod
+    def _rank0_decision(flag: bool) -> bool:
+        """Broadcast rank0's verdict so a collective-bearing branch is entered by
+        every rank or by none."""
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() == 1
+        ):
+            return bool(flag)
+        verdict = [bool(flag)]
+        torch.distributed.broadcast_object_list(verdict, src=0)
+        return bool(verdict[0])
+
+    def _checkpoint_manager(self):
+        # Lazily built in its S-home so the runtime seam does not import the domain
+        # layer at module load (mirrors _assemble_trainer's lazy Trainer import).
+        if self._checkpoint_mgr is None:
+            from specforge.training.checkpoint import CheckpointManager
+
+            self._checkpoint_mgr = CheckpointManager(self.output_dir, self.run_id)
+        return self._checkpoint_mgr
 
     def save_checkpoint(self, step: int) -> Checkpoint:
-        ckpt_dir = os.path.join(self.output_dir, f"{self.run_id}-step{step}")
-        is_rank0 = (
-            not torch.distributed.is_initialized()
-        ) or torch.distributed.get_rank() == 0
-        full_state = self.core.backend.state_dict()
-        draft_state = self.core.strategy.checkpoint_state_filter(full_state)
-        if is_rank0:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(
-                {
-                    "draft_state_dict": draft_state,
-                    "global_step": step,
-                    "epoch": self.epoch,
-                    "strategy": self.core.strategy.name,
-                    "run_id": self.run_id,
-                },
-                os.path.join(ckpt_dir, "training_state.pt"),
-            )
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        # Every rank participates: the FSDP FULL_STATE_DICT gather is a
+        # collective, and the optimizer/RNG parts are rank-local so every rank
+        # persists its own (the manager writes the shared payload on rank0 only).
+        full = self.core.backend.state_dict()
+        mgr = self._checkpoint_manager()
+        shared = None
+        if mgr.is_rank0():
+            shared = {
+                "draft_state_dict": self.core.strategy.checkpoint_state_filter(
+                    full["model"]
+                ),
+                "global_step": step,
+                "epoch": self.epoch,
+                "epoch_batch": self._epoch_batch,
+                "epoch_samples": self._epoch_samples,
+                "strategy": self.core.strategy.name,
+                "run_id": self.run_id,
+                "world_size": (
+                    torch.distributed.get_world_size()
+                    if torch.distributed.is_initialized()
+                    else 1
+                ),
+                **self.checkpoint_extra,
+            }
+        ckpt_dir = mgr.save(
+            shared,
+            step,
+            rank_state={"optimizer": full["optimizer"], "rng": full["rng"]},
+        )
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
             global_step=step,

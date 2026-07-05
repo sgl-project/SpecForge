@@ -8,16 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """FeatureDataLoader: ``SampleRef`` + ``FeatureStore`` -> ``TrainBatch``.
 
-The loader is the one place the online/offline difference is erased: it leases
-refs from a queue, fetches their tensors from the store, normalizes each sample
-(an injectable ``per_sample_transform``), collates a batch (an injectable
-``collate_fn``), and emits a ``TrainBatch``. Because both transform and collate
-are injected, the loader carries no model knowledge and is unit-testable on CPU;
-the offline-EAGLE3 run injects the existing ``OfflineEagle3Dataset.process_data``
-and ``DataCollatorWithPadding`` so the result is bit-identical to today's path.
-
-clone-on-fetch is the default: the loader clones tensors out of the store and
-releases the store handle immediately, so prefetch can never race a release.
+Leases refs (consume-once queue or re-iterable ref list), applies the injected
+per-sample transform and collate, and yields ``TrainBatch``es — no model
+knowledge. clone-on-fetch (default) clones tensors out of the store and releases
+the handle immediately, so prefetch can never race a release.
 """
 
 from __future__ import annotations
@@ -56,10 +50,6 @@ class FeatureDataLoader:
         strategy: str = "eagle3",
         ack: bool = True,
     ) -> None:
-        # Two iteration modes, reflecting that online and offline differ in
-        # *iteration* even though they converge at SampleRef:
-        #   - queue: a consume-once stream (online rollout produces over time)
-        #   - refs:  a fixed set, re-iterable across epochs (offline manifest)
         if (queue is None) == (refs is None):
             raise ValueError(
                 "provide exactly one of `queue` (stream) or `refs` (re-iterable)"
@@ -75,6 +65,7 @@ class FeatureDataLoader:
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack
+        self._seek_batches = 0
 
     def _validate_refs(self, refs: List[SampleRef]) -> None:
         strategies = {ref.strategy for ref in refs}
@@ -153,13 +144,40 @@ class FeatureDataLoader:
             yield from self._iter_queue()
 
     def _iter_refs(self) -> Iterator[TrainBatch]:
-        # Offline: a fixed ref set, re-iterable every epoch. Acking (durable
-        # marker) is the trainer's job via its ack callback, not the loader's.
-        for start in range(0, len(self._refs), self.batch_size):
+        # Acking (the durable marker) is the trainer's job here, not the loader's.
+        skip, self._seek_batches = self._seek_batches, 0
+        for start in range(skip * self.batch_size, len(self._refs), self.batch_size):
             chunk = self._refs[start : start + self.batch_size]
             if self.drop_last and len(chunk) < self.batch_size:
                 break
             yield self._make_batch(chunk)
+
+    def seek(self, num_batches: int) -> None:
+        """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
+
+        Raises on a queue stream (no position to restore — online resume
+        reconciles via the control plane) and when the skip exceeds the available
+        batches (a silently empty epoch is banned).
+        """
+        if self._refs is None:
+            raise ValueError(
+                "seek() applies to refs mode only; a queue stream is consume-once "
+                "(online resume goes through the control plane's skip_ids "
+                "reconciliation, not a loader seek)"
+            )
+        skip = max(0, int(num_batches))
+        if self.drop_last:
+            available = len(self._refs) // self.batch_size
+        else:
+            available = -(-len(self._refs) // self.batch_size)
+        if skip > available:
+            raise ValueError(
+                f"seek({num_batches}) skips past the end of the data: only "
+                f"{available} batches available ({len(self._refs)} refs at "
+                f"batch_size={self.batch_size}, drop_last={self.drop_last}); "
+                f"the resume position does not fit this dataset"
+            )
+        self._seek_batches = skip
 
     def _iter_queue(self) -> Iterator[TrainBatch]:
         while True:
@@ -167,8 +185,7 @@ class FeatureDataLoader:
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
-                # Incomplete trailing batch: fail-retryable so it is not lost,
-                # then stop (mirrors DataLoader(drop_last=True) per epoch pass).
+                # fail-retryable so the incomplete trailing batch is not lost
                 self.queue.fail(refs, reason="drop_last", retryable=True)
                 return
             try:
