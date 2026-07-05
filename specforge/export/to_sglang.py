@@ -30,6 +30,9 @@ from specforge.export.checkpoint_io import materialize_draft, resolve_training_s
 #: per-architecture trainer-key -> serving-key renames ({} = identity).
 WEIGHT_MAPS: Dict[str, Dict[str, str]] = {
     "LlamaForCausalLMEagle3": {},
+    # MLA (DeepSeek) eagle3 draft: the trainer keys already match the sglang
+    # serving names (see docs/export_weight_map_mla.md); identity map.
+    "DeepseekV3ForCausalLMEagle3": {},
 }
 
 #: keys the sglang EAGLE3 spec-decoder loader requires in a draft checkpoint.

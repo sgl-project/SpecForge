@@ -33,6 +33,7 @@ from specforge.inference.target_engine.dflash_target_model import (
     get_dflash_target_model,
 )
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.registry import DRAFT_REGISTRY
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -221,7 +222,16 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    # Resolve the draft architecture from the config's `architectures` via the
+    # draft registry (e.g. DeepseekDFlashDraftModel for the MLA variant),
+    # falling back to the standard Qwen3-style DFlash draft.
+    archs = getattr(draft_config, "architectures", None) or []
+    if len(archs) == 1 and archs[0] in DRAFT_REGISTRY:
+        draft_cls = DRAFT_REGISTRY[archs[0]]
+        print_on_rank0(f"Resolved draft architecture: {archs[0]}")
+    else:
+        draft_cls = DFlashDraftModel
+    draft_model = draft_cls(draft_config).to(device=device, dtype=torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -327,15 +337,19 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
 
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
+            # Copy the draft's own modeling source next to the checkpoint so it
+            # is self-describing (dflash.py for the Qwen3-style draft,
+            # deepseek_dflash.py for the MLA draft, ...).
+            modeling_module = type(draft_model).__module__.split(".")[-1]
             modeling_src = os.path.join(
                 os.path.dirname(__file__),
                 "..",
                 "specforge",
                 "modeling",
                 "draft",
-                "dflash.py",
+                f"{modeling_module}.py",
             )
-            modeling_dst = os.path.join(save_dir, "dflash.py")
+            modeling_dst = os.path.join(save_dir, f"{modeling_module}.py")
             if os.path.exists(modeling_src):
                 shutil.copy(modeling_src, modeling_dst)
 
@@ -385,6 +399,9 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    device = get_local_device()
+    device_type = device.type
+
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
@@ -407,7 +424,7 @@ def main():
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DFlashDraftModel.from_pretrained(
+        loaded_model = type(draft_model).from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
