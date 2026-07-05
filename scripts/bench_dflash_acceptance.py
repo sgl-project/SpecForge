@@ -39,6 +39,9 @@ from specforge.modeling.draft.registry import DRAFT_REGISTRY
 
 
 def load_draft(checkpoint: str, device, dtype):
+    import os
+
+    from safetensors.torch import load_file
     from transformers import AutoConfig
 
     cfg = AutoConfig.from_pretrained(checkpoint)
@@ -46,7 +49,16 @@ def load_draft(checkpoint: str, device, dtype):
     assert archs and archs[0] in DRAFT_REGISTRY, f"unknown draft arch {archs}"
     cls = DRAFT_REGISTRY[archs[0]]
     cfg._attn_implementation = "sdpa"
-    model = cls.from_pretrained(checkpoint, config=cfg, torch_dtype=dtype)
+    # Manual state-dict load (NOT from_pretrained): the hand-rolled MLA
+    # PreTrainedModel subclass silently returns fresh-init weights through
+    # transformers 5.x from_pretrained (keys match but values are re-init), so
+    # load the safetensors directly — keys match the model exactly.
+    model = cls(cfg)
+    sd = load_file(os.path.join(checkpoint, "model.safetensors"))
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    assert not missing and not unexpected, (
+        f"state-dict mismatch: missing={missing[:5]} unexpected={unexpected[:5]}"
+    )
     return model.to(device=device, dtype=dtype).eval(), archs[0]
 
 
