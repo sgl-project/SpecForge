@@ -10,7 +10,7 @@
 
 The named builders span the topology axis (offline vs online, colocated vs
 disaggregated); the draft model is the ``strategy=`` parameter, resolved to a
-:class:`StrategySpec` (``specforge.runtime.training.registry``) — adding a model
+:class:`StrategySpec` (``specforge.training.strategies.registry``) — adding a model
 is a registry entry, not a new ``build_*`` family.
 """
 
@@ -29,7 +29,7 @@ from specforge.runtime.control_plane.metadata_store import (
     SQLiteMetadataStore,
 )
 from specforge.runtime.data_plane import FeatureStore, LocalFeatureStore
-from specforge.runtime.training.registry import StrategySpec, resolve_strategy
+from specforge.training.strategies.registry import StrategySpec, resolve_strategy
 
 # ---------------------------------------------------------------------------
 # Shared assemblers — strategy- and topology-agnostic.
@@ -109,7 +109,7 @@ def _offline_io(spec: StrategySpec, max_len: int):
             f"offline data path for strategy {spec.name!r} is not wired yet: its "
             f"StrategySpec needs make_offline_transform + make_offline_collate "
             f"(DFlash/Domino use their own feature schema). See "
-            f"specforge.runtime.training.registry."
+            f"specforge.training.strategies.registry."
         )
     return spec.make_offline_collate(), spec.make_offline_transform(max_len)
 
@@ -122,7 +122,7 @@ def _online_collate(spec: StrategySpec, collate_fn):
         raise NotImplementedError(
             f"online data path for strategy {spec.name!r} is not wired yet: its "
             f"StrategySpec needs make_online_collate (or pass an explicit collate_fn). "
-            f"See specforge.runtime.training.registry."
+            f"See specforge.training.strategies.registry."
         )
     return spec.make_online_collate()
 
@@ -190,8 +190,8 @@ def _assemble_rollout_workers(
             f"a {spec.name} capture adapter. Set make_adapter + supports_online=True "
             f"on its StrategySpec."
         )
-    from specforge.runtime.inference.capture import CaptureConfig
-    from specforge.runtime.inference.rollout_worker import RolloutWorker
+    from specforge.inference.capture import CaptureConfig
+    from specforge.inference.rollout_worker import RolloutWorker
 
     if aux_hidden_state_layer_ids is None:
         aux_hidden_state_layer_ids = tuple(
@@ -200,7 +200,7 @@ def _assemble_rollout_workers(
     if spec.make_adapter is not None:
         adapter = spec.make_adapter(target_model, device=device, t2d=t2d)
     else:
-        from specforge.runtime.inference.sglang_adapter import SGLangAdapter
+        from specforge.inference.adapters.eagle3 import SGLangAdapter
 
         adapter = SGLangAdapter(target_model, device=device, t2d=t2d)
     capture = CaptureConfig.from_strategy(
@@ -272,7 +272,7 @@ def build_offline_runtime(
         raise NotImplementedError(
             f"offline data path for strategy {spec.name!r} is not wired yet: its "
             f"StrategySpec needs make_offline_reader. See "
-            f"specforge.runtime.training.registry."
+            f"specforge.training.strategies.registry."
         )
     collate_fn, per_sample_transform = _offline_io(spec, max_len)
     controller, durable_ack = build_control_plane_for_mode(

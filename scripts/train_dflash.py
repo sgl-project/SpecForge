@@ -28,11 +28,11 @@ from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.target.dflash_target_model import (
+from specforge.inference.target_engine.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
 )
+from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker

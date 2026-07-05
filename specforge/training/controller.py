@@ -25,8 +25,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import torch
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.runtime.training.backend import TrainingBackend
-from specforge.runtime.training.strategy import (
+from specforge.training.backend import TrainingBackend
+from specforge.training.strategies.base import (
     DraftTrainStrategy,
     StepContext,
     StepOutput,

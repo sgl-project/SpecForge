@@ -134,7 +134,7 @@ def main():
     if online:
         # `strategy=` selects the draft model (here eagle3); the runtime resolves
         # its StrategySpec. The topology is the builder; the model is a parameter.
-        from specforge.runtime.launch import build_online_runtime
+        from specforge.launch import build_online_runtime
 
         # Online target produces features in-loop (any backend exposing
         # generate_eagle3_data — HF or SGLang). is_online=True returns the model.
@@ -171,7 +171,7 @@ def main():
         print(f"[online] rollout produced {produced} samples", flush=True)
         trainer.fit(loader)
     else:
-        from specforge.runtime.launch import build_offline_runtime
+        from specforge.launch import build_offline_runtime
 
         target_head, _ = build_target_model(args, draft_config, is_online=False)
         trainer, loader = build_offline_runtime(

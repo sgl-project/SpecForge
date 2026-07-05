@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
 from specforge.distributed import init_distributed
-from specforge.modeling.target.eagle3_target_model import (
+from specforge.inference.target_engine.eagle3_target_model import (
     CustomEagle3TargetModel,
     HFEagle3TargetModel,
     SGLangEagle3TargetModel,
