@@ -59,7 +59,16 @@ try:  # canonical location since transformers ~4.53
 except ImportError:  # pragma: no cover - older layouts
     from transformers.models.qwen3.modeling_qwen3 import GradientCheckpointingLayer
 
-from transformers.modeling_utils import PreTrainedModel
+# Base off the DeepSeek pretrained-model class (as the Qwen3-style DFlash draft
+# bases off Qwen3PreTrainedModel) so transformers' from_pretrained weight
+# loading works — a bare PreTrainedModel subclass silently re-inits weights on
+# load in transformers 5.x. Fall back to the generic base on older layouts.
+try:
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3PreTrainedModel as _DFlashMLABase,
+    )
+except ImportError:  # pragma: no cover - older layouts
+    from transformers.modeling_utils import PreTrainedModel as _DFlashMLABase
 
 from specforge.modeling.draft.deepseek_eagle3 import (
     _rope_config_get,
@@ -330,7 +339,7 @@ class DeepseekDFlashDecoderLayer(GradientCheckpointingLayer):
 
 
 @register_draft
-class DeepseekDFlashDraftModel(PreTrainedModel):
+class DeepseekDFlashDraftModel(_DFlashMLABase):
     """MLA (DeepSeek/Kimi family) DFlash draft on the unchanged DFlash surface."""
 
     config_class = DeepseekV3Config
