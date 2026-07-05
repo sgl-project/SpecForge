@@ -337,10 +337,26 @@ class DeepseekDFlashDraftModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["DeepseekDFlashDecoderLayer"]
+    # The forward always uses torch SDPA; declare it so PreTrainedModel's attn
+    # validation accepts a config with `_attn_implementation="sdpa"`. The other
+    # flags keep construction from failing, but only sdpa is actually wired —
+    # __init__ raises for anything else (flex/fa need MLA-shaped kernels).
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
+    _supports_attention_backend = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
+        attn_impl = getattr(config, "_attn_implementation", None)
+        if attn_impl not in (None, "sdpa", "eager"):
+            raise ValueError(
+                f"DeepseekDFlashDraftModel supports the 'sdpa' attention backend "
+                f"only, got {attn_impl!r}. flex/fa need an MLA-shaped kernel "
+                f"treatment (asymmetric q/k vs v head dims); pass "
+                f"--attention-backend sdpa."
+            )
         self.layers = nn.ModuleList(
             [
                 DeepseekDFlashDecoderLayer(config, layer_idx)
