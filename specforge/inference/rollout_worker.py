@@ -11,10 +11,10 @@
 The worker is deliberately small and strategy-agnostic: it leases prompt tasks,
 asks a ``feature_source`` (e.g. a wrapper over the target model's
 ``generate_eagle3_data``, or ``SGLangAdapter``) for per-sample features,
-verifies them against the typed ``CaptureConfig`` *before* writing, writes them
+verifies them against the typed ``FeatureContract`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. It never hands a tensor to the controller. Strategy-specific capture
-requirements live in ``CaptureConfig`` + the feature schema, not here.
+requirements live in ``FeatureContract`` + the feature schema, not here.
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Protocol
 
 from specforge.inference.capture import (
-    CaptureConfig,
-    CaptureMismatchError,
-    verify_capture,
+    FeatureContract,
+    FeatureContractError,
+    verify_feature_contract,
 )
 from specforge.runtime.contracts import PromptTask, SampleRef
 
@@ -34,7 +34,7 @@ HEALTH_STATES = ("starting", "ready", "paused", "draining", "unhealthy", "stoppe
 
 class FeatureSource(Protocol):
     def generate_features(
-        self, tasks: List[PromptTask], *, capture: CaptureConfig
+        self, tasks: List[PromptTask], *, capture: FeatureContract
     ) -> List[Dict[str, Any]]: ...
 
 
@@ -44,7 +44,7 @@ class RolloutWorker:
         controller,
         feature_store,
         feature_source: FeatureSource,
-        capture: CaptureConfig,
+        capture: FeatureContract,
         *,
         run_id: str,
         worker_id: Optional[str] = None,
@@ -56,7 +56,9 @@ class RolloutWorker:
         self.controller = controller
         self.feature_store = feature_store
         self.feature_source = feature_source
-        self.capture = capture
+        self.feature_contract = capture
+        # Back-compat for code/tests that read RolloutWorker.capture directly.
+        self.capture = self.feature_contract
         self.run_id = run_id
         self.strategy = strategy
         self.target_model_version = target_model_version
@@ -90,7 +92,7 @@ class RolloutWorker:
         self._state = "ready"
         try:
             feats_list = self.feature_source.generate_features(
-                tasks, capture=self.capture
+                tasks, capture=self.feature_contract
             )
         except Exception as exc:  # rollout failure before any feature write
             self._state = "unhealthy"
@@ -120,18 +122,18 @@ class RolloutWorker:
             raise ValueError(reason)
 
         refs: List[SampleRef] = []
-        capture_error: Optional[CaptureMismatchError] = None
+        capture_error: Optional[FeatureContractError] = None
         for task, feats in zip(tasks, feats_list):
             sample_id = self._sample_id(task)
             recorded = feats.pop("__aux_layer_ids__", None)
             try:
-                verify_capture(
+                verify_feature_contract(
                     feats,
-                    self.capture,
+                    self.feature_contract,
                     sample_id=sample_id,
                     recorded_aux_layer_ids=recorded,
                 )
-            except CaptureMismatchError as exc:
+            except FeatureContractError as exc:
                 # Loud failure: do not persist a corrupt sample, but keep this
                 # batch's other prompt leases moving so no lease is stranded.
                 self._recent_failures.append(str(exc))
@@ -169,9 +171,9 @@ class RolloutWorker:
             "run_id": self.run_id,
             "source_task_id": task.task_id,
             "strategy": self.strategy,
-            "target_repr": self.capture.target_repr,
-            "vocab_map_version": self.capture.vocab_map_version,
-            "ttt_length": self.capture.extra.get("ttt_length"),
+            "target_repr": self.feature_contract.target_repr,
+            "vocab_map_version": self.feature_contract.vocab_map_version,
+            "ttt_length": self.feature_contract.extra.get("ttt_length"),
             "target_model_version": self.target_model_version,
             "tokenizer_version": self.tokenizer_version,
             "draft_weight_version": self.draft_weight_version,

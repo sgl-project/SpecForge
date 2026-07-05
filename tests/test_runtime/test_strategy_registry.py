@@ -32,11 +32,12 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertEqual(
             spec.required_features, frozenset(DFlashTrainStrategy.required_features)
         )
-        # offline (reader/transform/collate) + online (adapter) both wired
+        # offline (reader/transform/collate) + online (feature schema) both wired
         self.assertIsNotNone(spec.make_offline_reader)
         self.assertIsNotNone(spec.make_offline_transform)
         self.assertIsNotNone(spec.make_offline_collate)
-        self.assertIsNotNone(spec.make_adapter)
+        self.assertIsNotNone(spec.feature_schema)
+        self.assertIsNone(spec.feature_schema.target_feature)  # no target distribution
         self.assertTrue(spec.supports_online)
         # DFlash owns its own (frozen) head -> builders pass target_head=None
         self.assertFalse(spec.uses_target_head)
@@ -50,7 +51,7 @@ class TestStrategyRegistry(unittest.TestCase):
 
     def test_required_features_track_the_strategy_class(self):
         # The registry's required_features is the single source of truth wired
-        # into CaptureConfig.from_strategy + loader validation; it must equal the
+        # into FeatureContract.from_strategy + loader validation; it must equal the
         # strategy class's own declaration.
         self.assertEqual(
             resolve_strategy("eagle3").required_features,
