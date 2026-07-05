@@ -108,6 +108,19 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         The backbone of the draft model.
         """
 
+    @property
+    def all_tied_weights_keys(self) -> dict:
+        """Compat shim: newer transformers' from_pretrained finalize path reads
+        this unconditionally, and older transformers don't define it on
+        PreTrainedModel. Draft models never tie weights (tie_word_embeddings is
+        forced False by AutoDraftModelConfig), so this is normally empty."""
+        tied = getattr(self, "_tied_weights_keys", None)
+        if not tied:
+            return {}
+        if isinstance(tied, dict):
+            return tied
+        return {k: k for k in tied}
+
     def freeze_embedding(self) -> None:
         """
         Freeze the embeddings of the draft model so that they are not updated during training.
