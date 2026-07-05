@@ -35,8 +35,8 @@ except the draft class.
 | Target | `deepseek-ai/DeepSeek-V2-Lite` (16 heads, kv_lora 512, qk_nope 128, qk_rope 64, v_head 128, 27 layers, YaRN; loaded **native** in transformers 5.12.1, HF backend) |
 | MLA draft | `DeepseekDFlashDraftModel`, 3 layers, block 8, `target_layer_ids` [1,12,24], sdpa — `configs/deepseek-v2-lite-dflash.json` |
 | non-MLA draft | `DFlashDraftModel` (Qwen3 GQA), 3 layers, block 8, `target_layer_ids` [1,12,24], sdpa — `configs/deepseek-v2-lite-dflash-baseline.json` |
-| Data | Nemotron-Post-Training-v2 (`nemotron_400.jsonl`, 400 rows), `deepseek-v2` chat template (added — V2-Lite renders plain-text `User:`/`Assistant:`, not the `<｜Assistant｜>` tokens the `deepseek-v3` template expects) |
-| Schedule | 300 steps, batch 1, accum 1, max-len 2048, num-anchors 128, lr 6e-4, seed 0, `mask_token_id` 100002 |
+| Data | Nemotron-Post-Training-v2 (`nemotron_train3k.jsonl`, 3000 rows train → 2887 samples; `nemotron_eval60.jsonl` held out for acceptance), `deepseek-v2` chat template (added — V2-Lite renders plain-text `User:`/`Assistant:`, not the `<｜Assistant｜>` tokens the `deepseek-v3` template expects) |
+| Schedule | 4000 steps, batch 1, accum 1, max-len 2048, num-anchors 128, lr 6e-4, seed 0, `mask_token_id` 100002 |
 | Hardware | 1×H200 per run (sci-h200 pod), colocated (target capture + draft train in one process) |
 | Capture | identical for both: concat of target hidden states at layers [1,12,24] → fc(6144→2048) |
 
@@ -56,53 +56,70 @@ Both drafts consume the **same** captured DeepSeek-V2-Lite features (identical
 - `test_dflash_launch.py`, `test_dflash_online_launch.py` (non-MLA regression):
   **PASS**.
 
-## Results
+## Results — training
 
 Both drafts train through the identical `OnlineDFlashModel` spine on identical
-captured DeepSeek-V2-Lite features. 382 trainable samples, 300 steps, same
-throughput (**0.170 s/iter** on both). Loss is per-step (batch 1) so it is
-noisy; the mean over a 20-step window is the robust summary.
+captured DeepSeek-V2-Lite features, 4000 steps, same throughput
+(**~0.13 s/iter** on both). Loss is per-step (batch 1) so it's noisy; tail-50
+is the robust summary. The two track for ~2000 steps, then the GQA baseline
+pulls ahead.
 
-| Draft | params | loss step 1 | loss head-20 | loss tail-20 | acc tail-20 |
-|---|---|---|---|---|---|
-| non-MLA (`DFlashDraftModel`, Qwen3 GQA) | 264.7M | 33.49 | 22.96 | **8.65** | 0.047 |
-| MLA (`DeepseekDFlashDraftModel`) | 255.6M | 31.33 | 21.77 | **8.92** | 0.043 |
+| Draft | params | loss (step 100 → tail-50) | acc (step 100 → tail-50) |
+|---|---|---|---|
+| non-MLA (`DFlashDraftModel`, Qwen3 GQA) | 264.7M | 12.0 → **5.63** | 0.027 → **0.143** |
+| MLA (`DeepseekDFlashDraftModel`) | 255.6M | 11.8 → **6.49** | 0.015 → **0.075** |
 
-Both fall from ~22 (head-20 mean) to ~8.8 (tail-20 mean) over 300 steps — the
-MLA draft learns from real MLA-target features at the same rate as the standard
-draft. Per-step spot checks (loss / acc):
+Per-step accuracy over training (data-token acc): both climb off zero, but the
+GQA draft's accuracy roughly doubles the MLA draft's by step 4000
+(0.143 vs 0.075).
 
-| step | non-MLA (Qwen3 GQA) | MLA (DeepSeek) |
-|---|---|---|
-| 1 | 33.49 / 0.000 | 31.33 / 0.000 |
-| 50 | 13.68 / 0.002 | 13.52 / 0.002 |
-| 100 | 7.38 / 0.039 | 7.35 / 0.011 |
-| 150 | 8.77 / 0.051 | 8.65 / 0.057 |
-| 200 | 9.79 / 0.017 | 10.45 / 0.038 |
-| 300 | 6.75 / 0.021 | 7.51 / 0.050 |
+## Results — acceptance length
 
-The two curves interleave step-for-step (neither is consistently above the
-other), which is what "same algorithm, different draft attention" should look
-like: the draft architecture is not the bottleneck at this scale/step budget.
+The metric that matters for speculative decoding: run the real DFlash accept
+loop (draft proposes a block → target greedy-verifies → accept the matching
+prefix + 1 bonus) on 25 held-out prompts, greedy, via one cache-free harness
+for both drafts (`scripts/bench_dflash_acceptance.py`, adversarially reviewed).
+
+| Draft | mean accept length | max | accept-length histogram (blocks) |
+|---|---|---|---|
+| non-MLA (Qwen3 GQA) | **1.478** | 5 | 1:1032 · 2:409 · 3:103 · 4:35 · 5:10 |
+| MLA (DeepSeek) | **1.152** | 8 | 1:1791 · 2:173 · 3:64 · 8:1 |
+
+Both **accept** on a real MLA target — the MLA draft is end-to-end functional in
+speculative decoding (it proposes tokens the target verifies, occasionally a
+full 8-token block). At this 4000-step budget the GQA baseline accepts more
+(1.48 vs 1.15), tracking its higher training accuracy. Both are early/modest —
+a converged DFlash reaches ~2–4; this is a controlled architecture comparison,
+not a tuned draft.
 
 ## Takeaways
 
-- The MLA DFlash draft is **correct and trainable end-to-end** on a real MLA
+- The MLA DFlash draft is **correct and functional end-to-end** on a real MLA
   target (DeepSeek-V2-Lite): dataset → HF capture of layers [1,12,24] → MLA
-  context+noise attention (sdpa) → DFlash loss → optimizer step, on H200.
-- It **matches the standard Qwen3-GQA DFlash draft** in loss trajectory and
-  throughput on identical features — the compressed-KV / split-rope geometry
-  costs nothing here and slightly *reduces* parameters (255.6M vs 264.7M).
-- This mirrors the EAGLE3 two-axis result (`deepseek_eagle3.py` vs
-  `llama3_eagle.py`): the DFlash *algorithm* is unchanged; only the draft
-  *architecture* differs, resolved from the config through the draft registry.
+  context+noise attention (sdpa) → DFlash loss → optimizer step → speculative
+  decoding that **accepts tokens** (mean 1.15, up to 8/block), on H200.
+- At equal 4000-step training the **standard Qwen3-GQA draft outperforms it**
+  (acc 0.143 vs 0.075; accept 1.48 vs 1.15). The MLA geometry is not free here —
+  whether that's fundamental or a tuning gap (LR, the YaRN mscale carried into
+  the fresh draft, more steps) is the open question; the two track for the first
+  ~2000 steps before diverging.
+- Same EAGLE3 two-axis structure (`deepseek_eagle3.py` vs `llama3_eagle.py`):
+  the DFlash *algorithm* is unchanged; only the draft *architecture* differs,
+  resolved from the config through the draft registry.
+
+**Bug caught & fixed during this run.** The MLA draft's first acceptance run
+read exactly 1.0 (never accepted). Root cause: a hand-rolled `_init_weights` on
+the draft ran *after* transformers' weight load (it ignored the
+`_is_hf_initialized` guard), so `from_pretrained` silently returned a fresh-init
+model — the benchmark had loaded a random draft. Fixed by basing the draft on
+`DeepseekV3PreTrainedModel` and inheriting its guard-aware initializer;
+`from_pretrained` now round-trips (verified: `fc.weight` norm matches the
+checkpoint). This also un-breaks `--resume` for the MLA draft.
 
 **Scope / follow-ups.** sdpa training path only (flex/fa need MLA-shaped
-kernels); `spec_generate` (DynamicCache decode) not yet ported; 300-step
-demonstration run (not a converged draft); a longer run + a live-sglang
-acceptance gate are the natural next steps. Absolute accuracy is low because
-this is an early, short, batch-1 run — the loss trend, not the accuracy value,
-is the signal here.
+kernels); `spec_generate` (DynamicCache decode) not yet ported (the benchmark is
+cache-free); a longer/tuned run + a live-sglang
+acceptance gate are the natural next steps.
 
 ## Reproduction
 
@@ -110,25 +127,37 @@ Correctness gates first: `python -m pytest tests/test_runtime/test_mla_draft.py
 tests/test_runtime/test_dflash_mla.py` (GPU).
 
 ```bash
-# both runs (GPU 0 = MLA, GPU 1 = non-MLA), colocated HF backend, DeepSeek-V2-Lite
+# TRAIN both (GPU 0 = MLA, GPU 1 = non-MLA), colocated HF backend, DeepSeek-V2-Lite
 # is native in transformers 5.x so no --trust-remote-code needed:
 COMMON="--target-model-path deepseek-ai/DeepSeek-V2-Lite --target-model-backend hf \
-  --train-data-path nemotron_400.jsonl --chat-template deepseek-v2 \
+  --train-data-path nemotron_train3k.jsonl --chat-template deepseek-v2 \
   --max-length 2048 --batch-size 1 --learning-rate 6e-4 --attention-backend sdpa \
-  --num-anchors 128 --seed 0 --num-epochs 2 --max-num-steps 300 --log-interval 1 \
+  --num-anchors 128 --seed 0 --num-epochs 2 --max-num-steps 4000 --log-interval 5 \
   --save-interval 100000 --mask-token-id 100002"
 
 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nnodes 1 --nproc_per_node 1 \
   scripts/train_dflash.py $COMMON \
-  --draft-config-path configs/deepseek-v2-lite-dflash.json --output-dir out/mla
+  --draft-config-path configs/deepseek-v2-lite-dflash.json --output-dir out/mla_long
 
 CUDA_VISIBLE_DEVICES=1 torchrun --standalone --nnodes 1 --nproc_per_node 1 \
-  scripts/train_dflash.py $COMMON \
-  --draft-config-path configs/deepseek-v2-lite-dflash-baseline.json --output-dir out/base
+  scripts/train_dflash.py $COMMON --cache-dir cache_base \
+  --draft-config-path configs/deepseek-v2-lite-dflash-baseline.json --output-dir out/base_long
+
+# ACCEPTANCE-LENGTH benchmark (held-out prompts), one harness for both drafts:
+for d in mla base; do
+  python scripts/bench_dflash_acceptance.py \
+    --target-model-path deepseek-ai/DeepSeek-V2-Lite \
+    --draft-checkpoint out/${d}_long/epoch_2_step_4000 \
+    --eval-data-path nemotron_eval60.jsonl --chat-template deepseek-v2 \
+    --num-prompts 25 --max-new-tokens 96 --mask-token-id 100002 \
+    --json-out out/accept_${d}.json
+done
 ```
 
 > `mask_token_id 100002` is a valid embedding row that the V2-Lite tokenizer
 > never emits (its ids stop at 100001). The `deepseek-v2` chat template is
 > required — V2-Lite renders plain-text `User:`/`Assistant:`, which the
 > `deepseek-v3` template's `<｜Assistant｜>` header does not match (→ empty loss
-> masks → `total_steps 0`).
+> masks → `total_steps 0`). The draft's own modeling file is copied into each
+> checkpoint; the raw acceptance JSONs are in
+> [`data/`](data/dflash-mla-accept_mla.json).

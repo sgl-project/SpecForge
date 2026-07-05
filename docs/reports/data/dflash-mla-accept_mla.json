@@ -1,0 +1,42 @@
+{
+  "arch": "DeepseekDFlashDraftModel",
+  "checkpoint": "out/mla_long/epoch_2_step_4000",
+  "block_size": 8,
+  "n_prompts": 25,
+  "n_blocks": 2029,
+  "mean_accept_length": 1.1518,
+  "max_accept_length": 8,
+  "accept_length_hist": {
+    "1": 1791,
+    "2": 173,
+    "3": 64,
+    "8": 1
+  },
+  "per_prompt_mean": [
+    1.105,
+    1.319,
+    1.149,
+    1.08,
+    1.234,
+    1.079,
+    1.091,
+    1.044,
+    1.067,
+    1.044,
+    1.218,
+    1.267,
+    1.056,
+    1.157,
+    1.022,
+    1.357,
+    1.284,
+    1.067,
+    1.105,
+    1.159,
+    1.056,
+    1.557,
+    1.067,
+    1.462,
+    1.105
+  ]
+}
