@@ -559,7 +559,7 @@ def main():
             )
             hidden_states = target_output.hidden_states.to(device, non_blocking=True)
 
-            loss, accuracy = dflash_model(
+            loss, accuracy, _model_metrics = dflash_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,

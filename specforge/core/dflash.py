@@ -1,7 +1,7 @@
 # coding=utf-8
 """DFlash Training Wrapper."""
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -272,8 +272,9 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Parallel block-wise training forward pass."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Parallel block-wise training forward pass; returns
+        (loss, accuracy, metrics) — same shape as Domino's forward."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
@@ -389,7 +390,7 @@ class OnlineDFlashModel(nn.Module):
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
-            accuracy = correct.sum().float() / actual_token_count
+            accuracy_denom = binary_eval_mask.sum()
+            accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
 
-        return loss, accuracy
+        return loss, accuracy, {"accuracy_denom": accuracy_denom}

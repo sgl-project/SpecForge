@@ -8,20 +8,15 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-Currently implements ``FSDPTrainingBackend`` only. It carries a ``ParallelConfig``
-object (the device-mesh / parallel-group handles) rather than a bare FSDP
-module, so the existing FSDP + TP + Ulysses/Ring SP setup is preserved exactly.
-The backend does not re-derive parallelism — it reads the handles SpecForge's
-``init_distributed`` already created.
-
-``torch`` is imported at module load (fine without a GPU); ``specforge.distributed``
-and ``yunchang`` are imported lazily inside ``ParallelConfig.from_distributed`` so
-this module stays importable in a CPU-only environment.
+FSDP-only for now. ``ParallelConfig`` carries the parallel handles created by
+``init_distributed`` rather than re-deriving them; distributed imports stay
+lazy so the module is importable without a GPU.
 """
 
 from __future__ import annotations
 
 import abc
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -41,10 +36,8 @@ class ParallelConfig:
     sp_ring_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
     param_dtype: torch.dtype = torch.bfloat16
-    # opaque process-group / device-mesh handles (None in single-process).
-    # The full set is carried so TP + Ulysses/Ring SP survive the trainer split
-    # and a later reshard step has real handles to read — the parallelism is
-    # NOT re-derived here, only snapshotted from init_distributed.
+    # opaque process-group / device-mesh handles snapshotted from
+    # init_distributed, never re-derived (None in single-process).
     fsdp_process_group: Any = None
     dp_group: Any = None
     draft_dp_group: Any = None
@@ -70,12 +63,8 @@ class ParallelConfig:
         sharding_strategy: str = "SHARD_GRAD_OP",
         param_dtype: torch.dtype = torch.bfloat16,
     ) -> "ParallelConfig":
-        """Snapshot ALL parallel handles created by ``init_distributed``.
-
-        Captures the TP group + the Ulysses/Ring SP groups + both device meshes,
-        not just DP — so the backend genuinely carries the parallel layout. A
-        getter that is unexpectedly missing is logged, not silently swallowed.
-        """
+        """Snapshot all parallel handles (DP/TP/SP groups, device meshes) from
+        ``init_distributed``; a missing getter is logged, never silently skipped."""
         if not dist.is_initialized():
             return cls(
                 world_size=1,
@@ -134,7 +123,7 @@ class TrainingBackend(abc.ABC):
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
     @abc.abstractmethod
-    def backward(self, loss: torch.Tensor) -> None: ...
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None: ...
 
     @abc.abstractmethod
     def step(self) -> Optional[torch.Tensor]: ...
@@ -147,13 +136,9 @@ class TrainingBackend(abc.ABC):
 
 
 class FSDPTrainingBackend(TrainingBackend):
-    """FSDP1 backend mirroring today's SpecForge training math.
-
-    Wraps the composite module (e.g. ``OnlineEagle3Model``) in FSDP with
-    ``use_orig_params=True`` / bf16 mixed precision / ``SHARD_GRAD_OP`` over the
-    configured process group, while the optimizer targets the inner trainable
-    submodule (the draft model) — exactly as the legacy script.
-    """
+    """FSDP1 backend mirroring the legacy SpecForge training math: FSDP with
+    ``use_orig_params=True`` / bf16 mixed precision over the configured process
+    group, optimizer targeting the inner trainable submodule."""
 
     name = "fsdp"
 
@@ -176,12 +161,8 @@ class FSDPTrainingBackend(TrainingBackend):
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
     ) -> nn.Module:
-        """Register the trainable module, FSDP-wrapping it unless ``wrap=False``.
-
-        ``wrap=False`` registers the module without sharding (single-rank /
-        equivalence runs where FSDP would be a no-op) so ``state_dict`` and
-        ``step`` still work without changing the math.
-        """
+        """Register the trainable module, FSDP-wrapping it unless ``wrap=False``
+        (single-rank / equivalence runs where sharding would be a no-op)."""
         if not wrap:
             self.module = model
             self._wrapped = False
@@ -210,8 +191,16 @@ class FSDPTrainingBackend(TrainingBackend):
     def set_optimizer(self, optimizer) -> None:
         self.optimizer = optimizer
 
-    def backward(self, loss: torch.Tensor) -> None:
-        loss.backward()
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
+        """Backward one micro-step. FSDP reduce-scatters grads on every backward,
+        so non-boundary micro-steps run under ``no_sync()`` and the boundary
+        backward reduces the accumulated sum once — identical math, one
+        collective per optimizer step."""
+        if is_boundary or not self._wrapped:
+            loss.backward()
+        else:
+            with self.module.no_sync():
+                loss.backward()
 
     def step(self) -> Optional[torch.Tensor]:
         """Optimizer step + the distributed grad-norm reduction (run_backward_and_update)."""
@@ -230,19 +219,89 @@ class FSDPTrainingBackend(TrainingBackend):
         return grad_norm
 
     def state_dict(self) -> dict:
+        """Full training state ``{"model", "optimizer", "rng"}`` for resume.
+
+        ``model`` is gathered rank0-only with CPU offload (``{}`` on other ranks
+        when wrapped); ``optimizer``/``rng`` are rank-local and must be persisted
+        per rank — restoring rank0's copy everywhere corrupts the other ranks.
+        """
         if self.module is None:
             raise RuntimeError("state_dict called before prepare_model")
+        return {
+            "model": self._module_state_dict(),
+            "optimizer": (
+                self.optimizer.state_dict() if self.optimizer is not None else None
+            ),
+            "rng": self._rng_state(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore whichever of module weights / optimizer / RNG the state carries."""
+        if state.get("model") is not None:
+            self._load_module_state_dict(state["model"])
+        if self.optimizer is not None and state.get("optimizer") is not None:
+            self.optimizer.load_state_dict(state["optimizer"])
+        if state.get("rng") is not None:
+            self._set_rng_state(state["rng"])
+
+    def _full_state_ctx(self, state_dict_config=None):
+        """FULL_STATE_DICT context for a wrapped module; a no-op when unwrapped."""
         if not self._wrapped:
-            return self.module.state_dict()
+            return contextlib.nullcontext()
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import StateDictType
 
-        with FSDP.state_dict_type(self.module, StateDictType.FULL_STATE_DICT):
+        return FSDP.state_dict_type(
+            self.module, StateDictType.FULL_STATE_DICT, state_dict_config
+        )
+
+    def _module_state_dict(self) -> dict:
+        if not self._wrapped:
+            return self.module.state_dict()
+        from torch.distributed.fsdp import FullStateDictConfig
+
+        # gather to rank0 CPU only — materializing the full model on every
+        # rank's GPU is wasted memory when only rank0 writes it.
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with self._full_state_ctx(cfg):
             return self.module.state_dict()
 
-    def load_state_dict(self, state: dict) -> None:
-        if self.optimizer is not None and "optimizer_state_dict" in state:
-            self.optimizer.load_state_dict(state)
+    def _load_module_state_dict(self, model_state: dict) -> None:
+        # every rank loads the full state dict read from the shared file.
+        with self._full_state_ctx():
+            self.module.load_state_dict(model_state)
+
+    @staticmethod
+    def _rng_state() -> dict:
+        # single bound-device CUDA state keeps the checkpoint independent of
+        # how many devices happen to be visible at save time.
+        return {
+            "torch": torch.get_rng_state(),
+            "cuda": (
+                torch.cuda.get_rng_state(torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _set_rng_state(rng: dict) -> None:
+        cpu_state = rng.get("torch", rng.get("cpu"))  # "cpu" = legacy key
+        if cpu_state is not None:
+            torch.set_rng_state(cpu_state)
+        cuda_state = rng.get("cuda")
+        if cuda_state is None or not torch.cuda.is_available():
+            return
+        device = torch.cuda.current_device()
+        if isinstance(cuda_state, list):  # legacy get_rng_state_all format
+            if device >= len(cuda_state):
+                raise ValueError(
+                    f"legacy RNG checkpoint holds {len(cuda_state)} CUDA states "
+                    f"but this rank's bound device index is {device}; it was "
+                    "saved with fewer visible devices and cannot be restored here"
+                )
+            cuda_state = cuda_state[device]
+        torch.cuda.set_rng_state(cuda_state, device)
 
 
 __all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend"]

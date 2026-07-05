@@ -459,7 +459,8 @@ class OnlineDominoModel(nn.Module):
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
+            accuracy_denom = binary_eval_mask.sum()
+            actual_token_count = accuracy_denom + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
             metrics = self._compute_extra_metrics(
@@ -474,5 +475,6 @@ class OnlineDominoModel(nn.Module):
                 base_loss=base_loss,
                 lambda_base=lambda_base,
             )
+            metrics["accuracy_denom"] = accuracy_denom
 
         return loss, accuracy, metrics
