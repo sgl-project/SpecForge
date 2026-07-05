@@ -145,6 +145,13 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--max-num-steps",
+        type=int,
+        default=None,
+        help="Stop after this many optimizer steps (for short comparison runs). "
+        "None runs full epochs.",
+    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -552,7 +559,10 @@ def main():
     last_time = time.time()
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
+    stop_training = False
     for epoch in range(start_epoch, args.num_epochs):
+        if stop_training:
+            break
         train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
 
@@ -621,6 +631,13 @@ def main():
                 save_checkpoint(
                     args, epoch, global_step, dflash_model, draft_model, optimizer
                 )
+
+            if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                print_on_rank0(
+                    f"Reached max_num_steps={args.max_num_steps}; stopping."
+                )
+                stop_training = True
+                break
 
     save_checkpoint(
         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
