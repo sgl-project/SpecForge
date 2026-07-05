@@ -26,6 +26,35 @@ import torch
 CUDA = torch.cuda.is_available()
 
 
+def _make_batches(feat_dir, bs, ttt, nbatches):
+    """Assemble eagle3 offline TrainBatches from fixture feature files.
+
+    Mirrors the batch construction in test_checkpoint_resume (OfflineEagle3Dataset
+    -> DataCollatorWithPadding -> TrainBatch) so the ported MLA smoke drives the
+    unchanged Eagle3TrainStrategy exactly like the llama draft does.
+    """
+    from specforge.data.preprocessing import OfflineEagle3Dataset
+    from specforge.data.utils import DataCollatorWithPadding
+    from specforge.runtime.contracts import TrainBatch
+
+    files = sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir))
+    ds = OfflineEagle3Dataset(files, max_len=512)
+    collate = DataCollatorWithPadding()
+    out = []
+    for b in range(nbatches):
+        s = b * bs
+        data = collate([ds[j] for j in range(s, s + bs)])
+        out.append(
+            TrainBatch(
+                sample_ids=[str(j) for j in range(s, s + bs)],
+                strategy="eagle3",
+                tensors=dict(data),
+                metadata={"target_repr": "hidden_state", "ttt_length": ttt},
+            )
+        )
+    return out
+
+
 @unittest.skipUnless(CUDA, "MLA draft gates require CUDA")
 class TestMLADraft(unittest.TestCase):
     def test_suffix_cache_matches_causal_at_step0(self):
@@ -113,8 +142,6 @@ class TestMLADraft(unittest.TestCase):
             log_interval=1,
             logger=lambda m, s: losses.append(m["loss"]),
         )
-        from tests.test_runtime.test_checkpoint_resume import _make_batches
-
         step = ctrl.fit(_make_batches(feat_dir, BS, TTT, N // BS))
         self.assertEqual(step, 3)
         self.assertEqual(len(losses), 3)
