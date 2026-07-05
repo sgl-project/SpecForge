@@ -398,16 +398,11 @@ class DeepseekDFlashDraftModel(_DFlashMLABase):
             )
         self.post_init()
 
-    def _init_weights(self, module):
-        std = getattr(self.config, "initializer_range", 0.02)
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+    # NOTE: deliberately no custom `_init_weights` — inherit
+    # DeepseekV3PreTrainedModel's, which respects transformers' `_is_hf_initialized`
+    # guard. A custom unconditional initializer re-inits AFTER weight loading
+    # (transformers' final init_weights() pass), silently discarding the loaded
+    # checkpoint (from_pretrained then returns a fresh-init model).
 
     def forward(
         self,
