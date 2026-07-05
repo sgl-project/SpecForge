@@ -47,10 +47,7 @@ from transformers import AutoTokenizer
 
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.distributed import destroy_distributed, init_distributed
-from specforge.launch import (
-    build_disagg_online_consumer,
-    build_disagg_online_producer,
-)
+from specforge.launch import build_disagg_online_consumer, build_disagg_online_producer
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.runtime.data_plane.disaggregated import SharedDirFeatureStore
