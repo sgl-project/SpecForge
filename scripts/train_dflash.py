@@ -426,7 +426,7 @@ def evaluate(args, dflash_model, target_model, eval_dataloader, global_step, tra
         )
         hidden_states = target_output.hidden_states.cuda()
 
-        loss, accuracy = dflash_model(
+        loss, accuracy, _model_metrics = dflash_model(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
