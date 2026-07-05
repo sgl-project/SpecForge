@@ -21,6 +21,7 @@ from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
+from .registry import register_draft
 
 try:
     from flash_attn import flash_attn_varlen_func as _std_flash_attn_varlen_func
@@ -1624,6 +1625,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
+@register_draft
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
