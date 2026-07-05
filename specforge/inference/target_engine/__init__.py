@@ -1,5 +1,8 @@
-from specforge.inference.target_engine.base import KNOWN_BACKENDS, TargetEngine
-from specforge.inference.target_engine.eagle3_target_model import (
+# coding=utf-8
+"""Target engines: the backend-agnostic capture surface (TargetEngine + factory)."""
+
+from .base import KNOWN_BACKENDS, TargetEngine
+from .eagle3_target_model import (
     CustomEagle3TargetEngine,
     CustomEagle3TargetModel,
     Eagle3TargetEngine,
@@ -11,20 +14,13 @@ from specforge.inference.target_engine.eagle3_target_model import (
     SGLangServerEagle3TargetEngine,
     get_eagle3_target_model,
 )
-from specforge.inference.target_engine.factory import (
-    available_target_engines,
-    get_target_engine,
-)
-
-from .target_head import TargetHead
+from .factory import available_target_engines, get_target_engine
 
 __all__ = [
-    # Generic (Phase B) surface
     "TargetEngine",
     "KNOWN_BACKENDS",
     "get_target_engine",
     "available_target_engines",
-    # EAGLE3 engines
     "Eagle3TargetEngine",
     "SGLangEagle3TargetEngine",
     "HFEagle3TargetEngine",
@@ -36,11 +32,9 @@ __all__ = [
     "SGLangEagle3TargetModel",
     "HFEagle3TargetModel",
     "CustomEagle3TargetModel",
-    "TargetHead",
 ]
 
-# NOTE: the DFlash engines are intentionally NOT eagerly imported here — that
-# module imports sglang internals unconditionally, and this package must stay
-# importable without the pinned sglang. Import them from
-# specforge.inference.target_engine.dflash_target_model, or via
-# get_target_engine(strategy="dflash", ...).
+# NOTE: the DFlash engines (dflash_target_model) are intentionally NOT eagerly
+# imported here — that module imports sglang internals unconditionally, and this
+# package must stay importable without the pinned sglang. Import them from the
+# submodule, or via get_target_engine(strategy="dflash", ...).

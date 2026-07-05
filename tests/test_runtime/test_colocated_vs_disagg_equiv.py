@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Phase C gate: the control-plane mode must not change the training.
+"""Control-plane equivalence gate: the control-plane mode must not change the training.
 
 Trains the same eagle3 draft over the same offline features twice **through the
 same builder** (``build_offline_runtime``), varying only ``deployment_mode``:
@@ -10,8 +10,8 @@ store + optimizer-boundary ack). The per-step loss curves must be bit-identical
 the same result.
 
 Only the control plane differs; the data plane (LocalFeatureStore over the same
-file:// features) and the model weights are held constant, isolating the axis
-Phase C changes. The disagg leg additionally asserts the durable SQLite marker
+file:// features) and the model weights are held constant, isolating the
+control-plane axis. The disagg leg additionally asserts the durable SQLite marker
 was really written (the heavy plane was exercised, not silently bypassed).
 GPU-only. Run on the H200 box via rcli.
 """
@@ -32,9 +32,9 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29571")
 
+        from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
-        from specforge.runtime.launch import build_offline_runtime
 
         TTT, N, MAX_LEN = 3, 8, 512
         workdir = tempfile.mkdtemp(prefix="coloc_disagg_")

@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 import torch
 
-from specforge.runtime.training.strategy import DraftTrainStrategy, Eagle3TrainStrategy
+from specforge.training.strategies.base import DraftTrainStrategy, Eagle3TrainStrategy
 
 
 def concat_collate(feats: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -162,7 +162,7 @@ register_strategy(
 # and emits the same schema. The DFlashTrainStrategy already drops into the
 # unchanged TrainerCore/Backend/Loader.
 
-from specforge.runtime.training.strategy import DFlashTrainStrategy
+from specforge.training.strategies.base import DFlashTrainStrategy
 
 
 def _dflash_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
@@ -244,7 +244,7 @@ def _dflash_offline_collate():
 
 
 def _dflash_adapter(target_model, *, device="cuda", t2d=None):
-    from specforge.runtime.inference.dflash_adapter import DFlashAdapter
+    from specforge.inference.adapters.dflash import DFlashAdapter
 
     return DFlashAdapter(target_model, device=device, t2d=t2d)
 
@@ -273,7 +273,7 @@ register_strategy(
 # StepContext (forward_loss(batch, ctx)). That is the whole reason a new algorithm
 # needs anything beyond a spec entry here.
 
-from specforge.runtime.training.strategy import DominoTrainStrategy
+from specforge.training.strategies.base import DominoTrainStrategy
 
 
 def _domino_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):

@@ -27,10 +27,10 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+        from specforge.launch import build_online_runtime
         from specforge.modeling.target import get_target_engine
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import assert_no_tensors
-        from specforge.runtime.launch import build_online_runtime
 
         HIDDEN, V, SEQ, ACC, MAX_OPT_STEPS, N = 64, fx.V, 16, 2, 2, 8
         workdir = tempfile.mkdtemp(prefix="dflash_online_")
