@@ -8,30 +8,21 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Server-side spec-capture rollout source (zero-copy Mooncake transport).
 
-The in-process adapters (``PolicyFeatureAdapter``) run the frozen target
-locally and hand tensors to the RolloutWorker, which ``put()``s them into the
-FeatureStore. This module is the *server* transport: a live SGLang server —
-patched with ``patches/sglang/v0.5.14/spec-capture.patch`` and launched with
-``--enable-spec-capture`` — runs the prefill forward, captures aux/last hidden
-states, and writes them straight into the Mooncake store in
-:class:`MooncakeFeatureStore`'s zero-copy key layout. Feature tensors never
-travel through this process: the ``/generate`` response's
-``meta_info["spec_capture"]`` carries only key/shape/dtype metadata, from which
-:meth:`SGLangServerCaptureAdapter.produce_refs` builds committed-ready
-``SampleRef``s. One forward per sample, engine-side capture, RDMA-capable
-transport — the transport PR #641's reforward engine anticipated.
+The *server* transport (vs the in-process ``PolicyFeatureAdapter``): a live
+SGLang server patched with ``patches/sglang/v0.5.14/spec-capture.patch`` runs
+the prefill and writes captured features straight into Mooncake in
+:class:`MooncakeFeatureStore`'s key layout. Tensors never pass through this
+process — the ``/generate`` response's ``meta_info["spec_capture"]`` carries
+only key/shape/dtype, from which :meth:`SGLangServerCaptureAdapter.produce_refs`
+builds committed-ready ``SampleRef``s.
 
-Strategy-agnostic by construction: the server knows only two generic artifacts
-(``aux`` = concatenated capture layers, ``last_hidden`` = post-norm final
-hidden) plus verbatim passthrough tensors; *this* module maps them onto each
-strategy's feature names and shapes via :class:`ServerCaptureSchema`
-(eagle3 / dflash / domino registered below; register new strategies with
-:func:`register_server_capture_schema`).
-
-EAGLE3 note: the server transport stores the target as the LAST HIDDEN STATE
-(``target_repr="hidden_state"``, the offline convention — the train strategy
-re-runs the frozen ``TargetHead``), never full logits: a (L, vocab) logits
-tensor would be ~50x the traffic of (L, hidden) for no training benefit.
+Strategy-agnostic: the server knows only generic artifacts (``aux`` = capture
+layers concatenated, ``last_hidden`` = post-norm final hidden) plus passthrough
+tensors; :class:`ServerCaptureSchema` maps them onto each strategy's feature
+names/shapes (eagle3 / dflash / domino below; add more via
+:func:`register_server_capture_schema`). eagle3 stores the target as the last
+hidden state (``target_repr="hidden_state"``, offline convention — the trainer
+re-runs the frozen ``TargetHead``), not logits (~50x the traffic).
 """
 
 from __future__ import annotations
@@ -52,15 +43,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ServerCaptureSchema:
-    """How one strategy's features map onto the server's capture artifacts.
+    """Maps a strategy's feature names onto the server's capture artifacts.
 
-    ``aux_feature`` / ``last_hidden_feature`` name the stored features that
-    receive the two engine-side artifacts (None = strategy doesn't want it).
-    ``passthrough`` lists ``(feature_name, payload_key, trailing_shape)`` for
-    small client-known tensors stored verbatim by the server; ``trailing_shape``
-    is appended after ``(1, L)`` — e.g. ``(1,)`` turns loss_mask into the
-    eagle3 ``(1, L, 1)`` convention. ``attention_mask_feature`` (optional) is
-    synthesized as all-ones by the client (PromptTasks are unpadded).
+    ``aux_feature`` / ``last_hidden_feature`` name the features fed by the two
+    engine artifacts (None = not wanted). ``passthrough`` is
+    ``(feature_name, payload_key, trailing_shape)`` for client tensors stored
+    verbatim (``trailing_shape`` is appended after ``(1, L)``).
+    ``attention_mask_feature`` is synthesized all-ones (PromptTasks are unpadded).
     """
 
     strategy: str

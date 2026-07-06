@@ -1,44 +1,40 @@
-"""Disaggregated ONLINE DFlash example: rollout/inference pool and trainer pool
-as separate processes that share only a filesystem mount.
+"""Disaggregated ONLINE DFlash example — real server-capture zero-copy transport.
 
-Online analogue of ``run_disagg_eagle3.py`` (which wires the *offline* seam). Here
-the target model is never precomputed to disk — the **producer** runs it live and
-streams captured features to the **consumer**, which trains the DFlash draft:
+Inference and training are fully decoupled processes that share only a Mooncake
+object store (RDMA-capable, no shared *data* mount):
 
-* **producer** (rollout / inference pool): builds the DFlash target engine and
-  drives ``build_disagg_online_producer`` — RolloutWorkers ``put()`` consume-once
-  features into a ``SharedDirFeatureStore`` and stream tensor-free ``SampleRef``s
-  through a ``StreamingRefChannel``. No draft, no optimizer.
-* **consumer** (training pool): builds the DFlash draft (``OnlineDFlashModel``) and
-  trains via ``build_disagg_online_consumer``, reading refs off the channel and
-  features from the shared store. The target model is never loaded here.
+* **producer** (inference pool): a live SGLang server — patched with
+  ``patches/sglang/v0.5.14/spec-capture.patch`` and launched with
+  ``--enable-spec-capture`` — runs the frozen Qwen3.6-27B target and writes the
+  captured DFlash context hidden states straight into Mooncake. This process is
+  a thin driver: it sends prompts through ``SGLangServerCaptureAdapter`` and
+  streams the resulting tensor-free ``SampleRef``s to the consumer. No target
+  weights, no draft, no GPU model here.
+* **consumer** (training pool): trains the DFlash draft (``OnlineDFlashModel``),
+  reading refs off the channel and features from Mooncake — zero re-copy.
 
-The two pools share a run-scoped SQLite metadata store (``DISAGG_DB``) so commits
-and consume-once acks land together, exactly as in a real two-node split.
+This replaces the old in-process producer (which loaded the 27B target locally
+and ran staged, since DFlash's HF capture is not thread-safe): the server does
+the capture, so a single prefill per prompt feeds training directly. It is the
+disaggregated sibling of ``examples/run_qwen3.6_27b_dflash_online.sh``.
 
-This mirrors ``scripts/train_dflash.py``'s model assembly (``build_models``, mask
-token, ``TargetEmbeddingsAndHead``, ``OnlineDFlashModel``) so the disaggregated
-curve is comparable to the colocated ``examples/run_qwen3.6_27b_dflash_online.sh``
-run. It runs **staged** (producer drains, then consumer trains): the interleaved
-single-process runner forwards the target in a thread, and DFlash's HF capture
-(``output_hidden_states=True``) trips transformers' non-thread-safe hook wrapper.
-
-Config comes from the environment so one wrapper can drive both pools; role is
-``DISAGG_ROLE`` (``producer``/``consumer``), or derived from ``RCLI_NODE_RANK``:
+Config is environment-driven so one wrapper drives both roles; role is
+``DISAGG_ROLE`` (``producer``/``consumer``) or derived from ``RCLI_NODE_RANK``:
 
     DISAGG_ROLE=producer|consumer      # else rank 0 -> producer, else consumer
-    DISAGG_STORE_ROOT=/root/disagg36   # shared *data* mount (both pools)
-    DISAGG_STORE_ID=qwen36-dflash-disagg   # producer/consumer must match
-    DISAGG_DB=/root/disagg36/run.db    # shared durable metadata store
-    DISAGG_MAX_PROMPTS=300             # cap the prompt pool (0 = all)
-    DISAGG_MAX_STEPS=150               # trainer max optimizer steps (0 = all)
-    DISAGG_LOG_INTERVAL=1              # per-step metric logging cadence
+    DISAGG_SERVER_URL=http://host:30000   # the patched SGLang server (producer)
+    DISAGG_STORE_ID=qwen36-dflash-disagg  # Mooncake key namespace (both roles)
+    DISAGG_REF_CHANNEL=/root/disagg/refs.jsonl   # tiny ref manifest (both roles)
+    DISAGG_DB=/root/disagg/run.db      # shared durable metadata store
+    DISAGG_MAX_PROMPTS=400             # cap the prompt pool (0 = all)
+    DISAGG_MAX_STEPS=0                 # trainer max optimizer steps (0 = all)
 
-W&B logging on the consumer is driven by ``train_dflash``'s tracker args
-(``--report-to wandb --wandb-project ... --wandb-name ...``); export
-``WANDB_API_KEY`` in the environment (never hard-code it).
+Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
+``examples/disagg/README.md``); the server sink reads the same ones, so both
+sides land on one master. Export ``WANDB_API_KEY`` for consumer W&B logging.
 """
 
+import json
 import os
 
 from accelerate.utils import set_seed
@@ -47,10 +43,11 @@ from transformers import AutoTokenizer
 
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.distributed import destroy_distributed, init_distributed
+from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
 from specforge.launch import build_disagg_online_consumer, build_disagg_online_producer
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
-from specforge.runtime.data_plane.disaggregated import SharedDirFeatureStore
+from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from specforge.tracker import create_tracker
 
@@ -64,25 +61,29 @@ def _role() -> str:
     return "producer" if os.environ.get("RCLI_NODE_RANK", "0") == "0" else "consumer"
 
 
-def _store_root() -> str:
-    return os.path.join(os.environ["DISAGG_STORE_ROOT"], RUN_ID)
-
-
 def _max(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
 
 
-def _resolve_mask_token(args, tokenizer) -> int:
-    if args.mask_token_id is not None:
-        return args.mask_token_id
-    if tokenizer.mask_token_id is not None:
-        return tokenizer.mask_token_id
-    tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
-    return tokenizer.mask_token_id
+def _ref_channel() -> StreamingRefChannel:
+    return StreamingRefChannel(os.environ["DISAGG_REF_CHANNEL"])
+
+
+def _mooncake_store() -> MooncakeFeatureStore:
+    """Connect to the same Mooncake master the server sink writes to."""
+    return MooncakeFeatureStore(
+        store_id=RUN_ID,
+        setup_kwargs={
+            "local_hostname": os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"),
+            "metadata_server": os.environ["MOONCAKE_METADATA_SERVER"],
+            "master_server_addr": os.environ["MOONCAKE_MASTER_SERVER_ADDR"],
+            "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
+            "rdma_devices": os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
+        },
+    )
 
 
 def _extract_prompts(train_dataloader):
-    """Flatten the training dataloader into rollout prompts (input_ids + mask)."""
     prompts = []
     for batch in train_dataloader:
         input_ids = batch["input_ids"]
@@ -101,51 +102,67 @@ def _extract_prompts(train_dataloader):
     return prompts
 
 
-def _configure_draft(args, draft_model, tokenizer) -> int:
-    """Pin the mask token on the draft config (matches train_dflash.main)."""
-    mask_token_id = _resolve_mask_token(args, tokenizer)
-    draft_model.mask_token_id = mask_token_id
-    draft_model.config.dflash_config["mask_token_id"] = mask_token_id
-    draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
-    return mask_token_id
+def _resolve_mask_token(args, tokenizer) -> int:
+    if args.mask_token_id is not None:
+        return args.mask_token_id
+    if tokenizer.mask_token_id is not None:
+        return tokenizer.mask_token_id
+    tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
+    return tokenizer.mask_token_id
 
 
 def run_producer(args) -> None:
-    """Inference pool: run the target live, stream captured features out."""
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    target_model, draft_model = build_models(args)  # sets capture layers from draft
-    _configure_draft(args, draft_model, tokenizer)
-
+    """Thin driver: prompts -> patched server (captures to Mooncake) -> refs."""
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
     train_dataloader, _eval = build_dataloader(args, tokenizer)
     prompts = _extract_prompts(train_dataloader)
     max_prompts = _max("DISAGG_MAX_PROMPTS", 0)
     if max_prompts:
         prompts = prompts[:max_prompts]
 
-    store = SharedDirFeatureStore(_store_root(), store_id=RUN_ID)
-    channel = StreamingRefChannel(os.path.join(_store_root(), "refs.jsonl"))
-    print(f"[producer] {len(prompts)} prompts -> {_store_root()}", flush=True)
+    # DFlash captures the concatenation of these target layers; the shell passes
+    # the same list to the server's --spec-capture-aux-layer-ids.
+    draft_cfg = json.load(open(args.draft_config_path))
+    aux_layer_ids = tuple(draft_cfg["dflash_config"]["target_layer_ids"])
+    target_hidden = int(draft_cfg["hidden_size"])
+
+    store = _mooncake_store()
+    channel = _ref_channel()
+    adapter = SGLangServerCaptureAdapter(
+        os.environ["DISAGG_SERVER_URL"],
+        store,
+        run_id=RUN_ID,
+        strategy="dflash",
+        target_model_version=args.target_model_path,
+    )
+    print(f"[producer] {len(prompts)} prompts -> {os.environ['DISAGG_SERVER_URL']}")
 
     _workers, drive_producer = build_disagg_online_producer(
         strategy="dflash",
-        target_model=target_model,
+        feature_source=adapter,
         prompts=prompts,
         feature_store=store,
         channel=channel,
         run_id=RUN_ID,
-        target_hidden_size=int(draft_model.config.hidden_size),
+        target_hidden_size=target_hidden,
         target_repr=None,  # DFlash trains on captured hidden states, no target dist.
+        aux_hidden_state_layer_ids=aux_layer_ids,
         metadata_db_path=os.environ.get("DISAGG_DB") or None,
     )
-    produced = drive_producer()  # generates, streams, closes the channel (EOF)
+    produced = drive_producer()
     print(f"[producer] streamed {produced} samples; channel closed", flush=True)
 
 
 def run_consumer(args) -> None:
-    """Training pool: train the DFlash draft off the shared store + ref channel."""
+    """Training pool: train the DFlash draft off Mooncake + the ref channel."""
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     _target_unused, draft_model = build_models(args)
-    mask_token_id = _configure_draft(args, draft_model, tokenizer)
+    mask_token_id = _resolve_mask_token(args, tokenizer)
+    draft_model.mask_token_id = mask_token_id
+    draft_model.config.dflash_config["mask_token_id"] = mask_token_id
+    draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
 
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
@@ -178,7 +195,6 @@ def run_consumer(args) -> None:
             total_steps=max_steps or 10_000,
         )
 
-    # Route the trainer's per-step metrics to the configured tracker (W&B).
     tracker = create_tracker(args, args.output_dir)
 
     def logger(metrics, step):
@@ -191,14 +207,11 @@ def run_consumer(args) -> None:
         if logdict:
             tracker.log(logdict, step=step)
 
-    store = SharedDirFeatureStore(_store_root(), store_id=RUN_ID)
-    channel = StreamingRefChannel(os.path.join(_store_root(), "refs.jsonl"))
-    print(f"[consumer] training from {_store_root()}", flush=True)
-
+    print(f"[consumer] training from mooncake://{RUN_ID}", flush=True)
     trainer, loader = build_disagg_online_consumer(
         strategy="dflash",
-        feature_store=store,
-        channel=channel,
+        feature_store=_mooncake_store(),
+        channel=_ref_channel(),
         eagle3_model=dflash_model,  # legacy param name = the trainable draft model
         optimizer_factory=optimizer_factory,
         run_id=RUN_ID,
@@ -220,19 +233,16 @@ def run_consumer(args) -> None:
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-
     role = _role()
-    print(
-        f"[disagg-dflash] role={role} run_id={RUN_ID} "
-        f"node_rank={os.environ.get('RCLI_NODE_RANK', '0')}",
-        flush=True,
-    )
+    print(f"[disagg-dflash] role={role} run_id={RUN_ID}", flush=True)
+    # The producer is a thin HTTP driver (no torch model); only the trainer
+    # needs the process group.
+    if role == "producer":
+        run_producer(args)
+        return
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     try:
-        if role == "producer":
-            run_producer(args)
-        else:
-            run_consumer(args)
+        run_consumer(args)
     finally:
         destroy_distributed()
 
