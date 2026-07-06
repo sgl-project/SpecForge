@@ -14,6 +14,8 @@ zero-copy ``MooncakeFeatureStore.get``. The real-server end-to-end lives in
 """
 
 import ctypes
+import os
+import tempfile
 import unittest
 from typing import Any, Dict, List
 
@@ -386,8 +388,6 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
     """The example's exact path: build_disagg_online_producer(feature_source=...)."""
 
     def test_producer_streams_refs_via_feature_source(self):
-        import tempfile
-
         from specforge.launch import build_disagg_online_producer
         from specforge.runtime.data_plane.streaming_ref_channel import (
             StreamingRefChannel,
@@ -428,7 +428,7 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
         )
         produced = drive()
         self.assertEqual(produced, len(prompts))
-        self.assertEqual(channel.published(), len(prompts))
+        self.assertEqual(channel.published, len(prompts))
         self.assertTrue(channel.is_closed())
 
 
