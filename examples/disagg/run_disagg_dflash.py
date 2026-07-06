@@ -203,9 +203,16 @@ def run_consumer(args) -> None:
             try:
                 logdict[f"train/{key}"] = float(value)
             except (TypeError, ValueError):
-                continue
+                try:  # per-TTT-position list metrics -> log the mean
+                    seq = [float(x) for x in value]
+                except (TypeError, ValueError):
+                    continue
+                if seq:
+                    logdict[f"train/{key}_mean"] = sum(seq) / len(seq)
         if logdict:
             tracker.log(logdict, step=step)
+            summary = {k.split("/")[-1]: round(v, 4) for k, v in logdict.items()}
+            print(f"[consumer] step {step} {summary}", flush=True)
 
     print(f"[consumer] training from mooncake://{RUN_ID}", flush=True)
     trainer, loader = build_disagg_online_consumer(
