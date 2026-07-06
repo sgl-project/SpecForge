@@ -133,8 +133,8 @@ class Eagle3TargetModel(ABC):
             ]
         self.aux_hidden_states_layers = aux_hidden_states_layers
         assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
+            len(self.aux_hidden_states_layers) >= 2
+        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3, 2 layers for EDSD."
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
@@ -257,18 +257,22 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 handle.remove()
 
         # Verify we captured everything
-        if len(captured_states) != 3:
+        n_layers = len(self.aux_hidden_states_layers)
+        if len(captured_states) != n_layers:
             raise RuntimeError(
-                f"Expected to capture 3 layers, but captured {len(captured_states)}"
+                f"Expected to capture {n_layers} layers, but captured {len(captured_states)}"
             )
 
         # Extract in the correct order
-        hidden_states0 = captured_states[target_indices[0]]
-        hidden_states1 = captured_states[target_indices[1]]
-        hidden_states2 = captured_states[target_indices[2]]
+        #hidden_states0 = captured_states[target_indices[0]]
+        #hidden_states1 = captured_states[target_indices[1]]
+        #hidden_states2 = captured_states[target_indices[2]]
 
+        #hidden_states = torch.cat(
+        #    (hidden_states0, hidden_states1, hidden_states2), dim=-1
+        #)
         hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
+            [captured_states[target_indices[i]] for i in range(n_layers)], dim=-1
         )
 
         # apply pading

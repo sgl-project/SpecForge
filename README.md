@@ -29,6 +29,7 @@ Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get star
 | Method | Description | Training | Example | Optimization |
 | --- | --- | --- | --- | --- |
 | **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [`scripts/train_eagle3.py`](./scripts/train_eagle3.py) | [`examples/run_qwen3_8b_eagle3_online.sh`](./examples/run_qwen3_8b_eagle3_online.sh) | [LK loss](https://arxiv.org/pdf/2602.23881)
+| **[EDSD](https://aclanthology.org/2026.acl-long.2145.pdf)** | EAGLE3 with entropy-driven design | [`scripts/train_edsd.py`](./scripts/train_edsd.py) | [`examples/run_qwen3_8b_edsd_online.sh`](./examples/run_qwen3_8b_edsd_online.sh) | 
 | **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [`scripts/train_dflash.py`](./scripts/train_dflash.py) | [`examples/run_qwen3_8b_dflash_online.sh`](./examples/run_qwen3_8b_dflash_online.sh) | [D-PACE](https://arxiv.org/abs/2605.18810)
 | **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [`scripts/train_domino.py`](./scripts/train_domino.py) | [`examples/run_qwen3_8b_domino_online.sh`](./examples/run_qwen3_8b_domino_online.sh) |
 
@@ -47,6 +48,7 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 ## 🎉 News
 
+- [2026-07] 🔥 Added EDSD online training for EAGLE3 draft models.
 - [2026-06] 🔥 Added D-PACE as an optional loss for DFlash training.
 - [2026-06] 🔥 Added Domino online training for DFlash draft models.
 - [2026-01] 🔥 Added DFlash block-parallel online training with SGLang serving support.

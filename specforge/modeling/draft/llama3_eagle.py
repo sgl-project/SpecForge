@@ -1628,6 +1628,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
+    def _build_midlayer(self, config, attention_backend):
+        return LlamaDecoderLayer(config, attention_backend=attention_backend)
+
+    def _build_fc(self, config):
+        if hasattr(config, "target_hidden_size"):
+            return torch.nn.Linear(
+                config.target_hidden_size * 3, config.hidden_size, bias=False
+            )
+        return torch.nn.Linear(
+            config.hidden_size * 3, config.hidden_size, bias=False
+        )
+
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
         self.config = config
@@ -1638,16 +1650,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
-
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * 3, config.hidden_size, bias=False
-            )
-        else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * 3, config.hidden_size, bias=False
-            )
+        self.midlayer = self._build_midlayer(config, attention_backend)
+        self.fc = self._build_fc(config)
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
