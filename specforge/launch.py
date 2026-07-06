@@ -685,13 +685,12 @@ def build_disagg_online_consumer(
     rows), and round-robin dispatches aligned windows to per-rank inboxes under
     ``inbox_dir`` (default ``<channel>.inboxes``, trainer-local). Every rank
     consumes only its own inbox; durable acks gather to rank 0
-    (:class:`DPAckController`), which also advances the producer's backpressure
-    counter. Single-rank runs keep the original direct-channel path.
+    (:class:`DPAckController`) while the distributor mirrors the per-rank inbox
+    acks onto the producer's backpressure counter. Passing ``inbox_dir``
+    explicitly opts a single-rank run into the same distributor path;
+    otherwise ``dp_size == 1`` keeps the original direct-channel path.
     """
-    from specforge.runtime.data_plane.streaming_ref_channel import (
-        StreamingRefChannel,
-        StreamingRefQueue,
-    )
+    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
     if resume_from and not resume:
         raise ValueError(
@@ -732,7 +731,8 @@ def build_disagg_online_consumer(
         return set(reconciled["released"])
 
     distributor = None
-    if dp_size == 1:
+    if dp_size == 1 and inbox_dir is None:
+        # Legacy direct-channel path, unchanged.
         store = _resolve_metadata_store(metadata_store, metadata_db_path)
         controller = DataFlowController(run_id, metadata_store=store)
         skip_ids = _reconcile(controller, store) if resume else None
@@ -740,23 +740,57 @@ def build_disagg_online_consumer(
             channel, idle_timeout_s=idle_timeout_s, skip_ids=skip_ids
         )
     else:
+        import torch.distributed as dist
+
         from specforge.runtime.control_plane.dp_ack import DPAckController
-        from specforge.runtime.data_plane.ref_distributor import RefDistributor
+        from specforge.runtime.control_plane.metadata_store import NoOpMetadataStore
+        from specforge.runtime.data_plane.ref_distributor import (
+            InboxChannel,
+            RefDistributor,
+        )
 
         if inbox_dir is None:
             inbox_dir = channel.path + ".inboxes"
+        # Symmetric preconditions (ALL ranks) — a rank-0-only raise would strand
+        # the other ranks in the barrier below.
+        if metadata_store is None and metadata_db_path is None:
+            raise ValueError(
+                "DP online consumer needs a durable metadata_store/"
+                "metadata_db_path — the rank-0 distributor is the run's single "
+                "ledger"
+            )
+        if dist.is_available() and dist.is_initialized():
+            world = dist.get_world_size()
+            if world != dp_size:
+                raise ValueError(
+                    f"DP online consumer: dp_size={dp_size} but the process "
+                    f"group has {world} ranks — every rank must own exactly one "
+                    f"inbox"
+                )
+        # Liveness default: a dead producer/distributor must never hang the
+        # ranks silently. Generous enough for a cold server load before the
+        # first ref.
+        if idle_timeout_s is None:
+            idle_timeout_s = 1800.0
         if dp_rank == 0:
             store = _resolve_metadata_store(metadata_store, metadata_db_path)
-            if store is None:
+            if isinstance(store, NoOpMetadataStore):
                 raise ValueError(
-                    "DP online consumer needs a durable metadata_store/"
-                    "metadata_db_path on rank 0 — the distributor is the run's "
-                    "single ledger"
+                    "DP online consumer needs a RETAINING metadata store: the "
+                    "ledger is what dedups commits and reconciles restarts"
                 )
             controller = DPAckController(
                 run_id, is_authority=True, metadata_store=store
             )
             skip_ids = _reconcile(controller, store) if resume else None
+            if not resume and store.committed_count() > 0:
+                raise ValueError(
+                    f"metadata store already holds {store.committed_count()} "
+                    f"committed samples from a previous run; the distributor's "
+                    f"commit-dedup would silently drop the whole re-streamed "
+                    f"channel. Pass resume=True (+ resume_from) to reconcile, or "
+                    f"start fresh (new metadata_db_path / delete the db)"
+                )
             distributor = RefDistributor(
                 channel,
                 controller,
@@ -765,7 +799,6 @@ def build_disagg_online_consumer(
                 skip_ids=skip_ids,
                 idle_timeout_s=idle_timeout_s,
             )
-            controller.ack_sink = lambda ids: distributor.note_acked(len(ids))
         else:
             # Gather-participant only: throwaway store, records nothing.
             controller = DPAckController(
@@ -774,7 +807,7 @@ def build_disagg_online_consumer(
         # Inboxes must be re-created (rank 0, in RefDistributor.__init__) before
         # any rank opens a reader on a stale previous-attempt file.
         _dp_barrier()
-        inbox = StreamingRefChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
+        inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
         queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
         if distributor is not None:
             distributor.start()

@@ -58,15 +58,16 @@ def gather_id_union(ids: List[str]) -> List[str]:
 class DPAckController(DataFlowController):
     """A :class:`DataFlowController` whose ``ack_train_refs`` is a DP collective.
 
-    * ``is_authority=True`` (DP rank 0): holds the run's ONE durable store,
-      records the gathered union, then calls ``ack_sink(union_ids)`` — the
-      launcher points that at the distributor's consumed counter.
+    * ``is_authority=True`` (DP rank 0): holds the run's ONE durable store and
+      records the gathered union.
     * ``is_authority=False`` (other ranks): participates in the gather (the
       collective needs every rank) and records nothing; give it a throwaway
       in-memory store.
 
     Every rank must call ``ack_train_refs`` at every optimizer boundary — the
-    trainer's ``ack_fn`` already does exactly that.
+    trainer's ``ack_fn`` already does exactly that. Producer backpressure is
+    NOT this class's job: the distributor mirrors the per-rank inbox acks onto
+    the source counter at micro-batch granularity.
     """
 
     def __init__(
@@ -75,15 +76,11 @@ class DPAckController(DataFlowController):
         *,
         is_authority: bool = True,
         gather: Callable[[List[str]], List[str]] = gather_id_union,
-        ack_sink: Optional[Callable[[List[str]], None]] = None,
         **kwargs,
     ) -> None:
         super().__init__(run_id, **kwargs)
         self.is_authority = is_authority
         self._gather = gather
-        #: post-ack hook fed the gathered union (assignable after construction
-        #: because the distributor needs the controller first).
-        self.ack_sink = ack_sink
 
     def ack_train_refs(
         self,
@@ -102,8 +99,6 @@ class DPAckController(DataFlowController):
             global_step=global_step,
             optimizer_durable=optimizer_durable,
         )
-        if self.ack_sink is not None and union:
-            self.ack_sink(union)
 
 
 __all__ = ["DPAckController", "gather_id_union"]

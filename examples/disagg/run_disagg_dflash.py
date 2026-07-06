@@ -288,6 +288,8 @@ def run_consumer(args) -> None:
         logger=logger,
         log_interval=_max("DISAGG_LOG_INTERVAL", 1),
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
+        # liveness guard against a dead producer/server (DP default: 1800s)
+        idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", 0)) or None,
     )
     try:
         trainer.fit(loader)
