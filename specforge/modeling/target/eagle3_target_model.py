@@ -113,6 +113,22 @@ class Eagle3TargetModel(ABC):
         Generate the eagle3 data from the target model.
         """
 
+    @abstractmethod
+    def generate_mtp_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        **kwargs,
+    ) -> Eagle3TargetOutput:
+        """
+        Generate MTP data from the target model.
+
+        Unlike generate_eagle3_data, this must return *raw* input_ids and the
+        *last* hidden states without pre-shifting.  The MTP training wrapper
+        performs the next-token shift internally.
+        """
+
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
@@ -283,6 +299,43 @@ class HFEagle3TargetModel(Eagle3TargetModel):
             loss_mask=loss_mask,
             input_ids=input_ids,
             attention_mask=attention_mask,
+        )
+
+    @torch.no_grad()
+    def generate_mtp_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        **kwargs,
+    ) -> Eagle3TargetOutput:
+        """
+        HF backend for MTP: capture the last hidden state and return raw input_ids.
+        No aux hooks, no pre-shifting.
+        """
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            output_attentions=False,
+            output_router_logits=False,
+            use_cache=False,
+        )
+
+        # hidden_states[0] is embedding output; hidden_states[i+1] is layer i output
+        last_hidden_states = outputs.hidden_states[-1]
+        loss_mask = loss_mask[..., None].to(last_hidden_states.device)
+
+        return Eagle3TargetOutput(
+            hidden_states=None,
+            target=None,
+            loss_mask=loss_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            last_hidden_states=last_hidden_states,
         )
 
 
@@ -507,6 +560,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         return_last_hidden_states: bool = False,
+        capture_aux_hidden_states: bool = True,
         return_logits: bool = True,
         shard_returns: bool = False,
     ):
@@ -539,7 +593,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = self._extend(
             reqs,
-            capture_aux_hidden_states=True,
+            capture_aux_hidden_states=capture_aux_hidden_states,
             return_last_hidden_states=return_last_hidden_states,
             return_logits=return_logits,
             shard_returns=shard_returns,
@@ -845,6 +899,74 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             last_hidden_states=last_hidden_states_out,
         )
 
+    def generate_mtp_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        is_vlm: bool = False,
+        shard_returns: bool = False,
+        **kwargs,
+    ) -> Eagle3TargetOutput:
+        """
+        SGLang backend for MTP: capture the last hidden state and return raw input_ids.
+
+        Unlike generate_eagle3_data, this does NOT pre-shift input_ids via
+        padding(left=False); the shift is performed inside OnlineMTPModel.
+        """
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
+        if is_vlm:
+            data_cache, _, _, last_hidden_states_list = self.extend_vlm(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                return_last_hidden_states=True,
+                return_logits=False,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+        else:
+            data_cache, _, _, last_hidden_states_list = self.extend(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                return_last_hidden_states=True,
+                capture_aux_hidden_states=False,
+                return_logits=False,
+                shard_returns=shard_returns,
+            )
+
+        input_ids_out = []
+        attention_mask_out = []
+        loss_mask_out = []
+        last_hidden_states_out = []
+
+        for data, last_hidden_states in zip(data_cache, last_hidden_states_list):
+            input_ids_out.append(data[0])
+            attention_mask_out.append(data[1])
+            loss_mask_out.append(data[2])
+            if last_hidden_states is not None:
+                last_hidden_states_out.append(last_hidden_states.unsqueeze(0))
+
+        input_ids_out = torch.cat(input_ids_out, dim=0)
+        attention_mask_out = torch.cat(attention_mask_out, dim=0)
+        loss_mask_out = torch.cat(loss_mask_out, dim=0)
+        last_hidden_states_out = torch.cat(last_hidden_states_out, dim=0)
+        loss_mask_out = loss_mask_out[..., None]
+
+        return Eagle3TargetOutput(
+            hidden_states=None,
+            target=None,
+            loss_mask=loss_mask_out,
+            input_ids=input_ids_out,
+            attention_mask=attention_mask_out,
+            last_hidden_states=last_hidden_states_out,
+        )
+
 
 class CustomEagle3TargetModel(Eagle3TargetModel):
 
@@ -906,6 +1028,37 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
             loss_mask=loss_mask,
             input_ids=input_ids,
             attention_mask=attention_mask,
+        )
+
+    @torch.no_grad()
+    def generate_mtp_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        **kwargs,
+    ) -> Eagle3TargetOutput:
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            layers_to_output_hidden_states=[-1],
+            use_cache=False,
+        )
+
+        last_hidden_states = outputs.hidden_states[-1]
+        loss_mask = loss_mask[..., None].to(last_hidden_states.device)
+
+        return Eagle3TargetOutput(
+            hidden_states=None,
+            target=None,
+            loss_mask=loss_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            last_hidden_states=last_hidden_states,
         )
 
 

@@ -1,0 +1,37 @@
+{
+  "architectures": [
+    "Qwen3_5MTPDraftModel"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "auto_map": {
+    "AutoModel": "mtp.Qwen3_5MTPDraftModel"
+  },
+  "bos_token_id": 151643,
+  "eos_token_id": 151645,
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 2560,
+  "initializer_range": 0.02,
+  "intermediate_size": 9728,
+  "max_position_embeddings": 262144,
+  "max_window_layers": 36,
+  "model_type": "qwen3",
+  "mtp_config": {
+    "share_lm_head": true
+  },
+  "num_attention_heads": 32,
+  "num_hidden_layers": 1,
+  "num_key_value_heads": 8,
+  "pad_token_id": 151643,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": null,
+  "rope_theta": 5000000,
+  "sliding_window": null,
+  "tie_word_embeddings": true,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "5.13.0.dev0",
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 151936
+}
