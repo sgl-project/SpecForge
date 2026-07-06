@@ -281,9 +281,7 @@ class TestServerCaptureGate(unittest.TestCase):
         )
         refs = adapter.produce_refs(self._tasks(rows), capture=contract)
         for ref in refs:
-            self.assertIsInstance(
-                ref, SampleRef, f"expected a ref, got failure: {ref}"
-            )
+            self.assertIsInstance(ref, SampleRef, f"expected a ref, got failure: {ref}")
 
         aux_ref, logits_ref = self._hf_reference(rows)
         from specforge.modeling.target.target_head import TargetHead
@@ -351,9 +349,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
             )
         )
-        core = TrainerCore(
-            Eagle3TrainStrategy(model, target_head=head), backend
-        )
+        core = TrainerCore(Eagle3TrainStrategy(model, target_head=head), backend)
         # batch_size=1 batches (ragged lengths), one step each
         for i, out in enumerate(fetched):
             batch = TrainBatch(
@@ -392,12 +388,8 @@ class TestServerCaptureGate(unittest.TestCase):
         (ref,) = adapter.produce_refs(self._tasks(rows), capture=contract)
         self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
         out, handle = store.get(ref)
-        self.assertEqual(
-            sorted(out), ["hidden_states", "input_ids", "loss_mask"]
-        )
-        self.assertEqual(
-            out["hidden_states"].shape, (1, 5, len(AUX_LAYER_IDS) * H)
-        )
+        self.assertEqual(sorted(out), ["hidden_states", "input_ids", "loss_mask"])
+        self.assertEqual(out["hidden_states"].shape, (1, 5, len(AUX_LAYER_IDS) * H))
         aux_ref, _ = self._hf_reference(rows)
         torch.testing.assert_close(
             out["hidden_states"].float(), aux_ref[0].float(), rtol=TOL, atol=TOL
