@@ -1,3 +1,14 @@
+# Disaggregated examples
+
+Two flavors live here:
+
+- **Online DFlash via server-capture** (`run_disagg_dflash.py` +
+  `run_qwen3.6_27b_dflash_disagg.sh`) — the real zero-copy split: a live patched
+  SGLang server captures features and writes them straight into Mooncake; the
+  trainer consumes them by key. See [Online DFlash](#online-dflash-via-server-capture-real-zero-copy).
+- **Offline EAGLE3** (`run_disagg_eagle3.py`) — precomputed features ingested
+  into a shared store, documented below.
+
 # Disaggregated offline EAGLE3 example
 
 Runs the offline EAGLE3 training of `scripts/train_eagle3_dataflow.py`, but splits
@@ -99,3 +110,46 @@ acc / acceptance_rate climb over training in both (baseline direction). Per-step
 values are noisy at `batch_size=1` over 64 diverse samples. Note this is the
 training-time acceptance proxy; the serving accept-length (τ via spec-decoding) is
 a separate eval gate.
+
+# Online DFlash via server-capture (real zero-copy)
+
+The engine-side transport: a live SGLang server does the capture and writes
+straight into Mooncake, so inference and training are fully separate processes
+that share only the object store — no in-process target, no shared *data* mount.
+
+```
+ inference pool (GPU)                 mooncake                training pool (GPU)
+ ────────────────────                ─────────               ───────────────────
+ patched SGLang server  ──put()────▶  object    ──get()────▶ FeatureDataLoader
+ (--enable-spec-capture)   RDMA/TCP    store       zero-copy  -> OnlineDFlashModel
+        ▲                                                     TrainerController.fit()
+        │ /generate + spec_capture   (keys only)
+ SGLangServerCaptureAdapter ───────▶ StreamingRefChannel ───▶ (consumer reads refs)
+```
+
+The server is stock `sglang==0.5.14` patched with
+`patches/sglang/v0.5.14/spec-capture.patch` — apply it to the installed package
+with `scripts/apply_sglang_spec_capture_patch.sh`. Only tiny `SampleRef`s cross
+the ref channel; the DFlash context hidden states go server → Mooncake →
+trainer with no re-copy. Strategy-agnostic: the same server serves eagle3 or
+dflash requests, named per request by the client
+(`specforge/inference/adapters/server_capture.py`).
+
+## Run it (single 8-GPU node)
+
+```bash
+export WANDB_API_KEY=<key>            # or add --report-to none in the wrapper
+bash examples/disagg/run_qwen3.6_27b_dflash_disagg.sh
+```
+
+The wrapper starts a `mooncake_master`, the patched server (GPU 0), a thin CPU
+producer, and the trainer (GPU 1). `--spec-capture-aux-layer-ids` must match
+`dflash_config.target_layer_ids` in `configs/qwen3.6-27b-dflash.json` (the
+producer reads the same list for contract verification). Mooncake connection is
+the standard `MOONCAKE_*` env (see the wrapper for defaults).
+
+The transport is gate-validated end-to-end (patched server → Mooncake → one real
+train step, with aux parity vs an HF reference) in
+`tests/test_runtime/test_server_capture_gate.py`
+(`SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1`, GPU); the contract/ref/adapter logic is
+covered on CPU in `tests/test_runtime/test_server_capture.py`.
