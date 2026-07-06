@@ -165,7 +165,6 @@ def _checkpoint_global_step(resume_from: str) -> int:
 def _assemble_rollout_workers(
     *,
     spec: StrategySpec,
-    target_model,
     controller: DataFlowController,
     store: FeatureStore,
     run_id: str,
@@ -178,11 +177,16 @@ def _assemble_rollout_workers(
     t2d,
     num_rollout_workers: int,
     device: str,
+    target_model=None,
+    feature_source=None,
 ):
     """Build the rollout producer workers (colocated-online + disagg producer).
 
-    The capture contract derives from ``spec.required_features``; strategies with
-    ``supports_online=False`` raise here rather than emit the wrong feature schema.
+    ``feature_source`` overrides the in-process adapter with a pre-built
+    FeatureSource/RefSource (e.g. the server-capture transport, whose live
+    SGLang server writes features straight to the store — no ``target_model``
+    is loaded here). Otherwise an in-process adapter is built over
+    ``target_model``.
     """
     if not spec.supports_online:
         raise NotImplementedError(
@@ -197,7 +201,9 @@ def _assemble_rollout_workers(
         aux_hidden_state_layer_ids = tuple(
             getattr(target_model, "aux_hidden_states_layers", ()) or ()
         )
-    if spec.make_adapter is not None:
+    if feature_source is not None:
+        adapter = feature_source
+    elif spec.make_adapter is not None:
         adapter = spec.make_adapter(target_model, device=device, t2d=t2d)
     else:
         from specforge.inference.adapters.policy import (
@@ -503,7 +509,7 @@ def build_online_runtime(
 def build_disagg_online_producer(
     *,
     strategy: str = "eagle3",
-    target_model,
+    target_model=None,
     prompts,
     feature_store: FeatureStore,
     channel,
@@ -517,6 +523,7 @@ def build_disagg_online_producer(
     t2d=None,
     num_rollout_workers: int = 1,
     device: str = "cuda",
+    feature_source=None,
     lease: int = 8,
     in_flight_high_watermark: int = 256,
     backpressure_poll_s: float = 0.2,
@@ -527,11 +534,13 @@ def build_disagg_online_producer(
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
     Workers put() into a cross-node ``feature_store``; committed refs stream to
-    the consumer via ``channel``. ``metadata_store``/``metadata_db_path`` must be
-    the same durable store the consumer opens. Returns ``(workers,
-    drive_producer)``: ``drive_producer(should_stop=...)`` runs until the prompt
-    pool drains, pauses above ``in_flight_high_watermark``, and always closes the
-    channel on exit (EOF terminates the consumer's loader).
+    the consumer via ``channel``. Pass ``feature_source`` for the server-capture
+    transport (live SGLang server writes to the store; ``target_model`` stays
+    None). ``metadata_store``/``metadata_db_path`` must be the same durable store
+    the consumer opens. Returns ``(workers, drive_producer)``:
+    ``drive_producer(should_stop=...)`` runs until the prompt pool drains, pauses
+    above ``in_flight_high_watermark``, and always closes the channel on exit
+    (EOF terminates the consumer's loader).
     """
     import time
 
@@ -546,6 +555,7 @@ def build_disagg_online_producer(
     workers = _assemble_rollout_workers(
         spec=spec,
         target_model=target_model,
+        feature_source=feature_source,
         controller=controller,
         store=feature_store,
         run_id=run_id,

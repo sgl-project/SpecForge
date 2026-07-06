@@ -12,7 +12,9 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        exclude: \.patch$  # stripping context-line whitespace breaks git apply
       - id: end-of-file-fixer
+        exclude: \.patch$
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-toml

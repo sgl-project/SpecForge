@@ -20,8 +20,8 @@ from typing import Any, Dict, List
 import torch
 
 from specforge.inference.adapters.server_capture import (
-    SGLangServerCaptureAdapter,
     ServerCaptureFailure,
+    SGLangServerCaptureAdapter,
     resolve_server_capture_schema,
 )
 from specforge.inference.capture import (
@@ -103,9 +103,7 @@ class _StubCaptureServer:
     def __call__(self, url: str, json_body: Dict[str, Any], timeout: float):
         assert url.endswith("/generate")
         rows: List[Dict[str, Any]] = []
-        for input_ids, spec in zip(
-            json_body["input_ids"], json_body["spec_capture"]
-        ):
+        for input_ids, spec in zip(json_body["input_ids"], json_body["spec_capture"]):
             sid, gen = spec["sample_id"], int(spec["gen"])
             if sid in self.error_sample_ids:
                 rows.append(
@@ -279,9 +277,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         )
         self.assertEqual(ref.feature_specs["loss_mask"].shape, (1, 5))
         out, _ = store.get(ref)
-        self.assertEqual(
-            out["input_ids"].tolist(), [list(range(1, 6))]
-        )
+        self.assertEqual(out["input_ids"].tolist(), [list(range(1, 6))])
 
     def test_aux_width_mismatch_fails_loud_and_frees_keys(self):
         backend = _FakeMooncakeStore()
@@ -384,6 +380,56 @@ class TestServerCaptureAdapter(unittest.TestCase):
     def test_unknown_strategy_raises(self):
         with self.assertRaises(KeyError):
             resolve_server_capture_schema("nonexistent")
+
+
+class TestServerCaptureProducerWiring(unittest.TestCase):
+    """The example's exact path: build_disagg_online_producer(feature_source=...)."""
+
+    def test_producer_streams_refs_via_feature_source(self):
+        import tempfile
+
+        from specforge.launch import build_disagg_online_producer
+        from specforge.runtime.data_plane.streaming_ref_channel import (
+            StreamingRefChannel,
+        )
+
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        adapter = SGLangServerCaptureAdapter(
+            "http://server:30000",
+            store,
+            run_id="run0",
+            strategy="dflash",
+            post_fn=server,
+        )
+        prompts = [
+            {
+                "payload": {
+                    "input_ids": list(range(1, 5 + i)),
+                    "loss_mask": [1] * (4 + i),
+                }
+            }
+            for i in range(3)
+        ]
+        channel = StreamingRefChannel(
+            os.path.join(tempfile.mkdtemp(prefix="sc_prod_"), "refs.jsonl")
+        )
+        _workers, drive = build_disagg_online_producer(
+            strategy="dflash",
+            feature_source=adapter,
+            prompts=prompts,
+            feature_store=store,
+            channel=channel,
+            run_id="run0",
+            target_hidden_size=HIDDEN,
+            target_repr=None,
+            aux_hidden_state_layer_ids=AUX_LAYERS,
+        )
+        produced = drive()
+        self.assertEqual(produced, len(prompts))
+        self.assertEqual(channel.published(), len(prompts))
+        self.assertTrue(channel.is_closed())
 
 
 if __name__ == "__main__":
