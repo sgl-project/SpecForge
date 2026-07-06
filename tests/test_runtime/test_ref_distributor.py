@@ -10,7 +10,7 @@ from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.dp_ack import DPAckController, gather_id_union
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
-from specforge.runtime.data_plane.ref_distributor import RefDistributor
+from specforge.runtime.data_plane.ref_distributor import InboxChannel, RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import (
     StreamingRefChannel,
     StreamingRefQueue,
@@ -106,7 +106,11 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s1"])
         self.assertEqual(dist.stats["duplicates"], 1)
 
-    def test_skip_ids_marks_consumed_and_never_dispatches(self):
+    def test_skip_ids_never_dispatch_and_are_not_recounted(self):
+        # Released refs were already counted by the prior run's acks (the
+        # sidecar seed); the skip filter must not count them again.
+        prior = StreamingRefChannel(self.src_path)
+        prior.mark_consumed(2)  # run 1 counted s0, s1
         dist = self._distributor(dp_size=2, skip_ids={"s0", "s1"})
         for i in range(4):
             self.producer.publish(_ref(f"s{i}"))
@@ -114,9 +118,22 @@ class TestRefDistributor(unittest.TestCase):
         _pump_until_quiet(dist)
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s2"])
         self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s3"])
-        # skips count as consumed so the producer's in-flight stays exact
-        self.assertEqual(self.producer.consumed_remote(), 2)
-        dist.note_acked(2)  # the durable-ack path adds the trained ones
+        self.assertEqual(dist.stats["skipped"], 2)
+        self.assertEqual(self.producer.consumed_remote(), 2)  # seed only, no double
+
+    def test_inbox_acks_forward_to_source_counter(self):
+        dist = self._distributor(dp_size=2)
+        for i in range(4):
+            self.producer.publish(_ref(f"s{i}"))
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 0)  # dispatch != consumed
+        # rank readers ack their inboxes per micro-batch (loader behavior)
+        for rank in range(2):
+            q = StreamingRefQueue(
+                StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            )
+            q.ack(q.get(2))
+        _pump_until_quiet(dist)
         self.assertEqual(self.producer.consumed_remote(), 4)
 
     def test_consumed_counter_survives_restart(self):
@@ -124,9 +141,16 @@ class TestRefDistributor(unittest.TestCase):
         first = StreamingRefChannel(self.src_path)
         first.mark_consumed(3)
         self.assertEqual(self.producer.consumed_remote(), 3)
-        # A restarted distributor must seed from the sidecar, not rewind it.
+        # A restarted distributor must seed from the sidecar, not rewind it:
+        # one new inbox ack lands on top of the seed.
         dist = self._distributor(dp_size=1)
-        dist.note_acked(1)
+        self.producer.publish(_ref("s9"))
+        _pump_until_quiet(dist)
+        q = StreamingRefQueue(
+            StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, 0))
+        )
+        q.ack(q.get(1))
+        _pump_until_quiet(dist)
         self.assertEqual(self.producer.consumed_remote(), 4)
 
     def test_stale_inbox_files_recreated_fresh(self):
@@ -166,8 +190,36 @@ class TestRefDistributor(unittest.TestCase):
         # exactly the unacked tail trains again, split evenly, no duplicates
         self.assertEqual(sorted(ids0 + ids1), ["s2", "s3"])
         self.assertEqual(len(ids0), len(ids1))
-        self.assertEqual(self.producer.consumed_remote(), 2)  # the two skips
+        self.assertEqual(dist.stats["skipped"], 2)
         controller.store.close()
+
+    def test_end_of_stream_partial_window_releases_leases(self):
+        controller = DataFlowController("run0")
+        dist = self._distributor(dp_size=2, controller=controller)
+        for i in range(3):  # one full window + one leftover
+            self.producer.publish(_ref(f"s{i}"))
+        self.producer.close()
+        _pump_until_quiet(dist)
+        self.assertTrue(dist.finished)
+        self.assertEqual(dist.stats["dropped"], 1)
+        # the dropped ref's lease is released, not leaked
+        self.assertEqual(controller.sample_queue.in_flight(), 2)  # dispatched only
+        self.assertEqual(controller.sample_queue.depth(), 0)
+
+    def test_distributor_death_poisons_inboxes(self):
+        clock = {"t": 0.0}
+        dist = self._distributor(
+            dp_size=2,
+            idle_timeout_s=5.0,
+            clock=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        )
+        dist._run_guarded()  # idle-timeout kills it (producer silent)
+        self.assertIsInstance(dist.error, TimeoutError)
+        for rank in range(2):
+            reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            with self.assertRaisesRegex(RuntimeError, "ref-distributor died"):
+                StreamingRefQueue(reader).get(1)
 
     def test_idle_timeout_raises_when_producer_silent(self):
         clock = {"t": 0.0}
@@ -185,22 +237,19 @@ class TestDPAckController(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="dpack_")
 
-    def test_authority_records_gathered_union_and_drives_sink(self):
+    def test_authority_records_gathered_union(self):
         gathered = lambda ids: ids + ["s-other-rank"]  # noqa: E731
-        sunk = []
         controller = DPAckController(
             "run0",
             is_authority=True,
             gather=gathered,
             metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "run.db")),
         )
-        controller.ack_sink = lambda ids: sunk.extend(ids)
         controller.commit_samples("w0", [_ref("s0"), _ref("s-other-rank")])
         controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
         marker = controller.store.durable_marker()
         self.assertEqual(sorted(marker["acked"]), ["s-other-rank", "s0"])
         self.assertTrue(marker["optimizer_durable"])
-        self.assertEqual(sorted(sunk), ["s-other-rank", "s0"])
         controller.store.close()
 
     def test_non_authority_participates_but_records_nothing(self):
