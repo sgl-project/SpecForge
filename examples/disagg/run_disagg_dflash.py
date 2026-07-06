@@ -70,7 +70,14 @@ def _ref_channel() -> StreamingRefChannel:
 
 
 def _mooncake_store() -> MooncakeFeatureStore:
-    """Connect to the same Mooncake master the server sink writes to."""
+    """Connect to the same Mooncake master the server sink writes to.
+
+    global_segment_size=0: producer/consumer are pure clients contributing NO
+    storage — every object lives in the long-lived server process's segment, so
+    a producer exit cannot take committed features with it. Size the SERVER's
+    segment (MOONCAKE_GLOBAL_SEGMENT_SIZE) for the in-flight watermark: objects
+    are hard-pinned, so an undersized segment fails puts rather than evicting.
+    """
     return MooncakeFeatureStore(
         store_id=RUN_ID,
         setup_kwargs={
@@ -79,6 +86,10 @@ def _mooncake_store() -> MooncakeFeatureStore:
             "master_server_addr": os.environ["MOONCAKE_MASTER_SERVER_ADDR"],
             "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
             "rdma_devices": os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
+            "global_segment_size": int(os.environ.get("DISAGG_CLIENT_SEGMENT_SIZE", 0)),
+            "local_buffer_size": int(
+                os.environ.get("DISAGG_CLIENT_BUFFER_SIZE", 1 << 30)
+            ),
         },
     )
 
