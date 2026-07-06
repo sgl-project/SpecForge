@@ -439,7 +439,12 @@ class DFlashCapturePolicy(TargetCapturePolicy):
     spec = TargetCaptureSpec(
         name="dflash",
         num_capture_layers=None,
-        sglang_build_kwargs={"wrap_eagle3_logits": False},
+        # Wrap the sglang logits processor (as eagle3 does) so the post-norm final
+        # hidden can be surfaced via return_last_hidden_states for DSpark's L1 /
+        # confidence losses. DFlash itself needs only the aux concat and asks for no
+        # vocab logits (return_logits=False in extend_dflash), so this adds no
+        # eagle3 vocab dependency.
+        sglang_build_kwargs={"wrap_eagle3_logits": True},
         sglang_strict_capture_layers=False,
     )
 
