@@ -73,10 +73,16 @@ class Eagle3TargetOutput(TargetCaptureBatch):
 
 @dataclass
 class DFlashTargetOutput(TargetCaptureBatch):
-    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size]
+    hidden_states: torch.Tensor  # [batch, seq_len, n_capture*hidden_size]
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    # Target model's FINAL hidden state [batch, seq_len, hidden_size]. Optional:
+    # DFlash never reads it, but DSpark's L1 distribution-distillation and
+    # confidence-head losses need it (the frozen target LM head is applied to it
+    # to form the soft next-token distribution). None when the backend does not
+    # surface it (then DSpark must run CE-only).
+    last_hidden_states: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -433,7 +439,12 @@ class DFlashCapturePolicy(TargetCapturePolicy):
     spec = TargetCaptureSpec(
         name="dflash",
         num_capture_layers=None,
-        sglang_build_kwargs={"wrap_eagle3_logits": False},
+        # Wrap the sglang logits processor (as eagle3 does) so the post-norm final
+        # hidden can be surfaced via return_last_hidden_states for DSpark's L1 /
+        # confidence losses. DFlash itself needs only the aux concat and asks for no
+        # vocab logits (return_logits=False in extend_dflash), so this adds no
+        # eagle3 vocab dependency.
+        sglang_build_kwargs={"wrap_eagle3_logits": True},
         sglang_strict_capture_layers=False,
     )
 
@@ -476,7 +487,8 @@ class DFlashCapturePolicy(TargetCapturePolicy):
             use_cache=False,
         )
 
-        # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
+        # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output;
+        # hidden_states[-1] = final (post-norm) hidden, i.e. the LM-head input.
         offset = 1
         if capture_layers is not None:
             selected = [outputs.hidden_states[idx + offset] for idx in capture_layers]
@@ -484,11 +496,15 @@ class DFlashCapturePolicy(TargetCapturePolicy):
         else:
             hidden_states = outputs.hidden_states[-1]
 
+        # Final hidden state for DSpark's L1 / confidence losses (DFlash ignores it).
+        last_hidden_states = outputs.hidden_states[-1]
+
         return DFlashTargetOutput(
             hidden_states=hidden_states,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            last_hidden_states=last_hidden_states,
         )
 
     @torch.no_grad()
@@ -500,11 +516,19 @@ class DFlashCapturePolicy(TargetCapturePolicy):
         loss_mask,
         **kwargs,
     ) -> DFlashTargetOutput:
-        data_cache, hidden_states_list = backend.extend_dflash(
-            input_ids, attention_mask, loss_mask
+        # context = the captured (aux) mid-layer concat used by DFlash; final = the
+        # post-norm last-layer hidden, surfaced for DSpark's L1 / confidence losses
+        # (None when the runner only returned a single hidden stream).
+        data_cache, hidden_states_list, last_hidden_states_list = backend.extend_dflash(
+            input_ids, attention_mask, loss_mask, return_last_hidden_states=True
         )
 
         hidden_states = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
+        last_hidden_states = None
+        if all(h is not None for h in last_hidden_states_list):
+            last_hidden_states = torch.cat(
+                [h.unsqueeze(0) for h in last_hidden_states_list], dim=0
+            )
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
@@ -514,6 +538,7 @@ class DFlashCapturePolicy(TargetCapturePolicy):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            last_hidden_states=last_hidden_states,
         )
 
 
