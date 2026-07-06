@@ -194,8 +194,84 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
         return outputs
 
 
+class Qwen3MTPInnerModel(nn.Module):
+    """The 1-layer transformer nested under ``mtp.model.*``.
+
+    Produces weight keys ``mtp.model.layers.0.*`` and ``mtp.model.norm.weight``,
+    which is the checkpoint layout consumed by SGLang's
+    ``Qwen3_5ForCausalLMMTP.load_weights`` (the ``mtp.`` -> ``model.`` remap
+    turns ``mtp.model.layers.0`` into ``model.model.layers.0``, matching the
+    inner ``Qwen3_5ForCausalLM.model.layers`` of the SGLang MTP module).
+    """
+
+    def __init__(self, config: Qwen3Config):
+        super().__init__()
+        self.config = config
+
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        self.layers = nn.ModuleList(
+            [Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)]
+        )
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(mtp_config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.size()
+        if position_ids is None:
+            device = hidden_states.device
+            position_ids = (
+                torch.arange(seq_len, dtype=torch.long, device=device)
+                .unsqueeze(0)
+                .expand(bsz, -1)
+            )
+
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # Causal mask
+        if attention_mask is not None and attention_mask.dim() == 2:
+            # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
+            combined_mask = _make_causal_mask(
+                (bsz, seq_len), hidden_states.dtype, device=hidden_states.device
+            )
+            expanded_mask = _expand_mask(
+                attention_mask, hidden_states.dtype, tgt_len=seq_len
+            ).to(hidden_states.device)
+            attention_mask = expanded_mask + combined_mask
+        elif attention_mask is None and seq_len > 1:
+            attention_mask = _make_causal_mask(
+                (bsz, seq_len), hidden_states.dtype, device=hidden_states.device
+            )
+
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )[0]
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
 class Qwen3_5MTPModel(nn.Module):
-    """The core MTP module wrapped under the `mtp.` prefix."""
+    """The core MTP module wrapped under the ``mtp.`` prefix.
+
+    Weight key layout (matches SGLang's ``Qwen3_5ForCausalLMMTP`` checkpoint):
+      mtp.pre_fc_norm_embedding.weight
+      mtp.pre_fc_norm_hidden.weight
+      mtp.fc.weight
+      mtp.model.layers.0.self_attn.q_proj.weight
+      mtp.model.layers.0.mlp.gate_proj.weight
+      mtp.model.norm.weight
+      mtp.lm_head.weight
+    """
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
@@ -210,14 +286,10 @@ class Qwen3_5MTPModel(nn.Module):
         )
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        # Single-layer Qwen3 transformer
-        mtp_config = copy.deepcopy(config)
-        mtp_config.num_hidden_layers = 1
-        self.layers = nn.ModuleList(
-            [Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)]
-        )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(mtp_config)
+        # Single-layer Qwen3 transformer nested under `mtp.model.*` so that the
+        # saved keys (mtp.model.layers.0.* / mtp.model.norm.weight) match the
+        # layout expected by SGLang's Qwen3_5ForCausalLMMTP.load_weights.
+        self.model = Qwen3MTPInnerModel(config)
 
         # LM head (shared with target model during training)
         self.lm_head = nn.Linear(
@@ -236,43 +308,11 @@ class Qwen3_5MTPModel(nn.Module):
         normed_hidden = self.pre_fc_norm_hidden(hidden_states)
         fused = self.fc(torch.cat([normed_emb, normed_hidden], dim=-1))
 
-        bsz, seq_len, _ = fused.size()
-        if position_ids is None:
-            device = fused.device
-            position_ids = (
-                torch.arange(seq_len, dtype=torch.long, device=device)
-                .unsqueeze(0)
-                .expand(bsz, -1)
-            )
-
-        position_embeddings = self.rotary_emb(fused, position_ids)
-
-        # Causal mask
-        if attention_mask is not None and attention_mask.dim() == 2:
-            # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
-            combined_mask = _make_causal_mask(
-                (bsz, seq_len), fused.dtype, device=fused.device
-            )
-            expanded_mask = _expand_mask(attention_mask, fused.dtype, tgt_len=seq_len).to(
-                fused.device
-            )
-            attention_mask = expanded_mask + combined_mask
-        elif attention_mask is None and seq_len > 1:
-            attention_mask = _make_causal_mask(
-                (bsz, seq_len), fused.dtype, device=fused.device
-            )
-
-        hidden_states = fused
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-            )[0]
-
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return self.model(
+            fused,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
 
 
 class Qwen3_5MTPDraftModel(Qwen3PreTrainedModel):

@@ -1,6 +1,6 @@
 {
   "architectures": [
-    "Qwen3_5MTPDraftModel"
+    "Qwen3_5ForConditionalGeneration"
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,
