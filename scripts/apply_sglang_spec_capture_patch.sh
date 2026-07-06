@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Apply the spec-capture patch to the INSTALLED sglang (site-packages).
 #
-# The patch file is authored against the sglang source tree (paths like
-# python/sglang/srt/...); an installed package drops the python/ prefix, so we
-# strip one component and apply from the site-packages parent.
+# The patch file is authored against the sglang source tree (git-style paths
+# a/python/sglang/srt/...); an installed package drops the python/ prefix, so
+# strip TWO components (a/ + python/) and apply from the site-packages parent.
 #
 # Usage: scripts/apply_sglang_spec_capture_patch.sh [--reverse]
 set -euo pipefail
@@ -29,5 +29,5 @@ if [[ ${#REVERSE[@]} -eq 0 ]] && [[ -f "$SGL_PARENT/sglang/srt/spec_capture_sink
     exit 0
 fi
 
-patch "${REVERSE[@]}" -p1 -d "$SGL_PARENT" < "$PATCH"
+patch "${REVERSE[@]}" -p2 --batch -N -d "$SGL_PARENT" < "$PATCH"
 echo "spec-capture patch ${REVERSE[0]:-applied} at $SGL_PARENT/sglang (sglang $SGL_VERSION)"
