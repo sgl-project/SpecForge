@@ -142,6 +142,34 @@ def verify_feature_contract(
             )
 
 
+def verify_feature_contract_specs(
+    specs: Dict[str, Any],
+    contract: FeatureContract,
+    *,
+    sample_id: str,
+    recorded_aux_layer_ids: Optional[Tuple[int, ...]] = None,
+    aux_feature_name: str = "hidden_state",
+    target_feature_name: str = "target",
+) -> None:
+    """Contract verification from ``FeatureSpec``s alone — no tensors.
+
+    Used by ref-producing sources (server-side capture): the tensors already
+    live in the store, so the extraction-boundary checks run against the
+    returned shape/dtype metadata. Every check in
+    :func:`verify_feature_contract` reads only ``.shape`` from the mapping's
+    values, which ``FeatureSpec`` provides — so this is the same validation,
+    same error messages, same loudness.
+    """
+    verify_feature_contract(
+        specs,
+        contract,
+        sample_id=sample_id,
+        recorded_aux_layer_ids=recorded_aux_layer_ids,
+        aux_feature_name=aux_feature_name,
+        target_feature_name=target_feature_name,
+    )
+
+
 def verify_capture(
     tensors: Dict[str, Any],
     capture: FeatureContract,
@@ -172,6 +200,7 @@ __all__ = [
     "FeatureContract",
     "FeatureContractError",
     "verify_feature_contract",
+    "verify_feature_contract_specs",
     "CaptureConfig",
     "CaptureMismatchError",
     "verify_capture",
