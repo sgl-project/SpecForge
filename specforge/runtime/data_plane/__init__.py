@@ -14,6 +14,7 @@ from specforge.runtime.data_plane.offline_reader import (
     OfflineManifestReader,
     list_feature_files,
 )
+from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue, dp_partition
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "spec_from_tensor",
     "SampleRefQueue",
     "dp_partition",
+    "RefDistributor",
     "FeatureDataLoader",
     "OfflineManifestReader",
     "list_feature_files",
