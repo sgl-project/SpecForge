@@ -99,7 +99,9 @@ register_server_capture_schema(
         last_hidden_feature="target",  # target_repr="hidden_state"
         passthrough=(
             ("input_ids", "input_ids", ()),
-            ("loss_mask", "loss_mask", (1,)),  # eagle3 stores (1, L, 1)
+            # (1, L): the hidden_state train path mirrors the OFFLINE
+            # convention — TargetHead.preprocess adds the trailing mask dim.
+            ("loss_mask", "loss_mask", ()),
         ),
         attention_mask_feature="attention_mask",
     )
