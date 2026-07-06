@@ -414,6 +414,30 @@ class MooncakeFeatureStore(FeatureStore):
             },
         )
 
+    def adopt(self, sample_ref: SampleRef) -> None:
+        """Register an externally-produced sample for lifecycle management.
+
+        The server-capture transport writes tensors into this store's key
+        namespace from ANOTHER process (the SGLang server's sink), so this
+        instance has no put-side bookkeeping for them. ``adopt()`` records the
+        ref's generation / feature names / size so ``release``/``abort``/``gc``
+        can free the server-written objects exactly like locally-put ones.
+        """
+        gen = sample_ref.metadata.get("generation")
+        if gen is None:
+            raise ValueError(
+                f"cannot adopt {sample_ref.sample_id}: ref carries no generation"
+            )
+        with self._lock:
+            self._generation[sample_ref.sample_id] = int(gen)
+            self._sample_names[sample_ref.sample_id] = list(
+                sample_ref.feature_keys.keys()
+            )
+            self._sample_bytes[sample_ref.sample_id] = int(
+                sample_ref.estimated_bytes or 0
+            )
+            self._put_time[sample_ref.sample_id] = self._clock()
+
     # -- read --------------------------------------------------------------
     def get(
         self,
