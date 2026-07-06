@@ -42,6 +42,15 @@ sides land on one master. Export ``WANDB_API_KEY`` for consumer W&B logging.
 import hashlib
 import json
 import os
+import sys
+
+import torch
+
+if not torch.cuda.is_available():
+    # GPU-less process (the CPU producer): yunchang probes CUDA at import time
+    # whenever flashinfer is importable (yunchang.globals.get_cuda_arch) and
+    # raises; hiding flashinfer trips its clean ImportError fallback instead.
+    sys.modules["flashinfer"] = None
 
 from accelerate.utils import set_seed
 from train_dflash import build_models, parse_args
