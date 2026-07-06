@@ -231,28 +231,34 @@ index bf932611a..dc7615f44 100644
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 1cff5c983..d978ce788 100644
+index 1cff5c983..a5935fa3c 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -471,6 +471,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -471,6 +471,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                      # if there is no aux layer, set to None
                      self.eagle_aux_hidden_state_layer_ids = None
  
 +        if server_args.enable_spec_capture and not self.is_draft_worker:
-+            # Aux capture without a draft worker; None layer ids -> model default.
-+            self.eagle_use_aux_hidden_state = True
-+            self.eagle_aux_hidden_state_layer_ids = (
-+                server_args.spec_capture_aux_layer_ids
-+            )
++            # Aux capture without a draft worker, routed to the strategy's own
++            # capture method (they wire different submodules — e.g. VL models
++            # only populate layers_to_capture via the dflash path).
++            if getattr(server_args, "spec_capture_method", "eagle3") == "dflash":
++                self.dflash_use_aux_hidden_state = True
++                self.dflash_target_layer_ids = server_args.spec_capture_aux_layer_ids
++            else:
++                self.eagle_use_aux_hidden_state = True
++                self.eagle_aux_hidden_state_layer_ids = (
++                    server_args.spec_capture_aux_layer_ids
++                )
 +
          if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
              from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
  
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index c7162c16d..257d8b4f7 100644
+index c7162c16d..d515b3c69 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -2127,6 +2127,19 @@ class ServerArgs:
+@@ -2127,6 +2127,25 @@ class ServerArgs:
          bool,
          "Enable returning hidden states with responses.",
      ] = False
@@ -269,6 +275,12 @@ index c7162c16d..257d8b4f7 100644
 +        "spec-capture requests. Defaults to the model's EAGLE3 default layers "
 +        "(low/mid/high) when unset.",
 +    ] = None
++    spec_capture_method: A[
++        str,
++        "Capture method for --enable-spec-capture: 'eagle3' or 'dflash'. Must "
++        "match the draft strategy being trained; they wire capture onto "
++        "different submodules (VL targets only populate the dflash path).",
++    ] = "eagle3"
      enable_return_routed_experts: A[
          bool,
          "Enable returning routed experts of each layer with responses.",
