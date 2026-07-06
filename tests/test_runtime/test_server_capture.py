@@ -109,7 +109,14 @@ class _StubCaptureServer:
             sid, gen = spec["sample_id"], int(spec["gen"])
             if sid in self.error_sample_ids:
                 rows.append(
-                    {"meta_info": {"spec_capture_error": ["injected sink error"]}}
+                    {
+                        "meta_info": {
+                            "spec_capture": {
+                                "sample_id": sid,
+                                "error": "injected sink error",
+                            }
+                        }
+                    }
                 )
                 continue
             length = len(input_ids)
@@ -144,15 +151,13 @@ class _StubCaptureServer:
             rows.append(
                 {
                     "meta_info": {
-                        "spec_capture": [
-                            {
-                                "sample_id": sid,
-                                "store_id": spec["store_id"],
-                                "gen": gen,
-                                "aux_layer_ids": self.aux_layer_ids,
-                                "features": feats,
-                            }
-                        ]
+                        "spec_capture": {
+                            "sample_id": sid,
+                            "store_id": spec["store_id"],
+                            "gen": gen,
+                            "aux_layer_ids": self.aux_layer_ids,
+                            "features": feats,
+                        }
                     }
                 }
             )
