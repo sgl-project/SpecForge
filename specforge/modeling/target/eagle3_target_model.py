@@ -118,7 +118,6 @@ class Eagle3TargetModel(ABC):
         Generate the eagle3 data from the target model.
         """
 
-    @abstractmethod
     def generate_mtp_data(
         self,
         input_ids: torch.Tensor,
@@ -132,7 +131,16 @@ class Eagle3TargetModel(ABC):
         Unlike generate_eagle3_data, this must return *raw* input_ids and the
         *last* hidden states without pre-shifting.  The MTP training wrapper
         performs the next-token shift internally.
+
+        This is an optional capability: backends that do not support MTP
+        training need not override it.  Calling it on a backend without an
+        override raises at call time rather than failing at instantiation, so
+        external ``Eagle3TargetModel`` subclasses stay constructible.
         """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support MTP data generation; "
+            "override generate_mtp_data to enable MTP training."
+        )
 
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
