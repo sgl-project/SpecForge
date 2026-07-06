@@ -37,8 +37,20 @@ index a99d25267..f5d0b35e7 100644
                  # FIXME: These fields are not logits-related but are passed through here as a
                  # workaround since ForwardBatch is local to forward_batch_generation().
                  # They should be moved to GenerationBatchResult to keep this class clean.
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index b05334dea..2853c8231 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -441,6 +441,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+             output_token_entropy_val=recv_obj.output_token_entropy_val,
+             output_hidden_states=recv_obj.output_hidden_states,
++            spec_capture=recv_obj.spec_capture,
+             routed_experts=routed_experts,
+             indexer_topk=indexer_topk,
+             customized_info=recv_obj.customized_info,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 951f35495..082f3a114 100644
+index 951f35495..2359c31b7 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -284,6 +284,10 @@ class GenerateReqInput(BaseReq):
@@ -74,8 +86,28 @@ index 951f35495..082f3a114 100644
      # For observability
      time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
  
+@@ -1179,6 +1191,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     # The trainer step id. Used to know which step's weights are used for sampling.
+     token_steps: List[List[int]] = None
+ 
++    # Spec-training capture: one result dict per request (see spec_capture_sink).
++    spec_capture: Optional[List[Any]] = None
++
+     # Customized info
+     customized_info: Optional[Dict[str, List[Any]]] = None
+     # Detailed breakdown of cached tokens by source (device/host/storage)
+@@ -1247,6 +1262,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     # The trainer step id. Used to know which step's weights are used for sampling.
+     token_steps: List[List[int]] = None
+ 
++    # Spec-training capture: one result dict per request (see spec_capture_sink).
++    spec_capture: Optional[List[Any]] = None
++
+     # Customized info
+     customized_info: Optional[Dict[str, List[Any]]] = None
+     # Detailed breakdown of cached tokens by source (device/host/storage)
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index f1dc81d17..4ab4fc985 100755
+index f1dc81d17..a93a466b7 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -708,6 +708,7 @@ class Req(ReqDllmMixin):
@@ -86,7 +118,7 @@ index f1dc81d17..4ab4fc985 100755
      ):
          # Input and output info
          self.rid = rid
-@@ -771,7 +772,12 @@ class Req(ReqDllmMixin):
+@@ -771,7 +772,13 @@ class Req(ReqDllmMixin):
              }
          self.sampling_params = sampling_params
          self.custom_logit_processor = custom_logit_processor
@@ -97,6 +129,7 @@ index f1dc81d17..4ab4fc985 100755
 +        self.return_hidden_states = return_hidden_states or spec_capture is not None
 +        self.spec_capture_aux: List[torch.Tensor] = []
 +        self.spec_capture_last_hidden: List[torch.Tensor] = []
++        self.spec_capture_result = None  # per-request sink result -> output field
  
          # extra key for classifying the request (e.g. cache_salt)
          if lora_id is not None:
@@ -133,7 +166,7 @@ index abba37441..3018b8247 100644
              req.tokenizer = self.tokenizer
  
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index a9d5f0c28..2b2547509 100644
+index a9d5f0c28..001eff804 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -257,6 +257,18 @@ class SchedulerBatchResultProcessor:
@@ -186,9 +219,10 @@ index a9d5f0c28..2b2547509 100644
 +    def _sink_spec_capture(self, req: Req) -> None:
 +        """Write a finished capture request's tensors to the Mooncake sink.
 +
-+        Runs on the attention-TP rank that streams output; failures land in
-+        ``req.customized_info["spec_capture_error"]`` so the client sees a loud
-+        per-request error instead of a silent missing feature.
++        Runs on the attention-TP rank that streams output; the per-request result
++        (or an ``{"error": ...}`` marker) is set on ``req.spec_capture_result``,
++        returned to the client via the dedicated ``spec_capture`` output field
++        (a per-request channel, unlike per-token ``customized_info``).
 +        """
 +        from sglang.srt import spec_capture_sink
 +
@@ -202,24 +236,52 @@ index a9d5f0c28..2b2547509 100644
 +            else None
 +        )
 +        try:
-+            result = sink.put_sample(req.spec_capture, aux=aux, last_hidden=last_hidden)
-+            payload = {"spec_capture": [result]}
++            req.spec_capture_result = sink.put_sample(
++                req.spec_capture, aux=aux, last_hidden=last_hidden
++            )
 +        except Exception as e:
 +            logger.error("spec-capture sink failed for %s: %s", req.rid, e)
-+            payload = {"spec_capture_error": [str(e)]}
-+        # Ride the customized_info channel into meta_info (one-elem list: the
-+        # streamer slices [0:1]) — no new IPC fields.
-+        if req.customized_info is None:
-+            req.customized_info = {}
-+        req.customized_info.update(payload)
++            req.spec_capture_result = {
++                "sample_id": req.spec_capture.get("sample_id"),
++                "error": str(e),
++            }
 +        req.spec_capture_aux = []
 +        req.spec_capture_last_hidden = []
 +
      def _append_prefill_hidden_states(
          self,
          *,
+diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+index f95c59f6f..9e64326a1 100644
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -273,6 +273,7 @@ class _GenerationStreamAccumulator:
+     spec_correct_drafts_histogram: list = field(default_factory=list)
+     retraction_counts: list = field(default_factory=list)
+     output_hidden_states: Optional[list] = None
++    spec_capture: list = field(default_factory=list)
+     routed_experts: Optional[list] = None
+     indexer_topk: Optional[list] = None
+     customized_info: dict = field(default_factory=dict)
+@@ -482,6 +483,8 @@ class _GenerationStreamAccumulator:
+                 self.output_hidden_states.append(hs)
+             else:
+                 self.output_hidden_states.append(None)
++        # Per-request spec-capture result (aligned with rids), like the field above.
++        self.spec_capture.append(getattr(req, "spec_capture_result", None))
+         if self.return_routed_experts:
+             self.routed_experts.append(
+                 req.routed_experts if req.return_routed_experts else None
+@@ -540,6 +543,7 @@ class _GenerationStreamAccumulator:
+             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
+             output_token_entropy_val=None,
+             output_hidden_states=self.output_hidden_states,
++            spec_capture=self.spec_capture or None,
+             routed_experts=self.routed_experts,
+             indexer_topk=self.indexer_topk,
+             customized_info=self.customized_info,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index bf932611a..dc7615f44 100644
+index bf932611a..f0e821ec4 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -1172,6 +1172,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -230,6 +292,17 @@ index bf932611a..dc7615f44 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
+@@ -1922,6 +1923,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 hidden_states = recv_obj.output_hidden_states[i]
+                 if hidden_states is not None:
+                     meta_info["hidden_states"] = hidden_states
++            if getattr(recv_obj, "spec_capture", None):
++                sc = recv_obj.spec_capture[i]
++                if sc is not None:
++                    meta_info["spec_capture"] = sc
+             if getattr(recv_obj, "routed_experts", None):
+                 val = recv_obj.routed_experts[i]
+                 if val is not None:
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
 index 1cff5c983..a5935fa3c 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
