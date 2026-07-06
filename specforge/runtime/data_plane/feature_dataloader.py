@@ -16,6 +16,7 @@ the handle immediately, so prefetch can never race a release.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import torch
@@ -49,6 +50,7 @@ class FeatureDataLoader:
         drop_last: bool = True,
         strategy: str = "eagle3",
         ack: bool = True,
+        gc_interval_s: Optional[float] = 15.0,
     ) -> None:
         if (queue is None) == (refs is None):
             raise ValueError(
@@ -66,6 +68,20 @@ class FeatureDataLoader:
         self.strategy = strategy
         self.ack = ack
         self._seek_batches = 0
+        # Remote stores defer a physical free while the get() read-lease is live
+        # (Mooncake remove -> -706): release() parks it and gc() must retry.
+        # Pump gc on a cadence LONGER than the lease TTL — the store gives up
+        # after max_release_attempts, so rapid retries would leak the object.
+        self.gc_interval_s = gc_interval_s if hasattr(store, "gc") else None
+        self._last_gc = time.monotonic()
+
+    def _maybe_gc(self) -> None:
+        if self.gc_interval_s is None:
+            return
+        now = time.monotonic()
+        if now - self._last_gc >= self.gc_interval_s:
+            self._last_gc = now
+            self.store.gc()
 
     def _validate_refs(self, refs: List[SampleRef]) -> None:
         strategies = {ref.strategy for ref in refs}
@@ -112,6 +128,7 @@ class FeatureDataLoader:
         if self.clone_on_fetch:
             tensors = {k: v.clone() for k, v in tensors.items()}
         self.store.release(handle, reason="loaded")
+        self._maybe_gc()
         if self.per_sample_transform is not None:
             tensors = self.per_sample_transform(tensors)
         return tensors

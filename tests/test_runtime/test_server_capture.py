@@ -389,6 +389,49 @@ class TestServerCaptureAdapter(unittest.TestCase):
             resolve_server_capture_schema("nonexistent")
 
 
+class TestLoaderGcPump(unittest.TestCase):
+    """Consumer-side frees are lease-deferred by Mooncake (remove during the
+    get() read-lease fails, e.g. -706); release() parks them and the LOADER
+    must pump gc() or every consumed sample leaks until the segment fills."""
+
+    def test_loader_gc_pump_frees_lease_deferred_removes(self):
+        from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
+
+        backend = _FakeMooncakeStore()
+        backend.lease_active = True
+        original_remove = backend.remove
+
+        def lease_remove(key):
+            if backend.lease_active:
+                return -706
+            return original_remove(key)
+
+        backend.remove = lease_remove
+        store = MooncakeFeatureStore(
+            store=backend, store_id="run0", max_release_attempts=100
+        )
+        refs = [
+            store.put(
+                {"x": torch.ones(2, 2)},
+                sample_id=f"s{i}",
+                metadata={"run_id": "run0", "strategy": "eagle3"},
+            )
+            for i in range(3)
+        ]
+        loader = FeatureDataLoader(
+            store, refs=refs, batch_size=1, strategy="eagle3", gc_interval_s=0.0
+        )
+        for _ in loader:
+            pass
+        # all frees parked (lease active), nothing physically freed
+        self.assertTrue(any(backend._d))
+        self.assertEqual(store.health()["release_pending"], 3)
+        backend.lease_active = False  # lease expired
+        loader._maybe_gc()
+        self.assertFalse(any(backend._d), f"leaked: {list(backend._d)}")
+        self.assertEqual(store.health()["release_pending"], 0)
+
+
 class TestServerCaptureProducerWiring(unittest.TestCase):
     """The example's exact path: build_disagg_online_producer(feature_source=...)."""
 
