@@ -395,18 +395,33 @@ class TestLoaderGcPump(unittest.TestCase):
     must pump gc() or every consumed sample leaks until the segment fills."""
 
     def test_loader_gc_pump_frees_lease_deferred_removes(self):
+        import time as _time
+
         from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 
-        backend = _FakeMooncakeStore()
-        backend.lease_active = True
-        original_remove = backend.remove
+        TTL = 0.05
 
-        def lease_remove(key):
-            if backend.lease_active:
-                return -706
-            return original_remove(key)
+        class _LeaseFake(_FakeMooncakeStore):
+            """Mooncake lease semantics: is_exist GRANTS a read lease (TTL),
+            and a remove during a live lease fails (-706). get() probes
+            existence, so the release-time remove always fails; a retry frees
+            only if it runs after the TTL and is NOT preceded by another
+            exist probe (the gc() ordering bug this pins)."""
 
-        backend.remove = lease_remove
+            def __init__(self):
+                super().__init__()
+                self._lease_until = {}
+
+            def is_exist(self, key):
+                self._lease_until[key] = _time.monotonic() + TTL
+                return super().is_exist(key)
+
+            def remove(self, key):
+                if _time.monotonic() < self._lease_until.get(key, 0.0):
+                    return -706
+                return super().remove(key)
+
+        backend = _LeaseFake()
         store = MooncakeFeatureStore(
             store=backend, store_id="run0", max_release_attempts=100
         )
@@ -423,11 +438,11 @@ class TestLoaderGcPump(unittest.TestCase):
         )
         for _ in loader:
             pass
-        # all frees parked (lease active), nothing physically freed
+        # release-time frees parked: the get() exist-probe held the lease
         self.assertTrue(any(backend._d))
         self.assertEqual(store.health()["release_pending"], 3)
-        backend.lease_active = False  # lease expired
-        loader._maybe_gc()
+        _time.sleep(TTL * 3)  # pump cadence must exceed the lease TTL
+        loader._maybe_gc()  # retries remove FIRST (no re-leasing pre-check)
         self.assertFalse(any(backend._d), f"leaked: {list(backend._d)}")
         self.assertEqual(store.health()["release_pending"], 0)
 
