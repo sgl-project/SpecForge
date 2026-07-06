@@ -35,7 +35,8 @@ The extraction-correctness gate must be green on every pinned version. `status`:
 |---|---|---|---|---|
 | `0.5.5` (`lmsysorg/sglang:v0.5.5`) | 2.x / 4.x | sglang, hf, custom | `set_eagle3_layers_to_capture` | validated (repo CI image) |
 | `dev` (`lmsysorg/sglang:dev`) | 2.11 / 5.8 | sglang, hf, custom | `set_eagle3_layers_to_capture` | validated (H200 box) |
-| `0.5.9` (pyproject pin) | 2.9.1 / 4.57.1 | sglang, hf, custom | `set_eagle3_layers_to_capture` | target |
+| `0.5.9` (pyproject pin) | 2.9.1 / 4.57.1 | sglang, hf, custom | `set_eagle3_layers_to_capture` | superseded by 0.5.14 |
+| `0.5.14` (pyproject pin) | 2.9.1 / 4.57.1 | sglang, hf, custom, **server (spec-capture patch)** | `set_eagle3_layers_to_capture` / `--enable-spec-capture` | pin (PR #652); server transport gated by `test_server_capture_gate` |
 
 `0.5.9` is the dependency pin, but it is not an M4 sign-off until the
 extraction-correctness gate is green on that exact image/version.
@@ -55,6 +56,23 @@ a failure on a new image blocks the version bump.
 ## Patch files
 
 When an SGLang upgrade requires source changes to the extraction surface, add a
-versioned patch under `specforge/runtime/inference/patches/<sglang-version>.patch`
-and record it in the matrix above. None are required for the validated versions
-(extraction goes through the public capture API).
+versioned patch under `patches/sglang/<version>/` and record it in the matrix
+above. The in-process backends need none (extraction goes through the public
+capture API).
+
+### `patches/sglang/v0.5.14/spec-capture.patch` — server-side capture sink
+
+The **server transport**: 8 small hooks + one self-contained module
+(`sglang/srt/spec_capture_sink.py`) that let a live SGLang server, launched
+with `--enable-spec-capture [--spec-capture-aux-layer-ids ...]
+--chunked-prefill-size -1`, capture per-request aux/last hidden states during
+prefill and write them straight into a Mooncake store in
+`MooncakeFeatureStore`'s zero-copy key layout
+(`{store_id}/{sample_id}/g{gen}/{name}`, raw bytes, hard-pinned). The response
+`meta_info["spec_capture"]` carries only keys/shapes/dtypes; the client side is
+`specforge/inference/adapters/server_capture.py`. Apply to an installed sglang
+with `scripts/apply_sglang_spec_capture_patch.sh`. Strategy naming is decided
+per request by the client (eagle3 / dflash / domino registered;
+`register_server_capture_schema` for new ones). It also answers the stock
+`model_runner.py` TODO ("expose this to server args?") — the aux-capture
+upstream proposal from the O1.3 spike (PR #641) is exactly this surface.
