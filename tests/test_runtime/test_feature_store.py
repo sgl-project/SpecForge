@@ -1,5 +1,9 @@
 # coding=utf-8
-"""LocalFeatureStore: atomic put, get, idempotent release, abort, file mode (CPU)."""
+"""LocalFeatureStore: atomic put, get, idempotent release, abort, file mode (CPU).
+
+The ``TestFeatureStoreGC`` class covers the M5 reclamation surface: feature-lease
+max-hold force-free, the leak gate, and release-pending reconciliation.
+"""
 
 import logging
 import os
@@ -112,6 +116,21 @@ class TestLocalFeatureStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             store.get(ref)
 
+    def test_abort_returns_bytes_to_baseline(self):
+        # M5 leak gate: residency must return to exactly baseline after aborts,
+        # including the per-sample bookkeeping (no _generation/_put_time leak).
+        store = LocalFeatureStore("st")
+        baseline = store.health()["resident_bytes"]
+        for i in range(20):
+            store.put({"x": torch.randn(4, 16)}, sample_id=f"s{i}", metadata={})
+        self.assertGreater(store.health()["resident_bytes"], baseline)
+        for i in range(20):
+            store.abort(f"s{i}", reason="aborted")
+        h = store.health()
+        self.assertEqual(h["resident_bytes"], baseline)
+        self.assertEqual(h["resident_samples"], 0)
+        self.assertEqual(h["oldest_age_s"], 0.0)  # no put_time entries left
+
     def test_health(self):
         store = LocalFeatureStore("st")
         store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})
@@ -208,6 +227,107 @@ class TestLocalFeatureStore(unittest.TestCase):
             out, h = store.get(ref)  # mem publish survived
             self.assertIn("x", out)
             store.release(h)
+
+
+class _FakeClock:
+    """Deterministic monotonic clock for GC/age tests (no real sleeping)."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+class TestFeatureStoreGC(unittest.TestCase):
+    def test_gc_force_frees_past_max_hold_age(self):
+        clock = _FakeClock()
+        store = LocalFeatureStore("st", max_hold_age_s=10.0, clock=clock)
+        store.put({"x": torch.randn(1, 8)}, sample_id="old", metadata={})
+        clock.advance(20.0)  # "old" is now past max-hold
+        store.put({"x": torch.randn(1, 8)}, sample_id="new", metadata={})
+        report = store.gc()
+        self.assertEqual(report["force_freed"], 1)
+        self.assertGreater(report["force_freed_bytes"], 0)
+        self.assertEqual(store.health()["resident_samples"], 1)  # only "new" left
+
+    def test_gc_spares_leased_sample_even_if_old(self):
+        # A sample still leased by a (slow) trainer must NOT be force-freed, even
+        # past max-hold — that would be a use-after-free for the holder.
+        clock = _FakeClock()
+        store = LocalFeatureStore("st", max_hold_age_s=10.0, clock=clock)
+        ref = store.put({"x": torch.randn(1, 8)}, sample_id="held", metadata={})
+        _, h = store.get(ref)  # active lease
+        clock.advance(100.0)
+        report = store.gc()
+        self.assertEqual(report["force_freed"], 0)
+        self.assertEqual(store.health()["resident_samples"], 1)
+        store.release(h)  # once released, normal consume-once free applies
+        self.assertEqual(store.health()["resident_samples"], 0)
+
+    def test_gc_no_max_hold_is_noop(self):
+        clock = _FakeClock()
+        store = LocalFeatureStore("st", clock=clock)  # max_hold_age_s=None
+        store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        clock.advance(10_000.0)
+        self.assertEqual(store.gc()["force_freed"], 0)
+        self.assertEqual(store.health()["resident_samples"], 1)
+
+    def test_release_after_reput_while_leased_does_not_leak(self):
+        # Regression for the consume-once leak: re-put a sample_id while an older
+        # lease is still outstanding, then release the newest handle and finally
+        # the stale old handle. The current generation MUST be freed.
+        store = LocalFeatureStore("st")
+        ref1 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        _, h1 = store.get(ref1)  # lease on gen1
+        ref2 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})  # gen2
+        _, h2 = store.get(ref2)  # lease on gen2
+        store.release(h2)  # newest released first (h1/gen1 still active)
+        store.release(h1)  # stale gen1 handle released last
+        h = store.health()
+        self.assertEqual(h["resident_samples"], 0)  # was leaking before the fix
+        self.assertEqual(h["resident_bytes"], 0)
+
+    def test_stale_release_does_not_free_unconsumed_reput(self):
+        # The reverse guard: a stale double-release must NOT free a freshly
+        # re-put sample that nobody has consumed (leased) yet.
+        store = LocalFeatureStore("st")
+        ref1 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        _, h1 = store.get(ref1)
+        store.release(h1)  # frees gen1
+        store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})  # gen2, no get
+        store.release(h1)  # stale double-release of the gen1 handle
+        self.assertEqual(store.health()["resident_samples"], 1)  # gen2 preserved
+
+    def test_release_pending_reconciled_by_gc(self):
+        # A backend whose physical free fails parks the sample release-pending;
+        # gc() retries within the bounded window, then force-frees.
+        class FlakyFreeStore(LocalFeatureStore):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.fail_remaining = 5  # always fail retry -> hit force-free
+
+            def _try_physical_free(self, sample_id):
+                if self.fail_remaining > 0:
+                    self.fail_remaining -= 1
+                    return False
+                return super()._try_physical_free(sample_id)
+
+        store = FlakyFreeStore("st", max_release_attempts=3)
+        ref = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        _, h = store.get(ref)
+        store.release(h)  # free fails -> parked release-pending
+        self.assertEqual(store.health()["release_pending"], 1)
+        self.assertEqual(store.health()["resident_samples"], 1)  # still resident
+        store.gc()  # attempt 1
+        self.assertEqual(store.health()["release_pending"], 1)
+        store.gc()  # attempt 2
+        store.gc()  # attempt 3 -> bounded window exhausted -> force-free
+        self.assertEqual(store.health()["release_pending"], 0)
+        self.assertEqual(store.health()["resident_samples"], 0)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,243 @@
+<mxfile host="app.diagrams.net" modified="2026-06-15T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="specforge-dataflow-refactor-v4" name="SpecForge DataFlow Refactor Workflow">
+    <mxGraphModel dx="2200" dy="1400" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="SpecForge DataFlow-Centered Refactor Workflow" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=24;fontStyle=1;fontColor=#1f2933;" vertex="1" parent="1">
+          <mxGeometry x="610" y="20" width="980" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="Rule: DataFlowController coordinates metadata and lifecycle. FeatureStore moves tensors. Actorization follows resource, state, concurrency, and failure boundaries." style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=13;fontColor=#52606d;" vertex="1" parent="1">
+          <mxGeometry x="560" y="62" width="1080" height="32" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="legend_box" value="Legend" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#444444;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="30" y="30" width="380" height="260" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_orange" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="55" y="72" width="42" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_orange_text" value="Orange: orchestration, config, input source" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="112" y="66" width="240" height="36" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_red" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="55" y="108" width="42" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_red_text" value="Red: control plane, metadata, scheduling" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="112" y="102" width="240" height="36" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_purple" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="55" y="144" width="42" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_purple_text" value="Purple: data plane, tensor storage and fetch" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="112" y="138" width="240" height="36" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_blue" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="55" y="180" width="42" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_blue_text" value="Blue: trainer ownership" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="112" y="174" width="240" height="36" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_green" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="55" y="216" width="42" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_green_text" value="Green: inference and engine ownership" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="112" y="210" width="240" height="36" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_dashed" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#666666;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="55" y="250" width="42" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_dashed_text" value="Dashed boundary: Ray actor or service candidate" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="112" y="244" width="240" height="36" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="boundary_orchestration" value="Orchestration Layer - prefer in-process" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="470" y="120" width="620" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="train_py" value="train.py / CLI&#xa;Input: config, launch args&#xa;Output: runtime graph handle&#xa;API: specforge train --config&#xa;Deployment: in-process only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="510" y="170" width="245" height="105" as="geometry"/>
+        </mxCell>
+        <mxCell id="runtime_launcher" value="RuntimeLauncher / ComponentFactory&#xa;Input: resolved config&#xa;Output: controller, workers, stores&#xa;API: build(), start(), stop()&#xa;Deployment: in-process only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="805" y="170" width="245" height="105" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="boundary_trainer" value="Trainer Boundary - actor candidate when trainer is separate from rollout or inference" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f7fbff;strokeColor=#6c8ebf;dashed=1;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="1580" y="105" width="560" height="270" as="geometry"/>
+        </mxCell>
+        <mxCell id="trainer_controller" value="TrainerController&#xa;Input: TrainBatchRef, control commands&#xa;Output: TrainMetrics, WeightVersion, checkpoint status&#xa;API: train_step(refs), save_load(), offload(), status()&#xa;Deployment: local class or Ray actor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1625" y="160" width="470" height="125" as="geometry"/>
+        </mxCell>
+        <mxCell id="trainer_core" value="Trainer Core&#xa;Owns: draft model, optimizer, scheduler, FSDP or DP/SP implementation&#xa;Not a control-plane service; remains torch distributed training code" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1625" y="305" width="470" height="52" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="boundary_input" value="Prompt and Rollout Boundary" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="370" width="420" height="520" as="geometry"/>
+        </mxCell>
+        <mxCell id="prompt_source" value="PromptSource / DataSource&#xa;Input: jsonl, dataset, serving buffer&#xa;Output: PromptTask metadata&#xa;API: next_batch(), reload(), status()&#xa;Deployment: in-process by default; actor only for online traffic or remote dataset reload" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="430" width="340" height="125" as="geometry"/>
+        </mxCell>
+        <mxCell id="rollout_executor" value="RolloutExecutor&#xa;Input: PromptTask batch, rollout config, optional WeightVersion&#xa;Output: SampleRef metadata, eval metrics&#xa;API: run(tasks), eval(tasks), shutdown()&#xa;Deployment: in-process for simple rollout; Ray actor pool for agentic, sandbox, Polar, NanoRollout, multi-env" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="620" width="340" height="165" as="geometry"/>
+        </mxCell>
+        <mxCell id="rollout_actor_note" value="Ray actor boundary if rollout owns env workers, sandboxes, or independent CPU/GPU capacity." style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;dashed=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="95" y="805" width="310" height="50" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="boundary_control" value="Control Plane Boundary - one coordination point" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fffafa;strokeColor=#b85450;dashed=1;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="530" y="370" width="980" height="470" as="geometry"/>
+        </mxCell>
+        <mxCell id="dataflow_controller" value="DataFlowController&#xa;Input: PromptTask, WorkerStatus, SampleRef, TrainMetrics, WeightVersion&#xa;Output: GenerateRequest, RolloutRequest, TrainBatchRef, UpdateWeights, Pause/Resume/Stop&#xa;API: enqueue_prompts(), schedule_rollout(), commit_sample_ref(), dispatch_train_batch(), ack_train_result(), update_weight_version(), status()&#xa;Deployment: local class for direct/dataflow-colocated; Ray actor when any worker is remote or disaggregated" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="725" y="435" width="590" height="170" as="geometry"/>
+        </mxCell>
+        <mxCell id="prompt_queue" value="PromptQueue&#xa;Metadata only&#xa;PromptTask, priority, source_id" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="575" y="660" width="190" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="sample_ref_queue" value="SampleRefQueue&#xa;Metadata only&#xa;SampleRef ids ready for training" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="805" y="660" width="190" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="runtime_state" value="Runtime State&#xa;health, capacity, bytes backpressure, worker leases" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1035" y="660" width="190" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="version_policy" value="Version Policy&#xa;target_version, draft_version, train/serve consistency" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1265" y="660" width="190" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="control_contract" value="Control plane contract: pass metadata and refs only. No large hidden states, logits, or tensor payloads cross this boundary." style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="760" y="770" width="520" height="38" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="boundary_inference" value="Inference Boundary - actor or microservice candidate" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8fff6;strokeColor=#82b366;dashed=1;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="1580" y="430" width="560" height="470" as="geometry"/>
+        </mxCell>
+        <mxCell id="inference_worker" value="InferenceWorker / InferenceController&#xa;Input: GenerateRequest, UpdateWeights, capacity query&#xa;Output: SampleRef metadata, WorkerStatus&#xa;API: generate_features(), update_weights(), pause_resume(), status()&#xa;Deployment: Ray actor or service owner when engine has independent capacity" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1625" y="490" width="470" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="target_adapter" value="TargetEngineAdapter&#xa;Input: backend request, prompt tokens, target version&#xa;Output: normalized TargetOutput or FeaturePayload&#xa;API: generate(), get_addr(), health()&#xa;Deployment: prefer in-process inside InferenceWorker; not a standalone actor by itself" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1625" y="655" width="470" height="115" as="geometry"/>
+        </mxCell>
+        <mxCell id="engine_instances" value="Target Engine Instances&#xa;SGLang, vLLM, HF, custom&#xa;Owns: TP/EP/DP engine runtime, serving capacity, weight update mechanics" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1685" y="805" width="350" height="62" as="geometry"/>
+        </mxCell>
+        <mxCell id="router" value="Optional Router / Endpoint Surface&#xa;External: /v1/chat/completions&#xa;Internal: /generate, /health, /weights&#xa;Only needed for serving capture or external engine service" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1625" y="920" width="470" height="95" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="boundary_data" value="Data Plane Boundary - tensors live here; controllers pass refs and metadata" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fbf7ff;strokeColor=#9673a6;dashed=1;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="530" y="890" width="980" height="390" as="geometry"/>
+        </mxCell>
+        <mxCell id="feature_store" value="FeatureStore&#xa;Input: FeaturePayload tensors, lifecycle commands&#xa;Output: SampleRef metadata, fetched tensors by key&#xa;API: put(), get(), release(), abort(), stats()&#xa;Backends: local memory first; shared memory, Mooncake, NCCL, object store when cross-process or cross-node" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="585" y="960" width="390" height="145" as="geometry"/>
+        </mxCell>
+        <mxCell id="feature_loader" value="FeatureDataLoader&#xa;Input: SampleRef list, batch policy&#xa;Output: TrainBatch tensors&#xa;API: fetch_batch(refs), prefetch(), release_after_step()&#xa;Deployment: in-process with trainer unless tensor fetch becomes remote/async bottleneck" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="960" width="390" height="125" as="geometry"/>
+        </mxCell>
+        <mxCell id="sample_ref_schema" value="SampleRef schema&#xa;sample_id, feature_keys, shapes, dtypes, layout, bytes, target_version, draft_version, owner, ttl" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="760" y="1165" width="520" height="72" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="boundary_profiles" value="Runtime Profiles - deployment choices, not separate dataflow semantics" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;dashed=1;fontStyle=1;fontSize=13;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="980" width="420" height="250" as="geometry"/>
+        </mxCell>
+        <mxCell id="profile_direct" value="direct_local / legacy compatibility&#xa;Current SpecForge style: direct Python tensor pass. Keep for debugging and migration, not the target architecture." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="75" y="1030" width="350" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="profile_colocated" value="dataflow_colocated&#xa;Default target: same allocation can be used, but controller, refs, store, trainer, and inference boundaries are explicit." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="75" y="1110" width="350" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="profile_disagg" value="dataflow_disaggregated&#xa;Trainer, rollout, inference, and store can scale independently. Ray actors or services are used at the same component boundaries." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="75" y="1190" width="350" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="edge_train_launcher" value="build runtime" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d79b00;fontSize=11;" edge="1" parent="1" source="train_py" target="runtime_launcher">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_launcher_controller" value="creates and starts" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d79b00;fontSize=11;" edge="1" parent="1" source="runtime_launcher" target="dataflow_controller">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="930" y="335"/>
+              <mxPoint x="1020" y="335"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_prompt_controller" value="enqueue PromptTask" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d79b00;fontSize=11;" edge="1" parent="1" source="prompt_source" target="dataflow_controller">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_controller_rollout" value="run_rollout(tasks)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#b85450;fontSize=11;" edge="1" parent="1" source="dataflow_controller" target="rollout_executor">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_rollout_controller" value="SampleRef metadata / metrics" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#b85450;dashed=1;fontSize=11;" edge="1" parent="1" source="rollout_executor" target="sample_ref_queue">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_controller_inference_generate" value="generate_features(request)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#b85450;fontSize=11;" edge="1" parent="1" source="dataflow_controller" target="inference_worker">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_inference_controller_result" value="SampleRef metadata, health, capacity" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#b85450;dashed=1;fontSize=11;" edge="1" parent="1" source="inference_worker" target="runtime_state">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_controller_train" value="train_step(TrainBatchRef)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#b85450;fontSize=11;" edge="1" parent="1" source="dataflow_controller" target="trainer_controller">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1430" y="435"/>
+              <mxPoint x="1430" y="220"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_train_result" value="TrainMetrics, WeightVersion" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#6c8ebf;dashed=1;fontSize=11;" edge="1" parent="1" source="trainer_controller" target="version_policy">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_update_weights" value="update_weights(version)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#82b366;fontSize=11;" edge="1" parent="1" source="version_policy" target="inference_worker">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1360" y="805"/>
+              <mxPoint x="1560" y="805"/>
+              <mxPoint x="1560" y="560"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_inference_adapter" value="uses adapter" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#82b366;fontSize=11;" edge="1" parent="1" source="inference_worker" target="target_adapter">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_adapter_engine" value="owns or connects" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#82b366;fontSize=11;" edge="1" parent="1" source="target_adapter" target="engine_instances">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_inference_store" value="put FeaturePayload tensors" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#9673a6;fontSize=11;strokeWidth=2;" edge="1" parent="1" source="inference_worker" target="feature_store">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1530" y="585"/>
+              <mxPoint x="1530" y="935"/>
+              <mxPoint x="780" y="935"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_store_ref" value="returns SampleRef metadata" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#9673a6;dashed=1;fontSize=11;" edge="1" parent="1" source="feature_store" target="sample_ref_queue">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_trainer_loader" value="fetch batch refs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#6c8ebf;fontSize=11;" edge="1" parent="1" source="trainer_controller" target="feature_loader">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1580" y="245"/>
+              <mxPoint x="1500" y="245"/>
+              <mxPoint x="1500" y="1020"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_loader_store" value="get(ref)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#9673a6;fontSize=11;strokeWidth=2;" edge="1" parent="1" source="feature_loader" target="feature_store">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_loader_trainer" value="TrainBatch tensors" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#9673a6;dashed=1;fontSize=11;" edge="1" parent="1" source="feature_loader" target="trainer_core">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1500" y="1100"/>
+              <mxPoint x="2115" y="1100"/>
+              <mxPoint x="2115" y="330"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_router_worker" value="optional HTTP endpoint" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#82b366;dashed=1;fontSize=11;" edge="1" parent="1" source="router" target="inference_worker">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

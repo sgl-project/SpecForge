@@ -132,6 +132,8 @@ def initialize_model_parallel(
 
     # message queue broadcaster is only used in tensor model parallel group
     # NOTE: torch_compile parameter was removed in sglang 0.5.9
+    # NOTE: pynccl_use_current_stream was removed from init_model_parallel_group
+    #       in sglang 0.5.13 (was present in 0.5.9)
     parallel_state._TP = init_model_parallel_group(
         group_ranks,
         parallel_state._WORLD.local_rank,
@@ -140,7 +142,6 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
-        pynccl_use_current_stream=duplicate_tp_group,
     )
 
     if duplicate_tp_group:
@@ -156,7 +157,6 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
-            pynccl_use_current_stream=True,
         )
         # NOTE: Check pynccl_comm exists before accessing it (may be None in sglang 0.5.9)
         if parallel_state._TP.pynccl_comm is not None:
@@ -356,10 +356,15 @@ def initialize_dp_attention(
     dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
     # NOTE: Added attn_cp_size parameter for sglang 0.5.9
+    # NOTE: sglang 0.5.13 - compute_dp_attention_world_info now returns a 4-tuple
+    #       (attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size). The attn-tp
+    #       rank/size are no longer module globals (derived from the _ATTN_TP group),
+    #       so we only keep _ATTN_DP_RANK, mirroring sglang's initialize_dp_attention.
     (
-        dp_attention._ATTN_TP_RANK,
-        dp_attention._ATTN_TP_SIZE,
+        _,
+        _,
         dp_attention._ATTN_DP_RANK,
+        _,
     ) = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
