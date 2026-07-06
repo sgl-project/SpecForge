@@ -242,14 +242,15 @@ def main() -> None:
     set_seed(args.seed)
     role = _role()
     print(f"[disagg-dflash] role={role} run_id={RUN_ID}", flush=True)
-    # The producer is a thin HTTP driver (no torch model); only the trainer
-    # needs the process group.
-    if role == "producer":
-        run_producer(args)
-        return
+    # Both roles need the process group: the producer loads no model, but the
+    # control plane / feature store query dist rank. Launch each under torchrun
+    # (the producer on a spare GPU, its own rendezvous endpoint).
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     try:
-        run_consumer(args)
+        if role == "producer":
+            run_producer(args)
+        else:
+            run_consumer(args)
     finally:
         destroy_distributed()
 

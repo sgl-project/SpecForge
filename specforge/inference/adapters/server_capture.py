@@ -307,18 +307,10 @@ class SGLangServerCaptureAdapter:
         out: List[Union[Any, ServerCaptureFailure]] = []
         for task, row in zip(tasks, rows):
             meta = row.get("meta_info") or {}
-            err = meta.get("spec_capture_error")
-            if err:
-                out.append(
-                    ServerCaptureFailure(
-                        task_id=task.task_id,
-                        reason=f"server_capture:{err[0]}",
-                        retryable=True,
-                    )
-                )
-                continue
-            results = meta.get("spec_capture")
-            if not results:
+            # meta_info["spec_capture"] is the per-request result dict (or an
+            # {"error": ...} marker) from the server's dedicated output field.
+            result = meta.get("spec_capture")
+            if not result:
                 out.append(
                     ServerCaptureFailure(
                         task_id=task.task_id,
@@ -331,7 +323,15 @@ class SGLangServerCaptureAdapter:
                     )
                 )
                 continue
-            result = results[0]
+            if result.get("error"):
+                out.append(
+                    ServerCaptureFailure(
+                        task_id=task.task_id,
+                        reason=f"server_capture:{result['error']}",
+                        retryable=True,
+                    )
+                )
+                continue
             ref = self._ref_from_result(task, result, capture)
             try:
                 verify_feature_contract_specs(
