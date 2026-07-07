@@ -545,16 +545,29 @@ class MooncakeFeatureStore(FeatureStore):
 
         Zero-copy: one object per tensor, so remove every per-tensor key of the
         sample's current generation. Pickle: a single object.
+
+        Order matters against Mooncake's lease semantics: an is_exist probe
+        GRANTS a read lease, and a remove during any live lease fails (-706).
+        So each key is removed FIRST; the exist probe runs only after a failed
+        remove, purely to classify "already gone" as freed. (A probe on a
+        still-live key re-leases it, which is why gc() spaces retries beyond
+        the lease TTL.)
         """
         if not self._zero_copy:
-            return self._store_remove(self._key(sample_id))
+            if self._store_remove(self._key(sample_id)):
+                return True
+            return not self._store_exists(self._key(sample_id))
         gen = self._generation.get(sample_id)
         if gen is None:
             return True  # nothing tracked to remove (already freed)
         ok = True
         for name in self._sample_names.get(sample_id, []):
-            if not self._store_remove(self._tkey(sample_id, gen, name)):
-                ok = False
+            key = self._tkey(sample_id, gen, name)
+            if self._store_remove(key):
+                continue
+            if not self._store_exists(key):
+                continue  # already gone (freed remotely) counts as freed
+            ok = False
         return ok
 
     def _sample_exists(self, sample_id: str) -> bool:
@@ -632,11 +645,10 @@ class MooncakeFeatureStore(FeatureStore):
                         freed += 1
                     else:
                         self._release_pending.setdefault(sid, 0)
-            # reconcile release-pending: retry the fallible remote free
+            # reconcile release-pending: retry the fallible remote free.
+            # NO exists pre-check here: is_exist grants a read lease that would
+            # make the following remove fail (-706) on every retry.
             for sid in list(self._release_pending):
-                if not self._sample_exists(sid):
-                    freed_bytes += self._free_bookkeeping_locked(sid)
-                    continue
                 attempts = self._release_pending[sid] + 1
                 if self._try_physical_free(sid):
                     freed_bytes += self._free_bookkeeping_locked(sid)

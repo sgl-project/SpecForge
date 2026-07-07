@@ -109,7 +109,14 @@ class _StubCaptureServer:
             sid, gen = spec["sample_id"], int(spec["gen"])
             if sid in self.error_sample_ids:
                 rows.append(
-                    {"meta_info": {"spec_capture_error": ["injected sink error"]}}
+                    {
+                        "meta_info": {
+                            "spec_capture": {
+                                "sample_id": sid,
+                                "error": "injected sink error",
+                            }
+                        }
+                    }
                 )
                 continue
             length = len(input_ids)
@@ -144,15 +151,13 @@ class _StubCaptureServer:
             rows.append(
                 {
                     "meta_info": {
-                        "spec_capture": [
-                            {
-                                "sample_id": sid,
-                                "store_id": spec["store_id"],
-                                "gen": gen,
-                                "aux_layer_ids": self.aux_layer_ids,
-                                "features": feats,
-                            }
-                        ]
+                        "spec_capture": {
+                            "sample_id": sid,
+                            "store_id": spec["store_id"],
+                            "gen": gen,
+                            "aux_layer_ids": self.aux_layer_ids,
+                            "features": feats,
+                        }
                     }
                 }
             )
@@ -382,6 +387,64 @@ class TestServerCaptureAdapter(unittest.TestCase):
     def test_unknown_strategy_raises(self):
         with self.assertRaises(KeyError):
             resolve_server_capture_schema("nonexistent")
+
+
+class TestLoaderGcPump(unittest.TestCase):
+    """Consumer-side frees are lease-deferred by Mooncake (remove during the
+    get() read-lease fails, e.g. -706); release() parks them and the LOADER
+    must pump gc() or every consumed sample leaks until the segment fills."""
+
+    def test_loader_gc_pump_frees_lease_deferred_removes(self):
+        import time as _time
+
+        from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
+
+        TTL = 0.05
+
+        class _LeaseFake(_FakeMooncakeStore):
+            """Mooncake lease semantics: is_exist GRANTS a read lease (TTL),
+            and a remove during a live lease fails (-706). get() probes
+            existence, so the release-time remove always fails; a retry frees
+            only if it runs after the TTL and is NOT preceded by another
+            exist probe (the gc() ordering bug this pins)."""
+
+            def __init__(self):
+                super().__init__()
+                self._lease_until = {}
+
+            def is_exist(self, key):
+                self._lease_until[key] = _time.monotonic() + TTL
+                return super().is_exist(key)
+
+            def remove(self, key):
+                if _time.monotonic() < self._lease_until.get(key, 0.0):
+                    return -706
+                return super().remove(key)
+
+        backend = _LeaseFake()
+        store = MooncakeFeatureStore(
+            store=backend, store_id="run0", max_release_attempts=100
+        )
+        refs = [
+            store.put(
+                {"x": torch.ones(2, 2)},
+                sample_id=f"s{i}",
+                metadata={"run_id": "run0", "strategy": "eagle3"},
+            )
+            for i in range(3)
+        ]
+        loader = FeatureDataLoader(
+            store, refs=refs, batch_size=1, strategy="eagle3", gc_interval_s=0.0
+        )
+        for _ in loader:
+            pass
+        # release-time frees parked: the get() exist-probe held the lease
+        self.assertTrue(any(backend._d))
+        self.assertEqual(store.health()["release_pending"], 3)
+        _time.sleep(TTL * 3)  # pump cadence must exceed the lease TTL
+        loader._maybe_gc()  # retries remove FIRST (no re-leasing pre-check)
+        self.assertFalse(any(backend._d), f"leaked: {list(backend._d)}")
+        self.assertEqual(store.health()["release_pending"], 0)
 
 
 class TestServerCaptureProducerWiring(unittest.TestCase):
