@@ -132,6 +132,17 @@ class RefDistributor:
         self.finished = False
         self.error: Optional[BaseException] = None
         self.stats = {"dispatched": 0, "skipped": 0, "duplicates": 0, "dropped": 0}
+        # PROFILE_DISTRIB=<secs> -> periodic [dist] line: polled/dispatched
+        # rates, per-ref commit + count cost, inbox-publish cost, rank lag.
+        self._prof_s = float(os.environ.get("PROFILE_DISTRIB", "0"))
+        self._pd = {
+            "polled": 0,
+            "disp0": 0,
+            "commit": 0.0,
+            "cnt": 0.0,
+            "inboxpub": 0.0,
+            "t0": time.monotonic(),
+        }
 
     @staticmethod
     def inbox_path(inbox_dir: str, dp_rank: int) -> str:
@@ -165,6 +176,7 @@ class RefDistributor:
         raw = self.source.poll()
         if raw:
             progress = True
+            self._pd["polled"] += len(raw)
             for ref in raw:
                 if self._skip and ref.sample_id in self._skip:
                     # released in a prior run: already counted by that run's
@@ -174,12 +186,18 @@ class RefDistributor:
                     if not self._skip:
                         self._skip = None
                     continue
+                _t = time.monotonic()
                 before = self.controller.store.committed_count()
+                self._pd["cnt"] += time.monotonic() - _t
+                _t = time.monotonic()
                 self.controller.commit_samples(self.worker_id, [ref])
+                self._pd["commit"] += time.monotonic() - _t
+                _t = time.monotonic()
                 if self.controller.store.committed_count() == before:
                     # duplicate publication (e.g. producer restart); a
                     # reconcile-requeued ref also lands here and trains later.
                     self.stats["duplicates"] += 1
+                self._pd["cnt"] += time.monotonic() - _t
 
         # Dispatch every full window: one ref per rank, round-robin — per-rank
         # counts stay exactly equal, which is what keeps DP ranks in lockstep.
@@ -190,14 +208,43 @@ class RefDistributor:
                 self._window.extend(queue.get(need, timeout_s=0.0))
             if len(self._window) < self.dp_size:
                 break
+            _t = time.monotonic()
             for rank, ref in enumerate(self._window):
                 self._inboxes[rank].publish(ref)
+            self._pd["inboxpub"] += time.monotonic() - _t
             self.stats["dispatched"] += self.dp_size
             self._window = []
             progress = True
 
         if self._forward_consumed():
             progress = True
+
+        if self._prof_s:
+            now = time.monotonic()
+            win = now - self._pd["t0"]
+            if win >= self._prof_s:
+                pd = self._pd
+                n = max(1, pd["polled"])
+                disp = self.stats["dispatched"] - pd["disp0"]
+                lag = [
+                    inbox._published - inbox.consumed_remote()
+                    for inbox in self._inboxes
+                ]
+                print(
+                    f"[dist] win_s={win:.1f} polled={pd['polled']} disp={disp} "
+                    f"q={queue.depth()} dup={self.stats['duplicates']} "
+                    f"cnt_ms={1000*pd['cnt']/n:.2f} commit_ms={1000*pd['commit']/n:.2f} "
+                    f"inboxpub_ms={1000*pd['inboxpub']/n:.2f} lag={lag} (per-ref avg)",
+                    flush=True,
+                )
+                self._pd = {
+                    "polled": 0,
+                    "disp0": self.stats["dispatched"],
+                    "commit": 0.0,
+                    "cnt": 0.0,
+                    "inboxpub": 0.0,
+                    "t0": now,
+                }
 
         if not raw and self.source.is_closed() and queue.depth() == 0:
             self._finish()
