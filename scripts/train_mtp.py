@@ -171,7 +171,7 @@ def build_models(
         pretrained_model_name_or_path=args.target_model_path,
         backend=args.target_model_backend,
         torch_dtype=torch.bfloat16,
-        device="cuda" if args.target_model_backend != "sglang" else None,
+        device=device_type if args.target_model_backend != "sglang" else None,
         trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
