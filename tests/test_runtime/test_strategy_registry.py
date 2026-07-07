@@ -14,6 +14,8 @@ No GPU / model environment required.
 
 import unittest
 
+import torch
+
 from specforge import launch
 from specforge.training.strategies.base import DFlashTrainStrategy, Eagle3TrainStrategy
 from specforge.training.strategies.registry import (
@@ -57,6 +59,26 @@ class TestStrategyRegistry(unittest.TestCase):
             resolve_strategy("eagle3").required_features,
             frozenset(Eagle3TrainStrategy.required_features),
         )
+
+    def test_dflash_and_domino_online_collate_pad_ragged_sequences(self):
+        short = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "loss_mask": torch.tensor([[1, 1, 1]]),
+            "hidden_states": torch.ones(1, 3, 4),
+        }
+        long = {
+            "input_ids": torch.tensor([[4, 5, 6, 7, 8]]),
+            "loss_mask": torch.tensor([[1, 1, 1, 1, 1]]),
+            "hidden_states": torch.ones(1, 5, 4),
+        }
+        for name in ("dflash", "domino"):
+            with self.subTest(strategy=name):
+                batch = resolve_strategy(name).make_online_collate()([short, long])
+                self.assertEqual(batch["input_ids"].shape, (2, 5))
+                self.assertEqual(batch["hidden_states"].shape, (2, 5, 4))
+                self.assertEqual(batch["loss_mask"][0].tolist(), [1, 1, 1, 0, 0])
+                self.assertEqual(batch["input_ids"][0].tolist(), [1, 2, 3, 0, 0])
+                self.assertTrue(torch.all(batch["hidden_states"][0, 3:] == 0))
 
     def test_eagle3_is_fully_wired(self):
         spec = resolve_strategy("eagle3")

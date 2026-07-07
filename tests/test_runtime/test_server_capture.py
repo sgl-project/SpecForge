@@ -286,6 +286,25 @@ class TestServerCaptureAdapter(unittest.TestCase):
         out, _ = store.get(ref)
         self.assertEqual(out["input_ids"].tolist(), [list(range(1, 6))])
 
+    def test_batch_response_wrappers_are_normalized_by_sample_id(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def wrapped_server(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            results = [row["meta_info"]["spec_capture"] for row in rows]
+            for row in rows:
+                row["meta_info"]["spec_capture"] = [results]
+            return [[row] for row in rows]
+
+        _, _, _, adapter = _mk(
+            strategy="dflash", server=wrapped_server, backend=backend
+        )
+        refs = adapter.produce_refs(
+            [_task(0, 5), _task(1, 6)], capture=_dflash_contract()
+        )
+        self.assertTrue(all(isinstance(ref, SampleRef) for ref in refs))
+
     def test_aux_width_mismatch_fails_loud_and_frees_keys(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend, aux_width=HIDDEN)  # wrong width

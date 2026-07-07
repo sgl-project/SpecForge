@@ -136,6 +136,43 @@ def _default_post(url: str, json_body: Dict[str, Any], timeout: float):
     return resp.json()
 
 
+def _flatten_list_wrappers(value: Any) -> List[Any]:
+    """Flatten list-only response wrappers while leaving row objects intact."""
+    if not isinstance(value, list):
+        return [value]
+    flattened: List[Any] = []
+    for item in value:
+        flattened.extend(_flatten_list_wrappers(item))
+    return flattened
+
+
+def _capture_result_for_task(
+    value: Any, *, task_id: str, expected_sample_id: str
+) -> Optional[Dict[str, Any]]:
+    """Select this task's capture from scalar or batch-wrapped results."""
+    candidates = [item for item in _flatten_list_wrappers(value) if item is not None]
+    if not candidates:
+        return None
+    if not all(isinstance(item, dict) for item in candidates):
+        types = sorted({type(item).__name__ for item in candidates})
+        raise RuntimeError(
+            "spec-capture server returned non-object capture results for task "
+            f"{task_id}: {types}"
+        )
+    if len(candidates) == 1:
+        return candidates[0]
+    matches = [
+        item for item in candidates if str(item.get("sample_id")) == expected_sample_id
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "spec-capture server returned an ambiguous batch result for task "
+            f"{task_id}: expected sample_id={expected_sample_id!r}, "
+            f"matches={len(matches)}, candidates={len(candidates)}"
+        )
+    return matches[0]
+
+
 class SGLangServerCaptureAdapter:
     """RefSource over a live spec-capture SGLang server.
 
@@ -298,8 +335,7 @@ class SGLangServerCaptureAdapter:
         rows = self.post_fn(
             f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
         )
-        if isinstance(rows, dict):
-            rows = [rows]
+        rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):
             raise RuntimeError(
                 f"spec-capture server returned {len(rows)} rows for "
@@ -307,10 +343,19 @@ class SGLangServerCaptureAdapter:
             )
         out: List[Union[Any, ServerCaptureFailure]] = []
         for task, row in zip(tasks, rows):
+            if not isinstance(row, dict):
+                raise RuntimeError(
+                    "spec-capture server returned a non-object row for task "
+                    f"{task.task_id}: {type(row).__name__}"
+                )
             meta = row.get("meta_info") or {}
             # meta_info["spec_capture"] is the per-request result dict (or an
             # {"error": ...} marker) from the server's dedicated output field.
-            result = meta.get("spec_capture")
+            result = _capture_result_for_task(
+                meta.get("spec_capture"),
+                task_id=task.task_id,
+                expected_sample_id=self._sample_id(task),
+            )
             if not result:
                 out.append(
                     ServerCaptureFailure(

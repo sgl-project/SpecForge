@@ -264,7 +264,7 @@ register_strategy(
         make_offline_reader=_dflash_offline_reader,
         make_offline_transform=_dflash_offline_transform,
         make_offline_collate=_dflash_offline_collate,
-        make_online_collate=lambda: concat_collate,
+        make_online_collate=_dflash_offline_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,
         supports_online=True,
     )
@@ -311,7 +311,7 @@ register_strategy(
         make_offline_reader=_domino_offline_reader,
         make_offline_transform=_dflash_offline_transform,  # same schema as DFlash
         make_offline_collate=_dflash_offline_collate,
-        make_online_collate=lambda: concat_collate,
+        make_online_collate=_dflash_offline_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,  # same capture path as DFlash
         supports_online=True,
     )
