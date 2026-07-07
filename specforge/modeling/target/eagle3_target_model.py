@@ -216,39 +216,61 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
     def _get_language_model(self):
         """
-        Return the inner transformer module (without the lm_head) used for
-        cheap hidden-state-only forward passes.
+        Return the inner transformer module (without the lm_head) that owns the
+        decoder layers, used for cheap hidden-state-only forward passes.
 
-        Handles causal LMs (``model.model``) and multimodal conditional
-        generation models whose text decoder is nested under
-        ``model.language_model`` (e.g. ``Qwen3_5ForConditionalGeneration``,
-        where the embedding key resolves to
-        ``model.language_model.embed_tokens.weight``).
+        Handles causal LMs (``model.model``), multimodal conditional generation
+        models (text decoder under ``model.language_model``), and falls back to
+        a recursive search for any module that directly contains a ``layers``/
+        ``h`` ``nn.ModuleList`` (preferring a ``language_model`` path), so it
+        copes with arbitrary nesting in VLM checkpoints.
         """
+        # Fast paths for common layouts.
         if hasattr(self.model, "language_model"):
             lm = self.model.language_model
-            # language_model may be a ForCausalLM (has .model) or a bare Model.
-            return lm.model if hasattr(lm, "model") else lm
-        if hasattr(self.model, "model"):
+            if hasattr(lm, "model"):
+                return lm.model
+            if hasattr(lm, "layers"):
+                return lm
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             return self.model.model
+        if hasattr(self.model, "layers"):
+            return self.model
+        # Recursive fallback: a module whose direct child is a decoder-layers
+        # ModuleList. Handles VLMs whose text decoder is nested deeper than
+        # model.language_model (e.g. under model.model.language_model).
+        candidates = []
+        for name, module in self.model.named_modules():
+            for attr in ("layers", "h"):
+                child = getattr(module, attr, None)
+                if isinstance(child, nn.ModuleList) and len(child) > 0:
+                    candidates.append((name, module, len(child)))
+                    break
+        if candidates:
+            # Prefer a "language_model" path, then the largest layer count.
+            candidates.sort(key=lambda c: ("language_model" not in c[0], -c[2]))
+            return candidates[0][1]
         return self.model
 
     def _get_transformer_layers(self):
         """
         Helper to find the module list containing the transformer layers.
-        Adapts to common architectures (Llama, Qwen, Mistral, OPT) and
-        multimodal Qwen3_5ForConditionalGeneration (layers under
-        ``language_model``).
+        Adapts to common architectures (Llama, Qwen, Mistral, OPT, GPT-2) and
+        multimodal Qwen3_5ForConditionalGeneration via _get_language_model.
         """
         lm = self._get_language_model()
-        if hasattr(lm, "layers"):
+        if isinstance(getattr(lm, "layers", None), nn.ModuleList):
             return lm.layers
-        if hasattr(lm, "transformer") and hasattr(lm.transformer, "h"):
-            return lm.transformer.h
-        if hasattr(lm, "h"):  # GPT-2 style
+        if isinstance(getattr(lm, "h", None), nn.ModuleList):
             return lm.h
+        if hasattr(lm, "transformer") and isinstance(
+            getattr(lm.transformer, "h", None), nn.ModuleList
+        ):
+            return lm.transformer.h
         raise ValueError(
-            "Could not locate transformer layers in the model architecture to register hooks."
+            "Could not locate transformer layers in the model architecture to register hooks. "
+            f"model class={type(self.model).__name__}, "
+            f"top-level children={[n for n, _ in self.model.named_children()]}"
         )
 
     @torch.no_grad()
