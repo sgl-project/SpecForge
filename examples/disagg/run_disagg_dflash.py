@@ -18,6 +18,11 @@ and ran staged, since DFlash's HF capture is not thread-safe): the server does
 the capture, so a single prefill per prompt feeds training directly. It is the
 disaggregated sibling of ``examples/run_qwen3.6_27b_dflash_online.sh``.
 
+The producer is CPU-only (no torch.distributed, no GPU); the consumer runs
+under torchrun and data-parallel-shards the stream across its ranks: rank 0
+hosts the RefDistributor (the run's single ledger + round-robin dispatch to
+per-rank inboxes), gradients sync via FSDP.
+
 Config is environment-driven so one wrapper drives both roles; role is
 ``DISAGG_ROLE`` (``producer``/``consumer``) or derived from ``RCLI_NODE_RANK``:
 
@@ -25,7 +30,7 @@ Config is environment-driven so one wrapper drives both roles; role is
     DISAGG_SERVER_URL=http://host:30000   # the patched SGLang server (producer)
     DISAGG_STORE_ID=qwen36-dflash-disagg  # Mooncake key namespace (both roles)
     DISAGG_REF_CHANNEL=/root/disagg/refs.jsonl   # tiny ref manifest (both roles)
-    DISAGG_DB=/root/disagg/run.db      # shared durable metadata store
+    DISAGG_DB=/root/disagg/run.db      # consumer rank-0 ledger (trainer-side ONLY)
     DISAGG_MAX_PROMPTS=400             # cap the prompt pool (0 = all)
     DISAGG_MAX_STEPS=0                 # trainer max optimizer steps (0 = all)
 
@@ -34,11 +39,21 @@ Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
 sides land on one master. Export ``WANDB_API_KEY`` for consumer W&B logging.
 """
 
+import hashlib
 import json
 import os
+import sys
+
+import torch
+
+if not torch.cuda.is_available():
+    # GPU-less process (the CPU producer): yunchang probes CUDA at import time
+    # whenever flashinfer is importable (yunchang.globals.get_cuda_arch) and
+    # raises; hiding flashinfer trips its clean ImportError fallback instead.
+    sys.modules["flashinfer"] = None
 
 from accelerate.utils import set_seed
-from train_dflash import build_dataloader, build_models, parse_args
+from train_dflash import build_models, parse_args
 from transformers import AutoTokenizer
 
 from specforge.core.dflash import OnlineDFlashModel
@@ -94,22 +109,47 @@ def _mooncake_store() -> MooncakeFeatureStore:
     )
 
 
-def _extract_prompts(train_dataloader):
+def _producer_prompts(args, tokenizer):
+    """Tokenized prompts straight off the dataset — no DataLoader, no dist.
+
+    The producer only feeds prompts to the server, so it skips
+    ``prepare_dp_dataloaders`` (whose DistributedSampler needs a process group)
+    and stays CPU-only. Same tokenize/template/cache + min-loss filter as
+    ``train_dflash.build_dataloader``.
+    """
+    from datasets import load_dataset
+    from specforge.data import build_eagle3_dataset
+
+    cache_key = hashlib.md5(
+        f"{args.train_data_path}-{args.max_length}-{args.chat_template}-"
+        f"{args.target_model_path}".encode()
+    ).hexdigest()
+    dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    dataset = build_eagle3_dataset(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        chat_template=args.chat_template,
+        max_length=args.max_length,
+        is_preformatted=args.is_preformatted,
+        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+        cache_key=cache_key,
+        num_proc=args.build_dataset_num_proc,
+    )
+    dataset = dataset.filter(lambda x: x["loss_mask"].sum() >= 2 * args.block_size)
+
     prompts = []
-    for batch in train_dataloader:
-        input_ids = batch["input_ids"]
-        loss_mask = batch["loss_mask"]
-        attn = batch.get("attention_mask")
-        for i in range(input_ids.shape[0]):
-            n = int(attn[i].sum().item()) if attn is not None else input_ids.shape[1]
-            prompts.append(
-                {
-                    "payload": {
-                        "input_ids": input_ids[i, :n].tolist(),
-                        "loss_mask": loss_mask[i, :n].tolist(),
-                    }
+    for row in dataset:  # rows are (1, L) tensors
+        input_ids, loss_mask = row["input_ids"][0], row["loss_mask"][0]
+        attn = row.get("attention_mask")
+        n = int(attn[0].sum().item()) if attn is not None else input_ids.shape[0]
+        prompts.append(
+            {
+                "payload": {
+                    "input_ids": input_ids[:n].tolist(),
+                    "loss_mask": loss_mask[:n].tolist(),
                 }
-            )
+            }
+        )
     return prompts
 
 
@@ -123,12 +163,11 @@ def _resolve_mask_token(args, tokenizer) -> int:
 
 
 def run_producer(args) -> None:
-    """Thin driver: prompts -> patched server (captures to Mooncake) -> refs."""
+    """Thin CPU driver: prompts -> patched server (captures to Mooncake) -> refs."""
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    train_dataloader, _eval = build_dataloader(args, tokenizer)
-    prompts = _extract_prompts(train_dataloader)
+    prompts = _producer_prompts(args, tokenizer)
     max_prompts = _max("DISAGG_MAX_PROMPTS", 0)
     if max_prompts:
         prompts = prompts[:max_prompts]
@@ -150,6 +189,10 @@ def run_producer(args) -> None:
     )
     print(f"[producer] {len(prompts)} prompts -> {os.environ['DISAGG_SERVER_URL']}")
 
+    # NO shared db: the trainer-side ledger (DISAGG_DB) is the run's single
+    # book-keeper; committed rows from the producer would make the consumer
+    # distributor's commit-dedup drop every ref. The producer's private
+    # in-memory store still dedups within its own process.
     _workers, drive_producer = build_disagg_online_producer(
         strategy="dflash",
         feature_source=adapter,
@@ -160,7 +203,6 @@ def run_producer(args) -> None:
         target_hidden_size=target_hidden,
         target_repr=None,  # DFlash trains on captured hidden states, no target dist.
         aux_hidden_state_layer_ids=aux_layer_ids,
-        metadata_db_path=os.environ.get("DISAGG_DB") or None,
     )
     produced = drive_producer()
     print(f"[producer] streamed {produced} samples; channel closed", flush=True)
@@ -226,6 +268,8 @@ def run_consumer(args) -> None:
             print(f"[consumer] step {step} {summary}", flush=True)
 
     print(f"[consumer] training from mooncake://{RUN_ID}", flush=True)
+    # dp_rank/dp_size default from the torchrun world: rank 0 hosts the
+    # RefDistributor (single ledger + per-rank inbox dispatch).
     trainer, loader = build_disagg_online_consumer(
         strategy="dflash",
         feature_store=_mooncake_store(),
@@ -243,8 +287,15 @@ def run_consumer(args) -> None:
         metadata_db_path=os.environ.get("DISAGG_DB") or None,
         logger=logger,
         log_interval=_max("DISAGG_LOG_INTERVAL", 1),
+        inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
+        # liveness guard against a dead producer/server (DP default: 1800s)
+        idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", 0)) or None,
     )
-    trainer.fit(loader)
+    try:
+        trainer.fit(loader)
+    finally:
+        if getattr(trainer, "ref_distributor", None) is not None:
+            trainer.ref_distributor.stop()  # clean wind-down on max_steps exit
     print(f"[consumer] DONE ({RUN_ID})", flush=True)
 
 
@@ -253,15 +304,13 @@ def main() -> None:
     set_seed(args.seed)
     role = _role()
     print(f"[disagg-dflash] role={role} run_id={RUN_ID}", flush=True)
-    # Both roles need the process group: the producer loads no model, but the
-    # control plane / feature store query dist rank. Launch each under torchrun
-    # (the producer on a spare GPU, its own rendezvous endpoint).
+    if role == "producer":
+        # CPU-only: no model, no collectives — plain `python`, no torchrun.
+        run_producer(args)
+        return
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     try:
-        if role == "producer":
-            run_producer(args)
-        else:
-            run_consumer(args)
+        run_consumer(args)
     finally:
         destroy_distributed()
 

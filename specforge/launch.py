@@ -16,7 +16,7 @@ is a registry entry, not a new ``build_*`` family.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from specforge.runtime.contracts import DeploymentMode, SampleRef
 from specforge.runtime.control_plane import (
@@ -142,6 +142,44 @@ def _resolve_metadata_store(
     if metadata_db_path is not None:
         return SQLiteMetadataStore(metadata_db_path)
     return None
+
+
+def _dp_consumer_layout(
+    dp_rank: Optional[int],
+    dp_size: Optional[int],
+    tp_size: int,
+    sp_ulysses_size: int,
+    sp_ring_size: int,
+) -> Tuple[int, int]:
+    """Resolve the online consumer's (dp_rank, dp_size), defaulting from dist.
+
+    The DP online consumer shards DATA across ranks (one inbox each), so its DP
+    width is the whole trainer world; tp/sp replication inside a shard is not
+    wired yet and is rejected rather than silently double-training.
+    """
+    import torch.distributed as dist
+
+    initialized = dist.is_available() and dist.is_initialized()
+    if dp_size is None:
+        dp_size = dist.get_world_size() if initialized else 1
+    if dp_rank is None:
+        dp_rank = dist.get_rank() if initialized else 0
+    if dp_size > 1 and (tp_size != 1 or sp_ulysses_size != 1 or sp_ring_size != 1):
+        raise NotImplementedError(
+            "DP online consumer shards refs across dp ranks; tp/sp inside a DP "
+            f"shard is not wired yet (got tp={tp_size}, sp_ulysses="
+            f"{sp_ulysses_size}, sp_ring={sp_ring_size})"
+        )
+    if not 0 <= dp_rank < dp_size:
+        raise ValueError(f"dp_rank {dp_rank} out of range for dp_size {dp_size}")
+    return dp_rank, dp_size
+
+
+def _dp_barrier() -> None:
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
 
 
 def _checkpoint_global_step(resume_from: str) -> int:
@@ -625,17 +663,32 @@ def build_disagg_online_consumer(
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    dp_rank: Optional[int] = None,
+    dp_size: Optional[int] = None,
+    inbox_dir: Optional[str] = None,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
     Trains from a streamed ref ``channel`` + a consume-once ``feature_store``
-    produced by another pool; ``metadata_store``/``metadata_db_path`` must be the
-    durable store the producer commits to. Online resume needs BOTH knobs:
-    ``resume=True`` reconciles the durable marker (already-trained refs are
-    skipped on the channel re-read) and ``resume_from`` restores the trainer
-    state those acks correspond to. ``resume_from`` alone raises; a marker ahead
-    of the checkpoint raises (the skipped samples' weight updates were rolled
-    back — silent data loss).
+    produced by another pool. Online resume needs BOTH knobs: ``resume=True``
+    reconciles the durable marker (already-trained refs are skipped on the
+    channel re-read) and ``resume_from`` restores the trainer state those acks
+    correspond to. ``resume_from`` alone raises; a marker ahead of the
+    checkpoint raises (the skipped samples' weight updates were rolled back —
+    silent data loss).
+
+    **Data-parallel trainer** (``dp_size > 1``, defaulting to the torchrun
+    world): rank 0 runs the :class:`RefDistributor` — the run's single
+    book-keeper. It alone reads ``channel``, commits into the ONE durable
+    ``metadata_store``/``metadata_db_path`` (required on rank 0; the producer
+    must NOT share this db — the distributor's commit-dedup would drop its
+    rows), and round-robin dispatches aligned windows to per-rank inboxes under
+    ``inbox_dir`` (default ``<channel>.inboxes``, trainer-local). Every rank
+    consumes only its own inbox; durable acks gather to rank 0
+    (:class:`DPAckController`) while the distributor mirrors the per-rank inbox
+    acks onto the producer's backpressure counter. Passing ``inbox_dir``
+    explicitly opts a single-rank run into the same distributor path;
+    otherwise ``dp_size == 1`` keeps the original direct-channel path.
     """
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
@@ -648,12 +701,13 @@ def build_disagg_online_consumer(
             "alone would re-train the whole re-streamed channel"
         )
     spec = resolve_strategy(strategy)
-    store = _resolve_metadata_store(metadata_store, metadata_db_path)
-    controller = DataFlowController(run_id, metadata_store=store)
+    dp_rank, dp_size = _dp_consumer_layout(
+        dp_rank, dp_size, tp_size, sp_ulysses_size, sp_ring_size
+    )
 
-    skip_ids = None
-    if resume:
-        if store is None:
+    def _reconcile(controller, resolved_store):
+        """resume=True -> skip already-released refs; guard marker vs checkpoint."""
+        if resolved_store is None:
             raise ValueError(
                 "resume=True needs a durable metadata_store/metadata_db_path; an "
                 "in-process store has no committed/ack history to reconcile against"
@@ -661,7 +715,6 @@ def build_disagg_online_consumer(
         # Released == durably acked AND optimizer-step committed: skip exactly
         # those on the channel re-read; the committed-unacked tail re-trains.
         reconciled = controller.reconcile_on_restart(feature_store)
-        skip_ids = set(reconciled["released"])
         if resume_from:
             marker_step = reconciled["global_step"]
             ckpt_step = _checkpoint_global_step(resume_from)
@@ -675,9 +728,91 @@ def build_disagg_online_consumer(
                     f"latest), or start a fresh run_id + metadata store to re-train "
                     f"from scratch"
                 )
+        return set(reconciled["released"])
 
-    queue = StreamingRefQueue(channel, idle_timeout_s=idle_timeout_s, skip_ids=skip_ids)
-    return _assemble_trainer(
+    distributor = None
+    if dp_size == 1 and inbox_dir is None:
+        # Legacy direct-channel path, unchanged.
+        store = _resolve_metadata_store(metadata_store, metadata_db_path)
+        controller = DataFlowController(run_id, metadata_store=store)
+        skip_ids = _reconcile(controller, store) if resume else None
+        queue = StreamingRefQueue(
+            channel, idle_timeout_s=idle_timeout_s, skip_ids=skip_ids
+        )
+    else:
+        import torch.distributed as dist
+
+        from specforge.runtime.control_plane.dp_ack import DPAckController
+        from specforge.runtime.control_plane.metadata_store import NoOpMetadataStore
+        from specforge.runtime.data_plane.ref_distributor import (
+            InboxChannel,
+            RefDistributor,
+        )
+
+        if inbox_dir is None:
+            inbox_dir = channel.path + ".inboxes"
+        # Symmetric preconditions (ALL ranks) — a rank-0-only raise would strand
+        # the other ranks in the barrier below.
+        if metadata_store is None and metadata_db_path is None:
+            raise ValueError(
+                "DP online consumer needs a durable metadata_store/"
+                "metadata_db_path — the rank-0 distributor is the run's single "
+                "ledger"
+            )
+        if dist.is_available() and dist.is_initialized():
+            world = dist.get_world_size()
+            if world != dp_size:
+                raise ValueError(
+                    f"DP online consumer: dp_size={dp_size} but the process "
+                    f"group has {world} ranks — every rank must own exactly one "
+                    f"inbox"
+                )
+        # Liveness default: a dead producer/distributor must never hang the
+        # ranks silently. Generous enough for a cold server load before the
+        # first ref.
+        if idle_timeout_s is None:
+            idle_timeout_s = 1800.0
+        if dp_rank == 0:
+            store = _resolve_metadata_store(metadata_store, metadata_db_path)
+            if isinstance(store, NoOpMetadataStore):
+                raise ValueError(
+                    "DP online consumer needs a RETAINING metadata store: the "
+                    "ledger is what dedups commits and reconciles restarts"
+                )
+            controller = DPAckController(
+                run_id, is_authority=True, metadata_store=store
+            )
+            skip_ids = _reconcile(controller, store) if resume else None
+            if not resume and store.committed_count() > 0:
+                raise ValueError(
+                    f"metadata store already holds {store.committed_count()} "
+                    f"committed samples from a previous run; the distributor's "
+                    f"commit-dedup would silently drop the whole re-streamed "
+                    f"channel. Pass resume=True (+ resume_from) to reconcile, or "
+                    f"start fresh (new metadata_db_path / delete the db)"
+                )
+            distributor = RefDistributor(
+                channel,
+                controller,
+                inbox_dir,
+                dp_size,
+                skip_ids=skip_ids,
+                idle_timeout_s=idle_timeout_s,
+            )
+        else:
+            # Gather-participant only: throwaway store, records nothing.
+            controller = DPAckController(
+                run_id, is_authority=False, metadata_store=InMemoryMetadataStore()
+            )
+        # Inboxes must be re-created (rank 0, in RefDistributor.__init__) before
+        # any rank opens a reader on a stale previous-attempt file.
+        _dp_barrier()
+        inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
+        queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
+        if distributor is not None:
+            distributor.start()
+
+    trainer, loader = _assemble_trainer(
         spec=spec,
         controller=controller,
         store=feature_store,
@@ -704,6 +839,10 @@ def build_disagg_online_consumer(
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
     )
+    #: rank 0's RefDistributor handle in DP mode (None elsewhere) — callers may
+    #: stop() it after fit for a clean early (max_steps) shutdown.
+    trainer.ref_distributor = distributor
+    return trainer, loader
 
 
 def run_disagg_online_interleaved(
