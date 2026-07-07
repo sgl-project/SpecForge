@@ -16,6 +16,7 @@ is a registry entry, not a new ``build_*`` family.
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional, Tuple
 
 from specforge.runtime.contracts import DeploymentMode, SampleRef
@@ -30,6 +31,8 @@ from specforge.runtime.control_plane.metadata_store import (
 )
 from specforge.runtime.data_plane import FeatureStore, LocalFeatureStore
 from specforge.training.strategies.registry import StrategySpec, resolve_strategy
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared assemblers — strategy- and topology-agnostic.
@@ -225,6 +228,12 @@ def _assemble_rollout_workers(
     SGLang server writes features straight to the store — no ``target_model``
     is loaded here). Otherwise an in-process adapter is built over
     ``target_model``.
+
+    A *sequence* of feature sources fans out to one worker per source (the
+    multi-server topology: 1 server : 1 adapter : 1 worker). All workers share
+    the one controller, whose per-``worker_id`` leases keep their prompt slices
+    disjoint. A single source keeps the legacy shape: ``num_rollout_workers``
+    workers sharing it.
     """
     if not spec.supports_online:
         raise NotImplementedError(
@@ -239,22 +248,35 @@ def _assemble_rollout_workers(
         aux_hidden_state_layer_ids = tuple(
             getattr(target_model, "aux_hidden_states_layers", ()) or ()
         )
-    if feature_source is not None:
-        adapter = feature_source
+    if isinstance(feature_source, (list, tuple)):
+        if not feature_source:
+            raise ValueError("feature_source sequence is empty")
+        if num_rollout_workers not in (1, len(feature_source)):
+            raise ValueError(
+                f"num_rollout_workers={num_rollout_workers} conflicts with "
+                f"{len(feature_source)} feature sources (one worker per source)"
+            )
+        adapters = list(feature_source)
+    elif feature_source is not None:
+        adapters = [feature_source] * num_rollout_workers
     elif spec.make_adapter is not None:
-        adapter = spec.make_adapter(target_model, device=device, t2d=t2d)
+        adapters = [
+            spec.make_adapter(target_model, device=device, t2d=t2d)
+        ] * num_rollout_workers
     else:
         from specforge.inference.adapters.policy import (
             EAGLE3_FEATURE_SCHEMA,
             PolicyFeatureAdapter,
         )
 
-        adapter = PolicyFeatureAdapter(
-            target_model,
-            schema=spec.feature_schema or EAGLE3_FEATURE_SCHEMA,
-            device=device,
-            t2d=t2d,
-        )
+        adapters = [
+            PolicyFeatureAdapter(
+                target_model,
+                schema=spec.feature_schema or EAGLE3_FEATURE_SCHEMA,
+                device=device,
+                t2d=t2d,
+            )
+        ] * num_rollout_workers
     feature_contract = FeatureContract.from_strategy(
         required_features=spec.required_features,
         aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
@@ -275,7 +297,7 @@ def _assemble_rollout_workers(
             worker_id=f"rollout-{i}",
             strategy=spec.name,
         )
-        for i in range(num_rollout_workers)
+        for i, adapter in enumerate(adapters)
     ]
 
 
@@ -565,6 +587,8 @@ def build_disagg_online_producer(
     lease: int = 8,
     in_flight_high_watermark: int = 256,
     backpressure_poll_s: float = 0.2,
+    max_worker_failures: int = 3,
+    max_prompt_attempts: Optional[int] = 5,
     metadata_store: Optional[MetadataStore] = None,
     metadata_db_path: Optional[str] = None,
     sleep=None,
@@ -574,12 +598,27 @@ def build_disagg_online_producer(
     Workers put() into a cross-node ``feature_store``; committed refs stream to
     the consumer via ``channel``. Pass ``feature_source`` for the server-capture
     transport (live SGLang server writes to the store; ``target_model`` stays
-    None). ``metadata_store``/``metadata_db_path`` must be the same durable store
+    None) — a *sequence* of sources fans out to one worker per source (the
+    multi-server topology; each worker drives its own server concurrently).
+    ``metadata_store``/``metadata_db_path`` must be the same durable store
     the consumer opens. Returns ``(workers, drive_producer)``:
     ``drive_producer(should_stop=...)`` runs until the prompt pool drains, pauses
     above ``in_flight_high_watermark``, and always closes the channel on exit
     (EOF terminates the consumer's loader).
+
+    Failure semantics: a worker whose source raises (dead/unreachable server)
+    has already failed its leases retryable — the surviving workers re-lease
+    those prompts. After ``max_worker_failures`` *consecutive* failures the
+    worker is dropped from rotation (its health is logged); if every worker is
+    dropped while prompts remain, ``drive_producer`` raises instead of silently
+    truncating the run. Per-task retryable failures are bounded by
+    ``max_prompt_attempts`` (a poisoned prompt goes terminal, not infinite).
+    The pool counts as drained only when no prompt is pending *or leased* —
+    an all-failed round no longer reads as end-of-data. With N workers the
+    watermark can overshoot by up to N * lease (each worker checks it
+    independently before leasing).
     """
+    import threading
     import time
 
     spec = resolve_strategy(strategy)
@@ -587,6 +626,7 @@ def build_disagg_online_producer(
     controller = DataFlowController(
         run_id,
         metadata_store=_resolve_metadata_store(metadata_store, metadata_db_path),
+        max_prompt_attempts=max_prompt_attempts,
     )
     controller.ingest_prompts(prompts)
 
@@ -609,26 +649,113 @@ def build_disagg_online_producer(
     )
 
     def drive_producer(max_rounds: int = 1_000_000, should_stop=None) -> int:
+        """Drive all workers until the pool drains; returns refs published.
+
+        One worker runs inline; N workers run one thread each (the blocking
+        HTTP prefill call releases the GIL, so servers genuinely overlap).
+        The controller and feature store are lock-protected; the channel is
+        not, so publishes serialize through ``publish_lock``.
+        """
         for w in workers:
             w.start()
-        produced = 0
-        try:
+        publish_lock = threading.Lock()
+        state = {"produced": 0}
+        dead: dict = {}  # worker_id -> last failure reason
+
+        def pool_drained() -> bool:
+            st = controller.status()
+            # leased counts too: a peer's in-flight lease may fail retryable
+            # and come back — leaving then would strand it.
+            return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
+
+        def run_worker(w) -> None:
+            failures = 0
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
-                    break  # caller asked us to wind down (e.g. trainer finished)
+                    return
                 # backpressure: in_flight = published - consumer-acked
                 while channel.in_flight_remote() >= in_flight_high_watermark:
                     if should_stop is not None and should_stop():
-                        return produced  # don't block on the watermark forever
+                        return
                     sleep(backpressure_poll_s)
-                refs = []
-                for w in workers:
-                    refs.extend(w.run_once(max_tasks=lease))
-                if not refs:
-                    break  # prompt pool drained
-                channel.publish_many(refs)
-                produced += len(refs)
-            return produced
+                try:
+                    refs = w.run_once(max_tasks=lease)
+                except Exception as exc:
+                    # the worker already failed its leases retryable; peers
+                    # (or this worker, next round) will re-lease them.
+                    failures += 1
+                    logger.warning(
+                        "rollout worker %s failed (%d/%d): %s",
+                        w.worker_id,
+                        failures,
+                        max_worker_failures,
+                        exc,
+                    )
+                    if failures >= max_worker_failures:
+                        dead[w.worker_id] = str(exc)
+                        logger.error(
+                            "dropping rollout worker %s after %d consecutive "
+                            "failures; health=%s",
+                            w.worker_id,
+                            failures,
+                            w.health(),
+                        )
+                        return
+                    sleep(backpressure_poll_s)
+                    continue
+                failures = 0
+                if refs:
+                    with publish_lock:
+                        channel.publish_many(refs)
+                        state["produced"] += len(refs)
+                elif pool_drained():
+                    return
+                else:
+                    # leased nothing: peers hold the remaining prompts (their
+                    # leases may yet fail back into the pool) — wait, retry.
+                    sleep(backpressure_poll_s)
+
+        fatal: list = []  # non-transport errors escaping a worker thread
+
+        def run_worker_guarded(w) -> None:
+            try:
+                run_worker(w)
+            except BaseException as exc:  # e.g. a channel publish failure
+                fatal.append((w.worker_id, exc))
+
+        try:
+            if len(workers) == 1:
+                run_worker(workers[0])
+            else:
+                threads = [
+                    threading.Thread(
+                        target=run_worker_guarded,
+                        args=(w,),
+                        name=f"drive-{w.worker_id}",
+                        daemon=True,
+                    )
+                    for w in workers
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+            if fatal:
+                raise fatal[0][1]
+            stopped = should_stop is not None and should_stop()
+            if dead and not stopped and not pool_drained():
+                raise RuntimeError(
+                    f"all rollout workers exited with {len(dead)} dropped as "
+                    f"dead and prompts remaining — dead workers: {dead}"
+                )
+            st = controller.status()
+            if st["prompts_failed"]:
+                logger.warning(
+                    "producer finished with %d terminally failed prompts "
+                    "(see controller status for reasons)",
+                    st["prompts_failed"],
+                )
+            return state["produced"]
         finally:
             channel.close()  # EOF -> the consumer's loader terminates once drained
 

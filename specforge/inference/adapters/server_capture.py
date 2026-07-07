@@ -274,6 +274,7 @@ class SGLangServerCaptureAdapter:
                 "target_repr": contract.target_repr,
                 "vocab_map_version": contract.vocab_map_version,
                 "transport": "sglang_server_capture",
+                "server": self.base_url,  # which server captured it (provenance)
                 "generation": gen,  # the zero-copy get() locator
             },
         )
