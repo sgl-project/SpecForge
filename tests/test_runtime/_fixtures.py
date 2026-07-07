@@ -149,6 +149,68 @@ def write_offline_files(d, n=4, seq=16, hidden=H, vocab=V, seed=0):
     return d
 
 
+TINY_MLA_DRAFT_CONFIG = {
+    "architectures": ["DeepseekV3ForCausalLMEagle3"],
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "hidden_act": "silu",
+    "hidden_size": 64,
+    "initializer_range": 0.02,
+    "intermediate_size": 128,
+    "max_position_embeddings": 512,
+    "model_type": "deepseek_v3",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 1,
+    # MLA geometry (tiny): compressed KV + split nope/rope head dims.
+    "q_lora_rank": 24,
+    "kv_lora_rank": 16,
+    "qk_nope_head_dim": 8,
+    "qk_rope_head_dim": 8,
+    "v_head_dim": 16,
+    "rope_scaling": None,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-5,
+    "tie_word_embeddings": False,
+    "torch_dtype": "bfloat16",
+    "vocab_size": 256,
+    "draft_vocab_size": 64,
+}
+
+
+def write_mla_draft_config(path):
+    with open(path, "w") as f:
+        json.dump(TINY_MLA_DRAFT_CONFIG, f)
+    return path
+
+
+def build_mla_eagle3(workdir, ttt=3):
+    """(eagle3_model, target_head) with the MLA (DeepSeek) draft, on cuda.
+
+    Mirrors :func:`build_eagle3`; the fixture dims (H/V/draft vocab) are shared,
+    so the same offline feature files and vocab mapping drive both drafts —
+    the algorithm surface is identical, only the draft ARCHITECTURE differs.
+    MLA supports the sdpa backend (see deepseek_eagle3.py).
+    """
+    from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
+    from specforge.modeling.target import TargetHead
+
+    cfg = write_mla_draft_config(os.path.join(workdir, "mla_draft.json"))
+    target_dir = write_target_head_dir(os.path.join(workdir, "target"))
+    vocab_path = write_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
+
+    draft_config = AutoDraftModelConfig.from_file(cfg)
+    draft_model = AutoEagle3DraftModel.from_config(
+        draft_config, attention_backend="sdpa", torch_dtype=torch.bfloat16
+    ).cuda()
+    draft_model.load_vocab_mapping(vocab_path)
+    draft_model.freeze_embedding()
+    target_head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
+    eagle3_model = OnlineEagle3Model(
+        draft_model=draft_model, length=ttt, attention_backend="sdpa"
+    ).cuda()
+    return eagle3_model, target_head
+
+
 def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4)):
     """Build a tiny HF Llama target wrapped by the SpecForge HF eagle3 backend."""
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -301,6 +363,108 @@ def build_dflash(
     ).cuda()
     width = len(draft_model.target_layer_ids) * hidden
     return dflash_model, width, target_dir, list(draft_model.target_layer_ids)
+
+
+# --- DFlash MLA (DeepSeek) fixtures ------------------------------------------
+# The draft-ARCHITECTURE axis for DFlash: the MLA draft (deepseek_dflash.py)
+# trains through the SAME OnlineDFlashModel wrapper as the Qwen3-style draft.
+# Building a real tiny DeepSeek target is heavy (MoE); the DFlash training
+# forward only needs the target's embed/lm_head + captured features, so we use
+# plain nn.Embedding / nn.Linear stand-ins and synthetic hidden states.
+
+TINY_MLA_DFLASH_CONFIG = {
+    "architectures": ["DeepseekDFlashDraftModel"],
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "hidden_act": "silu",
+    "hidden_size": 64,
+    "initializer_range": 0.02,
+    "intermediate_size": 128,
+    "max_position_embeddings": 512,
+    "model_type": "deepseek_v3",
+    "num_attention_heads": 4,
+    # draft depth; target depth drives the auto capture-layer schedule.
+    "num_hidden_layers": 2,
+    "num_target_layers": 8,
+    # MLA geometry (tiny): no q_lora (matches DeepSeek-V2-Lite), compressed KV,
+    # split nope/rope head dims.
+    "q_lora_rank": None,
+    "kv_lora_rank": 16,
+    "qk_nope_head_dim": 8,
+    "qk_rope_head_dim": 8,
+    "v_head_dim": 16,
+    "rope_scaling": None,
+    "rope_theta": 10000,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-5,
+    "tie_word_embeddings": False,
+    "torch_dtype": "bfloat16",
+    "vocab_size": 256,
+    "draft_vocab_size": 256,
+    "block_size": 4,
+    "dflash_config": {"mask_token_id": 0},
+}
+
+
+def write_mla_dflash_config(path, **overrides):
+    cfg = dict(TINY_MLA_DFLASH_CONFIG)
+    cfg.update(overrides)
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    return path
+
+
+def build_dflash_mla(
+    workdir,
+    *,
+    vocab=256,
+    num_anchors=8,
+    mask_token_id=0,
+    **config_overrides,
+):
+    """Build a tiny OnlineDFlashModel with the MLA (DeepSeek) draft, on cuda.
+
+    Returns (dflash_model, hidden_states_width, target_layer_ids). Mirrors
+    :func:`build_dflash` but swaps the draft architecture to the MLA draft and
+    uses plain embed/lm_head stand-ins (no real DeepSeek target). MLA supports
+    the sdpa training backend only.
+    """
+    from transformers import AutoConfig
+
+    from specforge.core.dflash import OnlineDFlashModel
+    from specforge.modeling.draft.deepseek_dflash import DeepseekDFlashDraftModel
+
+    cfg_path = write_mla_dflash_config(
+        os.path.join(workdir, "mla_dflash.json"), vocab_size=vocab, **config_overrides
+    )
+    draft_config = AutoConfig.from_pretrained(cfg_path)
+    draft_config._attn_implementation = "sdpa"
+
+    draft_model = DeepseekDFlashDraftModel(draft_config).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    draft_model.mask_token_id = mask_token_id
+
+    hidden = draft_config.hidden_size
+    embed_tokens = torch.nn.Embedding(vocab, hidden).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    lm_head = torch.nn.Linear(hidden, vocab, bias=False).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+
+    dflash_model = OnlineDFlashModel(
+        draft_model=draft_model,
+        target_lm_head=lm_head,
+        target_embed_tokens=embed_tokens,
+        block_size=draft_model.block_size,
+        mask_token_id=mask_token_id,
+        attention_backend="sdpa",
+        num_anchors=num_anchors,
+        loss_type="dflash",
+    ).cuda()
+    width = len(draft_model.target_layer_ids) * hidden
+    return dflash_model, width, list(draft_model.target_layer_ids)
 
 
 def build_domino(

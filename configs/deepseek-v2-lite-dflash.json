@@ -1,0 +1,36 @@
+{
+  "architectures": [
+    "DeepseekDFlashDraftModel"
+  ],
+  "model_type": "deepseek_v3",
+  "hidden_act": "silu",
+  "hidden_size": 2048,
+  "intermediate_size": 10944,
+  "initializer_range": 0.02,
+  "max_position_embeddings": 163840,
+  "num_attention_heads": 16,
+  "num_hidden_layers": 3,
+  "num_target_layers": 27,
+  "block_size": 8,
+  "q_lora_rank": null,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "rope_theta": 10000,
+  "rope_scaling": {
+    "beta_fast": 32.0,
+    "beta_slow": 1.0,
+    "factor": 40.0,
+    "mscale": 0.707,
+    "mscale_all_dim": 0.707,
+    "original_max_position_embeddings": 4096,
+    "rope_type": "yarn"
+  },
+  "rms_norm_eps": 1e-06,
+  "vocab_size": 102400,
+  "draft_vocab_size": 102400,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "dflash_config": {}
+}

@@ -1,4 +1,6 @@
 from .base import Eagle3DraftModel
+from .deepseek_dflash import DeepseekDFlashDraftModel
+from .deepseek_eagle3 import DeepseekV3ForCausalLMEagle3
 from .dflash import (
     DFlashDraftModel,
     build_target_layer_ids,
@@ -10,6 +12,8 @@ from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_
 
 __all__ = [
     "Eagle3DraftModel",
+    "DeepseekV3ForCausalLMEagle3",
+    "DeepseekDFlashDraftModel",
     "DFlashDraftModel",
     "LlamaForCausalLMEagle3",
     "build_target_layer_ids",
