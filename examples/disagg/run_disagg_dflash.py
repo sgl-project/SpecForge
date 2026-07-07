@@ -70,7 +70,14 @@ def _ref_channel() -> StreamingRefChannel:
 
 
 def _mooncake_store() -> MooncakeFeatureStore:
-    """Connect to the same Mooncake master the server sink writes to."""
+    """Connect to the same Mooncake master the server sink writes to.
+
+    global_segment_size=0: producer/consumer are pure clients contributing NO
+    storage — every object lives in the long-lived server process's segment, so
+    a producer exit cannot take committed features with it. Size the SERVER's
+    segment (MOONCAKE_GLOBAL_SEGMENT_SIZE) for the in-flight watermark: objects
+    are hard-pinned, so an undersized segment fails puts rather than evicting.
+    """
     return MooncakeFeatureStore(
         store_id=RUN_ID,
         setup_kwargs={
@@ -79,6 +86,10 @@ def _mooncake_store() -> MooncakeFeatureStore:
             "master_server_addr": os.environ["MOONCAKE_MASTER_SERVER_ADDR"],
             "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
             "rdma_devices": os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
+            "global_segment_size": int(os.environ.get("DISAGG_CLIENT_SEGMENT_SIZE", 0)),
+            "local_buffer_size": int(
+                os.environ.get("DISAGG_CLIENT_BUFFER_SIZE", 1 << 30)
+            ),
         },
     )
 
@@ -203,9 +214,16 @@ def run_consumer(args) -> None:
             try:
                 logdict[f"train/{key}"] = float(value)
             except (TypeError, ValueError):
-                continue
+                try:  # per-TTT-position list metrics -> log the mean
+                    seq = [float(x) for x in value]
+                except (TypeError, ValueError):
+                    continue
+                if seq:
+                    logdict[f"train/{key}_mean"] = sum(seq) / len(seq)
         if logdict:
             tracker.log(logdict, step=step)
+            summary = {k.split("/")[-1]: round(v, 4) for k, v in logdict.items()}
+            print(f"[consumer] step {step} {summary}", flush=True)
 
     print(f"[consumer] training from mooncake://{RUN_ID}", flush=True)
     trainer, loader = build_disagg_online_consumer(
@@ -235,14 +253,15 @@ def main() -> None:
     set_seed(args.seed)
     role = _role()
     print(f"[disagg-dflash] role={role} run_id={RUN_ID}", flush=True)
-    # The producer is a thin HTTP driver (no torch model); only the trainer
-    # needs the process group.
-    if role == "producer":
-        run_producer(args)
-        return
+    # Both roles need the process group: the producer loads no model, but the
+    # control plane / feature store query dist rank. Launch each under torchrun
+    # (the producer on a spare GPU, its own rendezvous endpoint).
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     try:
-        run_consumer(args)
+        if role == "producer":
+            run_producer(args)
+        else:
+            run_consumer(args)
     finally:
         destroy_distributed()
 

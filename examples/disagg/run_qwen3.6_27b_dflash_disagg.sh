@@ -34,7 +34,13 @@ export MOONCAKE_LOCAL_HOSTNAME=${MOONCAKE_LOCAL_HOSTNAME:-127.0.0.1}
 export MOONCAKE_MASTER_SERVER_ADDR=${MOONCAKE_MASTER_SERVER_ADDR:-127.0.0.1:50051}
 export MOONCAKE_METADATA_SERVER=${MOONCAKE_METADATA_SERVER:-http://127.0.0.1:8080/metadata}
 export MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-tcp}
-export MOONCAKE_GLOBAL_SEGMENT_SIZE=${MOONCAKE_GLOBAL_SEGMENT_SIZE:-$((4 << 30))}
+# The server sink's segment is the ONLY object storage (features are
+# hard-pinned: undersizing fails puts rather than evicting). Size it above the
+# producer watermark: 256 in-flight x ~100MB/sample at seq 2048 ~= 26GB.
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=${MOONCAKE_GLOBAL_SEGMENT_SIZE:-$((64 << 30))}
+# Producer/consumer are pure clients (no segment): objects must not live in a
+# process that exits before training finishes.
+export DISAGG_CLIENT_SEGMENT_SIZE=${DISAGG_CLIENT_SEGMENT_SIZE:-0}
 
 export DISAGG_STORE_ID=${DISAGG_STORE_ID:-qwen36-dflash-disagg}
 export DISAGG_SERVER_URL=http://127.0.0.1:$SERVER_PORT
