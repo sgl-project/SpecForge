@@ -143,6 +143,17 @@ class StreamingRefChannel:
             f.write(str(self._consumed))
         os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
 
+    def seed_consumed(self) -> int:
+        """Adopt the sidecar's persisted count as this instance's baseline.
+
+        ``mark_consumed`` publishes this instance's cumulative in-memory count,
+        so a restarted consumer (fresh instance, ``_consumed=0``) would rewind
+        the sidecar and inflate the producer's ``in_flight_remote`` forever.
+        Call once on restart, before the first ``mark_consumed``.
+        """
+        self._consumed = self.consumed_remote()
+        return self._consumed
+
     def stream(
         self,
         *,
