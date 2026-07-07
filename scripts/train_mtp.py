@@ -142,8 +142,12 @@ def parse_args():
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
 
-    sglang_group = parser.add_argument_group("sglang backend")
-    SGLangBackendArgs.add_args(sglang_group)
+    # Only expose SGLang-specific CLI args when the backend is actually sglang.
+    # This lets NPU/HF-only runs proceed without sglang installed.
+    tmp_args, _ = parser.parse_known_args()
+    if tmp_args.target_model_backend == "sglang":
+        sglang_group = parser.add_argument_group("sglang backend")
+        SGLangBackendArgs.add_args(sglang_group)
 
     return parser.parse_args()
 
