@@ -274,6 +274,7 @@ class SGLangServerCaptureAdapter:
                 "target_repr": contract.target_repr,
                 "vocab_map_version": contract.vocab_map_version,
                 "transport": "sglang_server_capture",
+                "server": self.base_url,  # which server captured it (provenance)
                 "generation": gen,  # the zero-copy get() locator
             },
         )
@@ -333,6 +334,30 @@ class SGLangServerCaptureAdapter:
                 )
                 continue
             ref = self._ref_from_result(task, result, capture)
+            # A capture shorter than the prompt is corrupt (classic cause: a
+            # radix-cache prefix hit skips prefilling — and capturing — the
+            # cached tokens; the patched scheduler refuses that config).
+            expected_len = len(task.payload["input_ids"])
+            short = {
+                name: spec.shape
+                for name, spec in ref.feature_specs.items()
+                if len(spec.shape) >= 2 and spec.shape[1] != expected_len
+            }
+            if short:
+                self.store.adopt(ref)
+                self.store.abort(ref.sample_id, reason="seq-len-mismatch")
+                out.append(
+                    ServerCaptureFailure(
+                        task_id=task.task_id,
+                        reason=(
+                            f"server_capture: captured seq len != prompt len "
+                            f"{expected_len} for {short} — was the server "
+                            f"started without --disable-radix-cache?"
+                        ),
+                        retryable=False,
+                    )
+                )
+                continue
             try:
                 verify_feature_contract_specs(
                     ref.feature_specs,
