@@ -110,9 +110,10 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Any:
         from mooncake.store import MooncakeDistributedStore  # type: ignore
     except Exception as e:  # pragma: no cover - exercised only without mooncake
         raise RuntimeError(
-            "MooncakeFeatureStore requires the 'mooncake' package "
-            "(pip install mooncake-transfer-engine). Pass store=<obj> to inject "
-            "a backend for testing."
+            "MooncakeFeatureStore could not load mooncake.store: "
+            f"{type(e).__name__}: {e}. Install mooncake-transfer-engine and its "
+            "binary dependencies (the PyPI wheel requires the CUDA 12 runtime). "
+            "Pass store=<obj> to inject a backend for testing."
         ) from e
     store = MooncakeDistributedStore()
     rc = store.setup(**setup_kwargs)
