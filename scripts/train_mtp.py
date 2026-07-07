@@ -207,7 +207,12 @@ def build_models(
 
     # The target model is only used to produce hidden states; keep it in eval mode
     # to disable dropout / batch-norm updates and reduce memory spikes.
-    target_model.eval()
+    # Different backends wrap the underlying HF model differently (e.g.
+    # HFEagle3TargetModel holds it in self.model), so eval the inner model when
+    # the wrapper itself is not an nn.Module.
+    model_for_eval = getattr(target_model, "model", target_model)
+    if hasattr(model_for_eval, "eval"):
+        model_for_eval.eval()
 
     return target_model, draft_model
 
