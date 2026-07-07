@@ -214,23 +214,42 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
         return cls(target_model)
 
+    def _get_language_model(self):
+        """
+        Return the inner transformer module (without the lm_head) used for
+        cheap hidden-state-only forward passes.
+
+        Handles causal LMs (``model.model``) and multimodal conditional
+        generation models whose text decoder is nested under
+        ``model.language_model`` (e.g. ``Qwen3_5ForConditionalGeneration``,
+        where the embedding key resolves to
+        ``model.language_model.embed_tokens.weight``).
+        """
+        if hasattr(self.model, "language_model"):
+            lm = self.model.language_model
+            # language_model may be a ForCausalLM (has .model) or a bare Model.
+            return lm.model if hasattr(lm, "model") else lm
+        if hasattr(self.model, "model"):
+            return self.model.model
+        return self.model
+
     def _get_transformer_layers(self):
         """
         Helper to find the module list containing the transformer layers.
-        Adapts to common architectures (Llama, Qwen, Mistral, OPT, etc.)
+        Adapts to common architectures (Llama, Qwen, Mistral, OPT) and
+        multimodal Qwen3_5ForConditionalGeneration (layers under
+        ``language_model``).
         """
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model.layers
-        elif hasattr(self.model, "layers"):
-            return self.model.layers
-        elif hasattr(self.model, "transformer") and hasattr(
-            self.model.transformer, "h"
-        ):
-            return self.model.transformer.h
-        else:
-            raise ValueError(
-                "Could not locate transformer layers in the model architecture to register hooks."
-            )
+        lm = self._get_language_model()
+        if hasattr(lm, "layers"):
+            return lm.layers
+        if hasattr(lm, "transformer") and hasattr(lm.transformer, "h"):
+            return lm.transformer.h
+        if hasattr(lm, "h"):  # GPT-2 style
+            return lm.h
+        raise ValueError(
+            "Could not locate transformer layers in the model architecture to register hooks."
+        )
 
     @torch.no_grad()
     def generate_eagle3_data(
@@ -352,9 +371,11 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
         handle = layers[-1].register_forward_hook(get_hook())
         try:
-            # Use the underlying transformer model (model.model) to avoid the
-            # memory and compute cost of the final lm_head, which MTP does not need.
-            self.model.model(
+            # Run the inner transformer (without lm_head) to save the memory and
+            # compute cost of the final projection, which MTP does not need.
+            # _get_language_model handles both causal LMs (model.model) and
+            # multimodal models whose text decoder is under model.language_model.
+            self._get_language_model()(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=False,
