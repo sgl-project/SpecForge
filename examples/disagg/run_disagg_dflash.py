@@ -28,6 +28,10 @@ Config is environment-driven so one wrapper drives both roles; role is
 
     DISAGG_ROLE=producer|consumer      # else rank 0 -> producer, else consumer
     DISAGG_SERVER_URL=http://host:30000   # the patched SGLang server (producer)
+    DISAGG_SERVER_URLS=http://h1:30000,http://h2:30000  # MULTI-server fan-out
+                                       # (comma-separated; overrides SERVER_URL;
+                                       #  one adapter+worker per server, driven
+                                       #  concurrently over disjoint prompts)
     DISAGG_STORE_ID=qwen36-dflash-disagg  # Mooncake key namespace (both roles)
     DISAGG_REF_CHANNEL=/root/disagg/refs.jsonl   # tiny ref manifest (both roles)
     DISAGG_DB=/root/disagg/run.db      # consumer rank-0 ledger (trainer-side ONLY)
@@ -162,8 +166,18 @@ def _resolve_mask_token(args, tokenizer) -> int:
     return tokenizer.mask_token_id
 
 
+def _server_urls() -> list:
+    """The patched-server pool: DISAGG_SERVER_URLS (comma list) or the single
+    DISAGG_SERVER_URL. Every server must run the SAME model/patch flags (the
+    FeatureContract check fails loud per-sample on a heterogeneous pool)."""
+    urls = os.environ.get("DISAGG_SERVER_URLS")
+    if urls:
+        return [u.strip() for u in urls.split(",") if u.strip()]
+    return [os.environ["DISAGG_SERVER_URL"]]
+
+
 def run_producer(args) -> None:
-    """Thin CPU driver: prompts -> patched server (captures to Mooncake) -> refs."""
+    """Thin CPU driver: prompts -> patched server(s) (capture to Mooncake) -> refs."""
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
@@ -180,14 +194,21 @@ def run_producer(args) -> None:
 
     store = _mooncake_store()
     channel = _ref_channel()
-    adapter = SGLangServerCaptureAdapter(
-        os.environ["DISAGG_SERVER_URL"],
-        store,
-        run_id=RUN_ID,
-        strategy="dflash",
-        target_model_version=args.target_model_path,
-    )
-    print(f"[producer] {len(prompts)} prompts -> {os.environ['DISAGG_SERVER_URL']}")
+    # One adapter per server, all over the ONE store instance (thread-safe):
+    # each adapter gets its own RolloutWorker leasing disjoint prompts, so N
+    # servers prefill concurrently into the same Mooncake namespace.
+    urls = _server_urls()
+    adapters = [
+        SGLangServerCaptureAdapter(
+            url,
+            store,
+            run_id=RUN_ID,
+            strategy="dflash",
+            target_model_version=args.target_model_path,
+        )
+        for url in urls
+    ]
+    print(f"[producer] {len(prompts)} prompts -> {len(urls)} server(s): {urls}")
 
     # NO shared db: the trainer-side ledger (DISAGG_DB) is the run's single
     # book-keeper; committed rows from the producer would make the consumer
@@ -195,7 +216,7 @@ def run_producer(args) -> None:
     # in-memory store still dedups within its own process.
     _workers, drive_producer = build_disagg_online_producer(
         strategy="dflash",
-        feature_source=adapter,
+        feature_source=adapters if len(adapters) > 1 else adapters[0],
         prompts=prompts,
         feature_store=store,
         channel=channel,
