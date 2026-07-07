@@ -329,17 +329,34 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         if kwargs:
             logger.debug(f"unused kwargs {list(kwargs.keys())}")
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            output_attentions=False,
-            output_router_logits=False,
-            use_cache=False,
-        )
+        # Capture only the last transformer layer output instead of materializing
+        # the full hidden_states tuple (one tensor per layer), which saves a lot
+        # of device memory on NPU/GPU during target-model forward passes.
+        layers = self._get_transformer_layers()
+        last_hidden_state = [None]
 
-        # hidden_states[0] is embedding output; hidden_states[i+1] is layer i output
-        last_hidden_states = outputs.hidden_states[-1]
+        def get_hook():
+            def hook(module, inp, out):
+                # Layer output is either a tuple (hidden_states, ...) or a single tensor.
+                last_hidden_state[0] = out[0] if isinstance(out, tuple) else out
+
+            return hook
+
+        handle = layers[-1].register_forward_hook(get_hook())
+        try:
+            # Use the underlying transformer model (model.model) to avoid the
+            # memory and compute cost of the final lm_head, which MTP does not need.
+            self.model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                output_attentions=False,
+                use_cache=False,
+            )
+        finally:
+            handle.remove()
+
+        last_hidden_states = last_hidden_state[0]
         loss_mask = loss_mask[..., None].to(last_hidden_states.device)
 
         return Eagle3TargetOutput(

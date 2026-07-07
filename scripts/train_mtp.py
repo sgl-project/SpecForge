@@ -205,6 +205,10 @@ def build_models(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
 
+    # The target model is only used to produce hidden states; keep it in eval mode
+    # to disable dropout / batch-norm updates and reduce memory spikes.
+    target_model.eval()
+
     return target_model, draft_model
 
 
