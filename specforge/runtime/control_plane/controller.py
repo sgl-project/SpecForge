@@ -89,6 +89,7 @@ class DataFlowController:
         sample_queue: Optional[SampleRefQueue] = None,
         metadata_store: Optional[MetadataStore] = None,
         backpressure: Optional[BackpressureController] = None,
+        max_prompt_attempts: Optional[int] = None,
     ) -> None:
         self.run_id = run_id
         self.sample_queue = sample_queue or SampleRefQueue()
@@ -97,6 +98,10 @@ class DataFlowController:
         # behavior). The controller owns the pause decision; the policy only
         # reads capacity (FeatureStore.health) — no tensors cross this seam.
         self.backpressure = backpressure
+        # Retryable-failure bound: a task failed this many attempts goes
+        # terminal instead of requeueing (None = retry forever). Bounds a
+        # poisoned prompt that would otherwise pin the pool non-empty forever.
+        self.max_prompt_attempts = max_prompt_attempts
         self._prompts: "OrderedDict[str, PromptTask]" = OrderedDict()
         self._prompt_pending: Deque[str] = deque()
         self._prompt_leased: Dict[str, str] = {}  # task_id -> worker_id
@@ -193,12 +198,20 @@ class DataFlowController:
                 task = self._prompts.get(task_id)
                 if task is None:
                     continue
-                if retryable:
+                attempts_left = (
+                    self.max_prompt_attempts is None
+                    or task.attempt + 1 < self.max_prompt_attempts
+                )
+                if retryable and attempts_left:
                     self._prompts[task_id] = dataclasses.replace(
                         task, attempt=task.attempt + 1
                     )
                     if task_id not in self._prompt_pending:
                         self._prompt_pending.append(task_id)
+                elif retryable:
+                    self._prompt_failed[task_id] = (
+                        f"{reason} (attempts exhausted: {task.attempt + 1})"
+                    )
                 else:
                     self._prompt_failed[task_id] = reason
 

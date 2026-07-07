@@ -10,6 +10,7 @@ from specforge.runtime.control_plane.controller import (
     TrainLease,
     build_control_plane_for_mode,
 )
+from specforge.runtime.control_plane.dp_ack import DPAckController, gather_id_union
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
@@ -19,6 +20,8 @@ from specforge.runtime.control_plane.metadata_store import (
 
 __all__ = [
     "DataFlowController",
+    "DPAckController",
+    "gather_id_union",
     "TrainLease",
     "build_control_plane_for_mode",
     "MetadataStore",

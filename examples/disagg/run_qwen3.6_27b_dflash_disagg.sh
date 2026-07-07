@@ -1,9 +1,14 @@
 #!/bin/bash
 # Qwen3.6-27B DFlash, ONLINE disaggregated via server-capture on one 8-GPU node:
-#   mooncake master        -> CPU (RDMA/TCP object store)
-#   patched SGLang server   -> GPU 0   (frozen 27B target, captures to mooncake)
-#   producer (HTTP driver)  -> CPU     (prompts -> server, streams refs)
-#   consumer (DFlash trainer)-> GPU 1  (trains from mooncake, zero-copy)
+#   mooncake master          -> CPU (RDMA/TCP object store)
+#   patched SGLang server    -> SERVER_GPU     (frozen 27B target -> mooncake)
+#   producer (HTTP driver)   -> CPU            (prompts -> server, streams refs)
+#   consumer (DFlash trainer)-> CONSUMER_GPUS  (DP=TRAIN_DP over per-rank inboxes)
+#
+# The consumer is DATA-PARALLEL: torchrun spawns TRAIN_DP ranks; rank 0 hosts the
+# RefDistributor — the run's single book-keeper (one SQLite ledger, one channel
+# reader) — and round-robin dispatches refs to per-rank inboxes; gradients sync
+# via FSDP. The producer never touches the ledger (trainer-side only).
 #
 # The server is sglang 0.5.14 patched with patches/sglang/v0.5.14/spec-capture.patch
 # (apply with scripts/apply_sglang_spec_capture_patch.sh). Feature tensors travel
@@ -23,7 +28,8 @@ export PYTHONPATH="$ROOT_DIR:$ROOT_DIR/scripts:${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 SERVER_GPU=${SERVER_GPU:-0}
-CONSUMER_GPU=${CONSUMER_GPU:-1}
+TRAIN_DP=${TRAIN_DP:-2}
+CONSUMER_GPUS=${CONSUMER_GPUS:-"1,2"}
 SERVER_PORT=${SERVER_PORT:-30000}
 # DFlash target capture layers — must match dflash_config.target_layer_ids in
 # the draft config below.
@@ -45,7 +51,10 @@ export DISAGG_CLIENT_SEGMENT_SIZE=${DISAGG_CLIENT_SEGMENT_SIZE:-0}
 export DISAGG_STORE_ID=${DISAGG_STORE_ID:-qwen36-dflash-disagg}
 export DISAGG_SERVER_URL=http://127.0.0.1:$SERVER_PORT
 export DISAGG_REF_CHANNEL=${DISAGG_REF_CHANNEL:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/refs.jsonl}
-export DISAGG_DB=${DISAGG_DB:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/run.db}
+# Trainer-side ONLY (rank-0 ledger + per-rank inboxes); the producer must not
+# see the db — the launcher below passes it just to the consumer.
+DISAGG_DB=${DISAGG_DB:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/run.db}
+DISAGG_INBOX_DIR=${DISAGG_INBOX_DIR:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/inboxes}
 export DISAGG_MAX_PROMPTS=${DISAGG_MAX_PROMPTS:-400}
 export DISAGG_MAX_STEPS=${DISAGG_MAX_STEPS:-0}
 export DISAGG_LOG_INTERVAL=${DISAGG_LOG_INTERVAL:-1}
@@ -70,7 +79,9 @@ CUDA_VISIBLE_DEVICES=$SERVER_GPU MOONCAKE_LOCAL_HOSTNAME=$MOONCAKE_LOCAL_HOSTNAM
         --skip-tokenizer-init \
         --mem-fraction-static 0.85 \
         --chunked-prefill-size -1 \
+        --disable-radix-cache \
         --enable-spec-capture \
+        --spec-capture-method dflash \
         --spec-capture-aux-layer-ids $AUX_LAYER_IDS \
         --port $SERVER_PORT &
 SERVER_PID=$!
@@ -82,7 +93,7 @@ until curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null; do
 done
 
 # recipe matches run_qwen3.6_27b_dflash_online.sh; max-length 2048 for a bounded
-# single-node demo (online disagg is consume-once / single-DP-rank).
+# single-node demo. batch-size is PER RANK: global batch = batch_size * TRAIN_DP.
 ARGS=(
     --target-model-path Qwen/Qwen3.6-27B
     --target-model-backend hf
@@ -109,20 +120,21 @@ ARGS=(
 
 LAUNCHER=$SCRIPT_DIR/run_disagg_dflash.py
 
-# --- producer: HTTP driver (no torch model; shares the box, no GPU model) ---
+# --- producer: CPU-only HTTP driver (no torch model, no process group) ---
 DISAGG_ROLE=producer CUDA_VISIBLE_DEVICES="" \
     python "$LAUNCHER" "${ARGS[@]}" \
         --output-dir "$ROOT_DIR/outputs/qwen36-disagg-producer" &
 PRODUCER_PID=$!
 
-# --- consumer: trainer pool (GPU $CONSUMER_GPU), logs the curve to W&B ---
-CUDA_VISIBLE_DEVICES=$CONSUMER_GPU DISAGG_ROLE=consumer \
+# --- consumer: DP=$TRAIN_DP trainer pool; rank 0 = distributor + ledger ---
+CUDA_VISIBLE_DEVICES=$CONSUMER_GPUS DISAGG_ROLE=consumer \
+    DISAGG_DB=$DISAGG_DB DISAGG_INBOX_DIR=$DISAGG_INBOX_DIR \
     torchrun --rdzv-backend c10d --rdzv-endpoint localhost:29702 \
-        --nnodes 1 --nproc_per_node 1 "$LAUNCHER" "${ARGS[@]}" \
+        --nnodes 1 --nproc_per_node "$TRAIN_DP" "$LAUNCHER" "${ARGS[@]}" \
         --output-dir "$ROOT_DIR/outputs/qwen36-disagg-consumer" \
         --report-to wandb \
         --wandb-project qwen36-dflash-disagg \
-        --wandb-name qwen36-27b-dflash-nemotron-server-capture
+        --wandb-name qwen36-27b-dflash-server-capture-dp$TRAIN_DP
 
 wait $PRODUCER_PID
 echo "DISAGG36-DONE"
