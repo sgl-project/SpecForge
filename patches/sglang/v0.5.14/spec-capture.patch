@@ -137,7 +137,7 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
 index abba37441..3018b8247 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -576,6 +576,19 @@ class Scheduler(
+@@ -576,6 +576,25 @@ class Scheduler(
  
          self.init_batch_result_processor()
  
@@ -149,6 +149,12 @@ index abba37441..3018b8247 100644
 +                    "--enable-spec-capture requires --chunked-prefill-size -1 "
 +                    "(single-pass prefill) so captured hidden states cover the "
 +                    "whole sequence"
++                )
++            if not server_args.disable_radix_cache:
++                raise ValueError(
++                    "--enable-spec-capture requires --disable-radix-cache: a "
++                    "prefix-cache hit skips prefilling (and capturing) the "
++                    "cached tokens, silently truncating the stored hidden states"
 +                )
 +            from sglang.srt import spec_capture_sink
 +

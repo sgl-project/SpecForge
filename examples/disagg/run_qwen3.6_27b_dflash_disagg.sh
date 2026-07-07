@@ -79,6 +79,7 @@ CUDA_VISIBLE_DEVICES=$SERVER_GPU MOONCAKE_LOCAL_HOSTNAME=$MOONCAKE_LOCAL_HOSTNAM
         --skip-tokenizer-init \
         --mem-fraction-static 0.85 \
         --chunked-prefill-size -1 \
+        --disable-radix-cache \
         --enable-spec-capture \
         --spec-capture-aux-layer-ids $AUX_LAYER_IDS \
         --port $SERVER_PORT &
