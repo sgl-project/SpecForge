@@ -108,6 +108,10 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             server_args=server_args,
             nccl_port=None,
         )
+        # sglang 0.5.14 post-load setup; see eagle3_target_model.py for details.
+        model_runner.alloc_memory_pool()
+        model_runner.init_attention_backends()
+        model_runner.init_cuda_graphs()
         return cls(model_runner)
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
