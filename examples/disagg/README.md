@@ -153,3 +153,23 @@ train step, with aux parity vs an HF reference) in
 `tests/test_runtime/test_server_capture_gate.py`
 (`SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1`, GPU); the contract/ref/adapter logic is
 covered on CPU in `tests/test_runtime/test_server_capture.py`.
+
+## Multi-server (scale the inference pool)
+
+```bash
+bash examples/disagg/run_qwen3.6_27b_dflash_disagg_multiserver.sh   # 2x TP=2 + DP=2
+```
+
+`DISAGG_SERVER_URLS` (comma-separated) fans the producer out: one
+`SGLangServerCaptureAdapter` + one `RolloutWorker` *per server*, each on its own
+thread, leasing **disjoint** prompts from the one controller — N servers prefill
+concurrently into the same Mooncake namespace (every server registers a segment
+with the one master; the trainer fetches by key, oblivious to which server
+captured). All servers must run the same model + capture flags.
+
+Failure semantics (`specforge/launch.py:build_disagg_online_producer`): a dead
+server's worker fails its leases retryable (survivors re-lease them) and is
+dropped after `max_worker_failures` consecutive errors; all workers dead with
+prompts remaining raises instead of truncating; a prompt the pool rejects every
+time goes terminal after `max_prompt_attempts`. CPU coverage:
+`tests/test_runtime/test_disagg_multiserver.py`.
