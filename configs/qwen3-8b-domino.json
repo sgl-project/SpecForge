@@ -1,4 +1,5 @@
 {
+  "emb_dim": 256,
   "architectures": [
     "DFlashDraftModel"
   ],

@@ -53,6 +53,7 @@ class Trainer:
         logger,
         log_interval: int,
         collate_fn,
+        strategy_kwargs: Optional[dict] = None,
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
@@ -151,7 +152,9 @@ class Trainer:
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
         if resume is not None:
             backend.load_state_dict(resume["backend"])
-        strategy = spec.make_strategy(wrapped, target_head=target_head)
+        strategy = spec.make_strategy(
+            wrapped, target_head=target_head, **(strategy_kwargs or {})
+        )
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
         ack_fn = None
         if durable_ack:
