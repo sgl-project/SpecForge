@@ -18,6 +18,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -65,6 +66,10 @@ class ParallelConfig:
     ) -> "ParallelConfig":
         """Snapshot all parallel handles (DP/TP/SP groups, device meshes) from
         ``init_distributed``; a missing getter is logged, never silently skipped."""
+        # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
+        # runs DDP-style (full params replicated, one grad all-reduce, no param
+        # all-gather). Default unchanged when the env var is unset.
+        sharding_strategy = os.environ.get("FSDP_SHARDING", sharding_strategy)
         if not dist.is_initialized():
             return cls(
                 world_size=1,
