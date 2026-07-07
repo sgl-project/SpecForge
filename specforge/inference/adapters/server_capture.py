@@ -327,14 +327,37 @@ class SGLangServerCaptureAdapter:
         transport-level error raises — the worker fails the whole lease batch
         retryable, mirroring ``generate_features`` semantics.
         """
+        import os as _os
+        import time as _time
+
+        # PROFILE_PRODUCER=N -> every N produce_refs calls print one
+        # [prod-http] line splitting body-build / HTTP round-trip / parse.
+        _prof = int(_os.environ.get("PROFILE_PRODUCER", "0"))
+        if _prof and not hasattr(self, "_hs"):
+            self._hs = {
+                "calls": 0,
+                "n": 0,
+                "tok": 0,
+                "build": 0.0,
+                "http": 0.0,
+                "parse": 0.0,
+            }
+        _t = _time.monotonic()
         body = {
             "input_ids": [list(t.payload["input_ids"]) for t in tasks],
             "sampling_params": {"temperature": 0.0, "max_new_tokens": 1},
             "spec_capture": [self._spec_capture_payload(t) for t in tasks],
         }
+        if _prof:
+            self._hs["build"] += _time.monotonic() - _t
+            self._hs["tok"] += sum(len(t.payload["input_ids"]) for t in tasks)
+        _t = _time.monotonic()
         rows = self.post_fn(
             f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
         )
+        if _prof:
+            self._hs["http"] += _time.monotonic() - _t
+        _t = _time.monotonic()
         rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):
             raise RuntimeError(
@@ -429,6 +452,27 @@ class SGLangServerCaptureAdapter:
                 continue
             self.store.adopt(ref)
             out.append(ref)
+        if _prof:
+            self._hs["parse"] += _time.monotonic() - _t
+            self._hs["calls"] += 1
+            self._hs["n"] += len(tasks)
+            if self._hs["calls"] >= _prof:
+                h = self._hs
+                print(
+                    f"[prod-http] calls={h['calls']} n={h['n']} tok={h['tok']} "
+                    f"build_ms={1000*h['build']/h['calls']:.1f} "
+                    f"http_ms={1000*h['http']/h['calls']:.1f} "
+                    f"parse_ms={1000*h['parse']/h['calls']:.1f} (avg/call)",
+                    flush=True,
+                )
+                self._hs = {
+                    "calls": 0,
+                    "n": 0,
+                    "tok": 0,
+                    "build": 0.0,
+                    "http": 0.0,
+                    "parse": 0.0,
+                }
         return out
 
     def health(self) -> Dict[str, Any]:
