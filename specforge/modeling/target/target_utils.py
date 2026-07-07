@@ -106,7 +106,9 @@ class TargetEmbeddingsAndHead(nn.Module):
                 "model.embed_tokens.weight",
                 "embed_tokens.weight",
                 "model.language_model.model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
                 "language_model.model.embed_tokens.weight",
+                "language_model.embed_tokens.weight",
                 "model.model.embed_tokens.weight",
             ]
             resolved_embed_key = None
@@ -174,7 +176,9 @@ class TargetEmbeddingsAndHead(nn.Module):
                 "model.embed_tokens.weight",
                 "embed_tokens.weight",
                 "model.language_model.model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
                 "language_model.model.embed_tokens.weight",
+                "language_model.embed_tokens.weight",
                 "model.model.embed_tokens.weight",
             ]
             resolved_embed_key = None
