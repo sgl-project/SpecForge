@@ -214,20 +214,12 @@ class FSDPTrainingBackend(TrainingBackend):
         loss.backward()
 
     def step(self) -> Optional[torch.Tensor]:
-        """Optimizer step + the distributed grad-norm reduction (run_backward_and_update)."""
+        """Optimizer step (run_backward_and_update); the optimizer clips by and returns the global grad norm."""
         if self.optimizer is None:
             raise RuntimeError(
                 "FSDPTrainingBackend.step called before optimizer is set"
             )
-        grad_norm = self.optimizer.step()
-        if grad_norm is not None and dist.is_initialized():
-            grad_norm = grad_norm.detach().float()
-            if torch.cuda.is_available():
-                grad_norm = grad_norm.to(torch.cuda.current_device())
-            grad_norm = grad_norm.pow(2)
-            dist.all_reduce(grad_norm, op=dist.ReduceOp.SUM)
-            grad_norm = grad_norm.sqrt()
-        return grad_norm
+        return self.optimizer.step()
 
     def state_dict(self) -> dict:
         if self.module is None:

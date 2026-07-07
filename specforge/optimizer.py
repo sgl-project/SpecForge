@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
@@ -36,13 +37,34 @@ class BF16Optimizer:
             warmup_steps=int(warmup_ratio * total_steps),
         )
 
+    def _clip_grad_norm(self):
+        """Clip by the global grad norm, accumulated across ranks.
+
+        Under FSDP each rank holds only its shard of the gradients, so
+        `torch.nn.utils.clip_grad_norm_` would compute a rank-local norm and
+        scale each shard by a different coefficient.
+        """
+        grads = [mp.grad for mp in self.fp32_params if mp.grad is not None]
+        device = self.fp32_params[0].device if self.fp32_params else None
+        if grads:
+            total_norm_sq = torch.stack([g.pow(2).sum() for g in grads]).sum()
+        else:
+            total_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM)
+        total_norm = total_norm_sq.sqrt()
+        clip_coef = torch.clamp(self.max_grad_norm / (total_norm + 1e-6), max=1.0)
+        for g in grads:
+            g.mul_(clip_coef)
+        return total_norm
+
     def step(self):
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 mp.grad = (
                     p.grad.detach().to(torch.float32) if p.grad is not None else None
                 )
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        grad_norm = self._clip_grad_norm()
         self.last_grad_norm = grad_norm.detach()
         self.optimizer.step()
         self.optimizer.zero_grad()
