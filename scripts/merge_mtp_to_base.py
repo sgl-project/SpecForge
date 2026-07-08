@@ -66,6 +66,11 @@ def convert_mtp_keys(state_dict: Dict[str, torch.Tensor], fmt: str) -> Dict[str,
     raise ValueError(f"Unknown key format: {fmt}")
 
 
+def _is_mtp_key(key: str) -> bool:
+    """Return True for keys that belong to the MTP module."""
+    return key.startswith("mtp.")
+
+
 def merge_checkpoints(
     base_model_path: str,
     mtp_checkpoint_path: str,
@@ -104,6 +109,15 @@ def merge_checkpoints(
             index = json.load(f)
         weight_map = index.get("weight_map", {})
 
+        # If the base checkpoint already contains native MTP weights (e.g. an
+        # official Qwen3.5 checkpoint), drop the old MTP entries so the trained
+        # MTP weights replace them rather than duplicating them.
+        old_mtp_keys = [k for k in weight_map if _is_mtp_key(k)]
+        for key in old_mtp_keys:
+            del weight_map[key]
+        if old_mtp_keys:
+            print(f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model.")
+
         # Write MTP weights into a dedicated shard so we do not need to rewrite
         # the (large) base model shards.
         mtp_shard_name = "mtp-merged.safetensors"
@@ -130,6 +144,14 @@ def merge_checkpoints(
             out_name = os.path.basename(base_bins[0])
         else:
             raise FileNotFoundError(f"No checkpoint found in {base_model_path}")
+
+        # Remove any native MTP weights from the base state before overwriting
+        # with the trained MTP weights.
+        old_mtp_keys = [k for k in base_state if _is_mtp_key(k)]
+        for key in old_mtp_keys:
+            del base_state[key]
+        if old_mtp_keys:
+            print(f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model.")
 
         merged = {**base_state, **mtp_state}
 
