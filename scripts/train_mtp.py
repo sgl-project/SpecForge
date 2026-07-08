@@ -68,6 +68,13 @@ def parse_args():
         help="Disable sharing lm_head weights with the target model.",
     )
     model_group.add_argument(
+        "--no-init-from-native-mtp",
+        action="store_true",
+        help="Do not initialize the MTP module from the native pretrained "
+        "mtp.* weights in the target checkpoint (train from scratch instead). "
+        "By default the native mtp.* weights are loaded for finetuning.",
+    )
+    model_group.add_argument(
         "--attention-backend",
         type=str,
         default="sdpa",
@@ -196,6 +203,40 @@ def build_models(
         device=device, dtype=torch.bfloat16
     )
 
+    # Optionally initialize the MTP module from the native pretrained mtp.*
+    # weights shipped with the target checkpoint (finetune) instead of random
+    # init. The native keys (mtp.layers.0.*, mtp.fc.weight, mtp.norm.weight,
+    # mtp.pre_fc_norm_*) match the flat draft layout; embed_tokens and lm_head
+    # are skipped here and loaded separately via target sharing below.
+    if not args.no_init_from_native_mtp:
+        try:
+            import glob as _glob
+            from safetensors.torch import safe_open as _safe_open
+
+            native_mtp: dict = {}
+            for _st in sorted(
+                _glob.glob(os.path.join(args.target_model_path, "*.safetensors"))
+            ):
+                with _safe_open(_st, framework="pt") as _f:
+                    for _k in _f.keys():
+                        if _k.startswith("mtp."):
+                            native_mtp[_k] = _f.get_tensor(_k)
+            if native_mtp:
+                draft_model.load_state_dict(native_mtp, strict=False)
+                print_on_rank0(
+                    f"Initialized MTP module from {len(native_mtp)} native "
+                    f"mtp.* weights in {args.target_model_path} (finetune)."
+                )
+            else:
+                print_on_rank0(
+                    "No native mtp.* weights found in target checkpoint; "
+                    "training MTP from scratch."
+                )
+        except Exception as e:
+            print_on_rank0(
+                f"Could not load native mtp weights ({e}); from scratch."
+            )
+
     print_on_rank0(
         f"Draft config: hidden_size={draft_config.hidden_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
@@ -279,11 +320,16 @@ def save_checkpoint(args, epoch, step, mtp_model, draft_model, optimizer):
 
     with FSDP.state_dict_type(mtp_model, StateDictType.FULL_STATE_DICT):
         state_dict = mtp_model.state_dict()
-        # Strip the outer wrapper prefix; keep the `mtp.*` prefix required by SGLang.
+        # Strip the outer wrapper prefix; keep the `mtp.*` prefix required by
+        # SGLang. Drop the frozen/shared embed_tokens and lm_head so the
+        # checkpoint only contains the trainable MTP module (they are restored
+        # from the target at inference via set_embed_and_head / sharing).
         draft_state_dict = {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
             if "draft_model." in k
+            and "embed_tokens" not in k
+            and "lm_head" not in k
         }
 
         if dist.get_rank() == 0:
@@ -382,7 +428,9 @@ def main():
         loaded_model = Qwen3_5MTPDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
-        draft_model.load_state_dict(loaded_model.state_dict())
+        # strict=False: the checkpoint no longer persists embed_tokens / lm_head
+        # (they are frozen/shared and restored from the target below).
+        draft_model.load_state_dict(loaded_model.state_dict(), strict=False)
         del loaded_model
         print("Loaded draft model weights from checkpoint")
 
