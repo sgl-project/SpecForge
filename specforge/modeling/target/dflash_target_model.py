@@ -156,9 +156,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
-                attn_cp_size=getattr(
-                    self.model_runner.server_args, "attn_cp_size", 1
-                ),
+                attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
