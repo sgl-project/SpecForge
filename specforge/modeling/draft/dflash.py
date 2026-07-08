@@ -5,14 +5,16 @@ from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+# Resolve patchable Qwen3 classes at construction time so Liger patching is
+# independent of import order.
+from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
     GradientCheckpointingLayer,
     Qwen3Config,
-    Qwen3MLP,
     Qwen3PreTrainedModel,
-    Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
     eager_attention_forward,
     rotate_half,
@@ -77,8 +79,12 @@ class Qwen3DFlashAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = modeling_qwen3.Qwen3RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )
+        self.k_norm = modeling_qwen3.Qwen3RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )
         self.sliding_window = (
             config.sliding_window
             if config.layer_types[layer_idx] == "sliding_attention"
@@ -141,9 +147,11 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(
+        self.mlp = modeling_qwen3.Qwen3MLP(config)
+        self.input_layernorm = modeling_qwen3.Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = modeling_qwen3.Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -269,14 +277,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = modeling_qwen3.Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,
             bias=False,
         )
-        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_norm = modeling_qwen3.Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
