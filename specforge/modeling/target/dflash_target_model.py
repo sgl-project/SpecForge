@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from array import array
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -7,7 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -135,18 +136,32 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
         )
+        # sglang 0.5.13+: the scheduler's PrefillAdder normally builds fill ids and
+        # sets extend_range; we bypass it, so do it per req (no prefix-cache reuse).
+        for req in reqs:
+            req.init_next_round_input(tree_cache)
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
+        # Capture input lengths before prepare_for_extend, which releases
+        # origin_input_ids (becomes None afterwards).
+        input_lens = [len(req.origin_input_ids) for req in reqs]
         batch.prepare_for_extend()
 
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            # prepare_mlp_sync_batch_raw is now a module-level function; the
+            # spec_algorithm/speculative_num_draft_tokens args were removed and
+            # attn_cp_size was added.
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
+                attn_cp_size=getattr(
+                    self.model_runner.server_args, "attn_cp_size", 1
+                ),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
@@ -154,15 +169,24 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 offload_tags=set(),
             )
 
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        # prepare_for_extend stages input_ids on pinned CPU and leaves
+        # batch.input_ids=None; the scheduler normally does this H2D copy.
+        if batch.prefill_input_ids_cpu is not None:
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+
+        # The ModelWorkerBatch step was removed: ForwardBatch.init_new consumes the
+        # ScheduleBatch directly and reads capture_hidden_mode from it.
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
         output = self.model_runner.forward(forward_batch)
         if hasattr(output, "logits_output"):
             output = output.logits_output
 
-        input_lens = [len(req.origin_input_ids) for req in reqs]
         if (
             hasattr(output, "aux_hidden_states")
             and output.aux_hidden_states is not None
@@ -204,8 +228,12 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 origin_input_ids=curr_ids.view(-1).tolist(),
                 sampling_params=sampling_params,
             )
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            # sglang 0.5.13+: Req.fill_ids was replaced by full_untruncated_fill_ids
+            # (origin + output ids) plus an integer fill_len.
+            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
+            req.fill_len = len(req.full_untruncated_fill_ids)
+            req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.logprob_start_len = len(req.origin_input_ids) - 1
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
