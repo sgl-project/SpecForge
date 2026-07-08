@@ -39,31 +39,30 @@ def load_safetensors_file(path: str) -> Dict[str, torch.Tensor]:
 def convert_mtp_keys(state_dict: Dict[str, torch.Tensor], fmt: str) -> Dict[str, torch.Tensor]:
     """Convert MTP weight keys to the requested output format.
 
-    SpecForge training saves keys as:
-        mtp.model.layers.0.self_attn.q_proj.weight
+    SpecForge training saves keys in the flat native layout:
+        mtp.layers.0.self_attn.q_proj.weight
         mtp.pre_fc_norm_embedding.weight
+        mtp.norm.weight
         ...
 
-    Supported output formats:
-      - sglang: keep the training layout (mtp.model.layers.0.*). SGLang's
-        Qwen3_5ForCausalLMMTP remaps the leading 'mtp.' -> 'model.' internally.
-      - hf: convert to the HuggingFace / vLLM native layout:
-          mtp.model.layers.0.* -> mtp.layers.0.*
+    This flat layout is what both SGLang's ``Qwen3_5ForCausalLMMTP.load_weights``
+    (``mtp.`` -> ``model.`` remap, flat ``Qwen3_5ForCausalLM``) and the native
+    HuggingFace / vLLM MTP modules expect, so both formats are identical.
+    The ``fmt`` argument is kept for backward compatibility; ``sglang`` and
+    ``hf`` both return the flat layout unchanged. A legacy nested layout
+    (``mtp.model.layers.0.*``) is also normalized to flat if encountered.
     """
-    if fmt == "sglang":
-        return dict(state_dict)
-
-    if fmt == "hf":
-        converted = {}
-        for k, v in state_dict.items():
-            if k.startswith("mtp.model.layers."):
-                new_k = k.replace("mtp.model.layers.", "mtp.layers.", 1)
-            else:
-                new_k = k
-            converted[new_k] = v
-        return converted
-
-    raise ValueError(f"Unknown key format: {fmt}")
+    converted = {}
+    for k, v in state_dict.items():
+        # Normalize legacy nested keys (mtp.model.layers.* -> mtp.layers.*).
+        if k.startswith("mtp.model.layers."):
+            new_k = k.replace("mtp.model.layers.", "mtp.layers.", 1)
+        elif k == "mtp.model.norm.weight":
+            new_k = "mtp.norm.weight"
+        else:
+            new_k = k
+        converted[new_k] = v
+    return converted
 
 
 def _is_mtp_key(key: str) -> bool:
@@ -202,9 +201,10 @@ def main():
         default="sglang",
         choices=["sglang", "hf"],
         help=(
-            "Target key layout. 'sglang' keeps mtp.model.layers.* (matches "
-            "SGLang's internal remap). 'hf' converts to mtp.layers.* (matches "
-            "the native HuggingFace / vLLM layout)."
+            "MTP key layout. Both 'sglang' and 'hf' produce the flat native "
+            "layout (mtp.layers.0.* / mtp.norm.weight) that SGLang's flat "
+            "Qwen3_5ForCausalLMMTP and HF/vLLM MTP modules expect; the argument "
+            "is kept for backward compatibility."
         ),
     )
     args = parser.parse_args()

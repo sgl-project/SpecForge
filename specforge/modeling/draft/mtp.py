@@ -194,20 +194,41 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
         return outputs
 
 
-class Qwen3MTPInnerModel(nn.Module):
-    """The 1-layer transformer nested under ``mtp.model.*``.
+class Qwen3_5MTPModel(nn.Module):
+    """The core MTP module wrapped under the ``mtp.`` prefix.
 
-    Produces weight keys ``mtp.model.layers.0.*`` and ``mtp.model.norm.weight``,
-    which is the checkpoint layout consumed by SGLang's
-    ``Qwen3_5ForCausalLMMTP.load_weights`` (the ``mtp.`` -> ``model.`` remap
-    turns ``mtp.model.layers.0`` into ``model.model.layers.0``, matching the
-    inner ``Qwen3_5ForCausalLM.model.layers`` of the SGLang MTP module).
+    Weight key layout (flat, matches the native Qwen3.5 checkpoint and
+    SGLang's ``Qwen3_5ForCausalLMMTP.load_weights`` remap):
+      mtp.pre_fc_norm_embedding.weight
+      mtp.pre_fc_norm_hidden.weight
+      mtp.fc.weight
+      mtp.layers.0.self_attn.q_proj.weight
+      mtp.layers.0.mlp.gate_proj.weight
+      mtp.norm.weight
+      mtp.lm_head.weight
+
+    SGLang's ``Qwen3_5ForCausalLMMTP`` wraps a *flat* ``Qwen3_5ForCausalLM``
+    (``self.layers`` directly on the ForCausalLM, not nested under
+    ``self.model``), so after the ``mtp.`` -> ``model.`` remap the flat keys
+    ``mtp.layers.0.*`` / ``mtp.norm.weight`` become ``model.layers.0.*`` /
+    ``model.norm.weight``, matching ``self.model.layers`` / ``self.model.norm``.
     """
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
         self.config = config
 
+        # Fusion projection: fc( concat( norm(input_embeds), norm(target_hidden) ) )
+        self.pre_fc_norm_embedding = Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+
+        # Single-layer Qwen3 transformer, flat under `mtp.layers.*` / `mtp.norm`
+        # to match the native Qwen3.5 checkpoint layout consumed by SGLang.
         mtp_config = copy.deepcopy(config)
         mtp_config.num_hidden_layers = 1
         self.layers = nn.ModuleList(
@@ -216,12 +237,23 @@ class Qwen3MTPInnerModel(nn.Module):
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(mtp_config)
 
+        # LM head (shared with target model during training)
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
+
     def forward(
         self,
+        inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
+        # Fusion
+        normed_emb = self.pre_fc_norm_embedding(inputs_embeds)
+        normed_hidden = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.fc(torch.cat([normed_emb, normed_hidden], dim=-1))
+
         bsz, seq_len, _ = hidden_states.size()
         if position_ids is None:
             device = hidden_states.device
@@ -258,61 +290,6 @@ class Qwen3MTPInnerModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
-
-
-class Qwen3_5MTPModel(nn.Module):
-    """The core MTP module wrapped under the ``mtp.`` prefix.
-
-    Weight key layout (matches SGLang's ``Qwen3_5ForCausalLMMTP`` checkpoint):
-      mtp.pre_fc_norm_embedding.weight
-      mtp.pre_fc_norm_hidden.weight
-      mtp.fc.weight
-      mtp.model.layers.0.self_attn.q_proj.weight
-      mtp.model.layers.0.mlp.gate_proj.weight
-      mtp.model.norm.weight
-      mtp.lm_head.weight
-    """
-
-    def __init__(self, config: Qwen3Config):
-        super().__init__()
-        self.config = config
-
-        # Fusion projection: fc( concat( norm(input_embeds), norm(target_hidden) ) )
-        self.pre_fc_norm_embedding = Qwen3RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_fc_norm_hidden = Qwen3RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-
-        # Single-layer Qwen3 transformer nested under `mtp.model.*` so that the
-        # saved keys (mtp.model.layers.0.* / mtp.model.norm.weight) match the
-        # layout expected by SGLang's Qwen3_5ForCausalLMMTP.load_weights.
-        self.model = Qwen3MTPInnerModel(config)
-
-        # LM head (shared with target model during training)
-        self.lm_head = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
-
-    def forward(
-        self,
-        inputs_embeds: torch.Tensor,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
-        # Fusion
-        normed_emb = self.pre_fc_norm_embedding(inputs_embeds)
-        normed_hidden = self.pre_fc_norm_hidden(hidden_states)
-        fused = self.fc(torch.cat([normed_emb, normed_hidden], dim=-1))
-
-        return self.model(
-            fused,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
 
 
 class Qwen3_5MTPDraftModel(Qwen3PreTrainedModel):
