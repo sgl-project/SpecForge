@@ -1,45 +1,50 @@
 #!/bin/bash
-# Qwen3-8B Domino, ONLINE disaggregated, MULTI-SERVER on one node:
-#   mooncake master           -> CPU  (RDMA/TCP object store)
-#   patched SGLang server 0   -> SERVER0_GPUS (frozen Qwen3-8B -> mooncake)
-#   patched SGLang server 1   -> SERVER1_GPUS (same model + capture flags)
-#   producer (HTTP driver)    -> CPU  (fans prompts out to BOTH servers)
-#   consumer (Domino trainer) -> CONSUMER_GPUS (DP=TRAIN_DP)
+# Qwen3-8B Domino, online disaggregated training on one multi-GPU node:
+#   Mooncake master           -> CPU
+#   patched SGLang server     -> SERVER_GPUS
+#   producer HTTP driver      -> CPU
+#   consumer Domino trainer   -> CONSUMER_GPUS, DP=TRAIN_DP
 #
-# Domino uses the same server-side DFlash feature capture as DFlash. The draft
-# config must have dflash_config.projector_type="domino"; the trainer consumes
-# the captured hidden_states with strategy="domino".
-set -euxo pipefail
+# Domino reuses DFlash server-side feature capture. The draft config must set
+# dflash_config.projector_type="domino", and AUX_LAYER_IDS must match
+# dflash_config.target_layer_ids in that config.
+set -euo pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname "$(dirname "$SCRIPT_DIR")")
+cd "$ROOT_DIR"
+
+# -----------------------------------------------------------------------------
+# Local runtime paths
+# -----------------------------------------------------------------------------
 export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export PYTHONPATH="$ROOT_DIR:$ROOT_DIR/scripts:${PYTHONPATH:-}"
-cd "$ROOT_DIR"
 
-# --- topology: 2 servers x TP=1 + DP=2 trainer (override via env) ---
-SERVER0_GPUS=${SERVER0_GPUS:-"2"}
-SERVER1_GPUS=${SERVER1_GPUS:-"3"}
-SERVER_TP=${SERVER_TP:-1}
-SERVER0_PORT=${SERVER0_PORT:-30000}
-SERVER1_PORT=${SERVER1_PORT:-30001}
-TRAIN_DP=${TRAIN_DP:-2}
-CONSUMER_GPUS=${CONSUMER_GPUS:-"4,5"}
+LAUNCHER=$SCRIPT_DIR/run_disagg_domino.py
 
-TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-Qwen/Qwen3-8B}
+# -----------------------------------------------------------------------------
+# Model, data, and Domino capture config
+# -----------------------------------------------------------------------------
+TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/disk3/wjp/pretrained_models/Qwen3-8B}
 DRAFT_CONFIG_PATH=${DRAFT_CONFIG_PATH:-$ROOT_DIR/configs/qwen3-8b-domino.json}
-TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-/sgl-workspace/SpecForge/cache/dataset/perfectblend_train_regen_temperature0_no_think_20w.jsonl}
+TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-/disk3/wjp/datasets/perfectblend/qwen3-8b/perfectblend_train_regen_temperature0_no_think.jsonl}
 CHAT_TEMPLATE=${CHAT_TEMPLATE:-qwen}
-
-# Must match dflash_config.target_layer_ids in configs/qwen3-8b-domino.json.
 AUX_LAYER_IDS=${AUX_LAYER_IDS:-"1 9 17 25 33"}
 
-# --- mooncake connection (server sinks + producer + consumer share these) ---
-# export MOONCAKE_LOCAL_HOSTNAME=${MOONCAKE_LOCAL_HOSTNAME:-127.0.0.1}
-# export MOONCAKE_MASTER_SERVER_ADDR=${MOONCAKE_MASTER_SERVER_ADDR:-127.0.0.1:50051}
-# export MOONCAKE_METADATA_SERVER=${MOONCAKE_METADATA_SERVER:-http://127.0.0.1:8080/metadata}
+# -----------------------------------------------------------------------------
+# GPU topology
+# -----------------------------------------------------------------------------
+SERVER_GPUS=${SERVER_GPUS:-${SERVER0_GPUS:-"2"}}
+SERVER_TP=${SERVER_TP:-1}
+SERVER_PORT=${SERVER_PORT:-${SERVER0_PORT:-30000}}
 
+TRAIN_DP=${TRAIN_DP:-4}
+CONSUMER_GPUS=${CONSUMER_GPUS:-"3,4,5,6"}
+
+# -----------------------------------------------------------------------------
+# Mooncake object-store config
+# -----------------------------------------------------------------------------
 MOONCAKE_HOST=${MOONCAKE_HOST:-127.0.0.1}
 MOONCAKE_RPC_PORT=${MOONCAKE_RPC_PORT:-35551}
 MOONCAKE_HTTP_PORT=${MOONCAKE_HTTP_PORT:-35880}
@@ -48,11 +53,11 @@ MOONCAKE_METRICS_PORT=${MOONCAKE_METRICS_PORT:-35903}
 export MOONCAKE_LOCAL_HOSTNAME=$MOONCAKE_HOST
 export MOONCAKE_MASTER_SERVER_ADDR=$MOONCAKE_HOST:$MOONCAKE_RPC_PORT
 export MOONCAKE_METADATA_SERVER=http://$MOONCAKE_HOST:$MOONCAKE_HTTP_PORT/metadata
-export MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-tcp}
+export MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-rdma}
 export MOONCAKE_GLOBAL_SEGMENT_SIZE=${MOONCAKE_GLOBAL_SEGMENT_SIZE:-$((32 << 30))}
-# Only the long-lived SGLang servers may own storage segments. The producer
-# exits after publishing refs; if it contributes a segment, objects placed
-# there disappear before the consumer loads them.
+
+# Only long-lived SGLang servers should own segments; producer/consumer are
+# clients. If the producer owns feature objects, they can disappear when it exits.
 export DISAGG_CLIENT_SEGMENT_SIZE=${DISAGG_CLIENT_SEGMENT_SIZE:-0}
 export DISAGG_CLIENT_BUFFER_SIZE=${DISAGG_CLIENT_BUFFER_SIZE:-$((256 << 20))}
 if [[ "$DISAGG_CLIENT_SEGMENT_SIZE" -ne 0 ]]; then
@@ -60,55 +65,103 @@ if [[ "$DISAGG_CLIENT_SEGMENT_SIZE" -ne 0 ]]; then
     exit 2
 fi
 
-export DISAGG_STORE_ID=${DISAGG_STORE_ID:-qwen3-8b-domino-disagg-2srv}
-export DISAGG_SERVER_URLS="http://127.0.0.1:$SERVER0_PORT,http://127.0.0.1:$SERVER1_PORT"
+# -----------------------------------------------------------------------------
+# Disaggregated runtime channels and limits
+# -----------------------------------------------------------------------------
+export DISAGG_STORE_ID=${DISAGG_STORE_ID:-qwen3-8b-domino-disagg-1srv}
+export DISAGG_SERVER_URLS="http://127.0.0.1:$SERVER_PORT"
 export DISAGG_REF_CHANNEL=${DISAGG_REF_CHANNEL:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/refs.jsonl}
-DISAGG_DB=${DISAGG_DB:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/run.db}
-DISAGG_INBOX_DIR=${DISAGG_INBOX_DIR:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/inboxes}
 export DISAGG_MAX_PROMPTS=${DISAGG_MAX_PROMPTS:-400000}
 export DISAGG_MAX_STEPS=${DISAGG_MAX_STEPS:-0}
-export DISAGG_TOTAL_STEPS=${DISAGG_TOTAL_STEPS:-10000}
+export DISAGG_TOTAL_STEPS=${DISAGG_TOTAL_STEPS:-100000}
 export DISAGG_LOG_INTERVAL=${DISAGG_LOG_INTERVAL:-1}
-REPORT_TO=${REPORT_TO:-none}  # set REPORT_TO=wandb after installing/configuring W&B
 
-# Fail before allocating GPUs if Mooncake's Python extension or the selected
-# optional tracker is unavailable. Import torch first so pip-installed NVIDIA
-# runtime libraries are preloaded in the same order as the launcher.
-python - <<'PY'
-import torch
-try:
-    from mooncake.store import MooncakeDistributedStore, ReplicateConfig
-except Exception as exc:
-    raise SystemExit(
-        f"Mooncake preflight failed: {type(exc).__name__}: {exc}\n"
-        "Install compatible binaries with: pip install mooncake-transfer-engine "
-        "nvidia-cuda-runtime-cu12"
-    ) from exc
-PY
-if [[ "$REPORT_TO" == "wandb" ]]; then
-    python - <<'PY'
-import wandb
+DISAGG_DB=${DISAGG_DB:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/run.db}
+DISAGG_INBOX_DIR=${DISAGG_INBOX_DIR:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/inboxes}
+RUN_OUTPUT_DIR=$(dirname "$DISAGG_REF_CHANNEL")
+case "$RUN_OUTPUT_DIR" in
+    "$ROOT_DIR"/outputs/*) ;;
+    *)
+        echo "DISAGG_REF_CHANNEL must live under $ROOT_DIR/outputs" >&2
+        exit 2
+        ;;
+esac
+case "$DISAGG_DB" in
+    "$RUN_OUTPUT_DIR"/*) ;;
+    *)
+        echo "DISAGG_DB must live under $RUN_OUTPUT_DIR" >&2
+        exit 2
+        ;;
+esac
+MOONCAKE_LOG=${MOONCAKE_LOG:-$RUN_OUTPUT_DIR/mooncake.log}
 
-required = ("login", "init", "log", "finish")
-if not all(callable(getattr(wandb, name, None)) for name in required):
-    raise SystemExit("REPORT_TO=wandb requires a complete W&B client: pip install wandb")
-PY
-fi
+PRODUCER_OUTPUT_DIR=$ROOT_DIR/outputs/qwen3-8b-domino-disagg-1p4c-producer
+CONSUMER_OUTPUT_DIR=$ROOT_DIR/outputs/qwen3-8b-domino-disagg-1p4c-consumer
+REPORT_TO=${REPORT_TO:-none}
 
-rm -rf "$(dirname "$DISAGG_REF_CHANNEL")" "$DISAGG_DB"
-mkdir -p "$(dirname "$DISAGG_REF_CHANNEL")"
+# -----------------------------------------------------------------------------
+# Common training arguments
+# -----------------------------------------------------------------------------
+ARGS=(
+    # Target and draft model
+    --target-model-path "$TARGET_MODEL_PATH"
+    --target-model-backend hf
+    --trust-remote-code
+    --draft-config-path "$DRAFT_CONFIG_PATH"
+
+    # Data and tokenization
+    --mask-token-id 151669
+    --train-data-path "$TRAIN_DATA_PATH"
+    --chat-template "$CHAT_TEMPLATE"
+    --max-length 3072
+
+    # Optimization
+    --batch-size 2
+    --learning-rate 6e-4
+    --warmup-ratio 0.04
+    --max-grad-norm 1.0
+    --num-epochs 6
+    --seed 42
+    --save-interval 2000
+
+    # Domino / DFlash draft head
+    --attention-backend flex_attention
+    --block-size 16
+    --num-anchors 256
+    --loss-decay-gamma 7.0
+    --lambda-base-start 1.0
+    --lambda-base-decay-ratio 1.0
+)
+
+SGLANG_ARGS=(
+    --model-path "$TARGET_MODEL_PATH"
+    --trust-remote-code
+    --skip-tokenizer-init
+    --tp-size "$SERVER_TP"
+    --mem-fraction-static 0.85
+    --chunked-prefill-size -1
+    --disable-radix-cache
+    --enable-spec-capture
+    --spec-capture-method dflash
+    --spec-capture-aux-layer-ids $AUX_LAYER_IDS
+)
+
+
+rm -rf "$RUN_OUTPUT_DIR" "$DISAGG_DB"
+mkdir -p "$RUN_OUTPUT_DIR"
 : > "$DISAGG_REF_CHANNEL"
-MOONCAKE_LOG=${MOONCAKE_LOG:-$(dirname "$DISAGG_REF_CHANNEL")/mooncake.log}
 
 cleanup() {
-    kill "${SERVER0_PID:-}" "${SERVER1_PID:-}" "${PRODUCER_PID:-}" 2>/dev/null || true
+    kill "${SERVER_PID:-}" "${PRODUCER_PID:-}" 2>/dev/null || true
     if [[ -n "${MASTER_PID:-}" ]]; then
         kill -- "-$MASTER_PID" 2>/dev/null || kill "$MASTER_PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
 
-# --- mooncake master ---
+# -----------------------------------------------------------------------------
+# Mooncake master
+# -----------------------------------------------------------------------------
 setsid mooncake_master \
     --enable_http_metadata_server=true \
     --rpc_port="$MOONCAKE_RPC_PORT" \
@@ -124,93 +177,75 @@ wait_for_mooncake() {
             tail -n 100 "$MOONCAKE_LOG" >&2 || true
             return 1
         fi
+
         if curl -sS --max-time 1 -o /dev/null \
             "$MOONCAKE_METADATA_SERVER?key=specforge-health-check" \
             && timeout 1 bash -c \
                 "</dev/tcp/$MOONCAKE_HOST/$MOONCAKE_RPC_PORT" 2>/dev/null; then
             return 0
         fi
+
         sleep 1
     done
+
     echo "Mooncake master did not become ready; see $MOONCAKE_LOG" >&2
     tail -n 100 "$MOONCAKE_LOG" >&2 || true
     return 1
 }
 wait_for_mooncake
 
-# --- patched SGLang servers: frozen target, spec-capture on ---
-launch_server() { # $1=gpus $2=port
-    CUDA_VISIBLE_DEVICES=$1 MOONCAKE_LOCAL_HOSTNAME=$MOONCAKE_LOCAL_HOSTNAME \
-        python -m sglang.launch_server \
-            --model-path "$TARGET_MODEL_PATH" \
-            --trust-remote-code \
-            --skip-tokenizer-init \
-            --tp-size "$SERVER_TP" \
-            --mem-fraction-static 0.85 \
-            --chunked-prefill-size -1 \
-            --disable-radix-cache \
-            --enable-spec-capture \
-            --spec-capture-method dflash \
-            --spec-capture-aux-layer-ids $AUX_LAYER_IDS \
-            --port "$2" &
-}
-launch_server "$SERVER0_GPUS" "$SERVER0_PORT"
-SERVER0_PID=$!
-launch_server "$SERVER1_GPUS" "$SERVER1_PORT"
-SERVER1_PID=$!
+# -----------------------------------------------------------------------------
+# SGLang capture servers
+# -----------------------------------------------------------------------------
+launch_server() {
+    local gpus=$1
+    local port=$2
 
-for port_pid in "$SERVER0_PORT:$SERVER0_PID" "$SERVER1_PORT:$SERVER1_PID"; do
-    port=${port_pid%%:*}; pid=${port_pid##*:}
+    CUDA_VISIBLE_DEVICES=$gpus \
+        python -m sglang.launch_server "${SGLANG_ARGS[@]}" --port "$port" &
+}
+
+wait_for_server() {
+    local port=$1
+    local pid=$2
+
     until curl -sf "http://127.0.0.1:$port/health" > /dev/null; do
         if ! kill -0 "$MASTER_PID" 2>/dev/null; then
             echo "Mooncake master died while SGLang servers were starting" >&2
             tail -n 100 "$MOONCAKE_LOG" >&2 || true
             exit 1
         fi
-        if ! kill -0 "$pid" 2>/dev/null; then echo "server on :$port died"; exit 1; fi
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "server on :$port died" >&2
+            exit 1
+        fi
+
         sleep 5
     done
-done
+}
 
-ARGS=(
-    --target-model-path "$TARGET_MODEL_PATH"
-    --target-model-backend hf
-    --trust-remote-code
-    --draft-config-path "$DRAFT_CONFIG_PATH"
-    --mask-token-id 151669
-    --train-data-path "$TRAIN_DATA_PATH"
-    --chat-template "$CHAT_TEMPLATE"
-    --max-length 3072
-    --batch-size 2
-    --learning-rate 6e-4
-    --warmup-ratio 0.04
-    --max-grad-norm 1.0
-    --attention-backend flex_attention
-    --block-size 16
-    --num-anchors 256
-    --loss-decay-gamma 7.0
-    --num-epochs 6
-    --seed 42
-    --save-interval 2000
-    --lambda-base-start 1.0
-    --lambda-base-decay-ratio 1.0
-)
+launch_server "$SERVER_GPUS" "$SERVER_PORT"
+SERVER_PID=$!
 
-LAUNCHER=$SCRIPT_DIR/run_disagg_domino.py
+wait_for_server "$SERVER_PORT" "$SERVER_PID"
 
+# -----------------------------------------------------------------------------
+# Producer and consumer
+# -----------------------------------------------------------------------------
 DISAGG_ROLE=producer CUDA_VISIBLE_DEVICES="" \
     python "$LAUNCHER" "${ARGS[@]}" \
-        --output-dir "$ROOT_DIR/outputs/qwen3-8b-domino-disagg-2srv-producer" &
+        --output-dir "$PRODUCER_OUTPUT_DIR" &
 PRODUCER_PID=$!
 
 CUDA_VISIBLE_DEVICES=$CONSUMER_GPUS DISAGG_ROLE=consumer \
     DISAGG_DB=$DISAGG_DB DISAGG_INBOX_DIR=$DISAGG_INBOX_DIR \
     torchrun --rdzv-backend c10d --rdzv-endpoint localhost:29702 \
         --nnodes 1 --nproc_per_node "$TRAIN_DP" "$LAUNCHER" "${ARGS[@]}" \
-        --output-dir "$ROOT_DIR/outputs/qwen3-8b-domino-disagg-2srv-consumer" \
+        --output-dir "$CONSUMER_OUTPUT_DIR" \
         --report-to "$REPORT_TO" \
         --wandb-project qwen3-8b-domino-disagg \
-        --wandb-name qwen3-8b-domino-2srv-dp$TRAIN_DP
+        --wandb-name qwen3-8b-domino-1srv-dp$TRAIN_DP
 
-wait $PRODUCER_PID
-echo "QWEN3-8B-DOMINO-DISAGG-2SRV-DONE"
+wait "$PRODUCER_PID"
+echo "QWEN3-8B-DOMINO-DISAGG-1SRV-DONE"

@@ -17,8 +17,7 @@ except ImportError:
 # A local ``wandb/`` output directory is importable as a namespace package when
 # the real client is absent. Treat that case as an unavailable dependency too.
 if wandb is not None and not all(
-    callable(getattr(wandb, name, None))
-    for name in ("login", "init", "log", "finish")
+    callable(getattr(wandb, name, None)) for name in ("login", "init", "log", "finish")
 ):
     wandb = None
 

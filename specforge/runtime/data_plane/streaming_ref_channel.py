@@ -230,6 +230,10 @@ class StreamingRefQueue:
         self._clock = clock
         self._sleep = sleep
         self._buf: List[SampleRef] = []
+        self._wait_log_interval_s = float(
+            os.environ.get("SPECFORGE_STREAM_WAIT_LOG_INTERVAL", 30.0)
+        )
+        self._last_wait_log = 0.0
 
     def _poll(self) -> "tuple[List[SampleRef], int]":
         """Poll the channel, dropping already-trained refs (restart skip).
@@ -283,6 +287,20 @@ class StreamingRefQueue:
                     f"StreamingRefQueue {self.channel.path}: idle "
                     f"{self.idle_timeout_s:.0f}s with the channel still open"
                 )
+            now = self._clock()
+            if (
+                self._wait_log_interval_s > 0
+                and now - self._last_wait_log >= self._wait_log_interval_s
+            ):
+                print(
+                    "[stream-ref-queue] "
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} waiting "
+                    f"path={self.channel.path} need={n} buffered={len(self._buf)} "
+                    f"closed={self.channel.is_closed()} "
+                    f"since_progress={now - last_progress:.1f}s",
+                    flush=True,
+                )
+                self._last_wait_log = now
             self._sleep(self.poll_s)
         take = min(n, len(self._buf))
         out, self._buf = self._buf[:take], self._buf[take:]

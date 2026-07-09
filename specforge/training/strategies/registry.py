@@ -295,12 +295,14 @@ def _domino_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
         target_repr=None,
     )
 
+
 def _make_domino_strategy(
     wrapped, *, target_head=None, lambda_start=1.0, decay_ratio=0.5
 ):
     return DominoTrainStrategy(
         wrapped, lambda_start=lambda_start, decay_ratio=decay_ratio
     )
+
 
 register_strategy(
     StrategySpec(
