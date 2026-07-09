@@ -19,6 +19,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+from .dspark_heads import AcceptRatePredictor, build_markov_head
 from .registry import register_draft
 
 
@@ -244,6 +245,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
 
+        self.markov_head = None
+        self.enable_confidence_head = False
+        self.confidence_head_with_markov = False
+        self.confidence_head = None
+
         if self.projector_type == "domino":
             self.emb_dim = dflash_config["emb_dim"]
             self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
@@ -260,9 +266,62 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 nn.SiLU(),
                 nn.Linear(self.emb_dim, config.vocab_size, bias=False),
             )
+        elif self.projector_type == "dspark":
+            self.markov_head = build_markov_head(config, dflash_config)
+            confidence_alpha = float(
+                dflash_config.get("confidence_head_alpha", 0.0) or 0.0
+            )
+            self.enable_confidence_head = bool(
+                dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
+            )
+            self.confidence_head_with_markov = bool(
+                dflash_config.get("confidence_head_with_markov", False)
+            )
+            if self.confidence_head_with_markov and self.markov_head is None:
+                raise ValueError(
+                    "confidence_head_with_markov=True requires markov_rank > 0"
+                )
+            if self.enable_confidence_head:
+                input_dim = config.hidden_size
+                if self.confidence_head_with_markov:
+                    input_dim += self.markov_head.markov_rank
+                self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
         elif self.projector_type is not None:
             raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
         self.post_init()
+
+    def apply_markov_logits(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.markov_head is None:
+            return base_logits
+        return self.markov_head.apply_block_logits(
+            base_logits,
+            token_ids=prev_token_ids,
+            hidden_states=hidden_states,
+        )
+
+    def predict_confidence(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if self.confidence_head is None:
+            return None
+        if self.confidence_head_with_markov:
+            assert self.markov_head is not None
+            if prev_token_ids is None:
+                raise ValueError("prev_token_ids is required for Markov confidence")
+            prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids).to(
+                hidden_states.dtype
+            )
+            hidden_states = torch.cat([hidden_states, prev_embeddings], dim=-1)
+        return self.confidence_head(hidden_states).float()
 
     def forward(
         self,

@@ -267,18 +267,12 @@ class OnlineDFlashModel(nn.Module):
             return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
         raise ValueError(f"unknown D-PACE loss_type {loss_type!r}")
 
-    def forward(
+    def _forward_draft_blocks(
         self,
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """Parallel block-wise training forward pass; returns
-        (loss, accuracy, metrics) — same shape as Domino's forward."""
-        if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
-            raise ValueError(
-                "flex_attention is not available on this device; use sdpa/eager."
-            )
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -318,6 +312,28 @@ class OnlineDFlashModel(nn.Module):
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+        )
+        return anchor_positions, block_keep_mask, output_hidden
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Parallel block-wise training forward pass; returns
+        (loss, accuracy, metrics) — same shape as Domino's forward."""
+        if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
+            raise ValueError(
+                "flex_attention is not available on this device; use sdpa/eager."
+            )
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
+        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
         )
 
         logits = self.lm_head(output_hidden)

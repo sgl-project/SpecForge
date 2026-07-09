@@ -40,14 +40,29 @@ TINY_EAGLE3 = {
 TINY_DFLASH = {
     "architectures": ["DFlashDraftModel"],
     "model_type": "qwen3",
+    "block_size": 4,
     "hidden_size": 64,
     "intermediate_size": 128,
     "num_attention_heads": 4,
     "num_key_value_heads": 2,
     "num_hidden_layers": 1,
+    "num_target_layers": 4,
     "head_dim": 16,
     "max_position_embeddings": 512,
     "vocab_size": 256,
+}
+
+TINY_DSPARK = {
+    **TINY_DFLASH,
+    "architectures": ["DFlashDraftModel"],
+    "layer_types": ["full_attention"],
+    "dflash_config": {
+        "projector_type": "dspark",
+        "markov_rank": 8,
+        "markov_head_type": "vanilla",
+        "confidence_head_alpha": 1.0,
+        "confidence_head_with_markov": True,
+    },
 }
 
 
@@ -109,6 +124,16 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         config = AutoDraftModelConfig.from_file(path)
         self.assertIsInstance(config, Qwen3Config)
+
+    def test_from_config_builds_dspark_as_dflash_projector(self):
+        path = _write(TINY_DSPARK)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.projector_type, "dspark")
+        self.assertIsNotNone(model.markov_head)
+        self.assertIsNotNone(model.confidence_head)
 
     def test_from_file_unknown_architecture_raises(self):
         path = _write({**TINY_EAGLE3, "architectures": ["NoSuchDraft"]})

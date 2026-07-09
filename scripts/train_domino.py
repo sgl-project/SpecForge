@@ -543,7 +543,7 @@ def main():
         use_orig_params=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
+            buffer_dtype=torch.float32,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )

@@ -17,7 +17,11 @@ import unittest
 import torch
 
 from specforge import launch
-from specforge.training.strategies.base import DFlashTrainStrategy, Eagle3TrainStrategy
+from specforge.training.strategies.base import (
+    DFlashTrainStrategy,
+    DSparkTrainStrategy,
+    Eagle3TrainStrategy,
+)
 from specforge.training.strategies.registry import (
     available_strategies,
     resolve_strategy,
@@ -28,6 +32,7 @@ class TestStrategyRegistry(unittest.TestCase):
     def test_builtins_registered(self):
         self.assertIn("eagle3", available_strategies())
         self.assertIn("dflash", available_strategies())
+        self.assertIn("dspark", available_strategies())
 
     def test_dflash_fully_wired(self):
         spec = resolve_strategy("dflash")
@@ -49,6 +54,25 @@ class TestStrategyRegistry(unittest.TestCase):
 
         self.assertIsInstance(
             spec.make_strategy(_M(), target_head=None), DFlashTrainStrategy
+        )
+
+    def test_dspark_is_server_capture_online_only(self):
+        spec = resolve_strategy("dspark")
+        self.assertEqual(
+            spec.required_features, frozenset(DSparkTrainStrategy.required_features)
+        )
+        self.assertTrue(spec.supports_online)
+        self.assertIsNone(spec.make_offline_reader)
+        self.assertIsNone(spec.feature_schema)
+        self.assertFalse(spec.uses_target_head)
+        with self.assertRaises(NotImplementedError):
+            spec.make_adapter(None)
+
+        class _M:
+            draft_model = object()
+
+        self.assertIsInstance(
+            spec.make_strategy(_M(), target_head=None), DSparkTrainStrategy
         )
 
     def test_required_features_track_the_strategy_class(self):
@@ -79,6 +103,25 @@ class TestStrategyRegistry(unittest.TestCase):
                 self.assertEqual(batch["loss_mask"][0].tolist(), [1, 1, 1, 0, 0])
                 self.assertEqual(batch["input_ids"][0].tolist(), [1, 2, 3, 0, 0])
                 self.assertTrue(torch.all(batch["hidden_states"][0, 3:] == 0))
+
+    def test_dspark_online_collate_pads_target_last_hidden(self):
+        short = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "loss_mask": torch.tensor([[1, 1, 1]]),
+            "hidden_states": torch.ones(1, 3, 4),
+            "target_last_hidden_states": torch.ones(1, 3, 2),
+        }
+        long = {
+            "input_ids": torch.tensor([[4, 5, 6, 7, 8]]),
+            "loss_mask": torch.tensor([[1, 1, 1, 1, 1]]),
+            "hidden_states": torch.ones(1, 5, 4),
+            "target_last_hidden_states": torch.ones(1, 5, 2),
+        }
+        batch = resolve_strategy("dspark").make_online_collate()([short, long])
+        self.assertEqual(batch["input_ids"].shape, (2, 5))
+        self.assertEqual(batch["hidden_states"].shape, (2, 5, 4))
+        self.assertEqual(batch["target_last_hidden_states"].shape, (2, 5, 2))
+        self.assertTrue(torch.all(batch["target_last_hidden_states"][0, 3:] == 0))
 
     def test_eagle3_is_fully_wired(self):
         spec = resolve_strategy("eagle3")
