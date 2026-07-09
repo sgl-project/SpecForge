@@ -212,8 +212,10 @@ class DataFlowController:
                     self._prompt_failed[task_id] = (
                         f"{reason} (attempts exhausted: {task.attempt + 1})"
                     )
+                    self._prompts.pop(task_id, None)
                 else:
                     self._prompt_failed[task_id] = reason
+                    self._prompts.pop(task_id, None)
 
     def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> None:
         fresh: List[SampleRef] = []
@@ -224,6 +226,7 @@ class DataFlowController:
             if ref.source_task_id is not None:
                 with self._lock:
                     self._prompt_leased.pop(ref.source_task_id, None)
+                    self._prompts.pop(ref.source_task_id, None)
             fresh.append(ref)
         if fresh:
             self.sample_queue.put(fresh)
