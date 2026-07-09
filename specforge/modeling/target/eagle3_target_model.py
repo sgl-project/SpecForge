@@ -118,30 +118,6 @@ class Eagle3TargetModel(ABC):
         Generate the eagle3 data from the target model.
         """
 
-    def generate_mtp_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        **kwargs,
-    ) -> Eagle3TargetOutput:
-        """
-        Generate MTP data from the target model.
-
-        Unlike generate_eagle3_data, this must return *raw* input_ids and the
-        *last* hidden states without pre-shifting.  The MTP training wrapper
-        performs the next-token shift internally.
-
-        This is an optional capability: backends that do not support MTP
-        training need not override it.  Calling it on a backend without an
-        override raises at call time rather than failing at instantiation, so
-        external ``Eagle3TargetModel`` subclasses stay constructible.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support MTP data generation; "
-            "override generate_mtp_data to enable MTP training."
-        )
-
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
@@ -214,64 +190,23 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
         return cls(target_model)
 
-    def _get_language_model(self):
-        """
-        Return the inner transformer module (without the lm_head) that owns the
-        decoder layers, used for cheap hidden-state-only forward passes.
-
-        Handles causal LMs (``model.model``), multimodal conditional generation
-        models (text decoder under ``model.language_model``), and falls back to
-        a recursive search for any module that directly contains a ``layers``/
-        ``h`` ``nn.ModuleList`` (preferring a ``language_model`` path), so it
-        copes with arbitrary nesting in VLM checkpoints.
-        """
-        # Fast paths for common layouts.
-        if hasattr(self.model, "language_model"):
-            lm = self.model.language_model
-            if hasattr(lm, "model"):
-                return lm.model
-            if hasattr(lm, "layers"):
-                return lm
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model
-        if hasattr(self.model, "layers"):
-            return self.model
-        # Recursive fallback: a module whose direct child is a decoder-layers
-        # ModuleList. Handles VLMs whose text decoder is nested deeper than
-        # model.language_model (e.g. under model.model.language_model).
-        candidates = []
-        for name, module in self.model.named_modules():
-            for attr in ("layers", "h"):
-                child = getattr(module, attr, None)
-                if isinstance(child, nn.ModuleList) and len(child) > 0:
-                    candidates.append((name, module, len(child)))
-                    break
-        if candidates:
-            # Prefer a "language_model" path, then the largest layer count.
-            candidates.sort(key=lambda c: ("language_model" not in c[0], -c[2]))
-            return candidates[0][1]
-        return self.model
-
     def _get_transformer_layers(self):
         """
         Helper to find the module list containing the transformer layers.
-        Adapts to common architectures (Llama, Qwen, Mistral, OPT, GPT-2) and
-        multimodal Qwen3_5ForConditionalGeneration via _get_language_model.
+        Adapts to common architectures (Llama, Qwen, Mistral, OPT, etc.)
         """
-        lm = self._get_language_model()
-        if isinstance(getattr(lm, "layers", None), nn.ModuleList):
-            return lm.layers
-        if isinstance(getattr(lm, "h", None), nn.ModuleList):
-            return lm.h
-        if hasattr(lm, "transformer") and isinstance(
-            getattr(lm.transformer, "h", None), nn.ModuleList
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            return self.model.model.layers
+        elif hasattr(self.model, "layers"):
+            return self.model.layers
+        elif hasattr(self.model, "transformer") and hasattr(
+            self.model.transformer, "h"
         ):
-            return lm.transformer.h
-        raise ValueError(
-            "Could not locate transformer layers in the model architecture to register hooks. "
-            f"model class={type(self.model).__name__}, "
-            f"top-level children={[n for n, _ in self.model.named_children()]}"
-        )
+            return self.model.transformer.h
+        else:
+            raise ValueError(
+                "Could not locate transformer layers in the model architecture to register hooks."
+            )
 
     @torch.no_grad()
     def generate_eagle3_data(
@@ -361,62 +296,6 @@ class HFEagle3TargetModel(Eagle3TargetModel):
             loss_mask=loss_mask,
             input_ids=input_ids,
             attention_mask=attention_mask,
-        )
-
-    @torch.no_grad()
-    def generate_mtp_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        **kwargs,
-    ) -> Eagle3TargetOutput:
-        """
-        HF backend for MTP: capture the last hidden state and return raw input_ids.
-        No aux hooks, no pre-shifting.
-        """
-        if kwargs:
-            logger.debug(f"unused kwargs {list(kwargs.keys())}")
-
-        # Capture only the last transformer layer output instead of materializing
-        # the full hidden_states tuple (one tensor per layer), which saves a lot
-        # of device memory on NPU/GPU during target-model forward passes.
-        layers = self._get_transformer_layers()
-        last_hidden_state = [None]
-
-        def get_hook():
-            def hook(module, inp, out):
-                # Layer output is either a tuple (hidden_states, ...) or a single tensor.
-                last_hidden_state[0] = out[0] if isinstance(out, tuple) else out
-
-            return hook
-
-        handle = layers[-1].register_forward_hook(get_hook())
-        try:
-            # Run the inner transformer (without lm_head) to save the memory and
-            # compute cost of the final projection, which MTP does not need.
-            # _get_language_model handles both causal LMs (model.model) and
-            # multimodal models whose text decoder is under model.language_model.
-            self._get_language_model()(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=False,
-                output_attentions=False,
-                use_cache=False,
-            )
-        finally:
-            handle.remove()
-
-        last_hidden_states = last_hidden_state[0]
-        loss_mask = loss_mask[..., None].to(last_hidden_states.device)
-
-        return Eagle3TargetOutput(
-            hidden_states=None,
-            target=None,
-            loss_mask=loss_mask,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            last_hidden_states=last_hidden_states,
         )
 
 
@@ -1030,74 +909,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             last_hidden_states=last_hidden_states_out,
         )
 
-    def generate_mtp_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        is_vlm: bool = False,
-        shard_returns: bool = False,
-        **kwargs,
-    ) -> Eagle3TargetOutput:
-        """
-        SGLang backend for MTP: capture the last hidden state and return raw input_ids.
-
-        Unlike generate_eagle3_data, this does NOT pre-shift input_ids via
-        padding(left=False); the shift is performed inside OnlineMTPModel.
-        """
-        if kwargs:
-            logger.debug(f"unused kwargs {list(kwargs.keys())}")
-
-        if is_vlm:
-            data_cache, _, _, last_hidden_states_list = self.extend_vlm(
-                input_ids,
-                attention_mask,
-                loss_mask,
-                return_last_hidden_states=True,
-                return_logits=False,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-            )
-        else:
-            data_cache, _, _, last_hidden_states_list = self.extend(
-                input_ids,
-                attention_mask,
-                loss_mask,
-                return_last_hidden_states=True,
-                capture_aux_hidden_states=False,
-                return_logits=False,
-                shard_returns=shard_returns,
-            )
-
-        input_ids_out = []
-        attention_mask_out = []
-        loss_mask_out = []
-        last_hidden_states_out = []
-
-        for data, last_hidden_states in zip(data_cache, last_hidden_states_list):
-            input_ids_out.append(data[0])
-            attention_mask_out.append(data[1])
-            loss_mask_out.append(data[2])
-            if last_hidden_states is not None:
-                last_hidden_states_out.append(last_hidden_states.unsqueeze(0))
-
-        input_ids_out = torch.cat(input_ids_out, dim=0)
-        attention_mask_out = torch.cat(attention_mask_out, dim=0)
-        loss_mask_out = torch.cat(loss_mask_out, dim=0)
-        last_hidden_states_out = torch.cat(last_hidden_states_out, dim=0)
-        loss_mask_out = loss_mask_out[..., None]
-
-        return Eagle3TargetOutput(
-            hidden_states=None,
-            target=None,
-            loss_mask=loss_mask_out,
-            input_ids=input_ids_out,
-            attention_mask=attention_mask_out,
-            last_hidden_states=last_hidden_states_out,
-        )
-
 
 class CustomEagle3TargetModel(Eagle3TargetModel):
 
@@ -1159,37 +970,6 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
             loss_mask=loss_mask,
             input_ids=input_ids,
             attention_mask=attention_mask,
-        )
-
-    @torch.no_grad()
-    def generate_mtp_data(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        **kwargs,
-    ) -> Eagle3TargetOutput:
-        if kwargs:
-            logger.debug(f"unused kwargs {list(kwargs.keys())}")
-
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            layers_to_output_hidden_states=[-1],
-            use_cache=False,
-        )
-
-        last_hidden_states = outputs.hidden_states[-1]
-        loss_mask = loss_mask[..., None].to(last_hidden_states.device)
-
-        return Eagle3TargetOutput(
-            hidden_states=None,
-            target=None,
-            loss_mask=loss_mask,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            last_hidden_states=last_hidden_states,
         )
 
 

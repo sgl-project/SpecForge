@@ -31,6 +31,7 @@ from specforge.distributed import destroy_distributed, get_dp_group, init_distri
 from specforge.modeling import get_eagle3_target_model
 from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
 from specforge.modeling.target.eagle3_target_model import Eagle3TargetModel
+from specforge.modeling.target.mtp_target_model import generate_mtp_data
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -560,8 +561,8 @@ def main():
             attention_mask = data["attention_mask"].to(device_type, non_blocking=True)
             loss_mask = data["loss_mask"].to(device_type, non_blocking=True)
 
-            target_output = target_model.generate_mtp_data(
-                input_ids, attention_mask, loss_mask
+            target_output = generate_mtp_data(
+                target_model, input_ids, attention_mask, loss_mask
             )
             hidden_states = target_output.last_hidden_states.to(
                 device_type, non_blocking=True
