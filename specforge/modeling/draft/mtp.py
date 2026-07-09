@@ -11,8 +11,8 @@ Weight key layout matches SGLang's Qwen3_5ForCausalLMMTP:
   mtp.pre_fc_norm_embedding.weight
   mtp.pre_fc_norm_hidden.weight
   mtp.fc.weight
-  mtp.model.layers.0.self_attn.q_proj.weight
-  mtp.model.layers.0.mlp.gate_proj.weight
+  mtp.layers.0.self_attn.q_proj.weight
+  mtp.layers.0.mlp.gate_proj.weight
   mtp.lm_head.weight
 """
 
@@ -31,7 +31,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3MLP,
     Qwen3PreTrainedModel,
     Qwen3RMSNorm,
-    Qwen3RotaryEmbedding,
     eager_attention_forward,
     rotate_half,
 )
@@ -40,17 +39,62 @@ from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Apply rotary positional embeddings to q/k tensors."""
+    """Apply rotary positional embeddings with partial rotary support.
+
+    When partial_rotary_factor < 1.0, only the first ``rotary_dim`` dimensions
+    of q/k are rotated; the rest pass through unchanged.
+    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
     return q_embed, k_embed
 
 
+class PartialRotaryEmbedding(nn.Module):
+    """Rotary embedding that computes inv_freq for only a fraction of head_dim.
+
+    Matches the official Qwen3.5 ``partial_rotary_factor`` behaviour where
+    ``dim = int(head_dim * partial_rotary_factor)``.
+    """
+
+    inv_freq: torch.Tensor
+
+    def __init__(self, config, head_dim):
+        super().__init__()
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        dim = int(head_dim * partial_rotary_factor)
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()
+        sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class Qwen3MTPAttention(nn.Module):
-    """Standard causal self-attention used inside the MTP transformer."""
+    """Causal self-attention with optional output gate (Qwen3.5 style).
+
+    When ``attn_output_gate`` is True (the default for Qwen3.5), ``q_proj``
+    outputs ``num_heads * head_dim * 2`` and the extra half is used as a
+    sigmoid gate applied to the attention output before ``o_proj``.
+    """
 
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
@@ -64,11 +108,20 @@ class Qwen3MTPAttention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
+        self.attn_output_gate = getattr(config, "attn_output_gate", False)
+
+        if self.attn_output_gate:
+            self.q_proj = nn.Linear(
+                config.hidden_size,
+                config.num_attention_heads * self.head_dim * 2,
+                bias=config.attention_bias,
+            )
+        else:
+            self.q_proj = nn.Linear(
+                config.hidden_size,
+                config.num_attention_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
         self.k_proj = nn.Linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
@@ -98,7 +151,18 @@ class Qwen3MTPAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
+        if self.attn_output_gate:
+            query_states, gate = torch.chunk(
+                self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim * 2),
+                2,
+                dim=-1,
+            )
+            gate = gate.reshape(bsz, q_len, -1)
+        else:
+            query_states = self.q_proj(hidden_states).view(
+                bsz, q_len, -1, self.head_dim
+            )
+
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
@@ -142,6 +206,10 @@ class Qwen3MTPAttention(nn.Module):
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)
+
+        if self.attn_output_gate:
+            attn_output = attn_output * torch.sigmoid(gate)
+
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -235,7 +303,10 @@ class Qwen3_5MTPModel(nn.Module):
             [Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(mtp_config)
+        self.rotary_emb = PartialRotaryEmbedding(
+            mtp_config,
+            getattr(mtp_config, "head_dim", mtp_config.hidden_size // mtp_config.num_attention_heads),
+        )
 
         # LM head (shared with target model during training)
         self.lm_head = nn.Linear(
