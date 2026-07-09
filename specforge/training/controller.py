@@ -66,6 +66,31 @@ def _scalar(x: Any) -> float:
     return float(x)
 
 
+def _dp_mean(x: Any) -> Any:
+    """Average a scalar metric tensor across all ranks before it is logged.
+
+    Matches stock ``train_dflash.py`` (``dist.all_reduce(acc); acc /= world``):
+    without it the disagg consumer logs a single rank's local-batch accuracy
+    (~1 rank x batch x anchors), which is ~sqrt(world) noisier and spikes because
+    each rank's few round-robin refs can be all-easy or all-hard. Reducing across
+    ranks recovers the ~world x larger effective sample the stock path logs.
+    No-op when torch.distributed is unavailable / single-rank / x is not a
+    tensor. Called every step on every rank, so the collective stays in lockstep.
+    """
+    import torch.distributed as dist
+
+    if not isinstance(x, torch.Tensor):
+        return x
+    if not (dist.is_available() and dist.is_initialized()):
+        return x
+    world = dist.get_world_size()
+    if world <= 1:
+        return x
+    x = x.detach().clone()
+    dist.all_reduce(x)
+    return x / world
+
+
 class TrainerCore:
     """One step: forward/loss (strategy) -> backward (backend) -> optimizer boundary."""
 
@@ -153,14 +178,18 @@ class TrainerCore:
     # count tensors that correct acc-len aggregation needs.
 
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
-        metrics: Dict[str, Any] = {"loss": _scalar(out.loss)}
+        # DP-average loss AND accuracy across ranks before logging, matching stock
+        # train_dflash.py (all_reduce(loss)/world, all_reduce(acc)/world).
+        metrics: Dict[str, Any] = {"loss": _scalar(_dp_mean(out.loss))}
         for key in ("acces", "acceptance_rates", "plosses"):
             if key in out.metrics:
                 metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
                     out.metrics[key]
                 )
         if "accuracy" in out.metrics:
-            metrics["acc"] = _scalar(out.metrics["accuracy"])
+            # DP-average the accuracy across ranks (matches stock train_dflash.py)
+            # so the logged curve is smooth, not a single rank's noisy local batch.
+            metrics["acc"] = _scalar(_dp_mean(out.metrics["accuracy"]))
         gn = _scalar(grad_norm) if grad_norm is not None else None
         if gn is not None:
             metrics["grad_norm"] = gn

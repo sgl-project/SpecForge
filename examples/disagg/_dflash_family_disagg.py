@@ -404,34 +404,46 @@ def build_consumer_parts(
     )
 
 
-def _optimizer_factory(args, total_steps: int):
+def _optimizer_factory(args, total_steps: int, holder: Optional[Dict] = None):
     def factory(draft_module):
-        return BF16Optimizer(
+        opt = BF16Optimizer(
             draft_module,
             lr=args.learning_rate,
             max_grad_norm=args.max_grad_norm,
             warmup_ratio=args.warmup_ratio,
             total_steps=total_steps,
         )
+        if holder is not None:
+            holder["opt"] = opt
+        return opt
 
     return factory
 
 
-def _make_logger(args):
+def _make_logger(args, holder: Optional[Dict] = None):
     tracker = create_tracker(args, args.output_dir)
 
     def logger(metrics, step):
         logdict = {}
         for key, value in metrics.items():
+            # Log accuracy under `train/accuracy` to match stock train_dflash.py.
+            k = "accuracy" if key == "acc" else key
             try:
-                logdict[f"train/{key}"] = float(value)
+                logdict[f"train/{k}"] = float(value)
             except (TypeError, ValueError):
                 try:
                     seq = [float(x) for x in value]
                 except (TypeError, ValueError):
                     continue
                 if seq:
-                    logdict[f"train/{key}_mean"] = sum(seq) / len(seq)
+                    logdict[f"train/{k}_mean"] = sum(seq) / len(seq)
+        # Log the current learning rate (like stock train_dflash.py -> train/lr).
+        opt = (holder or {}).get("opt")
+        if opt is not None:
+            try:
+                logdict["train/lr"] = float(opt.get_learning_rate())
+            except Exception:
+                pass
         if logdict:
             tracker.log(logdict, step=step)
             summary = {k.split("/")[-1]: round(v, 4) for k, v in logdict.items()}
@@ -456,12 +468,14 @@ def fit_online_consumer(
         f"(producer-looped epochs={args.num_epochs})",
         flush=True,
     )
+    # Shared holder so the logger can read the live optimizer's learning rate.
+    opt_holder: Dict = {}
     trainer, loader = build_disagg_online_consumer(
         strategy=strategy,
         feature_store=mooncake_store(run_id),
         channel=ref_channel(),
         eagle3_model=composite_model,  # legacy param name = composite draft model
-        optimizer_factory=_optimizer_factory(args, total_steps),
+        optimizer_factory=_optimizer_factory(args, total_steps, opt_holder),
         run_id=run_id,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
@@ -472,7 +486,7 @@ def fit_online_consumer(
         save_interval=args.save_interval,
         tp_size=args.tp_size,
         metadata_db_path=os.environ.get("DISAGG_DB") or None,
-        logger=_make_logger(args),
+        logger=_make_logger(args, opt_holder),
         log_interval=env_int("DISAGG_LOG_INTERVAL", 1),
         strategy_kwargs=strategy_kwargs,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
