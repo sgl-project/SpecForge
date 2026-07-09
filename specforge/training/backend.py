@@ -181,7 +181,7 @@ class FSDPTrainingBackend(TrainingBackend):
                 model,
                 use_orig_params=True,
                 mixed_precision=MixedPrecision(
-                    param_dtype=pc.param_dtype, buffer_dtype=pc.param_dtype
+                    param_dtype=pc.param_dtype, buffer_dtype=torch.float32
                 ),
                 sharding_strategy=sharding,
                 process_group=pc.fsdp_process_group,
