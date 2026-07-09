@@ -7,10 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.core.dflash import (
-    FLEX_ATTENTION_AVAILABLE,
-    OnlineDFlashModel,
-)
+from specforge.core.dflash import FLEX_ATTENTION_AVAILABLE, OnlineDFlashModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
 
@@ -80,8 +77,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             return anchors, keep_mask
 
         valid_counts = valid.sum(dim=1)
-        indices = torch.arange(num_candidates, device=device).unsqueeze(0).expand(
-            bsz, -1
+        indices = (
+            torch.arange(num_candidates, device=device).unsqueeze(0).expand(bsz, -1)
         )
         masked_indices = torch.where(
             valid,
@@ -152,9 +149,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_weight_mask = eval_mask.to(torch.float32)
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             positions = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -positions.float() / float(self.loss_decay_gamma)
-            )
+            decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask
 
@@ -225,7 +220,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         confidence_abs_error = ce_loss.new_zeros(())
         if confidence_pred is not None:
             if accept_rate_3d is None:
-                raise ValueError("DSpark confidence head requires aligned target logits.")
+                raise ValueError(
+                    "DSpark confidence head requires aligned target logits."
+                )
             confidence_errors = F.binary_cross_entropy_with_logits(
                 confidence_pred.float(),
                 accept_rate_3d.detach(),
@@ -274,9 +271,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         logits = self.lm_head(output_hidden)
         num_blocks = anchor_positions.size(1)
-        output_hidden_4d = output_hidden.reshape(
-            bsz, num_blocks, self.block_size, -1
-        )
+        output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
         (
             target_ids,
             eval_mask,
