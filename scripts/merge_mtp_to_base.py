@@ -70,6 +70,42 @@ def _is_mtp_key(key: str) -> bool:
     return key.startswith("mtp.")
 
 
+def _patch_text_config(base_config: dict, draft_config: dict) -> dict:
+    """Ensure base text_config contains MTP-critical dims from the draft config.
+
+    Some Qwen3.5 base checkpoints omit ``head_dim`` in ``text_config``; vLLM's
+    ``Qwen3_5TextConfig`` then falls back to its default (``head_dim=256``),
+    which mismatches the trained MTP weights (e.g. q_norm/k_norm shape 128).
+    We sync only the structural dims that must agree between base and draft.
+    """
+    keys_to_sync = [
+        "head_dim",
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ]
+
+    target = base_config
+    if "text_config" in base_config:
+        target = base_config["text_config"]
+
+    source = draft_config
+    if "text_config" in draft_config:
+        source = draft_config["text_config"]
+
+    for key in keys_to_sync:
+        if key not in source:
+            continue
+        old = target.get(key)
+        new = source[key]
+        if old != new:
+            target[key] = new
+            print(f"  overriding text_config.{key}: {old} -> {new}")
+
+    return base_config
+
+
 def merge_checkpoints(
     base_model_path: str,
     mtp_checkpoint_path: str,
@@ -158,6 +194,21 @@ def merge_checkpoints(
             save_file(merged, os.path.join(output_path, out_name))
         else:
             torch.save(merged, os.path.join(output_path, out_name))
+
+    # Ensure the merged config exposes the MTP structural dims.  vLLM/SGLang
+    # use these values to build the MTP module; if the base config omits
+    # ``head_dim`` (common for some Qwen3.5 checkpoints), the loader will use
+    # its default and fail with a shape mismatch.
+    draft_config_path = os.path.join(mtp_checkpoint_path, "config.json")
+    output_config_path = os.path.join(output_path, "config.json")
+    if os.path.exists(draft_config_path) and os.path.exists(output_config_path):
+        with open(draft_config_path, "r") as f:
+            draft_config = json.load(f)
+        with open(output_config_path, "r") as f:
+            base_config = json.load(f)
+        patched_config = _patch_text_config(base_config, draft_config)
+        with open(output_config_path, "w") as f:
+            json.dump(patched_config, f, indent=2)
 
     # Copy over the MTP modeling file if present; some loaders need it for
     # trust_remote_code / auto_map resolution.
