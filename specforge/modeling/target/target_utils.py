@@ -98,61 +98,20 @@ class TargetEmbeddingsAndHead(nn.Module):
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
 
-            # Auto-detect the embedding key if the supplied/default key is missing.
-            # This handles plain LLMs (model.embed_tokens.weight), MLLMs
-            # (model.language_model.model.embed_tokens.weight), and renamed checkpoints.
-            candidate_embed_keys = [
-                embed_key,
-                "model.embed_tokens.weight",
-                "embed_tokens.weight",
-                "model.language_model.model.embed_tokens.weight",
-                "model.language_model.embed_tokens.weight",
-                "language_model.model.embed_tokens.weight",
-                "language_model.embed_tokens.weight",
-                "model.model.embed_tokens.weight",
-            ]
-            resolved_embed_key = None
-            for key in candidate_embed_keys:
-                if key in weight_map:
-                    resolved_embed_key = key
-                    break
-            if resolved_embed_key is None:
+            if embed_key in weight_map:
+                files_to_load[embed_key] = weight_map[embed_key]
+            else:
                 raise ValueError(
-                    f"Embedding key '{embed_key}' not found in weight map and no "
-                    f"candidate embed key matched. Available keys (first 20): "
-                    f"{list(weight_map.keys())[:20]}"
+                    f"Embedding key '{embed_key}' not found in weight map."
                 )
-            if resolved_embed_key != embed_key:
-                print(
-                    f"Resolved embedding key '{embed_key}' -> '{resolved_embed_key}'"
-                )
-            files_to_load[resolved_embed_key] = weight_map[resolved_embed_key]
-            embed_key = resolved_embed_key
 
             if not tie_weights:
-                candidate_head_keys = [
-                    lm_head_key,
-                    "lm_head.weight",
-                    "model.lm_head.weight",
-                    "model.language_model.lm_head.weight",
-                    "language_model.lm_head.weight",
-                ]
-                resolved_head_key = None
-                for key in candidate_head_keys:
-                    if key in weight_map:
-                        resolved_head_key = key
-                        break
-                if resolved_head_key is None:
+                if lm_head_key in weight_map:
+                    files_to_load[lm_head_key] = weight_map[lm_head_key]
+                else:
                     print(
                         f"Warning: {lm_head_key} not found. Ensure model doesn't use tied weights manually."
                     )
-                else:
-                    if resolved_head_key != lm_head_key:
-                        print(
-                            f"Resolved lm_head key '{lm_head_key}' -> '{resolved_head_key}'"
-                        )
-                    files_to_load[resolved_head_key] = weight_map[resolved_head_key]
-                    lm_head_key = resolved_head_key
         else:
             safetensors = glob.glob(os.path.join(model_path, "*.safetensors"))
             bins = glob.glob(os.path.join(model_path, "*.bin"))
@@ -161,75 +120,9 @@ class TargetEmbeddingsAndHead(nn.Module):
             if not target_file:
                 raise FileNotFoundError("No checkpoint found.")
 
-            # Read the available keys so we can auto-detect embed/lm_head names
-            # in single-file checkpoints too.
-            if target_file.endswith(".safetensors"):
-                with safe_open(target_file, framework="np") as f:
-                    available_keys = set(f.keys())
-            else:
-                # For .bin files we fall back to the provided keys; auto-detection
-                # would require loading the whole state dict up front.
-                available_keys = None
-
-            candidate_embed_keys = [
-                embed_key,
-                "model.embed_tokens.weight",
-                "embed_tokens.weight",
-                "model.language_model.model.embed_tokens.weight",
-                "model.language_model.embed_tokens.weight",
-                "language_model.model.embed_tokens.weight",
-                "language_model.embed_tokens.weight",
-                "model.model.embed_tokens.weight",
-            ]
-            resolved_embed_key = None
-            if available_keys is not None:
-                for key in candidate_embed_keys:
-                    if key in available_keys:
-                        resolved_embed_key = key
-                        break
-            else:
-                resolved_embed_key = embed_key
-
-            if resolved_embed_key is None:
-                raise ValueError(
-                    f"Embedding key '{embed_key}' not found in checkpoint and no "
-                    f"candidate embed key matched."
-                )
-            if resolved_embed_key != embed_key:
-                print(
-                    f"Resolved embedding key '{embed_key}' -> '{resolved_embed_key}'"
-                )
-            files_to_load[resolved_embed_key] = os.path.basename(target_file)
-            embed_key = resolved_embed_key
-
+            files_to_load[embed_key] = os.path.basename(target_file)
             if not tie_weights:
-                candidate_head_keys = [
-                    lm_head_key,
-                    "lm_head.weight",
-                    "model.lm_head.weight",
-                    "model.language_model.lm_head.weight",
-                    "language_model.lm_head.weight",
-                ]
-                resolved_head_key = None
-                if available_keys is not None:
-                    for key in candidate_head_keys:
-                        if key in available_keys:
-                            resolved_head_key = key
-                            break
-                else:
-                    resolved_head_key = lm_head_key
-
-                if resolved_head_key is None:
-                    print(
-                        f"Warning: {lm_head_key} not found. Ensure model doesn't use tied weights manually."
-                    )
-                else:
-                    if resolved_head_key != lm_head_key:
-                        print(
-                            f"Resolved lm_head key '{lm_head_key}' -> '{resolved_head_key}'"
-                        )
-                    files_to_load[resolved_head_key] = os.path.basename(target_file)
-                    lm_head_key = resolved_head_key
+                files_to_load[lm_head_key] = os.path.basename(target_file)
 
         loaded_keys = set()
 

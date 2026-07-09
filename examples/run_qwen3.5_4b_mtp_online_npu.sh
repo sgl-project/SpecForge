@@ -1,4 +1,10 @@
 #!/bin/bash
+#
+# Qwen3.5-4B MTP online training on NPU (HF backend).
+#
+# NOTE: the text decoder in the Qwen3.5-4B VLM checkpoint is nested under
+# model.language_model, so we explicitly pass --embedding-key and --lm-head-key.
+# If your checkpoint uses a different key layout, adjust the two keys below.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname $SCRIPT_DIR)
@@ -32,4 +38,6 @@ torchrun \
     --save-interval 10000 \
     --report-to tensorboard \
     --target-model-backend hf \
-    --trust-remote-code
+    --trust-remote-code \
+    --embedding-key model.language_model.model.embed_tokens.weight \
+    --lm-head-key model.language_model.lm_head.weight

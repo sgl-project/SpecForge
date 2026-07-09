@@ -2,6 +2,8 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Dict
 
+from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+
 
 @dataclass
 class TrackerArgs:
@@ -101,9 +103,6 @@ class SGLangBackendArgs:
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
         # sglang arguments
-        # NOTE: defer the import so NPU/HF-only runs don't need sglang installed.
-        from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
-
         parser.add_argument(
             "--sglang-attention-backend",
             type=str,
