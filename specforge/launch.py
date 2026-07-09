@@ -187,6 +187,35 @@ def _dp_barrier() -> None:
         dist.barrier()
 
 
+def _normalize_prompt_epochs(prompt_epochs: int) -> int:
+    prompt_epochs = int(prompt_epochs or 1)
+    if prompt_epochs < 1:
+        raise ValueError(f"prompt_epochs must be >= 1, got {prompt_epochs}")
+    return prompt_epochs
+
+
+def _epoch_online_prompts(prompts, epoch: int, prompt_epochs: int):
+    """Build one epoch's prompt tasks without expanding the full run upfront."""
+    if prompt_epochs == 1:
+        return prompts
+
+    out = []
+    for idx, prompt in enumerate(prompts):
+        item = dict(prompt)
+        metadata = dict(prompt.get("metadata") or {})
+        if "task_id" in prompt:
+            metadata.setdefault("base_task_id", str(prompt["task_id"]))
+        metadata["prompt_index"] = idx
+        metadata["epoch"] = epoch
+        metadata["prompt_epochs"] = prompt_epochs
+        item["metadata"] = metadata
+        # The online feature store is consume-once and commit dedups by
+        # sample_id, so every epoch pass must mint distinct task/sample ids.
+        item["task_id"] = f"epoch{epoch:04d}-prompt{idx:012d}"
+        out.append(item)
+    return out
+
+
 def _checkpoint_global_step(resume_from: str) -> int:
     """Read ``global_step`` from the shared payload of the checkpoint at
     ``resume_from`` (a checkpoint dir, its state file, or a ``file://`` URI)."""
@@ -594,6 +623,7 @@ def build_disagg_online_producer(
     metadata_store: Optional[MetadataStore] = None,
     metadata_db_path: Optional[str] = None,
     sleep=None,
+    prompt_epochs: int = 1,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -607,6 +637,10 @@ def build_disagg_online_producer(
     ``drive_producer(should_stop=...)`` runs until the prompt pool drains, pauses
     above ``in_flight_high_watermark``, and always closes the channel on exit
     (EOF terminates the consumer's loader).
+
+    ``prompt_epochs`` repeats the prompt stream on the producer side by minting
+    epoch-tagged task/sample ids. This keeps the consumer path consume-once while
+    preserving ``num_epochs`` semantics for online streams.
 
     Failure semantics: a worker whose source raises (dead/unreachable server)
     has already failed its leases retryable — the surviving workers re-lease
@@ -636,11 +670,16 @@ def build_disagg_online_producer(
     spec = resolve_strategy(strategy)
     sleep = sleep or time.sleep
     build_start = time.perf_counter()
-    prompt_count = len(prompts) if hasattr(prompts, "__len__") else "unknown"
+    prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
+    if prompt_epochs > 1:
+        prompts = list(prompts)
+    base_prompt_count = len(prompts) if hasattr(prompts, "__len__") else "unknown"
     producer_timing(
         "build_disagg_online_producer enter "
-        f"strategy={strategy} prompts={prompt_count} lease={lease} "
-        f"workers={num_rollout_workers} watermark={in_flight_high_watermark}"
+        f"strategy={strategy} base_prompts={base_prompt_count} "
+        f"prompt_epochs={prompt_epochs} "
+        f"lease={lease} workers={num_rollout_workers} "
+        f"watermark={in_flight_high_watermark}"
     )
     phase = time.perf_counter()
     controller = DataFlowController(
@@ -649,15 +688,6 @@ def build_disagg_online_producer(
         max_prompt_attempts=max_prompt_attempts,
     )
     producer_timing(f"DataFlowController created elapsed={elapsed(phase)}")
-    phase = time.perf_counter()
-    producer_timing(f"controller.ingest_prompts start prompts={prompt_count}")
-    task_ids = controller.ingest_prompts(prompts)
-    status = controller.status()
-    producer_timing(
-        "controller.ingest_prompts done "
-        f"tasks={len(task_ids)} pending={status['prompts_pending']} "
-        f"elapsed={elapsed(phase)}"
-    )
 
     phase = time.perf_counter()
     producer_timing("assemble rollout workers start")
@@ -828,17 +858,35 @@ def build_disagg_online_producer(
                     # leases may yet fail back into the pool) — wait, retry.
                     sleep(backpressure_poll_s)
 
-        fatal: list = []  # non-transport errors escaping a worker thread
+        def ingest_epoch(epoch: int) -> None:
+            epoch_prompts = _epoch_online_prompts(prompts, epoch, prompt_epochs)
+            epoch_count = (
+                len(epoch_prompts) if hasattr(epoch_prompts, "__len__") else "unknown"
+            )
+            phase = time.perf_counter()
+            producer_timing(
+                "controller.ingest_prompts start "
+                f"epoch={epoch + 1}/{prompt_epochs} prompts={epoch_count}"
+            )
+            task_ids = controller.ingest_prompts(epoch_prompts)
+            status = controller.status()
+            producer_timing(
+                "controller.ingest_prompts done "
+                f"epoch={epoch + 1}/{prompt_epochs} tasks={len(task_ids)} "
+                f"pending={status['prompts_pending']} elapsed={elapsed(phase)}"
+            )
 
-        def run_worker_guarded(w) -> None:
-            try:
-                run_worker(w)
-            except BaseException as exc:  # e.g. a channel publish failure
-                fatal.append((w.worker_id, exc))
+        def run_epoch_workers(live_workers) -> None:
+            fatal: list = []  # non-transport errors escaping a worker thread
 
-        try:
-            if len(workers) == 1:
-                run_worker(workers[0])
+            def run_worker_guarded(w) -> None:
+                try:
+                    run_worker(w)
+                except BaseException as exc:  # e.g. a channel publish failure
+                    fatal.append((w.worker_id, exc))
+
+            if len(live_workers) == 1:
+                run_worker(live_workers[0])
             else:
                 threads = [
                     threading.Thread(
@@ -847,7 +895,7 @@ def build_disagg_online_producer(
                         name=f"drive-{w.worker_id}",
                         daemon=True,
                     )
-                    for w in workers
+                    for w in live_workers
                 ]
                 for t in threads:
                     t.start()
@@ -855,11 +903,37 @@ def build_disagg_online_producer(
                     t.join()
             if fatal:
                 raise fatal[0][1]
-            stopped = should_stop is not None and should_stop()
-            if dead and not stopped and not pool_drained():
-                raise RuntimeError(
-                    f"all rollout workers exited with {len(dead)} dropped as "
-                    f"dead and prompts remaining — dead workers: {dead}"
+
+        try:
+            live_workers = list(workers)
+            for epoch in range(prompt_epochs):
+                if should_stop is not None and should_stop():
+                    break
+                ingest_epoch(epoch)
+                if not live_workers:
+                    raise RuntimeError(
+                        f"all rollout workers were already dropped before "
+                        f"epoch {epoch + 1}/{prompt_epochs} could run — "
+                        f"dead workers: {dead}"
+                    )
+                run_epoch_workers(live_workers)
+                stopped = should_stop is not None and should_stop()
+                live_workers = [w for w in live_workers if w.worker_id not in dead]
+                if dead and not stopped and not pool_drained():
+                    raise RuntimeError(
+                        f"all rollout workers exited with {len(dead)} dropped as "
+                        f"dead and prompts remaining — dead workers: {dead}"
+                    )
+                if stopped:
+                    break
+                st = controller.status()
+                producer_timing(
+                    "epoch drained "
+                    f"epoch={epoch + 1}/{prompt_epochs} "
+                    f"produced={state['produced']} "
+                    f"prompts_failed={st['prompts_failed']} "
+                    f"pending={st['prompts_pending']} leased={st['prompts_leased']} "
+                    f"elapsed={elapsed(drive_start)}"
                 )
             st = controller.status()
             if st["prompts_failed"]:
@@ -1255,6 +1329,7 @@ def build_disagg_online_runtime(
         in_flight_high_watermark=in_flight_high_watermark,
         metadata_store=shared_store,
         metadata_db_path=metadata_db_path,
+        prompt_epochs=num_epochs,
     )
     trainer, loader = build_disagg_online_consumer(
         strategy=strategy,
@@ -1266,7 +1341,7 @@ def build_disagg_online_runtime(
         output_dir=output_dir,
         batch_size=batch_size,
         accumulation_steps=accumulation_steps,
-        num_epochs=num_epochs,
+        num_epochs=1,
         max_steps=max_steps,
         total_steps=total_steps,
         save_interval=save_interval,
