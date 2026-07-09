@@ -114,12 +114,8 @@ def _add_dflash_loss_args(parser: argparse.ArgumentParser) -> None:
             "dpace-continuation-value-only",
         ],
         help=(
-<<<<<<< HEAD
             "Training objective. If omitted, reads dflash_config.training_mode or "
             "dflash_config.loss_type from the draft config, defaulting to dflash."
-=======
-            "Training objective for this DFlash-family entry point. "
->>>>>>> 87abca1 (support dspark training)
         ),
     )
 
@@ -135,34 +131,7 @@ def _add_dflash_loss_args(parser: argparse.ArgumentParser) -> None:
         "--dpace-alpha",
         type=float,
         default=0.5,
-<<<<<<< HEAD
-        help="Smoothing alpha for D-PACE position weights.",
-    )
-    model_group.add_argument(
-        "--prefix-weight-base",
-        type=float,
-        default=None,
-        help=(
-            "VP-Drafter prefix length sampling base. Values below 1 prefer shorter "
-            "visible prefixes; defaults to dflash_config.prefix_weight_base or 0.9."
-        ),
-    )
-    model_group.add_argument(
-        "--embedding-key",
-        type=str,
-        default=None,
-        help="Embedding weight key in the target model. "
-        "Default: 'model.embed_tokens.weight' for standard models, "
-        "'model.language_model.embed_tokens.weight' for multimodal models like Qwen3.5-A3B.",
-    )
-    model_group.add_argument(
-        "--lm-head-key",
-        type=str,
-        default=None,
-        help="LM head weight key in the target model. Default: 'lm_head.weight'.",
-=======
         help="Smoothing alpha for D-PACE objectives.",
->>>>>>> 87abca1 (support dspark training)
     )
 
 

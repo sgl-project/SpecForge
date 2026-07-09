@@ -132,9 +132,9 @@ class _DualFixedHead(nn.Module):
         if hidden_states.ndim == 4:
             return self.target_logits.to(device=hidden_states.device)
         bsz, n_blocks, block_size, vocab_size = self.draft_logits.shape
-        return self.draft_logits.reshape(
-            bsz, n_blocks * block_size, vocab_size
-        ).to(device=hidden_states.device)
+        return self.draft_logits.reshape(bsz, n_blocks * block_size, vocab_size).to(
+            device=hidden_states.device
+        )
 
 
 def _fixed_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
@@ -540,9 +540,7 @@ class TestDFlashLosses(unittest.TestCase):
             self.logits.shape[2],
         )
         weights = eval_mask.double()
-        ce = (_neg_log_q(self.logits, targets) * weights).sum() / (
-            weights.sum() + 1e-6
-        )
+        ce = (_neg_log_q(self.logits, targets) * weights).sum() / (weights.sum() + 1e-6)
         draft_probs = torch.softmax(self.logits.float(), dim=-1)
         target_probs = torch.softmax(target_logits.float(), dim=-1)
         l1_dist = (draft_probs - target_probs).abs().sum(dim=-1).double()
