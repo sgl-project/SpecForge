@@ -256,6 +256,60 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         }
 
 
+class DSparkTrainStrategy(DraftTrainStrategy):
+    """DSpark strategy over DFlash with target hidden-state supervision."""
+
+    name = "dspark"
+    required_features = {
+        "input_ids",
+        "hidden_states",
+        "loss_mask",
+        "target_last_hidden_states",
+    }
+
+    def __init__(self, dspark_model: nn.Module) -> None:
+        self.dspark_model = dspark_model
+
+    def trainable_module(self) -> nn.Module:
+        return self.dspark_model
+
+    def _device(self) -> torch.device:
+        return next(self.dspark_model.parameters()).device
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        self.validate_batch(batch)
+        t = batch.tensors
+        device = self._device()
+        loss, accuracy, model_metrics = self.dspark_model(
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
+            target_last_hidden_states=t["target_last_hidden_states"].to(device),
+        )
+        metrics = {
+            "accuracy": accuracy.detach(),
+            "accuracy_denom": model_metrics["accuracy_denom"],
+        }
+        for name in (
+            "ce_loss",
+            "l1_loss",
+            "confidence_loss",
+            "confidence_abs_error",
+        ):
+            if name in model_metrics:
+                metrics[name] = model_metrics[name]
+        return StepOutput(loss=loss, metrics=metrics)
+
+    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            k.replace("draft_model.", ""): v
+            for k, v in state_dict.items()
+            if "draft_model." in k
+        }
+
+
 class DominoTrainStrategy(DraftTrainStrategy):
     """Domino block-parallel strategy wrapping ``OnlineDominoModel``.
 
@@ -329,6 +383,7 @@ __all__ = [
     "DraftTrainStrategy",
     "Eagle3TrainStrategy",
     "DFlashTrainStrategy",
+    "DSparkTrainStrategy",
     "DominoTrainStrategy",
     "StepOutput",
     "StepContext",

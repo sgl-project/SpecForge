@@ -117,6 +117,17 @@ register_server_capture_schema(
         ),
     )
 )
+register_server_capture_schema(
+    ServerCaptureSchema(
+        strategy="dspark",
+        aux_feature="hidden_states",
+        last_hidden_feature="target_last_hidden_states",
+        passthrough=(
+            ("input_ids", "input_ids", ()),
+            ("loss_mask", "loss_mask", ()),
+        ),
+    )
+)
 
 
 @dataclass(frozen=True)

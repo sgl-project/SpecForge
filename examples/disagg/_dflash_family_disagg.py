@@ -212,7 +212,13 @@ def build_producer_prompts(args, tokenizer, *, max_prompts: int = 0):
     return prompts
 
 
-def run_server_capture_producer(strategy: str, args, run_id: str) -> None:
+def run_server_capture_producer(
+    strategy: str,
+    args,
+    run_id: str,
+    *,
+    target_repr=None,
+) -> None:
     total_start = time.perf_counter()
     log_event("producer-timing", f"run_producer start run_id={run_id}")
 
@@ -272,6 +278,7 @@ def run_server_capture_producer(strategy: str, args, run_id: str) -> None:
 
     phase = time.perf_counter()
     log_event("producer-timing", "build_disagg_online_producer start")
+    prompt_epochs = max(1, int(args.num_epochs))
     _workers, drive_producer = build_disagg_online_producer(
         strategy=strategy,
         feature_source=adapters if len(adapters) > 1 else adapters[0],
@@ -280,8 +287,9 @@ def run_server_capture_producer(strategy: str, args, run_id: str) -> None:
         channel=channel,
         run_id=run_id,
         target_hidden_size=capture_cfg.target_hidden_size,
-        target_repr=None,
+        target_repr=target_repr,
         aux_hidden_state_layer_ids=capture_cfg.aux_layer_ids,
+        prompt_epochs=prompt_epochs,
     )
     log_event(
         "producer-timing",
@@ -443,7 +451,11 @@ def fit_online_consumer(
     max_steps = env_int("DISAGG_MAX_STEPS", 0) or None
     total_steps = env_int("DISAGG_TOTAL_STEPS", 0) or max_steps or 10_000
 
-    print(f"[consumer] training from mooncake://{run_id}", flush=True)
+    print(
+        f"[consumer] training from mooncake://{run_id} "
+        f"(producer-looped epochs={args.num_epochs})",
+        flush=True,
+    )
     trainer, loader = build_disagg_online_consumer(
         strategy=strategy,
         feature_store=mooncake_store(run_id),
@@ -454,7 +466,7 @@ def fit_online_consumer(
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         accumulation_steps=args.accumulation_steps,
-        num_epochs=args.num_epochs,
+        num_epochs=1,
         max_steps=max_steps,
         total_steps=total_steps,
         save_interval=args.save_interval,
