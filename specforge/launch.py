@@ -717,6 +717,21 @@ def build_disagg_online_producer(
             return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
 
         def run_worker(w) -> None:
+            import os as _os
+
+            # PROFILE_PRODUCER=N -> every N rounds print one [prod] line
+            # splitting the round into backpressure-park / run_once / publish.
+            _prof = int(_os.environ.get("PROFILE_PRODUCER", "0"))
+            _ps = {
+                "rounds": 0,
+                "refs": 0,
+                "bp": 0.0,
+                "once": 0.0,
+                "pub": 0.0,
+                "t0": time.monotonic(),
+                "infl": 0,
+                "infl_max": 0,
+            }
             failures = 0
             last_backpressure_log = 0.0
             for _ in range(max_rounds):
@@ -742,6 +757,12 @@ def build_disagg_online_producer(
                     if should_stop is not None and should_stop():
                         return
                     sleep(backpressure_poll_s)
+                    _infl = channel.in_flight_remote()
+                if _prof:
+                    _ps["bp"] += time.monotonic() - _t
+                    _ps["infl"] = _infl
+                    _ps["infl_max"] = max(_ps["infl_max"], _infl)
+                _t = time.monotonic()
                 try:
                     run_once_start = time.perf_counter()
                     refs = w.run_once(max_tasks=lease)
@@ -769,7 +790,10 @@ def build_disagg_online_producer(
                     sleep(backpressure_poll_s)
                     continue
                 failures = 0
+                if _prof:
+                    _ps["once"] += time.monotonic() - _t
                 if refs:
+                    _t = time.monotonic()
                     with publish_lock:
                         channel.publish_many(refs)
                         state["produced"] += len(refs)
