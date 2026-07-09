@@ -620,18 +620,47 @@ def build_disagg_online_producer(
     watermark can overshoot by up to N * lease (each worker checks it
     independently before leasing).
     """
+    import os
     import threading
     import time
 
+    def producer_timing(message: str) -> None:
+        print(
+            f"[producer-timing] {time.strftime('%Y-%m-%d %H:%M:%S')} {message}",
+            flush=True,
+        )
+
+    def elapsed(start: float) -> str:
+        return f"{time.perf_counter() - start:.3f}s"
+
     spec = resolve_strategy(strategy)
     sleep = sleep or time.sleep
+    build_start = time.perf_counter()
+    prompt_count = len(prompts) if hasattr(prompts, "__len__") else "unknown"
+    producer_timing(
+        "build_disagg_online_producer enter "
+        f"strategy={strategy} prompts={prompt_count} lease={lease} "
+        f"workers={num_rollout_workers} watermark={in_flight_high_watermark}"
+    )
+    phase = time.perf_counter()
     controller = DataFlowController(
         run_id,
         metadata_store=_resolve_metadata_store(metadata_store, metadata_db_path),
         max_prompt_attempts=max_prompt_attempts,
     )
-    controller.ingest_prompts(prompts)
+    producer_timing(f"DataFlowController created elapsed={elapsed(phase)}")
+    phase = time.perf_counter()
+    producer_timing(f"controller.ingest_prompts start prompts={prompt_count}")
+    task_ids = controller.ingest_prompts(prompts)
+    status = controller.status()
+    producer_timing(
+        "controller.ingest_prompts done "
+        f"tasks={len(task_ids)} pending={status['prompts_pending']} "
+        f"elapsed={elapsed(phase)}"
+    )
 
+    phase = time.perf_counter()
+    producer_timing("assemble rollout workers start")
     workers = _assemble_rollout_workers(
         spec=spec,
         target_model=target_model,
@@ -649,6 +678,11 @@ def build_disagg_online_producer(
         num_rollout_workers=num_rollout_workers,
         device=device,
     )
+    producer_timing(
+        "assemble rollout workers done "
+        f"workers={len(workers)} elapsed={elapsed(phase)} "
+        f"total_build_elapsed={elapsed(build_start)}"
+    )
 
     def drive_producer(max_rounds: int = 1_000_000, should_stop=None) -> int:
         """Drive all workers until the pool drains; returns refs published.
@@ -658,10 +692,22 @@ def build_disagg_online_producer(
         The controller and feature store are lock-protected; the channel is
         not, so publishes serialize through ``publish_lock``.
         """
+        drive_start = time.perf_counter()
+        progress_interval = float(
+            os.environ.get("DISAGG_PRODUCER_PROGRESS_INTERVAL", 30.0)
+        )
+        producer_timing(
+            "drive_producer enter "
+            f"workers={len(workers)} lease={lease} max_rounds={max_rounds} "
+            f"watermark={in_flight_high_watermark} "
+            f"progress_interval={progress_interval}"
+        )
         for w in workers:
+            producer_timing(f"rollout worker start worker_id={w.worker_id}")
             w.start()
         publish_lock = threading.Lock()
-        state = {"produced": 0}
+        state = {"produced": 0, "first_ref_logged": False}
+        last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
 
         def pool_drained() -> bool:
@@ -672,15 +718,32 @@ def build_disagg_online_producer(
 
         def run_worker(w) -> None:
             failures = 0
+            last_backpressure_log = 0.0
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
                     return
                 # backpressure: in_flight = published - consumer-acked
                 while channel.in_flight_remote() >= in_flight_high_watermark:
+                    now = time.perf_counter()
+                    if (
+                        progress_interval > 0
+                        and now - last_backpressure_log >= progress_interval
+                    ):
+                        st = controller.status()
+                        producer_timing(
+                            "backpressure wait "
+                            f"worker={w.worker_id} produced={state['produced']} "
+                            f"in_flight={channel.in_flight_remote()} "
+                            f"pending={st['prompts_pending']} "
+                            f"leased={st['prompts_leased']} "
+                            f"elapsed={elapsed(drive_start)}"
+                        )
+                        last_backpressure_log = now
                     if should_stop is not None and should_stop():
                         return
                     sleep(backpressure_poll_s)
                 try:
+                    run_once_start = time.perf_counter()
                     refs = w.run_once(max_tasks=lease)
                 except Exception as exc:
                     # the worker already failed its leases retryable; peers
@@ -710,7 +773,31 @@ def build_disagg_online_producer(
                     with publish_lock:
                         channel.publish_many(refs)
                         state["produced"] += len(refs)
+                        now = time.perf_counter()
+                        should_log = not state["first_ref_logged"]
+                        should_log = should_log or (
+                            progress_interval > 0
+                            and now - last_publish_log["t"] >= progress_interval
+                        )
+                        if should_log:
+                            st = controller.status()
+                            producer_timing(
+                                "published refs "
+                                f"worker={w.worker_id} batch={len(refs)} "
+                                f"produced={state['produced']} "
+                                f"in_flight={channel.in_flight_remote()} "
+                                f"pending={st['prompts_pending']} "
+                                f"leased={st['prompts_leased']} "
+                                f"run_once_elapsed={elapsed(run_once_start)} "
+                                f"elapsed={elapsed(drive_start)}"
+                            )
+                            state["first_ref_logged"] = True
+                            last_publish_log["t"] = now
                 elif pool_drained():
+                    producer_timing(
+                        f"pool drained worker={w.worker_id} produced={state['produced']} "
+                        f"elapsed={elapsed(drive_start)}"
+                    )
                     return
                 else:
                     # leased nothing: peers hold the remaining prompts (their
@@ -757,8 +844,18 @@ def build_disagg_online_producer(
                     "(see controller status for reasons)",
                     st["prompts_failed"],
                 )
+            producer_timing(
+                "drive_producer returning "
+                f"produced={state['produced']} prompts_failed={st['prompts_failed']} "
+                f"pending={st['prompts_pending']} leased={st['prompts_leased']} "
+                f"elapsed={elapsed(drive_start)}"
+            )
             return state["produced"]
         finally:
+            producer_timing(
+                f"drive_producer closing channel produced={state['produced']} "
+                f"elapsed={elapsed(drive_start)}"
+            )
             channel.close()  # EOF -> the consumer's loader terminates once drained
 
     return workers, drive_producer
