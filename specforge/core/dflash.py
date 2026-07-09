@@ -18,6 +18,20 @@ except ImportError:
     BlockMask = None
     create_block_mask = None
 
+# NPU workaround: flex_attention is not available on Ascend NPU.
+if hasattr(torch, "npu") and torch.npu.is_available():
+    FLEX_ATTENTION_AVAILABLE = False
+
+
+_VALID_LOSS_TYPES = {
+    "dflash",
+    "vp_drafter",
+    "dpace",
+    "dpace-cumulative-confidence-only",
+    "dpace-continuation-value-only",
+}
+_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash", "vp_drafter"}
+
 
 def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
     B, N = anchor_positions.shape
@@ -94,7 +108,7 @@ def create_dflash_block_mask(
 
 
 class OnlineDFlashModel(nn.Module):
-    """DFlash online training wrapper with block-wise CE loss."""
+    """DFlash online training wrapper with DFlash and D-PACE losses."""
 
     def __init__(
         self,
@@ -106,8 +120,24 @@ class OnlineDFlashModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
+        prefix_weight_base: float = 0.9,
     ):
         super().__init__()
+        if loss_type not in _VALID_LOSS_TYPES:
+            raise ValueError(
+                f"loss_type={loss_type!r}; must be one of {sorted(_VALID_LOSS_TYPES)}"
+            )
+        if not 0.0 <= dpace_alpha <= 1.0:
+            raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        if prefix_weight_base is None:
+            prefix_weight_base = 0.9
+        if prefix_weight_base <= 0.0:
+            raise ValueError(
+                f"prefix_weight_base must be positive, got {prefix_weight_base}"
+            )
+
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
@@ -116,6 +146,9 @@ class OnlineDFlashModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.loss_type = loss_type
+        self.dpace_alpha = dpace_alpha
+        self.prefix_weight_base = prefix_weight_base
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -158,6 +191,33 @@ class OnlineDFlashModel(nn.Module):
         )
 
         return anchors, keep_mask
+
+    def _sample_prefix_lengths(
+        self, bsz: int, n_blocks: int, device: torch.device
+    ) -> torch.Tensor:
+        """Sample visible prefix lengths for VP-Drafter training.
+
+        A prefix length i means block positions [0, i) are visible real tokens and
+        positions [i, block_size) are masked prediction targets. The sampled
+        range follows D2SD's variable-prefix recipe while avoiding the degenerate
+        fixed-anchor DFlash case.
+        """
+        min_prefix = min(2, self.block_size - 1)
+        max_prefix = self.block_size - 1
+        if max_prefix <= min_prefix:
+            return torch.full(
+                (bsz, n_blocks), min_prefix, dtype=torch.long, device=device
+            )
+
+        prefix_ids = torch.arange(min_prefix, max_prefix + 1, device=device)
+        weights = torch.pow(
+            torch.full_like(prefix_ids, self.prefix_weight_base, dtype=torch.float32),
+            prefix_ids.float(),
+        )
+        samples = torch.multinomial(
+            weights, num_samples=bsz * n_blocks, replacement=True
+        ).reshape(bsz, n_blocks)
+        return samples + min_prefix
 
     def prepare_noise_input(
         self, input_ids: torch.Tensor, block_ids: Optional[torch.Tensor] = None
@@ -211,6 +271,68 @@ class OnlineDFlashModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
+    def _create_vp_noise_embed(
+        self,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        prefix_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prepare VP-Drafter inputs with variable visible prefixes."""
+        bsz, seq_len = input_ids.shape
+        n = anchor_positions.shape[1]
+        bs = self.block_size
+        device = input_ids.device
+
+        offsets = torch.arange(bs, device=device).view(1, 1, -1)
+        token_positions = anchor_positions.unsqueeze(-1) + offsets
+        safe_positions = token_positions.clamp(0, seq_len - 1)
+
+        real_tokens = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, n, -1),
+            2,
+            safe_positions,
+        )
+        visible_prefix = offsets < prefix_lengths.unsqueeze(-1)
+        valid_positions = token_positions < seq_len
+        fill_mask = visible_prefix & block_keep_mask.unsqueeze(-1) & valid_positions
+
+        mask_tokens = torch.full_like(real_tokens, self.mask_token_id)
+        noise_ids = torch.where(fill_mask, real_tokens, mask_tokens)
+        return self.embed_tokens(noise_ids.reshape(bsz, n * bs))
+
+    def _dpace_weight(
+        self,
+        prob: torch.Tensor,
+        binary_mask: torch.Tensor,
+        binary_mask_b: torch.Tensor,
+        loss_type: str,
+    ) -> torch.Tensor:
+        """Compute detached D-PACE position weights.
+
+        ``prob`` is the draft probability on the target token at each draft
+        position. Invalid positions are treated as multiplicative no-ops inside
+        prefix products and excluded from suffix sums; the caller still
+        multiplies the returned weights by ``binary_mask`` before reduction.
+        """
+        smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
+        smooth = torch.where(binary_mask_b, smooth, torch.ones_like(smooth))
+        prefix = torch.cumprod(smooth, dim=-1)
+
+        if loss_type == "dpace-cumulative-confidence-only":
+            return prefix
+
+        suffix = torch.flip(
+            torch.cumsum(torch.flip(prefix * binary_mask, dims=[-1]), dim=-1),
+            dims=[-1],
+        )
+
+        if loss_type == "dpace":
+            return suffix
+        if loss_type == "dpace-continuation-value-only":
+            return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
+        raise ValueError(f"unknown D-PACE loss_type {loss_type!r}")
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -218,6 +340,10 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
+        if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
+            raise ValueError(
+                "flex_attention is not available on this device; use sdpa/eager."
+            )
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -225,9 +351,18 @@ class OnlineDFlashModel(nn.Module):
             seq_len, loss_mask, device
         )
 
-        noise_embedding = self._create_noise_embed(
-            input_ids, anchor_positions, block_keep_mask
-        )
+        prefix_lengths = None
+        if self.loss_type == "vp_drafter":
+            prefix_lengths = self._sample_prefix_lengths(
+                bsz, anchor_positions.shape[1], device
+            )
+            noise_embedding = self._create_vp_noise_embed(
+                input_ids, anchor_positions, block_keep_mask, prefix_lengths
+            )
+        else:
+            noise_embedding = self._create_noise_embed(
+                input_ids, anchor_positions, block_keep_mask
+            )
 
         context_position_ids = (
             torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
@@ -280,7 +415,12 @@ class OnlineDFlashModel(nn.Module):
         weight_mask = weight_mask * valid_label_mask.float()
 
         pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        weight_mask = weight_mask * (pos_in_block > 0).float()
+        if self.loss_type == "vp_drafter":
+            weight_mask = (
+                weight_mask * (pos_in_block >= prefix_lengths.unsqueeze(-1)).float()
+            )
+        else:
+            weight_mask = weight_mask * (pos_in_block > 0).float()
 
         original_loss_mask_gathered = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
@@ -291,22 +431,52 @@ class OnlineDFlashModel(nn.Module):
 
         binary_eval_mask = weight_mask.view(-1)
 
-        # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
-            )
-            weight_mask = weight_mask * decay_weights
-
         # --- Cross entropy ---
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+
+        if self.loss_type == "dflash":
+            # Preserve the existing DFlash weighted-mean behavior.
+            loss_weights = weight_mask
+            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+                k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+                decay_weights = torch.exp(
+                    -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
+                )
+                loss_weights = loss_weights * decay_weights
+
+            flat_weights = loss_weights.view(-1)
+            valid_token_count = flat_weights.sum() + 1e-6
+            loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        elif self.loss_type == "vp_drafter":
+            loss_weights = weight_mask
+            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+                k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+                effective_pos = (
+                    k.float() - prefix_lengths.unsqueeze(-1).float()
+                ).clamp(min=0)
+                decay_weights = torch.exp(-effective_pos / self.loss_decay_gamma)
+                loss_weights = loss_weights * decay_weights
+
+            flat_weights = loss_weights.view(-1)
+            valid_token_count = flat_weights.sum() + 1e-6
+            loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        elif self.loss_type in _DPACE_LOSS_TYPES:
+            neg_log_q = loss_per_token.view_as(target_ids)
+            with torch.no_grad():
+                q = torch.exp(-neg_log_q)
+                dpace_weights = self._dpace_weight(
+                    q,
+                    weight_mask,
+                    weight_mask > 0,
+                    self.loss_type,
+                )
+            loss_weights = weight_mask * dpace_weights
+            loss = (neg_log_q * loss_weights).sum() / float(bsz)
+        else:
+            raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
         # --- Accuracy ---
         with torch.no_grad():

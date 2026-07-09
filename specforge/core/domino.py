@@ -8,11 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.core.dflash import (
+    FLEX_ATTENTION_AVAILABLE,
     BlockMask,
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.utils import get_device_type
 
 
 def compute_accept_len(
@@ -59,6 +61,32 @@ class OnlineDominoModel(nn.Module):
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+        if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
+            raise ValueError(
+                "flex_attention is not available on this device; use sdpa/eager."
+            )
+
+        # NPU workaround: pre-create a float16 GRU module since Ascend
+        # DynamicGRU does not support bfloat16.
+        # Use object.__setattr__ to avoid registering it as a submodule,
+        # otherwise FSDP will complain about mixed dtypes (bfloat16 + float16).
+        gru_fp16 = None
+        if get_device_type() == "npu":
+            prefix_gru = draft_model.prefix_gru
+            gru_fp16 = nn.GRU(
+                input_size=prefix_gru.weight_ih_l0.shape[1],
+                hidden_size=prefix_gru.hidden_size,
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            gru_fp16.to(
+                device=next(prefix_gru.parameters()).device, dtype=torch.float16
+            )
+            gru_fp16.weight_ih_l0.requires_grad = False
+            gru_fp16.weight_hh_l0.requires_grad = False
+        object.__setattr__(self, "_gru_fp16", gru_fp16)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -179,6 +207,23 @@ class OnlineDominoModel(nn.Module):
 
         return hidden4d, prev_ids
 
+    def _run_gru(self, gru_inputs: torch.Tensor) -> torch.Tensor:
+        """Run GRU with NPU-compatible dtype.
+
+        Ascend NPU DynamicGRU does not support bfloat16; use the pre-created
+        float16 GRU module and cast outputs back to the original dtype.
+        """
+        if self._gru_fp16 is not None and gru_inputs.dtype == torch.bfloat16:
+            self._gru_fp16.weight_ih_l0.data.copy_(
+                self.draft_model.prefix_gru.weight_ih_l0.data.half()
+            )
+            self._gru_fp16.weight_hh_l0.data.copy_(
+                self.draft_model.prefix_gru.weight_hh_l0.data.half()
+            )
+            out = self._gru_fp16(gru_inputs.half())[0]
+            return out.to(gru_inputs.dtype)
+        return self.draft_model.prefix_gru(gru_inputs)[0]
+
     def _apply_domino_head(
         self,
         base_logits4d: torch.Tensor,
@@ -191,13 +236,13 @@ class OnlineDominoModel(nn.Module):
         if self.shift_label:
             block_emb = self.embed_tokens(prev_ids)
             gru_inputs = block_emb.reshape(bsz * n, bs, -1)
-            gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
+            gru_out = self._run_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs, -1)
             prefix_states = gru_out[:, :, self._suffix_start :, :]
         else:
             block_emb = self.embed_tokens(target_ids)
             gru_inputs = block_emb[:, :, : bs - 1, :].reshape(bsz * n, bs - 1, -1)
-            gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
+            gru_out = self._run_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs - 1, -1)
             prefix_states = gru_out[:, :, self._suffix_start - 1 :, :]
         z_n = hidden4d[:, :, self._suffix_start :, :]

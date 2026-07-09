@@ -306,6 +306,7 @@ def build_eagle3_dataset(
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
+    minimum_valid_tokens: Optional[int] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -333,10 +334,14 @@ def build_eagle3_dataset(
                         If False, expects "conversations" column with ShareGPT format.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
                              Useful for thinking models where history may not contain thoughts.
+        minimum_valid_tokens: If set, drops samples with fewer trainable tokens.
 
     Returns:
         The processed HF dataset.
     """
+    if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
+        raise ValueError("minimum_valid_tokens must be >= 0")
+
     if is_vlm:
         assert processor is not None, "processor must be provided when is_vlm is True"
 
@@ -459,6 +464,30 @@ def build_eagle3_dataset(
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
+
+    if minimum_valid_tokens is not None:
+        before_filter = len(dataset)
+
+        def has_minimum_valid_tokens(example):
+            loss_mask = example["loss_mask"]
+            if isinstance(loss_mask, torch.Tensor):
+                valid_tokens = int(loss_mask.sum().item())
+            else:
+                valid_tokens = sum(
+                    int(token)
+                    for row in loss_mask
+                    for token in (row if isinstance(row, list) else [row])
+                )
+            return valid_tokens >= minimum_valid_tokens
+
+        dataset = dataset.filter(
+            has_minimum_valid_tokens,
+            num_proc=num_proc,
+            desc=f"Filtering samples with >= {minimum_valid_tokens} trainable tokens",
+        )
+        print(
+            f"Filtered dataset by trainable tokens: {before_filter} -> {len(dataset)}"
+        )
 
     dataset.set_format(type="torch")
     return dataset
@@ -601,13 +630,15 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["attention_mask"] = attention_mask
 
         # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Local seq_len (per sp_rank) = local_len; attention uses (local_len - ttt_length).
+        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
+        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size
-        ring_start = ring_rank * ring_chunk
+        ulysses_rank = sp_rank % sp_ulysses_size
+        ring_start = ring_rank * ring_chunk + ulysses_rank * usp_chunk_size
         new_data["position_ids"] = torch.arange(
-            ring_start, ring_start + ring_chunk, dtype=torch.long
+            ring_start, ring_start + usp_chunk_size, dtype=torch.long
         ).unsqueeze(0)
 
         if transform:
