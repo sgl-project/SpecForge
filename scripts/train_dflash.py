@@ -111,9 +111,7 @@ def _add_dflash_loss_args(parser: argparse.ArgumentParser) -> None:
             "dpace-cumulative-confidence-only",
             "dpace-continuation-value-only",
         ],
-        help=(
-            "Training objective for this DFlash-family entry point. "
-        ),
+        help=("Training objective for this DFlash-family entry point. "),
     )
 
     loss_group.add_argument(

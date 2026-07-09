@@ -154,6 +154,40 @@ train step, with aux parity vs an HF reference) in
 (`SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1`, GPU); the contract/ref/adapter logic is
 covered on CPU in `tests/test_runtime/test_server_capture.py`.
 
+## Run it (two physical nodes with RCLI)
+
+`run_qwen3_8b_dflash_disagg_2node.sh` separates the online Qwen3-8B workload by
+role: node rank 0 runs Mooncake, one TP=1 capture server, and the CPU producer;
+node rank 1 runs the DP=4 consumer/trainer. The two nodes exchange feature
+tensors through Mooncake. A shared filesystem is still required for the small
+ref channel, logs, and lifecycle markers under `DISAGG_RUN_ROOT`.
+
+Create a unique run ID and start one detached session per rank with identical
+environment settings (replace the job, repository, and dataset paths):
+
+```bash
+JOB=your-two-node-job
+RUN_ID=qwen3-8b-dflash-$(date +%Y%m%d-%H%M%S)
+REMOTE_ROOT=/workspace/SpecForge
+DATA_PATH=/workspace/data/perfectblend_train.jsonl
+REMOTE_CMD="cd $REMOTE_ROOT && DISAGG_STORE_ID=$RUN_ID TRAIN_DP=4 REPORT_TO=none TRAIN_DATA_PATH=$DATA_PATH bash examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh"
+
+rcli exec -d --node-rank 0 --name dflash-inference "$JOB" "$REMOTE_CMD"
+rcli exec -d --node-rank 1 --name dflash-training "$JOB" "$REMOTE_CMD"
+```
+
+The job scheduler must place the two pods on different physical hosts;
+`--num-nodes 2` alone does not guarantee this, so verify physical placement
+before launching. Both pods must share the repository/output path and have
+direct network reachability for the Mooncake and SGLang ports. The launcher
+consumes Kubernetes GPU UUIDs from `NVIDIA_VISIBLE_DEVICES`; override
+`SERVER_GPUS`, `CONSUMER_GPUS`, or `TRAIN_DP` for other allocations. A
+`CONSUMER_GPUS` override must list exactly `TRAIN_DP` devices. The tested
+topology allocates four GPUs per pod, uses one GPU on rank 0, and trains DP=4 on
+rank 1. Set `REPORT_TO=wandb` and the usual W&B variables to enable remote
+reporting. `DISAGG_IDLE_TIMEOUT` defaults to 600 seconds so a lost inference
+pod cannot leave the consumer blocked forever.
+
 ## Multi-server (scale the inference pool)
 
 ```bash
