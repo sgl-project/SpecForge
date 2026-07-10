@@ -266,6 +266,19 @@ def build_parser() -> ArgumentParser:
     other_group = parser.add_argument_group("others")
     other_group.add_argument("--cache-key", type=str, default=None)
     other_group.add_argument("--cache-dir", type=str, default="./cache")
+    other_group.add_argument(
+        "--vocab-mapping-path",
+        type=str,
+        default=None,
+        help=(
+            "Use this existing vocab mapping file instead of generating one "
+            "from the dataset. The generated mapping is keyed on max-length "
+            "(among others), so resuming a checkpoint under a different "
+            "max-length would silently regenerate a shifted d2t/t2d and "
+            "scramble the head's learned vocabulary. Pin the original mapping "
+            "when resuming with changed dataset parameters."
+        ),
+    )
     other_group.add_argument("--output-dir", type=str, required=True)
     other_group.add_argument("--verbose", action="store_true")
     other_group.add_argument(
@@ -600,13 +613,21 @@ def build_dataloaders(
             num_proc=args.build_dataset_num_proc,
             train_only_last_turn=args.train_only_last_turn,
         )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=vocab_cache_key,
-        )
+        if args.vocab_mapping_path:
+            if not os.path.isfile(args.vocab_mapping_path):
+                raise FileNotFoundError(
+                    f"--vocab-mapping-path {args.vocab_mapping_path} does not exist"
+                )
+            vocab_mapping_path = args.vocab_mapping_path
+            print_on_rank0(f"Using pinned vocab mapping: {vocab_mapping_path}")
+        else:
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=vocab_cache_key,
+            )
 
         if not is_online:
             train_eagle3_dataset = build_offline_eagle3_dataset(
