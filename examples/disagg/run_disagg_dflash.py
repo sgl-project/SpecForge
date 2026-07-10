@@ -157,9 +157,12 @@ def _producer_prompts(args, tokenizer):
     return prompts
 
 
-def _resolve_mask_token(args, tokenizer) -> int:
+def _resolve_mask_token(args, tokenizer, draft_model=None) -> int:
     if args.mask_token_id is not None:
         return args.mask_token_id
+    draft_config = getattr(getattr(draft_model, "config", None), "dflash_config", {})
+    if draft_config and draft_config.get("mask_token_id") is not None:
+        return draft_config["mask_token_id"]
     if tokenizer.mask_token_id is not None:
         return tokenizer.mask_token_id
     tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
@@ -233,7 +236,7 @@ def run_consumer(args) -> None:
     """Training pool: train the DFlash draft off Mooncake + the ref channel."""
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     _target_unused, draft_model = build_models(args)
-    mask_token_id = _resolve_mask_token(args, tokenizer)
+    mask_token_id = _resolve_mask_token(args, tokenizer, draft_model)
     draft_model.mask_token_id = mask_token_id
     draft_model.config.dflash_config["mask_token_id"] = mask_token_id
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids

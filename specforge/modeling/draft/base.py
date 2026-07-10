@@ -110,16 +110,20 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
     @property
     def all_tied_weights_keys(self) -> dict:
-        """Compat shim: newer transformers' from_pretrained finalize path reads
-        this unconditionally, and older transformers don't define it on
-        PreTrainedModel. Draft models never tie weights (tie_word_embeddings is
-        forced False by AutoDraftModelConfig), so this is normally empty."""
+        """Bridge Transformers versions that materialize tied keys at post-init."""
+        initialized = getattr(self, "_all_tied_weights_keys", None)
+        if initialized is not None:
+            return initialized
         tied = getattr(self, "_tied_weights_keys", None)
         if not tied:
             return {}
         if isinstance(tied, dict):
             return tied
-        return {k: k for k in tied}
+        return {key: key for key in tied}
+
+    @all_tied_weights_keys.setter
+    def all_tied_weights_keys(self, value: dict) -> None:
+        self._all_tied_weights_keys = value
 
     def freeze_embedding(self) -> None:
         """

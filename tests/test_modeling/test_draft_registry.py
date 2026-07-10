@@ -18,6 +18,7 @@ from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlashDraftModel,
     LlamaForCausalLMEagle3,
+    PEagleDraftModel,
     available_drafts,
     register_draft,
     resolve_draft,
@@ -50,6 +51,11 @@ TINY_DFLASH = {
     "vocab_size": 256,
 }
 
+TINY_PEAGLE = {
+    **TINY_EAGLE3,
+    "architectures": ["PEagleDraftModel"],
+}
+
 
 def _write(cfg: dict) -> str:
     fd, path = tempfile.mkstemp(suffix=".json")
@@ -62,8 +68,10 @@ class DraftRegistryTest(unittest.TestCase):
     def test_builtin_architectures_registered(self):
         self.assertIn("LlamaForCausalLMEagle3", available_drafts())
         self.assertIn("DFlashDraftModel", available_drafts())
+        self.assertIn("PEagleDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
+        self.assertIs(resolve_draft("PEagleDraftModel"), PEagleDraftModel)
 
     def test_unknown_architecture_raises_with_available_list(self):
         with self.assertRaises(KeyError) as ctx:
@@ -124,6 +132,22 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         model = AutoEagle3DraftModel.from_config(config)
         self.assertIsInstance(model, LlamaForCausalLMEagle3)
 
+    def test_from_config_resolves_peagle_via_registry(self):
+        path = _write(TINY_PEAGLE)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        self.assertIsInstance(model, PEagleDraftModel)
+
+    def test_peagle_direct_save_reload(self):
+        path = _write(TINY_PEAGLE)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = PEagleDraftModel(config)
+        with tempfile.TemporaryDirectory() as output_dir:
+            model.save_pretrained(output_dir)
+            reloaded = PEagleDraftModel.from_pretrained(output_dir)
+        self.assertIsInstance(reloaded, PEagleDraftModel)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
