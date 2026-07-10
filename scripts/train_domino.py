@@ -22,14 +22,14 @@ from transformers import AutoConfig, AutoTokenizer
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
-from specforge.core.domino import OnlineDominoModel
+from specforge.core.dflash import OnlineDominoModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.inference.target_engine.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
 )
-from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.domino import DominoDraftModel
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -162,7 +162,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
+def build_models(args) -> Tuple[DFlashTargetModel, DominoDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
@@ -239,7 +239,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    draft_model = DominoDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -476,7 +476,7 @@ def main():
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DFlashDraftModel.from_pretrained(
+        loaded_model = DominoDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
