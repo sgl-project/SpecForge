@@ -203,52 +203,6 @@ class OnlineDFlashModel(nn.Module):
 
         return anchors, keep_mask
 
-    def _sample_prefix_lengths(
-        self, bsz: int, n_blocks: int, device: torch.device
-    ) -> torch.Tensor:
-        """Sample visible prefix lengths for VP-Drafter training.
-
-        A prefix length i means block positions [0, i) are visible real tokens and
-        positions [i, block_size) are masked prediction targets. The sampled
-        range follows D2SD's variable-prefix recipe while avoiding the degenerate
-        fixed-anchor DFlash case.
-        """
-        min_prefix = min(2, self.block_size - 1)
-        max_prefix = self.block_size - 1
-        if max_prefix <= min_prefix:
-            return torch.full(
-                (bsz, n_blocks), min_prefix, dtype=torch.long, device=device
-            )
-
-        prefix_ids = torch.arange(min_prefix, max_prefix + 1, device=device)
-        weights = torch.pow(
-            torch.full_like(prefix_ids, self.prefix_weight_base, dtype=torch.float32),
-            prefix_ids.float(),
-        )
-        samples = torch.multinomial(
-            weights, num_samples=bsz * n_blocks, replacement=True
-        ).reshape(bsz, n_blocks)
-        return samples + min_prefix
-
-    def prepare_noise_input(
-        self, input_ids: torch.Tensor, block_ids: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Prepare noise input: first token of each block is real, rest are MASK."""
-        bsz, seq_len = input_ids.shape
-        device = input_ids.device
-
-        if block_ids is not None:
-            is_block_start = torch.ones(bsz, seq_len, dtype=torch.bool, device=device)
-            is_block_start[:, 1:] = block_ids[:, 1:] != block_ids[:, :-1]
-        else:
-            positions = torch.arange(seq_len, device=device)
-            is_block_start = (positions % self.block_size) == 0
-            is_block_start = is_block_start.unsqueeze(0).expand(bsz, -1)
-
-        noise_input_ids = torch.full_like(input_ids, self.mask_token_id)
-        noise_input_ids[is_block_start] = input_ids[is_block_start]
-        return noise_input_ids
-
     def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
         """Create absolute position IDs for parallel draft blocks."""
         bsz, n_blocks = anchor_positions.shape
@@ -912,9 +866,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_mask: torch.Tensor,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz, seq_len = input_ids.shape
-        del bsz
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        seq_len = input_ids.shape[1]
         device = input_ids.device
         label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
             1, 1, -1
@@ -941,16 +894,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
         eval_mask = target_valid & (target_loss_mask > 0.5)
         eval_mask = eval_mask & block_keep_mask.unsqueeze(-1)
         eval_mask = eval_mask.to(torch.int32).cumprod(dim=-1).bool()
-        return target_ids, eval_mask, label_indices, safe_label_indices
+        return target_ids, eval_mask, safe_label_indices
 
     def _dspark_loss_weight_mask(
         self,
         eval_mask: torch.Tensor,
-        device: torch.device,
     ) -> torch.Tensor:
         loss_weight_mask = eval_mask.to(torch.float32)
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            positions = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            positions = torch.arange(
+                self.block_size, device=eval_mask.device
+            ).view(1, 1, -1)
             decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask
@@ -989,27 +943,28 @@ class OnlineDSparkModel(OnlineDFlashModel):
         confidence_pred: Optional[torch.Tensor],
         aligned_target_logits: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        device = draft_logits.device
         vocab_size = draft_logits.size(-1)
-        loss_weight_mask = self._dspark_loss_weight_mask(eval_mask, device)
+        loss_weight_mask = self._dspark_loss_weight_mask(eval_mask)
         flat_logits = draft_logits.reshape(-1, vocab_size)
         flat_targets = target_ids.reshape(-1)
         flat_weights = loss_weight_mask.reshape(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        ce_loss_num = (loss_per_token * flat_weights).sum()
         ce_loss_den = flat_weights.sum()
-        ce_loss = ce_loss_num / (ce_loss_den + 1e-6)
+        ce_loss = (loss_per_token * flat_weights).sum() / (ce_loss_den + 1e-6)
 
         l1_loss = ce_loss.new_zeros(())
         accept_rate_3d = None
-        if aligned_target_logits is not None:
+        needs_target_distribution = (
+            self.dspark_l1_loss_alpha > 0 or confidence_pred is not None
+        )
+        if aligned_target_logits is not None and needs_target_distribution:
             draft_probs = torch.softmax(draft_logits.float(), dim=-1)
             target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-            accept_rate_3d = 1.0 - 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)
+            l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
+            accept_rate_3d = 1.0 - 0.5 * l1_dist
             accept_rate_3d = accept_rate_3d.clamp_(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
-                l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
                 l1_loss = (l1_dist * loss_weight_mask).sum() / (ce_loss_den + 1e-6)
         elif self.dspark_l1_loss_alpha > 0 or self.dspark_confidence_head_alpha > 0:
             raise ValueError(
@@ -1077,7 +1032,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         (
             target_ids,
             eval_mask,
-            _label_indices,
             safe_label_indices,
         ) = self._build_dspark_labels_and_mask(
             input_ids=input_ids,
