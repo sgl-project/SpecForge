@@ -56,26 +56,7 @@ with patch.dict(
 ):
     _spec.loader.exec_module(_dflash_module)
 OnlineDFlashModel = _dflash_module.OnlineDFlashModel
-
-_spec_dspark = importlib.util.spec_from_file_location(
-    "specforge.core.dspark", REPO / "specforge" / "core" / "dspark.py"
-)
-_dspark_module = importlib.util.module_from_spec(_spec_dspark)
-
-with patch.dict(
-    sys.modules,
-    {
-        "specforge": _pkg_specforge,
-        "specforge.core": _pkg_core,
-        "specforge.core.dflash": _dflash_module,
-        "specforge.core.dspark": _dspark_module,
-        "specforge.modeling": _pkg_modeling,
-        "specforge.modeling.draft": _pkg_draft,
-        "specforge.modeling.draft.dflash": _stub_dflash_draft,
-    },
-):
-    _spec_dspark.loader.exec_module(_dspark_module)
-OnlineDSparkModel = _dspark_module.OnlineDSparkModel
+OnlineDSparkModel = _dflash_module.OnlineDSparkModel
 
 
 class _FixedDraft(nn.Module):
@@ -93,6 +74,14 @@ class _FixedDraft(nn.Module):
             device=noise_embedding.device,
         )
 
+    def apply_logits_head(self, base_logits, **kwargs):
+        del kwargs
+        return base_logits
+
+    def predict_confidence(self, hidden_states, prev_token_ids=None):
+        del hidden_states, prev_token_ids
+        return None
+
 
 class _FixedDSparkDraft(_FixedDraft):
     def __init__(self, hidden_size: int, confidence_logits: torch.Tensor = None):
@@ -102,7 +91,7 @@ class _FixedDSparkDraft(_FixedDraft):
         else:
             self.confidence_logits = None
 
-    def apply_markov_logits(self, base_logits, prev_token_ids, hidden_states):
+    def apply_logits_head(self, base_logits, prev_token_ids, hidden_states):
         del prev_token_ids, hidden_states
         return base_logits
 

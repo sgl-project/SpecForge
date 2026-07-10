@@ -1,6 +1,4 @@
-from .dflash import OnlineDFlashModel
-from .domino import OnlineDominoModel
-from .dspark import OnlineDSparkModel
+from .dflash import OnlineDFlashModel, OnlineDominoModel, OnlineDSparkModel
 from .eagle3 import OnlineEagle3Model, QwenVLOnlineEagle3Model
 from .peagle import OnlinePEagleModel
 

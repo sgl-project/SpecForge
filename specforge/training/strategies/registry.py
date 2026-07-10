@@ -333,12 +333,10 @@ register_strategy(
 
 
 # --- Domino -----------------------------------------------------------------
-# Domino reuses DFlash's draft model (projector_type="domino" head), feature
-# schema, offline transform/collate, and capture path (same DFLASH_FEATURE_SCHEMA
-# -> hidden_states). The ONE difference is the loss: it blends a base loss with a
-# step-decayed weight, so DominoTrainStrategy reads the StepContext
-# (forward_loss(batch, ctx)). That is the whole reason a new algorithm needs
-# anything beyond a spec entry here.
+# Domino uses a DFlash-family draft model and reuses the DFlash feature schema,
+# offline transform/collate, and capture path (same DFLASH_FEATURE_SCHEMA ->
+# hidden_states). The loss blends a base loss with a step-decayed weight, so
+# DominoTrainStrategy reads the StepContext (forward_loss(batch, ctx)).
 
 from specforge.training.strategies.base import DominoTrainStrategy
 

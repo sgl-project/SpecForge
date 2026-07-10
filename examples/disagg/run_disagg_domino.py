@@ -18,7 +18,7 @@ from _dflash_family_disagg import (
 from accelerate.utils import set_seed
 from train_domino import parse_args
 
-from specforge.core.domino import OnlineDominoModel
+from specforge.core.dflash import OnlineDominoModel
 from specforge.distributed import destroy_distributed, init_distributed
 
 STRATEGY = "domino"

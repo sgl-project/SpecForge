@@ -317,14 +317,14 @@ def build_domino(
 ):
     """Build a tiny OnlineDominoModel on cuda, mirroring scripts/train_domino.
 
-    Domino reuses the DFlash draft model with a projector_type="domino" head (GRU
-    prefix + embed projection). Returns
+    Domino uses a DFlash-backed DominoDraftModel with a GRU prefix + embed
+    projection head. Returns
     (domino_model, hidden_states_width, target_dir, target_layer_ids).
     """
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
-    from specforge.core.domino import OnlineDominoModel
-    from specforge.modeling.draft.dflash import DFlashDraftModel
+    from specforge.core.dflash import OnlineDominoModel
+    from specforge.modeling.draft.domino import DominoDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     tcfg = Qwen3Config(
@@ -347,7 +347,7 @@ def build_domino(
     draft_config.block_size = block_size
     draft_config.num_target_layers = target_layers
     draft_config.dflash_config = {
-        "projector_type": "domino",  # builds the GRU prefix + embed_proj head
+        "projector_type": "domino",
         "emb_dim": hidden,
         "gru_hidden_dim": hidden // 2,
         "pure_draft_prefix_len": 0,
@@ -356,7 +356,7 @@ def build_domino(
     }
     draft_config._attn_implementation = attention_backend
 
-    draft_model = DFlashDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
+    draft_model = DominoDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
     draft_model.mask_token_id = mask_token_id
 
     target_components = TargetEmbeddingsAndHead.from_pretrained(
