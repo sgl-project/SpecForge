@@ -43,10 +43,27 @@ def _masked_mean(
 def _acceptance_rate_per_token_from_logits(
     logits: torch.Tensor,
     target_probs: torch.Tensor,
+    chunk_size: int = 256,
 ) -> torch.Tensor:
-    """Return per-token expected acceptance from draft logits and target probs."""
-    draft_p = F.softmax(logits.to(torch.float32), dim=-1).to(target_probs.dtype)
-    return expected_acceptance_rate(target_probs=target_probs, draft_probs=draft_p)
+    """Return per-token expected acceptance from draft logits and target probs.
+
+    The fp32 softmax over the draft vocab is computed in token chunks so it
+    never materializes for the whole sequence at once; each chunk reduces to
+    one scalar per token, keeping peak memory flat in sequence length.
+    """
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_target = target_probs.reshape(-1, target_probs.shape[-1])
+    per_token = []
+    for i in range(0, flat_logits.shape[0], chunk_size):
+        draft_p = F.softmax(
+            flat_logits[i : i + chunk_size].to(torch.float32), dim=-1
+        ).to(flat_target.dtype)
+        per_token.append(
+            expected_acceptance_rate(
+                target_probs=flat_target[i : i + chunk_size], draft_probs=draft_p
+            )
+        )
+    return torch.cat(per_token).reshape(logits.shape[:-1])
 
 
 def compute_acceptance_rate(

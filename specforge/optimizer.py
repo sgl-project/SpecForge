@@ -13,6 +13,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        cpu_offload=False,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
@@ -21,9 +22,18 @@ class BF16Optimizer:
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
-        self.fp32_params = [
-            p.detach().clone().to(torch.float32) for p in self.model_params
-        ]
+        self.cpu_offload = cpu_offload
+        if cpu_offload:
+            # Keep fp32 master params and AdamW state in host memory so only
+            # the bf16 params/grads occupy VRAM. The AdamW step runs on CPU.
+            self.fp32_params = [
+                p.detach().to(torch.float32).cpu().pin_memory()
+                for p in self.model_params
+            ]
+        else:
+            self.fp32_params = [
+                p.detach().clone().to(torch.float32) for p in self.model_params
+            ]
         for mp in self.fp32_params:
             mp.requires_grad = True
         self.optimizer = torch.optim.AdamW(
@@ -40,7 +50,9 @@ class BF16Optimizer:
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 mp.grad = (
-                    p.grad.detach().to(torch.float32) if p.grad is not None else None
+                    p.grad.detach().to(device=mp.device, dtype=torch.float32)
+                    if p.grad is not None
+                    else None
                 )
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
         self.last_grad_norm = grad_norm.detach()
@@ -49,7 +61,7 @@ class BF16Optimizer:
         self.scheduler.step()
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
-                p.data.copy_(mp.data.to(p.dtype))
+                p.data.copy_(mp.data)
                 p.grad = None
         return self.last_grad_norm
 
