@@ -836,9 +836,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
     ) -> torch.Tensor:
         loss_weight_mask = eval_mask.to(torch.float32)
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            positions = torch.arange(
-                self.block_size, device=eval_mask.device
-            ).view(1, 1, -1)
+            positions = torch.arange(self.block_size, device=eval_mask.device).view(
+                1, 1, -1
+            )
             decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask
