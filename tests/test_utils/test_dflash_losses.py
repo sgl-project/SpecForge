@@ -317,13 +317,14 @@ class TestDFlashLosses(unittest.TestCase):
             loss_type="vp_drafter",
             loss_decay_gamma=gamma,
         )
-        got, accuracy = model(
+        got, accuracy, metrics = model(
             input_ids=self.input_ids,
             hidden_states=self.hidden_states,
             loss_mask=self.loss_mask,
         )
         want = _naive_vp_drafter_loss(neg_log_q, binary_mask, prefix_lengths, gamma)
         self.assertTrue(torch.isfinite(accuracy))
+        torch.testing.assert_close(metrics["accuracy_denom"], binary_mask.sum())
         torch.testing.assert_close(got, want, rtol=0, atol=1e-8)
 
     def test_dpace_full_matches_naive_reference(self):
