@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Small DSpark heads layered on top of the DFlash draft backbone."""
+"""DSpark draft model entry point and Markov heads."""
 
 from __future__ import annotations
 
@@ -7,6 +7,9 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
+
+from .dflash import DFlashDraftModel
+from .registry import register_draft
 
 
 def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -228,7 +231,7 @@ class RNNMarkovHead(VanillaMarkovHead):
         state = torch.zeros(
             batch_size,
             self.markov_rank,
-            device=base_logits.device,
+            device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
         sampled_tokens = []
@@ -276,10 +279,88 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
     raise ValueError(f"Unsupported markov_head_type: {markov_head_type!r}")
 
 
+@register_draft
+class DSparkDraftModel(DFlashDraftModel):
+    """DFlash backbone with DSpark Markov/confidence heads."""
+
+    expected_projector_type = "dspark"
+
+    def __init__(self, config) -> None:
+        dflash_config = getattr(config, "dflash_config", None) or {}
+        projector_type = dflash_config.get("projector_type")
+        if projector_type is None:
+            dflash_config["projector_type"] = self.expected_projector_type
+            config.dflash_config = dflash_config
+        elif projector_type != self.expected_projector_type:
+            raise ValueError(
+                "DSparkDraftModel requires " "dflash_config.projector_type='dspark'."
+            )
+        super().__init__(config)
+
+    def _init_draft_head(self, config, dflash_config: dict) -> None:
+        self.markov_head = build_markov_head(config, dflash_config)
+        confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
+        self.enable_confidence_head = bool(
+            dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
+        )
+        self.confidence_head_with_markov = bool(
+            dflash_config.get("confidence_head_with_markov", False)
+        )
+        if self.confidence_head_with_markov and self.markov_head is None:
+            raise ValueError(
+                "confidence_head_with_markov=True requires markov_rank > 0"
+            )
+
+        self.confidence_head = None
+        if self.enable_confidence_head:
+            input_dim = config.hidden_size
+            if self.confidence_head_with_markov:
+                input_dim += self.markov_head.markov_rank
+            self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
+
+    def apply_logits_head(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+        prev_token_embeddings: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        del prev_token_embeddings
+        if self.markov_head is None:
+            return base_logits
+        if prev_token_ids is None:
+            raise ValueError("DSparkDraftModel requires prev_token_ids")
+        return self.markov_head.apply_block_logits(
+            base_logits,
+            token_ids=prev_token_ids,
+            hidden_states=hidden_states,
+        )
+
+    def predict_confidence(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if self.confidence_head is None:
+            return None
+        if self.confidence_head_with_markov:
+            assert self.markov_head is not None
+            if prev_token_ids is None:
+                raise ValueError("prev_token_ids is required for Markov confidence")
+            prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids).to(
+                hidden_states.dtype
+            )
+            hidden_states = torch.cat([hidden_states, prev_embeddings], dim=-1)
+        return self.confidence_head(hidden_states).float()
+
+
 __all__ = [
     "AcceptRatePredictor",
-    "VanillaMarkovHead",
+    "DSparkDraftModel",
     "GatedMarkovHead",
     "RNNMarkovHead",
+    "VanillaMarkovHead",
     "build_markov_head",
 ]

@@ -1,11 +1,11 @@
 {
   "architectures": [
-    "DFlashDraftModel"
+    "DSparkDraftModel"
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,
   "auto_map": {
-    "AutoModel": "dflash.DFlashDraftModel"
+    "AutoModel": "dspark.DSparkDraftModel"
   },
   "block_size": 7,
   "bos_token_id": 151643,

@@ -18,7 +18,7 @@ from _dflash_family_disagg import (
 from accelerate.utils import set_seed
 from train_dflash import parse_dspark_disagg_args
 
-from specforge.core.dspark import OnlineDSparkModel
+from specforge.core.dflash import OnlineDSparkModel
 from specforge.distributed import destroy_distributed, init_distributed
 
 STRATEGY = "dspark"

@@ -54,6 +54,13 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         archs = getattr(config, "architectures", None) or []
         if len(archs) == 1 and archs[0] in DRAFT_REGISTRY:
             _model_cls = DRAFT_REGISTRY[archs[0]]
+            if archs[0] == "DFlashDraftModel":
+                dflash_config = getattr(config, "dflash_config", {}) or {}
+                projector_type = dflash_config.get("projector_type", None)
+                if projector_type == "domino":
+                    _model_cls = DRAFT_REGISTRY["DominoDraftModel"]
+                elif projector_type == "dspark":
+                    _model_cls = DRAFT_REGISTRY["DSparkDraftModel"]
         else:
             _model_cls = cls._model_mapping[type(config)]
         model = _model_cls(config, **config_kwargs)

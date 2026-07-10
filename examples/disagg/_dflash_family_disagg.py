@@ -21,6 +21,8 @@ from transformers import AutoConfig, AutoTokenizer
 from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
 from specforge.launch import build_disagg_online_consumer, build_disagg_online_producer
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.domino import DominoDraftModel
+from specforge.modeling.draft.dspark import DSparkDraftModel
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
@@ -359,7 +361,12 @@ def build_dflash_family_draft(
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    draft_cls = DFlashDraftModel
+    if expected_projector_type == "domino":
+        draft_cls = DominoDraftModel
+    elif expected_projector_type == "dspark":
+        draft_cls = DSparkDraftModel
+    draft_model = draft_cls(draft_config).to(device=device, dtype=torch.bfloat16)
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
