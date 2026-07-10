@@ -1,6 +1,7 @@
 import logging
 
 import torch
+import torch.distributed as dist
 
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
@@ -34,11 +35,49 @@ class BF16Optimizer:
             self.fp32_params, lr=lr, weight_decay=weight_decay
         )
         self.last_grad_norm = None
+        self._grad_norm_process_group = None
+        self._reduce_grad_norm_across_ranks = True
         self.scheduler = CosineAnnealingWarmupLR(
             self.optimizer,
             total_steps=total_steps,
             warmup_steps=int(warmup_ratio * total_steps),
         )
+
+    def configure_grad_norm_reduction(
+        self, *, process_group=None, enabled: bool = True
+    ) -> None:
+        """Configure the group that owns disjoint gradient shards.
+
+        FSDP backends disable the reduction for replicated/NO_SHARD parameters.
+        """
+        self._grad_norm_process_group = process_group
+        self._reduce_grad_norm_across_ranks = enabled
+
+    def _clip_grad_norm(self):
+        """Clip all FSDP shards with one global L2-norm coefficient."""
+        grads = [mp.grad for mp in self.fp32_params if mp.grad is not None]
+        if grads:
+            total_norm_sq = torch.stack([grad.square().sum() for grad in grads]).sum()
+        else:
+            device = self.fp32_params[0].device if self.fp32_params else "cpu"
+            total_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
+
+        if (
+            self._reduce_grad_norm_across_ranks
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
+            dist.all_reduce(
+                total_norm_sq,
+                op=dist.ReduceOp.SUM,
+                group=self._grad_norm_process_group,
+            )
+
+        total_norm = total_norm_sq.sqrt()
+        clip_coef = torch.clamp(self.max_grad_norm / (total_norm + 1e-6), max=1.0)
+        for grad in grads:
+            grad.mul_(clip_coef)
+        return total_norm
 
     def step(self):
         with torch.no_grad():
@@ -46,7 +85,7 @@ class BF16Optimizer:
                 mp.grad = (
                     p.grad.detach().to(torch.float32) if p.grad is not None else None
                 )
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        grad_norm = self._clip_grad_norm()
         self.last_grad_norm = grad_norm.detach()
         self.optimizer.step()
         self.optimizer.zero_grad()
