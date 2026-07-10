@@ -380,6 +380,7 @@ def build_eagle3_dataset(
                 max_length,
                 is_preformatted=True,
                 train_only_last_turn=train_only_last_turn,
+                tools=[[] for _ in range(len(examples["text"]))],
             )
         else:
             # Handle ShareGPT conversations
