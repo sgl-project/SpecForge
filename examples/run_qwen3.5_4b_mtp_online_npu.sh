@@ -39,5 +39,5 @@ torchrun \
     --report-to tensorboard \
     --target-model-backend hf \
     --trust-remote-code \
-    --embedding-key model.language_model.model.embed_tokens.weight \
-    --lm-head-key model.language_model.lm_head.weight
+    --embedding-key model.language_model.embed_tokens.weight \
+    --lm-head-key model.language_model.embed_tokens.weight
