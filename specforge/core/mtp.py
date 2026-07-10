@@ -88,7 +88,7 @@ class OnlineMTPModel(nn.Module):
 
         with torch.no_grad():
             preds = shift_logits.argmax(dim=-1)
-            corrects = ((preds == shift_labels).float() * shift_mask.float())
+            corrects = (preds == shift_labels).float() * shift_mask.float()
             denoms = shift_mask.float()
 
         # Single-layer MTP: wrap in length-1 lists for E1 evaluator compatibility.

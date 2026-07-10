@@ -238,7 +238,9 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> Tuple[
+        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
+    ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, self_attn_weights = self.self_attn(
@@ -299,19 +301,19 @@ class Qwen3_5MTPModel(nn.Module):
         # to match the native Qwen3.5 checkpoint layout consumed by SGLang.
         mtp_config = copy.deepcopy(config)
         mtp_config.num_hidden_layers = 1
-        self.layers = nn.ModuleList(
-            [Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)]
-        )
+        self.layers = nn.ModuleList([Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)])
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = PartialRotaryEmbedding(
             mtp_config,
-            getattr(mtp_config, "head_dim", mtp_config.hidden_size // mtp_config.num_attention_heads),
+            getattr(
+                mtp_config,
+                "head_dim",
+                mtp_config.hidden_size // mtp_config.num_attention_heads,
+            ),
         )
 
         # LM head (shared with target model during training)
-        self.lm_head = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
         self,
@@ -439,7 +441,6 @@ class Qwen3_5MTPDraftModel(Qwen3PreTrainedModel):
         from transformers.cache_utils import DynamicCache
 
         past_key_values_target = DynamicCache()
-        past_key_values_draft = DynamicCache()
 
         # Prefill target once to get initial last hidden state
         target_out = target(
@@ -494,7 +495,9 @@ class Qwen3_5MTPDraftModel(Qwen3PreTrainedModel):
                 output_hidden_states=True,
             )
             target_hidden = target_out.hidden_states[-1][:, -1:, :]
-            target_token = torch.argmax(target_out.logits[:, -1, :], dim=-1, keepdim=True)
+            target_token = torch.argmax(
+                target_out.logits[:, -1, :], dim=-1, keepdim=True
+            )
 
             if torch.equal(draft_token, target_token):
                 output_ids = torch.cat([output_ids, draft_token], dim=1)
@@ -508,5 +511,3 @@ class Qwen3_5MTPDraftModel(Qwen3PreTrainedModel):
                 break
 
         return output_ids
-
-

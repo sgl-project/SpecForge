@@ -38,7 +38,6 @@ from specforge.tracker import create_tracker
 from specforge.utils import (
     get_last_checkpoint,
     get_local_device,
-    load_tokenizer,
     print_on_rank0,
     print_with_rank,
 )
@@ -212,6 +211,7 @@ def build_models(
     if not args.no_init_from_native_mtp:
         try:
             import glob as _glob
+
             from safetensors.torch import safe_open as _safe_open
 
             native_mtp: dict = {}
@@ -234,9 +234,7 @@ def build_models(
                     "training MTP from scratch."
                 )
         except Exception as e:
-            print_on_rank0(
-                f"Could not load native mtp weights ({e}); from scratch."
-            )
+            print_on_rank0(f"Could not load native mtp weights ({e}); from scratch.")
 
     print_on_rank0(
         f"Draft config: hidden_size={draft_config.hidden_size}, "
@@ -328,9 +326,7 @@ def save_checkpoint(args, epoch, step, mtp_model, draft_model, optimizer):
         draft_state_dict = {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
-            if "draft_model." in k
-            and "embed_tokens" not in k
-            and "lm_head" not in k
+            if "draft_model." in k and "embed_tokens" not in k and "lm_head" not in k
         }
 
         if dist.get_rank() == 0:

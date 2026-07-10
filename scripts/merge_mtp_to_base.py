@@ -19,12 +19,11 @@ import glob
 import json
 import os
 import shutil
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import AutoConfig
 
 
 def load_safetensors_file(path: str) -> Dict[str, torch.Tensor]:
@@ -36,7 +35,9 @@ def load_safetensors_file(path: str) -> Dict[str, torch.Tensor]:
     return state
 
 
-def convert_mtp_keys(state_dict: Dict[str, torch.Tensor], fmt: str) -> Dict[str, torch.Tensor]:
+def convert_mtp_keys(
+    state_dict: Dict[str, torch.Tensor], fmt: str
+) -> Dict[str, torch.Tensor]:
     """Convert MTP weight keys to the requested output format.
 
     SpecForge training saves keys in the flat native layout:
@@ -151,7 +152,9 @@ def merge_checkpoints(
         for key in old_mtp_keys:
             del weight_map[key]
         if old_mtp_keys:
-            print(f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model.")
+            print(
+                f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model."
+            )
 
         # Write MTP weights into a dedicated shard so we do not need to rewrite
         # the (large) base model shards.
@@ -164,7 +167,9 @@ def merge_checkpoints(
 
         # Save the updated index. Re-use the original index file name.
         index["weight_map"] = weight_map
-        with open(os.path.join(output_path, os.path.basename(index_files[0])), "w") as f:
+        with open(
+            os.path.join(output_path, os.path.basename(index_files[0])), "w"
+        ) as f:
             json.dump(index, f, indent=2)
     else:
         # Single-file checkpoint: load base weights, merge, and rewrite.
@@ -186,7 +191,9 @@ def merge_checkpoints(
         for key in old_mtp_keys:
             del base_state[key]
         if old_mtp_keys:
-            print(f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model.")
+            print(
+                f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model."
+            )
 
         merged = {**base_state, **mtp_state}
 

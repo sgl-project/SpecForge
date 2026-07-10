@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # VLM-aware module discovery (standalone, not methods on Eagle3TargetModel)
 # ---------------------------------------------------------------------------
 
+
 def _get_language_model(target_model) -> nn.Module:
     """Return the inner transformer module (without the lm_head).
 
@@ -93,11 +94,17 @@ def generate_mtp_data(
     next-token shift is performed inside ``OnlineMTPModel``.
     """
     if isinstance(target_model, HFEagle3TargetModel):
-        return _generate_mtp_data_hf(target_model, input_ids, attention_mask, loss_mask, **kwargs)
+        return _generate_mtp_data_hf(
+            target_model, input_ids, attention_mask, loss_mask, **kwargs
+        )
     elif isinstance(target_model, SGLangEagle3TargetModel):
-        return _generate_mtp_data_sglang(target_model, input_ids, attention_mask, loss_mask, **kwargs)
+        return _generate_mtp_data_sglang(
+            target_model, input_ids, attention_mask, loss_mask, **kwargs
+        )
     elif isinstance(target_model, CustomEagle3TargetModel):
-        return _generate_mtp_data_custom(target_model, input_ids, attention_mask, loss_mask, **kwargs)
+        return _generate_mtp_data_custom(
+            target_model, input_ids, attention_mask, loss_mask, **kwargs
+        )
     raise NotImplementedError(
         f"MTP data generation not supported for {type(target_model).__name__}"
     )
@@ -121,6 +128,7 @@ def _generate_mtp_data_hf(
     def get_hook():
         def hook(module, inp, out):
             last_hidden_state[0] = out[0] if isinstance(out, tuple) else out
+
         return hook
 
     handle = layers[-1].register_forward_hook(get_hook())
