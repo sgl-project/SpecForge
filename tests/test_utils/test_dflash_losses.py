@@ -442,6 +442,28 @@ class TestDFlashLosses(unittest.TestCase):
         want = (neg_log_q * weights).sum() / (weights.sum() + 1e-6)
         torch.testing.assert_close(loss, want, rtol=0, atol=1e-6)
 
+    def test_dspark_ce_only_skips_target_distribution(self):
+        target_logits = torch.randn_like(self.logits)
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            lm_head=_DualFixedHead(self.logits, target_logits).double(),
+            dspark_ce_loss_alpha=1.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+        )
+
+        with patch.object(torch, "softmax", side_effect=AssertionError("unexpected")):
+            loss, _accuracy, _metrics = model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+                target_last_hidden_states=torch.zeros_like(self.hidden_states),
+            )
+
+        self.assertTrue(torch.isfinite(loss))
+
     def test_dspark_l1_and_confidence_match_reference(self):
         torch.manual_seed(321)
         target_logits = torch.randn_like(self.logits)

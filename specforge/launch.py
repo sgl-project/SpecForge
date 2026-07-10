@@ -767,8 +767,10 @@ def build_disagg_online_producer(
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
                     return
+                _t = time.monotonic()
+                _infl = channel.in_flight_remote()
                 # backpressure: in_flight = published - consumer-acked
-                while channel.in_flight_remote() >= in_flight_high_watermark:
+                while _infl >= in_flight_high_watermark:
                     now = time.perf_counter()
                     if (
                         progress_interval > 0
