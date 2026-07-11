@@ -15,6 +15,7 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaRotaryEmbedding,
     rotate_half,
 )
+from specforge.modeling.draft.registry import register_draft
 
 
 class PEagleAttention(nn.Module):
@@ -170,6 +171,7 @@ class PEagleStandardLayer(nn.Module):
         return hidden_states
 
 
+@register_draft
 class PEagleDraftModel(Eagle3DraftModel):
     """P-EAGLE draft model with multi-layer architecture.
 

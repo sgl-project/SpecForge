@@ -149,5 +149,6 @@ class AutoLoaderRegistryTest(unittest.TestCase):
             reloaded = PEagleDraftModel.from_pretrained(output_dir)
         self.assertIsInstance(reloaded, PEagleDraftModel)
 
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -53,10 +53,8 @@ def replaced_logits_processor_forward_for_eagle3(
     Updated for sglang 0.5.9:
     - Added hidden_states_before_norm parameter for compatibility
     """
-    # sglang 0.5.13: multi-item delimiter indices are now carried per-request on
-    # the ForwardBatch (multi_item_delimiter_indices) instead of as a
-    # LogitsProcessor attribute (self.multi_item_delimiter). Extract them before
-    # the ForwardBatch -> LogitsMetadata conversion.
+    # 0.5.13 moved the multi-item delimiter off the LogitsProcessor onto the
+    # ForwardBatch (multi_item_delimiter_indices); read it before the conversion.
     multi_item_delimiter_indices = None
     if isinstance(logits_metadata, ForwardBatch):
         multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
