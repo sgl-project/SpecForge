@@ -11,6 +11,7 @@ import os
 import tempfile
 import unittest
 
+import torch
 from transformers import LlamaConfig, Qwen3Config
 
 from specforge.modeling.auto import AutoDraftModelConfig, AutoEagle3DraftModel
@@ -132,6 +133,20 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         model = AutoEagle3DraftModel.from_config(config)
         self.assertIsInstance(model, LlamaForCausalLMEagle3)
 
+    def test_from_config_without_architecture_uses_legacy_fallback(self):
+        config = LlamaConfig(
+            **{k: v for k, v in TINY_EAGLE3.items() if k != "architectures"}
+        )
+        model = AutoEagle3DraftModel.from_config(config)
+        self.assertIsInstance(model, LlamaForCausalLMEagle3)
+
+    def test_auto_mapping_exposes_non_llama_registered_configs(self):
+        self.assertIn(Qwen3Config, AutoEagle3DraftModel._model_mapping)
+        self.assertIn(
+            DFlashDraftModel,
+            AutoEagle3DraftModel._model_mapping[Qwen3Config],
+        )
+
     def test_from_config_resolves_peagle_via_registry(self):
         path = _write(TINY_PEAGLE)
         self.addCleanup(os.unlink, path)
@@ -147,7 +162,11 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as output_dir:
             model.save_pretrained(output_dir)
             reloaded = PEagleDraftModel.from_pretrained(output_dir)
+            auto_reloaded = AutoEagle3DraftModel.from_pretrained(output_dir)
         self.assertIsInstance(reloaded, PEagleDraftModel)
+        self.assertIsInstance(auto_reloaded, PEagleDraftModel)
+        self.assertTrue(torch.isfinite(reloaded.rotary_emb.cos_cached).all())
+        self.assertTrue(torch.isfinite(auto_reloaded.rotary_emb.cos_cached).all())
 
 
 if __name__ == "__main__":

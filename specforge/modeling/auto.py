@@ -31,12 +31,56 @@ from .target.custom_backend import (
 )
 
 
+class _DraftModelMapping(dict):
+    """Expose registered drafts to the Transformers auto-model dispatcher."""
+
+    def _config_classes(self):
+        config_classes = list(super().keys())
+        for model_cls in DRAFT_REGISTRY.values():
+            config_cls = getattr(model_cls, "config_class", None)
+            if config_cls is not None and config_cls not in config_classes:
+                config_classes.append(config_cls)
+        return tuple(config_classes)
+
+    def __getitem__(self, config_cls):
+        fallback = super().get(config_cls)
+        if fallback is None:
+            candidates = []
+        elif isinstance(fallback, (list, tuple)):
+            candidates = list(fallback)
+        else:
+            candidates = [fallback]
+        for model_cls in DRAFT_REGISTRY.values():
+            if (
+                getattr(model_cls, "config_class", None) is config_cls
+                and model_cls not in candidates
+            ):
+                candidates.append(model_cls)
+        if not candidates:
+            raise KeyError(config_cls)
+        return tuple(candidates)
+
+    def __contains__(self, config_cls):
+        return config_cls in self._config_classes()
+
+    def __iter__(self):
+        return iter(self._config_classes())
+
+    def __len__(self):
+        return len(self._config_classes())
+
+    def keys(self):
+        return self._config_classes()
+
+
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     # legacy config-type dispatch, kept as the fallback for configs that carry
     # no ``architectures``; new drafts register via @register_draft instead.
-    _model_mapping = {
-        LlamaConfig: LlamaForCausalLMEagle3,
-    }
+    _model_mapping = _DraftModelMapping(
+        {
+            LlamaConfig: LlamaForCausalLMEagle3,
+        }
+    )
 
     @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
@@ -55,7 +99,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         if len(archs) == 1 and archs[0] in DRAFT_REGISTRY:
             _model_cls = DRAFT_REGISTRY[archs[0]]
         else:
-            _model_cls = cls._model_mapping[type(config)]
+            _model_cls = cls._model_mapping[type(config)][0]
         model = _model_cls(config, **config_kwargs)
 
         # Convert model to specified dtype if provided
@@ -72,16 +116,18 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     ):
         original_warn = modeling_utils.logger.warning
 
-        def filtered_warning(msg):
+        def filtered_warning(msg, *args, **warning_kwargs):
             if "embed_tokens.weight" in str(msg) and "initialized" in str(msg):
                 return
-            original_warn(msg)
+            original_warn(msg, *args, **warning_kwargs)
 
         modeling_utils.logger.warning = filtered_warning
 
         try:
             model = super().from_pretrained(
-                pretrained_model_name_or_path, *model_args, **kwargs
+                pretrained_model_name_or_path,
+                *model_args,
+                **kwargs,
             )
         finally:
             modeling_utils.logger.warning = original_warn

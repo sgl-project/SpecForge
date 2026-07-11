@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from argparse import Namespace
 from unittest.mock import MagicMock, patch
@@ -12,6 +13,7 @@ from specforge.core.peagle import (
     create_peagle_mask_mod,
     generate_cod_sample_indices,
 )
+from specforge.modeling.auto import AutoEagle3DraftModel
 from specforge.modeling.draft.peagle import PEagleDraftModel
 
 
@@ -55,6 +57,22 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         model = PEagleDraftModel(config)
 
         self.assertTrue(model.embed_tokens.weight.requires_grad)
+
+    def test_norm_before_residual_round_trips_through_config(self):
+        config = self._tiny_config()
+        model = PEagleDraftModel(config, norm_before_residual=True)
+
+        self.assertTrue(model.config.norm_before_residual)
+        with tempfile.TemporaryDirectory() as output_dir:
+            model.save_pretrained(output_dir)
+            direct = PEagleDraftModel.from_pretrained(output_dir)
+            automatic = AutoEagle3DraftModel.from_pretrained(output_dir)
+
+        for reloaded in (direct, automatic):
+            self.assertIsInstance(reloaded, PEagleDraftModel)
+            self.assertTrue(reloaded.config.norm_before_residual)
+            self.assertTrue(reloaded.norm_before_residual)
+            self.assertTrue(reloaded.layers[0].norm_before_residual)
 
     def test_compute_metrics_masks_targets_outside_draft_vocab(self):
         logits = torch.tensor(
@@ -115,6 +133,63 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         self.assertTrue(
             torch.all(loss_mask[0, sampled_target_pos[parallel_depth_mask]] == 1)
         )
+
+    def test_cod_sampling_never_emits_negative_anchors(self):
+        torch.manual_seed(0)
+        loss_mask = torch.ones(1, 8, dtype=torch.long)
+
+        anchor_pos, depth = generate_cod_sample_indices(
+            seq_length=loss_mask.shape[1],
+            loss_mask=loss_mask,
+            num_depths=4,
+            down_sample_ratio=1.0,
+            down_sample_ratio_min=1.0,
+        )
+
+        sampled_target_pos = anchor_pos + depth
+        self.assertTrue(torch.all(anchor_pos >= 0))
+        self.assertTrue(torch.all(sampled_target_pos < loss_mask.shape[1]))
+        self.assertTrue(torch.all(loss_mask[0, sampled_target_pos] == 1))
+
+    def test_cod_sampling_does_not_cross_packed_document_boundaries(self):
+        torch.manual_seed(0)
+        loss_mask = torch.ones(1, 6, dtype=torch.long)
+        lengths = torch.tensor([3, 3], dtype=torch.long)
+
+        anchor_pos, depth = generate_cod_sample_indices(
+            seq_length=loss_mask.shape[1],
+            loss_mask=loss_mask,
+            lengths=lengths,
+            num_depths=3,
+            down_sample_ratio=1.0,
+            down_sample_ratio_min=1.0,
+        )
+
+        target_pos = anchor_pos + depth
+        document_ids = torch.tensor([0, 0, 0, 1, 1, 1])
+        parallel = depth > 0
+        self.assertTrue(
+            torch.all(
+                document_ids[anchor_pos[parallel]] == document_ids[target_pos[parallel]]
+            )
+        )
+
+    def test_online_wrapper_rejects_batch_larger_than_one(self):
+        config = self._tiny_config()
+        wrapper = OnlinePEagleModel(
+            draft_model=PEagleDraftModel(config),
+            mask_token_id=0,
+        )
+        input_ids = torch.ones(2, 4, dtype=torch.long)
+
+        with self.assertRaisesRegex(ValueError, "batch size 1"):
+            wrapper(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                target=torch.zeros(2, 4, config.vocab_size),
+                loss_mask=torch.ones_like(input_ids),
+                hidden_states=torch.zeros(2, 4, 3 * config.hidden_size),
+            )
 
     def test_peagle_mask_respects_documents_depth_order_and_padding(self):
         anchor_pos = torch.tensor([0, 1, 1, 2, 4, 4, 5])

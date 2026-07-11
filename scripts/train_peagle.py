@@ -77,20 +77,23 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     peagle_group.add_argument(
         "--num-depths",
         type=int,
-        default=8,
-        help="Number of parallel prediction depths for P-EAGLE COD sampling",
+        default=None,
+        help=(
+            "Number of parallel prediction depths for P-EAGLE COD sampling. "
+            "Defaults to 8 for a fresh run and to the checkpoint value on resume."
+        ),
     )
     peagle_group.add_argument(
         "--down-sample-ratio",
         type=float,
-        default=0.8,
-        help="Geometric decay ratio for COD sampling",
+        default=None,
+        help="Geometric COD decay ratio (fresh-run default: 0.8)",
     )
     peagle_group.add_argument(
         "--down-sample-ratio-min",
         type=float,
-        default=0.2,
-        help="Minimum retention ratio for COD sampling",
+        default=None,
+        help="Minimum COD retention ratio (fresh-run default: 0.2)",
     )
     peagle_group.add_argument(
         "--mask-token-id",
@@ -101,19 +104,26 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     peagle_group.add_argument(
         "--num-draft-layers",
         type=int,
-        default=4,
-        help="Number of decoder layers in the P-EAGLE draft model",
+        default=None,
+        help=(
+            "Number of decoder layers in the P-EAGLE draft model. Defaults to 4 "
+            "for a fresh run and to the checkpoint value when resuming."
+        ),
     )
-    peagle_group.add_argument(
+    norm_group = peagle_group.add_mutually_exclusive_group()
+    norm_group.add_argument(
         "--norm-before-residual",
+        dest="norm_before_residual",
         action="store_true",
         help="Whether to use normalized hidden as residual in the first layer",
     )
-    peagle_group.add_argument(
+    norm_group.add_argument(
         "--no-norm-before-residual",
-        action="store_true",
+        dest="norm_before_residual",
+        action="store_false",
         help="Explicitly disable norm-before-residual",
     )
+    parser.set_defaults(norm_before_residual=None)
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -206,33 +216,49 @@ def build_target_model(
     return target_model
 
 
+def _distributed_rank_and_world_size() -> Tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def _rank_training_state_path(checkpoint_dir: str, rank: int) -> str:
+    return os.path.join(checkpoint_dir, f"training_state_rank_{rank}.pt")
+
+
+def _resolve_resume_training_state_path(checkpoint_dir: str) -> str:
+    rank, world_size = _distributed_rank_and_world_size()
+    rank_path = _rank_training_state_path(checkpoint_dir, rank)
+    if os.path.isfile(rank_path):
+        return rank_path
+
+    legacy_path = os.path.join(checkpoint_dir, "training_state.pt")
+    if world_size == 1 and os.path.isfile(legacy_path):
+        return legacy_path
+    if os.path.isfile(legacy_path):
+        raise ValueError(
+            "Cannot safely resume this distributed P-EAGLE checkpoint: it only "
+            "contains the legacy rank-0 training_state.pt. Start a new run from "
+            "--ckpt-dir to load model weights without the unsafe optimizer state."
+        )
+    raise ValueError(
+        f"Cannot resume: checkpoint has no optimizer state for rank {rank}: "
+        f"{checkpoint_dir}"
+    )
+
+
 def build_draft_model(args: Namespace) -> Tuple:
     ckpt_info = (0, 0)
     resume_state = None
     should_load_target_embedding = True
-
-    if args.draft_model_config is not None:
-        draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-    else:
-        from specforge.utils import create_draft_config_from_target
-
-        auto_config_path = create_draft_config_from_target(
-            target_model_path=args.target_model_path,
-            cache_dir=args.model_download_dir,
-        )
-        draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
-
-    # Override num_hidden_layers for P-EAGLE multi-layer
-    draft_model_config.num_hidden_layers = args.num_draft_layers
-
     draft_model_last_checkpoint = None
     is_resume_checkpoint = False
+
+    if args.resume and args.ckpt_dir is not None:
+        raise ValueError("--resume and --ckpt-dir cannot be used together")
+
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
-            draft_model_config = AutoDraftModelConfig.from_file(
-                os.path.join(args.ckpt_dir, "config.json")
-            )
-            draft_model_config.num_hidden_layers = args.num_draft_layers
             draft_model_last_checkpoint = args.ckpt_dir
             should_load_target_embedding = False
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
@@ -241,15 +267,118 @@ def build_draft_model(args: Namespace) -> Tuple:
                 f"Provided base model dir {args.ckpt_dir} is not a valid directory."
             )
 
-    if args.resume and os.path.isdir(args.output_dir):
+    if args.resume:
+        if not os.path.isdir(args.output_dir):
+            raise ValueError(
+                f"Cannot resume: output directory {args.output_dir} does not exist"
+            )
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        if draft_model_last_checkpoint is None:
+            raise ValueError(f"Cannot resume: no checkpoint found in {args.output_dir}")
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
         is_resume_checkpoint = True
         should_load_target_embedding = False
 
-    norm_before_residual = (
-        args.norm_before_residual and not args.no_norm_before_residual
-    )
+    if draft_model_last_checkpoint is not None:
+        checkpoint_config_path = os.path.join(
+            draft_model_last_checkpoint, "config.json"
+        )
+        if not os.path.isfile(checkpoint_config_path):
+            raise ValueError(
+                f"P-EAGLE checkpoint has no config.json: {draft_model_last_checkpoint}"
+            )
+        draft_model_config = AutoDraftModelConfig.from_file(checkpoint_config_path)
+        peagle_config_path = os.path.join(
+            draft_model_last_checkpoint, "peagle_config.json"
+        )
+        peagle_checkpoint_config = {}
+        if os.path.isfile(peagle_config_path):
+            with open(peagle_config_path, "r") as f:
+                peagle_checkpoint_config = json.load(f)
+
+        checkpoint_layers = draft_model_config.num_hidden_layers
+        saved_layers = peagle_checkpoint_config.get("num_draft_layers")
+        if saved_layers is not None and saved_layers != checkpoint_layers:
+            raise ValueError(
+                "P-EAGLE checkpoint layer metadata is inconsistent: "
+                f"config.json={checkpoint_layers}, peagle_config.json={saved_layers}"
+            )
+        if (
+            args.num_draft_layers is not None
+            and args.num_draft_layers != checkpoint_layers
+        ):
+            raise ValueError(
+                "Cannot change P-EAGLE layer count while loading a checkpoint: "
+                f"checkpoint={checkpoint_layers}, requested={args.num_draft_layers}"
+            )
+        saved_norm = peagle_checkpoint_config.get("norm_before_residual")
+        config_norm = getattr(draft_model_config, "norm_before_residual", None)
+        if config_norm is None and saved_norm is not None:
+            draft_model_config.norm_before_residual = bool(saved_norm)
+            config_norm = bool(saved_norm)
+        elif (
+            config_norm is not None
+            and saved_norm is not None
+            and bool(config_norm) != bool(saved_norm)
+        ):
+            raise ValueError(
+                "P-EAGLE checkpoint norm metadata is inconsistent: "
+                f"config.json={bool(config_norm)}, "
+                f"peagle_config.json={bool(saved_norm)}"
+            )
+        checkpoint_norm = bool(config_norm) if config_norm is not None else False
+        if (
+            args.norm_before_residual is not None
+            and args.norm_before_residual != checkpoint_norm
+        ):
+            raise ValueError(
+                "Cannot change norm-before-residual while loading a checkpoint: "
+                f"checkpoint={checkpoint_norm}, requested={args.norm_before_residual}"
+            )
+        args.num_draft_layers = checkpoint_layers
+        norm_before_residual = None
+
+        objective_defaults = {
+            "num_depths": 8,
+            "down_sample_ratio": 0.8,
+            "down_sample_ratio_min": 0.2,
+            "mask_token_id": None,
+        }
+        for name, default in objective_defaults.items():
+            requested = getattr(args, name)
+            saved = peagle_checkpoint_config.get(name, default)
+            if is_resume_checkpoint and requested is not None and requested != saved:
+                raise ValueError(
+                    f"Cannot change {name} while resuming: "
+                    f"checkpoint={saved}, requested={requested}"
+                )
+            if requested is None:
+                setattr(args, name, saved)
+    else:
+        if args.draft_model_config is not None:
+            draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+        else:
+            from specforge.utils import create_draft_config_from_target
+
+            auto_config_path = create_draft_config_from_target(
+                target_model_path=args.target_model_path,
+                cache_dir=args.model_download_dir,
+            )
+            draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
+
+        if args.num_draft_layers is None:
+            args.num_draft_layers = 4
+        if args.num_draft_layers < 1:
+            raise ValueError("--num-draft-layers must be at least 1")
+        draft_model_config.num_hidden_layers = args.num_draft_layers
+        norm_before_residual = args.norm_before_residual
+
+    if args.num_depths is None:
+        args.num_depths = 8
+    if args.down_sample_ratio is None:
+        args.down_sample_ratio = 0.8
+    if args.down_sample_ratio_min is None:
+        args.down_sample_ratio_min = 0.2
 
     if draft_model_last_checkpoint:
         draft_model = PEagleDraftModel(
@@ -271,6 +400,11 @@ def build_draft_model(args: Namespace) -> Tuple:
                     "loading embeddings from the target model."
                 )
         else:
+            if is_resume_checkpoint:
+                raise ValueError(
+                    "Cannot resume: checkpoint has no model.safetensors: "
+                    f"{draft_model_last_checkpoint}"
+                )
             should_load_target_embedding = True
             print_on_rank0(
                 f"No model.safetensors found in {draft_model_last_checkpoint}; "
@@ -282,18 +416,26 @@ def build_draft_model(args: Namespace) -> Tuple:
             norm_before_residual=norm_before_residual,
         ).to(dtype=torch.bfloat16, device="cuda")
 
+    args.norm_before_residual = draft_model.norm_before_residual
+
     if is_resume_checkpoint and draft_model_last_checkpoint:
-        training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+        training_state_path = _resolve_resume_training_state_path(
+            draft_model_last_checkpoint
         )
-        if os.path.exists(training_state_path):
-            resume_state = torch.load(
-                training_state_path, map_location="cpu", weights_only=False
+        resume_state = torch.load(
+            training_state_path, map_location="cpu", weights_only=False
+        )
+        _, world_size = _distributed_rank_and_world_size()
+        saved_world_size = resume_state.get("world_size")
+        if saved_world_size is not None and saved_world_size != world_size:
+            raise ValueError(
+                "Cannot resume P-EAGLE with a different world size: "
+                f"checkpoint={saved_world_size}, current={world_size}"
             )
-            print_on_rank0(
-                f"Loaded training state from {training_state_path}: "
-                f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
-            )
+        print_on_rank0(
+            f"Loaded training state from {training_state_path}: "
+            f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
+        )
 
     if should_load_target_embedding:
         draft_model.load_embedding(
@@ -418,6 +560,7 @@ def save_checkpoints(
         state_to_save = {
             "epoch": epoch,
             "global_step": step,
+            "world_size": dist.get_world_size(),
             "args": args,
         }
         state_to_save.update(optimizer.state_dict())
@@ -427,7 +570,14 @@ def save_checkpoints(
             if "draft_model." in k
         }
 
-        if dist.get_rank() == 0:
+        rank = dist.get_rank()
+        torch.save(
+            state_to_save,
+            _rank_training_state_path(epoch_output_dir, rank),
+        )
+
+        if rank == 0:
+            # Keep the legacy filename as a single-rank/backward-compatible alias.
             torch.save(
                 state_to_save,
                 os.path.join(epoch_output_dir, "training_state.pt"),
@@ -442,7 +592,7 @@ def save_checkpoints(
                 "down_sample_ratio_min": args.down_sample_ratio_min,
                 "mask_token_id": args.mask_token_id,
                 "num_draft_layers": args.num_draft_layers,
-                "norm_before_residual": args.norm_before_residual,
+                "norm_before_residual": peagle_model.draft_model.norm_before_residual,
             }
             with open(os.path.join(epoch_output_dir, "peagle_config.json"), "w") as f:
                 json.dump(peagle_config, f, indent=2)
@@ -587,6 +737,8 @@ def main():
     # 1. Initialize
     # ================================================
     parser, args = parse_args()
+    if args.batch_size != 1:
+        parser.error("P-EAGLE currently requires --batch-size 1")
     set_seed(args.seed)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
 
