@@ -127,6 +127,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 "0.3",
                 "--chunked-prefill-size",
                 "-1",
+                "--disable-radix-cache",
                 "--enable-spec-capture",
                 "--spec-capture-aux-layer-ids",
                 *[str(i) for i in AUX_LAYER_IDS],

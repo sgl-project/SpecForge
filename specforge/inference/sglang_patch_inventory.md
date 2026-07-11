@@ -65,7 +65,8 @@ capture API).
 The **server transport**: 8 small hooks + one self-contained module
 (`sglang/srt/spec_capture_sink.py`) that let a live SGLang server, launched
 with `--enable-spec-capture [--spec-capture-aux-layer-ids ...]
---chunked-prefill-size -1`, capture per-request aux/last hidden states during
+--chunked-prefill-size -1 --disable-radix-cache`, capture per-request aux/last
+hidden states during
 prefill and write them straight into a Mooncake store in
 `MooncakeFeatureStore`'s zero-copy key layout
 (`{store_id}/{sample_id}/g{gen}/{name}`, raw bytes, hard-pinned). The response
