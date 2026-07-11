@@ -320,14 +320,24 @@ def save_checkpoint(args, epoch, step, mtp_model, draft_model, optimizer):
     with FSDP.state_dict_type(mtp_model, StateDictType.FULL_STATE_DICT):
         state_dict = mtp_model.state_dict()
         # Strip the outer wrapper prefix; keep the `mtp.*` prefix required by
-        # SGLang. Drop the frozen/shared embed_tokens and lm_head so the
-        # checkpoint only contains the trainable MTP module (they are restored
-        # from the target at inference via set_embed_and_head / sharing).
-        draft_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in state_dict.items()
-            if "draft_model." in k and "embed_tokens" not in k and "lm_head" not in k
-        }
+        # SGLang. Keep a copy of embed_tokens so that the checkpoint is
+        # self-contained for vLLM/SGLang serving, which instantiate their own
+        # ``mtp.embed_tokens`` and expect it in the checkpoint. Drop the lm_head
+        # only when it is shared with the target model (it is restored from the
+        # target at inference via sharing); when ``--not-share-lm-head`` is set
+        # the draft owns a separate lm_head and we keep it.
+        if args.not_share_lm_head:
+            draft_state_dict = {
+                k.replace("draft_model.", ""): v
+                for k, v in state_dict.items()
+                if "draft_model." in k
+            }
+        else:
+            draft_state_dict = {
+                k.replace("draft_model.", ""): v
+                for k, v in state_dict.items()
+                if "draft_model." in k and "lm_head" not in k
+            }
 
         if dist.get_rank() == 0:
             torch.save(

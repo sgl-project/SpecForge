@@ -60,6 +60,12 @@ def convert_mtp_keys(
             new_k = k.replace("mtp.model.layers.", "mtp.layers.", 1)
         elif k == "mtp.model.norm.weight":
             new_k = "mtp.norm.weight"
+        # Promote bare embed_tokens / lm_head saved by the training script to the
+        # ``mtp.*`` namespace expected by vLLM/SGLang.
+        elif k == "embed_tokens.weight":
+            new_k = "mtp.embed_tokens.weight"
+        elif k == "lm_head.weight":
+            new_k = "mtp.lm_head.weight"
         else:
             new_k = k
         converted[new_k] = v
@@ -69,6 +75,60 @@ def convert_mtp_keys(
 def _is_mtp_key(key: str) -> bool:
     """Return True for keys that belong to the MTP module."""
     return key.startswith("mtp.")
+
+
+def _find_base_key(state_dict: Dict[str, torch.Tensor], *candidates: str) -> str | None:
+    """Return the first candidate key that exists in ``state_dict``."""
+    for key in candidates:
+        if key in state_dict:
+            return key
+    return None
+
+
+def _copy_shared_embeddings(
+    base_state: Dict[str, torch.Tensor],
+    mtp_state: Dict[str, torch.Tensor],
+    tie_word_embeddings: bool,
+) -> Dict[str, torch.Tensor]:
+    """Copy base embed_tokens/lm_head into the MTP state if they are missing.
+
+    During training the draft model typically shares ``embed_tokens`` and
+    ``lm_head`` with the target model, so the saved MTP checkpoint does not
+    contain those tensors.  vLLM/SGLang, however, instantiate their own
+    ``mtp.embed_tokens`` (and a separate ``lm_head`` when weights are not tied),
+    and expect them in the checkpoint.  Copying them from the base model keeps
+    the merged checkpoint self-contained and avoids random-initialization of the
+    MTP input/output embeddings at serving time.
+    """
+    if "mtp.embed_tokens.weight" not in mtp_state:
+        embed_key = _find_base_key(
+            base_state,
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+        )
+        if embed_key:
+            mtp_state["mtp.embed_tokens.weight"] = base_state[embed_key]
+            print(f"  copied {embed_key} -> mtp.embed_tokens.weight")
+        else:
+            print("  warning: base embed_tokens.weight not found; "
+                  "mtp.embed_tokens will be randomly initialized")
+
+    if not tie_word_embeddings and "mtp.lm_head.weight" not in mtp_state:
+        lm_head_key = _find_base_key(
+            base_state,
+            "model.language_model.lm_head.weight",
+            "model.lm_head.weight",
+            "lm_head.weight",
+        )
+        if lm_head_key:
+            mtp_state["mtp.lm_head.weight"] = base_state[lm_head_key]
+            print(f"  copied {lm_head_key} -> mtp.lm_head.weight")
+        else:
+            print("  warning: base lm_head.weight not found; "
+                  "mtp.lm_head will be randomly initialized")
+
+    return mtp_state
 
 
 def _patch_text_config(base_config: dict, draft_config: dict) -> dict:
@@ -138,6 +198,17 @@ def merge_checkpoints(
 
     mtp_state = convert_mtp_keys(mtp_state, key_format)
 
+    # Determine whether word embeddings are tied so we know whether a separate
+    # lm_head must be materialized for the MTP module.
+    tie_word_embeddings = True
+    base_config_path = os.path.join(base_model_path, "config.json")
+    if os.path.exists(base_config_path):
+        with open(base_config_path, "r") as f:
+            base_cfg = json.load(f)
+        # VLM checkpoints nest text config under "text_config".
+        text_cfg = base_cfg.get("text_config", base_cfg)
+        tie_word_embeddings = text_cfg.get("tie_word_embeddings", True)
+
     # Load base model index if present.
     index_files = glob.glob(os.path.join(base_model_path, "*.index.json"))
     if index_files:
@@ -155,6 +226,31 @@ def merge_checkpoints(
             print(
                 f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model."
             )
+
+        # If the trained checkpoint did not save shared embeddings, copy them
+        # from the base model shards so vLLM/SGLang can initialise the MTP
+        # embed_tokens/lm_head from the merged checkpoint.
+        if "mtp.embed_tokens.weight" not in mtp_state or (
+            not tie_word_embeddings and "mtp.lm_head.weight" not in mtp_state
+        ):
+            base_state: Dict[str, torch.Tensor] = {}
+            for candidate in [
+                "model.language_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+                "embed_tokens.weight",
+                "model.language_model.lm_head.weight",
+                "model.lm_head.weight",
+                "lm_head.weight",
+            ]:
+                if candidate not in weight_map:
+                    continue
+                shard_path = os.path.join(base_model_path, weight_map[candidate])
+                if not os.path.exists(shard_path):
+                    continue
+                with safe_open(shard_path, framework="pt") as f:
+                    if candidate in f.keys():
+                        base_state[candidate] = f.get_tensor(candidate)
+            mtp_state = _copy_shared_embeddings(base_state, mtp_state, tie_word_embeddings)
 
         # Write MTP weights into a dedicated shard so we do not need to rewrite
         # the (large) base model shards.
@@ -194,6 +290,8 @@ def merge_checkpoints(
             print(
                 f"Replaced {len(old_mtp_keys)} native MTP weight entries from base model."
             )
+
+        mtp_state = _copy_shared_embeddings(base_state, mtp_state, tie_word_embeddings)
 
         merged = {**base_state, **mtp_state}
 
