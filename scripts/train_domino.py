@@ -105,6 +105,14 @@ def parse_args():
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
+    dataset_group.add_argument(
+        "--train-only-last-turn",
+        action="store_true",
+        help=(
+            "Only the last assistant turn in each conversation contributes to "
+            "the loss. Use with exploded generation-event data."
+        ),
+    )
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
     dataset_group.add_argument(
         "--build-dataset-num-proc",
@@ -263,7 +271,8 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"
+        f"{args.target_model_path}-"
+        f"train_only_last_turn={args.train_only_last_turn}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
@@ -277,6 +286,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
+        train_only_last_turn=args.train_only_last_turn,
     )
 
     min_loss_tokens = 2 * args.block_size
@@ -305,6 +315,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             chat_template=args.chat_template,
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
+            train_only_last_turn=args.train_only_last_turn,
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,

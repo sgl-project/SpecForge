@@ -133,7 +133,8 @@ def build_producer_prompts(args, tokenizer, *, max_prompts: int = 0):
 
     cache_key_parts = (
         f"{args.train_data_path}-{args.max_length}-{args.chat_template}-"
-        f"{args.target_model_path}"
+        f"{args.target_model_path}-"
+        f"train_only_last_turn={args.train_only_last_turn}"
     )
     if cache_scope != "all":
         cache_key_parts = f"{cache_key_parts}-{cache_scope}"
@@ -155,6 +156,7 @@ def build_producer_prompts(args, tokenizer, *, max_prompts: int = 0):
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
+        train_only_last_turn=args.train_only_last_turn,
     )
     log_event(
         "producer-timing",
@@ -453,7 +455,10 @@ def _make_logger(args, holder: Optional[Dict] = None):
                 pass
         if logdict:
             tracker.log(logdict, step=step)
-            summary = {k.split("/")[-1]: round(v, 4) for k, v in logdict.items()}
+            # Keep machine-readable gate metrics at full float precision. Rounding
+            # here can turn loss=1.49e-4 into 1e-4 or accuracy=0.99996 into 1.0,
+            # allowing a strict overfit threshold to pass on the displayed value.
+            summary = {k.split("/")[-1]: v for k, v in logdict.items()}
             print(f"[consumer] step {step} {summary}", flush=True)
 
     return logger
