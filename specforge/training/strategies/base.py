@@ -328,13 +328,17 @@ class DominoTrainStrategy(DraftTrainStrategy):
         lambda_start: float = 1.0,
         decay_ratio: float = 0.5,
         logit_chunk_size: int = 0,
+        metrics_interval: int = 1,
     ) -> None:
         if logit_chunk_size < 0:
             raise ValueError("logit_chunk_size must be non-negative")
+        if metrics_interval <= 0:
+            raise ValueError("metrics_interval must be positive")
         self.domino_model = domino_model
         self.lambda_start = lambda_start
         self.decay_ratio = decay_ratio
         self.logit_chunk_size = logit_chunk_size
+        self.metrics_interval = metrics_interval
 
     def trainable_module(self) -> nn.Module:
         return self.domino_model
@@ -357,13 +361,22 @@ class DominoTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         lambda_base = self._lambda_base(ctx)
+        # Controller logging happens after the optimizer boundary increments
+        # global_step, so ctx.global_step + 1 is the step about to be logged.
+        # The full-logits path already has predictions in memory and stays as-is.
+        compute_metrics = (
+            self.logit_chunk_size <= 0
+            or not self.domino_model.training
+            or ctx is None
+            or (ctx.global_step + 1) % self.metrics_interval == 0
+        )
         loss, accuracy, model_metrics = self.domino_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
             lambda_base=lambda_base,
             logit_chunk_size=self.logit_chunk_size,
-            compute_metrics=True,
+            compute_metrics=compute_metrics,
         )
         return StepOutput(
             loss=loss,

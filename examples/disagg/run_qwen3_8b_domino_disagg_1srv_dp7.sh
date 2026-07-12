@@ -60,6 +60,9 @@ export DISAGG_MAX_STEPS=${DISAGG_MAX_STEPS:-0}
 # too-small value decays the LR to ~0 before training finishes.
 export DISAGG_TOTAL_STEPS=${DISAGG_TOTAL_STEPS:-6000}
 export DISAGG_LOG_INTERVAL=${DISAGG_LOG_INTERVAL:-10}
+export FSDP_SHARDING=${FSDP_SHARDING:-FULL_SHARD}
+export FSDP_AUTO_WRAP=${FSDP_AUTO_WRAP:-1}
+LOGIT_CHUNK_SIZE=${LOGIT_CHUNK_SIZE:-256}
 NUM_EPOCHS=${NUM_EPOCHS:-10}
 SAVE_INTERVAL=${SAVE_INTERVAL:-800}
 BATCH_SIZE=${BATCH_SIZE:-2}
@@ -177,6 +180,7 @@ ARGS=(
     --save-interval ${SAVE_INTERVAL}
     --lambda-base-start 1.0
     --lambda-base-decay-ratio 1.0
+    --domino-logit-chunk-size "$LOGIT_CHUNK_SIZE"
 )
 
 LAUNCHER=$SCRIPT_DIR/run_disagg_domino.py

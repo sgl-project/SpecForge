@@ -8,20 +8,64 @@ forward_loss. These tests prove (1) the lambda schedule logic (CPU), and (2) tha
 domino trains end-to-end offline and online through the same runtime spine (GPU).
 """
 
+import importlib.util
 import os
+import sys
 import tempfile
+import types
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
 CUDA = torch.cuda.is_available()
 
 
+def _load_strategy_module():
+    """Load the strategy seam without importing SpecForge's GPU-heavy package."""
+    repo = Path(__file__).resolve().parents[2]
+    module_name = "_domino_test_strategy_base"
+    names = (
+        "specforge",
+        "specforge.runtime",
+        "specforge.runtime.contracts",
+        module_name,
+    )
+    saved = {name: sys.modules.get(name) for name in names}
+    try:
+        for name in ("specforge", "specforge.runtime"):
+            package = types.ModuleType(name)
+            package.__path__ = []
+            sys.modules[name] = package
+        contracts = types.ModuleType("specforge.runtime.contracts")
+        contracts.TrainBatch = object
+        sys.modules[contracts.__name__] = contracts
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            repo / "specforge" / "training" / "strategies" / "base.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+STRATEGY_MODULE = _load_strategy_module()
+
+
 class TestDominoLambdaSchedule(unittest.TestCase):
     """CPU: the StepContext-driven lambda_base schedule (no model needed)."""
 
     def test_lambda_base_decays_over_total_steps(self):
-        from specforge.training.strategies.base import DominoTrainStrategy, StepContext
+        DominoTrainStrategy = STRATEGY_MODULE.DominoTrainStrategy
+        StepContext = STRATEGY_MODULE.StepContext
 
         # _lambda_base reads only ctx + lambda_start/decay_ratio, not the model.
         s = DominoTrainStrategy(None, lambda_start=1.0, decay_ratio=0.5)
@@ -40,6 +84,57 @@ class TestDominoLambdaSchedule(unittest.TestCase):
         self.assertEqual(
             s._lambda_base(StepContext(global_step=3, total_steps=None)), 0.0
         )
+
+    def test_chunk_metrics_align_with_the_upcoming_log_step(self):
+        DominoTrainStrategy = STRATEGY_MODULE.DominoTrainStrategy
+        StepContext = STRATEGY_MODULE.StepContext
+
+        class RecordingModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(()))
+                self.compute_metrics = []
+
+            def forward(self, **kwargs):
+                compute_metrics = kwargs["compute_metrics"]
+                self.compute_metrics.append(compute_metrics)
+                accuracy = torch.tensor(1.0 if compute_metrics else float("nan"))
+                return self.weight * 0, accuracy, {"accuracy_denom": torch.tensor(1.0)}
+
+        model = RecordingModel()
+        strategy = DominoTrainStrategy(model, logit_chunk_size=4, metrics_interval=3)
+        batch = SimpleNamespace(
+            tensors={
+                "input_ids": torch.ones(1, 2, dtype=torch.long),
+                "hidden_states": torch.ones(1, 2, 1),
+                "loss_mask": torch.ones(1, 2),
+            }
+        )
+
+        outputs = [
+            strategy.forward_loss(batch, StepContext(global_step=step, total_steps=10))
+            for step in range(4)
+        ]
+        self.assertEqual(model.compute_metrics, [False, False, True, False])
+        self.assertTrue(torch.isnan(outputs[0].metrics["accuracy"]))
+        self.assertEqual(outputs[2].metrics["accuracy"].item(), 1.0)
+
+        model.eval()
+        eval_output = strategy.forward_loss(
+            batch, StepContext(global_step=0, total_steps=10)
+        )
+        self.assertTrue(model.compute_metrics[-1], "evaluation must retain metrics")
+        self.assertEqual(eval_output.metrics["accuracy"].item(), 1.0)
+
+        model.train()
+        strategy.forward_loss(batch, None)
+        self.assertTrue(model.compute_metrics[-1], "context-free probes retain metrics")
+
+    def test_metrics_interval_must_be_positive(self):
+        DominoTrainStrategy = STRATEGY_MODULE.DominoTrainStrategy
+
+        with self.assertRaisesRegex(ValueError, "metrics_interval must be positive"):
+            DominoTrainStrategy(None, metrics_interval=0)
 
 
 @unittest.skipUnless(CUDA, "Domino launcher FSDP path requires CUDA")

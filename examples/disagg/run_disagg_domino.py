@@ -61,6 +61,7 @@ def run_consumer(args) -> None:
             "lambda_start": args.lambda_base_start,
             "decay_ratio": args.lambda_base_decay_ratio,
             "logit_chunk_size": args.domino_logit_chunk_size,
+            "metrics_interval": max(1, int(os.environ.get("DISAGG_LOG_INTERVAL", "1"))),
         },
     )
 

@@ -16,7 +16,12 @@ import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import (
+    FullStateDictConfig,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -346,7 +351,10 @@ def save_checkpoint(args, epoch, step, domino_model, draft_model, optimizer):
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(domino_model, StateDictType.FULL_STATE_DICT):
+    full_state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(
+        domino_model, StateDictType.FULL_STATE_DICT, full_state_config
+    ):
         state_dict = domino_model.state_dict()
         draft_state_dict = {
             k.replace("draft_model.", ""): v

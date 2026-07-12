@@ -17,6 +17,7 @@ ref source + store the Trainer is handed — the loader IS the stream.
 
 from __future__ import annotations
 
+import os
 from functools import partial
 from typing import Optional
 
@@ -175,15 +176,19 @@ class Trainer:
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
-            sharding_strategy=(
-                "FULL_SHARD" if spec.name == "domino" else "SHARD_GRAD_OP"
-            ),
+            # Keep the checkpoint-compatible runtime default. Memory-oriented
+            # launchers opt into FULL_SHARD through the existing FSDP_SHARDING
+            # environment override.
+            sharding_strategy="SHARD_GRAD_OP",
         )
         backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-        if spec.name == "domino":
+        domino_auto_wrap = (
+            spec.name == "domino" and os.environ.get("FSDP_AUTO_WRAP", "0") == "1"
+        )
+        if domino_auto_wrap:
             auto_wrap_policy, ignored_modules = _fsdp_wrap_options(model)
             wrapped = backend.prepare_model(
                 model,
@@ -192,7 +197,7 @@ class Trainer:
                 ignored_modules=ignored_modules,
             )
         else:
-            # Preserve the existing backend call contract for every other strategy.
+            # Preserve the root-wrap layout unless Domino explicitly opts in.
             wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
         if resume is not None:
             backend.load_state_dict(resume["backend"])

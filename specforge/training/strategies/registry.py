@@ -362,12 +362,14 @@ def _make_domino_strategy(
     lambda_start=1.0,
     decay_ratio=0.5,
     logit_chunk_size=0,
+    metrics_interval=1,
 ):
     return DominoTrainStrategy(
         wrapped,
         lambda_start=lambda_start,
         decay_ratio=decay_ratio,
         logit_chunk_size=logit_chunk_size,
+        metrics_interval=metrics_interval,
     )
 
 

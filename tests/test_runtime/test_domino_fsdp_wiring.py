@@ -1,11 +1,14 @@
 # coding=utf-8
 """CPU/mock checks for Domino-only FSDP memory options."""
 
+import ast
 import importlib.util
+import os
 import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch.nn as nn
 
@@ -104,7 +107,7 @@ class _Composite(nn.Module):
 
 
 class TestDominoFSDPWiring(unittest.TestCase):
-    def _build(self, strategy_name):
+    def _build(self, strategy_name, *, auto_wrap=False):
         trainer_module = _load_trainer_module()
         captured = {}
 
@@ -157,33 +160,43 @@ class TestDominoFSDPWiring(unittest.TestCase):
                 return object()
 
         model = _Composite()
-        trainer_module.Trainer(
-            spec=Spec(),
-            controller=ControlPlane(),
-            store=object(),
-            ref_source={"queue": object()},
-            model=model,
-            target_head=None,
-            optimizer_factory=None,
-            run_id="run",
-            output_dir="/tmp/out",
-            batch_size=1,
-            accumulation_steps=1,
-            num_epochs=1,
-            max_steps=1,
-            save_interval=0,
-            eval_interval=0,
-            tp_size=1,
-            sp_ulysses_size=1,
-            sp_ring_size=1,
-            logger=None,
-            log_interval=1,
-            collate_fn=lambda features: features,
-        )
+        with mock.patch.dict(os.environ, {"FSDP_AUTO_WRAP": "1" if auto_wrap else "0"}):
+            trainer_module.Trainer(
+                spec=Spec(),
+                controller=ControlPlane(),
+                store=object(),
+                ref_source={"queue": object()},
+                model=model,
+                target_head=None,
+                optimizer_factory=None,
+                run_id="run",
+                output_dir="/tmp/out",
+                batch_size=1,
+                accumulation_steps=1,
+                num_epochs=1,
+                max_steps=1,
+                save_interval=0,
+                eval_interval=0,
+                tp_size=1,
+                sp_ulysses_size=1,
+                sp_ring_size=1,
+                logger=None,
+                log_interval=1,
+                collate_fn=lambda features: features,
+            )
         return model, captured
 
-    def test_domino_excludes_frozen_target_modules_and_wraps_draft_blocks(self):
+    def test_domino_keeps_checkpoint_compatible_root_wrap_by_default(self):
         model, options = self._build("domino")
+        self.assertEqual(options["optimizer_target"], model.draft_model)
+        self.assertNotIn("auto_wrap_policy", options)
+        self.assertNotIn("ignored_modules", options)
+        self.assertEqual(
+            options["parallel_options"]["sharding_strategy"], "SHARD_GRAD_OP"
+        )
+
+    def test_domino_auto_wrap_is_explicit_opt_in(self):
+        model, options = self._build("domino", auto_wrap=True)
         self.assertEqual(options["optimizer_target"], model.draft_model)
         self.assertEqual(
             options["ignored_modules"], [model.lm_head, model.embed_tokens]
@@ -191,15 +204,48 @@ class TestDominoFSDPWiring(unittest.TestCase):
         policy = options["auto_wrap_policy"]
         self.assertIsNotNone(policy)
         self.assertEqual(policy.keywords["transformer_layer_cls"], {_TransformerBlock})
-        self.assertEqual(options["parallel_options"]["sharding_strategy"], "FULL_SHARD")
+        self.assertEqual(
+            options["parallel_options"]["sharding_strategy"], "SHARD_GRAD_OP"
+        )
 
     def test_non_domino_strategies_do_not_receive_domino_fsdp_options(self):
-        model, options = self._build("dflash")
+        model, options = self._build("dflash", auto_wrap=True)
         self.assertEqual(options["optimizer_target"], model.draft_model)
         self.assertNotIn("auto_wrap_policy", options)
         self.assertNotIn("ignored_modules", options)
         self.assertEqual(
             options["parallel_options"]["sharding_strategy"], "SHARD_GRAD_OP"
+        )
+
+    def test_standalone_checkpoint_offloads_full_state_to_rank0_cpu(self):
+        repo = Path(__file__).resolve().parents[2]
+        tree = ast.parse((repo / "scripts" / "train_domino.py").read_text())
+        configs = []
+        state_dict_calls = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                if isinstance(node.value.func, ast.Name) and node.value.func.id == (
+                    "FullStateDictConfig"
+                ):
+                    configs.append(node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "state_dict_type":
+                    state_dict_calls.append(node)
+
+        self.assertEqual(len(configs), 1)
+        config = configs[0]
+        keywords = {keyword.arg: keyword.value for keyword in config.value.keywords}
+        self.assertTrue(ast.literal_eval(keywords["offload_to_cpu"]))
+        self.assertTrue(ast.literal_eval(keywords["rank0_only"]))
+        config_name = config.targets[0].id
+        self.assertTrue(
+            any(
+                any(
+                    isinstance(arg, ast.Name) and arg.id == config_name
+                    for arg in call.args
+                )
+                for call in state_dict_calls
+            )
         )
 
 
