@@ -326,7 +326,7 @@ def save_checkpoint(args, epoch, step, mtp_model, draft_model, optimizer):
         # only when it is shared with the target model (it is restored from the
         # target at inference via sharing); when ``--not-share-lm-head`` is set
         # the draft owns a separate lm_head and we keep it.
-        if args.not_share_lm_head:
+        if args.no_share_lm_head:
             draft_state_dict = {
                 k.replace("draft_model.", ""): v
                 for k, v in state_dict.items()

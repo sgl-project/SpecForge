@@ -30,12 +30,36 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Config,
     Qwen3MLP,
     Qwen3PreTrainedModel,
-    Qwen3RMSNorm,
     eager_attention_forward,
     rotate_half,
 )
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+
+
+class Qwen3_5RMSNorm(nn.Module):
+    """Gemma-style RMSNorm used by Qwen3.5 in vLLM.
+
+    The official Qwen3.5 checkpoints and vLLM use ``x * (1 + weight)`` instead of
+    the standard HuggingFace ``x * weight``.  The parameter is initialized to
+    zeros so that ``1 + weight`` starts at one.  This must match the inference
+    implementation, otherwise every RMSNorm weight trained in SpecForge would be
+    off by +1.0 when loaded into vLLM.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        # Gemma-style: multiply by (1 + weight).
+        hidden_states = hidden_states * (1.0 + self.weight.float())
+        return hidden_states.to(input_dtype)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -137,8 +161,8 @@ class Qwen3MTPAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -222,8 +246,10 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3MTPAttention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(
+        self.input_layernorm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -289,10 +315,10 @@ class Qwen3_5MTPModel(nn.Module):
         self.config = config
 
         # Fusion projection: fc( concat( norm(input_embeds), norm(target_hidden) ) )
-        self.pre_fc_norm_embedding = Qwen3RMSNorm(
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = Qwen3RMSNorm(
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
@@ -302,7 +328,7 @@ class Qwen3_5MTPModel(nn.Module):
         mtp_config = copy.deepcopy(config)
         mtp_config.num_hidden_layers = 1
         self.layers = nn.ModuleList([Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)])
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = PartialRotaryEmbedding(
             mtp_config,
             getattr(

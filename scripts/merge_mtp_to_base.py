@@ -111,8 +111,10 @@ def _copy_shared_embeddings(
             mtp_state["mtp.embed_tokens.weight"] = base_state[embed_key]
             print(f"  copied {embed_key} -> mtp.embed_tokens.weight")
         else:
-            print("  warning: base embed_tokens.weight not found; "
-                  "mtp.embed_tokens will be randomly initialized")
+            print(
+                "  warning: base embed_tokens.weight not found; "
+                "mtp.embed_tokens will be randomly initialized"
+            )
 
     if not tie_word_embeddings and "mtp.lm_head.weight" not in mtp_state:
         lm_head_key = _find_base_key(
@@ -125,8 +127,10 @@ def _copy_shared_embeddings(
             mtp_state["mtp.lm_head.weight"] = base_state[lm_head_key]
             print(f"  copied {lm_head_key} -> mtp.lm_head.weight")
         else:
-            print("  warning: base lm_head.weight not found; "
-                  "mtp.lm_head will be randomly initialized")
+            print(
+                "  warning: base lm_head.weight not found; "
+                "mtp.lm_head will be randomly initialized"
+            )
 
     return mtp_state
 
@@ -250,7 +254,9 @@ def merge_checkpoints(
                 with safe_open(shard_path, framework="pt") as f:
                     if candidate in f.keys():
                         base_state[candidate] = f.get_tensor(candidate)
-            mtp_state = _copy_shared_embeddings(base_state, mtp_state, tie_word_embeddings)
+            mtp_state = _copy_shared_embeddings(
+                base_state, mtp_state, tie_word_embeddings
+            )
 
         # Write MTP weights into a dedicated shard so we do not need to rewrite
         # the (large) base model shards.

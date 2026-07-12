@@ -118,32 +118,29 @@ def _generate_mtp_data_hf(
     loss_mask: torch.Tensor,
     **kwargs,
 ) -> Eagle3TargetOutput:
-    """HF backend: capture last hidden state via forward hook on the last layer."""
+    """HF backend: capture the model's final hidden state (post-final-norm).
+
+    vLLM/SGLang pass the target model's *post-final-RMSNorm* hidden states to
+    the MTP draft (Qwen3NextModel.forward returns self.norm(...)).
+    The previous hook-on-last-layer implementation captured the *pre-norm*
+    output, creating a train/serve distribution mismatch and collapsing the
+    speculative acceptance rate.  We now call the HF language model directly
+    and take its last hidden state output, which is the post-norm representation.
+    """
     if kwargs:
         logger.debug(f"unused kwargs {list(kwargs.keys())}")
 
-    layers = _get_transformer_layers(target)
-    last_hidden_state = [None]
-
-    def get_hook():
-        def hook(module, inp, out):
-            last_hidden_state[0] = out[0] if isinstance(out, tuple) else out
-
-        return hook
-
-    handle = layers[-1].register_forward_hook(get_hook())
-    try:
-        _get_language_model(target)(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=False,
-            output_attentions=False,
-            use_cache=False,
-        )
-    finally:
-        handle.remove()
-
-    last_hidden_states = last_hidden_state[0]
+    language_model = _get_language_model(target)
+    lm_output = language_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=False,
+        output_attentions=False,
+        use_cache=False,
+    )
+    # HF base models return BaseModelOutputWithPooling; the last hidden state
+    # is post-final-norm and matches what vLLM feeds into the MTP module.
+    last_hidden_states = lm_output[0]
     loss_mask = loss_mask[..., None].to(last_hidden_states.device)
 
     return Eagle3TargetOutput(
