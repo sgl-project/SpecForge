@@ -327,10 +327,14 @@ class DominoTrainStrategy(DraftTrainStrategy):
         *,
         lambda_start: float = 1.0,
         decay_ratio: float = 0.5,
+        logit_chunk_size: int = 0,
     ) -> None:
+        if logit_chunk_size < 0:
+            raise ValueError("logit_chunk_size must be non-negative")
         self.domino_model = domino_model
         self.lambda_start = lambda_start
         self.decay_ratio = decay_ratio
+        self.logit_chunk_size = logit_chunk_size
 
     def trainable_module(self) -> nn.Module:
         return self.domino_model
@@ -358,6 +362,8 @@ class DominoTrainStrategy(DraftTrainStrategy):
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
             lambda_base=lambda_base,
+            logit_chunk_size=self.logit_chunk_size,
+            compute_metrics=True,
         )
         return StepOutput(
             loss=loss,

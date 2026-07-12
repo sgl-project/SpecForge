@@ -5,10 +5,14 @@ The idea of in-place backward pass is from Liger-Kernel.
 See the original Liger-Kernel repository at https://github.com/linkedin/Liger-Kernel.
 """
 
+from typing import Dict, Tuple
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch.utils.checkpoint import checkpoint
 
 
 # Reference implementation
@@ -19,6 +23,220 @@ def _compute_loss(logits, target_p, position_mask):
     plogp = target_p * out_logp
     loss = -torch.sum(position_mask * plogp, 2).mean()
     return loss
+
+
+def compute_accept_len(
+    pred_ids_4d: torch.Tensor,
+    target_ids_4d: torch.Tensor,
+    valid_mask_4d: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the consecutive accepted token count for each block."""
+    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
+    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
+    return accept_prefix.sum(dim=2).float()
+
+
+def _compute_domino_chunk_weighted_losses(
+    output_hidden_flat: torch.Tensor,
+    prefix_states_flat: torch.Tensor,
+    flat_targets: torch.Tensor,
+    flat_weights: torch.Tensor,
+    valid_token_count: torch.Tensor,
+    lambda_base: float,
+    start: int,
+    end: int,
+    lm_head: nn.Module,
+    embed_proj: nn.Module,
+    block_size: int,
+    suffix_start: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    idx = torch.arange(start, end, device=output_hidden_flat.device)
+    pos_in_block = idx % block_size
+    block_idx = idx // block_size
+
+    chunk_hidden = output_hidden_flat[idx]
+    chunk_targets = flat_targets[idx]
+    chunk_weights = flat_weights[idx]
+    base_logits = lm_head(chunk_hidden)
+
+    base_loss_per_token = F.cross_entropy(base_logits, chunk_targets, reduction="none")
+    base_numer = (base_loss_per_token * chunk_weights).sum()
+
+    final_numer = torch.zeros_like(base_numer)
+    prefix_mask = pos_in_block < suffix_start
+    if prefix_mask.any():
+        final_numer = (
+            final_numer
+            + (base_loss_per_token[prefix_mask] * chunk_weights[prefix_mask]).sum()
+        )
+
+    suffix_mask = ~prefix_mask
+    if suffix_mask.any():
+        suffix_idx = block_idx[suffix_mask] * (block_size - suffix_start) + (
+            pos_in_block[suffix_mask] - suffix_start
+        )
+        concat_features = torch.cat(
+            [chunk_hidden[suffix_mask], prefix_states_flat[suffix_idx]], dim=-1
+        )
+        final_logits = base_logits[suffix_mask] + embed_proj(concat_features)
+        final_loss_per_token = F.cross_entropy(
+            final_logits, chunk_targets[suffix_mask], reduction="none"
+        )
+        final_numer = (
+            final_numer + (final_loss_per_token * chunk_weights[suffix_mask]).sum()
+        )
+
+    final_loss = final_numer / valid_token_count
+    base_loss = base_numer / valid_token_count
+    loss = (1.0 - lambda_base) * final_loss + lambda_base * base_loss
+    return loss, final_loss, base_loss
+
+
+def compute_domino_chunked_weighted_losses(
+    output_hidden: torch.Tensor,
+    prefix_states: torch.Tensor,
+    target_ids: torch.Tensor,
+    weight_mask: torch.Tensor,
+    lambda_base: float,
+    logit_chunk_size: int,
+    lm_head: nn.Module,
+    embed_proj: nn.Module,
+    block_size: int,
+    suffix_start: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute Domino CE in checkpointed token chunks to bound logit memory."""
+    if logit_chunk_size <= 0:
+        raise ValueError("logit_chunk_size must be positive")
+
+    output_hidden_flat = output_hidden.reshape(-1, output_hidden.shape[-1])
+    prefix_states_flat = prefix_states.reshape(-1, prefix_states.shape[-1])
+    flat_targets = target_ids.reshape(-1)
+    flat_weights = weight_mask.reshape(-1)
+    valid_token_count = flat_weights.sum() + 1e-6
+
+    loss = torch.zeros((), device=output_hidden.device)
+    final_loss = torch.zeros((), device=output_hidden.device)
+    base_loss = torch.zeros((), device=output_hidden.device)
+    total_tokens = flat_targets.numel()
+
+    for start in range(0, total_tokens, logit_chunk_size):
+        end = min(total_tokens, start + logit_chunk_size)
+
+        def chunk_fn(hidden_flat, prefix_flat, start=start, end=end):
+            return _compute_domino_chunk_weighted_losses(
+                output_hidden_flat=hidden_flat,
+                prefix_states_flat=prefix_flat,
+                flat_targets=flat_targets,
+                flat_weights=flat_weights,
+                valid_token_count=valid_token_count,
+                lambda_base=lambda_base,
+                start=start,
+                end=end,
+                lm_head=lm_head,
+                embed_proj=embed_proj,
+                block_size=block_size,
+                suffix_start=suffix_start,
+            )
+
+        chunk_loss, chunk_final_loss, chunk_base_loss = checkpoint(
+            chunk_fn,
+            output_hidden_flat,
+            prefix_states_flat,
+            use_reentrant=False,
+        )
+        loss = loss + chunk_loss
+        final_loss = final_loss + chunk_final_loss.detach()
+        base_loss = base_loss + chunk_base_loss.detach()
+
+    return loss, final_loss, base_loss
+
+
+@torch.no_grad()
+def compute_domino_chunked_metrics(
+    output_hidden: torch.Tensor,
+    prefix_states: torch.Tensor,
+    target_ids: torch.Tensor,
+    eval_weight_mask: torch.Tensor,
+    final_loss: torch.Tensor,
+    base_loss: torch.Tensor,
+    lambda_base: float,
+    logit_chunk_size: int,
+    lm_head: nn.Module,
+    embed_proj: nn.Module,
+    block_size: int,
+    suffix_start: int,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute Domino predictions and metrics without materializing full logits."""
+    if logit_chunk_size <= 0:
+        raise ValueError("logit_chunk_size must be positive")
+
+    output_hidden_flat = output_hidden.reshape(-1, output_hidden.shape[-1])
+    prefix_states_flat = prefix_states.reshape(-1, prefix_states.shape[-1])
+    flat_targets = target_ids.reshape(-1)
+    binary_eval_mask = eval_weight_mask.reshape(-1)
+    actual_token_count = binary_eval_mask.sum() + 1e-6
+    total_tokens = flat_targets.numel()
+
+    pred_ids = torch.empty_like(flat_targets)
+    base_pred_ids = torch.empty_like(flat_targets)
+
+    for start in range(0, total_tokens, logit_chunk_size):
+        end = min(total_tokens, start + logit_chunk_size)
+        idx = torch.arange(start, end, device=output_hidden.device)
+        pos_in_block = idx % block_size
+        block_idx = idx // block_size
+        chunk_hidden = output_hidden_flat[idx]
+        base_logits = lm_head(chunk_hidden)
+        chunk_base_pred_ids = torch.argmax(base_logits, dim=-1)
+        chunk_pred_ids = chunk_base_pred_ids.clone()
+
+        suffix_mask = pos_in_block >= suffix_start
+        if suffix_mask.any():
+            suffix_idx = block_idx[suffix_mask] * (block_size - suffix_start) + (
+                pos_in_block[suffix_mask] - suffix_start
+            )
+            concat_features = torch.cat(
+                [chunk_hidden[suffix_mask], prefix_states_flat[suffix_idx]], dim=-1
+            )
+            final_logits = base_logits[suffix_mask] + embed_proj(concat_features)
+            chunk_pred_ids[suffix_mask] = torch.argmax(final_logits, dim=-1)
+
+        pred_ids[idx] = chunk_pred_ids
+        base_pred_ids[idx] = chunk_base_pred_ids
+
+    correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+    accuracy = correct.sum().float() / actual_token_count
+
+    base_correct = (base_pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+    base_accuracy = base_correct.sum().float() / actual_token_count
+
+    bsz, n, bs = target_ids.shape
+    valid_mask_4d = (eval_weight_mask > 0).bool()
+    pred_accept_len = compute_accept_len(
+        pred_ids.view(bsz, n, bs), target_ids, valid_mask_4d
+    )
+    base_accept_len = compute_accept_len(
+        base_pred_ids.view(bsz, n, bs), target_ids, valid_mask_4d
+    )
+
+    valid_block_mask = valid_mask_4d.any(dim=2)
+    num_valid_blocks = valid_block_mask.sum().float() + 1e-6
+    avg_accept_len = (
+        (pred_accept_len + 1.0) * valid_block_mask.float()
+    ).sum() / num_valid_blocks
+    base_avg_accept_len = (
+        (base_accept_len + 1.0) * valid_block_mask.float()
+    ).sum() / num_valid_blocks
+
+    metrics = {
+        "final_loss": final_loss.detach(),
+        "base_loss": base_loss.detach(),
+        "base_accuracy": base_accuracy.detach(),
+        "accept_len": avg_accept_len.detach(),
+        "base_accept_len": base_avg_accept_len.detach(),
+        "lambda_base": torch.tensor(lambda_base, device=final_loss.device),
+    }
+    return accuracy, metrics
 
 
 def _calculate_settings(n):

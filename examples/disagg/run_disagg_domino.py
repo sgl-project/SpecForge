@@ -60,6 +60,7 @@ def run_consumer(args) -> None:
         strategy_kwargs={
             "lambda_start": args.lambda_base_start,
             "decay_ratio": args.lambda_base_decay_ratio,
+            "logit_chunk_size": args.domino_logit_chunk_size,
         },
     )
 

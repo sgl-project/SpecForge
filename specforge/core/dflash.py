@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from specforge.core.loss import (
+    compute_accept_len,
+    compute_domino_chunked_metrics,
+    compute_domino_chunked_weighted_losses,
+)
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
 try:
@@ -30,17 +35,6 @@ _VALID_LOSS_TYPES = {
     "dpace-continuation-value-only",
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
-
-
-def compute_accept_len(
-    pred_ids_4d: torch.Tensor,
-    target_ids_4d: torch.Tensor,
-    valid_mask_4d: torch.Tensor,
-) -> torch.Tensor:
-    """Compute per-block acceptance length."""
-    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
-    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
-    return accept_prefix.sum(dim=2).float()
 
 
 def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
@@ -595,6 +589,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         lambda_base: float = 0.0,
+        logit_chunk_size: int = 0,
+        compute_metrics: bool = True,
     ):
         """Parallel Domino training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -624,22 +620,12 @@ class OnlineDominoModel(OnlineDFlashModel):
             safe_target_indices,
         )
 
-        bsz, n, bs = target_ids.shape
-        base_logits = self.lm_head(output_hidden)
         hidden4d, prev_ids = self._build_domino_head_inputs(
             input_ids=input_ids,
             anchor_positions=anchor_positions,
             target_ids=target_ids,
             output_hidden=output_hidden,
         )
-        base_logits4d = base_logits.reshape(bsz, n, bs, -1)
-        final_logits = self._apply_domino_head(
-            base_logits4d=base_logits4d,
-            hidden4d=hidden4d,
-            prev_ids=prev_ids,
-            target_ids=target_ids,
-        ).reshape(bsz, n * bs, -1)
-
         weight_mask = (
             block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         )
@@ -666,6 +652,59 @@ class OnlineDominoModel(OnlineDFlashModel):
                 -(k - offset).clamp(min=0).float() / self.loss_decay_gamma
             )
             weight_mask = weight_mask * decay_weights
+
+        bsz, n, bs = target_ids.shape
+        if logit_chunk_size > 0:
+            head_token_ids = prev_ids if self.shift_label else target_ids
+            prefix_states = self.draft_model.compute_prefix_states(
+                self.embed_tokens(head_token_ids)
+            )
+            loss, final_loss, base_loss = compute_domino_chunked_weighted_losses(
+                output_hidden=output_hidden,
+                prefix_states=prefix_states,
+                target_ids=target_ids,
+                weight_mask=weight_mask,
+                lambda_base=lambda_base,
+                logit_chunk_size=logit_chunk_size,
+                lm_head=self.lm_head,
+                embed_proj=self.draft_model.embed_proj,
+                block_size=self.block_size,
+                suffix_start=self.draft_model.suffix_start,
+            )
+            accuracy_denom = binary_eval_mask.sum()
+            if compute_metrics:
+                accuracy, metrics = compute_domino_chunked_metrics(
+                    output_hidden=output_hidden,
+                    prefix_states=prefix_states,
+                    target_ids=target_ids,
+                    eval_weight_mask=eval_weight_mask,
+                    final_loss=final_loss,
+                    base_loss=base_loss,
+                    lambda_base=lambda_base,
+                    logit_chunk_size=logit_chunk_size,
+                    lm_head=self.lm_head,
+                    embed_proj=self.draft_model.embed_proj,
+                    block_size=self.block_size,
+                    suffix_start=self.draft_model.suffix_start,
+                )
+            else:
+                accuracy = torch.full((), float("nan"), device=device)
+                metrics = {
+                    "final_loss": final_loss.detach(),
+                    "base_loss": base_loss.detach(),
+                    "lambda_base": torch.tensor(lambda_base, device=device),
+                }
+            metrics["accuracy_denom"] = accuracy_denom
+            return loss, accuracy, metrics
+
+        base_logits = self.lm_head(output_hidden)
+        base_logits4d = base_logits.reshape(bsz, n, bs, -1)
+        final_logits = self._apply_domino_head(
+            base_logits4d=base_logits4d,
+            hidden4d=hidden4d,
+            prev_ids=prev_ids,
+            target_ids=target_ids,
+        ).reshape(bsz, n * bs, -1)
 
         loss, final_loss, base_loss, flat_logits, flat_base_logits, flat_targets = (
             self._compute_weighted_losses(

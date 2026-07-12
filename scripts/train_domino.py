@@ -9,6 +9,7 @@ import os
 import shutil
 import time
 import warnings
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -16,6 +17,7 @@ import torch.distributed as dist
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
@@ -123,6 +125,15 @@ def parse_args():
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
+        "--domino-logit-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "If positive, checkpoint and compute Domino vocabulary logits in "
+            "token chunks of this size. Zero keeps the full-logits path."
+        ),
+    )
+    training_group.add_argument(
         "--lambda-base-start",
         type=float,
         default=1.0,
@@ -133,6 +144,17 @@ def parse_args():
         type=float,
         default=0.5,
         help="Fraction of total steps used to decay lambda_base to 0.",
+    )
+    training_group.add_argument(
+        "--fsdp-sharding-strategy",
+        choices=["full_shard", "shard_grad_op"],
+        default="full_shard",
+        help="FSDP sharding strategy for the trainable Domino draft model.",
+    )
+    training_group.add_argument(
+        "--disable-fsdp-auto-wrap",
+        action="store_true",
+        help="Use a single root FSDP unit instead of wrapping decoder blocks.",
     )
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -538,16 +560,49 @@ def main():
         shift_label=draft_model.shift_label,
     )
 
+    sharding_strategy = {
+        "full_shard": ShardingStrategy.FULL_SHARD,
+        "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
+    }[args.fsdp_sharding_strategy]
+    auto_wrap_policy = None
+    if not args.disable_fsdp_auto_wrap:
+        block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
+        block_classes = {
+            type(module)
+            for module in domino_model.modules()
+            if type(module).__name__ in block_names
+        }
+        if block_classes:
+            auto_wrap_policy = partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=block_classes,
+            )
+        else:
+            print_with_rank(
+                "No draft decoder block class found; using one root FSDP unit."
+            )
+
     domino_model = FSDP(
         domino_model,
         use_orig_params=True,
+        auto_wrap_policy=auto_wrap_policy,
+        ignored_modules=[
+            target_components.lm_head,
+            target_components.embed_tokens,
+        ],
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.float32,
         ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        sharding_strategy=sharding_strategy,
+        limit_all_gathers=True,
     )
-    print_with_rank("Initialized FSDP")
+    print_with_rank(
+        "Initialized FSDP "
+        f"(sharding={args.fsdp_sharding_strategy}, "
+        f"auto_wrap={auto_wrap_policy is not None}, "
+        "ignored_frozen_target=True)"
+    )
 
     start_epoch = ckpt_info[0]
     global_step = ckpt_info[1]
@@ -578,6 +633,7 @@ def main():
     print_on_rank0("Tracker initialized successfully.")
 
     last_time = time.time()
+    last_accuracy = torch.tensor(float("nan"), device=device)
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -610,12 +666,20 @@ def main():
                 decay_ratio=args.lambda_base_decay_ratio,
             )
 
+            compute_metrics = (
+                args.domino_logit_chunk_size <= 0
+                or global_step % args.log_interval == 0
+            )
             loss, accuracy, metrics = domino_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
                 lambda_base=lambda_base,
+                logit_chunk_size=args.domino_logit_chunk_size,
+                compute_metrics=compute_metrics,
             )
+            if compute_metrics:
+                last_accuracy = accuracy.detach()
 
             (loss / args.accumulation_steps).backward()
 
@@ -649,7 +713,7 @@ def main():
                 progress_bar.set_postfix(
                     {
                         "loss": f"{loss.item():.4f}",
-                        "acc": f"{accuracy.item():.4f}",
+                        "acc": f"{last_accuracy.item():.4f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

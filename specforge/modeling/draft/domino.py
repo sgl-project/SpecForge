@@ -104,7 +104,20 @@ class DominoDraftModel(DFlashDraftModel):
         if prev_token_embeddings is None:
             raise ValueError("DominoDraftModel requires prev_token_embeddings")
 
-        bsz, n_blocks, block_size = base_logits.shape[:3]
+        prefix_states = self.compute_prefix_states(prev_token_embeddings)
+        z_n = hidden_states[:, :, self.suffix_start :, :]
+        concat_features = torch.cat([z_n, prefix_states], dim=-1)
+        logits_e = self.embed_proj(concat_features)
+
+        prefix_logits = base_logits[:, :, : self.suffix_start, :]
+        suffix_logits = base_logits[:, :, self.suffix_start :, :] + logits_e
+        return torch.cat([prefix_logits, suffix_logits], dim=2)
+
+    def compute_prefix_states(
+        self, prev_token_embeddings: torch.Tensor
+    ) -> torch.Tensor:
+        """Return GRU prefix states used by both full and chunked logit heads."""
+        bsz, n_blocks, block_size = prev_token_embeddings.shape[:3]
         if self.shift_label:
             gru_inputs = prev_token_embeddings.reshape(bsz * n_blocks, block_size, -1)
             gru_out = self._run_gru(gru_inputs)
@@ -117,14 +130,7 @@ class DominoDraftModel(DFlashDraftModel):
             gru_out = self._run_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n_blocks, block_size - 1, -1)
             prefix_states = gru_out[:, :, self.suffix_start - 1 :, :]
-
-        z_n = hidden_states[:, :, self.suffix_start :, :]
-        concat_features = torch.cat([z_n, prefix_states], dim=-1)
-        logits_e = self.embed_proj(concat_features)
-
-        prefix_logits = base_logits[:, :, : self.suffix_start, :]
-        suffix_logits = base_logits[:, :, self.suffix_start :, :] + logits_e
-        return torch.cat([prefix_logits, suffix_logits], dim=2)
+        return prefix_states
 
 
 __all__ = ["DominoDraftModel"]

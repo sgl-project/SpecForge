@@ -17,6 +17,7 @@ ref source + store the Trainer is handed — the loader IS the stream.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Optional
 
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
@@ -24,6 +25,34 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 from specforge.training.strategies.registry import StrategySpec, resolve_strategy
+
+
+def _fsdp_wrap_options(model):
+    """Build FSDP options that keep frozen target weights outside the wrapper."""
+    ignored_modules = []
+    for name in ("lm_head", "embed_tokens"):
+        module = getattr(model, name, None)
+        if module is not None and all(
+            not parameter.requires_grad for parameter in module.parameters()
+        ):
+            ignored_modules.append(module)
+
+    auto_wrap_policy = None
+    draft_model = getattr(model, "draft_model", None)
+    block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
+    block_classes = {
+        type(module)
+        for module in model.modules()
+        if type(module).__name__ in block_names
+    }
+    if block_classes:
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=block_classes,
+        )
+    return auto_wrap_policy, ignored_modules or None
 
 
 class Trainer:
@@ -143,13 +172,28 @@ class Trainer:
             del state, saved_weights
 
         parallel = ParallelConfig.from_distributed(
-            tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
+            tp_size=tp_size,
+            sp_ulysses_size=sp_ulysses_size,
+            sp_ring_size=sp_ring_size,
+            sharding_strategy=(
+                "FULL_SHARD" if spec.name == "domino" else "SHARD_GRAD_OP"
+            ),
         )
         backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-        wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+        if spec.name == "domino":
+            auto_wrap_policy, ignored_modules = _fsdp_wrap_options(model)
+            wrapped = backend.prepare_model(
+                model,
+                optimizer_target=model.draft_model,
+                auto_wrap_policy=auto_wrap_policy,
+                ignored_modules=ignored_modules,
+            )
+        else:
+            # Preserve the existing backend call contract for every other strategy.
+            wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
         if resume is not None:
             backend.load_state_dict(resume["backend"])
         strategy = spec.make_strategy(

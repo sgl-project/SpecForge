@@ -165,6 +165,8 @@ class FSDPTrainingBackend(TrainingBackend):
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
+        auto_wrap_policy=None,
+        ignored_modules=None,
     ) -> nn.Module:
         """Register the trainable module, FSDP-wrapping it unless ``wrap=False``
         (single-rank / equivalence runs where sharding would be a no-op)."""
@@ -185,6 +187,9 @@ class FSDPTrainingBackend(TrainingBackend):
                 ),
                 sharding_strategy=sharding,
                 process_group=pc.fsdp_process_group,
+                auto_wrap_policy=auto_wrap_policy,
+                ignored_modules=ignored_modules,
+                limit_all_gathers=True,
             )
             self.module = model
             self._wrapped = True
