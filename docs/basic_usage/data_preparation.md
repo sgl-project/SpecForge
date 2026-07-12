@@ -59,6 +59,96 @@ For reasoning models, add `--reasoning save` to store `reasoning_content` in the
 
 For maximum performance, we recommend to scale the number of GPUs to regenerate the dataset in data parallel mode. To do this, you can simply add more server addresses to the `--server-address` argument, e.g. `--server-address localhost:30000 localhost:30001 localhost:30002 localhost:30003`.
 
+### Qwen ShareGPT recipes
+
+The Qwen recipe wraps regeneration, complete-row accounting, and output
+validation. It expects one or more SGLang servers to already be running; it does
+not launch or stop the servers itself.
+
+For Qwen3-8B non-reasoning regeneration, start a target server in one terminal:
+
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B \
+    --tp-size 1 \
+    --dtype bfloat16 \
+    --mem-fraction-static 0.8 \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+After `curl --fail http://127.0.0.1:30000/health` succeeds, run the recipe from
+the SpecForge repository root:
+
+```bash
+MODEL_PROFILE=qwen3-8b \
+INPUT_FILE=./cache/dataset/sharegpt_train.jsonl \
+OUTPUT_FILE=./cache/dataset/sharegpt_train_regen_qwen3_8b_temperature0_non_reasoning.jsonl \
+SERVER_ADDRESSES="localhost:30000" \
+bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
+```
+
+This profile sets temperature to zero, disables thinking through
+`chat_template_kwargs.enable_thinking=false`, and rejects non-empty structured
+reasoning in successful rows.
+
+For Qwen3.6-27B structured-reasoning regeneration, start SGLang with the Qwen3
+reasoning parser so the OpenAI-compatible response includes
+`reasoning_content`:
+
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3.6-27B \
+    --tp-size 1 \
+    --dtype bfloat16 \
+    --mem-fraction-static 0.8 \
+    --reasoning-parser qwen3 \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+After `curl --fail http://127.0.0.1:30000/health` succeeds, run:
+
+```bash
+MODEL_PROFILE=qwen3.6-27b \
+INPUT_FILE=./cache/dataset/sharegpt_train.jsonl \
+OUTPUT_FILE=./cache/dataset/sharegpt_train_regen_qwen3.6-27b_temperature0_reasoning.jsonl \
+SERVER_ADDRESSES="localhost:30000" \
+bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
+```
+
+The default maximum completion lengths are 4096 tokens for Qwen3-8B and 32768
+tokens for Qwen3.6-27B. The server context length must accommodate both the
+rendered prompt and `MAX_TOKENS`; override `MAX_TOKENS` when using a shorter
+server context.
+
+`INPUT_FILE` may point to another dataset without changing the recipe as long
+as it is JSONL in the conversation format documented below, with a non-empty
+string `id` and alternating `user`/`assistant` messages. Always choose a fresh
+`OUTPUT_FILE`: the recipe deliberately refuses to overwrite or resume an
+existing run.
+
+For an output such as `dataset_regen.jsonl`, the recipe produces:
+
+- `dataset_regen.jsonl`: successful regenerated training rows;
+- `dataset_regen_error.jsonl`: request or generation errors;
+- `dataset_regen_skipped.jsonl`: schema-invalid inputs and outputs excluded by the
+  selected reasoning contract.
+
+The run passes accounting only when
+`success + error + skipped == input`. It prints the success fraction without a
+fixed minimum threshold, then strictly validates every successful row,
+including its conversation structure, reasoning contract, and absence of raw
+`<think>` markers.
+
+To distribute regeneration across independently launched servers, provide all
+addresses as a space-separated list, for example:
+
+```bash
+SERVER_ADDRESSES="localhost:30000 localhost:30010" \
+CONCURRENCY=64 \
+bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
+```
 
 ## 🤩 Prepare your own dataset
 
