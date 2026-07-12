@@ -471,6 +471,16 @@ def sanity_check(args: Namespace) -> None:
             raise ValueError("shard_target_output is only supported for sglang backend")
         if args.is_vlm:
             raise ValueError("shard_target_output is only supported non vlm model")
+    if (
+        args.optimizer_cpu_offload or args.draft_embedding_cpu
+    ) and dist.get_world_size() > 1:
+        # both options assume unwrapped parameters; under FSDP's flat
+        # parameter groups they would misbehave silently
+        raise ValueError(
+            "--optimizer-cpu-offload and --draft-embedding-cpu are "
+            "single-GPU options (world_size 1); they are incompatible "
+            "with the FSDP wrap used at world_size > 1"
+        )
 
 
 def sp_sanity_check(args: Namespace) -> None:
