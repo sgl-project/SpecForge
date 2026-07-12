@@ -16,9 +16,48 @@ the target via ``load_embedding``.
 from __future__ import annotations
 
 import argparse
+import glob
+import json
+import os
 from typing import Optional
 
+import torch
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+
 from specforge.export.checkpoint_io import materialize_draft, resolve_training_state
+
+
+def _load_embedding_tensor(source: str, key: str) -> torch.Tensor:
+    """Read one target embedding without materializing the target lm_head."""
+    root = source if os.path.exists(source) else snapshot_download(repo_id=source)
+    index_paths = glob.glob(os.path.join(root, "*.index.json"))
+    if len(index_paths) > 1:
+        raise FileNotFoundError(f"multiple index files found under {root}")
+    if index_paths:
+        with open(index_paths[0], encoding="utf-8") as handle:
+            weight_file = json.load(handle).get("weight_map", {}).get(key)
+        if not weight_file:
+            raise KeyError(f"embedding key {key!r} is absent from {index_paths[0]}")
+        path = os.path.join(root, weight_file)
+    else:
+        candidates = glob.glob(os.path.join(root, "*.safetensors"))
+        candidates += glob.glob(os.path.join(root, "*.bin"))
+        if len(candidates) != 1:
+            raise FileNotFoundError(
+                f"expected one model weight file under {root}, found {len(candidates)}"
+            )
+        path = candidates[0]
+
+    if path.endswith(".safetensors"):
+        with safe_open(path, framework="pt") as handle:
+            if key not in handle.keys():
+                raise KeyError(f"embedding key {key!r} is absent from {path}")
+            return handle.get_tensor(key)
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if key not in state:
+        raise KeyError(f"embedding key {key!r} is absent from {path}")
+    return state[key]
 
 
 def export_to_hf(
@@ -50,8 +89,22 @@ def export_to_hf(
                 "exclude the frozen embedding); pass embedding_source=<target "
                 "model path> so the export ships the real embedding"
             )
-        model.load_embedding(embedding_source, embedding_key=embedding_key)
+        load_embedding = getattr(model, "load_embedding", None)
+        if load_embedding is not None:
+            load_embedding(embedding_source, embedding_key=embedding_key)
     full_state = dict(model.state_dict())
+    if (
+        "embed_tokens.weight" not in full_state
+        and "embed_tokens.weight" not in state["draft_state_dict"]
+    ):
+        if not embedding_source:
+            raise ValueError(
+                "checkpoint does not contain embed_tokens.weight; pass "
+                "embedding_source=<target model path>"
+            )
+        full_state["embed_tokens.weight"] = _load_embedding_tensor(
+            embedding_source, embedding_key
+        )
     full_state.update(state["draft_state_dict"])  # trained keys win
     model.save_pretrained(output_dir, state_dict=full_state)
     return output_dir

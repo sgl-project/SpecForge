@@ -453,7 +453,10 @@ def _make_logger(args, holder: Optional[Dict] = None):
                 pass
         if logdict:
             tracker.log(logdict, step=step)
-            summary = {k.split("/")[-1]: round(v, 4) for k, v in logdict.items()}
+            # Keep machine-readable gate metrics at full float precision. Rounding
+            # here can turn loss=1.49e-4 into 1e-4 or accuracy=0.99996 into 1.0,
+            # allowing a strict overfit threshold to pass on the displayed value.
+            summary = {k.split("/")[-1]: v for k, v in logdict.items()}
             print(f"[consumer] step {step} {summary}", flush=True)
 
     return logger
