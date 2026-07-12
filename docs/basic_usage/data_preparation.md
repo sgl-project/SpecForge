@@ -57,6 +57,31 @@ python scripts/regenerate_train_data.py \
 
 For reasoning models, add `--reasoning save` to store `reasoning_content` in the regenerated dataset. To use a reasoning model with thinking disabled, add `--reasoning disable`, which forwards `chat_template_kwargs.enable_thinking=false` to the SGLang server and does not save `reasoning_content`.
 
+### Multi-turn structured reasoning
+
+A regenerated multi-turn reasoning conversation stores several assistant
+targets in one row. When training uses last-turn-only loss masking, only the
+final assistant target is supervised. Convert the validated conversation-level
+output into one generation-event row per assistant turn so every reasoning
+target is trained with the visible history available at its serving boundary:
+
+```bash
+python scripts/explode_generation_events.py \
+    --input-file-path ./cache/dataset/sharegpt_train_regen_reasoning.jsonl \
+    --output-file-path ./cache/dataset/sharegpt_train_regen_reasoning_exploded.jsonl
+```
+
+Each event ends at its current assistant target and preserves that turn's
+`reasoning_content` and visible `content`. Historical assistant messages keep
+only visible `content`; their hidden reasoning is removed from the event
+context. Train the exploded output with the entry point's
+`train_only_last_turn` option enabled.
+
+The converter accepts only successful rows with non-empty IDs, message content,
+and assistant `reasoning_content`. Invalid input is written to a skipped JSONL;
+if any turn is invalid, the entire source conversation is skipped. Output files
+must be fresh and distinct from the input.
+
 For maximum performance, we recommend to scale the number of GPUs to regenerate the dataset in data parallel mode. To do this, you can simply add more server addresses to the `--server-address` argument, e.g. `--server-address localhost:30000 localhost:30001 localhost:30002 localhost:30003`.
 
 ### Qwen ShareGPT recipes
