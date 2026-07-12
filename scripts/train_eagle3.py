@@ -473,6 +473,12 @@ def sanity_check(args: Namespace) -> None:
             raise ValueError("shard_target_output is only supported for sglang backend")
         if args.is_vlm:
             raise ValueError("shard_target_output is only supported non vlm model")
+    if args.vocab_mapping_path and not os.path.isfile(args.vocab_mapping_path):
+        # validated here, on every rank, before any distributed barrier:
+        # raising inside rank_0_priority() would hang the other ranks
+        raise FileNotFoundError(
+            f"--vocab-mapping-path {args.vocab_mapping_path} does not exist"
+        )
 
 
 def sp_sanity_check(args: Namespace) -> None:
@@ -600,24 +606,24 @@ def build_dataloaders(
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
     with rank_0_priority():
-        train_eagle3_dataset = build_eagle3_dataset(
-            dataset=train_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            is_vlm=args.is_vlm,
-            is_preformatted=args.is_preformatted,
-            processor=processor,
-            num_proc=args.build_dataset_num_proc,
-            train_only_last_turn=args.train_only_last_turn,
-        )
+        # offline with a pinned mapping consumes neither product of this
+        # build (the offline dataset replaces it below), so skip the work
+        if is_online or not args.vocab_mapping_path:
+            train_eagle3_dataset = build_eagle3_dataset(
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                cache_key=cache_key,
+                is_vlm=args.is_vlm,
+                is_preformatted=args.is_preformatted,
+                processor=processor,
+                num_proc=args.build_dataset_num_proc,
+                train_only_last_turn=args.train_only_last_turn,
+            )
         if args.vocab_mapping_path:
-            if not os.path.isfile(args.vocab_mapping_path):
-                raise FileNotFoundError(
-                    f"--vocab-mapping-path {args.vocab_mapping_path} does not exist"
-                )
+            # existence validated in sanity_check, on all ranks, pre-barrier
             vocab_mapping_path = args.vocab_mapping_path
             print_on_rank0(f"Using pinned vocab mapping: {vocab_mapping_path}")
         else:
