@@ -104,6 +104,9 @@ def _worker(rank, world_size, workdir, results_dir):
         target_model_backend="hf",
         shard_target_output=False,
         draft_accumulation_steps=1,
+        # Keep the legacy full-logits teacher path used by this equivalence gate.
+        compact_teacher=False,
+        compact_teacher_chunk_size=None,
     )
 
     # --- legacy path ---
