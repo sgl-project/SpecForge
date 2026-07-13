@@ -312,7 +312,9 @@ def resolve_mask_token(args, tokenizer, draft_model=None) -> int:
     if args.mask_token_id is not None:
         return args.mask_token_id
     if draft_model is not None:
-        dflash_config = getattr(getattr(draft_model, "config", None), "dflash_config", {})
+        dflash_config = getattr(
+            getattr(draft_model, "config", None), "dflash_config", {}
+        )
         if dflash_config is not None and dflash_config.get("mask_token_id") is not None:
             return dflash_config["mask_token_id"]
     if tokenizer.mask_token_id is not None:
