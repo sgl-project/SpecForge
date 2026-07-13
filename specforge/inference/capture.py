@@ -22,9 +22,9 @@ Import-light (stdlib only) so the assertions are unit-testable without a GPU.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Mapping, Optional, Tuple
 
-from specforge.runtime.contracts import TargetRepr
+from specforge.runtime.contracts import FeatureSpec, TargetRepr
 
 
 class CaptureMismatchError(AssertionError):
@@ -78,6 +78,69 @@ class CaptureConfig:
         return None
 
 
+def _verify_capture_shapes(
+    shapes: Mapping[str, Tuple[int, ...]],
+    capture: CaptureConfig,
+    *,
+    sample_id: str,
+    recorded_aux_layer_ids: Optional[Tuple[int, ...]] = None,
+    aux_feature_name: str = "hidden_state",
+    target_feature_name: str = "target",
+) -> None:
+    # (1) all requested feature names present
+    missing = sorted(n for n in capture.feature_names if n not in shapes)
+    if missing:
+        raise CaptureMismatchError(
+            f"[{sample_id}] capture missing features {missing}; "
+            f"got {sorted(shapes)}; requested {sorted(capture.feature_names)}"
+        )
+
+    # (2) recorded aux-layer IDs == requested
+    if recorded_aux_layer_ids is not None:
+        if tuple(recorded_aux_layer_ids) != capture.aux_hidden_state_layer_ids:
+            raise CaptureMismatchError(
+                f"[{sample_id}] aux-layer id mismatch: recorded "
+                f"{tuple(recorded_aux_layer_ids)} != requested "
+                f"{capture.aux_hidden_state_layer_ids}"
+            )
+
+    # (3) aux width == len(aux_layer_ids) * target_hidden_size
+    if aux_feature_name in shapes and capture.aux_hidden_state_layer_ids:
+        shape = tuple(shapes[aux_feature_name])
+        if not shape:
+            raise CaptureMismatchError(
+                f"[{sample_id}] aux feature {aux_feature_name!r} has no dimensions"
+            )
+        width = int(shape[-1])
+        if width != capture.expected_aux_width:
+            raise CaptureMismatchError(
+                f"[{sample_id}] aux width {width} != "
+                f"len(aux_layer_ids)*target_hidden_size="
+                f"{len(capture.aux_hidden_state_layer_ids)}*"
+                f"{capture.target_hidden_size}={capture.expected_aux_width}"
+            )
+
+    # (4) target last-dim matches target_repr (+ vocab-map dim for pruned_logits)
+    expected = capture.expected_target_dim()
+    if target_feature_name in shapes and expected is not None:
+        shape = tuple(shapes[target_feature_name])
+        if not shape:
+            raise CaptureMismatchError(
+                f"[{sample_id}] target feature {target_feature_name!r} has no dimensions"
+            )
+        dim = int(shape[-1])
+        if dim != expected:
+            raise CaptureMismatchError(
+                f"[{sample_id}] target last-dim {dim} != expected {expected} "
+                f"for target_repr={capture.target_repr!r}"
+            )
+        if capture.target_repr == "pruned_logits" and capture.vocab_map_version is None:
+            raise CaptureMismatchError(
+                f"[{sample_id}] target_repr='pruned_logits' requires a "
+                f"vocab_map_version so the trainer-side mapping is gated"
+            )
+
+
 def verify_capture(
     tensors: Dict[str, Any],
     capture: CaptureConfig,
@@ -92,48 +155,39 @@ def verify_capture(
     Raises :class:`CaptureMismatchError` on the first mismatch with a
     requested-vs-actual diff and the offending ``sample_id``.
     """
-    # (1) all requested feature names present
-    missing = sorted(n for n in capture.feature_names if n not in tensors)
-    if missing:
-        raise CaptureMismatchError(
-            f"[{sample_id}] capture missing features {missing}; "
-            f"got {sorted(tensors)}; requested {sorted(capture.feature_names)}"
-        )
-
-    # (2) recorded aux-layer IDs == requested
-    if recorded_aux_layer_ids is not None:
-        if tuple(recorded_aux_layer_ids) != capture.aux_hidden_state_layer_ids:
-            raise CaptureMismatchError(
-                f"[{sample_id}] aux-layer id mismatch: recorded "
-                f"{tuple(recorded_aux_layer_ids)} != requested "
-                f"{capture.aux_hidden_state_layer_ids}"
-            )
-
-    # (3) aux width == len(aux_layer_ids) * target_hidden_size
-    if aux_feature_name in tensors and capture.aux_hidden_state_layer_ids:
-        width = int(tuple(tensors[aux_feature_name].shape)[-1])
-        if width != capture.expected_aux_width:
-            raise CaptureMismatchError(
-                f"[{sample_id}] aux width {width} != "
-                f"len(aux_layer_ids)*target_hidden_size="
-                f"{len(capture.aux_hidden_state_layer_ids)}*"
-                f"{capture.target_hidden_size}={capture.expected_aux_width}"
-            )
-
-    # (4) target last-dim matches target_repr (+ vocab-map dim for pruned_logits)
-    expected = capture.expected_target_dim()
-    if target_feature_name in tensors and expected is not None:
-        dim = int(tuple(tensors[target_feature_name].shape)[-1])
-        if dim != expected:
-            raise CaptureMismatchError(
-                f"[{sample_id}] target last-dim {dim} != expected {expected} "
-                f"for target_repr={capture.target_repr!r}"
-            )
-        if capture.target_repr == "pruned_logits" and capture.vocab_map_version is None:
-            raise CaptureMismatchError(
-                f"[{sample_id}] target_repr='pruned_logits' requires a "
-                f"vocab_map_version so the trainer-side mapping is gated"
-            )
+    _verify_capture_shapes(
+        {name: tuple(tensor.shape) for name, tensor in tensors.items()},
+        capture,
+        sample_id=sample_id,
+        recorded_aux_layer_ids=recorded_aux_layer_ids,
+        aux_feature_name=aux_feature_name,
+        target_feature_name=target_feature_name,
+    )
 
 
-__all__ = ["CaptureConfig", "CaptureMismatchError", "verify_capture"]
+def verify_capture_specs(
+    specs: Mapping[str, FeatureSpec],
+    capture: CaptureConfig,
+    *,
+    sample_id: str,
+    recorded_aux_layer_ids: Optional[Tuple[int, ...]] = None,
+    aux_feature_name: str = "hidden_state",
+    target_feature_name: str = "target",
+) -> None:
+    """Validate ``FeatureSpec`` metadata against ``capture`` without tensors."""
+    _verify_capture_shapes(
+        {name: tuple(spec.shape) for name, spec in specs.items()},
+        capture,
+        sample_id=sample_id,
+        recorded_aux_layer_ids=recorded_aux_layer_ids,
+        aux_feature_name=aux_feature_name,
+        target_feature_name=target_feature_name,
+    )
+
+
+__all__ = [
+    "CaptureConfig",
+    "CaptureMismatchError",
+    "verify_capture",
+    "verify_capture_specs",
+]

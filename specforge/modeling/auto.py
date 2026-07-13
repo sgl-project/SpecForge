@@ -39,6 +39,21 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     }
 
     @classmethod
+    def _model_cls_from_config(cls, config: PretrainedConfig):
+        archs = getattr(config, "architectures", None) or []
+        if len(archs) == 1 and archs[0] in DRAFT_REGISTRY:
+            model_cls = DRAFT_REGISTRY[archs[0]]
+            if archs[0] == "DFlashDraftModel":
+                dflash_config = getattr(config, "dflash_config", {}) or {}
+                projector_type = dflash_config.get("projector_type", None)
+                if projector_type == "domino":
+                    model_cls = DRAFT_REGISTRY["DominoDraftModel"]
+                elif projector_type == "dspark":
+                    model_cls = DRAFT_REGISTRY["DSparkDraftModel"]
+            return model_cls
+        return cls._model_mapping[type(config)]
+
+    @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
         This class method takes a configuration object and creates its model,
@@ -51,18 +66,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         Returns:
             A model instance.
         """
-        archs = getattr(config, "architectures", None) or []
-        if len(archs) == 1 and archs[0] in DRAFT_REGISTRY:
-            _model_cls = DRAFT_REGISTRY[archs[0]]
-            if archs[0] == "DFlashDraftModel":
-                dflash_config = getattr(config, "dflash_config", {}) or {}
-                projector_type = dflash_config.get("projector_type", None)
-                if projector_type == "domino":
-                    _model_cls = DRAFT_REGISTRY["DominoDraftModel"]
-                elif projector_type == "dspark":
-                    _model_cls = DRAFT_REGISTRY["DSparkDraftModel"]
-        else:
-            _model_cls = cls._model_mapping[type(config)]
+        _model_cls = cls._model_cls_from_config(config)
         model = _model_cls(config, **config_kwargs)
 
         # Convert model to specified dtype if provided
@@ -87,9 +91,19 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         modeling_utils.logger.warning = filtered_warning
 
         try:
-            model = super().from_pretrained(
-                pretrained_model_name_or_path, *model_args, **kwargs
-            )
+            config = kwargs.get("config")
+            if config is None:
+                config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+            model_cls = cls._model_cls_from_config(config)
+            if model_cls is not cls._model_mapping.get(type(config)):
+                kwargs = {**kwargs, "config": config}
+                model = model_cls.from_pretrained(
+                    pretrained_model_name_or_path, *model_args, **kwargs
+                )
+            else:
+                model = super().from_pretrained(
+                    pretrained_model_name_or_path, *model_args, **kwargs
+                )
         finally:
             modeling_utils.logger.warning = original_warn
 

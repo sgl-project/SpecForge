@@ -32,6 +32,7 @@ class TestStrategyRegistry(unittest.TestCase):
     def test_builtins_registered(self):
         self.assertIn("eagle3", available_strategies())
         self.assertIn("dflash", available_strategies())
+        self.assertIn("domino", available_strategies())
         self.assertIn("dspark", available_strategies())
 
     def test_dflash_fully_wired(self):
@@ -44,6 +45,7 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIsNotNone(spec.make_offline_transform)
         self.assertIsNotNone(spec.make_offline_collate)
         self.assertIsNotNone(spec.feature_schema)
+        self.assertIsNotNone(spec.make_adapter)
         self.assertIsNone(spec.feature_schema.target_feature)  # no target distribution
         self.assertTrue(spec.supports_online)
         # DFlash owns its own (frozen) head -> builders pass target_head=None
@@ -55,6 +57,20 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIsInstance(
             spec.make_strategy(_M(), target_head=None), DFlashTrainStrategy
         )
+
+    def test_dflash_family_online_uses_dflash_adapter(self):
+        for name in ("dflash", "domino"):
+            with self.subTest(strategy=name):
+                adapter = resolve_strategy(name).make_adapter(
+                    object(), device="cpu", t2d=None
+                )
+                self.assertEqual(type(adapter).__name__, "DFlashAdapter")
+
+    def test_eagle3_online_uses_eagle3_adapter(self):
+        adapter = resolve_strategy("eagle3").make_adapter(
+            object(), device="cpu", t2d=None
+        )
+        self.assertEqual(type(adapter).__name__, "SGLangAdapter")
 
     def test_dspark_is_server_capture_online_only(self):
         spec = resolve_strategy("dspark")
@@ -77,7 +93,7 @@ class TestStrategyRegistry(unittest.TestCase):
 
     def test_required_features_track_the_strategy_class(self):
         # The registry's required_features is the single source of truth wired
-        # into FeatureContract.from_strategy + loader validation; it must equal the
+        # into CaptureConfig.from_strategy + loader validation; it must equal the
         # strategy class's own declaration.
         self.assertEqual(
             resolve_strategy("eagle3").required_features,

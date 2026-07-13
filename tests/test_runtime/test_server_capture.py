@@ -27,9 +27,9 @@ from specforge.inference.adapters.server_capture import (
     resolve_server_capture_schema,
 )
 from specforge.inference.capture import (
-    FeatureContract,
-    FeatureContractError,
-    verify_feature_contract_specs,
+    CaptureConfig,
+    CaptureMismatchError,
+    verify_capture_specs,
 )
 from specforge.runtime.contracts import FeatureSpec, PromptTask, SampleRef
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
@@ -199,8 +199,8 @@ def _task(i: int, length: int) -> PromptTask:
     )
 
 
-def _eagle3_contract() -> FeatureContract:
-    return FeatureContract.from_strategy(
+def _eagle3_contract() -> CaptureConfig:
+    return CaptureConfig.from_strategy(
         required_features={
             "input_ids",
             "attention_mask",
@@ -214,8 +214,8 @@ def _eagle3_contract() -> FeatureContract:
     )
 
 
-def _dflash_contract() -> FeatureContract:
-    return FeatureContract.from_strategy(
+def _dflash_contract() -> CaptureConfig:
+    return CaptureConfig.from_strategy(
         required_features={"input_ids", "hidden_states", "loss_mask"},
         aux_hidden_state_layer_ids=AUX_LAYERS,
         target_repr="hidden_state",
@@ -223,8 +223,8 @@ def _dflash_contract() -> FeatureContract:
     )
 
 
-def _dspark_contract() -> FeatureContract:
-    return FeatureContract.from_strategy(
+def _dspark_contract() -> CaptureConfig:
+    return CaptureConfig.from_strategy(
         required_features={
             "input_ids",
             "hidden_states",
@@ -430,17 +430,17 @@ class TestServerCaptureAdapter(unittest.TestCase):
                 "target": (1, 4, HIDDEN),
             }.items()
         }
-        verify_feature_contract_specs(
+        verify_capture_specs(
             specs, contract, sample_id="s0", recorded_aux_layer_ids=AUX_LAYERS
         )
         bad = dict(specs)
         bad["hidden_state"] = FeatureSpec(
             name="hidden_state", shape=(1, 4, HIDDEN), dtype="bfloat16"
         )
-        with self.assertRaises(FeatureContractError):
-            verify_feature_contract_specs(bad, contract, sample_id="s0")
-        with self.assertRaises(FeatureContractError):
-            verify_feature_contract_specs(
+        with self.assertRaises(CaptureMismatchError):
+            verify_capture_specs(bad, contract, sample_id="s0")
+        with self.assertRaises(CaptureMismatchError):
+            verify_capture_specs(
                 specs,
                 contract,
                 sample_id="s0",

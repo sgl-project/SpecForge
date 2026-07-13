@@ -313,7 +313,8 @@ class RefDistributor:
             self.run()
         except BaseException as exc:  # noqa: BLE001 - surfaced via self.error
             self.error = exc
-            logger.exception("ref-distributor: died; poisoning inboxes")
+            logger.error("ref-distributor: died; poisoning inboxes: %s", exc)
+            logger.debug("ref-distributor traceback", exc_info=True)
             self._fail_inboxes(exc)
 
     def start(self) -> "RefDistributor":

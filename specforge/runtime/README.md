@@ -28,7 +28,7 @@ specforge/runtime/
     offline_reader.py     # OfflineManifestReader (.ckpt -> SampleRef)
     feature_dataloader.py # FeatureDataLoader (SampleRef -> TrainBatch)
   inference/
-    capture.py            # FeatureContract + verify_feature_contract (B7/B8)
+    capture.py            # CaptureConfig + verify_capture (B7/B8)
     rollout_worker.py     # RolloutWorker (strategy-agnostic)
     adapters/             # PolicyFeatureAdapter.generate_features (the SpecForge<->engine seam)
     sglang_patch_inventory.md  # patch surface + supported-version matrix (M4)

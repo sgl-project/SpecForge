@@ -560,7 +560,7 @@ register_target_capture_policy("domino", TARGET_CAPTURE_POLICIES["dflash"])
 
 # Back-compat aliases for the original shorter names. New code should prefer
 # TargetCaptureSpec/TargetCapturePolicy to avoid confusion with
-# inference.capture.FeatureContract.
+# inference.capture.CaptureConfig.
 CaptureSpec = TargetCaptureSpec
 CapturePolicy = TargetCapturePolicy
 

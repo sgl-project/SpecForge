@@ -33,7 +33,7 @@ from typing import Any, Dict, FrozenSet, List, Optional
 
 import torch
 
-from specforge.inference.capture import FeatureContract
+from specforge.inference.capture import CaptureConfig
 from specforge.runtime.contracts import PromptTask
 
 # NOTE: target_engine.target_capture_policy (TargetCaptureBatch) is imported
@@ -49,8 +49,8 @@ class FeatureSchema:
     receives the capture's ``hidden_states``; ``target_feature`` (None for
     algorithms without a target distribution, e.g. DFlash) receives the —
     optionally vocab-projected — ``target``. ``records_aux_layer_ids`` emits the
-    out-of-band ``__aux_layer_ids__`` key that ``verify_feature_contract``
-    checks against the requested aux layers.
+    out-of-band ``__aux_layer_ids__`` key that ``verify_capture`` checks
+    against the requested aux layers.
     """
 
     names: FrozenSet[str]
@@ -117,12 +117,12 @@ class PolicyFeatureAdapter:
         return tuple(ids) if ids is not None else ()
 
     def _project_target(
-        self, target: torch.Tensor, feature_contract: FeatureContract
+        self, target: torch.Tensor, capture: CaptureConfig
     ) -> torch.Tensor:
         """The ONLY place target->draft projection/pruning happens."""
-        if feature_contract.target_repr == "logits":
+        if capture.target_repr == "logits":
             return target
-        if feature_contract.target_repr == "pruned_logits":
+        if capture.target_repr == "pruned_logits":
             if self.t2d is None:
                 raise ValueError("pruned_logits capture requires a t2d vocab map")
             return target[..., self.t2d.to(target.device)]
@@ -131,12 +131,12 @@ class PolicyFeatureAdapter:
         # offline path supports it (the strategy re-runs TargetHead).
         raise NotImplementedError(
             f"{type(self).__name__} does not implement online capture for "
-            f"target_repr={feature_contract.target_repr!r}; "
+            f"target_repr={capture.target_repr!r}; "
             f"supported: {self.SUPPORTED_TARGET_REPRS}"
         )
 
     def generate_features(
-        self, tasks: List[PromptTask], *, capture: FeatureContract
+        self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Dict[str, Any]]:
         """Extract per-sample features, batching the engine call.
 
@@ -146,14 +146,13 @@ class PolicyFeatureAdapter:
         Equal-length grouping avoids intra-batch padding, so per-sample features
         are sliced out cleanly. The result preserves task order.
 
-        The ``capture`` keyword carries the runtime :class:`FeatureContract`
-        (kept under that name for the ``FeatureSource`` protocol).
+        The ``capture`` keyword carries the runtime :class:`CaptureConfig`.
         """
         from specforge.inference.target_engine.target_capture_policy import (
             TargetCaptureBatch,
         )
 
-        feature_contract = capture
+        capture_config = capture
         schema = self.schema
         recorded = (
             self._recorded_aux_layer_ids() if schema.records_aux_layer_ids else None
@@ -201,7 +200,7 @@ class PolicyFeatureAdapter:
             target = None
             if schema.target_feature is not None:
                 target = (
-                    self._project_target(data.target, feature_contract)
+                    self._project_target(data.target, capture_config)
                     if schema.needs_vocab_projection
                     else data.target
                 )
@@ -215,8 +214,8 @@ class PolicyFeatureAdapter:
                     else:
                         feats[name] = getattr(data, name)[j : j + 1]
                 if recorded is not None:
-                    # carried out-of-band for verify_feature_contract; the
-                    # RolloutWorker pops it before any store put.
+                    # carried out-of-band for verify_capture; the RolloutWorker
+                    # pops it before any store put.
                     feats["__aux_layer_ids__"] = recorded
                 out[gi] = feats
         return out

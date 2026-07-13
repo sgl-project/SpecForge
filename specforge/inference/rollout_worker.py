@@ -6,15 +6,17 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""RolloutWorker: PromptTask -> features -> FeatureStore -> SampleRef commit.
+"""RolloutWorker: PromptTask -> features/refs -> SampleRef commit.
 
 The worker is deliberately small and strategy-agnostic: it leases prompt tasks,
 asks a ``feature_source`` (e.g. a wrapper over the target model's
 ``generate_eagle3_data``, or ``SGLangAdapter``) for per-sample features,
 verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
-controller. It never hands a tensor to the controller. Strategy-specific capture
-requirements live in ``CaptureConfig`` + the feature schema, not here.
+controller. A server-side capture source may instead return already-written
+``SampleRef``s via ``produce_refs``. It never hands a tensor to the controller.
+Strategy-specific capture requirements live in ``CaptureConfig`` + the feature
+schema, not here.
 """
 
 from __future__ import annotations
@@ -36,6 +38,12 @@ class FeatureSource(Protocol):
     def generate_features(
         self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Dict[str, Any]]: ...
+
+
+class RefSource(Protocol):
+    def produce_refs(
+        self, tasks: List[PromptTask], *, capture: CaptureConfig
+    ) -> List[Any]: ...
 
 
 class RolloutWorker:
@@ -88,6 +96,10 @@ class RolloutWorker:
             return []
         self._inflight = len(tasks)
         self._state = "ready"
+        produce_refs = getattr(self.feature_source, "produce_refs", None)
+        if callable(produce_refs):
+            return self._run_ref_source(tasks, produce_refs)
+
         try:
             feats_list = self.feature_source.generate_features(
                 tasks, capture=self.capture
@@ -164,6 +176,70 @@ class RolloutWorker:
             raise capture_error
         return refs
 
+    def _run_ref_source(self, tasks: List[PromptTask], produce_refs) -> List[SampleRef]:
+        try:
+            results = produce_refs(tasks, capture=self.capture)
+        except Exception as exc:
+            self._state = "unhealthy"
+            self._recent_failures.append(f"produce_refs: {exc}")
+            self.controller.fail_prompt_tasks(
+                self.worker_id,
+                [t.task_id for t in tasks],
+                reason=f"produce_refs:{exc}",
+                retryable=True,
+            )
+            self._inflight = 0
+            raise
+        if len(results) != len(tasks):
+            reason = (
+                f"produce_refs returned {len(results)} records for {len(tasks)} tasks"
+            )
+            self._state = "unhealthy"
+            self._recent_failures.append(reason)
+            self.controller.fail_prompt_tasks(
+                self.worker_id,
+                [t.task_id for t in tasks],
+                reason=reason,
+                retryable=False,
+            )
+            self._inflight = 0
+            raise ValueError(reason)
+
+        refs: List[SampleRef] = []
+        for result in results:
+            if isinstance(result, SampleRef):
+                refs.append(result)
+                continue
+
+            task_id = getattr(result, "task_id", None)
+            reason = getattr(
+                result,
+                "reason",
+                f"produce_refs returned {type(result).__name__}, not SampleRef",
+            )
+            retryable = bool(getattr(result, "retryable", True))
+            if task_id is None:
+                self._state = "unhealthy"
+                self._recent_failures.append(reason)
+                self.controller.fail_prompt_tasks(
+                    self.worker_id,
+                    [t.task_id for t in tasks],
+                    reason=reason,
+                    retryable=False,
+                )
+                self._inflight = 0
+                raise TypeError(reason)
+            self._recent_failures.append(str(reason))
+            self.controller.fail_prompt_tasks(
+                self.worker_id, [task_id], reason=str(reason), retryable=retryable
+            )
+
+        if refs:
+            self.controller.commit_samples(self.worker_id, refs)
+            self._last_commit_count += len(refs)
+        self._inflight = 0
+        return refs
+
     def _put_metadata(self, task: PromptTask) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -197,4 +273,4 @@ class RolloutWorker:
         }
 
 
-__all__ = ["RolloutWorker", "FeatureSource", "HEALTH_STATES"]
+__all__ = ["RolloutWorker", "FeatureSource", "RefSource", "HEALTH_STATES"]

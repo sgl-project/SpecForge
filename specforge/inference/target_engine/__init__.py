@@ -2,6 +2,7 @@
 """Target engines: the backend-agnostic capture surface (TargetEngine + factory)."""
 
 from .base import KNOWN_BACKENDS, TargetEngine
+from .custom import CustomTargetEngine
 from .eagle3_target_model import (
     CustomEagle3TargetEngine,
     CustomEagle3TargetModel,
@@ -15,12 +16,34 @@ from .eagle3_target_model import (
     get_eagle3_target_model,
 )
 from .factory import available_target_engines, get_target_engine
+from .hf import HFTargetEngine
+from .sglang import SGLangTargetEngine
+from .target_capture_policy import (
+    CAPTURE_POLICIES,
+    TARGET_CAPTURE_POLICIES,
+    CapturePolicy,
+    CaptureSpec,
+    DFlashCapturePolicy,
+    DFlashTargetOutput,
+    Eagle3CapturePolicy,
+    Eagle3TargetOutput,
+    TargetCaptureBatch,
+    TargetCapturePolicy,
+    TargetCaptureSpec,
+    register_capture_policy,
+    register_target_capture_policy,
+    resolve_capture_policy,
+    resolve_target_capture_policy,
+)
 
 __all__ = [
     "TargetEngine",
     "KNOWN_BACKENDS",
     "get_target_engine",
     "available_target_engines",
+    "HFTargetEngine",
+    "SGLangTargetEngine",
+    "CustomTargetEngine",
     "Eagle3TargetEngine",
     "SGLangEagle3TargetEngine",
     "HFEagle3TargetEngine",
@@ -32,6 +55,22 @@ __all__ = [
     "SGLangEagle3TargetModel",
     "HFEagle3TargetModel",
     "CustomEagle3TargetModel",
+    # Target-capture policy API
+    "TargetCaptureBatch",
+    "TargetCaptureSpec",
+    "TargetCapturePolicy",
+    "CaptureSpec",
+    "CapturePolicy",
+    "Eagle3CapturePolicy",
+    "DFlashCapturePolicy",
+    "Eagle3TargetOutput",
+    "DFlashTargetOutput",
+    "TARGET_CAPTURE_POLICIES",
+    "CAPTURE_POLICIES",
+    "register_target_capture_policy",
+    "resolve_target_capture_policy",
+    "register_capture_policy",
+    "resolve_capture_policy",
 ]
 
 # NOTE: the DFlash engines (dflash_target_model) are intentionally NOT eagerly

@@ -192,6 +192,7 @@ class PEagleDraftModel(Eagle3DraftModel):
         if norm_before_residual is None:
             norm_before_residual = getattr(config, "norm_before_residual", False)
         norm_before_residual = bool(norm_before_residual)
+        config.architectures = [type(self).__name__]
         config.norm_before_residual = norm_before_residual
         self.config = config
         self.hidden_size = config.hidden_size

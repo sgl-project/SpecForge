@@ -11,6 +11,7 @@ from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
 from .base import TargetEngine
+from .target_capture_policy import Eagle3CapturePolicy
 
 # NOTE (Phase B2): this module no longer imports sglang internals. The
 # SGLang-version-pinned capture path (ServerArgs / ModelConfig / SGLangRunner +
@@ -20,6 +21,8 @@ from .base import TargetEngine
 # module — the engine and ``import specforge`` are sglang-version-agnostic.
 
 logger = logging.getLogger(__name__)
+
+_EAGLE3 = Eagle3CapturePolicy()
 
 
 @dataclass
@@ -191,86 +194,13 @@ class HFEagle3TargetEngine(Eagle3TargetEngine):
         loss_mask: torch.Tensor,
         **kwargs,
     ) -> Eagle3TargetOutput:
-        """
-        Optimized HF backend:
-        Instead of returning all hidden states (memory heavy), we use forward hooks
-        to capture only the specific layers required by Eagle3.
-        """
-        if kwargs:
-            logger.debug(f"unused kwargs {list(kwargs.keys())}")
-
-        captured_states = {}
-        handles = []
-
-        def get_hook(layer_idx):
-            def hook(module, input, output):
-                # HF outputs for layers are usually tuples (hidden_states, present_key_value, ...)
-                # We only need the hidden_states (first element)
-                if isinstance(output, tuple):
-                    hidden = output[0]
-                else:
-                    hidden = output
-                captured_states[layer_idx] = hidden
-
-            return hook
-
-        # Locate the transformer layers ModuleList
-        layers = self._get_transformer_layers()
-
-        target_indices = self.aux_hidden_states_layers
-
-        # Register hooks
-        for idx in target_indices:
-            # Ensure index is within bounds
-            if 0 <= idx < len(layers):
-                handles.append(layers[idx].register_forward_hook(get_hook(idx)))
-            else:
-                raise ValueError(
-                    f"Layer index {idx} out of bounds for model with {len(layers)} layers."
-                )
-
-        try:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=False,
-                output_attentions=False,
-                output_router_logits=False,
-                use_cache=False,
-            )
-            target = outputs.logits
-        finally:
-            # Always remove hooks to prevent memory leaks or side effects on subsequent calls
-            for handle in handles:
-                handle.remove()
-
-        # Verify we captured everything
-        if len(captured_states) != 3:
-            raise RuntimeError(
-                f"Expected to capture 3 layers, but captured {len(captured_states)}"
-            )
-
-        # Extract in the correct order
-        hidden_states0 = captured_states[target_indices[0]]
-        hidden_states1 = captured_states[target_indices[1]]
-        hidden_states2 = captured_states[target_indices[2]]
-
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
-
-        # apply pading
-        target = outputs.logits
-        target = padding(target, left=False)
-        input_ids = padding(input_ids, left=False)
-        loss_mask = loss_mask[..., None].to(target.device)
-
-        return Eagle3TargetOutput(
-            hidden_states=hidden_states,
-            target=target,
-            loss_mask=loss_mask,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+        return _EAGLE3.hf_capture(
+            self.model,
+            self.aux_hidden_states_layers,
+            input_ids,
+            attention_mask,
+            loss_mask,
+            **kwargs,
         )
 
 

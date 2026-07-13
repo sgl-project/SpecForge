@@ -22,7 +22,11 @@ from typing import Optional
 
 import torch
 
-from .base import TargetEngine
+from .base import KNOWN_BACKENDS, TargetEngine
+from .target_capture_policy import (
+    TARGET_CAPTURE_POLICIES,
+    resolve_target_capture_policy,
+)
 
 # strategy name -> per-algorithm engine. Domino reuses the DFlash engine (same
 # capture: concatenated layer hidden states, no target distribution). The loaders
@@ -35,7 +39,7 @@ _ENGINE_STRATEGIES = ("eagle3", "dflash", "domino")
 
 def available_target_engines():
     """Strategy names with a registered target-engine loader."""
-    return sorted(_ENGINE_STRATEGIES)
+    return sorted(TARGET_CAPTURE_POLICIES)
 
 
 def _resolve_loader(strategy: str):
@@ -53,6 +57,60 @@ def _resolve_loader(strategy: str):
     )
 
 
+def _load_generic_engine(
+    pretrained_model_name_or_path: str,
+    *,
+    strategy: str,
+    backend: str,
+    torch_dtype: Optional[torch.dtype],
+    device: Optional[str],
+    cache_dir: Optional[str],
+    **kwargs,
+) -> TargetEngine:
+    try:
+        policy = resolve_target_capture_policy(strategy)
+    except KeyError:
+        raise ValueError(
+            f"no target engine for strategy {strategy!r}; "
+            f"registered: {available_target_engines()}"
+        ) from None
+
+    if backend == "hf":
+        from .hf import HFTargetEngine
+
+        return HFTargetEngine.from_pretrained(
+            pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            policy=policy,
+            **kwargs,
+        )
+    if backend == "sglang":
+        from .sglang import SGLangTargetEngine
+
+        return SGLangTargetEngine.from_pretrained(
+            pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            policy=policy,
+            **kwargs,
+        )
+    if backend == "custom":
+        from .custom import CustomTargetEngine
+
+        return CustomTargetEngine.from_pretrained(
+            pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            policy=policy,
+            **kwargs,
+        )
+    raise ValueError(f"Unknown backend {backend!r}; known: {KNOWN_BACKENDS}")
+
+
 def get_target_engine(
     pretrained_model_name_or_path: str,
     *,
@@ -68,6 +126,16 @@ def get_target_engine(
     The single, algorithm-agnostic entry point launch code should prefer. The
     older ``get_eagle3_target_model`` / ``get_dflash_target_model`` stay valid.
     """
+    if strategy not in _ENGINE_STRATEGIES:
+        return _load_generic_engine(
+            pretrained_model_name_or_path,
+            strategy=strategy,
+            backend=backend,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
     loader = _resolve_loader(strategy)
     return loader(
         pretrained_model_name_or_path=pretrained_model_name_or_path,

@@ -15,8 +15,8 @@ once per strategy, instead of being hardcoded into every ``build_*`` function:
 
   * ``make_strategy``        — build the per-step strategy over the FSDP-wrapped
                                model (the seam ``TrainerCore`` consumes),
-  * ``required_features``    — the feature contract (drives
-                               ``FeatureContract.from_strategy`` + loader validation),
+  * ``required_features``    — the capture config (drives
+                               ``CaptureConfig.from_strategy`` + loader validation),
   * the offline data path    — reader + per-sample transform + collate + target_repr,
   * ``make_online_collate``  — the online/streamed collate,
   * ``feature_schema``       — the store-ready dict shape the shared
@@ -147,6 +147,12 @@ def _eagle3_offline_collate():
     return DataCollatorWithPadding()
 
 
+def _make_eagle3_adapter(target_model, *, device="cuda", t2d=None):
+    from specforge.inference.adapters.eagle3 import SGLangAdapter
+
+    return SGLangAdapter(target_model, device=device, t2d=t2d)
+
+
 register_strategy(
     StrategySpec(
         name="eagle3",
@@ -160,6 +166,7 @@ register_strategy(
         make_offline_collate=_eagle3_offline_collate,
         make_online_collate=lambda: concat_collate,
         feature_schema=EAGLE3_FEATURE_SCHEMA,
+        make_adapter=_make_eagle3_adapter,
         supports_online=True,
     )
 )
@@ -170,9 +177,9 @@ register_strategy(
 # capture layers, NO eagle3 aux/target swap, NO target distribution / vocab map).
 # Offline: the reader reuses OfflineManifestReader with dflash feature_keys; the
 # transform slices to max_len (no swap); the collate pads + emits {input_ids,
-# hidden_states, loss_mask}. Online: DFLASH_FEATURE_SCHEMA drives the shared
-# PolicyFeatureAdapter to emit the same schema. The DFlashTrainStrategy already
-# drops into the unchanged TrainerCore/Backend/Loader.
+# hidden_states, loss_mask}. Online: DFlashAdapter emits the same schema from
+# the DFlash-family target engine. The DFlashTrainStrategy already drops into
+# the unchanged TrainerCore/Backend/Loader.
 
 from specforge.training.strategies.base import DFlashTrainStrategy
 
@@ -255,6 +262,12 @@ def _dflash_offline_collate():
     return collate
 
 
+def _make_dflash_adapter(target_model, *, device="cuda", t2d=None):
+    from specforge.inference.adapters.dflash import DFlashAdapter
+
+    return DFlashAdapter(target_model, device=device, t2d=t2d)
+
+
 register_strategy(
     StrategySpec(
         name="dflash",
@@ -266,6 +279,7 @@ register_strategy(
         make_offline_collate=_dflash_offline_collate,
         make_online_collate=_dflash_offline_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,
+        make_adapter=_make_dflash_adapter,
         supports_online=True,
     )
 )
@@ -374,6 +388,7 @@ register_strategy(
         make_offline_collate=_dflash_offline_collate,
         make_online_collate=_dflash_offline_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,  # same capture path as DFlash
+        make_adapter=_make_dflash_adapter,
         supports_online=True,
     )
 )

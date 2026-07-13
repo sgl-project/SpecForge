@@ -32,9 +32,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from specforge.inference.capture import (
-    FeatureContract,
-    FeatureContractError,
-    verify_feature_contract_specs,
+    CaptureConfig,
+    CaptureMismatchError,
+    verify_capture_specs,
 )
 from specforge.runtime.contracts import SCHEMA_VERSION, FeatureSpec, PromptTask
 
@@ -190,7 +190,7 @@ class SGLangServerCaptureAdapter:
     Implements ``produce_refs`` (not ``generate_features``): the returned
     ``SampleRef``s point at tensors the SERVER already wrote to the Mooncake
     store, so the RolloutWorker commits them without any local put. The refs
-    are verified against the :class:`FeatureContract` from their FeatureSpecs
+    are verified against the :class:`CaptureConfig` from their FeatureSpecs
     alone — same loud extraction-boundary guarantee, no tensor fetch.
 
     ``store`` must be the run's :class:`MooncakeFeatureStore` (its ``store_id``
@@ -278,7 +278,7 @@ class SGLangServerCaptureAdapter:
 
     # -- ref construction ------------------------------------------------------
     def _ref_from_result(
-        self, task: PromptTask, result: Dict[str, Any], contract: FeatureContract
+        self, task: PromptTask, result: Dict[str, Any], capture: CaptureConfig
     ):
         from specforge.runtime.contracts import SampleRef
 
@@ -292,10 +292,10 @@ class SGLangServerCaptureAdapter:
             dtype = str(meta["dtype"])
             extra: Dict[str, Any] = {}
             if name == self.schema.last_hidden_feature:
-                extra["target_repr"] = contract.target_repr
-                if contract.vocab_map_version:
+                extra["target_repr"] = capture.target_repr
+                if capture.vocab_map_version:
                     extra["target_meta"] = {
-                        "vocab_map_version": contract.vocab_map_version
+                        "vocab_map_version": capture.vocab_map_version
                     }
             specs[name] = FeatureSpec(name=name, shape=shape, dtype=dtype, **extra)
             nbytes += _spec_nbytes(shape, dtype)
@@ -319,8 +319,8 @@ class SGLangServerCaptureAdapter:
                 "run_id": self.run_id,
                 "source_task_id": task.task_id,
                 "strategy": self.strategy,
-                "target_repr": contract.target_repr,
-                "vocab_map_version": contract.vocab_map_version,
+                "target_repr": capture.target_repr,
+                "vocab_map_version": capture.vocab_map_version,
                 "transport": "sglang_server_capture",
                 "server": self.base_url,  # which server captured it (provenance)
                 "generation": gen,  # the zero-copy get() locator
@@ -329,7 +329,7 @@ class SGLangServerCaptureAdapter:
 
     # -- the RefSource entry point ----------------------------------------------
     def produce_refs(
-        self, tasks: List[PromptTask], *, capture: FeatureContract
+        self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Union["SampleRef", ServerCaptureFailure]]:  # noqa: F821
         """One batched server call -> one committed-ready ref per task.
 
@@ -438,7 +438,7 @@ class SGLangServerCaptureAdapter:
                 )
                 continue
             try:
-                verify_feature_contract_specs(
+                verify_capture_specs(
                     ref.feature_specs,
                     capture,
                     sample_id=ref.sample_id,
@@ -450,7 +450,7 @@ class SGLangServerCaptureAdapter:
                     aux_feature_name=self.schema.aux_feature or "hidden_state",
                     target_feature_name=self.schema.last_hidden_feature or "target",
                 )
-            except FeatureContractError as exc:
+            except CaptureMismatchError as exc:
                 # Loud boundary failure; free the server-written keys so a
                 # mismatched sample is never consumable.
                 self.store.adopt(ref)

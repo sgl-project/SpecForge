@@ -260,7 +260,7 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.inference.adapters.server_capture import (
             SGLangServerCaptureAdapter,
         )
-        from specforge.inference.capture import FeatureContract
+        from specforge.inference.capture import CaptureConfig
         from specforge.runtime.contracts import SampleRef
 
         rows = [[5, 6, 7, 8, 9, 10], [11, 12, 13, 14]]
@@ -268,7 +268,7 @@ class TestServerCaptureGate(unittest.TestCase):
         adapter = SGLangServerCaptureAdapter(
             f"http://localhost:{PORT}", store, run_id="gate0", strategy="eagle3"
         )
-        contract = FeatureContract.from_strategy(
+        contract = CaptureConfig.from_strategy(
             required_features={
                 "input_ids",
                 "attention_mask",
@@ -372,7 +372,7 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.inference.adapters.server_capture import (
             SGLangServerCaptureAdapter,
         )
-        from specforge.inference.capture import FeatureContract
+        from specforge.inference.capture import CaptureConfig
         from specforge.runtime.contracts import SampleRef
 
         rows = [[3, 1, 4, 1, 5]]
@@ -380,7 +380,7 @@ class TestServerCaptureGate(unittest.TestCase):
         adapter = SGLangServerCaptureAdapter(
             f"http://localhost:{PORT}", store, run_id="gate1", strategy="dflash"
         )
-        contract = FeatureContract.from_strategy(
+        contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
             aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
             target_repr="hidden_state",

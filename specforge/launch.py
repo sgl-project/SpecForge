@@ -272,7 +272,7 @@ def _assemble_rollout_workers(
             f"a {spec.name} capture path. Set feature_schema (or make_adapter) + "
             f"supports_online=True on its StrategySpec."
         )
-    from specforge.inference.capture import FeatureContract
+    from specforge.inference.capture import CaptureConfig
     from specforge.inference.rollout_worker import RolloutWorker
 
     if aux_hidden_state_layer_ids is None:
@@ -308,7 +308,7 @@ def _assemble_rollout_workers(
                 t2d=t2d,
             )
         ] * num_rollout_workers
-    feature_contract = FeatureContract.from_strategy(
+    capture_config = CaptureConfig.from_strategy(
         required_features=spec.required_features,
         aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
         target_repr=target_repr,
@@ -323,7 +323,7 @@ def _assemble_rollout_workers(
             controller,
             store,
             adapter,
-            feature_contract,
+            capture_config,
             run_id=run_id,
             worker_id=f"rollout-{i}",
             strategy=spec.name,
