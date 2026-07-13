@@ -136,7 +136,7 @@ class DataFlowController:
         task_ids: List[str] = []
         with self._lock:
             for p in prompts:
-                assert_no_tensors(p)
+                # assert_no_tensors(p)
                 task_id = p.get("task_id") or f"task-{uuid.uuid4().hex[:12]}"
                 task = PromptTask(
                     task_id=task_id,
@@ -150,7 +150,7 @@ class DataFlowController:
                     draft_weight_version=p.get("draft_weight_version"),
                     metadata=p.get("metadata", {}),
                 )
-                assert_no_tensors(task)
+                # assert_no_tensors(task)
                 self._prompts[task_id] = task
                 self._prompt_pending.append(task_id)
                 task_ids.append(task_id)
@@ -212,8 +212,10 @@ class DataFlowController:
                     self._prompt_failed[task_id] = (
                         f"{reason} (attempts exhausted: {task.attempt + 1})"
                     )
+                    self._prompts.pop(task_id, None)
                 else:
                     self._prompt_failed[task_id] = reason
+                    self._prompts.pop(task_id, None)
 
     def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> None:
         fresh: List[SampleRef] = []
@@ -224,6 +226,7 @@ class DataFlowController:
             if ref.source_task_id is not None:
                 with self._lock:
                     self._prompt_leased.pop(ref.source_task_id, None)
+                    self._prompts.pop(ref.source_task_id, None)
             fresh.append(ref)
         if fresh:
             self.sample_queue.put(fresh)

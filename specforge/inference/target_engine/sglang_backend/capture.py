@@ -56,8 +56,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 
-# 0.5.14 relocated prepare_mlp_sync_batch_raw to scheduler_components.dp_attn
-# (module-level function, not a Scheduler method).
+# prepare_mlp_sync_batch_raw is a module-level function, not a Scheduler method.
+# sglang 0.5.14 moved it from managers.scheduler_dp_attn_mixin to
+# managers.scheduler_components.dp_attn.
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -121,11 +122,14 @@ class SGLangCaptureBackend:
         original eagle3 path).
         """
         tp_size = dist.get_world_size(get_tp_group())
-        # 0.5.13+ requires a non-None dtype; "auto" lets sglang decide.
+        # NOTE: sglang 0.5.13+ requires dtype to be non-None. If torch_dtype is None,
+        # use "auto" to let sglang decide the dtype.
         dtype_arg = torch_dtype if torch_dtype is not None else "auto"
-        # We prefill the whole batch in one forward, so disable chunked prefill:
-        # 0.5.14's eager runner otherwise caps per-call buffers at chunked_prefill_size
-        # (default 8192) and errors when our token count exceeds it.
+        # NOTE: DFlash/EAGLE3 prefill the whole batch in one _forward_extend call
+        # (no scheduler chunking). sglang 0.5.14's eager runner pre-allocates
+        # per-call buffers sized to chunked_prefill_size (default 8192), and copies
+        # into them fail with a shape mismatch when our token count exceeds that.
+        # Disable chunked prefill so the ceiling grows to max_total_num_tokens.
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
@@ -157,9 +161,11 @@ class SGLangCaptureBackend:
             nccl_port=None,
             is_draft_worker=False,
         )
-        # 0.5.14 moved post-load setup out of ModelRunner.initialize() (now
-        # weights-only). We drive the runner directly, so run it here: pools for
-        # forward(), attention backend, and the (eager) runner.
+        # sglang 0.5.14 split the post-load setup out of ModelRunner.initialize()
+        # (which now only loads the weights). The scheduler/TpModelWorker perform
+        # these steps explicitly; since we drive the ModelRunner directly, we must
+        # replicate them so `req_to_token_pool`/`token_to_kv_pool_allocator` exist
+        # and forward() has an attention backend and (eager) runner.
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
@@ -267,15 +273,18 @@ class SGLangCaptureBackend:
         )
         batch.prepare_for_extend()
         self._maybe_prepare_mlp_sync_batch(batch)
-        # 0.5.13+ stages input_ids on pinned CPU and leaves batch.input_ids=None;
-        # the scheduler normally does this H2D copy, but we bypass it.
+        # sglang 0.5.13+: prepare_for_extend stages input_ids on pinned CPU
+        # (prefill_input_ids_cpu) and leaves batch.input_ids=None; the scheduler
+        # normally materializes them to device via resolve_forward_inputs. We bypass
+        # the scheduler, so perform that prefill H2D copy here.
         if getattr(batch, "prefill_input_ids_cpu", None) is not None:
             batch.input_ids = batch.prefill_input_ids_cpu.to(
                 batch.device, non_blocking=True
             )
             batch.prefill_input_ids_cpu = None
-        # 0.5.13+ dropped ModelWorkerBatch; ForwardBatch.init_new reads
-        # capture_hidden_mode off the ScheduleBatch, so set it first.
+        # sglang 0.5.13+: the ModelWorkerBatch step was removed. ForwardBatch.init_new
+        # now consumes the ScheduleBatch directly and reads capture_hidden_mode from
+        # it, so set it on the batch before init_new.
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -300,7 +309,7 @@ class SGLangCaptureBackend:
     # --- EAGLE3 extend (text) ----------------------------------------------
 
     @torch.no_grad
-    def _forward_eagle3_reqs(
+    def _extend_eagle3(
         self,
         reqs,
         capture_aux_hidden_states: bool = True,
@@ -311,7 +320,8 @@ class SGLangCaptureBackend:
         self._set_eagle3_logits_flags(
             return_last_hidden_states, return_logits, shard_returns
         )
-        # Capture lengths before the forward: 0.5.13+ releases origin_input_ids in it.
+        # sglang 0.5.13+: capture input lengths BEFORE the forward — prepare_for_extend
+        # / forward release per-req fields (origin_input_ids becomes None afterwards).
         input_lens = [len(req.origin_input_ids) for req in reqs]
         eagle3_output = self._forward_extend(reqs)
 
@@ -361,7 +371,7 @@ class SGLangCaptureBackend:
         self._clear_pools()
         return logits, aux_hidden_states, last_hidden_states
 
-    def extend_eagle3(
+    def extend(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -391,8 +401,12 @@ class SGLangCaptureBackend:
                 origin_input_ids=input_id_.view(-1).tolist(),
                 sampling_params=sampling_params,
             )
-            # 0.5.13+ replaced Req.fill_ids with full_untruncated_fill_ids + int
-            # fill_len (set by PrefillAdder, which we bypass; no prefix reuse).
+            # sglang 0.5.13+: Req.fill_ids was removed in favor of
+            # full_untruncated_fill_ids (origin + output ids) plus an integer
+            # fill_len, which the scheduler's PrefillAdder sets during admission.
+            # We bypass the scheduler, so replicate that here with no prefix-cache
+            # reuse (prefix_indices stays empty). prepare_for_extend asserts
+            # fill_len - len(prefix_indices) == extend_input_len.
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.extend_input_len = req.fill_len - len(req.prefix_indices)
@@ -401,7 +415,7 @@ class SGLangCaptureBackend:
             reqs.append(req)
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            self._forward_eagle3_reqs(
+            self._extend_eagle3(
                 reqs,
                 capture_aux_hidden_states=True,
                 return_last_hidden_states=return_last_hidden_states,
@@ -442,7 +456,7 @@ class SGLangCaptureBackend:
 
         return position_ids, rope_deltas
 
-    def extend_eagle3_vlm(
+    def extend_vlm(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -520,7 +534,7 @@ class SGLangCaptureBackend:
 
             # Count image tokens
             num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
-            # print(f"[extend_eagle3_vlm] num_img_tokens in input_ids: {num_img_tokens}")
+            # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
 
             mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
                 spatial_merge_size=self.spatial_merge_size,
@@ -566,8 +580,12 @@ class SGLangCaptureBackend:
                 origin_input_ids=input_id_list,
                 sampling_params=sampling_params,
             )
-            # 0.5.13+ replaced Req.fill_ids with full_untruncated_fill_ids + int
-            # fill_len (set by PrefillAdder, which we bypass; no prefix reuse).
+            # sglang 0.5.13+: Req.fill_ids was removed in favor of
+            # full_untruncated_fill_ids (origin + output ids) plus an integer
+            # fill_len, which the scheduler's PrefillAdder sets during admission.
+            # We bypass the scheduler, so replicate that here with no prefix-cache
+            # reuse (prefix_indices stays empty). prepare_for_extend asserts
+            # fill_len - len(prefix_indices) == extend_input_len.
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.extend_input_len = req.fill_len - len(req.prefix_indices)
@@ -577,7 +595,7 @@ class SGLangCaptureBackend:
             reqs.append(req)
 
         logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            self._forward_eagle3_reqs(
+            self._extend_eagle3(
                 reqs,
                 capture_aux_hidden_states=True,
                 return_last_hidden_states=return_last_hidden_states,
@@ -586,10 +604,6 @@ class SGLangCaptureBackend:
         )
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
-
-    # Back-compat aliases for the pre-B2 SGLangEagle3TargetEngine method surface.
-    extend = extend_eagle3
-    extend_vlm = extend_eagle3_vlm
 
     # --- DFlash extend ------------------------------------------------------
 
@@ -622,15 +636,20 @@ class SGLangCaptureBackend:
                 origin_input_ids=curr_ids.view(-1).tolist(),
                 sampling_params=sampling_params,
             )
-            # 0.5.13+ replaced Req.fill_ids with full_untruncated_fill_ids + int
-            # fill_len (set by PrefillAdder, which we bypass; no prefix reuse).
+            # sglang 0.5.13+: Req.fill_ids was removed in favor of
+            # full_untruncated_fill_ids (origin + output ids) plus an integer
+            # fill_len, which the scheduler's PrefillAdder sets during admission.
+            # We bypass the scheduler, so replicate that here with no prefix-cache
+            # reuse (prefix_indices stays empty). prepare_for_extend asserts
+            # fill_len - len(prefix_indices) == extend_input_len.
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.extend_input_len = req.fill_len - len(req.prefix_indices)
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
-        # Capture lengths before the forward: 0.5.13+ releases origin_input_ids in it.
+        # sglang 0.5.13+: capture input lengths BEFORE the forward (origin_input_ids
+        # becomes None afterwards).
         input_lens = [len(req.origin_input_ids) for req in reqs]
         output = self._forward_extend(reqs)
         if (

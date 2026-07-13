@@ -29,7 +29,7 @@ class TestExtractionVsHFReference(unittest.TestCase):
         fx.build_single_rank_distributed(port="29564")
 
         from specforge.inference.adapters.eagle3 import SGLangAdapter
-        from specforge.inference.capture import FeatureContract, verify_feature_contract
+        from specforge.inference.capture import CaptureConfig, verify_capture
         from specforge.runtime.contracts import PromptTask
 
         H, V, SEQ = fx.H, fx.V, 12
@@ -39,7 +39,7 @@ class TestExtractionVsHFReference(unittest.TestCase):
         )
 
         adapter = SGLangAdapter(target, device="cuda")
-        capture = FeatureContract.from_strategy(
+        capture = CaptureConfig.from_strategy(
             required_features={
                 "input_ids",
                 "attention_mask",
@@ -64,9 +64,7 @@ class TestExtractionVsHFReference(unittest.TestCase):
         )
         feats = adapter.generate_features([task], capture=capture)[0]
         recorded = feats.pop("__aux_layer_ids__")
-        verify_feature_contract(
-            feats, capture, sample_id="t0", recorded_aux_layer_ids=recorded
-        )
+        verify_capture(feats, capture, sample_id="t0", recorded_aux_layer_ids=recorded)
         self.assertEqual(tuple(recorded), tuple(aux_ids))
         self.assertEqual(feats["hidden_state"].shape[-1], 3 * H)
 
@@ -106,12 +104,12 @@ class TestExtractionVsHFReference(unittest.TestCase):
     def test_capture_layer_mismatch_fails(self):
         """A recorded aux-layer set != requested fails loudly at the boundary."""
         from specforge.inference.capture import (
-            FeatureContract,
-            FeatureContractError,
-            verify_feature_contract,
+            CaptureConfig,
+            CaptureMismatchError,
+            verify_capture,
         )
 
-        cap = FeatureContract.from_strategy(
+        cap = CaptureConfig.from_strategy(
             required_features={"hidden_state", "target", "input_ids", "loss_mask"},
             aux_hidden_state_layer_ids=(1, 3, 4),
             target_repr="hidden_state",
@@ -123,8 +121,8 @@ class TestExtractionVsHFReference(unittest.TestCase):
             "hidden_state": torch.randn(1, 4, 24),
             "target": torch.randn(1, 4, 8),
         }
-        with self.assertRaises(FeatureContractError):
-            verify_feature_contract(
+        with self.assertRaises(CaptureMismatchError):
+            verify_capture(
                 tensors, cap, sample_id="x", recorded_aux_layer_ids=(1, 3, 5)
             )
 

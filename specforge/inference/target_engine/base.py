@@ -34,12 +34,9 @@ now-real ``.backend`` tag in ``health()``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import Any, List, Optional
 
 import torch
-
-if TYPE_CHECKING:
-    from .target_capture_policy import TargetCaptureBatch
 
 # Known transport/backend tags. ``sglang_server`` (a live frozen-target SGLang
 # server, cross-node) is introduced by the sglang-capture-backend PR; its capture
@@ -82,11 +79,11 @@ class TargetEngine(ABC):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         **kwargs,
-    ) -> "TargetCaptureBatch":
+    ) -> Any:
         """Run the frozen target forward and extract training features.
 
         The generic extraction entry point that replaces the EAGLE3-named
-        ``generate_eagle3_data``. Returns a typed ``TargetCaptureBatch``
+        ``generate_eagle3_data``. Returns a per-algorithm output dataclass
         (``Eagle3TargetOutput`` / ``DFlashTargetOutput``). Algorithm engines keep
         their original ``generate_*_data`` method as the concrete implementation
         and as a back-compat alias; ``capture`` simply dispatches to it, so the

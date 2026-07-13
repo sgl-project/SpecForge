@@ -18,6 +18,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -65,6 +66,10 @@ class ParallelConfig:
     ) -> "ParallelConfig":
         """Snapshot all parallel handles (DP/TP/SP groups, device meshes) from
         ``init_distributed``; a missing getter is logged, never silently skipped."""
+        # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
+        # runs DDP-style (full params replicated, one grad all-reduce, no param
+        # all-gather). Default unchanged when the env var is unset.
+        sharding_strategy = os.environ.get("FSDP_SHARDING", sharding_strategy)
         if not dist.is_initialized():
             return cls(
                 world_size=1,
@@ -176,7 +181,7 @@ class FSDPTrainingBackend(TrainingBackend):
                 model,
                 use_orig_params=True,
                 mixed_precision=MixedPrecision(
-                    param_dtype=pc.param_dtype, buffer_dtype=pc.param_dtype
+                    param_dtype=pc.param_dtype, buffer_dtype=torch.float32
                 ),
                 sharding_strategy=sharding,
                 process_group=pc.fsdp_process_group,
@@ -186,10 +191,23 @@ class FSDPTrainingBackend(TrainingBackend):
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
             self.optimizer = self._optimizer_factory(target)
+            self._configure_optimizer_grad_norm()
         return self.module
 
     def set_optimizer(self, optimizer) -> None:
         self.optimizer = optimizer
+        self._configure_optimizer_grad_norm()
+
+    def _configure_optimizer_grad_norm(self) -> None:
+        configure = getattr(self.optimizer, "configure_grad_norm_reduction", None)
+        if configure is not None:
+            configure(
+                process_group=self.parallel_config.fsdp_process_group,
+                enabled=(
+                    self._wrapped
+                    and self.parallel_config.sharding_strategy != "NO_SHARD"
+                ),
+            )
 
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
         """Backward one micro-step. FSDP reduce-scatters grads on every backward,
@@ -203,20 +221,12 @@ class FSDPTrainingBackend(TrainingBackend):
                 loss.backward()
 
     def step(self) -> Optional[torch.Tensor]:
-        """Optimizer step + the distributed grad-norm reduction (run_backward_and_update)."""
+        """Run the optimizer step, which clips and returns the global grad norm."""
         if self.optimizer is None:
             raise RuntimeError(
                 "FSDPTrainingBackend.step called before optimizer is set"
             )
-        grad_norm = self.optimizer.step()
-        if grad_norm is not None and dist.is_initialized():
-            grad_norm = grad_norm.detach().float()
-            if torch.cuda.is_available():
-                grad_norm = grad_norm.to(torch.cuda.current_device())
-            grad_norm = grad_norm.pow(2)
-            dist.all_reduce(grad_norm, op=dist.ReduceOp.SUM)
-            grad_norm = grad_norm.sqrt()
-        return grad_norm
+        return self.optimizer.step()
 
     def state_dict(self) -> dict:
         """Full training state ``{"model", "optimizer", "rng"}`` for resume.

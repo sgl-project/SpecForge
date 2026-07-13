@@ -243,26 +243,75 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
-
-        if self.projector_type == "domino":
-            self.emb_dim = dflash_config["emb_dim"]
-            self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
-            self.prefix_gru = nn.GRU(
-                input_size=config.hidden_size,
-                hidden_size=self.gru_hidden_dim,
-                num_layers=1,
-                batch_first=True,
-                bias=False,
-            )
-            in_dim = config.hidden_size + self.gru_hidden_dim
-            self.embed_proj = nn.Sequential(
-                nn.Linear(in_dim, self.emb_dim, bias=False),
-                nn.SiLU(),
-                nn.Linear(self.emb_dim, config.vocab_size, bias=False),
-            )
-        elif self.projector_type is not None:
-            raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
+        self._init_draft_head(config, dflash_config)
+        self.register_load_state_dict_pre_hook(self._remap_legacy_draft_head_keys)
         self.post_init()
+
+    @staticmethod
+    def _remap_legacy_draft_head_keys(
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        legacy_prefixes = (
+            ("logit_head.prefix_gru.", "prefix_gru."),
+            ("logit_head.embed_proj.", "embed_proj."),
+            ("logit_head.markov_head.", "markov_head."),
+            ("logit_head.confidence_head.", "confidence_head."),
+        )
+        for key in list(state_dict.keys()):
+            if not key.startswith(prefix):
+                continue
+            local_key = key[len(prefix) :]
+            for old_prefix, new_prefix in legacy_prefixes:
+                if local_key.startswith(old_prefix):
+                    new_key = prefix + new_prefix + local_key[len(old_prefix) :]
+                    if new_key not in state_dict:
+                        state_dict[new_key] = state_dict[key]
+                    state_dict.pop(key)
+                    break
+
+    def _init_draft_head(self, config, dflash_config: dict) -> None:
+        del config, dflash_config
+
+    def apply_logits_head(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+        prev_token_embeddings: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        del prev_token_ids, prev_token_embeddings, hidden_states
+        return base_logits
+
+    def apply_markov_logits(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.apply_logits_head(
+            base_logits,
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden_states,
+        )
+
+    def predict_confidence(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        del hidden_states, prev_token_ids
+        return None
 
     def forward(
         self,

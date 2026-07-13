@@ -212,49 +212,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         nargs="*",
         help="dotted overrides, e.g. training.learning_rate=1e-4",
     )
-    export = sub.add_parser(
-        "export", help="export a training checkpoint for serving / HF"
-    )
-    export.add_argument("--to", choices=["sglang", "hf"], required=True)
-    export.add_argument("--checkpoint", required=True)
-    export.add_argument("--draft-config", required=True)
-    export.add_argument("--output-dir", required=True)
-    export.add_argument("--vocab-mapping", default=None)
-    export.add_argument(
-        "--embedding-source",
-        default=None,
-        help="HF export only: target model path/dir supplying the frozen embedding",
-    )
-    export.add_argument(
-        "--embedding-key",
-        default="model.embed_tokens.weight",
-        help="HF export only: embedding tensor key inside --embedding-source",
-    )
     args = parser.parse_args(argv)
 
     if args.command == "train":
         cfg = load_config(args.config, args.overrides)
         _train(cfg)
-    elif args.command == "export":
-        from specforge.export import export_to_hf, export_to_sglang
-
-        if args.to == "sglang":
-            out = export_to_sglang(
-                args.checkpoint,
-                args.draft_config,
-                args.output_dir,
-                vocab_mapping_path=args.vocab_mapping,
-            )
-        else:
-            out = export_to_hf(
-                args.checkpoint,
-                args.draft_config,
-                args.output_dir,
-                vocab_mapping_path=args.vocab_mapping,
-                embedding_source=args.embedding_source,
-                embedding_key=args.embedding_key,
-            )
-        print(f"exported {args.to} draft to {out}")
     return 0
 
 

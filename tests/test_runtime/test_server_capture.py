@@ -223,6 +223,20 @@ def _dflash_contract() -> FeatureContract:
     )
 
 
+def _dspark_contract() -> FeatureContract:
+    return FeatureContract.from_strategy(
+        required_features={
+            "input_ids",
+            "hidden_states",
+            "loss_mask",
+            "target_last_hidden_states",
+        },
+        aux_hidden_state_layer_ids=AUX_LAYERS,
+        target_repr="hidden_state",
+        target_hidden_size=HIDDEN,
+    )
+
+
 def _mk(strategy="eagle3", server=None, backend=None):
     backend = backend or _FakeMooncakeStore()
     server = server or _StubCaptureServer(backend)
@@ -285,6 +299,55 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertEqual(ref.feature_specs["loss_mask"].shape, (1, 5))
         out, _ = store.get(ref)
         self.assertEqual(out["input_ids"].tolist(), [list(range(1, 6))])
+
+    def test_dspark_schema_includes_target_last_hidden(self):
+        backend, server, store, adapter = _mk(strategy="dspark")
+        refs = adapter.produce_refs([_task(0, 5)], capture=_dspark_contract())
+        (ref,) = refs
+        self.assertIsInstance(ref, SampleRef)
+        self.assertEqual(ref.strategy, "dspark")
+        self.assertEqual(
+            sorted(ref.feature_specs),
+            [
+                "hidden_states",
+                "input_ids",
+                "loss_mask",
+                "target_last_hidden_states",
+            ],
+        )
+        self.assertEqual(
+            ref.feature_specs["hidden_states"].shape,
+            (1, 5, len(AUX_LAYERS) * HIDDEN),
+        )
+        self.assertEqual(
+            ref.feature_specs["target_last_hidden_states"].shape,
+            (1, 5, HIDDEN),
+        )
+        self.assertEqual(
+            ref.feature_specs["target_last_hidden_states"].target_repr,
+            "hidden_state",
+        )
+        out, _ = store.get(ref)
+        self.assertIn("target_last_hidden_states", out)
+
+    def test_batch_response_wrappers_are_normalized_by_sample_id(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def wrapped_server(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            results = [row["meta_info"]["spec_capture"] for row in rows]
+            for row in rows:
+                row["meta_info"]["spec_capture"] = [results]
+            return [[row] for row in rows]
+
+        _, _, _, adapter = _mk(
+            strategy="dflash", server=wrapped_server, backend=backend
+        )
+        refs = adapter.produce_refs(
+            [_task(0, 5), _task(1, 6)], capture=_dflash_contract()
+        )
+        self.assertTrue(all(isinstance(ref, SampleRef) for ref in refs))
 
     def test_aux_width_mismatch_fails_loud_and_frees_keys(self):
         backend = _FakeMooncakeStore()

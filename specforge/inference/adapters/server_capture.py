@@ -117,6 +117,17 @@ register_server_capture_schema(
         ),
     )
 )
+register_server_capture_schema(
+    ServerCaptureSchema(
+        strategy="dspark",
+        aux_feature="hidden_states",
+        last_hidden_feature="target_last_hidden_states",
+        passthrough=(
+            ("input_ids", "input_ids", ()),
+            ("loss_mask", "loss_mask", ()),
+        ),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +145,43 @@ def _default_post(url: str, json_body: Dict[str, Any], timeout: float):
     resp = requests.post(url, json=json_body, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
+
+
+def _flatten_list_wrappers(value: Any) -> List[Any]:
+    """Flatten list-only response wrappers while leaving row objects intact."""
+    if not isinstance(value, list):
+        return [value]
+    flattened: List[Any] = []
+    for item in value:
+        flattened.extend(_flatten_list_wrappers(item))
+    return flattened
+
+
+def _capture_result_for_task(
+    value: Any, *, task_id: str, expected_sample_id: str
+) -> Optional[Dict[str, Any]]:
+    """Select this task's capture from scalar or batch-wrapped results."""
+    candidates = [item for item in _flatten_list_wrappers(value) if item is not None]
+    if not candidates:
+        return None
+    if not all(isinstance(item, dict) for item in candidates):
+        types = sorted({type(item).__name__ for item in candidates})
+        raise RuntimeError(
+            "spec-capture server returned non-object capture results for task "
+            f"{task_id}: {types}"
+        )
+    if len(candidates) == 1:
+        return candidates[0]
+    matches = [
+        item for item in candidates if str(item.get("sample_id")) == expected_sample_id
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "spec-capture server returned an ambiguous batch result for task "
+            f"{task_id}: expected sample_id={expected_sample_id!r}, "
+            f"matches={len(matches)}, candidates={len(candidates)}"
+        )
+    return matches[0]
 
 
 class SGLangServerCaptureAdapter:
@@ -290,16 +338,38 @@ class SGLangServerCaptureAdapter:
         transport-level error raises — the worker fails the whole lease batch
         retryable, mirroring ``generate_features`` semantics.
         """
+        import os as _os
+        import time as _time
+
+        # PROFILE_PRODUCER=N -> every N produce_refs calls print one
+        # [prod-http] line splitting body-build / HTTP round-trip / parse.
+        _prof = int(_os.environ.get("PROFILE_PRODUCER", "0"))
+        if _prof and not hasattr(self, "_hs"):
+            self._hs = {
+                "calls": 0,
+                "n": 0,
+                "tok": 0,
+                "build": 0.0,
+                "http": 0.0,
+                "parse": 0.0,
+            }
+        _t = _time.monotonic()
         body = {
             "input_ids": [list(t.payload["input_ids"]) for t in tasks],
             "sampling_params": {"temperature": 0.0, "max_new_tokens": 1},
             "spec_capture": [self._spec_capture_payload(t) for t in tasks],
         }
+        if _prof:
+            self._hs["build"] += _time.monotonic() - _t
+            self._hs["tok"] += sum(len(t.payload["input_ids"]) for t in tasks)
+        _t = _time.monotonic()
         rows = self.post_fn(
             f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
         )
-        if isinstance(rows, dict):
-            rows = [rows]
+        if _prof:
+            self._hs["http"] += _time.monotonic() - _t
+        _t = _time.monotonic()
+        rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):
             raise RuntimeError(
                 f"spec-capture server returned {len(rows)} rows for "
@@ -307,10 +377,19 @@ class SGLangServerCaptureAdapter:
             )
         out: List[Union[Any, ServerCaptureFailure]] = []
         for task, row in zip(tasks, rows):
+            if not isinstance(row, dict):
+                raise RuntimeError(
+                    "spec-capture server returned a non-object row for task "
+                    f"{task.task_id}: {type(row).__name__}"
+                )
             meta = row.get("meta_info") or {}
             # meta_info["spec_capture"] is the per-request result dict (or an
             # {"error": ...} marker) from the server's dedicated output field.
-            result = meta.get("spec_capture")
+            result = _capture_result_for_task(
+                meta.get("spec_capture"),
+                task_id=task.task_id,
+                expected_sample_id=self._sample_id(task),
+            )
             if not result:
                 out.append(
                     ServerCaptureFailure(
@@ -384,6 +463,27 @@ class SGLangServerCaptureAdapter:
                 continue
             self.store.adopt(ref)
             out.append(ref)
+        if _prof:
+            self._hs["parse"] += _time.monotonic() - _t
+            self._hs["calls"] += 1
+            self._hs["n"] += len(tasks)
+            if self._hs["calls"] >= _prof:
+                h = self._hs
+                print(
+                    f"[prod-http] calls={h['calls']} n={h['n']} tok={h['tok']} "
+                    f"build_ms={1000*h['build']/h['calls']:.1f} "
+                    f"http_ms={1000*h['http']/h['calls']:.1f} "
+                    f"parse_ms={1000*h['parse']/h['calls']:.1f} (avg/call)",
+                    flush=True,
+                )
+                self._hs = {
+                    "calls": 0,
+                    "n": 0,
+                    "tok": 0,
+                    "build": 0.0,
+                    "http": 0.0,
+                    "parse": 0.0,
+                }
         return out
 
     def health(self) -> Dict[str, Any]:

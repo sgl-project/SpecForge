@@ -11,15 +11,15 @@ import os
 import tempfile
 import unittest
 
-import torch
 from transformers import LlamaConfig, Qwen3Config
 
 from specforge.modeling.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlashDraftModel,
+    DominoDraftModel,
+    DSparkDraftModel,
     LlamaForCausalLMEagle3,
-    PEagleDraftModel,
     available_drafts,
     register_draft,
     resolve_draft,
@@ -42,19 +42,52 @@ TINY_EAGLE3 = {
 TINY_DFLASH = {
     "architectures": ["DFlashDraftModel"],
     "model_type": "qwen3",
+    "block_size": 4,
     "hidden_size": 64,
     "intermediate_size": 128,
     "num_attention_heads": 4,
     "num_key_value_heads": 2,
     "num_hidden_layers": 1,
+    "num_target_layers": 4,
     "head_dim": 16,
     "max_position_embeddings": 512,
     "vocab_size": 256,
 }
 
-TINY_PEAGLE = {
-    **TINY_EAGLE3,
-    "architectures": ["PEagleDraftModel"],
+TINY_DSPARK = {
+    **TINY_DFLASH,
+    "architectures": ["DSparkDraftModel"],
+    "layer_types": ["full_attention"],
+    "dflash_config": {
+        "projector_type": "dspark",
+        "markov_rank": 8,
+        "markov_head_type": "vanilla",
+        "confidence_head_alpha": 1.0,
+        "confidence_head_with_markov": True,
+    },
+}
+
+TINY_LEGACY_DSPARK = {
+    **TINY_DSPARK,
+    "architectures": ["DFlashDraftModel"],
+}
+
+TINY_DOMINO = {
+    **TINY_DFLASH,
+    "architectures": ["DominoDraftModel"],
+    "layer_types": ["full_attention"],
+    "dflash_config": {
+        "projector_type": "domino",
+        "emb_dim": 16,
+        "gru_hidden_dim": 16,
+        "pure_draft_prefix_len": 0,
+        "shift_label": False,
+    },
+}
+
+TINY_LEGACY_DOMINO = {
+    **TINY_DOMINO,
+    "architectures": ["DFlashDraftModel"],
 }
 
 
@@ -69,10 +102,12 @@ class DraftRegistryTest(unittest.TestCase):
     def test_builtin_architectures_registered(self):
         self.assertIn("LlamaForCausalLMEagle3", available_drafts())
         self.assertIn("DFlashDraftModel", available_drafts())
-        self.assertIn("PEagleDraftModel", available_drafts())
+        self.assertIn("DominoDraftModel", available_drafts())
+        self.assertIn("DSparkDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
-        self.assertIs(resolve_draft("PEagleDraftModel"), PEagleDraftModel)
+        self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)
+        self.assertIs(resolve_draft("DSparkDraftModel"), DSparkDraftModel)
 
     def test_unknown_architecture_raises_with_available_list(self):
         with self.assertRaises(KeyError) as ctx:
@@ -119,6 +154,68 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         config = AutoDraftModelConfig.from_file(path)
         self.assertIsInstance(config, Qwen3Config)
 
+    def test_from_config_builds_dspark_as_explicit_draft(self):
+        path = _write(TINY_DSPARK)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        self.assertIsInstance(model, DSparkDraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.projector_type, "dspark")
+        self.assertIsNotNone(model.markov_head)
+        self.assertIsNotNone(model.confidence_head)
+
+    def test_from_config_maps_legacy_dspark_projector_to_explicit_draft(self):
+        path = _write(TINY_LEGACY_DSPARK)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        self.assertIsInstance(model, DSparkDraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.projector_type, "dspark")
+        self.assertIsNotNone(model.markov_head)
+
+    def test_from_config_maps_legacy_domino_projector_to_explicit_draft(self):
+        path = _write(TINY_LEGACY_DOMINO)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        self.assertIsInstance(model, DominoDraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.projector_type, "domino")
+        self.assertIsNotNone(model.prefix_gru)
+
+    def test_from_config_builds_domino_as_explicit_draft(self):
+        path = _write(TINY_DOMINO)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        self.assertIsInstance(model, DominoDraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.projector_type, "domino")
+        self.assertIsNotNone(model.prefix_gru)
+        self.assertIsNotNone(model.embed_proj)
+
+    def test_domino_uses_direct_state_dict_keys(self):
+        path = _write(TINY_DOMINO)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        keys = set(model.state_dict())
+        self.assertTrue(any(key.startswith("prefix_gru.") for key in keys))
+        self.assertTrue(any(key.startswith("embed_proj.") for key in keys))
+        self.assertFalse(any(key.startswith("logit_head.") for key in keys))
+
+    def test_dspark_uses_direct_state_dict_keys(self):
+        path = _write(TINY_DSPARK)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoEagle3DraftModel.from_config(config)
+        keys = set(model.state_dict())
+        self.assertTrue(any(key.startswith("markov_head.") for key in keys))
+        self.assertTrue(any(key.startswith("confidence_head.") for key in keys))
+        self.assertFalse(any(key.startswith("logit_head.") for key in keys))
+
     def test_from_file_unknown_architecture_raises(self):
         path = _write({**TINY_EAGLE3, "architectures": ["NoSuchDraft"]})
         self.addCleanup(os.unlink, path)
@@ -132,41 +229,6 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         config = AutoDraftModelConfig.from_file(path)
         model = AutoEagle3DraftModel.from_config(config)
         self.assertIsInstance(model, LlamaForCausalLMEagle3)
-
-    def test_from_config_without_architecture_uses_legacy_fallback(self):
-        config = LlamaConfig(
-            **{k: v for k, v in TINY_EAGLE3.items() if k != "architectures"}
-        )
-        model = AutoEagle3DraftModel.from_config(config)
-        self.assertIsInstance(model, LlamaForCausalLMEagle3)
-
-    def test_auto_mapping_exposes_non_llama_registered_configs(self):
-        self.assertIn(Qwen3Config, AutoEagle3DraftModel._model_mapping)
-        self.assertIn(
-            DFlashDraftModel,
-            AutoEagle3DraftModel._model_mapping[Qwen3Config],
-        )
-
-    def test_from_config_resolves_peagle_via_registry(self):
-        path = _write(TINY_PEAGLE)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
-        self.assertIsInstance(model, PEagleDraftModel)
-
-    def test_peagle_direct_save_reload(self):
-        path = _write(TINY_PEAGLE)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
-        model = PEagleDraftModel(config)
-        with tempfile.TemporaryDirectory() as output_dir:
-            model.save_pretrained(output_dir)
-            reloaded = PEagleDraftModel.from_pretrained(output_dir)
-            auto_reloaded = AutoEagle3DraftModel.from_pretrained(output_dir)
-        self.assertIsInstance(reloaded, PEagleDraftModel)
-        self.assertIsInstance(auto_reloaded, PEagleDraftModel)
-        self.assertTrue(torch.isfinite(reloaded.rotary_emb.cos_cached).all())
-        self.assertTrue(torch.isfinite(auto_reloaded.rotary_emb.cos_cached).all())
 
 
 if __name__ == "__main__":

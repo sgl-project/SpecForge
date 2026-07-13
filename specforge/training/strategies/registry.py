@@ -264,20 +264,79 @@ register_strategy(
         make_offline_reader=_dflash_offline_reader,
         make_offline_transform=_dflash_offline_transform,
         make_offline_collate=_dflash_offline_collate,
-        make_online_collate=lambda: concat_collate,
+        make_online_collate=_dflash_offline_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,
         supports_online=True,
     )
 )
 
 
+# --- DSpark -----------------------------------------------------------------
+# DSpark is intentionally wired only for the server-capture disaggregated online
+# path. It reuses DFlash's captured layer feature (hidden_states), but also
+# requires the target model's last hidden state so the consumer can compute the
+# target distribution through its frozen lm_head.
+
+from specforge.training.strategies.base import DSparkTrainStrategy
+
+
+def _dspark_online_collate():
+    def collate(feats):
+        maxlen = max(f["input_ids"].shape[-1] for f in feats)
+
+        def pad2d(t):
+            n = t.shape[-1]
+            if n == maxlen:
+                return t
+            return torch.cat([t, t.new_zeros(t.shape[0], maxlen - n)], dim=-1)
+
+        def pad3d(t):
+            n = t.shape[1]
+            if n == maxlen:
+                return t
+            return torch.cat(
+                [t, t.new_zeros(t.shape[0], maxlen - n, t.shape[2])], dim=1
+            )
+
+        return {
+            "input_ids": torch.cat([pad2d(f["input_ids"]) for f in feats], dim=0),
+            "loss_mask": torch.cat([pad2d(f["loss_mask"]) for f in feats], dim=0),
+            "hidden_states": torch.cat(
+                [pad3d(f["hidden_states"]) for f in feats], dim=0
+            ),
+            "target_last_hidden_states": torch.cat(
+                [pad3d(f["target_last_hidden_states"]) for f in feats], dim=0
+            ),
+        }
+
+    return collate
+
+
+def _dspark_server_capture_only_adapter(*args, **kwargs):
+    raise NotImplementedError(
+        "DSpark online training is wired only for the disaggregated "
+        "server-capture path. Use examples/disagg/run_disagg_dspark.py."
+    )
+
+
+register_strategy(
+    StrategySpec(
+        name="dspark",
+        required_features=frozenset(DSparkTrainStrategy.required_features),
+        make_strategy=lambda wrapped, *, target_head=None: DSparkTrainStrategy(wrapped),
+        uses_target_head=False,
+        make_online_collate=_dspark_online_collate,
+        make_adapter=_dspark_server_capture_only_adapter,
+        supports_online=True,
+    )
+)
+
+
 # --- Domino -----------------------------------------------------------------
-# Domino reuses DFlash's draft model (projector_type="domino" head), feature
-# schema, offline transform/collate, and capture path (same DFLASH_FEATURE_SCHEMA
-# -> hidden_states). The ONE difference is the loss: it blends a base loss with a
-# step-decayed weight, so DominoTrainStrategy reads the StepContext
-# (forward_loss(batch, ctx)). That is the whole reason a new algorithm needs
-# anything beyond a spec entry here.
+# Domino uses a DFlash-family draft model and reuses the DFlash feature schema,
+# offline transform/collate, and capture path (same DFLASH_FEATURE_SCHEMA ->
+# hidden_states). The loss blends a base loss with a step-decayed weight, so
+# DominoTrainStrategy reads the StepContext (forward_loss(batch, ctx)).
 
 from specforge.training.strategies.base import DominoTrainStrategy
 
@@ -296,16 +355,24 @@ def _domino_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
     )
 
 
+def _make_domino_strategy(
+    wrapped, *, target_head=None, lambda_start=1.0, decay_ratio=0.5
+):
+    return DominoTrainStrategy(
+        wrapped, lambda_start=lambda_start, decay_ratio=decay_ratio
+    )
+
+
 register_strategy(
     StrategySpec(
         name="domino",
         required_features=frozenset(DominoTrainStrategy.required_features),
-        make_strategy=lambda wrapped, *, target_head=None: DominoTrainStrategy(wrapped),
+        make_strategy=_make_domino_strategy,
         uses_target_head=False,
         make_offline_reader=_domino_offline_reader,
         make_offline_transform=_dflash_offline_transform,  # same schema as DFlash
         make_offline_collate=_dflash_offline_collate,
-        make_online_collate=lambda: concat_collate,
+        make_online_collate=_dflash_offline_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,  # same capture path as DFlash
         supports_online=True,
     )

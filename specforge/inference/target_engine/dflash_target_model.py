@@ -1,17 +1,27 @@
 from abc import abstractmethod
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from transformers import AutoModelForCausalLM
 
 from .base import TargetEngine
-from .target_capture_policy import DFlashCapturePolicy, DFlashTargetOutput
 
-# NOTE: the capture/load implementations live in
-# ``target_capture_policy.DFlashCapturePolicy``, shared with the generic per-backend
-# engines. The classes below keep the existing hierarchy and delegate.
+# NOTE (Phase B2): this module no longer imports sglang internals. The
+# SGLang-version-pinned capture path (ServerArgs / ModelConfig / SGLangRunner +
+# the extend/capture forward) lives entirely in
+# ``sglang_backend.SGLangCaptureBackend``, shared with the eagle3 engine (one
+# copy of the forward + mlp-sync). The SGLang engine below composes it, imported
+# lazily inside ``from_pretrained`` so ``import specforge`` stays sglang-agnostic.
 
-_DFLASH = DFlashCapturePolicy()
+
+@dataclass
+class DFlashTargetOutput:
+    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size]
+    input_ids: torch.Tensor  # [batch, seq_len]
+    attention_mask: torch.Tensor  # [batch, seq_len]
+    loss_mask: torch.Tensor  # [batch, seq_len]
 
 
 class DFlashTargetEngine(TargetEngine):
@@ -94,14 +104,16 @@ class SGLangDFlashTargetEngine(DFlashTargetEngine):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangDFlashTargetEngine":
-        # Lazy import so `import specforge` still works without the pinned sglang.
+        # Lazy import so `import specforge` still works without the pinned sglang:
+        # the sglang-version coupling lives entirely in SGLangCaptureBackend, which
+        # also unifies the extend/mlp-sync forward this engine used to duplicate.
         from .sglang_backend import SGLangCaptureBackend
 
         backend = SGLangCaptureBackend.build(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             trust_remote_code=trust_remote_code,
-            **_DFLASH.spec.sglang_build_kwargs,
+            wrap_eagle3_logits=False,
             **kwargs,
         )
         return cls(backend)
@@ -111,14 +123,28 @@ class SGLangDFlashTargetEngine(DFlashTargetEngine):
         # Some target models expose set_eagle3_layers_to_capture; guard on it.
         self._backend.set_eagle3_capture_layers(layer_ids, if_supported=True)
 
+    @torch.no_grad()
     def generate_dflash_data(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> DFlashTargetOutput:
-        return _DFLASH.sglang_capture(
-            self._backend, input_ids, attention_mask, loss_mask
+        data_cache, hidden_states_list = self._backend.extend_dflash(
+            input_ids, attention_mask, loss_mask
+        )
+
+        # Stack back to batch
+        hidden_states = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
+        input_ids = torch.cat([d[0] for d in data_cache], dim=0)
+        attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
+        loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
+
+        return DFlashTargetOutput(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
         )
 
 
@@ -140,25 +166,50 @@ class HFDFlashTargetEngine(DFlashTargetEngine):
         trust_remote_code: bool = True,
         **kwargs,
     ) -> "HFDFlashTargetEngine":
-        return cls(
-            _DFLASH.hf_load(
-                pretrained_model_name_or_path,
-                torch_dtype,
-                device,
-                cache_dir,
-                trust_remote_code=trust_remote_code,
-                **kwargs,
-            )
-        )
 
+        target_model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            cache_dir=cache_dir,
+            output_hidden_states=True,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        ).eval()
+
+        if device:
+            target_model = target_model.to(device)
+
+        return cls(target_model)
+
+    @torch.no_grad()
     def generate_dflash_data(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> DFlashTargetOutput:
-        return _DFLASH.hf_capture(
-            self.model, self.capture_layer_ids, input_ids, attention_mask, loss_mask
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
+        # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
+        offset = 1
+        selected = []
+        if self.capture_layer_ids is not None:
+            for idx in self.capture_layer_ids:
+                selected.append(outputs.hidden_states[idx + offset])
+            hidden_states = torch.cat(selected, dim=-1)
+        else:
+            hidden_states = outputs.hidden_states[-1]
+
+        return DFlashTargetOutput(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
         )
 
 
@@ -191,6 +242,8 @@ def get_dflash_target_model(
 
 
 # --- Back-compat aliases (pre-Phase-B names) -------------------------------
+# See the note in eagle3_target_model.py: the ``*TargetModel`` -> ``*TargetEngine``
+# rename is import-compatible; these aliases keep existing callers working.
 DFlashTargetModel = DFlashTargetEngine
 SGLangDFlashTargetModel = SGLangDFlashTargetEngine
 HFDFlashTargetModel = HFDFlashTargetEngine

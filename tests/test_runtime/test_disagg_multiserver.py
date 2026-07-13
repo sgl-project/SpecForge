@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
 from specforge.launch import build_disagg_online_producer
@@ -120,6 +121,51 @@ class TestMultiServerProducer(unittest.TestCase):
             by_server.setdefault(r.metadata["server"], set()).add(r.sample_id)
         self.assertEqual(by_server.get("http://server0:30000"), seen0)
         self.assertEqual(by_server.get("http://server1:30001"), seen1)
+
+    def test_producer_profiling_handles_first_round_without_backpressure(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)], _prompts(2), store, channel, lease=2
+        )
+
+        with patch.dict(os.environ, {"PROFILE_PRODUCER": "1"}):
+            produced = drive()
+
+        self.assertEqual(produced, 2)
+        self.assertTrue(channel.is_closed())
+
+    def test_prompt_epochs_republish_with_unique_sample_ids(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        N, E = 3, 2
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(N),
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=E,
+        )
+
+        produced = drive()
+        self.assertEqual(produced, N * E)
+        ids = _published_sample_ids(channel.path)
+        self.assertEqual(len(ids), N * E)
+        self.assertEqual(len(set(ids)), N * E)
+        self.assertEqual(
+            set(ids),
+            {
+                f"run0:epoch{epoch:04d}-prompt{idx:012d}"
+                for epoch in range(E)
+                for idx in range(N)
+            },
+        )
+        self.assertTrue(channel.is_closed())
 
     def test_one_dead_server_survivor_completes_pool(self):
         backend = _FakeMooncakeStore()
