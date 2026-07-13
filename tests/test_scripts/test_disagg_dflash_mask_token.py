@@ -6,21 +6,21 @@ from pathlib import Path
 
 def _load_resolver():
     source_path = (
-        Path(__file__).parents[2] / "examples" / "disagg" / "run_disagg_dflash.py"
+        Path(__file__).parents[2] / "examples" / "disagg" / "_dflash_family_disagg.py"
     )
     tree = ast.parse(source_path.read_text(), filename=str(source_path))
     resolver = next(
         node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_resolve_mask_token"
+        and node.name == "resolve_mask_token"
     )
     namespace = {}
     exec(
         compile(ast.Module(body=[resolver], type_ignores=[]), str(source_path), "exec"),
         namespace,
     )
-    return namespace["_resolve_mask_token"]
+    return namespace["resolve_mask_token"]
 
 
 class _Tokenizer:

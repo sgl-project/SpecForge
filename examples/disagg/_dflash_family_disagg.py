@@ -308,9 +308,13 @@ def run_server_capture_producer(
     )
 
 
-def resolve_mask_token(args, tokenizer) -> int:
+def resolve_mask_token(args, tokenizer, draft_model=None) -> int:
     if args.mask_token_id is not None:
         return args.mask_token_id
+    if draft_model is not None:
+        dflash_config = getattr(getattr(draft_model, "config", None), "dflash_config", {})
+        if dflash_config is not None and dflash_config.get("mask_token_id") is not None:
+            return dflash_config["mask_token_id"]
     if tokenizer.mask_token_id is not None:
         return tokenizer.mask_token_id
     tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
@@ -392,7 +396,7 @@ def build_consumer_parts(
         expected_projector_type=expected_projector_type,
         required_dflash_fields=required_dflash_fields,
     )
-    mask_token_id = resolve_mask_token(args, tokenizer)
+    mask_token_id = resolve_mask_token(args, tokenizer, draft_model)
     draft_model.mask_token_id = mask_token_id
     draft_model.config.dflash_config["mask_token_id"] = mask_token_id
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
