@@ -426,6 +426,9 @@ class SGLangCaptureBackend:
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
 
+    def extend_eagle3(self, *args, **kwargs):
+        return self.extend(*args, **kwargs)
+
     # --- EAGLE3 extend (VLM) -----------------------------------------------
 
     def get_rope_index(
@@ -604,6 +607,9 @@ class SGLangCaptureBackend:
         )
 
         return data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list
+
+    def extend_eagle3_vlm(self, *args, **kwargs):
+        return self.extend_vlm(*args, **kwargs)
 
     # --- DFlash extend ------------------------------------------------------
 
