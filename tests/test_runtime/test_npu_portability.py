@@ -49,6 +49,21 @@ class NPUDistributedTest(unittest.TestCase):
         self.assertEqual(sf_dist._distributed_backend("npu"), "hccl")
         self.assertEqual(sf_dist._distributed_backend("cpu"), "gloo")
 
+    def test_pre_group_binding_falls_back_to_global_rank(self):
+        accelerator = mock.Mock()
+        accelerator.is_available.return_value = True
+        accelerator.device_count.return_value = 4
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "5"}, clear=True),
+            mock.patch.object(sf_dist, "_device_module", return_value=accelerator),
+            mock.patch.object(sf_dist.dist, "is_initialized", return_value=False),
+        ):
+            local_rank = sf_dist._bind_local_device("npu")
+
+        self.assertEqual(local_rank, 1)
+        accelerator.set_device.assert_called_once_with(1)
+
     def test_npu_init_uses_hccl_binding_and_npu_meshes(self):
         accelerator = mock.Mock()
         accelerator.is_available.return_value = True

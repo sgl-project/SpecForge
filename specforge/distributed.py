@@ -62,7 +62,12 @@ def _bind_local_device(device_type: str) -> int:
     count = int(module.device_count())
     if count <= 0:
         raise RuntimeError(f"requested {device_type!r} accelerator has no devices")
-    rank_fallback = dist.get_rank() % count if dist.is_initialized() else 0
+    if dist.is_initialized():
+        rank_fallback = dist.get_rank() % count
+    else:
+        # ``torchrun`` supplies LOCAL_RANK, while ``mp.spawn``-style launchers
+        # commonly supply only RANK before the default process group exists.
+        rank_fallback = int(os.environ.get("RANK", "0")) % count
     local_rank = int(os.environ.get("LOCAL_RANK", rank_fallback))
     if not 0 <= local_rank < count:
         raise ValueError(
