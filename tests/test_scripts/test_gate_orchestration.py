@@ -166,7 +166,10 @@ fi
             cwd=ROOT,
             text=True,
             capture_output=True,
-            timeout=10,
+            # A missed setsid startup signal blocks on the 30-second sleeper;
+            # keep enough scheduling headroom for slower macOS CI while still
+            # failing well before that broken path could finish naturally.
+            timeout=8,
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
