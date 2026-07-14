@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch one offline-disaggregated EAGLE3 role through the canonical CLI.
+# Launch one offline-disaggregated role through the canonical CLI.
 set -euo pipefail
 
 usage() {
