@@ -443,20 +443,33 @@ class SGLangCaptureBackend:
         if not self.is_vlm:
             raise ValueError("get_rope_index is only available for VLM models")
 
+        # SGLang's M-RoPE helper constructs temporal/spatial indices on CPU.
+        # Passing CUDA token ids alongside a CPU ``image_grid_thw`` therefore
+        # fails inside its stack/cat path. Compute the small index tensors on a
+        # single device, matching the backend's own ``extend_vlm`` path, then
+        # restore the caller's device for the canonical feature contract.
+        output_device = input_ids.device
+
+        def on_cpu(value):
+            return value.cpu() if isinstance(value, torch.Tensor) else value
+
         position_ids, rope_deltas = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.spatial_merge_size,
             image_token_id=self.image_token_id,
             video_token_id=self.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
             model_type=self.model_type,
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-            attention_mask=attention_mask,
+            input_ids=on_cpu(input_ids),
+            image_grid_thw=on_cpu(image_grid_thw),
+            video_grid_thw=on_cpu(video_grid_thw),
+            second_per_grid_ts=on_cpu(second_per_grid_ts),
+            attention_mask=on_cpu(attention_mask),
             tokens_per_second=self.tokens_per_second,
         )
 
+        position_ids = position_ids.to(output_device)
+        if isinstance(rope_deltas, torch.Tensor):
+            rope_deltas = rope_deltas.to(output_device)
         return position_ids, rope_deltas
 
     def extend_vlm(
