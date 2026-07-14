@@ -103,7 +103,9 @@ class TestMultiServerProducer(unittest.TestCase):
         produced = drive()
         self.assertEqual(produced, N)
         self.assertTrue(channel.is_closed())
-        self.assertEqual(workers[0].controller.sample_queue.depth(), 0)
+        # A disaggregated producer publishes refs directly to the channel. It
+        # must not retain a second local training queue/ledger.
+        self.assertIsNone(workers[0].controller.sample_queue)
 
         ids = _published_sample_ids(channel.path)
         self.assertEqual(len(ids), N)

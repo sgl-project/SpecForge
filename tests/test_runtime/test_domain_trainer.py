@@ -112,7 +112,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        trainer, cap, dfc_calls, model = self._build({"refs": [1, 2]})
+        refs = list(range(6))
+        trainer, cap, dfc_calls, model = self._build({"refs": refs})
 
         # Fixed offline refs bypass online queue/ledger state; trainer registered.
         self.assertIn(("register", {"role": "trainer", "run_id": "run"}), dfc_calls)
@@ -122,7 +123,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(cap["loader_kw"]["batch_size"], 2)
         self.assertEqual(cap["loader_kw"]["strategy"], "eagle3")
         self.assertIs(cap["loader_kw"]["drop_last"], True)
-        self.assertEqual(cap["loader_kw"]["refs"], [1, 2])
+        self.assertEqual(cap["loader_kw"]["refs"], refs)
 
         # optimizer built over the inner draft AFTER FSDP wrap
         self.assertEqual(cap["prepare_model"], (model, "DRAFT"))
@@ -134,7 +135,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         # run identity rides the shared checkpoint payload, validated on resume
         self.assertEqual(
             cap["ctrl_kw"]["checkpoint_extra"],
-            {"dataset_size": 2, "accumulation_steps": 3},
+            {"dataset_size": 6, "accumulation_steps": 3},
         )
 
     def test_fit_delegates_to_controller_over_loader(self):
@@ -142,7 +143,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        trainer, cap, _, _ = self._build({"refs": []})
+        trainer, cap, _, _ = self._build({"refs": list(range(6))})
         out = trainer.fit()
         self.assertEqual(out, 42)
         self.assertIs(cap["fit"], trainer.loader)
