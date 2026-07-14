@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
@@ -32,7 +31,7 @@ class TestDisaggregatedLaunchers(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 'printf "%s\\n" "$@" > "${CAPTURE_DIR}/'
-                f"{program}.args\"\n",
+                f'{program}.args"\n',
                 encoding="utf-8",
             )
             executable.chmod(0o755)

@@ -113,9 +113,7 @@ class LocalRolloutStream:
             )
 
     def _drained(self, status: dict) -> bool:
-        return not status.get("prompts_pending") and not status.get(
-            "prompts_leased"
-        )
+        return not status.get("prompts_pending") and not status.get("prompts_leased")
 
     def _pump_once(self, max_tasks: int) -> List[SampleRef]:
         resident = int(self.feature_store.health().get("resident_samples", 0))

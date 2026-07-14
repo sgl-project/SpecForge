@@ -91,9 +91,7 @@ class DataConfig(StrictConfigModel):
 
 
 class TrainingConfig(StrictConfigModel):
-    strategy: Literal["eagle3", "dflash", "domino", "dspark", "peagle"] = (
-        "eagle3"
-    )
+    strategy: Literal["eagle3", "dflash", "domino", "dspark", "peagle"] = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -157,8 +155,13 @@ class TrainingConfig(StrictConfigModel):
                 "EAGLE3 attention_backend must be sdpa, flex_attention, or fa"
             )
         if self.strategy == "peagle" and self.attention_backend != "flex_attention":
-            raise ValueError("P-EAGLE currently requires attention_backend=flex_attention")
-        if self.strategy in ("dflash", "domino", "dspark") and self.attention_backend == "fa":
+            raise ValueError(
+                "P-EAGLE currently requires attention_backend=flex_attention"
+            )
+        if (
+            self.strategy in ("dflash", "domino", "dspark")
+            and self.attention_backend == "fa"
+        ):
             raise ValueError(
                 "DFlash-family attention_backend must be eager, sdpa, or "
                 "flex_attention"
@@ -261,9 +264,9 @@ class Config(StrictConfigModel):
             )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
-        if (
-            self.model.target_backend == "custom"
-            and strategy not in ("eagle3", "peagle")
+        if self.model.target_backend == "custom" and strategy not in (
+            "eagle3",
+            "peagle",
         ):
             raise ValueError(
                 "the custom target backend currently supports EAGLE3 capture only"

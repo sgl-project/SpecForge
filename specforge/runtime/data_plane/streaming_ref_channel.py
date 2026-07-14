@@ -112,9 +112,9 @@ class StreamingRefChannel:
 
     def consumer_stopped(self) -> bool:
         """Whether the remote consumer completed or failed."""
-        return os.path.exists(
-            self.path + _CONSUMER_DONE_SUFFIX
-        ) or os.path.exists(self.path + _CONSUMER_FAILED_SUFFIX)
+        return os.path.exists(self.path + _CONSUMER_DONE_SUFFIX) or os.path.exists(
+            self.path + _CONSUMER_FAILED_SUFFIX
+        )
 
     def _write_sidecar(self, suffix: str, value: str) -> None:
         tmp = f"{self.path}{suffix}.tmp.{os.getpid()}"

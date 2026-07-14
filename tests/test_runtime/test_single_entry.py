@@ -89,11 +89,14 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         _claim_fresh_control_path(channel, (".failed",))
                     raise RuntimeError("assembly exploded")
 
-                with mock.patch.dict(
-                    os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False
-                ), mock.patch(
-                    "specforge.training.disaggregated._build_online",
-                    side_effect=fail_during_assembly,
+                with (
+                    mock.patch.dict(
+                        os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False
+                    ),
+                    mock.patch(
+                        "specforge.training.disaggregated._build_online",
+                        side_effect=fail_during_assembly,
+                    ),
                 ):
                     with self.assertRaisesRegex(RuntimeError, "assembly exploded"):
                         build_disaggregated_run(
@@ -126,11 +129,12 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 },
             }
         )
-        with mock.patch.dict(
-            os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False
-        ), mock.patch(
-            "specforge.training.disaggregated._build_online",
-            side_effect=RuntimeError("claim rejected"),
+        with (
+            mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False),
+            mock.patch(
+                "specforge.training.disaggregated._build_online",
+                side_effect=RuntimeError("claim rejected"),
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "claim rejected"):
                 build_disaggregated_run(
@@ -174,8 +178,9 @@ class TestCliLifecycle(unittest.TestCase):
             "127.0.0.1",
             32123,
         )
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
-            "specforge.cli.socket.socket", return_value=rendezvous
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("specforge.cli.socket.socket", return_value=rendezvous),
         ):
             _bootstrap_single_process_env()
             self.assertEqual(os.environ["RANK"], "0")

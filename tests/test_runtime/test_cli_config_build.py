@@ -92,9 +92,10 @@ class TestCliDispatch(unittest.TestCase):
                 "training": {"strategy": "dflash"},
             }
         )
-        with mock.patch("specforge.cli.load_config", return_value=cfg) as load, mock.patch(
-            "specforge.cli._train", return_value=3
-        ) as train:
+        with (
+            mock.patch("specforge.cli.load_config", return_value=cfg) as load,
+            mock.patch("specforge.cli._train", return_value=3) as train,
+        ):
             self.assertEqual(main(["train", "--config", "run.yaml"]), 0)
         load.assert_called_once_with("run.yaml", [])
         train.assert_called_once_with(cfg)

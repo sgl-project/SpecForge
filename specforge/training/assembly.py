@@ -175,10 +175,16 @@ def _draft_block_size(cfg: Config) -> int:
     """Read the DFlash-family block size from its single source of truth."""
     import json
 
-    with open(_draft_config_path(cfg.model.draft_model_config), encoding="utf-8") as stream:
+    with open(
+        _draft_config_path(cfg.model.draft_model_config), encoding="utf-8"
+    ) as stream:
         draft_config = json.load(stream)
     block_size = draft_config.get("block_size")
-    if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 1:
+    if (
+        not isinstance(block_size, int)
+        or isinstance(block_size, bool)
+        or block_size < 1
+    ):
         raise ValueError(
             "DFlash-family draft config must define a positive integer block_size"
         )
@@ -223,15 +229,15 @@ def _build_target_engine(cfg: Config, capture_layers):
     from specforge.inference.target_engine import get_target_engine
 
     # P-EAGLE consumes the exact EAGLE3 capture contract.
-    engine_strategy = "eagle3" if cfg.training.strategy == "peagle" else cfg.training.strategy
+    engine_strategy = (
+        "eagle3" if cfg.training.strategy == "peagle" else cfg.training.strategy
+    )
     backend_kwargs = {}
     if cfg.model.target_backend == "sglang":
         backend_kwargs = {
             "attention_backend": cfg.model.sglang_attention_backend,
             "mem_fraction_static": cfg.model.sglang_mem_fraction_static,
-            "context_length": (
-                cfg.model.sglang_context_length or cfg.data.max_length
-            ),
+            "context_length": (cfg.model.sglang_context_length or cfg.data.max_length),
             "enable_nccl_nvls": cfg.model.sglang_enable_nccl_nvls,
             "enable_symm_mem": cfg.model.sglang_enable_symm_mem,
             "enable_torch_compile": cfg.model.sglang_enable_torch_compile,
@@ -509,11 +515,16 @@ def _prepare_prompts(cfg: Config, tokenizer) -> List[dict]:
     )
 
 
-def _ensure_vocab_mapping(cfg: Config, bundle: ModelBundle, prompts: List[dict]) -> None:
+def _ensure_vocab_mapping(
+    cfg: Config, bundle: ModelBundle, prompts: List[dict]
+) -> None:
     """Generate the EAGLE-family dataset vocabulary map when not supplied."""
     if cfg.training.strategy not in ("eagle3", "peagle"):
         return
-    if cfg.model.vocab_mapping_path or bundle.draft_vocab_size == bundle.target_vocab_size:
+    if (
+        cfg.model.vocab_mapping_path
+        or bundle.draft_vocab_size == bundle.target_vocab_size
+    ):
         return
 
     key = hashlib.sha256(
@@ -551,7 +562,9 @@ def _ensure_vocab_mapping(cfg: Config, bundle: ModelBundle, prompts: List[dict])
     bundle.draft_model.d2t.copy_(d2t)
     bundle.draft_model.t2d.copy_(t2d)
     bundle.draft_model.vocab_mapping_loaded = True
-    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    distributed = (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    )
     if not distributed or torch.distributed.get_rank() == 0:
         temporary = f"{path}.{os.getpid()}.tmp"
         torch.save({"d2t": d2t, "t2d": t2d}, temporary)

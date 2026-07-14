@@ -19,9 +19,9 @@ def resolve_mask_token_id(
     token. Every candidate is range checked before it can reach a model lookup.
     """
 
-    method_config = getattr(
-        getattr(draft_model, "config", None), "dflash_config", None
-    ) or {}
+    method_config = (
+        getattr(getattr(draft_model, "config", None), "dflash_config", None) or {}
+    )
     candidates = [
         ("explicit mask token", explicit),
         ("draft config mask token", method_config.get("mask_token_id")),

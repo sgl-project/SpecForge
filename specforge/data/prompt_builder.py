@@ -13,7 +13,6 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from numbers import Integral
 from typing import Any
 
-
 PromptTaskDict = dict[str, Any]
 
 

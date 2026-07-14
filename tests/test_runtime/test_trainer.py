@@ -232,9 +232,7 @@ class TestResumeDataPosition(unittest.TestCase):
         core = TrainerCore(strat, backend, accumulation_steps=1)
         data = [_named_batch(i) for i in range(2)]
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core, run_id="r", output_dir=d, num_epochs=2
-            )
+            ctrl = TrainerController(core, run_id="r", output_dir=d, num_epochs=2)
             step = ctrl.fit(data)
             self.assertEqual(ctrl.epoch, 2)
             checkpoint = ctrl.save_checkpoint(step)

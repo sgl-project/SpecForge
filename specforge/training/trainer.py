@@ -84,9 +84,7 @@ class Trainer:
         )
 
         dataset_size = len(ref_source["refs"]) if "refs" in ref_source else None
-        configure_schedule = getattr(
-            optimizer_factory, "configure_total_steps", None
-        )
+        configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
         effective_total_steps = None
         if total_steps is not None or max_steps is not None or dataset_size is not None:
             from specforge.training.schedule import resolve_total_steps
