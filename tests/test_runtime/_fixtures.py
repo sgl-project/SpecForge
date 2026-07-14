@@ -453,9 +453,7 @@ def build_dspark(
     }
     draft_config._attn_implementation = attention_backend
 
-    draft_model = DSparkDraftModel(draft_config).to(
-        device="cuda", dtype=torch.bfloat16
-    )
+    draft_model = DSparkDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
     draft_model.mask_token_id = mask_token_id
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         target_dir,

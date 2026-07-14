@@ -1,8 +1,8 @@
 # coding=utf-8
 """TrainerCore grad-accum + TrainerController fit/eval/checkpoint (CPU)."""
 
-import json
 import inspect
+import json
 import os
 import tempfile
 import unittest
