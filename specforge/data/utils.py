@@ -22,9 +22,8 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
-
 from datasets import Dataset
+from torch.utils.data import DataLoader, DistributedSampler
 
 
 class DataCollatorWithPadding:

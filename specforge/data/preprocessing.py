@@ -29,9 +29,8 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from transformers import PreTrainedTokenizer
-
 from datasets import Dataset as HFDataset
+from transformers import PreTrainedTokenizer
 
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
