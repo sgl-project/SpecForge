@@ -54,24 +54,18 @@ class NPUDistributedTest(unittest.TestCase):
         accelerator.is_available.return_value = True
         accelerator.device_count.return_value = 8
         events = []
-        accelerator.set_device.side_effect = lambda rank: events.append(
-            ("bind", rank)
-        )
+        accelerator.set_device.side_effect = lambda rank: events.append(("bind", rank))
         target_mesh = _Mesh("target")
         draft_mesh = _Mesh("draft")
 
         with (
             mock.patch.dict(os.environ, {"LOCAL_RANK": "3"}),
             mock.patch.object(sf_dist, "get_device_type", return_value="npu"),
-            mock.patch.object(
-                sf_dist, "_device_module", return_value=accelerator
-            ),
+            mock.patch.object(sf_dist, "_device_module", return_value=accelerator),
             mock.patch.object(
                 sf_dist.dist,
                 "init_process_group",
-                side_effect=lambda **kwargs: events.append(
-                    ("init", kwargs["backend"])
-                ),
+                side_effect=lambda **kwargs: events.append(("init", kwargs["backend"])),
             ) as init_pg,
             mock.patch.object(sf_dist.dist, "is_initialized", return_value=False),
             mock.patch.object(sf_dist.dist, "get_rank", return_value=3),
@@ -90,9 +84,7 @@ class NPUDistributedTest(unittest.TestCase):
             mock.patch.object(
                 sf_dist.PROCESS_GROUP, "ULYSSES_PG", "ulysses", create=True
             ),
-            mock.patch.object(
-                sf_dist.PROCESS_GROUP, "RING_PG", "ring", create=True
-            ),
+            mock.patch.object(sf_dist.PROCESS_GROUP, "RING_PG", "ring", create=True),
         ):
             sf_dist.init_distributed(
                 timeout=7, tp_size=2, sp_ulysses_size=1, sp_ring_size=1
@@ -197,9 +189,7 @@ class NPUTargetAssemblyTest(unittest.TestCase):
                 "specforge.inference.target_engine.get_target_engine",
                 return_value=target,
             ) as get_engine,
-            mock.patch(
-                "specforge.training.assembly._device", return_value="npu:3"
-            ),
+            mock.patch("specforge.training.assembly._device", return_value="npu:3"),
         ):
             result = _build_target_engine(cfg, [1, 2])
 

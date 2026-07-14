@@ -165,9 +165,7 @@ def init_distributed(
     sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
     sp_ring_group = PROCESS_GROUP.RING_PG
     # we need to create a 1D submesh
-    tp_device_mesh = dist.DeviceMesh.from_group(
-        tp_group, device_type=device_type
-    )
+    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
     global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
@@ -178,9 +176,7 @@ def init_distributed(
     _DP_GROUP = dp_group
     _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
     _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(
-        dp_group, device_type=device_type
-    )
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
 
 def destroy_distributed():

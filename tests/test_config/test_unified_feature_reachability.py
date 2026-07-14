@@ -16,7 +16,6 @@ from specforge.training.assembly import (
     _strategy_kwargs,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
 

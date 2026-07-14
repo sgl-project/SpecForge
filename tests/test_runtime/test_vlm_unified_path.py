@@ -36,15 +36,11 @@ class _CharacterTokenizer:
                 pieces = []
                 for item in content:
                     if item["type"] == "image":
-                        pieces.append(
-                            "<|vision_start|><|image_pad|><|vision_end|>"
-                        )
+                        pieces.append("<|vision_start|><|image_pad|><|vision_end|>")
                     else:
                         pieces.append(item["text"])
                 content = "".join(pieces)
-            turns.append(
-                f'<|im_start|>{message["role"]}\n{content}<|im_end|>\n'
-            )
+            turns.append(f'<|im_start|>{message["role"]}\n{content}<|im_end|>\n')
         return "".join(turns)
 
     @staticmethod
@@ -175,12 +171,8 @@ class _TrainablePathVLMTarget:
         positions = torch.arange(length, device=input_ids.device).view(1, 1, length)
         positions = positions.expand(3, batch, length).clone()
         if length >= 4:
-            positions[1, :, 1:4] = torch.tensor(
-                [1, 1, 2], device=input_ids.device
-            )
-            positions[2, :, 1:4] = torch.tensor(
-                [1, 2, 1], device=input_ids.device
-            )
+            positions[1, :, 1:4] = torch.tensor([1, 1, 2], device=input_ids.device)
+            positions[2, :, 1:4] = torch.tensor([1, 2, 1], device=input_ids.device)
         return positions, None
 
 
@@ -266,9 +258,7 @@ class UnifiedVLMPathTest(unittest.TestCase):
             data_path = Path(directory) / "vlm.jsonl"
             data_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
             with (
-                mock.patch(
-                    "specforge.data.preprocessing.HAS_QWEN_VL_UTILS", True
-                ),
+                mock.patch("specforge.data.preprocessing.HAS_QWEN_VL_UTILS", True),
                 mock.patch(
                     "specforge.data.preprocessing.process_vision_info",
                     return_value=(["decoded-image"], None),
@@ -314,9 +304,9 @@ class UnifiedVLMPathTest(unittest.TestCase):
                     payload,
                     512,
                 )
-                prepared = QwenVLInputPreparer(
-                    processor, "qwen2-vl"
-                ).prepare(task, "cpu")
+                prepared = QwenVLInputPreparer(processor, "qwen2-vl").prepare(
+                    task, "cpu"
+                )
 
         self.assertEqual(process_vision.call_count, 2)
         self.assertTrue(

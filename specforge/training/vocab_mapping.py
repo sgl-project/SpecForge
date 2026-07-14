@@ -31,9 +31,7 @@ def count_effective_feature_tokens(
 
     paths = list_feature_files(hidden_states_path)
     if not paths:
-        raise ValueError(
-            f"no offline feature files found under {hidden_states_path!r}"
-        )
+        raise ValueError(f"no offline feature files found under {hidden_states_path!r}")
 
     counts: Counter = Counter()
     for path in paths:

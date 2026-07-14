@@ -244,16 +244,12 @@ class TestLocalRolloutStream(unittest.TestCase):
         """
         num_prompts = 4096
         batch_size = 8
-        controller, store, worker, stream = _runtime(
-            num_prompts, batch_size=batch_size
-        )
+        controller, store, worker, stream = _runtime(num_prompts, batch_size=batch_size)
         consumed = 0
 
         with stream:
             while refs := stream.get(batch_size):
-                self.assertLessEqual(
-                    store.health()["resident_samples"], batch_size
-                )
+                self.assertLessEqual(store.health()["resident_samples"], batch_size)
                 for ref in refs:
                     store.release(ref.sample_id)
                 stream.ack(refs)

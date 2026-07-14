@@ -33,9 +33,7 @@ class FlowControlTest(unittest.TestCase):
         self.assertGreater(snapshot["wait_checks"], 0)
 
     def test_prompt_lease_is_capped_per_worker(self):
-        policy = ProducerFlowControl(
-            FlowControlLimits(max_prompt_lease_per_worker=3)
-        )
+        policy = ProducerFlowControl(FlowControlLimits(max_prompt_lease_per_worker=3))
         self.assertEqual(policy.prompt_lease(8), 3)
         self.assertEqual(policy.prompt_lease(2), 2)
 

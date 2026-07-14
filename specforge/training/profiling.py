@@ -59,8 +59,7 @@ class StepProfiler:
             or self._done
             or self._profiler is not None
             or completed_steps < self.options.start_step
-            or completed_steps
-            >= self.options.start_step + self.options.num_steps
+            or completed_steps >= self.options.start_step + self.options.num_steps
         ):
             return
 

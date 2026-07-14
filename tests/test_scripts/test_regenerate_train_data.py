@@ -44,9 +44,7 @@ class TestRegenerateTrainData(unittest.TestCase):
             regeneration_process.wait()
             self.assertEqual(regeneration_process.returncode, 0)
             self.assertTrue(
-                CACHE_DIR.joinpath(
-                    "dataset", "sharegpt_train_regen.jsonl"
-                ).exists()
+                CACHE_DIR.joinpath("dataset", "sharegpt_train_regen.jsonl").exists()
             )
         finally:
             sglang_process.terminate()

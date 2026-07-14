@@ -174,8 +174,7 @@ class RuntimeConfig(StrictConfigModel):
         if (
             self.resident_high_watermark_bytes is not None
             and self.resident_low_watermark_bytes is not None
-            and self.resident_low_watermark_bytes
-            > self.resident_high_watermark_bytes
+            and self.resident_low_watermark_bytes > self.resident_high_watermark_bytes
         ):
             raise ValueError(
                 "runtime.resident_low_watermark_bytes must be <= "

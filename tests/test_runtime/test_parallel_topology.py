@@ -101,9 +101,7 @@ class ParallelTopologyTest(unittest.TestCase):
         )
         # One rank-local trained sample corresponds to a TP-wide pair of target
         # prompts, so resume skips exactly two entries from the planned queue.
-        remaining = _preposition_online_prompts(
-            planned, local_samples=1, tp_size=2
-        )
+        remaining = _preposition_online_prompts(planned, local_samples=1, tp_size=2)
         self.assertEqual(
             [item["metadata"]["prompt_epoch"] for item in remaining], [1, 1]
         )
@@ -129,9 +127,7 @@ class ParallelTopologyTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(
-                _shard_offline_refs(
-                    refs, use_usp_preprocess=False, shuffle=False
-                ),
+                _shard_offline_refs(refs, use_usp_preprocess=False, shuffle=False),
                 [1, 3, 0],
             )
             self.assertEqual(

@@ -213,9 +213,7 @@ def _run_decoder_parity(rank: int, world_size: int, port: int) -> None:
                 _local_sequence_shard(step, rank, world_size)
                 for step in global_input_steps
             ]
-            local_hidden_states = _local_sequence_shard(
-                hidden_states, rank, world_size
-            )
+            local_hidden_states = _local_sequence_shard(hidden_states, rank, world_size)
             if sp_ring_size > 1:
                 local_position_ids = _local_sequence_shard(
                     position_ids, rank, world_size

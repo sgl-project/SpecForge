@@ -558,9 +558,7 @@ def _configured_logger(cfg: Config):
     options["wandb_name"] = options["wandb_name"] or cfg.run_id
     options["swanlab_project"] = options["swanlab_project"] or "specforge"
     options["swanlab_name"] = options["swanlab_name"] or cfg.run_id
-    options["mlflow_experiment_name"] = (
-        options["mlflow_experiment_name"] or "specforge"
-    )
+    options["mlflow_experiment_name"] = options["mlflow_experiment_name"] or "specforge"
     options["mlflow_run_name"] = options["mlflow_run_name"] or cfg.run_id
     return create_tracker_logger(
         SimpleNamespace(**options), cfg.output_dir, console_logger=_logger
@@ -742,9 +740,7 @@ def _ensure_offline_vocab_mapping(cfg: Config, bundle: ModelBundle) -> None:
     identity_parts = []
     for path in list_feature_files(cfg.data.hidden_states_path):
         stat = os.stat(path)
-        identity_parts.append(
-            (os.path.abspath(path), stat.st_size, stat.st_mtime_ns)
-        )
+        identity_parts.append((os.path.abspath(path), stat.st_size, stat.st_mtime_ns))
     identity = json.dumps(
         {
             "kind": "offline-features-v1",

@@ -341,9 +341,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_complete_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
         out = os.path.join(workdir, "out")
-        complete, model, _ = self._make_trainer(
-            out, feat_dir=feat_dir, max_steps=None
-        )
+        complete, model, _ = self._make_trainer(out, feat_dir=feat_dir, max_steps=None)
         self.assertEqual(complete.fit(), 2)
         self.assertEqual(complete._controller.epoch, 1)
         checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
@@ -418,9 +416,7 @@ class TestFitReentry(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             seen = []
-            ctrl, backend = self._controller(
-                seen, None, d, start_step=3, start_epoch=1
-            )
+            ctrl, backend = self._controller(seen, None, d, start_step=3, start_epoch=1)
             self.assertEqual(ctrl.fit(Explode()), 3)
             self.assertEqual(seen, [])
             self.assertEqual(backend.steps, 0)

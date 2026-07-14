@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import torch
 
+from specforge.inference.media import MediaInputs
 from specforge.inference.target_engine import (
     TARGET_CAPTURE_POLICIES,
     DFlashCapturePolicy,
@@ -30,7 +31,6 @@ from specforge.inference.target_engine.target_capture_policy import (
     DFlashTargetOutput,
     Eagle3TargetOutput,
 )
-from specforge.inference.media import MediaInputs
 
 _ENGINE_DIR = os.path.normpath(
     os.path.join(
@@ -125,9 +125,7 @@ class PolicyRegistryTest(unittest.TestCase):
             def __init__(self):
                 self.kwargs = None
 
-            def extend_eagle3_vlm(
-                self, input_ids, attention_mask, loss_mask, **kwargs
-            ):
+            def extend_eagle3_vlm(self, input_ids, attention_mask, loss_mask, **kwargs):
                 self.kwargs = kwargs
                 return (
                     [[input_ids, attention_mask, loss_mask]],
@@ -141,9 +139,7 @@ class PolicyRegistryTest(unittest.TestCase):
         attention_mask = torch.ones_like(input_ids)
         loss_mask = torch.ones_like(input_ids)
         grid = torch.tensor([[1, 2, 2]])
-        media = MediaInputs(
-            pixel_values=torch.ones(4, 8), image_grid_thw=(grid,)
-        )
+        media = MediaInputs(pixel_values=torch.ones(4, 8), image_grid_thw=(grid,))
 
         captured = Eagle3CapturePolicy().sglang_capture(
             backend,
@@ -192,9 +188,7 @@ class PolicyRegistryTest(unittest.TestCase):
         attention_mask = torch.ones_like(input_ids)
         loss_mask = torch.ones_like(input_ids)
         grid = torch.tensor([[1, 2, 2]])
-        media = MediaInputs(
-            pixel_values=torch.ones(4, 8), image_grid_thw=(grid,)
-        )
+        media = MediaInputs(pixel_values=torch.ones(4, 8), image_grid_thw=(grid,))
 
         captured = Eagle3CapturePolicy().hf_capture(
             model,

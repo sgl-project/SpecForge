@@ -118,9 +118,7 @@ def test_vlm(rank, world_size, port, tp_size):
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    inputs = processor(
-        text=[text], images=[image], padding=True, return_tensors="pt"
-    )
+    inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt")
     input_ids = inputs["input_ids"].cuda()
     attention_mask = inputs["attention_mask"].cuda()
     loss_mask = attention_mask.clone()

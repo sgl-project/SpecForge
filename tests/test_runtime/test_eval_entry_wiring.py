@@ -168,10 +168,7 @@ class TestEvalAssembly(unittest.TestCase):
             draft_vocab_size=16,
             strategy_kwargs={},
         )
-        source = [
-            {"task_id": f"p{i}", "payload": {"input_ids": [i]}}
-            for i in range(3)
-        ]
+        source = [{"task_id": f"p{i}", "payload": {"input_ids": [i]}} for i in range(3)]
         state = {"epoch": 0, "epoch_samples": 2}
         trainer = object()
         with (
@@ -205,9 +202,7 @@ class TestEvalAssembly(unittest.TestCase):
         self.assertEqual(build.call_args.kwargs["dataset_size"], 6)
         self.assertIs(build.call_args.kwargs["resume_state"], state)
         self.assertEqual(build.call_args.kwargs["prompt_epochs"], 1)
-        self.assertEqual(
-            build.call_args.kwargs["checkpoint_extra"]["prompt_epochs"], 2
-        )
+        self.assertEqual(build.call_args.kwargs["checkpoint_extra"]["prompt_epochs"], 2)
 
 
 class TestEvalLaunch(unittest.TestCase):

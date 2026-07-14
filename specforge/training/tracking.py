@@ -123,9 +123,7 @@ def create_tracker_logger(
             raise ValueError(message)
 
     tracker_class.validate_args(_ValidationErrors(), args)
-    return TrackerLogger(
-        tracker_class(args, output_dir), console_logger=console_logger
-    )
+    return TrackerLogger(tracker_class(args, output_dir), console_logger=console_logger)
 
 
 __all__ = [

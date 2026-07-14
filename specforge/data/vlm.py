@@ -60,7 +60,9 @@ class QwenVLInputPreparer:
         expected_ids = torch.as_tensor(payload["input_ids"], dtype=torch.long)
         expected_loss = torch.as_tensor(payload["loss_mask"], dtype=torch.long)
         if not torch.equal(input_ids.cpu(), expected_ids):
-            raise ValueError("VLM prompt tokenization changed between ingest and rollout")
+            raise ValueError(
+                "VLM prompt tokenization changed between ingest and rollout"
+            )
         if not torch.equal(loss_mask.cpu(), expected_loss):
             raise ValueError("VLM loss mask changed between ingest and rollout")
 

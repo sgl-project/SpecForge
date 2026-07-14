@@ -1,8 +1,8 @@
 # coding=utf-8
 """Durable online recovery: replay unacked refs and skip durable ones."""
 
-import os
 import json
+import os
 import tempfile
 import unittest
 

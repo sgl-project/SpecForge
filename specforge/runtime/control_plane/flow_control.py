@@ -43,16 +43,13 @@ class FlowControlLimits:
                 "low_watermark_refs must be between 0 and high_watermark_refs"
             )
         if self.high_watermark_bytes is None and self.low_watermark_bytes is not None:
-            raise ValueError(
-                "low_watermark_bytes requires high_watermark_bytes"
-            )
+            raise ValueError("low_watermark_bytes requires high_watermark_bytes")
         if self.high_watermark_bytes is not None:
             if self.high_watermark_bytes < 1:
                 raise ValueError("high_watermark_bytes must be >= 1")
             if low_bytes is None or not 0 <= low_bytes <= self.high_watermark_bytes:
                 raise ValueError(
-                    "low_watermark_bytes must be between 0 and "
-                    "high_watermark_bytes"
+                    "low_watermark_bytes must be between 0 and " "high_watermark_bytes"
                 )
         if self.max_prompt_lease_per_worker < 1:
             raise ValueError("max_prompt_lease_per_worker must be >= 1")
@@ -116,7 +113,9 @@ class ProducerFlowControl:
                 self._stats["wait_checks"] += 1
             return self._paused
 
-    def snapshot(self, *, in_flight_refs: int, resident_bytes: int = 0) -> Dict[str, Any]:
+    def snapshot(
+        self, *, in_flight_refs: int, resident_bytes: int = 0
+    ) -> Dict[str, Any]:
         with self._lock:
             return {
                 "paused": self._paused,

@@ -137,9 +137,7 @@ class TrackingLoggerTest(unittest.TestCase):
         self.assertEqual(tracker.logged, [({"train/loss": 2.0}, 3)])
 
     def test_noop_tracker_does_not_require_initialized_distributed(self):
-        logger = create_tracker_logger(
-            SimpleNamespace(report_to="none"), "/tmp/output"
-        )
+        logger = create_tracker_logger(SimpleNamespace(report_to="none"), "/tmp/output")
         logger({"loss": 1.0}, 1)
         logger.close()
 

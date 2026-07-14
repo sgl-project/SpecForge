@@ -16,12 +16,8 @@ from specforge.training.vocab_mapping import count_effective_feature_tokens
 class _DraftWithMapping(torch.nn.Module):
     def __init__(self, target_vocab_size=8, draft_vocab_size=4):
         super().__init__()
-        self.register_buffer(
-            "t2d", torch.zeros(target_vocab_size, dtype=torch.bool)
-        )
-        self.register_buffer(
-            "d2t", torch.zeros(draft_vocab_size, dtype=torch.long)
-        )
+        self.register_buffer("t2d", torch.zeros(target_vocab_size, dtype=torch.bool))
+        self.register_buffer("d2t", torch.zeros(draft_vocab_size, dtype=torch.long))
         self.vocab_mapping_loaded = False
 
     def load_vocab_mapping(self, path):

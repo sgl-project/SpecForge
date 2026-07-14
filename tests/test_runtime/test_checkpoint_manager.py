@@ -303,9 +303,7 @@ class TestReadResumeState(unittest.TestCase):
         _mgr(out, "alpha").save(
             _state(2, world_size=1), 2, rank_state={"optimizer": {}}
         )
-        _mgr(out, "beta").save(
-            _state(3, world_size=1), 3, rank_state={"optimizer": {}}
-        )
+        _mgr(out, "beta").save(_state(3, world_size=1), 3, rank_state={"optimizer": {}})
         with self.assertRaisesRegex(ValueError, "multiple complete.*latest"):
             CheckpointManager.read_resume_state(out)
 
