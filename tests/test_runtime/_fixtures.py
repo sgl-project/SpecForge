@@ -58,23 +58,32 @@ def init_rank_distributed(
     rank,
     world_size,
     *,
+    tp_size=1,
+    sp_ulysses_size=1,
+    sp_ring_size=1,
     port="29571",
 ):
-    """Init one rank of a multi-process group (for the M6 >=4-rank tests).
+    """Initialize one rank with the canonical target/draft topology.
 
-    Each spawned process calls this with its own rank; together they form the
-    world-sized FSDP/DP group with target TP fixed to one. This mirrors the
-    canonical online-disaggregated consumer layout.
+    Defaults preserve the world-sized FSDP/DP layout used by the two-rank
+    runtime tests. The explicit TP/SP arguments let the numerical parity gate
+    exercise production TP2 x SP2 groups without a second test initializer.
     """
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ["MASTER_PORT"] = port
+    os.environ["SPECFORGE_DEVICE"] = "cuda"
     torch.cuda.set_device(rank)
     from specforge.distributed import init_distributed
 
-    init_distributed(timeout=60, tp_size=1)
+    init_distributed(
+        timeout=60,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+    )
 
 
 def write_draft_config(path):
@@ -228,7 +237,27 @@ def build_eagle3(workdir, ttt=3):
     return eagle3_model, target_head
 
 
-# --- DFlash online fixtures --------------------------------------------------
+# --- DFlash fixtures ---------------------------------------------------------
+# DFlash has its own feature schema: ``hidden_states`` is the concatenated
+# target-layer capture (no EAGLE3 aux/target swap or target distribution).
+
+
+def write_offline_files_dflash(d, n=4, seq=32, hidden=H, vocab=V, seed=0):
+    """Write synthetic DFlash/Domino offline feature files."""
+    os.makedirs(d, exist_ok=True)
+    generator = torch.Generator().manual_seed(seed)
+    for index in range(n):
+        torch.save(
+            {
+                "input_ids": torch.randint(0, vocab, (seq,), generator=generator),
+                "loss_mask": torch.ones(seq, dtype=torch.long),
+                "hidden_states": torch.randn(1, seq, hidden, generator=generator).to(
+                    torch.bfloat16
+                ),
+            },
+            os.path.join(d, f"{index:04d}.ckpt"),
+        )
+    return d
 
 
 def build_dflash(

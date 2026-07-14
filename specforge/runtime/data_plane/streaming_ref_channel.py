@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from typing import Iterator, List, Optional
 
@@ -117,7 +118,12 @@ class StreamingRefChannel:
             self.path + _CONSUMER_FAILED_SUFFIX
         )
 
-    def publish_consumer_quantum(self, refs_per_optimizer_step: int) -> None:
+    def publish_consumer_quantum(
+        self,
+        refs_per_optimizer_step: int,
+        *,
+        allow_existing: bool = False,
+    ) -> None:
         """Claim and publish the consumer's global optimizer-step ref quantum.
 
         Rank 0 calls this exactly once for a fresh attempt. The producer waits
@@ -131,6 +137,14 @@ class StreamingRefChannel:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError as exc:
+            if allow_existing:
+                existing = self.consumer_quantum()
+                if existing == quantum:
+                    return
+                raise ValueError(
+                    f"consumer quantum changed across resume for {self.path!r}: "
+                    f"existing={existing}, requested={quantum}"
+                ) from exc
             raise ValueError(
                 f"consumer quantum already exists for {self.path!r}; every online "
                 "attempt requires a fresh reference channel"
@@ -226,6 +240,11 @@ class StreamingRefChannel:
             f.write(str(self._consumed))
         os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
 
+    def seed_consumed(self) -> int:
+        """Continue an existing consumed counter after a consumer restart."""
+        self._consumed = self.consumed_remote()
+        return self._consumed
+
     def stream(
         self,
         *,
@@ -278,8 +297,9 @@ class StreamingRefQueue:
     closed-and-drained, so the trainer streams the whole online run and only sees
     an empty batch (-> loop ends) once the producer has closed. ``ack`` advances
     the channel's consumed counter (the producer's backpressure signal); the
-    feature-store free already happened in the loader's materialize (get ->
-    release) for a consume-once store.
+    online disaggregated consumers use a retaining store, so loader release ends
+    only the read lease. The durable optimizer-boundary controller owns the
+    later physical feature deletion.
 
     """
 
@@ -298,6 +318,12 @@ class StreamingRefQueue:
         self._clock = clock
         self._sleep = sleep
         self._buf: List[SampleRef] = []
+        # ``get`` may run on the loader-prefetch thread while the optimizer
+        # boundary acknowledges an earlier prefix on the training thread.
+        # Track that prefix explicitly so a durable ack can advance channel
+        # backpressure only for the exact refs it covered.
+        self._inflight: List[SampleRef] = []
+        self._inflight_lock = threading.Lock()
         self._wait_log_interval_s = float(
             os.environ.get("SPECFORGE_STREAM_WAIT_LOG_INTERVAL", 30.0)
         )
@@ -346,12 +372,38 @@ class StreamingRefQueue:
             self._sleep(self.poll_s)
         take = min(n, len(self._buf))
         out, self._buf = self._buf[:take], self._buf[take:]
+        with self._inflight_lock:
+            self._inflight.extend(out)
         return out
 
     def ack(self, refs: List[SampleRef]) -> None:
-        self.channel.mark_consumed(len(refs))  # backpressure: producer reads this
+        self.ack_ids([ref.sample_id for ref in refs])
+
+    def ack_ids(self, sample_ids: List[str]) -> None:
+        """Acknowledge the exact leased prefix after its durable train ack.
+
+        The channel exposes a count rather than per-id acknowledgements, so
+        accepting an arbitrary subset would make restart accounting ambiguous.
+        Training consumes refs in lease order; enforce that invariant loudly.
+        """
+        if not sample_ids:
+            return
+        with self._inflight_lock:
+            actual = [ref.sample_id for ref in self._inflight[: len(sample_ids)]]
+            if actual != list(sample_ids):
+                raise RuntimeError(
+                    "stream acknowledgement is not the leased prefix: "
+                    f"expected={actual}, got={list(sample_ids)}"
+                )
+            del self._inflight[: len(sample_ids)]
+        self.channel.mark_consumed(len(sample_ids))
 
     def fail(self, refs: List[SampleRef], reason: str, retryable: bool) -> None:
+        failed_ids = {ref.sample_id for ref in refs}
+        with self._inflight_lock:
+            self._inflight = [
+                ref for ref in self._inflight if ref.sample_id not in failed_ids
+            ]
         if retryable:
             self._buf[:0] = refs  # re-buffer at the front for the next get()
         else:
@@ -359,6 +411,10 @@ class StreamingRefQueue:
 
     def depth(self) -> int:
         return len(self._buf)
+
+    def in_flight_ids(self) -> List[str]:
+        with self._inflight_lock:
+            return [ref.sample_id for ref in self._inflight]
 
 
 __all__ = ["StreamingRefChannel", "StreamingRefQueue"]

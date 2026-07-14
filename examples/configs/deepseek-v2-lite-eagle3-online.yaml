@@ -1,0 +1,27 @@
+model:
+  target_model_path: "deepseek-ai/DeepSeek-V2-Lite"
+  draft_model_config: "configs/deepseek-v2-lite-eagle3.json"
+  target_backend: "hf"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "./cache/dataset/sharegpt_train.jsonl"
+  max_length: 4096
+  chat_template: "deepseek"
+  build_dataset_num_proc: 64
+  cache_dir: "./cache"
+training:
+  strategy: "eagle3"
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  save_interval: 1000
+  log_interval: 50
+  deployment_mode: "local_colocated"
+  dist_timeout: 20
+  seed: 0
+run_id: "deepseek-v2-lite-eagle3-online"
+output_dir: "./outputs/deepseek-v2-lite-eagle3-online"

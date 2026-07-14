@@ -16,7 +16,10 @@ is a registry entry, not a new ``build_*`` family.
 
 from __future__ import annotations
 
+import copy
+import itertools
 import logging
+from contextlib import contextmanager
 from typing import Callable, List, Optional, Tuple
 
 from specforge.runtime.contracts import SampleRef
@@ -28,9 +31,11 @@ from specforge.runtime.control_plane.metadata_store import (
     SQLiteMetadataStore,
 )
 from specforge.runtime.data_plane import (
+    FeatureDataLoader,
     FeatureStore,
     LocalFeatureStore,
     LocalRolloutStream,
+    drain_feature_store_removals,
 )
 from specforge.training.strategies.registry import StrategySpec, resolve_strategy
 
@@ -58,6 +63,8 @@ def _assemble_trainer(
     max_steps: Optional[int],
     total_steps: Optional[int] = None,
     save_interval: int,
+    eval_interval: int = 0,
+    eval_data_factory=None,
     logger,
     log_interval: int,
     collate_fn,
@@ -65,7 +72,15 @@ def _assemble_trainer(
     per_sample_transform=None,
     durable_ack: bool = True,
     resume_from: Optional[str] = None,
+    resume_state: Optional[dict] = None,
+    dataset_size: Optional[int] = None,
+    checkpoint_extra: Optional[dict] = None,
     max_checkpoints: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
     fit_context=None,
     on_fit_success: Optional[Callable[[int], None]] = None,
     on_fit_failure: Optional[Callable[[BaseException], None]] = None,
@@ -93,6 +108,8 @@ def _assemble_trainer(
         max_steps=max_steps,
         total_steps=total_steps,
         save_interval=save_interval,
+        eval_interval=eval_interval,
+        eval_data_factory=eval_data_factory,
         logger=logger,
         log_interval=log_interval,
         collate_fn=collate_fn,
@@ -100,7 +117,15 @@ def _assemble_trainer(
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
         resume_from=resume_from,
+        resume_state=resume_state,
+        dataset_size=dataset_size,
+        checkpoint_extra=checkpoint_extra,
         max_checkpoints=max_checkpoints,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        dataloader_num_workers=dataloader_num_workers,
+        profiling_options=profiling_options,
         fit_context=fit_context,
         on_fit_success=on_fit_success,
         on_fit_failure=on_fit_failure,
@@ -109,7 +134,13 @@ def _assemble_trainer(
     return trainer
 
 
-def _offline_io(spec: StrategySpec, max_len: int):
+def _offline_io(
+    spec: StrategySpec,
+    max_len: int,
+    *,
+    ttt_length: int,
+    use_usp_preprocess: bool,
+):
     """Resolve (collate_fn, per_sample_transform); raise if not wired for offline."""
     if spec.make_offline_collate is None or spec.make_offline_transform is None:
         raise NotImplementedError(
@@ -118,7 +149,254 @@ def _offline_io(spec: StrategySpec, max_len: int):
             f"(DFlash/Domino use their own feature schema). See "
             f"specforge.training.strategies.registry."
         )
-    return spec.make_offline_collate(), spec.make_offline_transform(max_len)
+    return spec.make_offline_collate(), spec.make_offline_transform(
+        max_len,
+        ttt_length=ttt_length,
+        use_usp_preprocess=use_usp_preprocess,
+    )
+
+
+def _shard_offline_refs(
+    refs,
+    *,
+    use_usp_preprocess: bool,
+    seed=0,
+    epoch=0,
+    shuffle=True,
+    dp_rank=None,
+    dp_size=None,
+):
+    """Match ``DistributedSampler`` over metadata-only refs for one epoch.
+
+    Draft sequence-parallel peers must see the same sample, while independent
+    draft-DP replicas see disjoint samples.  Without USP, target-TP peers see
+    the same sample and target-DP replicas are sharded.  Padding to an even
+    number of refs keeps every FSDP rank on the same number of collectives. The
+    caller rebuilds this plan with ``seed + epoch`` before applying a resume
+    seek, exactly like the legacy ``DistributedSampler.set_epoch`` lifecycle.
+    """
+    import torch.distributed as dist
+
+    refs = list(refs)
+    if (dp_rank is None) != (dp_size is None):
+        raise ValueError("dp_rank and dp_size must be provided together")
+    if dp_rank is None:
+        if dist.is_available() and dist.is_initialized():
+            from specforge.distributed import get_dp_group, get_draft_dp_group
+
+            group = get_draft_dp_group() if use_usp_preprocess else get_dp_group()
+            dp_rank, dp_size = dist.get_rank(group), dist.get_world_size(group)
+        else:
+            dp_rank, dp_size = 0, 1
+    if dp_size < 1 or not 0 <= dp_rank < dp_size:
+        raise ValueError(f"invalid data-DP layout rank={dp_rank}, size={dp_size}")
+    indices = _distributed_sampler_indices(
+        len(refs),
+        dp_rank=dp_rank,
+        dp_size=dp_size,
+        seed=seed,
+        epoch=epoch,
+        shuffle=shuffle,
+    )
+    return [refs[index] for index in indices]
+
+
+def _target_dp_layout(*, dp_rank=None, dp_size=None):
+    """Return the target-DP rank/size, with an explicit seam for CPU tests."""
+    if (dp_rank is None) != (dp_size is None):
+        raise ValueError("dp_rank and dp_size must be provided together")
+    if dp_rank is not None:
+        if dp_size < 1 or not 0 <= dp_rank < dp_size:
+            raise ValueError(f"invalid target-DP layout rank={dp_rank}, size={dp_size}")
+        return int(dp_rank), int(dp_size)
+
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0, 1
+    from specforge.distributed import get_dp_group
+
+    group = get_dp_group()
+    return dist.get_rank(group), dist.get_world_size(group)
+
+
+def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle=True):
+    """Reproduce ``DistributedSampler(drop_last=False)`` index generation."""
+    import math
+
+    import torch
+
+    if size <= 0:
+        return []
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed) + int(epoch))
+        indices = torch.randperm(size, generator=generator).tolist()
+    else:
+        indices = list(range(size))
+
+    total_size = math.ceil(size / dp_size) * dp_size
+    padding_size = total_size - len(indices)
+    if padding_size:
+        repeats = math.ceil(padding_size / len(indices))
+        indices.extend((indices * repeats)[:padding_size])
+    return indices[dp_rank:total_size:dp_size]
+
+
+def _shard_online_prompts(
+    prompts,
+    *,
+    seed=0,
+    epoch=0,
+    tp_size=1,
+    batch_size=1,
+    shuffle=True,
+    dp_rank=None,
+    dp_size=None,
+):
+    """Plan one independently shuffled and tail-truncated online epoch.
+
+    This matches ``DistributedSampler(seed=seed, drop_last=False)`` through the
+    target-DP split. All target-TP peers use the same ``dp_rank`` and therefore
+    receive the same shard. The rank-local tail is then dropped to a whole
+    target capture batch (``tp_size * batch_size``), so the final partial batch
+    can never be combined with the next epoch.
+    """
+
+    prompts = list(prompts)
+    if tp_size < 1 or batch_size < 1:
+        raise ValueError("tp_size and batch_size must be positive")
+    rank, replicas = _target_dp_layout(dp_rank=dp_rank, dp_size=dp_size)
+    selected = _distributed_sampler_indices(
+        len(prompts),
+        dp_rank=rank,
+        dp_size=replicas,
+        seed=seed,
+        epoch=epoch,
+        shuffle=shuffle,
+    )
+    target_batch_size = tp_size * batch_size
+    selected = selected[: len(selected) // target_batch_size * target_batch_size]
+    sharded = []
+    for slot, source_index in enumerate(selected):
+        item = dict(prompts[source_index])
+        metadata = dict(item.get("metadata") or {})
+        if "task_id" in item:
+            metadata.setdefault("base_task_id", str(item["task_id"]))
+        metadata.update(
+            {
+                "source_prompt_index": source_index,
+                "prompt_epoch": epoch,
+                "target_dp_rank": rank,
+                "target_dp_slot": slot,
+            }
+        )
+        item["metadata"] = metadata
+        item["task_id"] = (
+            f"target-dp{rank:04d}-epoch{epoch:08d}-"
+            f"slot{slot:012d}-prompt{source_index:012d}"
+        )
+        sharded.append(item)
+    return sharded
+
+
+def _plan_online_prompt_stream(
+    prompts,
+    *,
+    num_epochs,
+    seed,
+    tp_size,
+    batch_size,
+    shuffle=True,
+    dp_rank=None,
+    dp_size=None,
+):
+    """Flatten independently planned epochs into one deterministic stream."""
+    if num_epochs < 1:
+        raise ValueError("num_epochs must be positive")
+    prompts = list(prompts)
+    rank, replicas = _target_dp_layout(dp_rank=dp_rank, dp_size=dp_size)
+    planned = []
+    for epoch in range(num_epochs):
+        planned.extend(
+            _shard_online_prompts(
+                prompts,
+                seed=seed,
+                epoch=epoch,
+                tp_size=tp_size,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                dp_rank=rank,
+                dp_size=replicas,
+            )
+        )
+    return planned
+
+
+def _preposition_online_prompts(prompts, *, local_samples, tp_size):
+    """Drop the trained TP-wide prefix from a deterministic prompt stream."""
+    if local_samples < 0:
+        raise ValueError("checkpoint epoch_samples cannot be negative")
+    if tp_size < 1:
+        raise ValueError("tp_size must be positive")
+    prompts = list(prompts)
+    target_samples = local_samples * tp_size
+    if target_samples > len(prompts):
+        raise ValueError(
+            "checkpoint resume position skips past the online prompt stream: "
+            f"{local_samples} rank-local samples require {target_samples} target "
+            f"prompts, but the planned stream has {len(prompts)}"
+        )
+    return prompts[target_samples:]
+
+
+def _make_offline_eval_data_factory(
+    *,
+    spec: StrategySpec,
+    hidden_states_path: str,
+    run_id: str,
+    batch_size: int,
+    max_len: int,
+    ttt_length: int,
+    use_usp_preprocess: bool,
+    dataloader_num_workers: int,
+):
+    """Build a fresh re-iterable eval loader over the offline feature path."""
+    if spec.make_offline_reader is None:
+        raise NotImplementedError(
+            f"offline eval for strategy {spec.name!r} needs make_offline_reader"
+        )
+    collate_fn, per_sample_transform = _offline_io(
+        spec,
+        max_len,
+        ttt_length=ttt_length,
+        use_usp_preprocess=use_usp_preprocess,
+    )
+    eval_run_id = f"{run_id}-eval"
+    refs = spec.make_offline_reader(
+        hidden_states_path,
+        run_id=eval_run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+    ).read()
+    refs = _shard_offline_refs(
+        refs, use_usp_preprocess=use_usp_preprocess, shuffle=False
+    )
+    store = LocalFeatureStore(eval_run_id)
+
+    def build_loader():
+        return FeatureDataLoader(
+            store,
+            refs=refs,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            per_sample_transform=per_sample_transform,
+            drop_last=False,
+            strategy=spec.name,
+            num_workers=dataloader_num_workers,
+        )
+
+    return build_loader
 
 
 def _online_collate(spec: StrategySpec, collate_fn):
@@ -146,9 +424,29 @@ def _resolve_metadata_store(
     return None
 
 
+def _checkpoint_global_step(resume_from: str) -> int:
+    """Read the shared checkpoint step without requiring a rank-state file."""
+    import os
+
+    import torch
+
+    from specforge.training.checkpoint import STATE_FILE
+
+    path = str(resume_from)
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+    if os.path.basename(path) != STATE_FILE:
+        path = os.path.join(path, STATE_FILE)
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    return int(state.get("global_step", 0) or 0)
+
+
 def _dp_consumer_layout(
     dp_rank: Optional[int],
     dp_size: Optional[int],
+    tp_size: int,
+    sp_ulysses_size: int,
+    sp_ring_size: int,
 ) -> Tuple[int, int]:
     """Resolve the online consumer's (dp_rank, dp_size), defaulting from dist.
 
@@ -162,6 +460,13 @@ def _dp_consumer_layout(
         dp_size = dist.get_world_size() if initialized else 1
     if dp_rank is None:
         dp_rank = dist.get_rank() if initialized else 0
+    if dp_size > 1 and (tp_size != 1 or sp_ulysses_size != 1 or sp_ring_size != 1):
+        raise NotImplementedError(
+            "the online disaggregated consumer assigns one inbox to every "
+            "trainer rank; nested target TP or draft SP is not supported "
+            f"(tp={tp_size}, sp_ulysses={sp_ulysses_size}, "
+            f"sp_ring={sp_ring_size})"
+        )
     if not 0 <= dp_rank < dp_size:
         raise ValueError(f"dp_rank {dp_rank} out of range for dp_size {dp_size}")
     return dp_rank, dp_size
@@ -213,6 +518,10 @@ def _assemble_rollout_workers(
     device: str,
     target_model=None,
     feature_source=None,
+    feature_schema=None,
+    input_preparer=None,
+    batch_partition=None,
+    shard_target_output: bool = False,
 ):
     """Build the rollout producer workers (colocated-online + disagg producer).
 
@@ -233,8 +542,13 @@ def _assemble_rollout_workers(
             f"a {spec.name} capture path. Set feature_schema + "
             f"supports_online=True on its StrategySpec."
         )
+    from specforge.inference.batch_partition import TargetBatchPartition
     from specforge.inference.capture import CaptureConfig
     from specforge.inference.rollout_worker import RolloutWorker
+
+    batch_partition = batch_partition or TargetBatchPartition()
+    if shard_target_output and getattr(target_model, "backend", None) != "sglang":
+        raise ValueError("shard_target_output requires an SGLang target engine")
 
     if aux_hidden_state_layer_ids is None:
         aux_hidden_state_layer_ids = tuple(
@@ -254,7 +568,8 @@ def _assemble_rollout_workers(
     else:
         from specforge.inference.adapters.policy import PolicyFeatureAdapter
 
-        if spec.feature_schema is None:
+        active_schema = feature_schema or spec.feature_schema
+        if active_schema is None:
             raise NotImplementedError(
                 f"{spec.name} online capture requires a server feature source; "
                 "colocated target capture is not supported"
@@ -262,13 +577,19 @@ def _assemble_rollout_workers(
         adapters = [
             PolicyFeatureAdapter(
                 target_model,
-                schema=spec.feature_schema,
+                schema=active_schema,
                 device=device,
                 t2d=t2d,
+                shard_returns=True if shard_target_output else None,
+                output_partition=(batch_partition if shard_target_output else None),
+                input_preparer=input_preparer,
             )
         ] * num_rollout_workers
+    active_schema = feature_schema or spec.feature_schema
     capture_config = CaptureConfig.from_strategy(
-        required_features=spec.required_features,
+        required_features=(
+            active_schema.names if active_schema is not None else spec.required_features
+        ),
         aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
         target_repr=target_repr,
         target_hidden_size=target_hidden_size,
@@ -286,6 +607,8 @@ def _assemble_rollout_workers(
             run_id=run_id,
             worker_id=f"rollout-{i}",
             strategy=spec.name,
+            batch_partition=batch_partition,
+            feature_source_returns_local_batch=shard_target_output,
         )
         for i, adapter in enumerate(adapters)
     ]
@@ -313,11 +636,21 @@ def build_offline_runtime(
     max_steps: Optional[int] = None,
     total_steps: Optional[int] = None,
     save_interval: int = 0,
+    eval_interval: int = 0,
+    eval_hidden_states_path: Optional[str] = None,
+    eval_data_factory=None,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    use_usp_preprocess: bool = False,
+    seed: int = 0,
     logger=None,
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
     strategy_kwargs: Optional[dict] = None,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
@@ -332,21 +665,51 @@ def build_offline_runtime(
             f"StrategySpec needs make_offline_reader. See "
             f"specforge.training.strategies.registry."
         )
-    collate_fn, per_sample_transform = _offline_io(spec, max_len)
+    collate_fn, per_sample_transform = _offline_io(
+        spec,
+        max_len,
+        ttt_length=ttt_length,
+        use_usp_preprocess=use_usp_preprocess,
+    )
     controller = DataFlowController(
         run_id,
         metadata_store=NoOpMetadataStore(),
         enable_sample_queue=False,
     )
-    refs = spec.make_offline_reader(
+    source_refs = spec.make_offline_reader(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
+
+    def refs_for_epoch(epoch):
+        return _shard_offline_refs(
+            source_refs,
+            use_usp_preprocess=use_usp_preprocess,
+            seed=seed,
+            epoch=epoch,
+        )
+
+    refs = refs_for_epoch(0)
     store = LocalFeatureStore(run_id)
+    if eval_hidden_states_path:
+        if eval_data_factory is not None:
+            raise ValueError(
+                "pass either eval_hidden_states_path or eval_data_factory, not both"
+            )
+        eval_data_factory = _make_offline_eval_data_factory(
+            spec=spec,
+            hidden_states_path=eval_hidden_states_path,
+            run_id=run_id,
+            batch_size=batch_size,
+            max_len=max_len,
+            ttt_length=ttt_length,
+            use_usp_preprocess=use_usp_preprocess,
+            dataloader_num_workers=dataloader_num_workers,
+        )
     return _assemble_trainer(
         spec=spec,
         controller=controller,
         store=store,
-        ref_source={"refs": refs},
+        ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
         target_head=target_head if spec.uses_target_head else None,
         optimizer_factory=optimizer_factory,
@@ -358,6 +721,8 @@ def build_offline_runtime(
         max_steps=max_steps,
         total_steps=total_steps,
         save_interval=save_interval,
+        eval_interval=eval_interval,
+        eval_data_factory=eval_data_factory,
         logger=logger,
         log_interval=log_interval,
         collate_fn=collate_fn,
@@ -365,7 +730,17 @@ def build_offline_runtime(
         per_sample_transform=per_sample_transform,
         durable_ack=False,
         resume_from=resume_from,
+        checkpoint_extra={
+            "offline_sampler_version": 1,
+            "sampler_seed": seed,
+            "source_dataset_size": len(source_refs),
+        },
         max_checkpoints=max_checkpoints,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        dataloader_num_workers=dataloader_num_workers,
+        profiling_options=profiling_options,
     )
 
 
@@ -379,6 +754,7 @@ def build_disagg_offline_runtime(
     optimizer_factory,
     run_id: str,
     output_dir: str,
+    ttt_length: int = 7,
     max_len: int = 2048,
     batch_size: int = 1,
     accumulation_steps: int = 1,
@@ -386,11 +762,21 @@ def build_disagg_offline_runtime(
     max_steps: Optional[int] = None,
     total_steps: Optional[int] = None,
     save_interval: int = 0,
+    eval_interval: int = 0,
+    eval_hidden_states_path: Optional[str] = None,
+    eval_data_factory=None,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    use_usp_preprocess: bool = False,
+    seed: int = 0,
     logger=None,
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
     strategy_kwargs: Optional[dict] = None,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
 ):
     """Consumer side of a disaggregated OFFLINE run.
 
@@ -399,17 +785,48 @@ def build_disagg_offline_runtime(
     colocated offline path, so results match within determinism tolerance.
     """
     spec = resolve_strategy(strategy)
-    collate_fn, per_sample_transform = _offline_io(spec, max_len)
+    collate_fn, per_sample_transform = _offline_io(
+        spec,
+        max_len,
+        ttt_length=ttt_length,
+        use_usp_preprocess=use_usp_preprocess,
+    )
+    source_refs = list(refs)
+
+    def refs_for_epoch(epoch):
+        return _shard_offline_refs(
+            source_refs,
+            use_usp_preprocess=use_usp_preprocess,
+            seed=seed,
+            epoch=epoch,
+        )
+
+    refs = refs_for_epoch(0)
     controller = DataFlowController(
         run_id,
         metadata_store=NoOpMetadataStore(),
         enable_sample_queue=False,
     )
+    if eval_hidden_states_path:
+        if eval_data_factory is not None:
+            raise ValueError(
+                "pass either eval_hidden_states_path or eval_data_factory, not both"
+            )
+        eval_data_factory = _make_offline_eval_data_factory(
+            spec=spec,
+            hidden_states_path=eval_hidden_states_path,
+            run_id=run_id,
+            batch_size=batch_size,
+            max_len=max_len,
+            ttt_length=ttt_length,
+            use_usp_preprocess=use_usp_preprocess,
+            dataloader_num_workers=dataloader_num_workers,
+        )
     return _assemble_trainer(
         spec=spec,
         controller=controller,
         store=feature_store,
-        ref_source={"refs": refs},
+        ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
         target_head=target_head if spec.uses_target_head else None,
         optimizer_factory=optimizer_factory,
@@ -421,6 +838,8 @@ def build_disagg_offline_runtime(
         max_steps=max_steps,
         total_steps=total_steps,
         save_interval=save_interval,
+        eval_interval=eval_interval,
+        eval_data_factory=eval_data_factory,
         logger=logger,
         log_interval=log_interval,
         collate_fn=collate_fn,
@@ -428,13 +847,92 @@ def build_disagg_offline_runtime(
         per_sample_transform=per_sample_transform,
         durable_ack=False,
         resume_from=resume_from,
+        checkpoint_extra={
+            "offline_sampler_version": 1,
+            "sampler_seed": seed,
+            "source_dataset_size": len(source_refs),
+        },
         max_checkpoints=max_checkpoints,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        dataloader_num_workers=dataloader_num_workers,
+        profiling_options=profiling_options,
     )
 
 
 # ---------------------------------------------------------------------------
 # Online (colocated + disaggregated producer/consumer + one-process interleaved).
 # ---------------------------------------------------------------------------
+
+
+def _make_online_eval_data_factory(
+    *,
+    spec: StrategySpec,
+    prompts,
+    run_id: str,
+    batch_size: int,
+    collate_fn,
+    rollout_worker_kwargs: dict,
+    dataloader_num_workers: int,
+):
+    """Create one private rollout/control/data plane for every eval interval."""
+    prompts = copy.deepcopy(list(prompts))
+    if not prompts:
+        raise ValueError("online evaluation data preparation produced no prompts")
+    rollout_worker_kwargs = dict(rollout_worker_kwargs)
+    pass_ids = itertools.count(1)
+
+    def build_eval_data():
+        eval_run_id = f"{run_id}-eval-{next(pass_ids):06d}"
+        controller = DataFlowController(
+            eval_run_id,
+            metadata_store=NoOpMetadataStore(),
+        )
+        # Controller/PromptTask instances are pass-local. In particular, eval
+        # cannot consume leases or refs from the still-open training stream.
+        controller.ingest_prompts(copy.deepcopy(prompts))
+        store = LocalFeatureStore(eval_run_id)
+        workers = _assemble_rollout_workers(
+            spec=spec,
+            controller=controller,
+            store=store,
+            run_id=eval_run_id,
+            **rollout_worker_kwargs,
+        )
+        rollout_stream = LocalRolloutStream(
+            controller=controller,
+            workers=workers,
+            feature_store=store,
+            max_resident_samples=batch_size,
+            capture_batch_multiplier=rollout_worker_kwargs["batch_partition"].size,
+        )
+        loader = FeatureDataLoader(
+            store,
+            queue=rollout_stream,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            per_sample_transform=None,
+            drop_last=False,
+            strategy=spec.name,
+            num_workers=dataloader_num_workers,
+        )
+
+        @contextmanager
+        def managed_eval_data():
+            try:
+                yield loader
+            except BaseException:
+                rollout_stream.close(reason="evaluation_failed")
+                raise
+            else:
+                rollout_stream.close(reason="evaluation_finished")
+            finally:
+                loader.close()
+
+        return managed_eval_data()
+
+    return build_eval_data
 
 
 def build_online_runtime(
@@ -460,12 +958,27 @@ def build_online_runtime(
     max_steps: Optional[int] = None,
     total_steps: Optional[int] = None,
     save_interval: int = 0,
+    eval_interval: int = 0,
+    eval_prompts=None,
+    eval_data_factory=None,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
     collate_fn=None,
     logger=None,
     log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    resume_state: Optional[dict] = None,
+    dataset_size: Optional[int] = None,
+    checkpoint_extra: Optional[dict] = None,
     max_checkpoints: int = 0,
     strategy_kwargs: Optional[dict] = None,
     prompt_epochs: int = 1,
+    feature_schema=None,
+    input_preparer=None,
+    shard_target_output: bool = False,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
 ):
     """Assemble the colocated online dataflow and return its ``Trainer``.
 
@@ -476,6 +989,38 @@ def build_online_runtime(
     the target distribution.
     """
     spec = resolve_strategy(strategy)
+    from specforge.inference.batch_partition import TargetBatchPartition
+
+    batch_partition = TargetBatchPartition.from_distributed(tp_size)
+    resolved_collate = _online_collate(spec, collate_fn)
+    rollout_worker_kwargs = {
+        "target_model": target_model,
+        "target_hidden_size": target_hidden_size,
+        "target_vocab_size": target_vocab_size,
+        "draft_vocab_size": draft_vocab_size,
+        "target_repr": target_repr,
+        "aux_hidden_state_layer_ids": aux_hidden_state_layer_ids,
+        "vocab_map_version": vocab_map_version,
+        "t2d": t2d,
+        "num_rollout_workers": num_rollout_workers,
+        "device": device,
+        "feature_schema": feature_schema,
+        "input_preparer": input_preparer,
+        "batch_partition": batch_partition,
+        "shard_target_output": shard_target_output,
+    }
+    if eval_prompts is not None:
+        if eval_data_factory is not None:
+            raise ValueError("pass either eval_prompts or eval_data_factory, not both")
+        eval_data_factory = _make_online_eval_data_factory(
+            spec=spec,
+            prompts=eval_prompts,
+            run_id=run_id,
+            batch_size=batch_size,
+            collate_fn=resolved_collate,
+            rollout_worker_kwargs=rollout_worker_kwargs,
+            dataloader_num_workers=dataloader_num_workers,
+        )
     # Keep colocated online on a private queue; durable online runs use the
     # disagg builders with a shared store and streaming ref channel.
     controller = DataFlowController(
@@ -495,32 +1040,24 @@ def build_online_runtime(
 
     workers = _assemble_rollout_workers(
         spec=spec,
-        target_model=target_model,
         controller=controller,
         store=store,
         run_id=run_id,
-        target_hidden_size=target_hidden_size,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-        target_repr=target_repr,
-        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
-        vocab_map_version=vocab_map_version,
-        t2d=t2d,
-        num_rollout_workers=num_rollout_workers,
-        device=device,
+        **rollout_worker_kwargs,
     )
     rollout_stream = LocalRolloutStream(
         controller=controller,
         workers=workers,
         feature_store=store,
         max_resident_samples=batch_size,
+        capture_batch_multiplier=batch_partition.size,
     )
 
     trainer = _assemble_trainer(
         spec=spec,
         controller=controller,
         store=store,
-        ref_source={"queue": rollout_stream},
+        ref_source={"queue": rollout_stream, "prepositioned": resume_from is not None},
         model=draft_model,
         target_head=None,
         optimizer_factory=optimizer_factory,
@@ -532,13 +1069,24 @@ def build_online_runtime(
         max_steps=max_steps,
         total_steps=total_steps,
         save_interval=save_interval,
+        eval_interval=eval_interval,
+        eval_data_factory=eval_data_factory,
         logger=logger,
         log_interval=log_interval,
-        collate_fn=_online_collate(spec, collate_fn),
+        collate_fn=resolved_collate,
         strategy_kwargs=strategy_kwargs,
         per_sample_transform=None,
         durable_ack=False,
+        resume_from=resume_from,
+        resume_state=resume_state,
+        dataset_size=dataset_size,
+        checkpoint_extra=checkpoint_extra,
         max_checkpoints=max_checkpoints,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        dataloader_num_workers=dataloader_num_workers,
+        profiling_options=profiling_options,
         fit_context=rollout_stream,
     )
     trainer.rollout_workers = workers
@@ -566,12 +1114,18 @@ def build_disagg_online_producer(
     feature_source=None,
     lease: int = 8,
     in_flight_high_watermark: int = 256,
+    in_flight_low_watermark: Optional[int] = None,
+    resident_high_watermark_bytes: Optional[int] = None,
+    resident_low_watermark_bytes: Optional[int] = None,
+    feature_store_max_resident_bytes: Optional[int] = None,
     backpressure_poll_s: float = 0.2,
     peer_wait_timeout_s: Optional[float] = None,
     max_worker_failures: int = 3,
     max_prompt_attempts: Optional[int] = 5,
     sleep=None,
     prompt_epochs: int = 1,
+    feature_schema=None,
+    input_preparer=None,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -584,7 +1138,8 @@ def build_disagg_online_producer(
     deduplication and durable acknowledgements. Returns ``(workers,
     drive_producer)``:
     ``drive_producer(should_stop=...)`` runs until the prompt pool drains and
-    pauses above ``in_flight_high_watermark``. A successful or cooperative stop
+    pauses above the reference or resident-byte high watermark and resumes only
+    below the corresponding low watermarks. A successful or cooperative stop
     closes the channel; a failure publishes a distinct failure sentinel.
     ``peer_wait_timeout_s`` bounds a backpressure wait when the consumer dies
     before it can publish its stop sentinel.
@@ -609,6 +1164,11 @@ def build_disagg_online_producer(
     import threading
     import time
 
+    from specforge.runtime.control_plane.flow_control import (
+        FlowControlLimits,
+        ProducerFlowControl,
+    )
+
     def producer_timing(message: str) -> None:
         print(
             f"[producer-timing] {time.strftime('%Y-%m-%d %H:%M:%S')} {message}",
@@ -620,8 +1180,30 @@ def build_disagg_online_producer(
 
     spec = resolve_strategy(strategy)
     sleep = sleep or time.sleep
-    if in_flight_high_watermark < 1:
-        raise ValueError("in_flight_high_watermark must be >= 1")
+    flow_control = ProducerFlowControl(
+        FlowControlLimits(
+            high_watermark_refs=in_flight_high_watermark,
+            low_watermark_refs=in_flight_low_watermark,
+            high_watermark_bytes=resident_high_watermark_bytes,
+            low_watermark_bytes=resident_low_watermark_bytes,
+            max_prompt_lease_per_worker=lease,
+        )
+    )
+    if (
+        feature_store_max_resident_bytes is not None
+        and feature_store_max_resident_bytes < 1
+    ):
+        raise ValueError("feature_store_max_resident_bytes must be >= 1")
+    if (
+        feature_store_max_resident_bytes is not None
+        and resident_high_watermark_bytes is not None
+        and feature_store_max_resident_bytes < resident_high_watermark_bytes
+    ):
+        raise ValueError(
+            "feature_store_max_resident_bytes must be >= "
+            "resident_high_watermark_bytes"
+        )
+    worker_lease = flow_control.prompt_lease(lease)
     build_start = time.perf_counter()
     prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
     if prompt_epochs > 1:
@@ -631,8 +1213,9 @@ def build_disagg_online_producer(
         "build_disagg_online_producer enter "
         f"strategy={strategy} base_prompts={base_prompt_count} "
         f"prompt_epochs={prompt_epochs} "
-        f"lease={lease} workers={num_rollout_workers} "
-        f"watermark={in_flight_high_watermark}"
+        f"lease={worker_lease} workers={num_rollout_workers} "
+        f"watermarks={in_flight_high_watermark}/"
+        f"{flow_control.limits.resolved_low_watermark_refs}"
     )
     phase = time.perf_counter()
     controller = DataFlowController(
@@ -661,6 +1244,8 @@ def build_disagg_online_producer(
         t2d=t2d,
         num_rollout_workers=num_rollout_workers,
         device=device,
+        feature_schema=feature_schema,
+        input_preparer=input_preparer,
     )
     producer_timing(
         "assemble rollout workers done "
@@ -676,14 +1261,17 @@ def build_disagg_online_producer(
         The controller and feature store are lock-protected; the channel is
         not, so publishes serialize through ``publish_lock``.
         """
+        from collections import deque
+
         drive_start = time.perf_counter()
         progress_interval = float(
             os.environ.get("DISAGG_PRODUCER_PROGRESS_INTERVAL", 30.0)
         )
         producer_timing(
             "drive_producer enter "
-            f"workers={len(workers)} lease={lease} max_rounds={max_rounds} "
-            f"watermark={in_flight_high_watermark} "
+            f"workers={len(workers)} lease={worker_lease} max_rounds={max_rounds} "
+            f"watermarks={in_flight_high_watermark}/"
+            f"{flow_control.limits.resolved_low_watermark_refs} "
             f"progress_interval={progress_interval}"
         )
         quantum_wait_start = time.monotonic()
@@ -727,7 +1315,13 @@ def build_disagg_online_producer(
             producer_timing(f"rollout worker start worker_id={w.worker_id}")
             w.start()
         publish_lock = threading.Lock()
-        state = {"produced": 0, "first_ref_logged": False}
+        state = {
+            "produced": 0,
+            "first_ref_logged": False,
+            "accounted_consumed": channel.consumed_remote(),
+            "resident_bytes": 0,
+        }
+        published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
 
@@ -736,6 +1330,27 @@ def build_disagg_online_producer(
             # leased counts too: a peer's in-flight lease may fail retryable
             # and come back — leaving then would strand it.
             return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
+
+        def reconcile_consumed_locked() -> int:
+            consumed = channel.consumed_remote()
+            delta = consumed - state["accounted_consumed"]
+            if delta < 0 or delta > len(published_sizes):
+                raise RuntimeError(
+                    "producer byte accounting does not match the channel: "
+                    f"consumed advanced by {delta} with "
+                    f"{len(published_sizes)} published refs tracked"
+                )
+            for _ in range(delta):
+                state["resident_bytes"] -= published_sizes.popleft()
+            state["accounted_consumed"] = consumed
+            return state["resident_bytes"]
+
+        def resident_bytes() -> int:
+            # Mooncake health is process-local and cannot observe deletes made by
+            # a remote consumer. Track the published-but-unacknowledged prefix
+            # from SampleRef.estimated_bytes and the channel's durable counter.
+            with publish_lock:
+                return reconcile_consumed_locked()
 
         def run_worker(w) -> None:
             import os as _os
@@ -760,9 +1375,13 @@ def build_disagg_online_producer(
                     return
                 _t = time.monotonic()
                 _infl = channel.in_flight_remote()
+                _resident = resident_bytes()
                 # backpressure: in_flight = published - consumer-acked
                 backpressure_started = time.monotonic()
-                while _infl >= in_flight_high_watermark:
+                while flow_control.should_pause(
+                    in_flight_refs=_infl,
+                    resident_bytes=_resident,
+                ):
                     now = time.perf_counter()
                     if (
                         progress_interval > 0
@@ -773,6 +1392,7 @@ def build_disagg_online_producer(
                             "backpressure wait "
                             f"worker={w.worker_id} produced={state['produced']} "
                             f"in_flight={channel.in_flight_remote()} "
+                            f"resident_bytes={resident_bytes()} "
                             f"pending={st['prompts_pending']} "
                             f"leased={st['prompts_leased']} "
                             f"elapsed={elapsed(drive_start)}"
@@ -792,6 +1412,7 @@ def build_disagg_online_producer(
                         )
                     sleep(backpressure_poll_s)
                     _infl = channel.in_flight_remote()
+                    _resident = resident_bytes()
                 if _prof:
                     _ps["bp"] += time.monotonic() - _t
                     _ps["infl"] = _infl
@@ -799,7 +1420,7 @@ def build_disagg_online_producer(
                 _t = time.monotonic()
                 try:
                     run_once_start = time.perf_counter()
-                    refs = w.run_once(max_tasks=lease)
+                    refs = w.run_once(max_tasks=worker_lease)
                 except Exception as exc:
                     # the worker already failed its leases retryable; peers
                     # (or this worker, next round) will re-lease them.
@@ -829,7 +1450,37 @@ def build_disagg_online_producer(
                 if refs:
                     _t = time.monotonic()
                     with publish_lock:
+                        current_bytes = reconcile_consumed_locked()
+                        ref_sizes = [
+                            max(0, int(ref.estimated_bytes or 0)) for ref in refs
+                        ]
+                        projected_bytes = current_bytes + sum(ref_sizes)
+                        if (
+                            feature_store_max_resident_bytes is not None
+                            and projected_bytes > feature_store_max_resident_bytes
+                        ):
+                            cleanup_errors = []
+                            for ref in refs:
+                                try:
+                                    feature_store.abort(
+                                        ref.sample_id,
+                                        reason="producer-resident-byte-hard-cap",
+                                    )
+                                except Exception as exc:
+                                    cleanup_errors.append(
+                                        f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                                    )
+                            message = (
+                                "producer feature-store hard cap exceeded: "
+                                f"projected={projected_bytes} > "
+                                f"limit={feature_store_max_resident_bytes} bytes"
+                            )
+                            if cleanup_errors:
+                                message += f"; cleanup errors={cleanup_errors}"
+                            raise MemoryError(message)
                         channel.publish_many(refs)
+                        published_sizes.extend(ref_sizes)
+                        state["resident_bytes"] = projected_bytes
                         state["produced"] += len(refs)
                         now = time.perf_counter()
                         should_log = not state["first_ref_logged"]
@@ -977,6 +1628,7 @@ def build_disagg_online_producer(
         channel.close()  # successful EOF; a failure uses channel.fail()
         return produced
 
+    drive_producer.flow_control = flow_control
     return workers, drive_producer
 
 
@@ -995,6 +1647,8 @@ def build_disagg_online_consumer(
     max_steps: Optional[int] = None,
     total_steps: Optional[int] = None,
     save_interval: int = 0,
+    eval_interval: int = 0,
+    eval_data_factory=None,
     collate_fn=None,
     idle_timeout_s: Optional[float] = None,
     metadata_store: Optional[MetadataStore] = None,
@@ -1003,17 +1657,28 @@ def build_disagg_online_consumer(
     log_interval: int = 50,
     strategy_kwargs: Optional[dict] = None,
     max_checkpoints: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
     dp_rank: Optional[int] = None,
     dp_size: Optional[int] = None,
     inbox_dir: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
     Rank 0 always runs the :class:`RefDistributor`, including for ``dp_size=1``.
-    It is the only reader of ``channel`` and the only writer to the fresh
+    It is the only reader of ``channel`` and the only writer to the
     ``metadata_store``/``metadata_db_path`` ledger, then dispatches refs into one
     inbox per rank. Every rank consumes the same inbox-based path and durable
     acknowledgements gather to rank 0 through :class:`DPAckController`.
+
+    ``resume_from`` is consumer-only. Rank 0 reconciles the retained SQLite
+    ledger, skips optimizer-durable refs, requeues the unacked tail, and requires
+    the durable marker to match the checkpoint step. The producer and original
+    data plane must still be available; this does not restart a producer.
     """
     import torch.distributed as dist
 
@@ -1030,11 +1695,22 @@ def build_disagg_online_consumer(
     actual_rank = dist.get_rank() if distributed else 0
     preflight_exc = None
     try:
-        dp_rank, dp_size = _dp_consumer_layout(dp_rank, dp_size)
+        dp_rank, dp_size = _dp_consumer_layout(
+            dp_rank,
+            dp_size,
+            tp_size,
+            sp_ulysses_size,
+            sp_ring_size,
+        )
         if metadata_store is None and metadata_db_path is None:
             raise ValueError(
-                "online consumer needs a fresh metadata_store/metadata_db_path "
+                "online consumer needs a metadata_store/metadata_db_path "
                 "for its single rank-0 ledger"
+            )
+        if getattr(feature_store, "retain_on_release", False) is not True:
+            raise ValueError(
+                "online consumer feature_store must set retain_on_release=True; "
+                "features are deleted only after an optimizer-boundary durable ack"
             )
         if distributed and world != dp_size:
             raise ValueError(
@@ -1074,15 +1750,58 @@ def build_disagg_online_consumer(
             store = _resolve_metadata_store(metadata_store, metadata_db_path)
             if store is None or isinstance(store, NoOpMetadataStore):
                 raise ValueError("online consumer requires a retaining metadata ledger")
-            committed = store.committed_count()
-            if committed > 0:
-                raise ValueError(
-                    f"metadata store already holds {committed} committed samples; "
-                    "every online attempt requires a fresh ledger"
-                )
             controller = DPAckController(
-                run_id, is_authority=True, metadata_store=store
+                run_id,
+                is_authority=True,
+                metadata_store=store,
+                feature_store=feature_store,
             )
+            skip_ids = None
+            requeued_ids = None
+            committed = store.committed_count()
+            if resume_from is None:
+                if committed > 0:
+                    raise ValueError(
+                        f"metadata store already holds {committed} committed "
+                        "samples; a fresh online attempt cannot reuse a ledger. "
+                        "Set training.resume_from to reconcile this retained "
+                        "consumer attempt, or use a new metadata_db_path"
+                    )
+            else:
+                if isinstance(store, InMemoryMetadataStore):
+                    raise ValueError(
+                        "online consumer resume requires a durable metadata store; "
+                        "use metadata_db_path/SQLite rather than an in-memory ledger"
+                    )
+                reconciled = controller.reconcile_on_restart(feature_store)
+                # The fresh authority adopted every optimizer-durable committed
+                # ref before aborting it. Resolve any lease-deferred remote
+                # deletes now, while setup failures can still be broadcast to
+                # every rank, rather than carrying a hidden leak into training.
+                drain_feature_store_removals(feature_store)
+                marker_step = reconciled["global_step"]
+                checkpoint_step = _checkpoint_global_step(resume_from)
+                if marker_step is not None and not reconciled["optimizer_durable"]:
+                    raise RuntimeError(
+                        f"durable marker at global_step={marker_step} is not marked "
+                        "optimizer_durable; refusing to skip or replay ambiguously"
+                    )
+                if marker_step != checkpoint_step and not (
+                    marker_step is None and checkpoint_step == 0
+                ):
+                    direction = (
+                        "ahead of"
+                        if marker_step is not None and marker_step > checkpoint_step
+                        else "behind"
+                    )
+                    raise RuntimeError(
+                        f"durable marker global_step={marker_step} is {direction} "
+                        f"checkpoint {resume_from!r} global_step={checkpoint_step}; "
+                        "the retained ack set and restored weights do not describe "
+                        "the same optimizer boundary"
+                    )
+                skip_ids = set(reconciled["released"])
+                requeued_ids = set(reconciled["requeued"])
             distributor = RefDistributor(
                 channel,
                 controller,
@@ -1090,9 +1809,14 @@ def build_disagg_online_consumer(
                 dp_size,
                 feature_store=feature_store,
                 refs_per_rank_step=batch_size * accumulation_steps,
+                skip_ids=skip_ids,
+                requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
             )
-            channel.publish_consumer_quantum(dp_size * batch_size * accumulation_steps)
+            channel.publish_consumer_quantum(
+                dp_size * batch_size * accumulation_steps,
+                allow_existing=resume_from is not None,
+            )
         except BaseException as exc:
             setup_exc = exc
 
@@ -1110,7 +1834,10 @@ def build_disagg_online_consumer(
 
     if dp_rank != 0:
         controller = DPAckController(
-            run_id, is_authority=False, metadata_store=InMemoryMetadataStore()
+            run_id,
+            is_authority=False,
+            metadata_store=InMemoryMetadataStore(),
+            feature_store=feature_store,
         )
 
     # The successful rank-0 setup broadcast guarantees inbox recreation and the
@@ -1118,7 +1845,35 @@ def build_disagg_online_consumer(
     inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
     queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
 
+    drain_state = {"attempted": False}
+
+    def drain_consumer_store() -> None:
+        drain_state["attempted"] = True
+        drain_feature_store_removals(feature_store)
+
     def mark_consumer_done(_step: int) -> None:
+        # Do not publish success while another DP rank still has a deferred
+        # Mooncake remove. Every rank drains its own client, then collectively
+        # reports cleanup success/failure before rank 0 releases the producer.
+        cleanup_error = None
+        try:
+            drain_consumer_store()
+        except BaseException as exc:
+            cleanup_error = f"{type(exc).__name__}: {exc}"
+        if distributed and world > 1:
+            gathered_errors = [None] * world
+            dist.all_gather_object(gathered_errors, cleanup_error)
+            failures = [
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(gathered_errors)
+                if error is not None
+            ]
+            cleanup_error = "; ".join(failures) or None
+        if cleanup_error is not None:
+            raise RuntimeError(
+                "online consumer could not drain rank-local feature removals: "
+                f"{cleanup_error}"
+            )
         if dp_rank == 0:
             channel.mark_consumer_done()
 
@@ -1131,16 +1886,25 @@ def build_disagg_online_consumer(
         except Exception as signal_exc:
             print(f"failed to publish consumer failure: {signal_exc}", flush=True)
 
-    def stop_distributor() -> None:
+    def stop_distributor_and_drain() -> None:
         if distributor is not None:
             distributor.stop()
+        # The success hook already drained before publishing consumer_done. On
+        # an exception, finalization still makes one bounded local attempt and
+        # raises loudly rather than hiding hard-pinned remote objects.
+        if not drain_state["attempted"]:
+            drain_consumer_store()
 
     try:
         trainer = _assemble_trainer(
             spec=spec,
             controller=controller,
             store=feature_store,
-            ref_source={"queue": queue},
+            ref_source={
+                "queue": queue,
+                "prepositioned": resume_from is not None,
+                "defer_ack_until_durable": True,
+            },
             model=draft_model,
             target_head=target_head if spec.uses_target_head else None,
             optimizer_factory=optimizer_factory,
@@ -1152,15 +1916,23 @@ def build_disagg_online_consumer(
             max_steps=max_steps,
             total_steps=total_steps,
             save_interval=save_interval,
+            eval_interval=eval_interval,
+            eval_data_factory=eval_data_factory,
             logger=logger,
             log_interval=log_interval,
             collate_fn=_online_collate(spec, collate_fn),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
             max_checkpoints=max_checkpoints,
+            tp_size=tp_size,
+            sp_ulysses_size=sp_ulysses_size,
+            sp_ring_size=sp_ring_size,
+            resume_from=resume_from,
+            dataloader_num_workers=dataloader_num_workers,
+            profiling_options=profiling_options,
             on_fit_success=mark_consumer_done,
             on_fit_failure=mark_consumer_failed,
-            on_fit_finally=stop_distributor,
+            on_fit_finally=stop_distributor_and_drain,
         )
         #: Rank 0's lifecycle-owned RefDistributor handle (None elsewhere), exposed
         #: for runtime observability. ``Trainer.fit()`` always stops it.
@@ -1172,7 +1944,7 @@ def build_disagg_online_consumer(
         # The canonical builder also owns failures before ``Trainer.fit`` can
         # take over, so a direct Python caller cannot strand its producer.
         mark_consumer_failed(exc)
-        stop_distributor()
+        stop_distributor_and_drain()
         raise
 
 

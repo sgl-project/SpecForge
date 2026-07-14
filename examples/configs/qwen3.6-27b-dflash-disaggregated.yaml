@@ -1,0 +1,37 @@
+model:
+  target_model_path: "Qwen/Qwen3.6-27B"
+  draft_model_config: "configs/qwen3.6-27b-dflash.json"
+  target_backend: "sglang"
+  trust_remote_code: true
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  mask_token_id: 248070
+data:
+  train_data_path: "./cache/dataset/nemotron_v2_train.jsonl"
+  max_length: 2048
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 32
+  cache_dir: "./cache"
+training:
+  strategy: "dflash"
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 1000
+  log_interval: 10
+  deployment_mode: "disaggregated"
+  role: "producer"
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: "wandb"
+  wandb_project: "qwen36-dflash-disagg"
+  wandb_name: "qwen36-27b-dflash-server-capture-dp2"
+run_id: "qwen3.6-27b-dflash-disaggregated"
+output_dir: "./outputs/qwen3.6-27b-dflash-disaggregated"

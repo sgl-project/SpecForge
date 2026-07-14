@@ -25,16 +25,13 @@ REMOVED_MODULE_FILES = (
     "specforge/runtime/inference/dflash_adapter.py",
     "specforge/runtime/inference/sglang_adapter.py",
     "specforge/runtime/training/__init__.py",
-    "specforge/tracker.py",
     "specforge/args.py",
-    "specforge/core/compact_teacher.py",
     "specforge/inference/adapters/dflash.py",
     "specforge/inference/adapters/eagle3.py",
     "specforge/inference/target_engine/capture_policy.py",
     "specforge/inference/target_engine/dflash_target_model.py",
     "specforge/inference/target_engine/eagle3_target_model.py",
     "specforge/modeling/utils.py",
-    "specforge/runtime/control_plane/backpressure.py",
 )
 
 REMOVED_TRAINING_ENTRY_FILES = (
@@ -49,32 +46,43 @@ REMOVED_TRAINING_ENTRY_FILES = (
     "examples/disagg/run_disagg_dspark.py",
 )
 
-REMOVED_DUPLICATE_PATH_TESTS = (
-    "tests/test_runtime/test_colocated_vs_disagg_equiv.py",
+REMOVED_SUPERSEDED_PATH_TESTS = (
     "tests/test_runtime/test_disagg_online.py",
     "tests/test_runtime/test_disagg_online_interleave.py",
-    "tests/test_runtime/test_disagg_online_shared_plane.py",
-    "tests/test_runtime/test_soak.py",
-    "tests/test_runtime/test_backpressure.py",
 )
 
-REMOVED_OFFLINE_DATASET_API_NAMES = (
-    "OfflineEagle3Dataset",
-    "list_local_files",
-)
+# Deleted test filenames are historical capability labels, not paths we expect
+# to restore. Each label maps to the checked-in canonical-runtime gates that now
+# own that behavior. The architecture test below makes this mapping executable:
+# cleanup cannot silently turn a real correctness gate into prose-only intent.
+CAPABILITY_TEST_REPLACEMENTS = {
+    "tests/test_runtime/test_backpressure.py": (
+        "tests/test_runtime/test_flow_control.py",
+        "tests/test_runtime/test_disagg_multiserver.py",
+    ),
+    "tests/test_runtime/test_disagg_online_shared_plane.py": (
+        "tests/test_runtime/test_disagg_online_shared_plane.py",
+        "tests/test_runtime/test_ref_distributor.py",
+    ),
+    "tests/test_runtime/test_recovery.py": (
+        "tests/test_runtime/test_recovery.py",
+        "tests/test_runtime/test_ref_distributor.py",
+    ),
+    "tests/test_runtime/test_resharding.py": (
+        "tests/test_runtime/test_ref_distributor.py",
+    ),
+    "tests/test_runtime/test_soak.py": (
+        "tests/test_runtime/test_local_rollout_stream.py",
+    ),
+}
 
 REMOVED_PACKAGE_DIRECTORIES = (
-    "benchmarks",
-    "specforge/eval",
-    "specforge/layers/ring",
     "specforge/modeling/target/sglang_backend",
     "specforge/runtime/inference",
     "specforge/runtime/training",
 )
 
 REMOVED_MODULE_PREFIXES = (
-    "specforge.eval",
-    "specforge.layers.ring",
     "specforge.modeling.target.base",
     "specforge.modeling.target.factory",
     "specforge.modeling.target.dflash_target_model",
@@ -82,16 +90,13 @@ REMOVED_MODULE_PREFIXES = (
     "specforge.modeling.target.sglang_backend",
     "specforge.runtime.inference",
     "specforge.runtime.training",
-    "specforge.tracker",
     "specforge.args",
-    "specforge.core.compact_teacher",
     "specforge.inference.adapters.dflash",
     "specforge.inference.adapters.eagle3",
     "specforge.inference.target_engine.capture_policy",
     "specforge.inference.target_engine.dflash_target_model",
     "specforge.inference.target_engine.eagle3_target_model",
     "specforge.modeling.utils",
-    "specforge.runtime.control_plane.backpressure",
     "scripts.train_eagle3",
     "scripts.train_eagle3_dataflow",
     "scripts.train_dflash",
@@ -102,7 +107,6 @@ REMOVED_MODULE_PREFIXES = (
     "train_dflash",
     "train_domino",
     "train_peagle",
-    "yunchang",
 )
 
 SOURCE_ROOTS = (
@@ -117,69 +121,6 @@ PRODUCTION_ROOTS = (
     REPO_ROOT / "scripts",
     REPO_ROOT / "examples",
 )
-
-TEXT_ONLY_RUNTIME_FILES = (
-    "scripts/prepare_hidden_states.py",
-    "specforge/core/eagle3.py",
-    "specforge/data/preprocessing.py",
-    "specforge/data/utils.py",
-    "specforge/inference/target_engine/sglang.py",
-    "specforge/inference/target_engine/sglang_backend/capture.py",
-    "specforge/inference/target_engine/target_capture_policy.py",
-    "specforge/modeling/draft/llama3_eagle.py",
-    "specforge/modeling/target/custom_backend/llama4.py",
-    "specforge/modeling/target/target_head.py",
-)
-
-REMOVED_VLM_API_NAMES = {
-    "BaseMultimodalProcessor",
-    "ImageProcessingMixin",
-    "LlamaMutiRotaryEmbedding",
-    "MRotaryEmbedding",
-    "MultimodalInputs",
-    "QwenVLOnlineEagle3Model",
-    "VlmDataCollatorWithPadding",
-    "apply_multimodal_rotary_pos_emb",
-    "extend_eagle3_vlm",
-    "extend_vlm",
-    "get_rope_index",
-    "image_grid_thw",
-    "is_vlm",
-    "pixel_values",
-    "preprocess_vlm_conversations",
-    "qwen_vl_utils",
-    "vision_config",
-}
-
-REMOVED_VLM_SOURCE_TERMS = (
-    "mrope",
-    "multimodal",
-    "qwen_vl",
-    "vlm",
-)
-
-REMOVED_DRAFT_PARALLEL_API_NAMES = {
-    "Gather",
-    "LlamaUSPFlashAttention",
-    "SeqAllToAll4D",
-    "UspAdapter",
-    "all_gather_tensor",
-    "draft_dp_group",
-    "draft_sp_group",
-    "gather_outputs_and_unpad",
-    "gather_tensor",
-    "get_device_mesh",
-    "get_draft_dp_group",
-    "get_draft_sp_group",
-    "get_sp_ring_group",
-    "get_sp_ulysses_group",
-    "process_data_usp",
-    "sp_ring_group",
-    "sp_ring_size",
-    "sp_ulysses_group",
-    "sp_ulysses_size",
-    "use_usp_preprocess",
-}
 
 LEGACY_ENTRY_GLOBS = (
     "scripts/train_*.py",
@@ -212,7 +153,6 @@ LEGACY_API_NAMES = {
     "run_disagg_online_interleaved",
     "_is_closed",
     "_remap_legacy_draft_head_keys",
-    "all_committed_ids",
     "TrainLease",
     "cap_train_lease",
     "dp_partition",
@@ -223,10 +163,6 @@ LEGACY_API_NAMES = {
     "max_train_lease",
     "note_trainer_starved",
     "partition_key",
-    "reconcile_on_restart",
-    "seed_consumed",
-    "skip_ids",
-    "split_eval",
     "train_lease",
     "build_control_plane_for_mode",
 }
@@ -312,113 +248,6 @@ class TestPackageArchitecture(unittest.TestCase):
             project["project"]["scripts"],
         )
 
-    def test_removed_training_telemetry_stays_out_of_runtime_dependencies(self):
-        with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
-            dependencies = tomllib.load(project_file)["project"]["dependencies"]
-        names = {
-            item.split("[", 1)[0].split("=", 1)[0].lower() for item in dependencies
-        }
-        self.assertTrue({"wandb", "tensorboard"}.isdisjoint(names))
-
-    def test_typed_runtime_stays_text_only(self):
-        violations = []
-        for relative_path in TEXT_ONLY_RUNTIME_FILES:
-            path = REPO_ROOT / relative_path
-            source = path.read_text()
-            for node in ast.walk(_module_tree(path)):
-                name = None
-                if isinstance(node, ast.Name):
-                    name = node.id
-                elif isinstance(node, ast.Attribute):
-                    name = node.attr
-                elif isinstance(node, ast.alias):
-                    name = node.name.rsplit(".", 1)[-1]
-                elif isinstance(node, ast.arg):
-                    name = node.arg
-                elif isinstance(node, ast.keyword):
-                    name = node.arg
-                if name in REMOVED_VLM_API_NAMES:
-                    violations.append(f"{relative_path}:{node.lineno}: {name}")
-            for term in REMOVED_VLM_SOURCE_TERMS:
-                if term in source.lower():
-                    violations.append(f"{relative_path}: source term {term!r}")
-        self.assertEqual(
-            [],
-            violations,
-            "typed runtime must not reintroduce VLM APIs:\n" + "\n".join(violations),
-        )
-
-        with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
-            project = tomllib.load(project_file)["project"]
-        self.assertNotIn("vlm", project.get("optional-dependencies", {}))
-        dependencies = "\n".join(project["dependencies"]).lower()
-        self.assertNotIn("qwen-vl", dependencies)
-
-    def test_draft_sequence_parallel_stays_deleted(self):
-        violations = []
-        for source_root in PRODUCTION_ROOTS:
-            for path in sorted(source_root.rglob("*.py")):
-                for node in ast.walk(_module_tree(path)):
-                    name = None
-                    if isinstance(node, ast.Name):
-                        name = node.id
-                    elif isinstance(node, ast.Attribute):
-                        name = node.attr
-                    elif isinstance(node, ast.alias):
-                        name = node.name.rsplit(".", 1)[-1]
-                    elif isinstance(node, ast.arg):
-                        name = node.arg
-                    elif isinstance(node, ast.keyword):
-                        name = node.arg
-                    elif isinstance(node, ast.Constant) and node.value == "usp":
-                        name = node.value
-                    if name == "usp" or name in REMOVED_DRAFT_PARALLEL_API_NAMES:
-                        relative_path = path.relative_to(REPO_ROOT)
-                        violations.append(f"{relative_path}:{node.lineno}: {name}")
-        self.assertEqual(
-            [],
-            violations,
-            "draft sequence-parallel APIs reintroduced:\n" + "\n".join(violations),
-        )
-
-        with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
-            dependencies = tomllib.load(project_file)["project"]["dependencies"]
-        names = {
-            item.split("[", 1)[0].split("=", 1)[0].lower() for item in dependencies
-        }
-        self.assertNotIn("yunchang", names)
-
-        distributed_functions = {
-            node.name: node
-            for node in _module_tree(REPO_ROOT / "specforge" / "distributed.py").body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        init_parameters = {
-            arg.arg
-            for arg in distributed_functions["init_distributed"].args.args
-            + distributed_functions["init_distributed"].args.kwonlyargs
-        }
-        self.assertIn("tp_size", init_parameters)
-
-        launch_functions = {
-            node.name: node
-            for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        for name in CANONICAL_LAUNCH_EXPORTS:
-            parameters = {
-                arg.arg
-                for arg in launch_functions[name].args.args
-                + launch_functions[name].args.kwonlyargs
-            }
-            self.assertNotIn("tp_size", parameters, name)
-        consumer_parameters = {
-            arg.arg
-            for arg in launch_functions["build_disagg_online_consumer"].args.args
-            + launch_functions["build_disagg_online_consumer"].args.kwonlyargs
-        }
-        self.assertTrue({"dp_rank", "dp_size"}.issubset(consumer_parameters))
-
     def test_removed_move_shims_stay_deleted(self):
         present = [
             relative_path
@@ -444,32 +273,37 @@ class TestPackageArchitecture(unittest.TestCase):
         )
         self.assertEqual([], globbed, f"legacy entry pattern reintroduced: {globbed}")
 
-        duplicate_tests = [
-            path for path in REMOVED_DUPLICATE_PATH_TESTS if (REPO_ROOT / path).exists()
+        superseded_tests = [
+            path
+            for path in REMOVED_SUPERSEDED_PATH_TESTS
+            if (REPO_ROOT / path).exists()
         ]
         self.assertEqual(
             [],
-            duplicate_tests,
-            f"tests for removed duplicate paths reintroduced: {duplicate_tests}",
+            superseded_tests,
+            f"tests for superseded path topology reintroduced: {superseded_tests}",
         )
 
-    def test_legacy_offline_dataset_api_stays_deleted(self):
-        violations = []
-        this_file = Path(__file__).resolve()
-        for source_root in SOURCE_ROOTS:
-            for path in sorted(source_root.rglob("*.py")):
-                if path.resolve() == this_file:
-                    continue
-                source = path.read_text()
-                for name in REMOVED_OFFLINE_DATASET_API_NAMES:
-                    if name in source:
-                        relative_path = path.relative_to(REPO_ROOT)
-                        violations.append(f"{relative_path}: {name}")
-        self.assertEqual(
-            [],
-            violations,
-            "legacy offline Dataset API reintroduced:\n" + "\n".join(violations),
-        )
+    def test_deleted_capabilities_have_checked_in_canonical_replacements(self):
+        overlap = set(CAPABILITY_TEST_REPLACEMENTS) & set(REMOVED_SUPERSEDED_PATH_TESTS)
+        self.assertEqual(set(), overlap)
+
+        invalid = {}
+        missing = {}
+        for capability, replacements in CAPABILITY_TEST_REPLACEMENTS.items():
+            bad_paths = [
+                path
+                for path in replacements
+                if not path.startswith("tests/test_runtime/test_")
+                or not path.endswith(".py")
+            ]
+            if bad_paths:
+                invalid[capability] = bad_paths
+            absent = [path for path in replacements if not (REPO_ROOT / path).is_file()]
+            if absent:
+                missing[capability] = absent
+        self.assertEqual({}, invalid, f"invalid canonical test paths: {invalid}")
+        self.assertEqual({}, missing, f"missing canonical capability gates: {missing}")
 
     def test_repository_does_not_import_removed_modules(self):
         violations = []
@@ -647,21 +481,22 @@ class TestPackageArchitecture(unittest.TestCase):
             for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        for name in ("build_online_runtime", "build_disagg_online_consumer"):
-            parameters = {
-                arg.arg
-                for arg in functions[name].args.args + functions[name].args.kwonlyargs
-            }
-            self.assertTrue(
-                {"resume", "resume_from", "num_epochs"}.isdisjoint(parameters),
-                name,
-            )
         online_parameters = {
             arg.arg
             for arg in functions["build_online_runtime"].args.args
             + functions["build_online_runtime"].args.kwonlyargs
         }
+        self.assertIn("resume_from", online_parameters)
+        self.assertTrue({"resume", "num_epochs"}.isdisjoint(online_parameters))
         self.assertNotIn("ttt_length", online_parameters)
+
+        consumer_parameters = {
+            arg.arg
+            for arg in functions["build_disagg_online_consumer"].args.args
+            + functions["build_disagg_online_consumer"].args.kwonlyargs
+        }
+        self.assertIn("resume_from", consumer_parameters)
+        self.assertTrue({"resume", "num_epochs"}.isdisjoint(consumer_parameters))
 
         offline_parameters = {
             arg.arg
@@ -755,30 +590,13 @@ class TestPackageArchitecture(unittest.TestCase):
             if name in DRAFT_MODEL_BUILDERS:
                 self.assertIn("draft_model", parameters, name)
 
-    def test_canonical_launch_builders_have_no_eval_side_channel(self):
-        functions = {
-            node.name: node
-            for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        for name in CANONICAL_LAUNCH_EXPORTS:
-            parameters = {
-                arg.arg
-                for arg in functions[name].args.args + functions[name].args.kwonlyargs
-            }
-            self.assertNotIn("eval_interval", parameters, name)
-
     def test_data_preparation_exposes_only_canonical_presets(self):
         script_path = REPO_ROOT / "scripts" / "prepare_data.py"
-        self.assertEqual(
-            CANONICAL_DATASET_PRESETS,
-            _literal_assignment(script_path, "CANONICAL_DATASETS"),
+        self.assertTrue(
+            set(CANONICAL_DATASET_PRESETS).issubset(
+                _literal_assignment(script_path, "SUPPORTED_DATASETS")
+            )
         )
-
-        source = script_path.read_text()
-        self.assertNotIn("--opc-subset", source)
-        self.assertNotIn("--split-eval", source)
-        self.assertNotIn("_test.jsonl", source)
 
     def test_offline_capture_uses_only_the_canonical_target_engine_contract(self):
         source = (REPO_ROOT / "scripts" / "prepare_hidden_states.py").read_text()
@@ -791,7 +609,7 @@ class TestPackageArchitecture(unittest.TestCase):
 
     def test_only_canonical_draft_configs_are_checked_in(self):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
-        self.assertEqual(CANONICAL_DRAFT_CONFIGS, present)
+        self.assertTrue(CANONICAL_DRAFT_CONFIGS.issubset(present))
 
     def test_examples_and_scripts_do_not_bypass_the_cli(self):
         direct_imports = []

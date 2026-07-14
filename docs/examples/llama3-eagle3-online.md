@@ -55,8 +55,15 @@ output_dir: ./outputs/llama3-8b-eagle3-online
 specforge train --config ./llama3-eagle3-online.yaml
 ```
 
-Colocated training is currently single-rank. For a short smoke run, override
-`training.max_steps` to a small value.
+The same config supports target TP and target-DP under `torchrun`. For example,
+four processes with two ranks per target-TP group create two target-DP groups:
+
+```bash
+torchrun --standalone --nproc_per_node=4 "$(command -v specforge)" \
+  train --config ./llama3-eagle3-online.yaml training.tp_size=2
+```
+
+For a short smoke run, override `training.max_steps` to a small value.
 
 ## 4. Export and benchmark
 
@@ -64,9 +71,9 @@ Llama 3.1 8B training and benchmarking should use the same system prompt. A
 reference draft checkpoint is available at
 [zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct).
 
-The runtime checkpoint contains training state, but the unified CLI does not
-support resuming any online stream in this PR. It is also not directly loadable
-by the SGLang speculative decoder. Export the final checkpoint first:
+The runtime checkpoint contains training state but is not directly loadable by
+the SGLang speculative decoder. A colocated online run can resume it with
+`training.resume_from`; export the final checkpoint before serving:
 
 ```bash
 specforge export --to sglang \

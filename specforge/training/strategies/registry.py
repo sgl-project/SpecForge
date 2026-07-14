@@ -135,12 +135,37 @@ def _eagle3_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
     )
 
 
-def _eagle3_offline_transform(max_len):
+def _eagle3_offline_transform(
+    max_len,
+    *,
+    ttt_length=1,
+    use_usp_preprocess=False,
+):
     from functools import partial
 
-    from specforge.data.preprocessing import process_offline_eagle3_sample
+    if not use_usp_preprocess:
+        from specforge.data.preprocessing import process_offline_eagle3_sample
 
-    return partial(process_offline_eagle3_sample, max_len=max_len)
+        return partial(process_offline_eagle3_sample, max_len=max_len)
+
+    import torch.distributed as dist
+
+    from specforge.data.preprocessing import OfflineEagle3Dataset
+    from specforge.distributed import get_draft_sp_group, get_sp_ring_group
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("USP preprocessing requires initialized process groups")
+    sp_group = get_draft_sp_group()
+    ring_group = get_sp_ring_group()
+    return partial(
+        OfflineEagle3Dataset.process_data_usp,
+        max_len=max_len,
+        ttt_length=ttt_length,
+        sp_rank=dist.get_rank(sp_group),
+        sp_size=dist.get_world_size(sp_group),
+        ring_rank=dist.get_rank(ring_group),
+        sp_ring_size=dist.get_world_size(ring_group),
+    )
 
 
 def _eagle3_offline_collate():
@@ -149,13 +174,15 @@ def _eagle3_offline_collate():
     return DataCollatorWithPadding()
 
 
+def _make_eagle3_strategy(wrapped, *, target_head=None, **kwargs):
+    return Eagle3TrainStrategy(wrapped, target_head=target_head, **kwargs)
+
+
 register_strategy(
     StrategySpec(
         name="eagle3",
         required_features=frozenset(Eagle3TrainStrategy.required_features),
-        make_strategy=lambda wrapped, *, target_head=None: Eagle3TrainStrategy(
-            wrapped, target_head=target_head
-        ),
+        make_strategy=_make_eagle3_strategy,
         uses_target_head=True,
         make_offline_reader=_eagle3_offline_reader,
         make_offline_transform=_eagle3_offline_transform,
@@ -189,20 +216,41 @@ register_strategy(
 # --- DFlash -----------------------------------------------------------------
 # DFlash uses its own feature schema ('hidden_states' = the concatenated target
 # capture layers, NO eagle3 aux/target swap, NO target distribution / vocab map).
-# The shared PolicyFeatureAdapter emits this schema from the policy-driven
-# target engine. The typed run schema intentionally does not expose DFlash
-# offline training.
+# Offline and online use that same contract, so both paths share one transform
+# and collate implementation.  The shared PolicyFeatureAdapter emits the schema
+# from the policy-driven target engine for online runs.
 
 from specforge.training.strategies.base import DFlashTrainStrategy
 
 
-def _dflash_online_collate():
+def _dflash_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+        strategy="dflash",
+        feature_keys=("input_ids", "loss_mask", "hidden_states"),
+        target_repr=None,
+    )
+
+
+def _dflash_offline_transform(max_len, **_topology):
+    from functools import partial
+
+    from specforge.data.preprocessing import process_offline_dflash_sample
+
+    return partial(process_offline_dflash_sample, max_len=max_len)
+
+
+def _dflash_collate():
     """Right-pad ragged samples to the batch max length and concat along batch.
 
     DataCollatorWithPadding is eagle3-specific (hardwires attention_mask + the
     hidden_state/target keys), so DFlash uses this minimal collate. loss_mask is
-    zero-padded, so padded positions contribute no loss. (Single-rank; no SP
-    sharding multiple — offline DFlash is a follow-up.)
+    zero-padded, so padded positions contribute no loss.
     """
 
     def collate(feats):
@@ -239,7 +287,10 @@ register_strategy(
         required_features=frozenset(DFlashTrainStrategy.required_features),
         make_strategy=lambda wrapped, *, target_head=None: DFlashTrainStrategy(wrapped),
         uses_target_head=False,
-        make_online_collate=_dflash_online_collate,
+        make_offline_reader=_dflash_offline_reader,
+        make_offline_transform=_dflash_offline_transform,
+        make_offline_collate=_dflash_collate,
+        make_online_collate=_dflash_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,
         supports_online=True,
     )
@@ -300,11 +351,26 @@ register_strategy(
 
 
 # --- Domino -----------------------------------------------------------------
-# Domino uses a DFlash-family draft model and reuses the DFlash online feature
-# schema/collate. The loss blends a base loss with a step-decayed weight, so
-# DominoTrainStrategy reads the StepContext (forward_loss(batch, ctx)).
+# Domino uses a DFlash-family draft model and reuses the DFlash offline/online
+# feature schema, transform and collate. The loss blends a base loss with a
+# step-decayed weight, so DominoTrainStrategy reads the StepContext
+# (forward_loss(batch, ctx)).
 
 from specforge.training.strategies.base import DominoTrainStrategy
+
+
+def _domino_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+        strategy="domino",
+        feature_keys=("input_ids", "loss_mask", "hidden_states"),
+        target_repr=None,
+    )
 
 
 def _make_domino_strategy(
@@ -321,7 +387,10 @@ register_strategy(
         required_features=frozenset(DominoTrainStrategy.required_features),
         make_strategy=_make_domino_strategy,
         uses_target_head=False,
-        make_online_collate=_dflash_online_collate,
+        make_offline_reader=_domino_offline_reader,
+        make_offline_transform=_dflash_offline_transform,
+        make_offline_collate=_dflash_collate,
+        make_online_collate=_dflash_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,  # same capture path as DFlash
         supports_online=True,
     )

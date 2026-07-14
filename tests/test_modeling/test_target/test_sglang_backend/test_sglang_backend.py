@@ -8,6 +8,7 @@ import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
 from specforge.distributed import init_distributed
+from specforge.inference.media import MediaInputs
 from specforge.inference.target_engine import SGLangTargetEngine
 from tests.utils import get_available_port
 
@@ -87,6 +88,78 @@ def test_moe(rank, world_size, port, tp_size):
     )
 
 
+@torch.no_grad()
+def test_vlm(rank, world_size, port, tp_size):
+    """Exercise the canonical multimodal capture contract across target TP."""
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+
+    init_distributed(tp_size=tp_size)
+    set_seed(42)
+
+    from PIL import Image
+    from transformers import AutoProcessor
+
+    model_path = "Qwen/Qwen2.5-VL-7B-Instruct"
+    processor = AutoProcessor.from_pretrained(model_path)
+    image = Image.new("RGB", (56, 56), color=(127, 63, 31))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": "Describe the image."},
+            ],
+        }
+    ]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = processor(
+        text=[text], images=[image], padding=True, return_tensors="pt"
+    )
+    input_ids = inputs["input_ids"].cuda()
+    attention_mask = inputs["attention_mask"].cuda()
+    loss_mask = attention_mask.clone()
+    pixel_values = inputs["pixel_values"].cuda()
+    image_grid_thw = inputs["image_grid_thw"].cuda()
+
+    target = SGLangTargetEngine.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device="cuda",
+        attention_backend="fa3",
+        load_format="dummy",
+        mem_fraction_static=0.75,
+    )
+    target.set_capture_layers()
+    output = target.capture(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        media_inputs=MediaInputs(
+            pixel_values=pixel_values,
+            image_grid_thw=(image_grid_thw,),
+        ),
+    )
+    position_ids, _ = target.get_rope_index(
+        input_ids=output.input_ids,
+        image_grid_thw=image_grid_thw,
+        attention_mask=output.attention_mask,
+    )
+
+    assert output.hidden_states.shape[:2] == input_ids.shape
+    assert output.target.shape[:2] == input_ids.shape
+    assert position_ids.shape[-1] == input_ids.shape[-1]
+    print(f"[Rank {rank}] VLM capture passed for {model_path}")
+    del output, target, inputs, pixel_values, image_grid_thw
+    del input_ids, attention_mask, loss_mask, processor, image
+    cleanup_distributed()
+
+
 class TestTargetModelBackend(unittest.TestCase):
     def test_sglang_backend_with_dense(self):
         world_size = 2
@@ -100,6 +173,14 @@ class TestTargetModelBackend(unittest.TestCase):
         world_size = 2
         mp.spawn(
             test_moe,
+            nprocs=world_size,
+            args=(world_size, get_available_port(), 2),
+        )
+
+    def test_sglang_backend_with_vlm(self):
+        world_size = 2
+        mp.spawn(
+            test_vlm,
             nprocs=world_size,
             args=(world_size, get_available_port(), 2),
         )

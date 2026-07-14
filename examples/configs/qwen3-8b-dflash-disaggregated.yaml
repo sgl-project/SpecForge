@@ -21,5 +21,11 @@ training:
   num_anchors: 512
   loss_decay_gamma: 7.0
   save_interval: 1000
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: none
+  wandb_project: qwen3-8b-dflash-disagg
+  wandb_name: qwen3-8b-dflash-1srv-dp7
 run_id: qwen3-8b-dflash-disaggregated
 output_dir: outputs/qwen3-8b-dflash-disaggregated

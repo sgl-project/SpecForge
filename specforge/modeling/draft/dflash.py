@@ -188,7 +188,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
-        return [(num_target_layers // 2)]
+        return [num_target_layers // 2]
     start = 1
     end = num_target_layers - 3
     span = end - start
@@ -209,6 +209,45 @@ def extract_context_feature(
         selected_states.append(hidden_states[layer_id + offset])
     target_hidden = torch.cat(selected_states, dim=-1)
     return target_hidden
+
+
+def normalize_draft_head_checkpoint_keys(
+    module,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+):
+    """Map checkpoint-only nested head names onto the direct module layout.
+
+    Early Domino/DSpark checkpoints saved their auxiliary heads beneath a
+    ``logit_head`` container. The live architecture no longer owns that wrapper,
+    but those tensors remain valid and must not be dropped during warm start or
+    full resume.
+    """
+
+    del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    checkpoint_prefixes = (
+        ("logit_head.prefix_gru.", "prefix_gru."),
+        ("logit_head.embed_proj.", "embed_proj."),
+        ("logit_head.markov_head.", "markov_head."),
+        ("logit_head.confidence_head.", "confidence_head."),
+    )
+    for key in list(state_dict):
+        if not key.startswith(prefix):
+            continue
+        local_key = key[len(prefix) :]
+        for checkpoint_prefix, model_prefix in checkpoint_prefixes:
+            if not local_key.startswith(checkpoint_prefix):
+                continue
+            normalized_key = prefix + model_prefix + local_key[len(checkpoint_prefix) :]
+            if normalized_key not in state_dict:
+                state_dict[normalized_key] = state_dict[key]
+            state_dict.pop(key)
+            break
 
 
 @register_draft
@@ -244,6 +283,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
         self._init_draft_head(config, dflash_config)
+        self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:

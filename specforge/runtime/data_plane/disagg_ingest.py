@@ -9,8 +9,7 @@
 """Disaggregated offline producer: ingest features into a shared FeatureStore.
 
 This is the *producer* half of an offline disaggregated run. It reads SpecForge
-offline EAGLE3 feature files (the ``.ckpt`` produced by
-``scripts/prepare_hidden_states.py``) and ``put()``s each one into a
+offline feature files (``.ckpt`` / ``.ckpt.gz``) and ``put()``s each one into a
 :class:`SharedDirFeatureStore` that lives on a filesystem both pools share. The
 tensors land in the store (shared mount); the returned ``SampleRef``s are
 tensor-free metadata, which is all the consumer (trainer) needs to fetch them.
@@ -29,10 +28,7 @@ from typing import List, Optional
 
 from specforge.runtime.contracts import SCHEMA_VERSION, SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.feature_store import FeatureStore, load_feature_file
-from specforge.runtime.data_plane.offline_reader import (
-    _OFFLINE_EAGLE3_KEYS,
-    list_feature_files,
-)
+from specforge.runtime.data_plane.offline_reader import list_feature_files
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
 
 
@@ -40,6 +36,7 @@ def ingest_offline_features(
     store: FeatureStore,
     hidden_states_path: str,
     *,
+    strategy: str = "eagle3",
     run_id: str = "disagg",
     ttt_length: int = 7,
     max_len: int = 2048,
@@ -47,31 +44,46 @@ def ingest_offline_features(
 ) -> List[SampleRef]:
     """Load offline ``.ckpt`` features and ``put()`` them into ``store``.
 
-    Returns the ``disagg://`` ``SampleRef``s, in the same deterministic file
-    order as ``OfflineManifestReader``. The raw EAGLE3 keys
-    (``input_ids``/``loss_mask``/``hidden_state``/``aux_hidden_state``) are stored
-    verbatim — the consumer applies ``process_offline_eagle3_sample`` at load
-    time, so colocated and disaggregated offline runs see byte-identical tensors.
+    The strategy registry owns the raw feature contract. EAGLE3 stores its
+    final/auxiliary target states, while DFlash and Domino store their shared
+    ``hidden_states`` capture.  Tensors are copied verbatim; the consumer uses
+    the same strategy transform as a colocated run, so both topologies receive
+    byte-identical normalized batches.
     """
+    from specforge.training.strategies.registry import resolve_strategy
+
+    spec = resolve_strategy(strategy)
+    if spec.make_offline_reader is None:
+        raise NotImplementedError(
+            f"offline ingestion for strategy {strategy!r} is not wired; its "
+            "StrategySpec needs make_offline_reader"
+        )
+    reader = spec.make_offline_reader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+    )
+    feature_keys = tuple(reader.feature_keys)
     paths = list_feature_files(hidden_states_path)
     if limit is not None:
         paths = paths[:limit]
     refs: List[SampleRef] = []
     for index, path in enumerate(paths):
         raw = load_feature_file(path)
-        missing = [k for k in _OFFLINE_EAGLE3_KEYS if k not in raw]
+        missing = [key for key in feature_keys if key not in raw]
         if missing:
             raise KeyError(f"{path} missing required offline feature keys {missing}")
-        tensors = {k: raw[k] for k in _OFFLINE_EAGLE3_KEYS}
+        tensors = {key: raw[key] for key in feature_keys}
         input_ids = raw["input_ids"]
         ref = store.put(
             tensors,
             sample_id=f"{run_id}:{index:08d}",
             metadata={
                 "run_id": run_id,
-                "strategy": "eagle3",
-                "format": "offline_eagle3",
-                "target_repr": "hidden_state",
+                "strategy": strategy,
+                "format": f"offline_{strategy}",
+                "target_repr": reader.target_repr,
                 "ttt_length": ttt_length,
                 "max_len": max_len,
                 "num_tokens": int(input_ids.numel()),

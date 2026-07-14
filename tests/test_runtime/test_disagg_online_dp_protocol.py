@@ -42,12 +42,23 @@ class _PathOnlyChannel:
         self.path = path
 
 
+class _RetainingFeatureStore:
+    retain_on_release = True
+
+    def __init__(self) -> None:
+        self.aborted = []
+
+    def abort(self, sample_id, *, reason="aborted") -> None:
+        self.aborted.append((sample_id, reason))
+
+
 class _FakeRefDistributor:
     """Lifecycle probe used before any model/FSDP construction."""
 
     def __init__(self, *_args, **_kwargs) -> None:
         self.started = False
         self.stopped = False
+        self.kwargs = _kwargs
 
     @staticmethod
     def inbox_path(inbox_dir: str, dp_rank: int) -> str:
@@ -96,7 +107,7 @@ def _rank0_setup_error_worker(
 
         try:
             build_disagg_online_consumer(
-                feature_store=None,
+                feature_store=_RetainingFeatureStore(),
                 channel=_PathOnlyChannel(os.path.join(work_dir, "refs.jsonl")),
                 draft_model=None,
                 optimizer_factory=None,
@@ -321,7 +332,7 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
             mock.patch("specforge.launch._assemble_trainer", side_effect=assemble),
         ):
             trainer = build_disagg_online_consumer(
-                feature_store=object(),
+                feature_store=_RetainingFeatureStore(),
                 channel=channel,
                 draft_model=object(),
                 optimizer_factory=object(),

@@ -79,7 +79,9 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         # over one shared (here, fake-in-memory) Mooncake backend.
         backend = _FakeMooncakeStore()
         producer_store = MooncakeFeatureStore(store=backend, store_id="dol")
-        consumer_store = MooncakeFeatureStore(store=backend, store_id="dol")
+        consumer_store = MooncakeFeatureStore(
+            store=backend, store_id="dol", retain_on_release=True
+        )
         channel = StreamingRefChannel(os.path.join(workdir, "refs.jsonl"))
 
         # producer pool: rollout -> Mooncake (consume-once) -> channel
@@ -133,8 +135,8 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         self.assertFalse(os.path.exists(channel.path + ".consumer_failed"))
         self.assertIsNotNone(trainer.ref_distributor._thread)
         self.assertFalse(trainer.ref_distributor._thread.is_alive())
-        # Consume-once release occurs while materializing each ref, before the
-        # final yielded batch can return to the inbox-ack generator.
+        # Materialization only releases the read lease. The durable optimizer
+        # acknowledgement explicitly removes every feature at the boundary.
         self.assertEqual(backend._d, {})
 
 

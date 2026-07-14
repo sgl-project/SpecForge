@@ -43,6 +43,9 @@ class MetadataStore(abc.ABC):
     @abc.abstractmethod
     def committed_count(self) -> int: ...
 
+    @abc.abstractmethod
+    def all_committed_ids(self) -> List[str]: ...
+
     # -- durable ack transaction -------------------------------------------
     @abc.abstractmethod
     def record_train_ack(
@@ -89,6 +92,10 @@ class InMemoryMetadataStore(MetadataStore):
         with self._lock:
             return len(self._committed)
 
+    def all_committed_ids(self) -> List[str]:
+        with self._lock:
+            return list(self._committed)
+
     def record_train_ack(
         self,
         sample_ids: List[str],
@@ -131,6 +138,9 @@ class NoOpMetadataStore(MetadataStore):
 
     def committed_count(self) -> int:
         return 0
+
+    def all_committed_ids(self) -> List[str]:
+        return []
 
     def record_train_ack(
         self,
@@ -196,6 +206,15 @@ class SQLiteMetadataStore(MetadataStore):
     def committed_count(self) -> int:
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) FROM committed").fetchone()[0]
+
+    def all_committed_ids(self) -> List[str]:
+        with self._lock:
+            return [
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT sample_id FROM committed ORDER BY rowid"
+                ).fetchall()
+            ]
 
     def record_train_ack(
         self,

@@ -19,9 +19,9 @@ the reference source and feature-store backend change.
 | Mode | Producer side | Consumer reference source | Feature store | Iteration contract |
 | --- | --- | --- | --- | --- |
 | Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
-| Disaggregated offline | `run_offline.sh producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; epochs and checkpoint resume are supported; consumer is single-rank |
-| Colocated online | `RolloutWorker` captures on demand | `LocalRolloutStream` | Private `LocalFeatureStore` | Consume once; no online resume or second pass over produced refs |
-| Disaggregated online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; no online resume or second pass over produced refs |
+| Disaggregated offline | `run_offline.sh producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
+| Colocated online | `RolloutWorker` captures on demand | `LocalRolloutStream` | Private `LocalFeatureStore` | Consume once; deterministic resume rebuilds the untrained prompt suffix; no second pass over produced refs |
+| Disaggregated online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
 
 `training.num_epochs` on an online run controls how many prompt passes the
 producer creates. Each pass receives new task and sample ids. The consumer
@@ -113,9 +113,11 @@ terminal, their feature-store objects are aborted best-effort, the source
 counter is settled, and failure sentinels poison every inbox. A partial global
 optimizer step is never reported as successful completion.
 
-Every online attempt requires fresh source-channel, inbox, store-id, run-id,
-output, and SQLite paths. Online resume is unsupported; restarting means
-starting a new attempt.
+Every online producer requires fresh source-channel, store-id, and run-id
+artifacts. A fresh consumer requires a fresh SQLite ledger and rank 0 recreates
+its inboxes. Consumer-only recovery may instead reuse the retained ledger,
+channel/inboxes, Mooncake objects, and an exactly matching checkpoint; it
+reconciles the unacknowledged suffix but never restarts the producer.
 
 ## Other topology flows
 

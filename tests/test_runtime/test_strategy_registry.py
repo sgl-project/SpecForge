@@ -12,6 +12,8 @@ These lock the composition contract introduced by the launch refactor:
 No GPU / model environment required.
 """
 
+import os
+import tempfile
 import unittest
 
 import torch
@@ -39,14 +41,14 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIn("domino", available_strategies())
         self.assertIn("dspark", available_strategies())
 
-    def test_dflash_online_is_fully_wired(self):
+    def test_dflash_offline_and_online_are_fully_wired(self):
         spec = resolve_strategy("dflash")
         self.assertEqual(
             spec.required_features, frozenset(DFlashTrainStrategy.required_features)
         )
-        self.assertIsNone(spec.make_offline_reader)
-        self.assertIsNone(spec.make_offline_transform)
-        self.assertIsNone(spec.make_offline_collate)
+        self.assertIsNotNone(spec.make_offline_reader)
+        self.assertIsNotNone(spec.make_offline_transform)
+        self.assertIsNotNone(spec.make_offline_collate)
         self.assertIsNotNone(spec.feature_schema)
         self.assertIs(spec.feature_schema, DFLASH_FEATURE_SCHEMA)
         self.assertIsNone(spec.feature_schema.target_feature)  # no target distribution
@@ -61,14 +63,14 @@ class TestStrategyRegistry(unittest.TestCase):
             spec.make_strategy(_M(), target_head=None), DFlashTrainStrategy
         )
 
-    def test_dflash_family_uses_dflash_feature_schema(self):
+    def test_dflash_family_uses_one_feature_contract_offline_and_online(self):
         for name in ("dflash", "domino"):
             with self.subTest(strategy=name):
                 spec = resolve_strategy(name)
                 self.assertIs(spec.feature_schema, DFLASH_FEATURE_SCHEMA)
-                self.assertIsNone(spec.make_offline_reader)
-                self.assertIsNone(spec.make_offline_transform)
-                self.assertIsNone(spec.make_offline_collate)
+                self.assertIsNotNone(spec.make_offline_reader)
+                self.assertIsNotNone(spec.make_offline_transform)
+                self.assertIsNotNone(spec.make_offline_collate)
 
     def test_eagle3_uses_eagle3_feature_schema(self):
         self.assertIs(resolve_strategy("eagle3").feature_schema, EAGLE3_FEATURE_SCHEMA)
@@ -131,6 +133,82 @@ class TestStrategyRegistry(unittest.TestCase):
                 self.assertEqual(batch["loss_mask"][0].tolist(), [1, 1, 1, 0, 0])
                 self.assertEqual(batch["input_ids"][0].tolist(), [1, 2, 3, 0, 0])
                 self.assertTrue(torch.all(batch["hidden_states"][0, 3:] == 0))
+
+    def test_dflash_and_domino_offline_transform_preserves_capture_contract(self):
+        raw = {
+            "input_ids": torch.tensor([1, 2, 3, 4]),
+            "loss_mask": torch.tensor([1, 1, 1, 1]),
+            "hidden_states": torch.arange(24).reshape(1, 4, 6),
+        }
+        for name in ("dflash", "domino"):
+            with self.subTest(strategy=name):
+                transformed = resolve_strategy(name).make_offline_transform(3)(raw)
+                self.assertEqual(
+                    set(transformed), {"input_ids", "loss_mask", "hidden_states"}
+                )
+                self.assertEqual(transformed["input_ids"].shape, (1, 3))
+                self.assertEqual(transformed["loss_mask"].tolist(), [[1, 1, 1]])
+                self.assertEqual(transformed["hidden_states"].shape, (1, 3, 6))
+                self.assertTrue(
+                    torch.equal(
+                        transformed["hidden_states"], raw["hidden_states"][:, :3]
+                    )
+                )
+
+    def test_dflash_family_offline_reader_stamps_strategy_specific_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            torch.save(
+                {
+                    "input_ids": torch.tensor([1, 2, 3]),
+                    "loss_mask": torch.ones(3, dtype=torch.long),
+                    "hidden_states": torch.ones(1, 3, 4),
+                },
+                os.path.join(directory, "0000.ckpt"),
+            )
+            for name in ("dflash", "domino"):
+                with self.subTest(strategy=name):
+                    reader = resolve_strategy(name).make_offline_reader(
+                        directory,
+                        run_id=f"{name}-run",
+                        ttt_length=7,
+                        max_len=16,
+                    )
+                    refs = reader.read()
+                    self.assertEqual(len(refs), 1)
+                    self.assertEqual(refs[0].strategy, name)
+                    self.assertEqual(
+                        set(refs[0].feature_keys),
+                        {"input_ids", "loss_mask", "hidden_states"},
+                    )
+                    self.assertEqual(refs[0].metadata["format"], f"offline_{name}")
+                    self.assertIsNone(refs[0].metadata["target_repr"])
+
+    def test_disaggregated_ingest_uses_domino_offline_contract(self):
+        from specforge.runtime.data_plane import LocalFeatureStore
+        from specforge.runtime.data_plane.disagg_ingest import ingest_offline_features
+
+        with tempfile.TemporaryDirectory() as directory:
+            tensors = {
+                "input_ids": torch.tensor([1, 2, 3]),
+                "loss_mask": torch.ones(3, dtype=torch.long),
+                "hidden_states": torch.ones(1, 3, 4),
+            }
+            torch.save(tensors, os.path.join(directory, "0000.ckpt"))
+            store = LocalFeatureStore("offline-domino")
+            refs = ingest_offline_features(
+                store,
+                directory,
+                strategy="domino",
+                run_id="domino-run",
+            )
+            self.assertEqual(len(refs), 1)
+            self.assertEqual(refs[0].strategy, "domino")
+            self.assertEqual(refs[0].metadata["format"], "offline_domino")
+            loaded, handle = store.get(refs[0])
+            self.addCleanup(store.release, handle)
+            self.assertEqual(set(loaded), set(tensors))
+            for key, value in tensors.items():
+                self.assertTrue(torch.equal(loaded[key], value))
 
     def test_dspark_online_collate_pads_target_last_hidden(self):
         short = {

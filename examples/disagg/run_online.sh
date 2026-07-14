@@ -10,8 +10,10 @@ usage() {
         "  CONFIG DISAGG_REF_CHANNEL MOONCAKE_METADATA_SERVER" \
         "  MOONCAKE_MASTER_SERVER_ADDR MOONCAKE_LOCAL_HOSTNAME" \
         "Producer server URLs may come from the config or DISAGG_SERVER_URL(S)." \
-        "Consumer NPROC_PER_NODE defaults to 1." \
-        "  Every consumer requires a fresh DISAGG_DB."
+        "Consumer NPROC_PER_NODE and NNODES default to 1." \
+        "  For NNODES>1, also set NODE_RANK, MASTER_ADDR, and MASTER_PORT." \
+        "  Fresh consumer: use a new DISAGG_DB." \
+        "  Consumer restart: reuse DISAGG_DB and pass training.resume_from=..."
 }
 
 fail() {
@@ -62,15 +64,60 @@ case "$role" in
     consumer)
         database=${DISAGG_DB:-}
         nproc=${NPROC_PER_NODE:-1}
+        nnodes=${NNODES:-1}
+        resume=false
+        for override in "$@"; do
+            case "$override" in
+                training.resume_from=?*) resume=true ;;
+            esac
+        done
         [[ "$nproc" =~ ^[1-9][0-9]*$ ]] || {
             fail "NPROC_PER_NODE must be a positive integer, got: $nproc"
         }
+        [[ "$nnodes" =~ ^[1-9][0-9]*$ ]] || {
+            fail "NNODES must be a positive integer, got: $nnodes"
+        }
+        if ((nnodes == 1)); then
+            node_rank=${NODE_RANK:-0}
+            [[ "$node_rank" == "0" ]] || {
+                fail "NODE_RANK must be 0 when NNODES=1, got: $node_rank"
+            }
+            torchrun_args=(--standalone --nproc_per_node "$nproc")
+        else
+            node_rank=${NODE_RANK:-}
+            master_addr=${MASTER_ADDR:-}
+            master_port=${MASTER_PORT:-}
+            [[ "$node_rank" =~ ^[0-9]+$ ]] || {
+                fail "NODE_RANK must be a non-negative integer for NNODES>1"
+            }
+            ((node_rank < nnodes)) || {
+                fail "NODE_RANK must be smaller than NNODES, got: $node_rank"
+            }
+            require_value "$master_addr" MASTER_ADDR
+            [[ "$master_port" =~ ^[1-9][0-9]*$ ]] && \
+                ((master_port <= 65535)) || {
+                fail "MASTER_PORT must be an integer from 1 to 65535"
+            }
+            torchrun_args=(
+                --nnodes "$nnodes"
+                --node_rank "$node_rank"
+                --master_addr "$master_addr"
+                --master_port "$master_port"
+                --nproc_per_node "$nproc"
+            )
+        fi
         require_value "$database" DISAGG_DB
-        if [[ -e "$database" || -e "${database}-wal" || -e "${database}-shm" ]]; then
+        # In multi-node mode, only node 0 can safely check freshness: another
+        # node may start after global rank 0 has created the shared database.
+        if [[ "$resume" == false && "$node_rank" == "0" ]] && \
+            [[ -e "$database" || -e "${database}-wal" || -e "${database}-shm" ]]; then
             fail "DISAGG_DB must be a fresh attempt path: $database"
         fi
+        if [[ "$resume" == true && ! -e "$database" ]]; then
+            fail "consumer restart requires the retained DISAGG_DB: $database"
+        fi
         torchrun_bin=$(command -v torchrun) || fail "torchrun is not on PATH"
-        exec "$torchrun_bin" --standalone --nproc_per_node "$nproc" \
+        exec "$torchrun_bin" "${torchrun_args[@]}" \
             "$specforge_bin" train --config "$config" \
             "$@" "training.metadata_db_path=$database" \
             training.role=consumer

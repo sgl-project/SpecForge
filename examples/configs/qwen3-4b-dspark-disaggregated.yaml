@@ -20,5 +20,7 @@ training:
   max_grad_norm: 1.0
   num_anchors: 512
   save_interval: 1000
+  dist_timeout: 30
+  seed: 42
 run_id: qwen3-4b-dspark-disaggregated
 output_dir: outputs/qwen3-4b-dspark-disaggregated

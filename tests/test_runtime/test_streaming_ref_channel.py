@@ -99,6 +99,14 @@ class TestStreamingRefChannel(unittest.TestCase):
         self.assertEqual(producer.consumed_remote(), 4)
         self.assertEqual(producer.in_flight_remote(), 0)
 
+    def test_restart_seeds_consumed_counter_before_new_acks(self):
+        first = StreamingRefChannel(self.path)
+        first.mark_consumed(3)
+        restarted = StreamingRefChannel(self.path)
+        self.assertEqual(restarted.seed_consumed(), 3)
+        restarted.mark_consumed(2)
+        self.assertEqual(first.consumed_remote(), 5)
+
     def test_stream_idle_timeout_when_producer_silent(self):
         r = StreamingRefChannel(self.path)
         t = {"now": 0.0}
@@ -158,6 +166,27 @@ class TestStreamingRefChannel(unittest.TestCase):
         self.assertEqual(producer.consumer_quantum(), 32)
         with self.assertRaisesRegex(ValueError, "fresh reference channel"):
             consumer.publish_consumer_quantum(32)
+
+    def test_resume_accepts_only_the_existing_consumer_quantum(self):
+        consumer = StreamingRefChannel(self.path)
+        consumer.publish_consumer_quantum(8)
+        consumer.publish_consumer_quantum(8, allow_existing=True)
+        with self.assertRaisesRegex(ValueError, "changed across resume"):
+            consumer.publish_consumer_quantum(16, allow_existing=True)
+
+    def test_queue_get_does_not_advance_consumed_before_explicit_ack(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        queue = StreamingRefQueue(StreamingRefChannel(self.path), poll_s=0.0)
+
+        refs = queue.get(1)
+        self.assertEqual([ref.sample_id for ref in refs], ["s0"])
+        self.assertEqual(producer.consumed_remote(), 0)
+        self.assertEqual(queue.in_flight_ids(), ["s0"])
+
+        queue.ack_ids(["s0"])
+        self.assertEqual(producer.consumed_remote(), 1)
+        self.assertEqual(queue.in_flight_ids(), [])
 
 
 if __name__ == "__main__":
