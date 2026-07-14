@@ -71,6 +71,8 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
                 disagg_refs = ingest_offline_features(
                     shared_store,
                     feature_dir,
+                    algorithm_name=ALGORITHM.name,
+                    build_reader=ALGORITHM.providers.offline_for("text").build_reader,
                     run_id="parity",
                     ttt_length=3,
                     max_len=512,
