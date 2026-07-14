@@ -40,15 +40,17 @@ no method-specific Python training entry points.
 
 | Method | Description | Example config | Optimization |
 | --- | --- | --- | --- |
-| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online](./examples/configs/qwen3-8b-eagle3-online.yaml) / [Offline](./examples/configs/qwen3-8b-eagle3-offline.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
+| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online](./examples/configs/qwen3-8b-eagle3-online.yaml) / [Offline](./examples/configs/qwen3-8b-eagle3-offline.yaml) / [Disaggregated offline](./examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
 | **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online](./examples/configs/qwen3-8b-dflash-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-dflash-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
 | **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online](./examples/configs/qwen3-8b-domino-online.yaml) | — |
 | **DSpark** | Server-captured block-parallel drafting | [Disaggregated](./examples/configs/qwen3-4b-dspark-disaggregated.yaml) | — |
 | **P-EAGLE** | Parallel EAGLE training | [Online](./examples/configs/qwen3-8b-peagle-online.yaml) | — |
 
 See the [training guide](./docs/basic_usage/training.md) for the supported
-method/topology matrix. Unsupported combinations are rejected during config
-validation or run assembly instead of falling back to an older trainer.
+method/topology matrix and the
+[disaggregated guide](./docs/basic_usage/disaggregated_training.md) for the
+online/offline launch workflows. Unsupported combinations are rejected during
+config validation or run assembly instead of falling back to an older trainer.
 
 
 ## 🚀 Accelerate with SpecBundle
