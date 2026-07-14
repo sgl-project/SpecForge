@@ -72,6 +72,8 @@ class NPUDistributedTest(unittest.TestCase):
         accelerator.set_device.side_effect = lambda rank: events.append(("bind", rank))
         target_mesh = _Mesh("target")
         draft_mesh = _Mesh("draft")
+        set_seq_parallel_pg = mock.Mock()
+        process_group = SimpleNamespace(ULYSSES_PG="ulysses", RING_PG="ring")
 
         with (
             mock.patch.dict(os.environ, {"LOCAL_RANK": "3"}),
@@ -95,11 +97,11 @@ class NPUDistributedTest(unittest.TestCase):
                 "from_group",
                 side_effect=("tp-mesh", "dp-mesh"),
             ) as from_group,
-            mock.patch.object(sf_dist, "set_seq_parallel_pg"),
             mock.patch.object(
-                sf_dist.PROCESS_GROUP, "ULYSSES_PG", "ulysses", create=True
+                sf_dist,
+                "_load_yunchang_globals",
+                return_value=(process_group, set_seq_parallel_pg),
             ),
-            mock.patch.object(sf_dist.PROCESS_GROUP, "RING_PG", "ring", create=True),
         ):
             sf_dist.init_distributed(
                 timeout=7, tp_size=2, sp_ulysses_size=1, sp_ring_size=1
@@ -114,6 +116,7 @@ class NPUDistributedTest(unittest.TestCase):
             [call.kwargs["device_type"] for call in from_group.call_args_list],
             ["npu", "npu"],
         )
+        set_seq_parallel_pg.assert_called_once_with(1, 1, 3, 8)
 
 
 class DistributedTeardownTest(unittest.TestCase):

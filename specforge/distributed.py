@@ -4,7 +4,6 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
 from specforge.utils import get_device_type, print_with_rank
 
@@ -50,6 +49,14 @@ def _device_module(device_type: str):
             f"PyTorch does not expose the requested {device_type!r} device module"
         )
     return module
+
+
+def _load_yunchang_globals():
+    """Import sequence-parallel globals only inside trainer initialization."""
+
+    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+
+    return PROCESS_GROUP, set_seq_parallel_pg
 
 
 def _bind_local_device(device_type: str) -> int:
@@ -138,6 +145,11 @@ def init_distributed(
     # initialization; doing the same for NCCL also removes ambiguous rank/device
     # inference on heterogeneous hosts.
     local_rank = _bind_local_device(device_type)
+    # Yunchang probes the active CUDA device while importing. Keep it behind
+    # the trainer-only, device-bound initialization boundary so config loading
+    # and prompt preprocessing remain safe in CPU-only producer processes.
+    process_group, set_seq_parallel_pg = _load_yunchang_globals()
+
     dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
     print_with_rank(f"bind to {device_type} device {local_rank}")
 
@@ -167,8 +179,8 @@ def init_distributed(
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
 
-    sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
-    sp_ring_group = PROCESS_GROUP.RING_PG
+    sp_ulysses_group = process_group.ULYSSES_PG
+    sp_ring_group = process_group.RING_PG
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 

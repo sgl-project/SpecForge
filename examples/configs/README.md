@@ -27,10 +27,13 @@ supervises both roles on one trainer node or selects a split role with
 `--role`, and `*-npu.yaml` retains the HF + SDPA Ascend recipes.
 Qwen2.5-VL has both 7B and 32B online recipes and uses the same EAGLE3 trainer.
 
-The `qwen3-8b-domino-multiserver-disaggregated.yaml` and
+The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
+`qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
+`qwen3-8b-domino-multiserver-disaggregated.yaml`,
+`qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`, and
 `qwen3.6-27b-dflash-multiserver-disaggregated.yaml` recipes are opt-in local
-full-stack examples. Their typed `managed_local` blocks own Mooncake, two
-patched SGLang capture servers, and the trainer GPU allocation; the same
+full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
+two patched SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up each complete stack.
 Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
 for scheduler- or service-managed deployments.
@@ -94,6 +97,16 @@ control/data-plane state; capture producers always start a fresh attempt.
 
 Migration notes:
 
+- The former `run_qwen3_8b_dflash_disagg_1srv_dp7.sh` self-contained topology
+  is retained as `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`: one managed
+  capture server on GPU 0 and seven DFlash trainer ranks on GPUs 1–7.
+- The former `run_qwen3_8b_domino_disagg_1srv_dp7.sh` self-contained topology
+  is retained as `qwen3-8b-domino-1server-dp7-disaggregated.yaml`: one managed
+  capture server on GPU 0 and seven trainer ranks on GPUs 1–7.
+- The former `run_qwen3.6_27b_dflash_disagg.sh` one-server topology is retained
+  as `qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`: one managed capture
+  server on GPU 0 and two trainer ranks on GPUs 1–2. The external-service YAML
+  remains available for scheduler-managed deployments.
 - The latest pre-cleanup `run_qwen3_8b_domino_disagg_multiserver.sh` had been
   reduced to one SGLang server and one URL despite its historical name. The
   managed Qwen3-8B Domino recipe above restores a genuine two-server topology
@@ -103,8 +116,9 @@ Migration notes:
   `gpt-oss-120b-eagle3-online.yaml` points to the matching 120B config.
 - The former Qwen3-235B shell accidentally launched Qwen3-Next-80B; the two now
   have separate recipes.
-- Qwen3-Next online EAGLE3 retains its batch size of two; only P-EAGLE and the
-  current VLM recipes require batch size one.
+- Qwen3-Next online EAGLE3 retains its batch size of two. P-EAGLE requires
+  batch size one; the current VLM recipes keep batch size one as a conservative
+  default, while the unified VLM collator also supports larger padded batches.
 - The old Qwen3.5-35B offline shell had its training command commented out. The
   YAML records that intended offline trainer configuration after feature
   preparation.

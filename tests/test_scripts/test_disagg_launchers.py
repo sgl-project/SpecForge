@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
+OFFLINE_TWO_NODE = ROOT / "examples" / "disagg" / "run_offline_2node.sh"
 TWO_NODE = ROOT / "examples" / "disagg" / "run_qwen3_8b_dflash_disagg_2node.sh"
 
 
@@ -133,6 +134,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
         shared_root = self.root / "shared-attempt"
+        consumer_state = self.root / "node-local-consumer-state"
         base_env = self._env()
         base_env.update(
             {
@@ -140,6 +142,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 "HEAD_IP": "10.0.0.1",
                 "DISAGG_STORE_ID": "two-node-test",
                 "DISAGG_RUN_ROOT": str(shared_root),
+                "DISAGG_CONSUMER_STATE_DIR": str(consumer_state),
                 "DRY_RUN": "1",
             }
         )
@@ -164,9 +167,79 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("--role producer", outputs["0"])
         self.assertIn("specforge train", outputs["1"])
         self.assertIn("--role consumer", outputs["1"])
+        self.assertIn(
+            "deployment.disaggregated.consumer_state_dir=" + str(consumer_state),
+            outputs["1"],
+        )
+        self.assertNotIn(
+            "deployment.disaggregated.consumer_state_dir=" + str(shared_root),
+            outputs["1"],
+        )
         self.assertNotIn("run_disagg_dflash.py", "".join(outputs.values()))
         self.assertNotIn("torchrun", "".join(outputs.values()))
         self.assertFalse(shared_root.exists())
+
+    def test_offline_two_node_wrapper_dispatches_roles_to_the_unified_cli(self):
+        self.assertTrue(os.access(OFFLINE_TWO_NODE, os.X_OK))
+        syntax = subprocess.run(
+            ["bash", "-n", str(OFFLINE_TWO_NODE)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        for rank, role in (("0", "producer"), ("1", "consumer")):
+            with self.subTest(rank=rank):
+                env = self._env()
+                env.update({"RCLI_NODE_RANK": rank, "RCLI_NUM_NODES": "2"})
+                result = subprocess.run(
+                    [str(OFFLINE_TWO_NODE), "training.max_steps=1"],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.capture.read_text(encoding="utf-8").splitlines(),
+                    [
+                        "train",
+                        "--config",
+                        str(self.config),
+                        "--role",
+                        role,
+                        "training.max_steps=1",
+                    ],
+                )
+
+        source = OFFLINE_TWO_NODE.read_text(encoding="utf-8")
+        for token in ("torchrun", "MOONCAKE_", "DISAGG_DB", "DISAGG_MANIFEST"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, source)
+
+    def test_offline_two_node_wrapper_rejects_missing_or_invalid_rank(self):
+        for rank in ("", "2"):
+            with self.subTest(rank=rank or "missing"):
+                env = self._env()
+                env.update(
+                    {
+                        "RCLI_NODE_RANK": rank,
+                        "NODE_RANK": "",
+                        "RCLI_NUM_NODES": "2",
+                    }
+                )
+                result = subprocess.run(
+                    [str(OFFLINE_TWO_NODE)],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("must be 0 or 1", result.stderr)
 
 
 if __name__ == "__main__":

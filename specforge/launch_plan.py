@@ -19,7 +19,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
-from specforge.config import Config
+from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config
 
 LaunchRole = Literal["auto", "all", "producer", "consumer", "both"]
 PlanKind = Literal["worker", "command", "supervisor", "managed_supervisor"]
@@ -255,6 +255,7 @@ def _disaggregated_env(
         return {}
 
     control_dir = Path(deployment.control_dir)
+    consumer_state_dir = Path(deployment.consumer_state_dir or control_dir)
     values: dict[str, str] = {
         "DISAGG_BACKEND": deployment.backend,
         "DISAGG_STORE_ID": deployment.store_id or cfg.run_id,
@@ -268,8 +269,8 @@ def _disaggregated_env(
         values.update(
             {
                 "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
-                "DISAGG_DB": str(control_dir / "consumer.sqlite"),
-                "DISAGG_INBOX_DIR": str(control_dir / "inboxes"),
+                "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
+                "DISAGG_INBOX_DIR": str(consumer_state_dir / "inboxes"),
             }
         )
     else:
@@ -353,6 +354,9 @@ def _managed_local_services(cfg: Config) -> tuple[ServiceSpec, ...]:
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
     shared_env = _managed_local_environment(cfg)
+    capture_context_length = cfg.model.sglang_context_length or (
+        cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+    )
 
     mooncake_service = ServiceSpec(
         command=CommandSpec(
@@ -400,7 +404,7 @@ def _managed_local_services(cfg: Config) -> tuple[ServiceSpec, ...]:
                 "--tp-size",
                 str(server.tp_size),
                 "--context-length",
-                str(cfg.model.sglang_context_length or cfg.data.max_length),
+                str(capture_context_length),
                 "--mem-fraction-static",
                 str(server.mem_fraction_static),
                 "--chunked-prefill-size",

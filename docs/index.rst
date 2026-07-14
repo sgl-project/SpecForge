@@ -38,6 +38,7 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
    :caption: Benchmarks
 
    benchmarks/benchmark.md
+   benchmarks/eagle3-disaggregated-parity.md
    benchmarks/domino-disaggregated-performance.md
 
 .. toctree::

@@ -78,7 +78,9 @@ model:
 `model.target_backend` is also strategy- and topology-specific. Online
 disaggregation requires `sglang`. A `custom` backend is accepted only for
 EAGLE3 and P-EAGLE; DFlash-family strategies use `sglang` or `hf` where the
-selected topology supports them.
+selected topology supports them. For compatibility with the earlier VLM entry,
+`custom` plus `input_modality: qwen2_5_vl` is an observable alias for the
+effective `hf` target backend and emits a warning at assembly time.
 
 Large target models may use a tensor-parallel custom implementation under
 `specforge/modeling/target/custom_backend`. `training.tp_size` defines each

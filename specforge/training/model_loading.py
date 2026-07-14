@@ -98,7 +98,8 @@ def _looks_like_local_path(source: str) -> bool:
 
 def _draft_config_from_dict(payload: Dict[str, Any]) -> "PretrainedConfig":
     # Importing the draft package registers every built-in architecture before
-    # consulting the registry.
+    # consulting the registry. Model modules keep accelerator-only dependencies
+    # behind execution boundaries, so this remains safe in a CPU producer.
     import specforge.modeling.draft  # noqa: F401
     from specforge.modeling.draft.registry import DRAFT_REGISTRY, available_drafts
 

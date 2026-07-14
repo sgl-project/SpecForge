@@ -35,6 +35,7 @@ deployment:
     nproc_per_node: 4
   disaggregated:
     control_dir: outputs/qwen3-8b-dflash-disaggregated/control
+    consumer_state_dir: outputs/qwen3-8b-dflash-disaggregated/consumer-state
     backend: mooncake
     server_urls:
       - http://127.0.0.1:30000

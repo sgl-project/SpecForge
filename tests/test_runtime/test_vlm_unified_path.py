@@ -10,6 +10,7 @@ from unittest import mock
 
 import torch
 
+from specforge.config import Config
 from specforge.data.utils import DataCollatorWithPadding
 from specforge.data.vlm import QwenVLInputPreparer
 from specforge.inference.adapters.policy import (
@@ -177,6 +178,25 @@ class _TrainablePathVLMTarget:
 
 
 class UnifiedVLMPathTest(unittest.TestCase):
+    @staticmethod
+    def _config(*, target_backend="hf", batch_size=2, input_modality="qwen2_5_vl"):
+        return Config.model_validate(
+            {
+                "model": {
+                    "target_model_path": "target",
+                    "draft_model_config": "draft.json",
+                    "vocab_mapping_path": "/mapping.pt",
+                    "target_backend": target_backend,
+                    "input_modality": input_modality,
+                },
+                "data": {
+                    "train_data_path": "/train.jsonl",
+                    "chat_template": "qwen2-vl",
+                },
+                "training": {"batch_size": batch_size, "max_steps": 1},
+            }
+        )
+
     def _capture(self):
         return CaptureConfig.from_strategy(
             required_features=EAGLE3_VLM_FEATURE_SCHEMA.names,
@@ -217,7 +237,17 @@ class UnifiedVLMPathTest(unittest.TestCase):
             set(EAGLE3_VLM_FEATURE_SCHEMA.names),
         )
 
-    def test_collator_preserves_three_axis_mrope_layout(self):
+    def test_unified_assembly_selects_padding_only_for_vlm_online(self):
+        from specforge.training.assembly import _online_collate_override
+
+        self.assertIsInstance(
+            _online_collate_override(self._config()), DataCollatorWithPadding
+        )
+        self.assertIsNone(_online_collate_override(self._config(input_modality="text")))
+
+    def test_vlm_collator_pads_ragged_features_and_three_axis_mrope(self):
+        from specforge.training.assembly import _online_collate_override
+
         def sample(length, offset):
             return {
                 "input_ids": torch.arange(length).view(1, length),
@@ -231,10 +261,91 @@ class UnifiedVLMPathTest(unittest.TestCase):
                 ),
             }
 
-        batch = DataCollatorWithPadding()([sample(3, 0), sample(5, 10)])
+        collator = _online_collate_override(self._config())
+        batch = collator([sample(3, 0), sample(5, 10)])
+        self.assertEqual(batch["input_ids"].shape, (2, 5))
+        self.assertEqual(batch["attention_mask"].shape, (2, 5))
+        self.assertEqual(batch["loss_mask"].shape, (2, 5, 1))
+        self.assertEqual(batch["hidden_state"].shape, (2, 5, 12))
+        self.assertEqual(batch["target"].shape, (2, 5, 16))
         self.assertEqual(batch["position_ids"].shape, (3, 2, 5))
+        self.assertTrue(torch.equal(batch["input_ids"][0, 3:], torch.zeros(2)))
+        self.assertTrue(torch.equal(batch["attention_mask"][0, 3:], torch.zeros(2)))
+        self.assertTrue(torch.equal(batch["loss_mask"][0, 3:], torch.zeros(2, 1)))
         self.assertTrue(torch.equal(batch["position_ids"][:, 0, 3:], torch.zeros(3, 2)))
         self.assertEqual(int(batch["position_ids"][0, 1, 0]), 10)
+
+    def test_custom_vlm_target_uses_observable_hf_compatibility_backend(self):
+        from specforge.training.assembly import _build_target_engine
+        from specforge.training.strategies.registry import resolve_strategy
+
+        target = mock.Mock()
+        target.backend = "hf"
+        cfg = self._config(target_backend="custom")
+        with (
+            mock.patch(
+                "specforge.inference.target_engine.get_target_engine",
+                return_value=target,
+            ) as get_engine,
+            mock.patch("specforge.training.assembly._device", return_value="cpu"),
+            self.assertWarnsRegex(
+                UserWarning, "compatibility alias.*effective target backend 'hf'"
+            ),
+        ):
+            result = _build_target_engine(cfg, [1, 2, 3], resolve_strategy("eagle3"))
+
+        self.assertIs(result, target)
+        self.assertEqual(result.backend, "hf")
+        self.assertEqual(get_engine.call_args.kwargs["backend"], "hf")
+        self.assertEqual(get_engine.call_args.kwargs["input_modality"], "qwen2_5_vl")
+        target.set_capture_layers.assert_called_once_with([1, 2, 3])
+
+    def test_build_training_run_passes_vlm_padding_collator(self):
+        from specforge.training.assembly import ModelBundle, build_training_run
+
+        cfg = self._config(batch_size=2)
+        bundle = ModelBundle(
+            model=object(),
+            draft_model=object(),
+            tokenizer=object(),
+            processor=object(),
+            input_preparer=object(),
+            feature_schema=EAGLE3_VLM_FEATURE_SCHEMA,
+            target_engine=object(),
+            target_hidden_size=8,
+            target_vocab_size=16,
+            draft_vocab_size=16,
+            capture_layers=[1, 2, 3],
+            strategy_kwargs={},
+        )
+        prompts = [
+            {
+                "task_id": f"vlm-{index}",
+                "payload": {"input_ids": [index + 1], "loss_mask": [1]},
+            }
+            for index in range(2)
+        ]
+        trainer = object()
+        with (
+            mock.patch(
+                "specforge.training.assembly.build_model_bundle",
+                return_value=bundle,
+            ),
+            mock.patch(
+                "specforge.training.assembly._prepare_prompts",
+                return_value=prompts,
+            ),
+            mock.patch("specforge.training.assembly._device", return_value="cpu"),
+            mock.patch(
+                "specforge.launch.build_online_runtime", return_value=trainer
+            ) as build,
+        ):
+            run = build_training_run(cfg)
+
+        self.assertIs(run.trainer, trainer)
+        self.assertIsInstance(
+            build.call_args.kwargs["collate_fn"], DataCollatorWithPadding
+        )
 
     def test_raw_qwen_vl_loss_mask_and_media_survive_canonical_ingest(self):
         """Use the real preprocessor, prompt builder, and rollout preparer.
@@ -333,8 +444,8 @@ class UnifiedVLMPathTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(torch.cuda.is_available(), "VLM optimizer smoke needs CUDA")
-    def test_canonical_vlm_path_runs_mrope_loss_backward_and_optimizer_step(self):
-        """Exercise rollout -> FeatureStore -> FSDP -> M-RoPE draft training."""
+    def test_canonical_vlm_batch_two_runs_mrope_backward_and_optimizer_step(self):
+        """Exercise ragged VLM rollout -> padded batch -> M-RoPE training."""
 
         from specforge.core.eagle3 import OnlineEagle3Model
         from specforge.launch import build_online_runtime
@@ -343,7 +454,8 @@ class UnifiedVLMPathTest(unittest.TestCase):
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29583")
-        hidden_size, vocab_size, length = 32, 64, 8
+        hidden_size, vocab_size = 32, 64
+        lengths = (8, 6)
         with tempfile.TemporaryDirectory(prefix="vlm_train_step_") as directory:
             draft_config = {
                 **fx.TINY_DRAFT_CONFIG,
@@ -379,17 +491,23 @@ class UnifiedVLMPathTest(unittest.TestCase):
             ).cuda()
             target = _TrainablePathVLMTarget(hidden_size, vocab_size)
             losses = []
-            prompt = {
-                "payload": {
-                    "input_ids": list(range(1, length + 1)),
-                    "loss_mask": [0, 0, 0, 1, 1, 1, 1, 1],
-                    "media": {"image": "fixture.png", "conversations": []},
+            prompts = [
+                {
+                    "payload": {
+                        "input_ids": list(range(1, length + 1)),
+                        "loss_mask": [0, 0] + [1] * (length - 2),
+                        "media": {
+                            "image": f"fixture-{index}.png",
+                            "conversations": [],
+                        },
+                    }
                 }
-            }
+                for index, length in enumerate(lengths)
+            ]
             trainer = build_online_runtime(
                 strategy="eagle3",
                 target_model=target,
-                prompts=[prompt],
+                prompts=prompts,
                 draft_model=eagle,
                 optimizer_factory=lambda model: BF16Optimizer(
                     model,
@@ -405,10 +523,11 @@ class UnifiedVLMPathTest(unittest.TestCase):
                 draft_vocab_size=vocab_size,
                 target_repr="logits",
                 aux_hidden_state_layer_ids=(1, 2, 3),
-                batch_size=1,
+                batch_size=2,
                 max_steps=1,
                 feature_schema=EAGLE3_VLM_FEATURE_SCHEMA,
                 input_preparer=_VLMPreparer(),
+                collate_fn=DataCollatorWithPadding(),
                 logger=lambda metrics, _step: losses.append(metrics["loss"]),
                 log_interval=1,
             )

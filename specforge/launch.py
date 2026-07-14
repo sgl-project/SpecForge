@@ -421,6 +421,13 @@ def _resolve_metadata_store(
     if metadata_store is not None:
         return metadata_store
     if metadata_db_path is not None:
+        import os
+
+        # SQLite creates the database file but not its parent.  The typed
+        # consumer_state_dir is intentionally allowed to name a fresh
+        # node-local directory, so rank 0 must materialize it before opening
+        # the single authority ledger.
+        os.makedirs(os.path.dirname(os.path.abspath(metadata_db_path)), exist_ok=True)
         return SQLiteMetadataStore(metadata_db_path)
     return None
 

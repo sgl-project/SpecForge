@@ -206,14 +206,16 @@ assembly. In particular:
 - Qwen2.5-VL uses `model.input_modality: qwen2_5_vl` in a colocated online
   EAGLE3 run. Its raw records retain `image` and `conversations`; image tensors
   are materialized only inside rollout and are not stored in the control plane.
-  Each raw record currently supports one image and the documented recipes use
-  batch size one;
+  Each raw record currently supports one image. Ragged VLM samples are padded
+  by the unified online collator, including their three-axis M-RoPE position
+  IDs;
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, `fa`, or offline `usp`; P-EAGLE requires
   `flex_attention`; DFlash, Domino, and DSpark accept `eager`, `sdpa`, or
   `flex_attention`;
-- P-EAGLE requires `training.batch_size=1`; text EAGLE3 supports larger
-  batches, while the current Qwen2.5-VL recipes use batch size one;
+- P-EAGLE requires `training.batch_size=1`; text and Qwen2.5-VL EAGLE3 support
+  larger batches, while the checked-in VLM recipes retain their conservative
+  batch-size-one defaults;
 - DSpark requires disaggregated server capture;
 - offline feature training supports EAGLE3, DFlash, and Domino;
 - every online disaggregated run uses `model.target_backend=sglang` and sets

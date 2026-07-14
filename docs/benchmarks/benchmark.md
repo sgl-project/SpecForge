@@ -69,6 +69,10 @@ removed.
 
 ![Qwen2.5-0.5B EAGLE3 legacy, colocated, and disaggregated loss equivalence](../../examples/assets/qwen2.5-0.5b-eagle3-vs-main.png)
 
+The [Qwen2.5-7B EAGLE3 offline parity record](eagle3-disaggregated-parity.md)
+preserves the corresponding two-node metric comparison and its current
+rank-dispatch command.
+
 ### Qwen3.6-27B DFlash training curves
 
 The retained curves cover both the eight-H200 colocated run and the two-GPU

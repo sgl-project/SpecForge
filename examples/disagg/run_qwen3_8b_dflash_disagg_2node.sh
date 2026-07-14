@@ -16,6 +16,7 @@ NUM_NODES="${NUM_NODES:-${RCLI_NUM_NODES:-}}"
 HEAD_IP="${HEAD_IP:-${RCLI_HEAD_IP:-}}"
 RUN_ID="${DISAGG_STORE_ID:-}"
 RUN_ROOT="${DISAGG_RUN_ROOT:-}"
+CONSUMER_STATE_DIR="${DISAGG_CONSUMER_STATE_DIR:-${LOCAL_SCRATCH:-/tmp}/specforge/$RUN_ID/consumer-state}"
 CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/qwen3-8b-dflash-disaggregated.yaml}"
 
 SERVER_GPUS="${SERVER_GPUS:-0}"
@@ -113,6 +114,8 @@ validate_identity() {
         fail "set a unique DISAGG_STORE_ID using letters, digits, '.', '_' or '-'"
     [[ -n "$RUN_ROOT" && "$RUN_ROOT" != "/" ]] || \
         fail "set a non-root shared DISAGG_RUN_ROOT"
+    [[ -n "$CONSUMER_STATE_DIR" && "$CONSUMER_STATE_DIR" != "/" ]] || \
+        fail "set a non-root node-local DISAGG_CONSUMER_STATE_DIR"
     [[ -f "$CONFIG" ]] || fail "config does not exist: $CONFIG"
     [[ "$SERVER_TP" =~ ^[1-9][0-9]*$ ]] || fail "SERVER_TP must be positive"
     [[ "$TRAINER_NPROC" =~ ^[1-9][0-9]*$ ]] || \
@@ -140,6 +143,7 @@ COMMON_OVERRIDES=(
     "deployment.trainer.nnodes=1"
     "deployment.trainer.nproc_per_node=$TRAINER_NPROC"
     "deployment.disaggregated.control_dir=$RUN_ROOT/control"
+    "deployment.disaggregated.consumer_state_dir=$CONSUMER_STATE_DIR"
     "deployment.disaggregated.store_id=$RUN_ID"
     "deployment.disaggregated.server_urls=[\"http://$HEAD_IP:$SERVER_PORT\"]"
     "deployment.disaggregated.mooncake_metadata_server=http://$HEAD_IP:$MOONCAKE_HTTP_PORT/metadata"
@@ -298,6 +302,10 @@ run_training_node() {
     trap 'result=129; exit 129' HUP
     trap 'result=130; exit 130' INT
     trap 'result=143; exit 143' TERM
+
+    mkdir -p "$(dirname "$CONSUMER_STATE_DIR")"
+    mkdir "$CONSUMER_STATE_DIR" 2>/dev/null || \
+        fail "consumer state already exists; choose a fresh DISAGG_CONSUMER_STATE_DIR"
 
     setsid env CUDA_VISIBLE_DEVICES="$TRAINER_GPUS" \
         specforge train -c "$CONFIG" --role consumer \

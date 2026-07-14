@@ -44,6 +44,25 @@ settings. See the [disaggregated training guide](../basic_usage/disaggregated_tr
 for the distinction between multiple capture servers and multiple workers
 driving one server.
 
+## Self-contained one-server + DP7 topology
+
+The deleted self-contained shell's process topology is retained as a typed,
+managed-local recipe. One command owns Mooncake, a capture server on GPU 0, and
+seven trainer ranks on GPUs 1–7:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+```
+
+The recipe records batch size 2, accumulation 8, and capture-server memory
+fraction 0.5. It intentionally creates one producer worker for its one owned
+server. The 50.1 samples/s result above used eight workers against one external
+server, so use the repeated-URL command in **Best measured settings** when
+reproducing that exact historical peak. `CLONE_ON_FETCH=0`,
+`LOADER_PREFETCH=2`, and hardware-specific RDMA settings remain opt-in runtime
+environment controls.
+
 ## What each setting does
 
 | Setting | Effect | Mechanism |

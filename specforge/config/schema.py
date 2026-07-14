@@ -21,6 +21,11 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+# SGLang reserves one generated-token slot plus five internal slots, and its
+# request validator rejects ``input_len >= context_len - 6``.  Accepting a
+# prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
+SGLANG_CAPTURE_CONTEXT_HEADROOM = 7
+
 
 class StrictConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -337,8 +342,11 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     """Shared, non-secret topology for producer/consumer launch planning."""
 
     #: Attempt-scoped shared directory. The launcher derives refs, manifest,
-    #: SQLite, and per-rank inbox paths beneath it.
+    #: and lifecycle markers beneath it.
     control_dir: str
+    #: Optional node-local root for online consumer SQLite/WAL and rank inboxes.
+    #: When omitted, the historical control_dir-derived paths remain in use.
+    consumer_state_dir: Optional[str] = None
     backend: Literal["shared_dir", "mooncake"]
     store_root: Optional[str] = None
     store_id: Optional[str] = None
@@ -363,6 +371,14 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
+        if self.consumer_state_dir is not None and (
+            not self.consumer_state_dir
+            or self.consumer_state_dir.strip() != self.consumer_state_dir
+        ):
+            raise ValueError(
+                "deployment.disaggregated.consumer_state_dir must be non-empty "
+                "and must not contain surrounding whitespace"
+            )
         if self.backend == "shared_dir" and not self.store_root:
             raise ValueError(
                 "deployment.disaggregated.store_root is required for shared_dir"
@@ -762,6 +778,27 @@ class Config(StrictConfigModel):
             if self.deployment.disaggregated is not None
             else None
         )
+        consumer_state_dir = (
+            self.deployment.disaggregated.consumer_state_dir
+            if self.deployment.disaggregated is not None
+            else None
+        )
+        if consumer_state_dir is not None:
+            if mode != "online" or deployment != "disaggregated":
+                raise ValueError(
+                    "deployment.disaggregated.consumer_state_dir is valid only "
+                    "for online disaggregated training"
+                )
+            if self.deployment.trainer.nnodes != 1:
+                raise ValueError(
+                    "node-local consumer_state_dir currently requires "
+                    "deployment.trainer.nnodes=1"
+                )
+            if self.training.metadata_db_path is not None:
+                raise ValueError(
+                    "training.metadata_db_path conflicts with "
+                    "deployment.disaggregated.consumer_state_dir"
+                )
         if managed_local is not None:
             if mode != "online":
                 raise ValueError("managed_local supports online capture only")
@@ -773,6 +810,20 @@ class Config(StrictConfigModel):
                 )
             if self.training.resume_from is not None:
                 raise ValueError("managed_local does not support resume")
+            minimum_context_length = (
+                self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+            )
+            if (
+                self.model.sglang_context_length is not None
+                and self.model.sglang_context_length < minimum_context_length
+            ):
+                raise ValueError(
+                    "managed_local model.sglang_context_length must be at least "
+                    "data.max_length + "
+                    f"{SGLANG_CAPTURE_CONTEXT_HEADROOM} for SGLang capture "
+                    "request headroom "
+                    f"({minimum_context_length})"
+                )
             unsupported_dp_options = [
                 name
                 for name in (
@@ -835,15 +886,11 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "Qwen2.5-VL currently requires deployment_mode=local_colocated"
                 )
-            if self.model.target_backend == "custom":
-                raise ValueError("Qwen2.5-VL supports target_backend=sglang or hf")
             if self.data.prompts_path:
                 raise ValueError(
                     "Qwen2.5-VL requires raw data.train_data_path so image metadata "
                     "can be re-materialized during rollout"
                 )
-            if self.training.batch_size != 1:
-                raise ValueError("Qwen2.5-VL currently requires training.batch_size=1")
             if self.training.attention_backend == "usp":
                 raise ValueError("Qwen2.5-VL does not support USP attention")
         if shard_target_output:

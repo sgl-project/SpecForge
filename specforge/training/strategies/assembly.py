@@ -75,6 +75,12 @@ def _empty_strategy_kwargs(_cfg: Config) -> Dict[str, Any]:
     return {}
 
 
+def _empty_resume_contract(
+    _cfg: Config, _draft_model: Any, _model: Any
+) -> Dict[str, Any]:
+    return {}
+
+
 def _one_loss_token(_cfg: Config) -> int:
     return 1
 
@@ -103,6 +109,7 @@ class StrategyAssemblySpec:
     make_draft_model: Callable[[Any, Any], Any]
     make_model: Callable[[Any, Any, Any, Any, Any], StrategyModelParts]
     make_strategy_kwargs: Callable[[Any], Dict[str, Any]] = _empty_strategy_kwargs
+    resume_contract: Callable[[Any, Any, Any], Dict[str, Any]] = _empty_resume_contract
     min_loss_tokens: Callable[[Any], int] = _one_loss_token
     needs_input_tools: Callable[[Any, Any], bool] = _online_needs_input_tools
     resolve_capture_layers: Callable[[Any, Any, Any], Optional[List[int]]] = (
@@ -182,6 +189,21 @@ def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
     _warm_start(cfg, draft_model, draft_config)
     _load_vocab_mapping(cfg, draft_model)
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+
+
+def peagle_resume_contract(
+    _cfg: Config, draft_model: Any, model: Any
+) -> Dict[str, Any]:
+    """Persist the resolved P-EAGLE model and objective semantics."""
+
+    return {
+        "peagle_num_draft_layers": len(draft_model.layers),
+        "peagle_norm_before_residual": bool(draft_model.norm_before_residual),
+        "peagle_num_depths": int(model.num_depths),
+        "peagle_down_sample_ratio": float(model.down_sample_ratio),
+        "peagle_down_sample_ratio_min": float(model.down_sample_ratio_min),
+        "peagle_mask_token_id": int(model.mask_token_id),
+    }
 
 
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
@@ -482,6 +504,7 @@ __all__ = [
     "build_eagle3_draft",
     "build_eagle3_model",
     "build_peagle_draft",
+    "peagle_resume_contract",
     "build_peagle_model",
     "build_registered_draft",
     "dflash_min_loss_tokens",

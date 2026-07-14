@@ -49,6 +49,11 @@ EXPECTED_TRACKING = {
         "wandb_project": "qwen3-8b-dflash-disagg",
         "wandb_name": "qwen3-8b-dflash-disagg-dp4",
     },
+    "qwen3-8b-dflash-1server-dp7-disaggregated.yaml": {
+        "report_to": "none",
+        "wandb_project": "qwen3-8b-dflash-disagg",
+        "wandb_name": "qwen3-8b-dflash-1srv-dp7",
+    },
     "qwen3-8b-dflash-online.yaml": {
         "report_to": "wandb",
         "wandb_project": "specforge-qwen3-8b-dflash",
@@ -58,6 +63,11 @@ EXPECTED_TRACKING = {
         "report_to": "none",
         "wandb_project": "qwen3-8b-domino-disagg",
         "wandb_name": "qwen3-8b-domino-disagg-dp4",
+    },
+    "qwen3-8b-domino-1server-dp7-disaggregated.yaml": {
+        "report_to": "none",
+        "wandb_project": "qwen3-8b-domino-disagg",
+        "wandb_name": "qwen3-8b-domino-1srv-dp7",
     },
     "qwen3-8b-domino-multiserver-disaggregated.yaml": {
         "report_to": "none",
@@ -100,6 +110,11 @@ EXPECTED_TRACKING = {
         "wandb_project": "qwen36-dflash-disagg",
         "wandb_name": "qwen36-27b-dflash-server-capture-dp2",
     },
+    "qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml": {
+        "report_to": "none",
+        "wandb_project": "qwen36-dflash-disagg",
+        "wandb_name": "qwen36-27b-dflash-1srv-dp2",
+    },
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": {
         "report_to": "none",
         "wandb_project": "qwen36-dflash-disagg",
@@ -138,7 +153,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 54)
+        self.assertEqual(len(paths), 57)
 
         configs = {path.name: Config.from_file(str(path)) for path in paths}
 

@@ -391,7 +391,14 @@ class TestDisaggOnlineDPProtocol(unittest.TestCase):
 
 @unittest.skipUnless(dist is not None and dist.is_available(), "requires torch")
 class TestSingleRankConsumerLifecycle(unittest.TestCase):
-    def _build(self, work: str, *, assembly_error=None, feature_store=None):
+    def _build(
+        self,
+        work: str,
+        *,
+        assembly_error=None,
+        feature_store=None,
+        metadata_db_path=None,
+    ):
         from specforge.launch import build_disagg_online_consumer
         from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
         from specforge.runtime.data_plane.streaming_ref_channel import (
@@ -407,6 +414,11 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
             return SimpleNamespace()
 
         channel = StreamingRefChannel(os.path.join(work, "refs.jsonl"))
+        metadata_kwargs = (
+            {"metadata_db_path": metadata_db_path}
+            if metadata_db_path is not None
+            else {"metadata_store": InMemoryMetadataStore()}
+        )
         with (
             mock.patch.object(dist, "is_initialized", return_value=False),
             mock.patch(
@@ -422,10 +434,25 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
                 optimizer_factory=object(),
                 run_id="consumer-lifecycle",
                 output_dir=work,
-                metadata_store=InMemoryMetadataStore(),
                 inbox_dir=os.path.join(work, "inboxes"),
+                **metadata_kwargs,
             )
         return trainer, channel, captured
+
+    def test_fresh_metadata_db_parent_is_created_by_consumer_authority(self):
+        with tempfile.TemporaryDirectory(prefix="consumer_fresh_state_") as work:
+            state_dir = os.path.join(work, "node-local", "consumer-state")
+            metadata_db = os.path.join(state_dir, "consumer.sqlite")
+            self.assertFalse(os.path.exists(state_dir))
+
+            _trainer, _channel, captured = self._build(
+                work, metadata_db_path=metadata_db
+            )
+            store = captured["controller"].store
+            try:
+                self.assertTrue(os.path.isfile(metadata_db))
+            finally:
+                store.close()
 
     def test_direct_builder_success_signals_done_and_stops_distributor(self):
         with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_") as work:

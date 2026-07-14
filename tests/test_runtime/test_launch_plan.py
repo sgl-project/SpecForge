@@ -296,6 +296,69 @@ class LaunchPlanTest(unittest.TestCase):
             plan.commands[1].env["DISAGG_CLIENT_BUFFER_SIZE"], str(256 << 20)
         )
 
+    def test_consumer_state_dir_keeps_refs_shared_and_state_node_local(self):
+        raw = _config(mode="disaggregated", nproc=2).model_dump()
+        raw["deployment"]["disaggregated"][
+            "consumer_state_dir"
+        ] = "/local/attempt-state"
+        plan = build_launch_plan(
+            Config.model_validate(raw),
+            config_path="run.yaml",
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            env=MOONCAKE_ENV,
+        )
+
+        for command in plan.commands:
+            self.assertEqual(
+                command.env["DISAGG_REF_CHANNEL"],
+                "/shared/attempt-1/refs.jsonl",
+            )
+            self.assertEqual(
+                command.env["DISAGG_DB"],
+                "/local/attempt-state/consumer.sqlite",
+            )
+            self.assertEqual(
+                command.env["DISAGG_INBOX_DIR"],
+                "/local/attempt-state/inboxes",
+            )
+
+    def test_consumer_state_dir_rejects_unsupported_topologies(self):
+        cfg = _config(mode="disaggregated")
+        invalid_cases = {
+            "offline": (
+                lambda raw: raw.update(data={"hidden_states_path": "features"}),
+                "valid only for online disaggregated",
+            ),
+            "multi-node trainer": (
+                lambda raw: raw["deployment"]["trainer"].update(
+                    nnodes=2, master_addr="trainer-0"
+                ),
+                "requires deployment.trainer.nnodes=1",
+            ),
+            "explicit metadata db": (
+                lambda raw: raw["training"].update(
+                    metadata_db_path="/other/consumer.sqlite"
+                ),
+                "conflicts with",
+            ),
+            "surrounding whitespace": (
+                lambda raw: raw["deployment"]["disaggregated"].update(
+                    consumer_state_dir=" /local/attempt-state"
+                ),
+                "surrounding whitespace",
+            ),
+        }
+        for name, (mutate, message) in invalid_cases.items():
+            with self.subTest(case=name):
+                raw = cfg.model_dump()
+                raw["deployment"]["disaggregated"][
+                    "consumer_state_dir"
+                ] = "/local/attempt-state"
+                mutate(raw)
+                with self.assertRaisesRegex(ValidationError, message):
+                    Config.model_validate(raw)
+
     def test_disaggregated_roles_are_independently_selectable(self):
         producer = build_launch_plan(
             _config(mode="disaggregated", nproc=4),
@@ -429,6 +492,12 @@ class LaunchPlanTest(unittest.TestCase):
                 lambda raw: raw["model"].update(sglang_enable_dp_attention=True),
                 "do not support SGLang DP",
             ),
+            "capture context too short": (
+                lambda raw: raw["model"].update(
+                    sglang_context_length=raw["data"]["max_length"] + 6
+                ),
+                r"data.max_length \+ 7",
+            ),
         }
         for name, (mutate, message) in invalid_cases.items():
             with self.subTest(case=name):
@@ -436,6 +505,22 @@ class LaunchPlanTest(unittest.TestCase):
                 mutate(raw)
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
+
+    def test_managed_local_accepts_minimum_explicit_capture_context(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            raw = cfg.model_dump()
+            raw["data"]["max_length"] = 128
+            raw["model"]["sglang_context_length"] = 135
+            validated = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(validated, config_path="run.yaml", env={})
+
+        argv = plan.services[1].command.argv
+        self.assertEqual(argv[argv.index("--context-length") + 1], "135")
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
@@ -525,6 +610,7 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertIn(flag, argv)
             self.assertEqual(argv[argv.index("--max-running-requests") + 1], "64")
             self.assertEqual(argv[argv.index("--max-total-tokens") + 1], "8192")
+            self.assertEqual(argv[argv.index("--context-length") + 1], "2055")
         producer, consumer = plan.commands
         expected_urls = "http://127.0.0.1:30000,http://127.0.0.1:30001"
         self.assertEqual(producer.env["DISAGG_SERVER_URLS"], expected_urls)
@@ -558,6 +644,9 @@ class LaunchPlanTest(unittest.TestCase):
             ["", "0,1", "2,3"],
         )
         self.assertEqual(plan.commands[1].env["CUDA_VISIBLE_DEVICES"], "4,5")
+        for service in plan.services[1:]:
+            argv = service.command.argv
+            self.assertEqual(argv[argv.index("--context-length") + 1], "2055")
 
     def test_managed_local_plan_rejects_split_or_existing_runtime(self):
         with tempfile.TemporaryDirectory() as root:

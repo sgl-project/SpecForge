@@ -2,6 +2,7 @@
 """Typed run configuration (Pydantic) + loader for the ``specforge`` CLI."""
 
 from specforge.config.schema import (
+    SGLANG_CAPTURE_CONTEXT_HEADROOM,
     Config,
     DataConfig,
     DeploymentConfig,
@@ -32,6 +33,7 @@ __all__ = [
     "TrackingConfig",
     "ProfilingConfig",
     "RuntimeConfig",
+    "SGLANG_CAPTURE_CONTEXT_HEADROOM",
     "TrainerDeploymentConfig",
     "load_config",
     "apply_overrides",

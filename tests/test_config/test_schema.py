@@ -53,6 +53,13 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(cfg.model.input_modality, "qwen2_5_vl")
         self.assertEqual(cfg.mode, "online")
 
+        legacy_compatible = copy.deepcopy(payload)
+        legacy_compatible["model"]["target_backend"] = "custom"
+        legacy_compatible["training"] = {"batch_size": 2}
+        cfg = Config.model_validate(legacy_compatible)
+        self.assertEqual(cfg.model.target_backend, "custom")
+        self.assertEqual(cfg.training.batch_size, 2)
+
         invalid = copy.deepcopy(payload)
         invalid["data"] = {"hidden_states_path": "/features"}
         with self.assertRaisesRegex(ValidationError, "online target capture"):

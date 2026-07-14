@@ -3,6 +3,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -83,6 +85,34 @@ def _draft_payload(architecture: str, *, layers: int = 1, block_size=None):
 
 
 class DraftConfigResolutionTest(unittest.TestCase):
+    def test_config_resolution_does_not_initialize_cuda_model_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "draft.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(_draft_payload("DominoDraftModel", block_size=16), stream)
+            script = """
+import sys
+import torch
+import specforge.data.preprocessing
+import specforge.modeling.auto
+from specforge.training.model_loading import load_draft_config_source
+
+config = load_draft_config_source(sys.argv[1])
+assert config.architectures == ["DominoDraftModel"]
+assert config.block_size == 16
+assert "yunchang" not in sys.modules
+assert not torch.cuda.is_initialized()
+"""
+            env = dict(os.environ)
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            subprocess.run(
+                [sys.executable, "-c", script, path],
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
     def test_target_derived_defaults_match_legacy_trainers(self):
         cases = (
             ("eagle3", "LlamaForCausalLMEagle3", 1, None),

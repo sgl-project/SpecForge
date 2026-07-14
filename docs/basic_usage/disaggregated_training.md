@@ -14,10 +14,13 @@ The checked-in recipes are:
 | Workflow | Config |
 | --- | --- |
 | Online DFlash | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` |
+| Managed-local one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
 | Online Domino | `examples/configs/qwen3-8b-domino-disaggregated.yaml` |
+| Managed-local one-server + DP7 Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml` |
 | Managed-local two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
 | Online DSpark | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` |
 | Online Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-disaggregated.yaml` |
+| Managed-local one-server + DP2 Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
 | Managed-local two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
 | Offline EAGLE3 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` |
 | Offline Qwen2.5-7B EAGLE3 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` |
@@ -35,6 +38,7 @@ deployment:
     nproc_per_node: 4
   disaggregated:
     control_dir: outputs/qwen3-8b-dflash-disaggregated/control
+    consumer_state_dir: outputs/qwen3-8b-dflash-disaggregated/consumer-state
     backend: mooncake
     server_urls:
       - http://127.0.0.1:30000
@@ -49,10 +53,13 @@ flag to keep synchronized. The consumer world size is
 `nnodes * nproc_per_node`; it must satisfy the TP/USP topology in `training`.
 
 The control directory is attempt-scoped. The launcher deterministically derives
-the online reference channel, SQLite ledger, and inbox directory, or the
-offline manifest, beneath that root. A fresh attempt requires a fresh control
-directory. `store_id` defaults to `run_id` and can be set explicitly when the
-Mooncake deployment requires another namespace.
+the online reference channel and lifecycle markers, or the offline manifest,
+beneath that root. Online consumers may put their SQLite/WAL and rank inboxes
+under a separate `consumer_state_dir`; that path should be node-local and is
+currently supported only when `deployment.trainer.nnodes: 1`. A fresh attempt
+requires fresh control and consumer-state directories. `store_id` defaults to
+`run_id` and can be set explicitly when the Mooncake deployment requires
+another namespace.
 
 The launcher accepts the former `training.deployment_mode`, `training.role`,
 `training.server_urls`, and `training.metadata_db_path` fields for migration,
@@ -139,30 +146,49 @@ fresh online Mooncake run with automatic producer + consumer supervision; it is
 not a remote scheduler, resume path, existing-torchrun path, or replacement for
 explicit producer and consumer pools.
 
-The checked-in Qwen3-8B Domino recipe records two TP=1 capture servers on GPUs
-0–1 and a DP=2 trainer on GPUs 2–3. It directly replaces the discoverable
-multi-server behavior of the deleted legacy shell while retaining the unified
-training entry:
+The historical self-contained DFlash and Domino topologies each record one
+TP=1 capture server on GPU 0 and a DP=7 trainer on GPUs 1–7:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+
+specforge train -c \
+  examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+```
+
+The checked-in multi-server Qwen3-8B Domino recipe records two TP=1 capture
+servers on GPUs 0–1 and a DP=2 trainer on GPUs 2–3. It directly replaces the
+discoverable multi-server behavior of the deleted legacy shell while retaining
+the unified training entry:
 
 ```bash
 specforge train -c \
   examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml
 ```
 
-The larger Qwen3.6 DFlash recipe records two TP=2 capture servers on GPUs 0–3
-and a DP=2 trainer on GPUs 4–5:
+The Qwen3.6 DFlash one-server recipe owns a TP=1 server on GPU 0 and a DP=2
+trainer on GPUs 1–2. Its larger sibling records two TP=2 capture servers on
+GPUs 0–3 and a DP=2 trainer on GPUs 4–5:
 
 ```bash
+specforge train -c \
+  examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+
 specforge train -c \
   examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
 ```
 
 The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
-starts both capture servers and waits for every health endpoint, then starts the
-existing producer/consumer plan. A service or role failure terminates the owned
-stack; a clean producer exit leaves capture storage alive until the consumer
-finishes. Normal completion stops capture servers before Mooncake. Logs remain
-under the configured `control_dir/logs/`.
+starts every configured capture server and waits for every health endpoint,
+then starts the existing producer/consumer plan. A service or role failure
+terminates the owned stack; a clean producer exit leaves capture storage alive
+until the consumer finishes. Normal completion stops capture servers before
+Mooncake. Logs remain under the configured `control_dir/logs/`.
+
+Managed capture derives SGLang `--context-length` as `data.max_length + 7` to
+reserve the request headroom required by the capture endpoint. An explicit
+`model.sglang_context_length` must be at least that value.
 
 ## Split pools and multi-node consumers
 
@@ -175,6 +201,19 @@ specforge train -c run.yaml --role producer
 # Trainer pool
 specforge train -c run.yaml --role consumer
 ```
+
+For offline features split across two physical nodes, the generic wrapper maps
+the launcher-provided rank to those same two commands:
+
+```bash
+rcli exec --per-node <job> \
+  'CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+```
+
+`RCLI_NODE_RANK=0` selects the producer and rank 1 selects the consumer. The
+wrapper contains no trainer or transport setup; the shared `control_dir` and
+`store_root` remain in YAML and must resolve to the same fresh attempt storage
+on both nodes. `NODE_RANK`/`NUM_NODES` are accepted on other schedulers.
 
 For multiple consumer nodes, record the shared topology once:
 
@@ -224,7 +263,12 @@ process count still comes from the YAML. The wrapper coordinates only
 node-local services and shared lifecycle markers; it does not contain another
 trainer or construct `torchrun`. `NODE_RANK`/`NUM_NODES`/`HEAD_IP` may be used
 instead of the corresponding `RCLI_*` variables on another scheduler. Both
-nodes must see a fresh `DISAGG_RUN_ROOT`.
+nodes must see a fresh `DISAGG_RUN_ROOT`. References stay under its shared
+`control` directory, while the wrapper's lifecycle markers stay at the shared
+run root. SQLite/WAL and rank inboxes default to the trainer-local
+`/tmp/specforge/$DISAGG_STORE_ID/consumer-state`. Set
+`DISAGG_CONSUMER_STATE_DIR` or `LOCAL_SCRATCH` to select another node-local
+path. This split-state form currently supports one trainer node only.
 
 ## External and managed-local services
 

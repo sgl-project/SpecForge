@@ -8,7 +8,7 @@ already recorded in the YAML:
 specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
 ```
 
-The representative configs are below. The complete 54-recipe catalog,
+The representative configs are below. The complete 57-recipe catalog,
 including VLM, NPU, offline, and disaggregated variants, is in
 [`examples/configs/README.md`](./configs/README.md).
 
@@ -21,12 +21,15 @@ including VLM, NPU, offline, and disaggregated variants, is in
 | `examples/configs/qwen3-8b-dflash-online.yaml` | Online target capture | DFlash |
 | `examples/configs/qwen3-8b-dpace-online.yaml` | Online D-PACE objective | DFlash |
 | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` | Disaggregated server capture | DFlash |
+| `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | DFlash |
 | `examples/configs/qwen3-8b-domino-online.yaml` | Online target capture | Domino |
 | `examples/configs/qwen3-8b-domino-disaggregated.yaml` | Disaggregated server capture | Domino |
+| `examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | Domino |
 | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | Domino |
 | `examples/configs/qwen3-8b-peagle-online.yaml` | Online target capture | P-EAGLE |
 | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
 | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
+| `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
 | `examples/configs/qwen2.5-vl-7b-eagle3-online.yaml` | Online multimodal target capture | EAGLE3 |
 | `examples/configs/qwen2.5-vl-32b-eagle3-online.yaml` | Online multimodal target capture + target TP | EAGLE3 |
 | `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Ascend NPU online target capture | DFlash |
@@ -40,14 +43,18 @@ disaggregated EAGLE3 requires one explicit shared `model.vocab_mapping_path`.
 The Qwen2.5-VL 7B and 32B configs use the same `specforge train` entry and
 EAGLE3 strategy. Set `model.input_modality: qwen2_5_vl`; image pixels are
 prepared inside rollout and only M-RoPE position IDs are retained as training
-features. VLM supports colocated online capture with a batch size of one; the
-32B recipe uses target TP. Each raw VLM record currently carries one image.
+features. VLM supports padded multi-sample batches in colocated online capture;
+the checked-in recipes keep conservative batch-size-one defaults, and the 32B
+recipe uses target TP. Each raw VLM record currently carries one image.
 
 The same CLI owns target TP + target-DP, offline DP, and EAGLE3 offline USP.
 Online disaggregated consumers use every trainer rank for DP. The optional
 [`run_online.sh`](./disagg/run_online.sh) and
-[`run_offline.sh`](./disagg/run_offline.sh) scripts are thin delegates to
-`specforge train`; launch topology remains in YAML. The complete
+[`run_offline.sh`](./disagg/run_offline.sh) scripts are thin single-node
+delegates to `specforge train`. The
+[`run_offline_2node.sh`](./disagg/run_offline_2node.sh) wrapper only maps the
+cluster-provided node rank to the same CLI's producer or consumer role. Launch
+topology remains in YAML. The complete
 environment contract is in the [disaggregated training
 guide](../docs/basic_usage/disaggregated_training.md).
 

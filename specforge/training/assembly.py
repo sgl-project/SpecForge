@@ -163,11 +163,23 @@ def _load_online_inputs(cfg: Config):
 
 
 def _build_target_engine(cfg: Config, capture_layers, spec):
+    import warnings
+
     from specforge.inference.target_engine import get_target_engine
 
     engine_strategy = spec.assembly.capture_engine_strategy or spec.name
+    effective_backend = cfg.model.target_backend
+    if cfg.model.input_modality == "qwen2_5_vl" and effective_backend == "custom":
+        effective_backend = "hf"
+        warnings.warn(
+            "model.target_backend='custom' with input_modality='qwen2_5_vl' "
+            "is a compatibility alias for the Hugging Face VLM loader; using "
+            "effective target backend 'hf'",
+            UserWarning,
+            stacklevel=2,
+        )
     backend_kwargs = {}
-    if cfg.model.target_backend == "sglang":
+    if effective_backend == "sglang":
         target_batch_size = cfg.training.tp_size * cfg.training.batch_size
         backend_kwargs = {
             "attention_backend": cfg.model.sglang_attention_backend,
@@ -187,12 +199,12 @@ def _build_target_engine(cfg: Config, capture_layers, spec):
                 or target_batch_size * cfg.data.max_length
             ),
         }
-    elif cfg.model.target_backend == "hf":
+    elif effective_backend == "hf":
         backend_kwargs = {"input_modality": cfg.model.input_modality}
     target = get_target_engine(
         cfg.model.target_model_path,
         strategy=engine_strategy,
-        backend=cfg.model.target_backend,
+        backend=effective_backend,
         trust_remote_code=cfg.model.trust_remote_code,
         torch_dtype=_torch_dtype(cfg.model.torch_dtype),
         device=str(_device()),
@@ -209,19 +221,9 @@ def _strategy_kwargs(cfg: Config) -> Dict[str, Any]:
 
 def _strategy_resume_contract(cfg: Config, bundle: ModelBundle) -> Dict[str, Any]:
     """Return resolved strategy semantics that a checkpoint must preserve."""
-    if cfg.training.strategy != "peagle":
-        return {}
-
-    draft_model = bundle.draft_model
-    model = bundle.model
-    return {
-        "peagle_num_draft_layers": len(draft_model.layers),
-        "peagle_norm_before_residual": bool(draft_model.norm_before_residual),
-        "peagle_num_depths": int(model.num_depths),
-        "peagle_down_sample_ratio": float(model.down_sample_ratio),
-        "peagle_down_sample_ratio_min": float(model.down_sample_ratio_min),
-        "peagle_mask_token_id": int(model.mask_token_id),
-    }
+    return _strategy_spec(cfg).assembly.resume_contract(
+        cfg, bundle.draft_model, bundle.model
+    )
 
 
 def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> ModelBundle:
@@ -571,6 +573,15 @@ def _profiling_options(cfg: Config):
     )
 
 
+def _online_collate_override(cfg: Config):
+    """Return the modality-specific online collator override, if any."""
+    if cfg.model.input_modality != "qwen2_5_vl":
+        return None
+    from specforge.data.utils import DataCollatorWithPadding
+
+    return DataCollatorWithPadding()
+
+
 def _common_launch_kwargs(
     cfg: Config, bundle: ModelBundle, *, logger=_logger
 ) -> Dict[str, Any]:
@@ -780,6 +791,7 @@ def build_training_run(cfg: Config) -> TrainingRun:
             resume_state=resume_state,
             dataset_size=dataset_size,
             checkpoint_extra=checkpoint_extra,
+            collate_fn=_online_collate_override(cfg),
             **common,
         )
     except BaseException:
