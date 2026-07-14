@@ -18,17 +18,16 @@ upgrade can never silently change what is extracted.
 
 | # | Dependency | Where | Why it can break on upgrade |
 |---|---|---|---|
-| 1 | `CaptureHiddenMode.FULL` + `LogitsProcessorForEAGLE3` returning `aux_hidden_states` / `last_hidden_states` | `specforge/inference/target_engine/eagle3_target_model.py` `_extend`, `target_engine/sglang_backend/` | SGLang may rename the capture mode, change `logits_output` fields, or change aux-state layout |
-| 2 | `model.set_eagle3_layers_to_capture(layer_ids)` | `set_aux_hidden_states_layers` | Aux-layer registration API may move/rename |
+| 1 | `CaptureHiddenMode.FULL` + `LogitsProcessorForEAGLE3` returning `aux_hidden_states` / `last_hidden_states` | `target_engine/sglang_backend/` | SGLang may rename the capture mode, change `logits_output` fields, or change aux-state layout |
+| 2 | `model.set_eagle3_layers_to_capture(layer_ids)` | `SGLangTargetEngine.set_capture_layers` -> `SGLangCaptureBackend.set_eagle3_capture_layers` | Aux-layer registration API may move/rename |
 | 3 | `ScheduleBatch` / `ForwardBatch` / `ModelRunner` construction signature | `_extend` | New required ctor args on minor releases (e.g. `is_draft_worker`, `moe_dp_rank`) |
 | 4 | Per-request split of `aux_hidden_states` by `input_lens` | `_extend`, `_get_sharded_return` | Token packing / padding convention changes |
 | 5 | `wrap_eagle3_logits_processors_in_module(..., return_full_logits=False)` | `from_pretrained` | Logits-processor wrapping hook may change |
 
 `SGLangCaptureBackend` is the only in-process code that touches these SGLang
-internals. Everything downstream sees a `TargetEngine` capture result and the
-per-sample feature dictionaries normalized by
-[`adapters/eagle3.py`](adapters/eagle3.py) or
-[`adapters/dflash.py`](adapters/dflash.py).
+internals. Everything downstream sees a typed `TargetEngine.capture` result;
+the single [`PolicyFeatureAdapter`](adapters/policy.py) normalizes it into
+per-sample feature dictionaries according to the strategy schema.
 
 ## Supported version matrix
 
@@ -82,3 +81,8 @@ per request by the client (eagle3 / dflash / domino registered;
 `register_server_capture_schema` for new ones). It also answers the stock
 `model_runner.py` TODO ("expose this to server args?") — the aux-capture
 upstream proposal from the O1.3 spike (PR #641) is exactly this surface.
+
+This raw-buffer layout is also the only client-side Mooncake transport.
+`MooncakeFeatureStore` requires `put_from`/`get_into` at construction and fails
+fast when an installed client predates that API, so the server sink and trainer
+cannot silently select different wire formats.

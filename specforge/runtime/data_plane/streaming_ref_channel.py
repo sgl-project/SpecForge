@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Iterator, List, Optional, Set
+from typing import Iterator, List, Optional
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
@@ -50,6 +50,7 @@ _CONSUMED_SUFFIX = ".consumed_count"
 _FAILED_SUFFIX = ".failed"
 _CONSUMER_DONE_SUFFIX = ".consumer_done"
 _CONSUMER_FAILED_SUFFIX = ".consumer_failed"
+_CONSUMER_QUANTUM_SUFFIX = ".consumer_quantum"
 
 
 class StreamingRefChannel:
@@ -116,6 +117,43 @@ class StreamingRefChannel:
             self.path + _CONSUMER_FAILED_SUFFIX
         )
 
+    def publish_consumer_quantum(self, refs_per_optimizer_step: int) -> None:
+        """Claim and publish the consumer's global optimizer-step ref quantum.
+
+        Rank 0 calls this exactly once for a fresh attempt. The producer waits
+        for the value before capture so its in-flight watermark cannot deadlock
+        below the number of refs needed for one lockstep optimizer step.
+        """
+        quantum = int(refs_per_optimizer_step)
+        if quantum < 1:
+            raise ValueError(f"consumer quantum must be >= 1, got {quantum}")
+        path = self.path + _CONSUMER_QUANTUM_SUFFIX
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError as exc:
+            raise ValueError(
+                f"consumer quantum already exists for {self.path!r}; every online "
+                "attempt requires a fresh reference channel"
+            ) from exc
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(str(quantum))
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def consumer_quantum(self) -> Optional[int]:
+        """Return the consumer's global optimizer-step ref quantum, if ready."""
+        path = self.path + _CONSUMER_QUANTUM_SUFFIX
+        try:
+            with open(path, encoding="utf-8") as stream:
+                value = int(stream.read())
+        except FileNotFoundError:
+            return None
+        except ValueError as exc:
+            raise RuntimeError(f"invalid consumer quantum at {path}") from exc
+        if value < 1:
+            raise RuntimeError(f"invalid consumer quantum {value} at {path}")
+        return value
+
     def _write_sidecar(self, suffix: str, value: str) -> None:
         tmp = f"{self.path}{suffix}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as stream:
@@ -151,8 +189,6 @@ class StreamingRefChannel:
     def is_closed(self) -> bool:
         """True once the producer has dropped the EOF sentinel."""
         return os.path.exists(self.path + _CLOSED_SUFFIX)
-
-    _is_closed = is_closed  # backwards-compatible alias
 
     def poll(self, max_n: Optional[int] = None) -> List[SampleRef]:
         """Return refs appended since the last poll (complete lines only).
@@ -190,17 +226,6 @@ class StreamingRefChannel:
             f.write(str(self._consumed))
         os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
 
-    def seed_consumed(self) -> int:
-        """Adopt the sidecar's persisted count as this instance's baseline.
-
-        ``mark_consumed`` publishes this instance's cumulative in-memory count,
-        so a restarted consumer (fresh instance, ``_consumed=0``) would rewind
-        the sidecar and inflate the producer's ``in_flight_remote`` forever.
-        Call once on restart, before the first ``mark_consumed``.
-        """
-        self._consumed = self.consumed_remote()
-        return self._consumed
-
     def stream(
         self,
         *,
@@ -229,7 +254,7 @@ class StreamingRefChannel:
                 raise RuntimeError(
                     f"StreamingRefChannel {self.path}: producer failed: {failure}"
                 )
-            if self._is_closed():
+            if self.is_closed():
                 # one final drain after close, then stop
                 tail = self.poll()
                 for ref in tail:
@@ -256,13 +281,6 @@ class StreamingRefQueue:
     feature-store free already happened in the loader's materialize (get ->
     release) for a consume-once store.
 
-    ``skip_ids`` is the restart contract (O1.1): the channel JSONL is append-only
-    and a restarted consumer re-reads it from offset 0, so without a skip set it
-    would re-train every already-durably-acked sample. The launcher derives this
-    set from the shared durable :class:`MetadataStore` (the samples
-    ``reconcile_on_restart`` reports as released) and passes it here; matching refs
-    are dropped on read and counted as consumed so the producer's backpressure
-    signal (``in_flight_remote``) stays exact across the restart.
     """
 
     def __init__(
@@ -271,14 +289,12 @@ class StreamingRefQueue:
         *,
         poll_s: float = 0.1,
         idle_timeout_s: Optional[float] = None,
-        skip_ids: Optional[Set[str]] = None,
         clock=time.monotonic,
         sleep=time.sleep,
     ) -> None:
         self.channel = channel
         self.poll_s = poll_s
         self.idle_timeout_s = idle_timeout_s
-        self._skip_ids = set(skip_ids) if skip_ids else None
         self._clock = clock
         self._sleep = sleep
         self._buf: List[SampleRef] = []
@@ -287,45 +303,13 @@ class StreamingRefQueue:
         )
         self._last_wait_log = 0.0
 
-    def _poll(self) -> "tuple[List[SampleRef], int]":
-        """Poll the channel, dropping already-trained refs (restart skip).
-
-        Returns ``(fresh_refs, raw_count)``. ``raw_count`` is the number of refs
-        the channel actually yielded (skipped or not), so the caller can tell
-        "made progress" from "nothing new" even when every polled ref was skipped.
-        """
-        raw = self.channel.poll()
-        if not self._skip_ids or not raw:
-            return raw, len(raw)
-        fresh: List[SampleRef] = []
-        skipped = 0
-        for ref in raw:
-            if ref.sample_id in self._skip_ids:
-                self._skip_ids.discard(ref.sample_id)
-                skipped += 1
-            else:
-                fresh.append(ref)
-        if skipped:
-            # already durably trained on a prior run: count them consumed so the
-            # producer's in_flight_remote backpressure stays exact across restart.
-            self.channel.mark_consumed(skipped)
-            if not self._skip_ids:
-                # The restart skip-ids are the already-trained FRONT prefix, so once
-                # they are all drained drop back to the zero-overhead fast path
-                # instead of hashing every ref for the rest of a long online run.
-                self._skip_ids = None
-        return fresh, len(raw)
-
     def get(self, n: int, timeout_s: float = 0.0) -> List[SampleRef]:
         last_progress = self._clock()
         while len(self._buf) < n:
-            new, raw = self._poll()
-            if raw:
-                # progress on the channel (even if all refs were skipped): buffer
-                # what survived the skip filter and poll again before sleeping.
+            new = self.channel.poll()
+            if new:
                 last_progress = self._clock()
-                if new:
-                    self._buf.extend(new)
+                self._buf.extend(new)
                 continue
             failure = self.channel.failure()
             if failure is not None:
@@ -334,7 +318,7 @@ class StreamingRefQueue:
                     f"{failure}"
                 )
             if self.channel.is_closed():
-                drain, _ = self._poll()
+                drain = self.channel.poll()
                 self._buf.extend(drain)  # final drain
                 break
             if (

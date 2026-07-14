@@ -212,15 +212,12 @@ class FeatureDataLoader:
     def seek(self, num_batches: int) -> None:
         """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
 
-        Raises on a queue stream (no position to restore — online resume
-        reconciles via the control plane) and when the skip exceeds the available
-        batches (a silently empty epoch is banned).
+        Raises on a queue stream (which has no resumable position) and when the
+        skip exceeds the available batches (a silently empty epoch is banned).
         """
         if self._refs is None:
             raise ValueError(
-                "seek() applies to refs mode only; a queue stream is consume-once "
-                "(online resume goes through the control plane's skip_ids "
-                "reconciliation, not a loader seek)"
+                "seek() applies to refs mode only; a queue stream is consume-once"
             )
         skip = max(0, int(num_batches))
         if self.drop_last:
@@ -260,9 +257,12 @@ class FeatureDataLoader:
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
-                # fail-retryable so the incomplete trailing batch is not lost
-                self.queue.fail(refs, reason="drop_last", retryable=True)
-                return
+                reason = (
+                    "online stream ended with an incomplete batch: "
+                    f"received {len(refs)} refs but batch_size={self.batch_size}"
+                )
+                self.queue.fail(refs, reason=reason, retryable=False)
+                raise RuntimeError(reason)
             try:
                 batch = self._make_batch(refs)
             except Exception as exc:
@@ -305,8 +305,13 @@ class FeatureDataLoader:
                         buf.put(_EOS)
                         return
                     if self.drop_last and len(refs) < self.batch_size:
-                        self.queue.fail(refs, reason="drop_last", retryable=True)
-                        buf.put(_EOS)
+                        reason = (
+                            "online stream ended with an incomplete batch: "
+                            f"received {len(refs)} refs but "
+                            f"batch_size={self.batch_size}"
+                        )
+                        self.queue.fail(refs, reason=reason, retryable=False)
+                        buf.put(RuntimeError(reason))
                         return
                     try:
                         batch = self._make_batch(refs)

@@ -19,7 +19,6 @@ point:
 torchrun --standalone --nproc_per_node 8 \
   scripts/prepare_hidden_states.py \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-  --enable-aux-hidden-states \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/sharegpt-llama3-8b \
   --chat-template llama3 \

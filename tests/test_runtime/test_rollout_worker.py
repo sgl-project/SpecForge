@@ -30,7 +30,7 @@ def _capture(layer_ids=(1, 2, 3)):
 
 
 class FakeSource:
-    """Stand-in for SGLangAdapter: returns per-sample feature dicts."""
+    """Stand-in for a FeatureSource: returns per-sample feature dicts."""
 
     def __init__(self, seq=4, target_dim=32, aux_layers=3, bad_layers=False):
         self.seq = seq

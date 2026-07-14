@@ -43,6 +43,14 @@ def _inbox_ids(inbox_dir, rank):
     return [r.sample_id for r in reader.poll()]
 
 
+class _AbortStore:
+    def __init__(self):
+        self.aborted = []
+
+    def abort(self, sample_id, reason):
+        self.aborted.append((sample_id, reason))
+
+
 class TestRefDistributor(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="refdist_")
@@ -50,14 +58,22 @@ class TestRefDistributor(unittest.TestCase):
         self.inbox_dir = os.path.join(self.dir, "inboxes")
         self.producer = StreamingRefChannel(self.src_path)
         self.source = StreamingRefChannel(self.src_path)  # consumer-side view
+        self.feature_store = _AbortStore()
 
     def _distributor(self, dp_size=2, controller=None, **kwargs):
         controller = controller or DataFlowController("run0")
+        refs_per_rank_step = kwargs.pop("refs_per_rank_step", 1)
         return RefDistributor(
-            self.source, controller, self.inbox_dir, dp_size, **kwargs
+            self.source,
+            controller,
+            self.inbox_dir,
+            dp_size,
+            feature_store=self.feature_store,
+            refs_per_rank_step=refs_per_rank_step,
+            **kwargs,
         )
 
-    def test_round_robin_equal_counts_and_unaligned_tail_dropped(self):
+    def test_round_robin_equal_counts_and_unaligned_tail_fails(self):
         dist = self._distributor(dp_size=2)
         for i in range(7):
             self.producer.publish(_ref(f"s{i}"))
@@ -67,14 +83,14 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5"])
         self.assertFalse(dist.finished)
         self.producer.close()
-        _pump_until_quiet(dist)
-        self.assertTrue(dist.finished)
-        self.assertEqual(dist.stats["dropped"], 1)  # s6: replayed on restart
+        dist._run_guarded()
+        self.assertIsInstance(dist.error, RuntimeError)
+        self.assertEqual(dist.stats["dropped"], 1)
+        self.assertEqual([item[0] for item in self.feature_store.aborted], ["s6"])
         for rank in range(2):
-            reader = StreamingRefChannel(
-                RefDistributor.inbox_path(self.inbox_dir, rank)
-            )
-            self.assertTrue(reader.is_closed())
+            reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            with self.assertRaisesRegex(RuntimeError, "optimizer window"):
+                reader.is_closed()
 
     def test_inbox_readers_get_disjoint_shards_via_queue(self):
         dist = self._distributor(dp_size=2)
@@ -99,27 +115,23 @@ class TestRefDistributor(unittest.TestCase):
     def test_duplicate_publication_dispatched_once(self):
         dist = self._distributor(dp_size=1)
         self.producer.publish(_ref("s0"))
-        self.producer.publish(_ref("s0"))  # producer-restart republication
+        self.producer.publish(_ref("s0"))  # at-least-once duplicate
         self.producer.publish(_ref("s1"))
-        self.producer.close()
         _pump_until_quiet(dist)
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s1"])
         self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(self.producer.consumed_remote(), 1)
 
-    def test_skip_ids_never_dispatch_and_are_not_recounted(self):
-        # Released refs were already counted by the prior run's acks (the
-        # sidecar seed); the skip filter must not count them again.
-        prior = StreamingRefChannel(self.src_path)
-        prior.mark_consumed(2)  # run 1 counted s0, s1
-        dist = self._distributor(dp_size=2, skip_ids={"s0", "s1"})
-        for i in range(4):
-            self.producer.publish(_ref(f"s{i}"))
+        queue = StreamingRefQueue(
+            StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, 0))
+        )
+        refs = queue.get(2)
+        queue.ack(refs)
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 3)
+        self.assertEqual(self.producer.in_flight_remote(), 0)
         self.producer.close()
         _pump_until_quiet(dist)
-        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s2"])
-        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s3"])
-        self.assertEqual(dist.stats["skipped"], 2)
-        self.assertEqual(self.producer.consumed_remote(), 2)  # seed only, no double
 
     def test_inbox_acks_forward_to_source_counter(self):
         dist = self._distributor(dp_size=2)
@@ -136,23 +148,6 @@ class TestRefDistributor(unittest.TestCase):
         _pump_until_quiet(dist)
         self.assertEqual(self.producer.consumed_remote(), 4)
 
-    def test_consumed_counter_survives_restart(self):
-        # First consumer attempt marks 3 consumed, then dies.
-        first = StreamingRefChannel(self.src_path)
-        first.mark_consumed(3)
-        self.assertEqual(self.producer.consumed_remote(), 3)
-        # A restarted distributor must seed from the sidecar, not rewind it:
-        # one new inbox ack lands on top of the seed.
-        dist = self._distributor(dp_size=1)
-        self.producer.publish(_ref("s9"))
-        _pump_until_quiet(dist)
-        q = StreamingRefQueue(
-            StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, 0))
-        )
-        q.ack(q.get(1))
-        _pump_until_quiet(dist)
-        self.assertEqual(self.producer.consumed_remote(), 4)
-
     def test_stale_inbox_files_recreated_fresh(self):
         os.makedirs(self.inbox_dir, exist_ok=True)
         stale = RefDistributor.inbox_path(self.inbox_dir, 0)
@@ -165,46 +160,32 @@ class TestRefDistributor(unittest.TestCase):
         reader = StreamingRefChannel(stale)
         self.assertEqual([r.sample_id for r in reader.poll()], ["fresh"])
 
-    def test_resume_requeues_committed_unacked_and_skips_released(self):
-        db = os.path.join(self.dir, "run.db")
-        # Prior attempt: committed s0..s3; s0,s1 durably acked (released).
-        prior = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        prior.commit_samples("w0", [_ref(f"s{i}") for i in range(4)])
-        prior.ack_train_refs("t0", ["s0", "s1"], global_step=1, optimizer_durable=True)
-        prior.store.close()
-        # Restart: reconcile requeues committed-unacked (s2, s3) into the new
-        # controller's queue; released (s0, s1) become skip_ids.
-        controller = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        reconciled = controller.reconcile_on_restart()
-        self.assertEqual(sorted(reconciled["released"]), ["s0", "s1"])
-        self.assertEqual(sorted(reconciled["requeued"]), ["s2", "s3"])
-        dist = self._distributor(
-            dp_size=2, controller=controller, skip_ids=set(reconciled["released"])
-        )
-        # The channel replays everything from offset 0 (restart re-read).
-        for i in range(4):
-            self.producer.publish(_ref(f"s{i}"))
-        self.producer.close()
-        _pump_until_quiet(dist)
-        ids0, ids1 = _inbox_ids(self.inbox_dir, 0), _inbox_ids(self.inbox_dir, 1)
-        # exactly the unacked tail trains again, split evenly, no duplicates
-        self.assertEqual(sorted(ids0 + ids1), ["s2", "s3"])
-        self.assertEqual(len(ids0), len(ids1))
-        self.assertEqual(dist.stats["skipped"], 2)
-        controller.store.close()
-
-    def test_end_of_stream_partial_window_releases_leases(self):
+    def test_end_of_stream_partial_window_releases_leases_and_features(self):
         controller = DataFlowController("run0")
         dist = self._distributor(dp_size=2, controller=controller)
         for i in range(3):  # one full window + one leftover
             self.producer.publish(_ref(f"s{i}"))
         self.producer.close()
-        _pump_until_quiet(dist)
-        self.assertTrue(dist.finished)
+        dist._run_guarded()
+        self.assertIsInstance(dist.error, RuntimeError)
         self.assertEqual(dist.stats["dropped"], 1)
         # the dropped ref's lease is released, not leaked
         self.assertEqual(controller.sample_queue.in_flight(), 2)  # dispatched only
         self.assertEqual(controller.sample_queue.depth(), 0)
+        self.assertEqual([item[0] for item in self.feature_store.aborted], ["s2"])
+        self.assertEqual(self.producer.consumed_remote(), 1)
+
+    def test_dispatches_only_complete_optimizer_step_windows(self):
+        dist = self._distributor(dp_size=2, refs_per_rank_step=4)
+        for i in range(8):
+            self.producer.publish(_ref(f"s{i}"))
+        _pump_until_quiet(dist)
+        self.assertEqual(
+            _inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"]
+        )
+        self.assertEqual(
+            _inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"]
+        )
 
     def test_distributor_death_poisons_inboxes(self):
         clock = {"t": 0.0}

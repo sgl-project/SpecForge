@@ -92,12 +92,11 @@ class TestFeatureDataLoader(unittest.TestCase):
     def test_drop_last(self):
         with tempfile.TemporaryDirectory() as d:
             self._write_offline_files(d, n=3)
-            q = SampleRefQueue()
-            q.put(OfflineManifestReader(d, run_id="run").read())
+            refs = OfflineManifestReader(d, run_id="run").read()
             store = LocalFeatureStore("st")
             loader = FeatureDataLoader(
                 store,
-                q,
+                refs=refs,
                 batch_size=2,
                 collate_fn=_simple_collate,
                 per_sample_transform=_offline_eagle3_process_data,
@@ -105,6 +104,24 @@ class TestFeatureDataLoader(unittest.TestCase):
             )
             batches = list(loader)
             self.assertEqual(len(batches), 1)  # 3 samples, drop the trailing 1
+
+    def test_queue_partial_batch_fails_terminally(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=3)
+            q = SampleRefQueue()
+            q.put(OfflineManifestReader(d, run_id="run").read())
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                q,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=_offline_eagle3_process_data,
+                drop_last=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "incomplete batch"):
+                list(loader)
+            self.assertEqual(q.depth(), 0)
+            self.assertEqual(q.in_flight(), 0)
 
     def test_mixed_target_repr_fails_and_releases_refs(self):
         with tempfile.TemporaryDirectory() as d:

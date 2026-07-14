@@ -4,8 +4,8 @@
 These lock the composition contract introduced by the launch refactor:
   * the registry resolves eagle3 to a spec whose required_features match the
     strategy class, with its offline + online data paths wired;
-  * launch builders take a `strategy=` parameter (default "eagle3") and the old
-    eagle3-named builders are exact aliases of the strategy-neutral ones;
+  * launch builders take a ``strategy=`` parameter and do not expose
+    strategy-specific entry points;
   * a strategy whose data path is not wired raises an actionable
     NotImplementedError rather than silently assembling eagle3-shaped features.
 
@@ -16,7 +16,11 @@ import unittest
 
 import torch
 
-from specforge import launch
+import specforge.launch as launch
+from specforge.inference.adapters.policy import (
+    DFLASH_FEATURE_SCHEMA,
+    EAGLE3_FEATURE_SCHEMA,
+)
 from specforge.training.strategies.base import (
     DFlashTrainStrategy,
     DSparkTrainStrategy,
@@ -35,17 +39,16 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIn("domino", available_strategies())
         self.assertIn("dspark", available_strategies())
 
-    def test_dflash_fully_wired(self):
+    def test_dflash_online_is_fully_wired(self):
         spec = resolve_strategy("dflash")
         self.assertEqual(
             spec.required_features, frozenset(DFlashTrainStrategy.required_features)
         )
-        # offline (reader/transform/collate) + online (feature schema) both wired
-        self.assertIsNotNone(spec.make_offline_reader)
-        self.assertIsNotNone(spec.make_offline_transform)
-        self.assertIsNotNone(spec.make_offline_collate)
+        self.assertIsNone(spec.make_offline_reader)
+        self.assertIsNone(spec.make_offline_transform)
+        self.assertIsNone(spec.make_offline_collate)
         self.assertIsNotNone(spec.feature_schema)
-        self.assertIsNotNone(spec.make_adapter)
+        self.assertIs(spec.feature_schema, DFLASH_FEATURE_SCHEMA)
         self.assertIsNone(spec.feature_schema.target_feature)  # no target distribution
         self.assertTrue(spec.supports_online)
         # DFlash owns its own (frozen) head -> builders pass target_head=None
@@ -58,19 +61,19 @@ class TestStrategyRegistry(unittest.TestCase):
             spec.make_strategy(_M(), target_head=None), DFlashTrainStrategy
         )
 
-    def test_dflash_family_online_uses_dflash_adapter(self):
+    def test_dflash_family_uses_dflash_feature_schema(self):
         for name in ("dflash", "domino"):
             with self.subTest(strategy=name):
-                adapter = resolve_strategy(name).make_adapter(
-                    object(), device="cpu", t2d=None
+                spec = resolve_strategy(name)
+                self.assertIs(
+                    spec.feature_schema, DFLASH_FEATURE_SCHEMA
                 )
-                self.assertEqual(type(adapter).__name__, "DFlashAdapter")
+                self.assertIsNone(spec.make_offline_reader)
+                self.assertIsNone(spec.make_offline_transform)
+                self.assertIsNone(spec.make_offline_collate)
 
-    def test_eagle3_online_uses_eagle3_adapter(self):
-        adapter = resolve_strategy("eagle3").make_adapter(
-            object(), device="cpu", t2d=None
-        )
-        self.assertEqual(type(adapter).__name__, "SGLangAdapter")
+    def test_eagle3_uses_eagle3_feature_schema(self):
+        self.assertIs(resolve_strategy("eagle3").feature_schema, EAGLE3_FEATURE_SCHEMA)
 
     def test_dspark_is_server_capture_online_only(self):
         spec = resolve_strategy("dspark")
@@ -81,8 +84,19 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIsNone(spec.make_offline_reader)
         self.assertIsNone(spec.feature_schema)
         self.assertFalse(spec.uses_target_head)
-        with self.assertRaises(NotImplementedError):
-            spec.make_adapter(None)
+        with self.assertRaisesRegex(
+            NotImplementedError, "requires a server feature source"
+        ):
+            launch.build_online_runtime(
+                strategy="dspark",
+                target_model=None,
+                prompts=[],
+                draft_model=None,
+                optimizer_factory=None,
+                run_id="dspark-server-guard",
+                output_dir="unused",
+                target_hidden_size=8,
+            )
 
         class _M:
             draft_model = object()
@@ -161,21 +175,7 @@ class TestStrategyRegistry(unittest.TestCase):
         )
 
 
-class TestLaunchBackCompatAndGuards(unittest.TestCase):
-    def test_eagle3_named_builders_are_aliases_of_neutral_ones(self):
-        self.assertIs(launch.build_offline_eagle3_runtime, launch.build_offline_runtime)
-        self.assertIs(
-            launch.build_offline_eagle3_controller, launch.build_offline_runtime
-        )
-        self.assertIs(
-            launch.build_disagg_eagle3_runtime, launch.build_disagg_offline_runtime
-        )
-        self.assertIs(launch.build_online_eagle3_runtime, launch.build_online_runtime)
-        self.assertIs(
-            launch.build_disagg_online_eagle3_runtime,
-            launch.build_disagg_online_runtime,
-        )
-
+class TestLaunchGuards(unittest.TestCase):
     def test_offline_builder_rejects_unwired_strategy(self):
         # A strategy with no offline reader must fail fast and actionably, before
         # any model/controller is touched. Register a throwaway unwired spec so
@@ -198,7 +198,7 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
             launch.build_offline_runtime(
                 strategy="_unwired_offline_test",
                 hidden_states_path="unused",
-                eagle3_model=None,
+                draft_model=None,
                 target_head=None,
                 optimizer_factory=None,
                 run_id="r",
@@ -227,7 +227,7 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
                 strategy="_unwired_online_test",
                 target_model=None,
                 prompts=[],
-                eagle3_model=None,
+                draft_model=None,
                 optimizer_factory=None,
                 run_id="r-online",
                 output_dir="o",

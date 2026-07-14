@@ -57,8 +57,6 @@ fields are rejected. Attention backends are a closed, strategy-specific set:
 | P-EAGLE | `flex_attention` |
 | DFlash, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
 
-Ulysses/USP and arbitrary backend names are rejected.
-
 ## Target models
 
 For a Hugging Face-compatible target, normally only these model fields need to

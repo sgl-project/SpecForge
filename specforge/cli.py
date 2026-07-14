@@ -75,11 +75,7 @@ def _train(cfg: Config) -> int:
 
         return build_training_run(cfg).run()
     _bootstrap_single_process_env()
-    init_distributed(
-        tp_size=1,
-        sp_ulysses_size=1,
-        sp_ring_size=1,
-    )
+    init_distributed(tp_size=1)
     try:
         import torch.distributed as dist
 

@@ -7,9 +7,9 @@ from them) are aligned:
 
 * CPU, no model: the disagg store serves byte-identical tensors to the colocated
   ``LocalFeatureStore`` file:// path, and the ref manifest round-trips losslessly
-  (and carries no tensors). Since ``build_disagg_eagle3_runtime`` reuses the exact
+  (and carries no tensors). Since ``build_disagg_offline_runtime`` reuses the exact
   offline trainer assembly, identical tensors => identical training.
-* GPU: ``build_disagg_eagle3_runtime`` assembles + trains end to end through FSDP.
+* GPU: ``build_disagg_offline_runtime`` assembles + trains end to end through FSDP.
 """
 
 import os
@@ -140,7 +140,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge.launch import build_disagg_eagle3_runtime
+        from specforge.launch import build_disagg_offline_runtime
         from specforge.optimizer import BF16Optimizer
 
         TTT, ACC, MAX_OPT_STEPS, N = 3, 2, 2, 8
@@ -168,10 +168,11 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader = build_disagg_eagle3_runtime(
+        trainer, loader = build_disagg_offline_runtime(
+            strategy="eagle3",
             feature_store=store,
             refs=consumer_refs,
-            eagle3_model=eagle3_model,
+            draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
             run_id="e2e",

@@ -1,7 +1,7 @@
 # coding=utf-8
 """Launcher path: FSDP is in the forward path + global_step is optimizer steps.
 
-Exercises build_offline_eagle3_runtime end to end (single rank) with
+Exercises ``build_offline_runtime(strategy="eagle3")`` end to end with
 accumulation_steps=2, which the equivalence tests (wrap=False) do not cover:
 - the strategy must run forward through the FSDP-wrapped module (Issue 1);
 - fit's global_step counts OPTIMIZER steps, micro_step counts micro-batches (Issue 2).
@@ -28,7 +28,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge.launch import build_offline_eagle3_runtime
+        from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
 
         TTT, ACC, MAX_OPT_STEPS, N = 3, 2, 2, 8
@@ -45,9 +45,10 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader = build_offline_eagle3_runtime(
+        trainer, loader = build_offline_runtime(
+            strategy="eagle3",
             hidden_states_path=feat_dir,
-            eagle3_model=eagle3_model,
+            draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
             run_id="launch",

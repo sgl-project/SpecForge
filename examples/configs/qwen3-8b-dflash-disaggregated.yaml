@@ -3,7 +3,7 @@ model:
   draft_model_config: configs/qwen3-8b-dflash.json
   target_backend: sglang
 data:
-  train_data_path: cache/dataset/perfectblend_qwen3-8b_regen.jsonl
+  train_data_path: cache/dataset/sharegpt_train.jsonl
   max_length: 3072
   chat_template: qwen
   cache_dir: cache

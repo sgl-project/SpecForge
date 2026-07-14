@@ -36,7 +36,10 @@ def gather_id_union(ids: List[str]) -> List[str]:
     Identity when torch.distributed is absent/uninitialized/world=1. Dedup keeps
     first occurrence so SP-replicated shards (same ids on sp peers) collapse.
     """
-    import torch.distributed as dist
+    try:
+        import torch.distributed as dist
+    except ModuleNotFoundError:
+        return list(ids)
 
     if not (dist.is_available() and dist.is_initialized()):
         return list(ids)

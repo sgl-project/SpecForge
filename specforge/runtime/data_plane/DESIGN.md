@@ -1,245 +1,169 @@
-# Data Plane Design (PR 3/7 — `runtime/data_plane`)
+# Data plane design
 
-This is the design note for the **data plane**: the large-tensor storage and
-transfer boundary, plus the two metadata-only iteration sources that feed it and
-the loader that turns references into training batches.
+The data plane owns feature storage, cross-process reference transport, and the
+single bridge from `SampleRef` metadata to tensor-carrying `TrainBatch` objects.
+See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the complete topology.
 
-It is one slice of the DataFlow runtime. The current component boundaries are
-documented in [`runtime/ARCHITECTURE.md`](../ARCHITECTURE.md), while the shared
-records this layer exchanges are defined in
-[`runtime/contracts.py`](../contracts.py).
+## Invariants
 
-## The one load-bearing invariant
+- `SampleRef` transport is metadata-only; tensors never travel through the
+  controller, SQLite ledger, manifest, or JSONL channels.
+- `FeatureStore` is the only owner of captured feature tensors.
+- `FeatureDataLoader` resolves refs through a store, validates and collates the
+  result, and yields the only tensor-carrying runtime contract, `TrainBatch`.
+- Offline refs are fixed and re-iterable. Online refs are consume-once and are
+  never replayed for resume or a second consumer epoch.
 
-There are **two planes**, and they never mix:
-
-- **Control plane** moves only `SampleRef` — *metadata, never tensors*
-  (`assert_no_tensors` enforces this structurally).
-- **Data plane** (`FeatureStore`) is the *only* component that holds tensors.
-
-Everything below is a consequence of keeping those two separate.
-
-## Online vs offline: where they diverge, where they converge
+## Topology map
 
 ```mermaid
 flowchart TD
-    subgraph produce["① produce — online / offline diverge"]
-        direction LR
-        subgraph online["online (rollout)"]
-            direction TB
-            O1["rollout worker<br/><i>computes features on GPU</i>"]
-            O2["FeatureStore · mem://<br/><i>tensors in RAM, freed on release</i>"]
-            O3["SampleRefQueue<br/><i>ref stream, consume-once</i>"]
-            O1 --> O2 --> O3
-        end
-        subgraph offline["offline (precomputed)"]
-            direction TB
-            F1["prepare_hidden_states.py<br/><i>earlier job, writes to disk</i>"]
-            F2[".ckpt files on disk<br/><i>tensors already on disk</i>"]
-            F3["OfflineManifestReader<br/><i>scan → refs (file://)</i>"]
-            F1 --> F2 --> F3
-        end
-    end
+  subgraph CO[online colocated]
+    CR[RolloutWorker] --> CLS[LocalFeatureStore]
+    CR --> LRS[LocalRolloutStream]
+  end
 
-    SR["SampleRef<br/><i>metadata only · no tensors</i>"]
-    O3 -->|control flow| SR
-    F3 -->|control flow| SR
+  subgraph DO[offline disaggregated]
+    ING[offline ingest producer] --> DSTORE[SharedDir or Mooncake store]
+    ING --> MAN[static ref manifest]
+  end
 
-    SR --> DL["FeatureDataLoader<br/><i>get → clone → collate</i>"]
-    DL --> TB["TrainBatch<br/><i>the only tensor-carrying contract</i>"]
-    TB --> TR["Trainer<br/><i>draft model training</i>"]
+  subgraph DON[online disaggregated]
+    SGC[patched SGLang capture] --> MC[Mooncake store]
+    OP[producer] --> SRC[StreamingRefChannel]
+    SRC --> RD[RefDistributor rank 0]
+    RD --> I0[rank 0 InboxChannel]
+    RD --> IN[rank N InboxChannel]
+    I0 --> Q0[rank 0 StreamingRefQueue]
+    IN --> QN[rank N StreamingRefQueue]
+  end
 
-    O2 -.->|fetch tensors| DL
-    F2 -.->|fetch tensors| DL
-
-    classDef data fill:#E1F5EE,stroke:#0F6E56,color:#085041;
-    classDef control fill:#EEEDFE,stroke:#534AB7,color:#3C3489;
-    classDef compute fill:#F1EFE8,stroke:#5F5E5A,color:#444441;
-    class O2,F2,TB data;
-    class O3,F3,SR control;
-    class O1,F1,DL,TR compute;
+  OFF[local offline file refs] --> DL[FeatureDataLoader]
+  LRS --> DL
+  MAN --> DL
+  Q0 --> DL
+  QN --> DL
+  CLS -.-> DL
+  DSTORE -.-> DL
+  MC -.-> DL
+  DL --> TB[TrainBatch]
 ```
 
-Legend: teal = **data plane** (carries tensors) · purple = **control plane**
-(metadata only) · gray = compute. Solid = control flow · dashed = tensor fetch.
+The online-disaggregated path is always
+`RefDistributor -> per-rank InboxChannel -> StreamingRefQueue`, even when the
+consumer has one rank. A trainer never reads the producer's source channel
+directly.
 
-Read it in three bands:
+## Stores
 
-1. **Produce (diverge).** This is the *only* place the two modes differ — and
-   they differ on both planes at once:
-   - *Data plane:* online's `rollout_worker` computes tensors on the GPU and
-     `put()`s them into `FeatureStore` as `mem://` (RAM). Offline's tensors were
-     written to disk **earlier** by `prepare_hidden_states.py`; nobody re-writes
-     them — the reader just points at the existing `.ckpt` files.
-   - *Control plane:* online refs flow through `SampleRefQueue` (a consume-once
-     stream); offline refs are produced by `OfflineManifestReader` scanning files
-     (`file://`).
+### `FeatureStore` and `LocalFeatureStore`
 
-2. **Converge.** Both control-plane paths meet at `SampleRef` — a metadata-only
-   contract. From here down, **no code branches on online vs offline.**
+[`feature_store.py`](feature_store.py) defines storage lifecycle operations:
+`put`, `get`, `release`, `abort`, and `gc`. `LocalFeatureStore` supports
+in-memory `mem://` samples for colocated online capture and `file://` samples
+for colocated offline training.
 
-3. **Consume (shared).** `FeatureDataLoader → TrainBatch → Trainer` is one code
-   path for both modes.
+`get` returns tensors plus a lease handle. The loader clones when required and
+then releases the handle. Online in-memory samples are consume-once and free on
+their last current-generation release. Offline file refs never become a
+consume-once in-memory stream and remain available for later epochs.
 
-### The subtle part: control flow converges, tensors do not
+`abort` removes failed or abandoned samples. Optional resident-byte limits and
+`gc` bound leaks from stranded online objects.
 
-Notice the dashed arrows **bypass** `SampleRef` and go straight into the loader.
-Only the *control flow* (refs) actually merges. The *tensors* are fetched
-separately by the loader via `store.get(ref)`, which **re-routes by URI**:
+### Cross-process stores
 
-| ref URI    | source              | populates `_mem`? |
-|------------|---------------------|-------------------|
-| `mem://`   | `_mem` (RAM)        | yes (online only) |
-| `file://`  | disk file (mmap)    | no                |
+[`disaggregated.py`](disaggregated.py) provides the shared-directory backend
+used by offline examples. [`mooncake_store.py`](mooncake_store.py) provides the
+Mooncake backend used by online disaggregation and optionally by offline
+ingestion. Both implement the same `FeatureStore` contract, so the trainer and
+loader are transport-agnostic.
 
-So the loader and trainer share one API and one code path, but the physical data
-source stays split until the very last moment, behind `FeatureStore.get`.
+## Reference sources
 
-## Components
+### Offline fixed refs
 
-All four live in this folder; each carries no knowledge of the model.
+[`offline_reader.py`](offline_reader.py) points at precomputed local feature
+files. For disaggregation, [`disagg_ingest.py`](disagg_ingest.py) publishes
+existing feature tensors into the selected store and writes one immutable
+manifest. The consumer waits for the producer's completion sentinel and loads
+that fixed ref list.
 
-### `FeatureStore` / `LocalFeatureStore` — [`feature_store.py`](feature_store.py)
+Both paths feed `FeatureDataLoader` in refs mode. They support multiple epochs
+and an offline checkpoint can seek the next iteration to its saved sample
+position.
 
-The data plane's storage and transfer boundary. `FeatureStore` is the abstract
-contract; `LocalFeatureStore` is the only backend today (shared-memory and
-Mooncake/RDMA backends slot in behind the same API later).
+### Colocated online pull-through
 
-`LocalFeatureStore` serves both ref flavours transparently:
+[`local_rollout_stream.py`](local_rollout_stream.py) implements a bounded queue
+facade over the controller's private local queue. When the loader requests a
+batch, the stream runs only enough rollout work to fill it. This bounds local
+feature residency and keeps target inference on the training thread.
 
-- `mem://<store_id>/<sample_id>` — produced by `put()` (online rollout), held in
-  RAM on the hot path, with an opt-in disk/mmap `dump_dir` that doubles as the
-  capture/replay tap.
-- `file://<abs_path>` — produced by `OfflineManifestReader`; `get()` lazily loads
-  the named keys out of the existing file. No tensor copy, no `_mem` residency.
+### Online-disaggregated source channel
 
-Why RAM for the online hot path (not disk): online samples are computed fresh,
-consumed once, and require freshness — there is no reuse to amortize a disk
-round-trip, and disk bandwidth would bottleneck rollout. Offline samples are the
-opposite (computed once, reused every epoch), which is exactly why offline lives
-on disk.
+[`streaming_ref_channel.py`](streaming_ref_channel.py) is the append-only,
+filesystem-backed metadata channel between producer and consumer pools. It
+publishes explicit closed, producer-failed, consumer-done, and consumer-failed
+sidecars. Its consumed counter is the producer's remote backpressure signal.
 
-### `SampleRefQueue` — [`sample_ref_queue.py`](sample_ref_queue.py)
+The producer writes refs directly to this channel. It has no local training
+queue and no training ledger. Tensors are already in Mooncake and never enter
+the channel.
 
-A **metadata-only** queue with lease / ack / fail semantics (carries no
-tensors). In-process today, but the lease contract is present so a durable queue
-(visibility timeout, replay) can be swapped in without touching callers.
-`put` is idempotent on `sample_id` (at-least-once delivery); `fail(retryable=…)`
-either requeues or drops.
+### `RefDistributor`, inboxes, and `StreamingRefQueue`
 
-### `OfflineManifestReader` — [`offline_reader.py`](offline_reader.py)
+[`ref_distributor.py`](ref_distributor.py) runs once on consumer rank 0. It is
+the sole source-channel reader and the sole process that commits refs to the
+fresh durable ledger. It groups refs into
 
-Walks a directory of precomputed `.ckpt` files and emits one metadata-only
-`SampleRef` per file, referencing each file in place via a `file://` URI. It is
-the offline **ref producer** — it never `put()`s tensors. (Its online counterpart
-is `rollout_worker`, not the queue.)
-
-### `FeatureDataLoader` — [`feature_dataloader.py`](feature_dataloader.py)
-
-The bridge from `SampleRef` to `TrainBatch`, and the one place the online/offline
-difference is erased. Two iteration modes:
-
-- `queue` — online stream, consume-once, owns ack/fail of the queue.
-- `refs` — offline fixed set, re-iterable across epochs.
-
-For each ref it materializes (`store.get` → clone-on-fetch → `store.release`),
-applies an **injected** `per_sample_transform`, validates batch homogeneity,
-collates via an **injected** `collate_fn`, and emits a `TrainBatch`. Because
-transform and collate are injected, the loader carries no model knowledge and is
-unit-testable on CPU.
-
-What is explicitly **not** the loader's job: model semantics (injected), physical
-tensor free (the store's job — see below), and how samples are produced.
-
-## Lifecycle and memory semantics
-
-The store has five lifetime ops:
-
-| op          | who calls it                          | effect on `_mem`            |
-|-------------|---------------------------------------|-----------------------------|
-| `put`       | `rollout_worker` (online only)        | adds the sample             |
-| `get`       | `FeatureDataLoader`                   | none (hands out a lease)    |
-| `release`   | `FeatureDataLoader` after fetch       | frees on the last lease     |
-| `abort`     | `rollout_worker` / terminal drop      | evicts (frees the sample)   |
-| `gc`        | controller/orchestrator on a timer    | force-frees abandoned bytes |
-
-### Consume-once free (the design point worth remembering)
-
-`mem://` samples are **consume-once**. The store owns the tensors, and physical
-free is the *store's* responsibility — the consumer never needs to know the
-backend's memory policy. `release()` therefore frees the sample's tensors once
-the **last lease on the current generation** drops (reference-counted). `file://`
-samples never enter `_mem`, so release is a harmless no-op for them and offline
-ref sets stay re-iterable across epochs.
-
-Generation is a **global monotonic counter**: a re-`put` of the same `sample_id`
-always gets a strictly higher generation, so a stale handle released after the
-re-put is a safe no-op and can never alias freshly stored data. This is what lets
-`release()` drop the `_generation` entry too, bounding metadata growth.
-
-> **History / rationale.** An earlier version made `release()` free only the
-> *lease*, leaving tensors in `_mem` until `abort()`. But on the online success
-> path nothing calls `abort()` (it is only reached on a failed `put`), so a
-> `put → get → release` loop over unique `sample_id`s grew `_mem` without bound —
-> an OOM on long online runs. Offline was unaffected (it uses `file://`, never
-> `_mem`). The fix moves physical free into `release()` as above; see the
-> `test_release_*` and `test_online_put_get_release_loop_is_bounded` tests.
-
-### Backpressure guard
-
-`LocalFeatureStore(max_resident_bytes=…)` (opt-in, default unbounded) makes
-`put()` raise a descriptive `MemoryError` once residency would exceed the budget
-— a defined failure instead of a silent OOM when the consumer falls behind.
-Residency is observable via `health()`. The *controller* reads `health()` and
-pauses prompt leasing at a high watermark **before** this trips (see
-`control_plane/backpressure.py`); the cap is the backstop, not the primary
-mechanism.
-
-### GC and max-hold (M5)
-
-Backpressure only pauses *new* rollout — it cannot free bytes a slow trainer left
-*leased-then-stranded* or *committed-but-never-leased*. The store therefore needs
-an independent reclamation path. `gc()` (idempotent, safe on a timer) does two
-things:
-
-1. **Max-hold force-free.** `max_hold_age_s` (distinct from the *queue* lease
-   timeout) makes a sample eligible for force-free once it is older than the
-   bound **and** no active lease references it. A still-leased old sample is
-   spared — force-freeing it would be a use-after-free for the holder. This is
-   the "trainer lags for hours" backstop.
-2. **Release-pending reconciliation.** A backend whose physical free is
-   async/fallible (Mooncake later) parks the sample release-pending on
-   `release()`; `gc()` retries within a bounded window (`max_release_attempts`)
-   then force-frees, so a stuck cleanup never pins bytes forever. The local
-   backend frees synchronously, so this path is exercised by a fault-injecting
-   subclass in the tests.
-
-`abort()` drops a sample immediately (failed `put`, terminal-sample drop); it
-frees the tensors and all per-sample bookkeeping, which is what the leak gate
-relies on.
-
-**Deadlock-avoidance rule.** In the local-colocated profile the *primary* bound
-is rollout-pause backpressure + trainer-priority dispatch draining the backlog;
-`gc()` max-hold is the *backstop* that evicts the oldest abandoned (unleased)
-refs. A force-freed ref's later `get()` raises `KeyError`, which the loader turns
-into a sample failure the controller retries or marks terminal — the failure
-paths compose.
-
-## Tests
-
-CPU-only, in [`tests/test_runtime/`](../../../tests/test_runtime):
-
-- `test_feature_store.py` — atomic put, get/handle, idempotent + stale-safe
-  release, **consume-once free**, refcounted multi-lease, **bounded online
-  loop**, `max_resident_bytes`, abort, disk dump, `file://` mode. The
-  `TestFeatureStoreGC` class adds the M5 reclamation surface: **leak gate**
-  (`test_abort_returns_bytes_to_baseline`), **max-hold force-free** (sparing
-  leased samples), and **release-pending reconciliation** via `gc()`.
-- `test_sample_ref_queue.py` — lease / ack / fail / depth, idempotent put.
-- `test_feature_dataloader.py` — queue and refs modes, drop_last, batch
-  homogeneity validation, offline re-iteration across epochs.
-
-```bash
-# heavy model imports are stubbed on CPU; runs without a GPU or model download
-python -m unittest discover -s tests/test_runtime
+```text
+quantum = dp_size * batch_size * accumulation_steps
 ```
+
+and round-robins each complete quantum into one private `InboxChannel` per
+rank. Each rank receives exactly `batch_size * accumulation_steps` refs, enough
+for one lockstep optimizer step. The inbox is adapted to the loader's queue
+protocol by `StreamingRefQueue`.
+
+After the loader consumes a micro-batch, `StreamingRefQueue.ack` advances that
+inbox's consumed counter. The distributor sums rank counters and advances the
+source-channel counter; dispatch alone does not make a ref consumed. Durable
+optimizer ack is handled separately by `DPAckController`.
+
+Before producer capture, consumer rank 0 publishes `quantum` on the source
+channel. The producer's in-flight high watermark must be at least that value;
+`DISAGG_IN_FLIGHT_HIGH_WATERMARK` defaults to `256` in the canonical CLI.
+
+If source EOF arrives with fewer than one full quantum staged, the distributor
+fails those refs non-retryably, aborts their feature-store objects best-effort,
+settles the source counter, and poisons all inboxes with a failure sentinel.
+Ranks never train or silently drop a partial global optimizer window.
+
+## `FeatureDataLoader`
+
+[`feature_dataloader.py`](feature_dataloader.py) has two input modes:
+
+- `refs`: a fixed, re-iterable offline list;
+- `queue`: a consume-once online source (`LocalRolloutStream` or a rank's
+  `StreamingRefQueue`).
+
+For every ref it performs `store.get -> clone if needed -> store.release`, then
+applies the injected per-sample transform and collator. The loader contains no
+model-specific loss logic and no topology branch.
+
+Queue acknowledgement has two layers in online disaggregation. The loader
+acks the private inbox after materializing each micro-batch, which drives
+producer backpressure. At the optimizer boundary, `DPAckController` gathers all
+rank sample ids and rank 0 records one durable ledger transaction.
+
+## Attempt lifecycle
+
+Online control and tensor objects belong to one fresh attempt. The public
+launcher requires fresh channel and SQLite paths; rank 0 recreates ephemeral
+inboxes. Online resume and a second pass over consumed refs are unsupported.
+Producer/consumer failures are propagated explicitly, and the producer cleans
+published Mooncake objects when the attempt finishes.
+
+Offline manifests and feature objects are intentionally stable instead. They
+remain available for repeated epochs and checkpoint resume.

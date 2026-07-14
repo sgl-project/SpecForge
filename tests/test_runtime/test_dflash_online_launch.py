@@ -1,10 +1,9 @@
 # coding=utf-8
 """Launcher path (DFlash, online): build_online_runtime(strategy="dflash") end to end.
 
-Online analog of test_dflash_launch: interleaves a RolloutWorker with the new
-DFlashAdapter (HF DFlash target, no sglang) and FSDP training through the bounded
-mem:// stream. Proves the strategy-parameterized rollout assembler
-(spec.make_adapter + strategy tag) drives a non-eagle3 model. GPU-only.
+Interleaves a RolloutWorker with the policy adapter (HF DFlash target, no
+SGLang) and FSDP training through the bounded mem:// stream. Proves the strategy
+schema and tag drive a non-EAGLE3 model. GPU-only.
 """
 
 import os
@@ -27,7 +26,7 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         from specforge.launch import build_online_runtime
-        from specforge.modeling.target import get_target_engine
+        from specforge.inference.target_engine import get_target_engine
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import assert_no_tensors
 
@@ -79,14 +78,13 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
             strategy="dflash",
             target_model=target,
             prompts=prompts,
-            eagle3_model=dflash_model,  # legacy param name = the composite draft model
+            draft_model=dflash_model,
             optimizer_factory=optimizer_factory,
             run_id="dflash-online",
             output_dir=os.path.join(workdir, "out"),
             target_hidden_size=HIDDEN,  # benign for DFlash (no target distribution)
             batch_size=1,
             accumulation_steps=ACC,
-            num_epochs=1,
             max_steps=MAX_OPT_STEPS,
         )
 

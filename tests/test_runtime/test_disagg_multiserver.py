@@ -60,6 +60,7 @@ def _adapter(store, post_fn, url="http://server:30000"):
 
 
 def _build(adapters, prompts, store, channel, **kw):
+    channel.publish_consumer_quantum(kw.pop("consumer_quantum", 1))
     return build_disagg_online_producer(
         strategy="dflash",
         feature_source=adapters,
@@ -102,6 +103,7 @@ class TestMultiServerProducer(unittest.TestCase):
         produced = drive()
         self.assertEqual(produced, N)
         self.assertTrue(channel.is_closed())
+        self.assertEqual(workers[0].controller.sample_queue.depth(), 0)
 
         ids = _published_sample_ids(channel.path)
         self.assertEqual(len(ids), N)
@@ -121,6 +123,25 @@ class TestMultiServerProducer(unittest.TestCase):
             by_server.setdefault(r.metadata["server"], set()).add(r.sample_id)
         self.assertEqual(by_server.get("http://server0:30000"), seen0)
         self.assertEqual(by_server.get("http://server1:30001"), seen1)
+
+    def test_watermark_must_cover_one_consumer_optimizer_window(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(4),
+            store,
+            channel,
+            consumer_quantum=4,
+            in_flight_high_watermark=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "optimizer-step quantum 4"):
+            drive()
+        self.assertEqual(channel.published, 0)
+        self.assertIn("high watermark", channel.failure())
 
     def test_producer_profiling_handles_first_round_without_backpressure(self):
         backend = _FakeMooncakeStore()

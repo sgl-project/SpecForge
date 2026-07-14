@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Launcher path (online): build_online_eagle3_runtime end to end, single rank.
+"""Canonical online launcher end to end, single rank.
 
 Online analog of test_offline_launch_fsdp. Interleaves a RolloutWorker (HF
 target, no sglang) with FSDP training through the bounded mem:// stream. Asserts:
@@ -7,7 +7,6 @@ target, no sglang) with FSDP training through the bounded mem:// stream. Asserts
 - the strategy runs forward through the FSDP-wrapped module;
 - fit's global_step counts OPTIMIZER steps (micro_step = ACC * optimizer steps).
 
-The old-vs-new bit-exact loss equivalence is covered by test_equiv_online_eagle3.
 GPU-only. Run on the H200 box via rcli.
 """
 
@@ -30,12 +29,9 @@ class TestOnlineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
-        )
-        from specforge.launch import build_online_eagle3_runtime
+        from specforge.core.eagle3 import OnlineEagle3Model
+        from specforge.launch import build_online_runtime
+        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import assert_no_tensors
 
@@ -46,7 +42,7 @@ class TestOnlineLaunch(unittest.TestCase):
         target, _dir, aux_ids = fx.build_hf_target(workdir, hidden=H, layers=8, vocab=V)
         cfg = fx.write_draft_config(os.path.join(workdir, "draft.json"))
         vocab_path = fx.write_vocab_mapping(os.path.join(workdir, "vm.pt"))
-        draft = AutoEagle3DraftModel.from_config(
+        draft = AutoDraftModel.from_config(
             AutoDraftModelConfig.from_file(cfg),
             attention_backend="flex_attention",
             torch_dtype=torch.bfloat16,
@@ -79,10 +75,11 @@ class TestOnlineLaunch(unittest.TestCase):
             )
 
         trainer, loader, workers, controller, run_interleaved = (
-            build_online_eagle3_runtime(
+            build_online_runtime(
+                strategy="eagle3",
                 target_model=target,
                 prompts=prompts,
-                eagle3_model=eagle3_model,
+                draft_model=eagle3_model,
                 optimizer_factory=optimizer_factory,
                 run_id="online-launch",
                 output_dir=os.path.join(workdir, "out"),
@@ -92,7 +89,6 @@ class TestOnlineLaunch(unittest.TestCase):
                 aux_hidden_state_layer_ids=tuple(aux_ids),
                 batch_size=1,
                 accumulation_steps=ACC,
-                num_epochs=1,
                 max_steps=MAX_OPT_STEPS,
             )
         )

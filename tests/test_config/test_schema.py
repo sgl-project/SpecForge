@@ -86,7 +86,7 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(
                 {
                     **MINIMAL,
-                    "training": {"attention_backend": "usp"},
+                    "training": {"attention_backend": "unknown_backend"},
                 }
             )
         with self.assertRaises(ValidationError):
@@ -101,6 +101,13 @@ class ConfigSchemaTest(unittest.TestCase):
                 {
                     **MINIMAL,
                     "training": {"strategy": "dflash"},
+                }
+            )
+        with self.assertRaises(ValidationError):
+            Config.model_validate(
+                {
+                    **MINIMAL,
+                    "training": {"deployment_mode": "dataflow_colocated"},
                 }
             )
         dspark = Config.model_validate(
@@ -143,6 +150,7 @@ class ConfigSchemaTest(unittest.TestCase):
                     },
                 }
             )
+
         with self.assertRaisesRegex(ValidationError, "would be ignored"):
             Config.model_validate(
                 {
@@ -178,6 +186,29 @@ class ConfigSchemaTest(unittest.TestCase):
                     },
                 }
             )
+
+    def test_online_producer_cannot_claim_the_consumer_ledger(self):
+        payload = {
+            **MINIMAL,
+            "model": {**MINIMAL["model"], "target_backend": "sglang"},
+            "data": {"train_data_path": "/data.jsonl"},
+            "training": {
+                "deployment_mode": "disaggregated",
+                "role": "producer",
+                "max_steps": 1,
+                "metadata_db_path": "/shared/consumer.sqlite",
+            },
+        }
+        with self.assertRaisesRegex(ValidationError, "consumer only"):
+            Config.model_validate(payload)
+
+    def test_offline_run_cannot_configure_an_online_consumer_ledger(self):
+        payload = {
+            **MINIMAL,
+            "training": {"metadata_db_path": "/shared/consumer.sqlite"},
+        }
+        with self.assertRaisesRegex(ValidationError, "consumer only"):
+            Config.model_validate(payload)
 
     def test_invalid_core_bounds_fail_during_config_validation(self):
         cases = (

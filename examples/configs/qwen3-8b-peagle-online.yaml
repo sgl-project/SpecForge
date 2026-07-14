@@ -6,7 +6,7 @@ model:
   torch_dtype: bfloat16
 
 data:
-  train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen.jsonl
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
   max_length: 4096
   chat_template: qwen
   build_dataset_num_proc: 32

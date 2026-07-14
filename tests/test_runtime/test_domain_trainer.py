@@ -16,7 +16,7 @@ from unittest import mock
 
 
 class DomainTrainerWiringTest(unittest.TestCase):
-    def _build(self, ref_source):
+    def _build(self, ref_source, *, durable_ack=False):
         import specforge.training.trainer as tr
 
         cap = {}
@@ -51,16 +51,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap["ctrl_kw"] = kw
                 self.global_step = 0
 
-            def fit(self, loader, eval_data=None):
-                cap["fit"] = (loader, eval_data)
+            def fit(self, loader):
+                cap["fit"] = loader
                 return 42
 
         dfc_calls = []
 
         class FakeDataflowController:
-            def enqueue_offline_refs(self, refs):
-                dfc_calls.append(("enqueue", refs))
-
             def register_trainer(self, meta):
                 dfc_calls.append(("register", meta))
                 return "trainer-0"
@@ -103,13 +100,10 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 max_steps=None,
                 total_steps=None,
                 save_interval=0,
-                eval_interval=0,
-                tp_size=1,
-                sp_ulysses_size=1,
-                sp_ring_size=1,
                 logger=None,
                 log_interval=50,
                 collate_fn="COLLATE",
+                durable_ack=durable_ack,
             )
         return trainer, cap, dfc_calls, model
 
@@ -120,8 +114,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             self.skipTest("torch unavailable")
         trainer, cap, dfc_calls, model = self._build({"refs": [1, 2]})
 
-        # offline refs enqueued; trainer registered
-        self.assertIn(("enqueue", [1, 2]), dfc_calls)
+        # Fixed offline refs bypass online queue/ledger state; trainer registered.
         self.assertIn(("register", {"role": "trainer", "run_id": "run"}), dfc_calls)
 
         # loader built over the store with the spec's name + drop_last + ref_source
@@ -136,10 +129,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(cap["core"][0], ("STRAT", "WRAPPED", "HEAD"))
         self.assertEqual(cap["core"][2], 3)  # accumulation_steps threaded
 
-        # ack_fn wired to the DataFlowController with optimizer_durable=True
-        ack = cap["ctrl_kw"]["ack_fn"]
-        ack(["s1"], 7)
-        self.assertIn(("ack", "trainer-0", ["s1"], 7, True), dfc_calls)
+        self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
 
         # run identity rides the shared checkpoint payload, validated on resume
         self.assertEqual(
@@ -153,18 +143,21 @@ class DomainTrainerWiringTest(unittest.TestCase):
         except Exception:
             self.skipTest("torch unavailable")
         trainer, cap, _, _ = self._build({"refs": []})
-        out = trainer.fit(eval_data="EVAL")
+        out = trainer.fit()
         self.assertEqual(out, 42)
-        self.assertEqual(cap["fit"], (trainer.loader, "EVAL"))
+        self.assertIs(cap["fit"], trainer.loader)
 
-    def test_online_ref_source_not_enqueued(self):
+    def test_streaming_durable_ack_routes_through_controller(self):
         try:
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        _, _, dfc_calls, _ = self._build({"queue": object()})
-        # a streamed (online) ref source is committed elsewhere — not enqueued here
-        self.assertNotIn("enqueue", [c[0] for c in dfc_calls])
+        _, cap, dfc_calls, _ = self._build(
+            {"queue": object()}, durable_ack=True
+        )
+        ack = cap["ctrl_kw"]["ack_fn"]
+        ack(["s1"], 7)
+        self.assertIn(("ack", "trainer-0", ["s1"], 7, True), dfc_calls)
 
 
 if __name__ == "__main__":

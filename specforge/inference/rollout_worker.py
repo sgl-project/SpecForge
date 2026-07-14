@@ -10,7 +10,7 @@
 
 The worker is deliberately small and strategy-agnostic: it leases prompt tasks,
 asks a ``feature_source`` (e.g. a wrapper over the target model's
-``generate_eagle3_data``, or ``SGLangAdapter``) for per-sample features,
+``PolicyFeatureAdapter`` or server capture) for per-sample features,
 verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. A server-side capture source may instead return already-written

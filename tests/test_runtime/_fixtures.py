@@ -51,24 +51,20 @@ def build_single_rank_distributed(port="29561"):
     torch.cuda.set_device(0)
     from specforge.distributed import init_distributed
 
-    init_distributed(timeout=10, tp_size=1, sp_ulysses_size=1, sp_ring_size=1)
+    init_distributed(timeout=10, tp_size=1)
 
 
 def init_rank_distributed(
     rank,
     world_size,
     *,
-    tp_size=1,
-    sp_ulysses_size=1,
-    sp_ring_size=1,
     port="29571",
 ):
     """Init one rank of a multi-process group (for the M6 >=4-rank tests).
 
-    Each spawned process calls this with its own rank; together they form a
-    world_size group with the requested TP x SP layout. Mirrors the env that
-    torchrun sets, so SpecForge's ``init_distributed`` builds the real TP +
-    Ulysses/Ring SP groups.
+    Each spawned process calls this with its own rank; together they form the
+    world-sized FSDP/DP group with target TP fixed to one. This mirrors the
+    canonical online-disaggregated consumer layout.
     """
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -78,12 +74,7 @@ def init_rank_distributed(
     torch.cuda.set_device(rank)
     from specforge.distributed import init_distributed
 
-    init_distributed(
-        timeout=60,
-        tp_size=tp_size,
-        sp_ulysses_size=sp_ulysses_size,
-        sp_ring_size=sp_ring_size,
-    )
+    init_distributed(timeout=60, tp_size=1)
 
 
 def write_draft_config(path):
@@ -153,7 +144,7 @@ def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4
     """Build a tiny HF Llama target wrapped by the SpecForge HF eagle3 backend."""
     from transformers import LlamaConfig, LlamaForCausalLM
 
-    from specforge.modeling.target import get_target_engine
+    from specforge.inference.target_engine import get_target_engine
 
     cfg = LlamaConfig(
         hidden_size=hidden,
@@ -177,21 +168,22 @@ def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4
         torch_dtype=torch.bfloat16,
         device="cuda",
     )
-    target.set_aux_hidden_states_layers(list(aux_layer_ids))
+    target.set_capture_layers(list(aux_layer_ids))
     return target, target_dir, list(aux_layer_ids)
 
 
 def build_eagle3(workdir, ttt=3):
     """Build (eagle3_model, target_head) sharing one set of weights, on cuda."""
-    from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
-    from specforge.modeling.target import TargetHead
+    from specforge.core.eagle3 import OnlineEagle3Model
+    from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+    from specforge.modeling.target.target_head import TargetHead
 
     cfg = write_draft_config(os.path.join(workdir, "draft.json"))
     target_dir = write_target_head_dir(os.path.join(workdir, "target"))
     vocab_path = write_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
 
     draft_config = AutoDraftModelConfig.from_file(cfg)
-    draft_model = AutoEagle3DraftModel.from_config(
+    draft_model = AutoDraftModel.from_config(
         draft_config, attention_backend="flex_attention", torch_dtype=torch.bfloat16
     ).cuda()
     draft_model.load_vocab_mapping(vocab_path)
@@ -203,35 +195,7 @@ def build_eagle3(workdir, ttt=3):
     return eagle3_model, target_head
 
 
-# --- DFlash fixtures ---------------------------------------------------------
-# DFlash has its OWN feature schema: 'hidden_states' = concat of the target
-# capture layers (NO eagle3 aux/target swap, NO target distribution). For a
-# single draft layer the capture set is one layer, so width == hidden_size.
-
-
-def write_offline_files_dflash(d, n=4, seq=32, hidden=H, vocab=V, seed=0):
-    """Write synthetic DFlash offline .ckpt files: {input_ids, loss_mask, hidden_states}.
-
-    No production dumper for DFlash exists yet (prepare_hidden_states.py is the
-    EAGLE3 dumper), so the offline DataFlow path is exercised with synthetic files.
-    loss_mask is all-ones with seq >= 2*block_size so anchor sampling succeeds;
-    hidden_states is bf16 (uniform dtype across files for the loader's spec check).
-    """
-    os.makedirs(d, exist_ok=True)
-    g = torch.Generator().manual_seed(seed)
-    for i in range(n):
-        torch.save(
-            {
-                "input_ids": torch.randint(0, vocab, (seq,), generator=g),
-                "loss_mask": torch.ones(seq, dtype=torch.long),
-                # width == len(target_layer_ids)*hidden; single draft layer -> hidden
-                "hidden_states": torch.randn(1, seq, hidden, generator=g).to(
-                    torch.bfloat16
-                ),
-            },
-            os.path.join(d, f"{i:04d}.ckpt"),
-        )
-    return d
+# --- DFlash online fixtures --------------------------------------------------
 
 
 def build_dflash(

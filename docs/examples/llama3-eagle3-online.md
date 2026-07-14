@@ -58,16 +58,6 @@ specforge train --config ./llama3-eagle3-online.yaml
 Colocated training is currently single-rank. For a short smoke run, override
 `training.max_steps` to a small value.
 
-To train on Perfect-Blend, prepare it with
-`python ./scripts/prepare_data.py --dataset perfectblend`, then point the same
-config at the generated file:
-
-```bash
-specforge train \
-  --config ./llama3-eagle3-online.yaml \
-  data.train_data_path=./cache/dataset/perfectblend_train.jsonl
-```
-
 ## 4. Export and benchmark
 
 Llama 3.1 8B training and benchmarking should use the same system prompt. A
@@ -83,22 +73,4 @@ specforge export --to sglang \
   --checkpoint ./outputs/llama3-8b-eagle3-online/llama3-8b-eagle3-online-latest \
   --draft-config configs/llama3-8B-eagle3.json \
   --output-dir ./exports/llama3-8b-eagle3-sglang
-```
-
-From the `benchmarks` directory, point `--speculative-draft-model-path` at the
-exported directory:
-
-```bash
-config_list=(
-    "4,3,1,4"
-    "4,7,10,60"
-)
-python3 bench_eagle3.py \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path ../exports/llama3-8b-eagle3-sglang \
-    --port 30000 \
-    --mem-fraction-static 0.8 \
-    --tp-size 1 \
-    --config-list "${config_list[@]}" \
-    --benchmark-list mtbench gsm8k humaneval math500
 ```

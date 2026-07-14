@@ -46,10 +46,6 @@ class Trainer:
         num_epochs: int,
         max_steps: Optional[int],
         save_interval: int,
-        eval_interval: int,
-        tp_size: int,
-        sp_ulysses_size: int,
-        sp_ring_size: int,
         logger,
         log_interval: int,
         collate_fn,
@@ -60,18 +56,14 @@ class Trainer:
         resume_from: Optional[str] = None,
         max_checkpoints: int = 0,
     ):
-        # durable_ack off (local_colocated): no durable ack transaction — the
-        # loader releases each feature as it consumes it — so the offline enqueue
-        # is skipped too (nothing acks or reads that queue).
+        # Fixed offline refs never enter an online staging queue. The loader
+        # releases each feature as it consumes it and can re-iterate the same
+        # refs on later epochs.
         if "refs" in ref_source:
-            if durable_ack:
-                controller.enqueue_offline_refs(ref_source["refs"])
-            else:
-                from specforge.runtime.contracts import assert_no_tensors
+            from specforge.runtime.contracts import assert_no_tensors
 
-                # metadata-only contract still holds for refs entering the trainer
-                for ref in ref_source["refs"]:
-                    assert_no_tensors(ref)
+            for ref in ref_source["refs"]:
+                assert_no_tensors(ref)
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
         loader = FeatureDataLoader(
             store,
@@ -162,9 +154,7 @@ class Trainer:
             # drop the full draft state before the wrap
             del state, saved_weights
 
-        parallel = ParallelConfig.from_distributed(
-            tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
-        )
+        parallel = ParallelConfig.from_distributed()
         backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
@@ -192,7 +182,6 @@ class Trainer:
             max_steps=max_steps,
             total_steps=effective_total_steps,
             save_interval=save_interval,
-            eval_interval=eval_interval,
             log_interval=log_interval,
             logger=logger,
             ack_fn=ack_fn,
@@ -216,7 +205,7 @@ class Trainer:
         self.trainer_id = trainer_id
         self.backend = backend
         self.core = core
-        #: the runtime TrainerController (has fit / evaluate / save_checkpoint)
+        #: the runtime TrainerController (has fit / save_checkpoint)
         self.controller = controller_obj
         #: the FeatureDataLoader -> TrainBatch iterator (the canonical "stream")
         self.loader = loader
@@ -226,12 +215,9 @@ class Trainer:
         """Resolve the :class:`StrategySpec` by name, then assemble."""
         return cls(spec=resolve_strategy(strategy), **kwargs)
 
-    def fit(self, eval_data=None) -> int:
+    def fit(self) -> int:
         """Run the training loop over the loader; returns the final global step."""
-        return self.controller.fit(self.loader, eval_data=eval_data)
-
-    def evaluate(self, data=None):
-        return self.controller.evaluate(self.loader if data is None else data)
+        return self.controller.fit(self.loader)
 
     def save_checkpoint(self, step: Optional[int] = None):
         step = self.controller.global_step if step is None else step

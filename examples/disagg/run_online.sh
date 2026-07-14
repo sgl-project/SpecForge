@@ -11,7 +11,7 @@ usage() {
         "  MOONCAKE_MASTER_SERVER_ADDR MOONCAKE_LOCAL_HOSTNAME" \
         "Producer server URLs may come from the config or DISAGG_SERVER_URL(S)." \
         "Consumer NPROC_PER_NODE defaults to 1." \
-        "  DP or DISAGG_INBOX_DIR requires a fresh DISAGG_DB."
+        "  Every consumer requires a fresh DISAGG_DB."
 }
 
 fail() {
@@ -65,22 +65,14 @@ case "$role" in
         [[ "$nproc" =~ ^[1-9][0-9]*$ ]] || {
             fail "NPROC_PER_NODE must be a positive integer, got: $nproc"
         }
-        if ((nproc > 1)) || [[ -n "${DISAGG_INBOX_DIR:-}" ]]; then
-            require_value "$database" DISAGG_DB
-        fi
-        if [[ -n "$database" ]] && \
-            [[ -e "$database" || -e "${database}-wal" || -e "${database}-shm" ]]; then
+        require_value "$database" DISAGG_DB
+        if [[ -e "$database" || -e "${database}-wal" || -e "${database}-shm" ]]; then
             fail "DISAGG_DB must be a fresh attempt path: $database"
         fi
         torchrun_bin=$(command -v torchrun) || fail "torchrun is not on PATH"
-        if [[ -n "$database" ]]; then
-            exec "$torchrun_bin" --standalone --nproc_per_node "$nproc" \
-                "$specforge_bin" train --config "$config" \
-                "$@" "training.metadata_db_path=$database" \
-                training.role=consumer
-        fi
         exec "$torchrun_bin" --standalone --nproc_per_node "$nproc" \
             "$specforge_bin" train --config "$config" \
-            "$@" training.role=consumer
+            "$@" "training.metadata_db_path=$database" \
+            training.role=consumer
         ;;
 esac

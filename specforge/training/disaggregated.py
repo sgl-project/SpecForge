@@ -266,7 +266,7 @@ def _build_offline(
         strategy="eagle3",
         feature_store=_offline_store(cfg, retain_on_release=True),
         refs=read_ref_manifest(manifest),
-        eagle3_model=bundle.model,
+        draft_model=bundle.model,
         target_head=bundle.target_head,
         optimizer_factory=optimizer_factory(cfg),
         run_id=cfg.run_id,
@@ -278,9 +278,6 @@ def _build_offline(
         max_steps=cfg.training.max_steps,
         total_steps=cfg.training.total_steps,
         save_interval=cfg.training.save_interval,
-        tp_size=1,
-        sp_ulysses_size=1,
-        sp_ring_size=1,
         logger=logger,
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
@@ -385,6 +382,9 @@ def _build_online(
             for url in _server_urls(cfg)
         ]
         target_repr = "hidden_state" if strategy in ("eagle3", "dspark") else None
+        peer_wait_timeout_s = float(
+            os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800")
+        )
         _workers, drive = build_disagg_online_producer(
             strategy=strategy,
             prompts=prompts,
@@ -399,24 +399,55 @@ def _build_online(
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
-            peer_wait_timeout_s=float(
-                os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800")
+            in_flight_high_watermark=int(
+                os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK", "256")
             ),
+            peer_wait_timeout_s=peer_wait_timeout_s,
         )
 
         def produce() -> int:
-            produced = drive(should_stop=channel.consumer_stopped)
-            consumer_failure = channel.consumer_failure()
-            if consumer_failure is not None:
-                reason = f"consumer failed: {consumer_failure}"
+            produced = 0
+            primary_exc = None
+            try:
+                produced = drive(should_stop=channel.consumer_stopped)
+                deadline = time.monotonic() + peer_wait_timeout_s
+                while not channel.consumer_stopped():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "producer timed out waiting for the consumer result "
+                            f"after {peer_wait_timeout_s:.0f}s"
+                        )
+                    time.sleep(0.25)
+                consumer_failure = channel.consumer_failure()
+                if consumer_failure is not None:
+                    raise RuntimeError(f"consumer failed: {consumer_failure}")
+            except BaseException as exc:
+                primary_exc = exc
                 try:
-                    channel.fail(reason)
+                    channel.fail(f"{type(exc).__name__}: {exc}")
                 except Exception as signal_exc:
                     print(
                         f"failed to publish producer failure: {signal_exc}",
                         flush=True,
                     )
-                raise RuntimeError(reason)
+            cleanup_errors = []
+            reader = StreamingRefChannel(channel_path)
+            while True:
+                refs = reader.poll(max_n=1024)
+                if not refs:
+                    break
+                for ref in refs:
+                    try:
+                        store.abort(ref.sample_id, reason="online-attempt-finished")
+                    except Exception as exc:
+                        cleanup_errors.append(f"{ref.sample_id}: {exc}")
+            if primary_exc is not None:
+                raise primary_exc
+            if cleanup_errors:
+                raise RuntimeError(
+                    "producer could not clean all published Mooncake features: "
+                    f"{cleanup_errors}"
+                )
             return produced
 
         return TrainingRun(execute=produce)
@@ -426,7 +457,7 @@ def _build_online(
     bundle = build_model_bundle(cfg, load_target_engine=False)
     target_head = None
     if strategy == "eagle3":
-        from specforge.modeling.target import TargetHead
+        from specforge.modeling.target.target_head import TargetHead
 
         target_head = TargetHead.from_pretrained(
             cfg.model.target_model_path,
@@ -438,29 +469,23 @@ def _build_online(
         strategy=strategy,
         feature_store=store,
         channel=channel,
-        eagle3_model=bundle.model,
+        draft_model=bundle.model,
         target_head=target_head,
         optimizer_factory=optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=cfg.training.batch_size,
         accumulation_steps=cfg.training.accumulation_steps,
-        num_epochs=1,
         max_steps=cfg.training.max_steps,
         total_steps=cfg.training.total_steps,
         save_interval=cfg.training.save_interval,
-        tp_size=1,
-        sp_ulysses_size=1,
-        sp_ring_size=1,
         idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0")) or None,
         metadata_db_path=(
             cfg.training.metadata_db_path or os.environ.get("DISAGG_DB") or None
         ),
-        resume=bool(cfg.training.resume_from),
         logger=logger,
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
-        resume_from=cfg.training.resume_from,
         max_checkpoints=cfg.training.max_checkpoints,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
     )

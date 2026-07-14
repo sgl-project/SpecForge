@@ -134,10 +134,10 @@ class TrainingConfig(StrictConfigModel):
     max_checkpoints: int = Field(default=0, ge=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
-    #: control-plane selection for the offline builder.
-    deployment_mode: Literal[
-        "local_colocated", "dataflow_colocated", "disaggregated"
-    ] = "local_colocated"
+    #: Colocated process or split producer/consumer deployment.
+    deployment_mode: Literal["local_colocated", "disaggregated"] = (
+        "local_colocated"
+    )
     #: ``all`` is a colocated run. Disaggregated online runs launch producer
     #: and consumer as separate ``specforge train`` processes with the same
     #: config and different roles.
@@ -234,10 +234,6 @@ class Config(StrictConfigModel):
             )
         if strategy == "dspark" and deployment != "disaggregated":
             raise ValueError("DSpark requires disaggregated server capture")
-        if mode == "online" and deployment == "dataflow_colocated":
-            raise ValueError(
-                "online runs use local_colocated or disaggregated deployment"
-            )
         if (
             mode == "online"
             and deployment == "disaggregated"
@@ -264,6 +260,14 @@ class Config(StrictConfigModel):
             )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
+        if self.training.metadata_db_path is not None and not (
+            mode == "online"
+            and deployment == "disaggregated"
+            and self.training.role == "consumer"
+        ):
+            raise ValueError(
+                "training.metadata_db_path belongs to the online consumer only"
+            )
         if self.model.target_backend == "custom" and strategy not in (
             "eagle3",
             "peagle",
