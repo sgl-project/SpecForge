@@ -243,6 +243,20 @@ Every offline attempt must use a new manifest path and store id. The launcher
 rejects `NPROC_PER_NODE` values other than 1 for the consumer and never removes
 old manifests or store objects.
 
+If that consumer is interrupted, resume the same attempt by reusing its
+manifest, feature store, and `run_id`, and pass its latest checkpoint only to
+the consumer:
+
+```bash
+examples/disagg/run_offline.sh consumer \
+  run_id=qwen3-8b-eagle3-${ATTEMPT_ID} \
+  output_dir=outputs/qwen3-8b-eagle3-${ATTEMPT_ID} \
+  training.resume_from=outputs/qwen3-8b-eagle3-${ATTEMPT_ID}/qwen3-8b-eagle3-${ATTEMPT_ID}-latest
+```
+
+The offline producer is an ingestion role, not a trainer, and rejects
+`training.resume_from`.
+
 ## Launcher contract
 
 Run either script with `--help` for its environment contract. Both accept dotted

@@ -167,8 +167,9 @@ launch procedures.
 even when `save_interval` is zero or the final step is not an interval boundary.
 The `<run_id>-latest` symlink resolves to the newest complete checkpoint.
 
-The supported CLI resume path in this PR is a single-rank local offline run.
-Resume it by overriding `training.resume_from`:
+Resume is supported only by a single-rank offline trainer: either a colocated
+offline run or the consumer of a disaggregated offline run. For a colocated
+run, override `training.resume_from`:
 
 ```bash
 specforge train \
@@ -176,10 +177,12 @@ specforge train \
   training.resume_from=./outputs/qwen3-8b-eagle3-offline/qwen3-8b-eagle3-offline-latest
 ```
 
-No online run accepts `training.resume_from` in this PR, including colocated
-online and disaggregated online runs. Runtime checkpoints still contain
-training state and can be exported, but a new online attempt must start with a
-fresh run, channel, and coordination database.
+For a disaggregated offline resume, reuse the same manifest, feature store, and
+run id, then pass the override to `run_offline.sh consumer`; the producer never
+accepts a resume checkpoint. No online run accepts `training.resume_from` in
+this PR, including colocated online and disaggregated online runs. Runtime
+checkpoints still contain training state and can be exported, but a new online
+attempt must start with a fresh run, channel, and coordination database.
 
 Training metrics are printed every `training.log_interval` steps.
 

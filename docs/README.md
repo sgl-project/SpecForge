@@ -8,7 +8,7 @@ Most documentation files are located under the `docs/` folder.
 ### Install dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -r docs/requirements.txt
 ```
 
 ### Build and preview
@@ -19,9 +19,9 @@ include it in `index.rst` or the relevant nested toctree.
 Build the site and preview it with live reload:
 
 ```bash
-make html
-make serve
-PORT=8080 make serve
+make -C docs html
+make -C docs serve
+make -C docs serve PORT=8080
 ```
 
 Run repository formatting checks before submitting changes:

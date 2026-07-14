@@ -33,7 +33,8 @@ environment contract is in the
 [disaggregated training guide](../docs/basic_usage/disaggregated_training.md).
 
 Online resume is not supported in this PR. Use `training.resume_from` only for
-the single-rank local offline path documented in the
+a single-rank offline trainer: the colocated offline path or the consumer of a
+disaggregated offline run, as documented in the
 [training guide](../docs/basic_usage/training.md).
 
 Paths are resolved from the directory where the command is run. The checked-in
