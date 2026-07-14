@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import ast
-import tomllib
 import tokenize
+import tomllib
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -105,7 +104,9 @@ class TestPackageArchitecture(unittest.TestCase):
     def test_removed_training_telemetry_stays_out_of_runtime_dependencies(self):
         with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
             dependencies = tomllib.load(project_file)["project"]["dependencies"]
-        names = {item.split("[", 1)[0].split("=", 1)[0].lower() for item in dependencies}
+        names = {
+            item.split("[", 1)[0].split("=", 1)[0].lower() for item in dependencies
+        }
         self.assertTrue({"wandb", "tensorboard"}.isdisjoint(names))
 
     def test_removed_move_shims_stay_deleted(self):
@@ -122,7 +123,9 @@ class TestPackageArchitecture(unittest.TestCase):
             for relative_path in REMOVED_TRAINING_ENTRY_FILES
             if (REPO_ROOT / relative_path).exists()
         ]
-        self.assertEqual([], present, f"legacy training entries reintroduced: {present}")
+        self.assertEqual(
+            [], present, f"legacy training entries reintroduced: {present}"
+        )
 
     def test_repository_does_not_import_removed_modules(self):
         violations = []

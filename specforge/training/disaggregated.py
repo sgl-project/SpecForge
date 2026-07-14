@@ -23,7 +23,6 @@ from typing import Callable, Optional, Sequence
 
 from specforge.config import Config
 
-
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_CONTROL_SUFFIXES = (
     ".closed",
@@ -195,7 +194,9 @@ def _wait_for(
     while not os.path.exists(path):
         failure = _read_control(failure_path) if failure_path else None
         if failure is not None:
-            raise RuntimeError(f"remote role failed while waiting for {path}: {failure}")
+            raise RuntimeError(
+                f"remote role failed while waiting for {path}: {failure}"
+            )
         if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for {path}")
         time.sleep(0.25)

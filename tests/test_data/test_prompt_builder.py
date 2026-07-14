@@ -154,7 +154,7 @@ class TestPreparePromptTasks(unittest.TestCase):
         )
         self.assertEqual(
             load_calls,
-            [(('json',), {"data_files": path, "split": "train"})],
+            [(("json",), {"data_files": path, "split": "train"})],
         )
         self.assertEqual(len(build_calls), 1)
         self.assertEqual(len(build_calls[0]["dataset"]), 1)
