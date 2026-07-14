@@ -157,7 +157,10 @@ _gate_process_alive() {
     local pid=$1
     local mode=$2
     if [[ "$mode" == group ]]; then
-        kill -0 -- "-$pid" 2>/dev/null
+        # setsid(1) can still be between fork and setsid when cleanup starts.
+        # Check the owned child as well as its eventual process group so an
+        # immediate cleanup cannot mistake that startup window for exit.
+        kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null
     else
         kill -0 "$pid" 2>/dev/null
     fi
@@ -168,10 +171,36 @@ _gate_signal_process() {
     local pid=$2
     local mode=$3
     if [[ "$mode" == group ]]; then
-        kill "-$signal" -- "-$pid" 2>/dev/null || true
+        # Prefer the group to include descendants. Fall back to the direct
+        # child when setsid has not established the group yet.
+        if ! kill "-$signal" -- "-$pid" 2>/dev/null; then
+            kill "-$signal" "$pid" 2>/dev/null || true
+        fi
     else
         kill "-$signal" "$pid" 2>/dev/null || true
     fi
+}
+
+_gate_reap_exited_child() {
+    local pid=$1
+    local state
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null || true
+        return 0
+    fi
+
+    # kill -0 reports a zombie as alive. Waiting is non-blocking only after
+    # the owned child reaches that state; the PGID remains usable for checking
+    # and signaling any descendants that are still running.
+    if state=$(ps -o stat= -p "$pid" 2>/dev/null); then
+        state=${state//[[:space:]]/}
+        if [[ "$state" == Z* ]]; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    return 1
 }
 
 gate_forget_pid() {
@@ -268,6 +297,7 @@ gate_stop_services() {
             pid=${GATE_BACKGROUND_PIDS[$index]}
             [[ -n "$pid" ]] || continue
             mode=${GATE_BACKGROUND_MODES[$index]}
+            _gate_reap_exited_child "$pid" || true
             if _gate_process_alive "$pid" "$mode"; then
                 any_alive=true
                 break
