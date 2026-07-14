@@ -91,8 +91,10 @@ its `InboxChannel` through `StreamingRefQueue` and feeds the same
 
 At each optimizer boundary, all ranks call `DPAckController.ack_train_refs` in
 lockstep. It gathers their sample ids and rank 0 records one durable ack
-transaction. Inbox acknowledgements are also mirrored to the source channel so
-the producer's in-flight counter tracks refs that ranks have actually consumed.
+transaction. Only after that commit succeeds does each rank delete its local
+feature ids; cleanup errors are gathered before inbox acknowledgement. Inbox
+acknowledgements are also mirrored to the source channel so the producer's
+in-flight counter tracks refs that ranks have actually consumed.
 
 ### Optimizer-window handshake
 

@@ -52,6 +52,35 @@ class _RetainingFeatureStore:
         self.aborted.append((sample_id, reason))
 
 
+class _TrackingFeatureStore(_RetainingFeatureStore):
+    """Per-process store proving cleanup uses the rank-local client only."""
+
+    def __init__(self, *, fail_sample_id: str | None = None) -> None:
+        super().__init__()
+        self.fail_sample_id = fail_sample_id
+
+    def abort(self, sample_id, *, reason="aborted") -> None:
+        super().abort(sample_id, reason=reason)
+        if sample_id == self.fail_sample_id:
+            raise OSError(f"injected remove failure for {sample_id}")
+
+
+class _LifecycleFeatureStore(_RetainingFeatureStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.drain_calls = []
+
+    def drain_pending_removals(self, **kwargs):
+        self.drain_calls.append(kwargs)
+        return {"removed": 0, "release_pending": 0}
+
+
+class _FailingLifecycleFeatureStore(_LifecycleFeatureStore):
+    def drain_pending_removals(self, **kwargs):
+        self.drain_calls.append(kwargs)
+        raise OSError("remote remove stayed pinned")
+
+
 class _FakeRefDistributor:
     """Lifecycle probe used before any model/FSDP construction."""
 
@@ -139,9 +168,10 @@ def _dp_ack_worker(
     rank: int,
     init_method: str,
     metadata_db_path: str,
+    fail_cleanup_rank: int | None,
     results_dir: str,
 ) -> None:
-    """Run one real DPAck all-gather and expose each rank's local marker."""
+    """Run one real DPAck protocol and expose each rank's marker/cleanup."""
     payload = {}
     initialized = False
     store = None
@@ -161,23 +191,33 @@ def _dp_ack_worker(
             if is_authority
             else InMemoryMetadataStore()
         )
+        local_store = _TrackingFeatureStore(
+            fail_sample_id="rank-1" if rank == fail_cleanup_rank else None
+        )
         controller = DPAckController(
             "ack-run",
             is_authority=is_authority,
             metadata_store=store,
+            feature_store=local_store,
         )
         rank_ids = ["rank-0", "shared"] if rank == 0 else ["shared", "rank-1"]
-        controller.ack_train_refs(
-            f"trainer-{rank}",
-            rank_ids,
-            global_step=17 if rank == 0 else 999,
-            optimizer_durable=rank == 0,
-        )
+        ack_error = None
+        try:
+            controller.ack_train_refs(
+                f"trainer-{rank}",
+                rank_ids,
+                global_step=17 if rank == 0 else 999,
+                optimizer_durable=True,
+            )
+        except RuntimeError as exc:
+            ack_error = str(exc)
         marker = store.durable_marker()
         payload = {
             "acked": sorted(marker["acked"]),
             "global_step": marker["global_step"],
             "optimizer_durable": marker["optimizer_durable"],
+            "aborted": local_store.aborted,
+            "ack_error": ack_error,
         }
 
         # Keep the process group alive until both ranks have returned from the
@@ -279,15 +319,24 @@ class TestDisaggOnlineDPProtocol(unittest.TestCase):
                 _dp_ack_worker,
                 self._init_method(work),
                 metadata_db,
+                None,
                 work,
             )
 
             self.assertEqual(results[0]["acked"], ["rank-0", "rank-1", "shared"])
             self.assertEqual(results[0]["global_step"], 17)
             self.assertTrue(results[0]["optimizer_durable"])
+            self.assertEqual(results[1]["acked"], [])
+            self.assertIsNone(results[1]["global_step"])
+            self.assertFalse(results[1]["optimizer_durable"])
+            self.assertIsNone(results[0]["ack_error"])
+            self.assertIsNone(results[1]["ack_error"])
+            reason = "optimizer-boundary-durable-ack"
             self.assertEqual(
-                results[1],
-                {"acked": [], "global_step": None, "optimizer_durable": False},
+                results[0]["aborted"], [["rank-0", reason], ["shared", reason]]
+            )
+            self.assertEqual(
+                results[1]["aborted"], [["shared", reason], ["rank-1", reason]]
             )
 
             # The shared durable ledger reflects rank 0's boundary metadata,
@@ -304,10 +353,45 @@ class TestDisaggOnlineDPProtocol(unittest.TestCase):
             self.assertEqual(json.loads(marker["global_step"]), 17)
             self.assertTrue(json.loads(marker["optimizer_durable"]))
 
+    def test_dp_ack_cleanup_error_reaches_every_rank_after_commit(self):
+        with tempfile.TemporaryDirectory(prefix="disagg_dp_ack_cleanup_") as work:
+            metadata_db = os.path.join(work, "metadata.sqlite")
+            results = self._spawn_two_ranks(
+                _dp_ack_worker,
+                self._init_method(work),
+                metadata_db,
+                1,
+                work,
+            )
+
+            errors = [result["ack_error"] for result in results]
+            self.assertTrue(all(error is not None for error in errors))
+            self.assertEqual(errors[0], errors[1])
+            self.assertIn("rank-local feature cleanup failed", errors[0])
+            self.assertIn("rank 1", errors[0])
+            self.assertIn("injected remove failure for rank-1", errors[0])
+
+            # The authority transaction precedes cleanup, so it remains durable
+            # even though no rank is allowed to advance its inbox acknowledgement.
+            with sqlite3.connect(metadata_db) as connection:
+                acked = sorted(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT sample_id FROM acked ORDER BY sample_id"
+                    )
+                )
+            self.assertEqual(acked, ["rank-0", "rank-1", "shared"])
+            self.assertEqual(
+                [item[0] for item in results[0]["aborted"]], ["rank-0", "shared"]
+            )
+            self.assertEqual(
+                [item[0] for item in results[1]["aborted"]], ["shared", "rank-1"]
+            )
+
 
 @unittest.skipUnless(dist is not None and dist.is_available(), "requires torch")
 class TestSingleRankConsumerLifecycle(unittest.TestCase):
-    def _build(self, work: str, *, assembly_error=None):
+    def _build(self, work: str, *, assembly_error=None, feature_store=None):
         from specforge.launch import build_disagg_online_consumer
         from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
         from specforge.runtime.data_plane.streaming_ref_channel import (
@@ -332,7 +416,7 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
             mock.patch("specforge.launch._assemble_trainer", side_effect=assemble),
         ):
             trainer = build_disagg_online_consumer(
-                feature_store=_RetainingFeatureStore(),
+                feature_store=feature_store or _RetainingFeatureStore(),
                 channel=channel,
                 draft_model=object(),
                 optimizer_factory=object(),
@@ -355,6 +439,18 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
             self.assertIsNone(channel.consumer_failure())
             self.assertTrue(trainer.ref_distributor.stopped)
 
+    def test_success_drains_before_publishing_consumer_done(self):
+        with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_drain_") as work:
+            store = _LifecycleFeatureStore()
+            trainer, channel, captured = self._build(work, feature_store=store)
+
+            captured["on_fit_success"](3)
+            self.assertEqual(len(store.drain_calls), 1)
+            self.assertTrue(channel.consumer_stopped())
+            captured["on_fit_finally"]()
+            self.assertEqual(len(store.drain_calls), 1)
+            self.assertTrue(trainer.ref_distributor.stopped)
+
     def test_direct_builder_failure_signals_and_stops_distributor(self):
         with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_") as work:
             trainer, channel, captured = self._build(work)
@@ -366,6 +462,23 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
                 channel.consumer_failure(), "RuntimeError: optimizer failed"
             )
             self.assertTrue(trainer.ref_distributor.stopped)
+
+    def test_failure_drain_is_reported_without_masking_primary(self):
+        with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_drain_") as work:
+            store = _FailingLifecycleFeatureStore()
+            trainer, channel, captured = self._build(work, feature_store=store)
+            primary = RuntimeError("optimizer failed first")
+
+            captured["on_fit_failure"](primary)
+            # Trainer.fit is already propagating `primary`; the finally callback
+            # must signal the cleanup failure but must not raise over it.
+            captured["on_fit_finally"]()
+
+            self.assertEqual(len(store.drain_calls), 1)
+            self.assertTrue(trainer.ref_distributor.stopped)
+            failure = channel.consumer_failure()
+            self.assertIn("optimizer failed first", failure)
+            self.assertIn("remote remove stayed pinned", failure)
 
     def test_assembly_failure_notifies_producer_before_fit_exists(self):
         with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_") as work:

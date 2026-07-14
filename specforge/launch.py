@@ -1846,6 +1846,7 @@ def build_disagg_online_consumer(
     queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
 
     drain_state = {"attempted": False}
+    fit_failure = {"error": None}
 
     def drain_consumer_store() -> None:
         drain_state["attempted"] = True
@@ -1881,6 +1882,7 @@ def build_disagg_online_consumer(
         # Every rank may report failure: a non-authority rank can fail while
         # rank 0 is blocked in a distributed collective. Publishing the same
         # terminal sidecar is idempotent and lets the producer stop promptly.
+        fit_failure["error"] = exc
         try:
             channel.mark_consumer_failed(f"{type(exc).__name__}: {exc}")
         except Exception as signal_exc:
@@ -1891,9 +1893,30 @@ def build_disagg_online_consumer(
             distributor.stop()
         # The success hook already drained before publishing consumer_done. On
         # an exception, finalization still makes one bounded local attempt and
-        # raises loudly rather than hiding hard-pinned remote objects.
+        # reports a cleanup failure loudly without replacing the primary fit
+        # exception that is already propagating through Trainer.fit().
         if not drain_state["attempted"]:
-            drain_consumer_store()
+            try:
+                drain_consumer_store()
+            except BaseException as cleanup_exc:
+                primary = fit_failure["error"]
+                if primary is None:
+                    raise
+                combined = RuntimeError(
+                    f"primary consumer failure ({type(primary).__name__}: "
+                    f"{primary}); pending-remove drain also failed "
+                    f"({type(cleanup_exc).__name__}: {cleanup_exc})"
+                )
+                try:
+                    channel.mark_consumer_failed(
+                        f"{type(combined).__name__}: {combined}"
+                    )
+                except Exception as signal_exc:
+                    print(
+                        "failed to publish consumer cleanup failure: " f"{signal_exc}",
+                        flush=True,
+                    )
+                logging.getLogger(__name__).error("%s", combined)
 
     try:
         trainer = _assemble_trainer(

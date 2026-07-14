@@ -30,6 +30,7 @@ _ONLINE_CONTROL_SUFFIXES = (
     ".failed",
     ".consumer_done",
     ".consumer_failed",
+    ".consumer_quantum",
 )
 _OFFLINE_CONTROL_SUFFIXES = (".done", ".consumed", ".failed", ".consumer_failed")
 
@@ -146,7 +147,6 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
-        max_resident_bytes=cfg.runtime.feature_store_max_resident_bytes,
     )
 
 
@@ -369,6 +369,7 @@ def _build_online(
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
     store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
+    from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
     channel = StreamingRefChannel(channel_path)
@@ -443,6 +444,9 @@ def _build_online(
                 if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
                 else cfg.runtime.resident_low_watermark_bytes
             ),
+            feature_store_max_resident_bytes=(
+                cfg.runtime.feature_store_max_resident_bytes
+            ),
             peer_wait_timeout_s=peer_wait_timeout_s,
         )
 
@@ -472,16 +476,35 @@ def _build_online(
                         flush=True,
                     )
             cleanup_errors = []
-            reader = StreamingRefChannel(channel_path)
-            while True:
-                refs = reader.poll(max_n=1024)
-                if not refs:
-                    break
-                for ref in refs:
-                    try:
-                        store.abort(ref.sample_id, reason="online-attempt-finished")
-                    except Exception as exc:
-                        cleanup_errors.append(f"{ref.sample_id}: {exc}")
+            try:
+                reader = StreamingRefChannel(channel_path)
+                while True:
+                    refs = reader.poll(max_n=1024)
+                    if not refs:
+                        break
+                    for ref in refs:
+                        try:
+                            store.abort(ref.sample_id, reason="online-attempt-finished")
+                        except Exception as exc:
+                            cleanup_errors.append(
+                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                            )
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"published-ref scan: {type(exc).__name__}: {exc}"
+                )
+            try:
+                drain_feature_store_removals(store)
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"pending-remove drain: {type(exc).__name__}: {exc}"
+                )
+            if primary_exc is not None and cleanup_errors:
+                raise RuntimeError(
+                    f"producer failed ({type(primary_exc).__name__}: "
+                    f"{primary_exc}) and Mooncake cleanup also failed: "
+                    f"{cleanup_errors}"
+                ) from primary_exc
             if primary_exc is not None:
                 raise primary_exc
             if cleanup_errors:

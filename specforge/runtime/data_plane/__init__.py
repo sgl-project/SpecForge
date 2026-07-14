@@ -10,6 +10,7 @@ from importlib import import_module
 __all__ = [
     "FeatureStore",
     "LocalFeatureStore",
+    "drain_feature_store_removals",
     "load_feature_file",
     "spec_from_tensor",
     "SampleRefQueue",
@@ -26,6 +27,7 @@ __all__ = [
 _EXPORT_MODULE = {
     "FeatureStore": "feature_store",
     "LocalFeatureStore": "feature_store",
+    "drain_feature_store_removals": "feature_store",
     "load_feature_file": "feature_store",
     "spec_from_tensor": "feature_store",
     "SampleRefQueue": "sample_ref_queue",

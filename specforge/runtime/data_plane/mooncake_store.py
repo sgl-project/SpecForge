@@ -37,8 +37,10 @@ no-data-loss guarantee). We therefore **hard-pin** every object on ``put`` and
 free it only by explicit ``remove()`` on consume/abort — SpecForge is the sole
 lifetime authority, not Mooncake's LRU. Because ``remove()`` is a real (fallible)
 RPC, ``release()`` parks a failed free in ``_release_pending`` and ``gc()``
-retries up to ``max_release_attempts`` before giving up — the
-``LocalFeatureStore`` reclamation seam that ``SharedDirFeatureStore`` dropped.
+retries up to ``max_release_attempts`` during steady state. Lifecycle shutdown
+calls :meth:`drain_pending_removals`, a separate bounded retry that raises if
+physical removal never succeeds; failed hard-pinned objects are never silently
+dropped from bookkeeping.
 
 Concurrency: ``release``/``abort``/``gc`` hold ``self._lock`` across the
 ``remove()`` RPC. The lock is what makes consume-once free race-free against a
@@ -227,7 +229,8 @@ class MooncakeFeatureStore(FeatureStore):
         # ref in hand at release() time.
         self._sample_names: Dict[str, List[str]] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
-        # samples whose remote remove() failed; retried/force-freed by gc()
+        # Samples whose remote remove() failed. gc() performs bounded
+        # steady-state retries; lifecycle drain either removes them or raises.
         self._release_pending: Dict[str, int] = {}
         # (sample_id, generation) logically freed in THIS process. Mooncake's
         # remove() is lease-deferred (an object keeps a short read-lease), so the
@@ -549,15 +552,20 @@ class MooncakeFeatureStore(FeatureStore):
         return out, gen
 
     # -- lifetime ----------------------------------------------------------
-    def _try_physical_free(self, sample_id: str) -> bool:
+    def _try_physical_free(
+        self,
+        sample_id: str,
+        *,
+        confirm_absent_on_failure: bool = True,
+    ) -> bool:
         """Remove all tensor objects. False on a retryable RPC failure.
 
         Order matters against Mooncake's lease semantics: an is_exist probe
         GRANTS a read lease, and a remove during any live lease fails (-706).
-        So each key is removed FIRST; the exist probe runs only after a failed
-        remove, purely to classify "already gone" as freed. (A probe on a
-        still-live key re-leases it, which is why gc() spaces retries beyond
-        the lease TTL.)
+        So each key is removed FIRST. The optional exist probe runs only after a
+        failed remove, purely to classify "already gone" as freed. Retry loops
+        disable that probe because probing a still-live key would renew its
+        lease and make every following remove fail again.
         """
         gen = self._generation.get(sample_id)
         if gen is None:
@@ -567,7 +575,7 @@ class MooncakeFeatureStore(FeatureStore):
             key = self._tkey(sample_id, gen, name)
             if self._store_remove(key):
                 continue
-            if not self._store_exists(key):
+            if confirm_absent_on_failure and not self._store_exists(key):
                 continue  # already gone (freed remotely) counts as freed
             ok = False
         return ok
@@ -617,6 +625,87 @@ class MooncakeFeatureStore(FeatureStore):
             else:
                 self._release_pending.setdefault(sample_id, 0)
 
+    def drain_pending_removals(
+        self,
+        *,
+        max_attempts: int = 8,
+        retry_interval_s: float = 0.25,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> Dict[str, int]:
+        """Retry deferred removes at lifecycle shutdown or fail loudly.
+
+        ``gc()`` is a periodic best-effort pump.  This method is the stronger
+        terminal contract used by online producer/consumer finalization: it is
+        bounded, never discards the keys needed for another remove attempt, and
+        raises with the remaining sample ids when the remote RPC cannot drain.
+        ``sleep`` is injectable so protocol tests can advance a fake lease clock
+        without wall-clock delays.
+        """
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if retry_interval_s < 0:
+            raise ValueError("retry_interval_s must be >= 0")
+        removed = removed_bytes = 0
+        last_errors: Dict[str, str] = {}
+        attempts_run = 0
+        for attempt in range(max_attempts):
+            attempts_run = attempt + 1
+            with self._lock:
+                pending = list(self._release_pending)
+                if not pending:
+                    return {
+                        "removed": removed,
+                        "removed_bytes": removed_bytes,
+                        "release_pending": 0,
+                        "attempts": attempt,
+                    }
+                final_attempt = attempt + 1 == max_attempts
+                for sample_id in pending:
+                    try:
+                        physically_removed = self._try_physical_free(
+                            sample_id,
+                            # Intermediate retries must not renew Mooncake's
+                            # read lease. The final probe only classifies an
+                            # already-absent key and has no following retry to
+                            # poison.
+                            confirm_absent_on_failure=final_attempt,
+                        )
+                    except Exception as exc:  # preserve state for the next retry
+                        last_errors[sample_id] = f"{type(exc).__name__}: {exc}"
+                        physically_removed = False
+                    if physically_removed:
+                        sample_bytes = self._free_bookkeeping_locked(sample_id)
+                        removed_bytes += sample_bytes
+                        removed += 1
+                        self._stats["force_freed"] += 1
+                        self._stats["force_freed_bytes"] += sample_bytes
+                        last_errors.pop(sample_id, None)
+                    else:
+                        self._release_pending[sample_id] = min(
+                            self.max_release_attempts,
+                            self._release_pending.get(sample_id, 0) + 1,
+                        )
+                remaining = list(self._release_pending)
+            if not remaining:
+                return {
+                    "removed": removed,
+                    "removed_bytes": removed_bytes,
+                    "release_pending": 0,
+                    "attempts": attempts_run,
+                }
+            if attempt + 1 < max_attempts and retry_interval_s:
+                sleep(retry_interval_s)
+
+        with self._lock:
+            remaining = list(self._release_pending)
+        preview = remaining[:16]
+        detail = f"; last errors={last_errors}" if last_errors else ""
+        raise RuntimeError(
+            f"MooncakeFeatureStore {self.store_id} could not drain "
+            f"{len(remaining)} pending removal(s) after {attempts_run} attempts: "
+            f"{preview}{detail}"
+        )
+
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         _t0 = time.monotonic() if self._prof_store else 0.0
         now = self._clock() if now is None else now
@@ -631,22 +720,22 @@ class MooncakeFeatureStore(FeatureStore):
                     and not self._still_leased_locked(sid, self._generation.get(sid))
                 ]
                 for sid in stale:
-                    if self._try_physical_free(sid):
+                    if self._try_physical_free(sid, confirm_absent_on_failure=False):
                         freed_bytes += self._free_bookkeeping_locked(sid)
                         freed += 1
                     else:
                         self._release_pending.setdefault(sid, 0)
-            # reconcile release-pending: retry the fallible remote free.
-            # NO exists pre-check here: is_exist grants a read lease that would
-            # make the following remove fail (-706) on every retry.
+            # Reconcile release-pending without an exists probe: is_exist grants
+            # a read lease that would make the next remove fail (-706).
             for sid in list(self._release_pending):
+                if self._release_pending[sid] >= self.max_release_attempts:
+                    # Keep the physical key metadata and surface the pending
+                    # sample. Lifecycle drain owns the final bounded retry and
+                    # loud failure; silently dropping this bookkeeping would
+                    # make a hard-pinned remote leak invisible.
+                    continue
                 attempts = self._release_pending[sid] + 1
-                if self._try_physical_free(sid):
-                    freed_bytes += self._free_bookkeeping_locked(sid)
-                    freed += 1
-                elif attempts >= self.max_release_attempts:
-                    # give up retrying the remote remove; stop tracking it. The
-                    # remote object may leak — surfaced via force_freed stats.
+                if self._try_physical_free(sid, confirm_absent_on_failure=False):
                     freed_bytes += self._free_bookkeeping_locked(sid)
                     freed += 1
                 else:
