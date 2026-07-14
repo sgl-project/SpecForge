@@ -108,6 +108,23 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         The backbone of the draft model.
         """
 
+    @property
+    def all_tied_weights_keys(self) -> dict:
+        """Bridge Transformers versions that materialize tied keys at post-init."""
+        initialized = getattr(self, "_all_tied_weights_keys", None)
+        if initialized is not None:
+            return initialized
+        tied = getattr(self, "_tied_weights_keys", None)
+        if not tied:
+            return {}
+        if isinstance(tied, dict):
+            return tied
+        return {key: key for key in tied}
+
+    @all_tied_weights_keys.setter
+    def all_tied_weights_keys(self, value: dict) -> None:
+        self._all_tied_weights_keys = value
+
     def freeze_embedding(self) -> None:
         """
         Freeze the embeddings of the draft model so that they are not updated during training.

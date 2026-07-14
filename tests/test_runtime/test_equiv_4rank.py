@@ -59,9 +59,9 @@ def _worker(rank, world_size, workdir, results_dir):
     from specforge.modeling.target import TargetHead
     from specforge.optimizer import BF16Optimizer
     from specforge.runtime.contracts import TrainBatch
-    from specforge.runtime.training.backend import FSDPTrainingBackend, ParallelConfig
-    from specforge.runtime.training.strategy import Eagle3TrainStrategy
-    from specforge.runtime.training.trainer import TrainerCore
+    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.controller import TrainerCore
+    from specforge.training.strategies.base import Eagle3TrainStrategy
 
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -104,6 +104,9 @@ def _worker(rank, world_size, workdir, results_dir):
         target_model_backend="hf",
         shard_target_output=False,
         draft_accumulation_steps=1,
+        # Keep the legacy full-logits teacher path used by this equivalence gate.
+        compact_teacher=False,
+        compact_teacher_chunk_size=None,
     )
 
     # --- legacy path ---
@@ -114,6 +117,9 @@ def _worker(rank, world_size, workdir, results_dir):
         warmup_ratio=0.0,
         total_steps=10,
     )
+    # Both models are deliberately unwrapped in this equivalence gate, so their
+    # replicated parameters use rank-local norm clipping on both paths.
+    opt_a.configure_grad_norm_reduction(enabled=False)
     plosses_a, _, _, _, _, _, _ = run_forward(
         args, model_a, data, head, is_online=False
     )
@@ -186,18 +192,23 @@ class TestEquiv4Rank(unittest.TestCase):
                 results.append(json.load(f))
         self.assertEqual(len(results), WORLD)
 
+        # TrainerCore reports the world-averaged loss, matching production
+        # logging, while the legacy helper leaves each rank's loss local.
+        loss_old_global = sum(res["loss_old"] for res in results) / WORLD
         for res in results:
             self.assertEqual(res["world"], WORLD)
             self.assertEqual(res["tp"], 2)
             self.assertEqual(res["sp"], 2)
-            # per-rank: new path reproduces legacy loss on the same SP slice
             self.assertAlmostEqual(
-                res["loss_old"],
+                loss_old_global,
                 res["loss_new"],
                 places=3,
-                msg=f"rank {res['rank']} loss: old={res['loss_old']} new={res['loss_new']}",
+                msg=(
+                    f"rank {res['rank']} loss: "
+                    f"old_global={loss_old_global} new={res['loss_new']}"
+                ),
             )
-            # grad-norm reduction matches (both reduce across the world group)
+            # Unwrapped paths use the same rank-local clipping semantics.
             self.assertAlmostEqual(
                 res["gn_old"],
                 res["gn_new"],

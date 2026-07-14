@@ -26,7 +26,8 @@ class TestRegenerateTrainData(unittest.TestCase):
     --port 30000
         """,
             disable_proxy=True,
-            enable_hf_mirror=True,
+            enable_hf_mirror=False,
+            sglang_use_modelscope=True,
         )
         wait_for_server(f"http://localhost:30000", disable_proxy=True)
 
@@ -42,7 +43,7 @@ class TestRegenerateTrainData(unittest.TestCase):
     --num-samples 10
         """,
             disable_proxy=True,
-            enable_hf_mirror=True,
+            enable_hf_mirror=False,
         )
         regeneration_process.wait()
         self.assertEqual(regeneration_process.returncode, 0)

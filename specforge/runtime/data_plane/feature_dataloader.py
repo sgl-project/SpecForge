@@ -8,20 +8,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """FeatureDataLoader: ``SampleRef`` + ``FeatureStore`` -> ``TrainBatch``.
 
-The loader is the one place the online/offline difference is erased: it leases
-refs from a queue, fetches their tensors from the store, normalizes each sample
-(an injectable ``per_sample_transform``), collates a batch (an injectable
-``collate_fn``), and emits a ``TrainBatch``. Because both transform and collate
-are injected, the loader carries no model knowledge and is unit-testable on CPU;
-the offline-EAGLE3 run injects the existing ``OfflineEagle3Dataset.process_data``
-and ``DataCollatorWithPadding`` so the result is bit-identical to today's path.
-
-clone-on-fetch is the default: the loader clones tensors out of the store and
-releases the store handle immediately, so prefetch can never race a release.
+Leases refs (consume-once queue or re-iterable ref list), applies the injected
+per-sample transform and collate, and yields ``TrainBatch``es — no model
+knowledge. clone-on-fetch (default) clones tensors out of the store and releases
+the handle immediately, so prefetch can never race a release.
 """
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import torch
@@ -55,11 +51,8 @@ class FeatureDataLoader:
         drop_last: bool = True,
         strategy: str = "eagle3",
         ack: bool = True,
+        gc_interval_s: Optional[float] = 15.0,
     ) -> None:
-        # Two iteration modes, reflecting that online and offline differ in
-        # *iteration* even though they converge at SampleRef:
-        #   - queue: a consume-once stream (online rollout produces over time)
-        #   - refs:  a fixed set, re-iterable across epochs (offline manifest)
         if (queue is None) == (refs is None):
             raise ValueError(
                 "provide exactly one of `queue` (stream) or `refs` (re-iterable)"
@@ -71,10 +64,29 @@ class FeatureDataLoader:
         self.collate_fn = collate_fn or _default_collate
         self.per_sample_transform = per_sample_transform
         self.device = device
+        # CLONE_ON_FETCH=0 skips the defensive clone; safe for the mooncake
+        # zero-copy path, whose get() already allocates a fresh tensor.
+        if os.environ.get("CLONE_ON_FETCH", "1") == "0":
+            clone_on_fetch = False
         self.clone_on_fetch = clone_on_fetch
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack
+        self._seek_batches = 0
+        # Remote stores defer a physical free while the get() read-lease is live
+        # (Mooncake remove -> -706): release() parks it and gc() must retry.
+        # Pump gc on a cadence LONGER than the lease TTL — the store gives up
+        # after max_release_attempts, so rapid retries would leak the object.
+        self.gc_interval_s = gc_interval_s if hasattr(store, "gc") else None
+        self._last_gc = time.monotonic()
+
+    def _maybe_gc(self) -> None:
+        if self.gc_interval_s is None:
+            return
+        now = time.monotonic()
+        if now - self._last_gc >= self.gc_interval_s:
+            self._last_gc = now
+            self.store.gc()
 
     def _validate_refs(self, refs: List[SampleRef]) -> None:
         strategies = {ref.strategy for ref in refs}
@@ -116,11 +128,47 @@ class FeatureDataLoader:
                         f"feature {name!r}: {spec} vs {expected}"
                     )
 
+    # PROFILE_LOADER=N -> every N batches print one [loader rK] line splitting
+    # queue-wait / store-get / clone / release / gc time per batch.
+    _prof_loader = int(os.environ.get("PROFILE_LOADER", "0"))
+
+    def _lp(self) -> dict:
+        s = getattr(self, "_lp_state", None)
+        if s is None:
+            s = {
+                "b": 0,
+                "wait": 0.0,
+                "get": 0.0,
+                "clone": 0.0,
+                "rel": 0.0,
+                "gc": 0.0,
+                "bytes": 0,
+                "t0": time.monotonic(),
+            }
+            self._lp_state = s
+        return s
+
     def _materialize(self, ref: SampleRef) -> Dict[str, torch.Tensor]:
+        _prof = self._prof_loader
+        _t = time.monotonic()
         tensors, handle = self.store.get(ref, device=self.device)
+        if _prof:
+            s = self._lp()
+            s["get"] += time.monotonic() - _t
+            s["bytes"] += sum(t.numel() * t.element_size() for t in tensors.values())
+            _t = time.monotonic()
         if self.clone_on_fetch:
             tensors = {k: v.clone() for k, v in tensors.items()}
+        if _prof:
+            self._lp()["clone"] += time.monotonic() - _t
+            _t = time.monotonic()
         self.store.release(handle, reason="loaded")
+        if _prof:
+            self._lp()["rel"] += time.monotonic() - _t
+            _t = time.monotonic()
+        self._maybe_gc()
+        if _prof:
+            self._lp()["gc"] += time.monotonic() - _t
         if self.per_sample_transform is not None:
             tensors = self.per_sample_transform(tensors)
         return tensors
@@ -153,22 +201,61 @@ class FeatureDataLoader:
             yield from self._iter_queue()
 
     def _iter_refs(self) -> Iterator[TrainBatch]:
-        # Offline: a fixed ref set, re-iterable every epoch. Acking (durable
-        # marker) is the trainer's job via its ack callback, not the loader's.
-        for start in range(0, len(self._refs), self.batch_size):
+        # Acking (the durable marker) is the trainer's job here, not the loader's.
+        skip, self._seek_batches = self._seek_batches, 0
+        for start in range(skip * self.batch_size, len(self._refs), self.batch_size):
             chunk = self._refs[start : start + self.batch_size]
             if self.drop_last and len(chunk) < self.batch_size:
                 break
             yield self._make_batch(chunk)
 
+    def seek(self, num_batches: int) -> None:
+        """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
+
+        Raises on a queue stream (no position to restore — online resume
+        reconciles via the control plane) and when the skip exceeds the available
+        batches (a silently empty epoch is banned).
+        """
+        if self._refs is None:
+            raise ValueError(
+                "seek() applies to refs mode only; a queue stream is consume-once "
+                "(online resume goes through the control plane's skip_ids "
+                "reconciliation, not a loader seek)"
+            )
+        skip = max(0, int(num_batches))
+        if self.drop_last:
+            available = len(self._refs) // self.batch_size
+        else:
+            available = -(-len(self._refs) // self.batch_size)
+        if skip > available:
+            raise ValueError(
+                f"seek({num_batches}) skips past the end of the data: only "
+                f"{available} batches available ({len(self._refs)} refs at "
+                f"batch_size={self.batch_size}, drop_last={self.drop_last}); "
+                f"the resume position does not fit this dataset"
+            )
+        self._seek_batches = skip
+
     def _iter_queue(self) -> Iterator[TrainBatch]:
+        # LOADER_PREFETCH=N (>0) materializes up to N batches ahead on a
+        # background thread so the training step never pays fetch latency
+        # inline. Ack still happens on the consuming thread AFTER the trainer
+        # has taken the batch (same in-flight semantics as the sync path).
+        depth = int(os.environ.get("LOADER_PREFETCH", "0"))
+        if depth > 0:
+            yield from self._iter_queue_prefetch(depth)
+            return
+        _prof = self._prof_loader
         while True:
+            _t = time.monotonic()
             refs = self.queue.get(self.batch_size, timeout_s=0.0)
+            if _prof:
+                s = self._lp()
+                s["wait"] += time.monotonic() - _t
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
-                # Incomplete trailing batch: fail-retryable so it is not lost,
-                # then stop (mirrors DataLoader(drop_last=True) per epoch pass).
+                # fail-retryable so the incomplete trailing batch is not lost
                 self.queue.fail(refs, reason="drop_last", retryable=True)
                 return
             try:
@@ -176,6 +263,87 @@ class FeatureDataLoader:
             except Exception as exc:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
                 raise
+            if _prof:
+                s = self._lp()
+                s["b"] += 1
+                if s["b"] >= _prof:
+                    win = time.monotonic() - s["t0"]
+                    rank = os.environ.get("RANK", "?")
+                    print(
+                        f"[loader r{rank}] b={s['b']} win_s={win:.2f} "
+                        f"wait_ms={1000*s['wait']/s['b']:.1f} "
+                        f"get_ms={1000*s['get']/s['b']:.1f} "
+                        f"clone_ms={1000*s['clone']/s['b']:.1f} "
+                        f"rel_ms={1000*s['rel']/s['b']:.1f} "
+                        f"gc_ms={1000*s['gc']/s['b']:.1f} "
+                        f"MB={s['bytes']/s['b']/1e6:.1f} (avg/batch)",
+                        flush=True,
+                    )
+                    self._lp_state = None
+            yield batch
+            if self.ack:
+                self.queue.ack(refs)
+
+    def _iter_queue_prefetch(self, depth: int) -> Iterator[TrainBatch]:
+        import queue as _queue
+        import threading
+
+        _prof = self._prof_loader
+        buf: "_queue.Queue" = _queue.Queue(maxsize=depth)
+        _EOS = object()
+
+        def _worker() -> None:
+            try:
+                while True:
+                    refs = self.queue.get(self.batch_size, timeout_s=0.0)
+                    if not refs:
+                        buf.put(_EOS)
+                        return
+                    if self.drop_last and len(refs) < self.batch_size:
+                        self.queue.fail(refs, reason="drop_last", retryable=True)
+                        buf.put(_EOS)
+                        return
+                    try:
+                        batch = self._make_batch(refs)
+                    except Exception as exc:
+                        self.queue.fail(
+                            refs, reason=f"materialize:{exc}", retryable=False
+                        )
+                        buf.put(exc)
+                        return
+                    buf.put((batch, refs))
+            except BaseException as exc:  # loud failure, never a silent hang
+                buf.put(exc)
+
+        threading.Thread(target=_worker, name="loader-prefetch", daemon=True).start()
+        while True:
+            _t = time.monotonic()
+            item = buf.get()
+            if _prof:
+                s = self._lp()
+                s["wait"] += time.monotonic() - _t
+            if item is _EOS:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            batch, refs = item
+            if _prof:
+                s = self._lp()
+                s["b"] += 1
+                if s["b"] >= _prof:
+                    win = time.monotonic() - s["t0"]
+                    rank = os.environ.get("RANK", "?")
+                    print(
+                        f"[loader r{rank}] b={s['b']} win_s={win:.2f} "
+                        f"wait_ms={1000*s['wait']/s['b']:.1f} "
+                        f"get_ms={1000*s['get']/s['b']:.1f} "
+                        f"clone_ms={1000*s['clone']/s['b']:.1f} "
+                        f"rel_ms={1000*s['rel']/s['b']:.1f} "
+                        f"gc_ms={1000*s['gc']/s['b']:.1f} "
+                        f"MB={s['bytes']/s['b']/1e6:.1f} (avg/batch, prefetch)",
+                        flush=True,
+                    )
+                    self._lp_state = None
             yield batch
             if self.ack:
                 self.queue.ack(refs)

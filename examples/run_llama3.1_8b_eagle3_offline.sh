@@ -16,7 +16,8 @@ torchrun \
     --chat-template llama3 \
     --max-length 4096 \
     --tp-size $TP_SIZE \
-    --batch-size 32
+    --batch-size 32 \
+    --sglang-mem-fraction-static 0.7
 
 # train eagle3 offline
 torchrun \

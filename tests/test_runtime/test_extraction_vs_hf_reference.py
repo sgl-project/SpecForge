@@ -28,9 +28,9 @@ class TestExtractionVsHFReference(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29564")
 
+        from specforge.inference.adapters.eagle3 import SGLangAdapter
+        from specforge.inference.capture import CaptureConfig, verify_capture
         from specforge.runtime.contracts import PromptTask
-        from specforge.runtime.inference.capture import CaptureConfig, verify_capture
-        from specforge.runtime.inference.sglang_adapter import SGLangAdapter
 
         H, V, SEQ = fx.H, fx.V, 12
         workdir = tempfile.mkdtemp(prefix="extract_")
@@ -103,7 +103,7 @@ class TestExtractionVsHFReference(unittest.TestCase):
 
     def test_capture_layer_mismatch_fails(self):
         """A recorded aux-layer set != requested fails loudly at the boundary."""
-        from specforge.runtime.inference.capture import (
+        from specforge.inference.capture import (
             CaptureConfig,
             CaptureMismatchError,
             verify_capture,

@@ -153,7 +153,7 @@ def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4
     """Build a tiny HF Llama target wrapped by the SpecForge HF eagle3 backend."""
     from transformers import LlamaConfig, LlamaForCausalLM
 
-    from specforge.modeling.target import get_eagle3_target_model
+    from specforge.modeling.target import get_target_engine
 
     cfg = LlamaConfig(
         hidden_size=hidden,
@@ -170,8 +170,9 @@ def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4
     model = LlamaForCausalLM(cfg)
     target_dir = os.path.join(workdir, "hf_target")
     model.save_pretrained(target_dir)
-    target = get_eagle3_target_model(
-        pretrained_model_name_or_path=target_dir,
+    target = get_target_engine(
+        target_dir,
+        strategy="eagle3",
         backend="hf",
         torch_dtype=torch.bfloat16,
         device="cuda",
@@ -200,3 +201,177 @@ def build_eagle3(workdir, ttt=3):
         draft_model=draft_model, length=ttt, attention_backend="flex_attention"
     ).cuda()
     return eagle3_model, target_head
+
+
+# --- DFlash fixtures ---------------------------------------------------------
+# DFlash has its OWN feature schema: 'hidden_states' = concat of the target
+# capture layers (NO eagle3 aux/target swap, NO target distribution). For a
+# single draft layer the capture set is one layer, so width == hidden_size.
+
+
+def write_offline_files_dflash(d, n=4, seq=32, hidden=H, vocab=V, seed=0):
+    """Write synthetic DFlash offline .ckpt files: {input_ids, loss_mask, hidden_states}.
+
+    No production dumper for DFlash exists yet (prepare_hidden_states.py is the
+    EAGLE3 dumper), so the offline DataFlow path is exercised with synthetic files.
+    loss_mask is all-ones with seq >= 2*block_size so anchor sampling succeeds;
+    hidden_states is bf16 (uniform dtype across files for the loader's spec check).
+    """
+    os.makedirs(d, exist_ok=True)
+    g = torch.Generator().manual_seed(seed)
+    for i in range(n):
+        torch.save(
+            {
+                "input_ids": torch.randint(0, vocab, (seq,), generator=g),
+                "loss_mask": torch.ones(seq, dtype=torch.long),
+                # width == len(target_layer_ids)*hidden; single draft layer -> hidden
+                "hidden_states": torch.randn(1, seq, hidden, generator=g).to(
+                    torch.bfloat16
+                ),
+            },
+            os.path.join(d, f"{i:04d}.ckpt"),
+        )
+    return d
+
+
+def build_dflash(
+    workdir,
+    *,
+    hidden=H,
+    vocab=V,
+    target_layers=4,
+    draft_layers=1,
+    block_size=4,
+    num_anchors=8,
+    mask_token_id=0,
+    attention_backend="sdpa",
+):
+    """Build a tiny OnlineDFlashModel on cuda, mirroring scripts/train_dflash.build_models.
+
+    Returns (dflash_model, hidden_states_width, target_dir, target_layer_ids).
+    target_dir holds the saved tiny Qwen3 target (load it as an HF DFlash target for
+    the ONLINE path); target_layer_ids are the capture layers (== set_capture_layers).
+    For draft_layers=1 the capture set is one target layer so width == hidden.
+    """
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    from specforge.core.dflash import OnlineDFlashModel
+    from specforge.modeling.draft.dflash import DFlashDraftModel
+    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+    # tiny Qwen3 target saved to disk (draft config is derived from it, as in train_dflash)
+    tcfg = Qwen3Config(
+        hidden_size=hidden,
+        intermediate_size=2 * hidden,
+        num_hidden_layers=target_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=vocab,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(1234)
+    target_dir = os.path.join(workdir, "dflash_target")
+    Qwen3ForCausalLM(tcfg).save_pretrained(target_dir)
+
+    draft_config = AutoConfig.from_pretrained(target_dir)
+    draft_config.num_hidden_layers = draft_layers
+    draft_config.block_size = block_size
+    draft_config.num_target_layers = target_layers
+    draft_config.dflash_config = {"mask_token_id": mask_token_id}
+    draft_config._attn_implementation = attention_backend
+
+    draft_model = DFlashDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
+    draft_model.mask_token_id = mask_token_id
+
+    target_components = TargetEmbeddingsAndHead.from_pretrained(
+        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
+    )
+
+    dflash_model = OnlineDFlashModel(
+        draft_model=draft_model,
+        target_lm_head=target_components.lm_head,
+        target_embed_tokens=target_components.embed_tokens,
+        block_size=draft_model.block_size,
+        mask_token_id=mask_token_id,
+        attention_backend=attention_backend,
+        num_anchors=num_anchors,
+        loss_type="dflash",
+    ).cuda()
+    width = len(draft_model.target_layer_ids) * hidden
+    return dflash_model, width, target_dir, list(draft_model.target_layer_ids)
+
+
+def build_domino(
+    workdir,
+    *,
+    hidden=H,
+    vocab=V,
+    target_layers=4,
+    draft_layers=1,
+    block_size=4,
+    num_anchors=8,
+    mask_token_id=0,
+    attention_backend="sdpa",
+):
+    """Build a tiny OnlineDominoModel on cuda, mirroring scripts/train_domino.
+
+    Domino uses a DFlash-backed DominoDraftModel with a GRU prefix + embed
+    projection head. Returns
+    (domino_model, hidden_states_width, target_dir, target_layer_ids).
+    """
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    from specforge.core.dflash import OnlineDominoModel
+    from specforge.modeling.draft.domino import DominoDraftModel
+    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+    tcfg = Qwen3Config(
+        hidden_size=hidden,
+        intermediate_size=2 * hidden,
+        num_hidden_layers=target_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=vocab,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(1234)
+    target_dir = os.path.join(workdir, "domino_target")
+    Qwen3ForCausalLM(tcfg).save_pretrained(target_dir)
+
+    draft_config = AutoConfig.from_pretrained(target_dir)
+    draft_config.num_hidden_layers = draft_layers
+    draft_config.block_size = block_size
+    draft_config.num_target_layers = target_layers
+    draft_config.dflash_config = {
+        "projector_type": "domino",
+        "emb_dim": hidden,
+        "gru_hidden_dim": hidden // 2,
+        "pure_draft_prefix_len": 0,
+        "shift_label": False,
+        "mask_token_id": mask_token_id,
+    }
+    draft_config._attn_implementation = attention_backend
+
+    draft_model = DominoDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
+    draft_model.mask_token_id = mask_token_id
+
+    target_components = TargetEmbeddingsAndHead.from_pretrained(
+        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
+    )
+
+    domino_model = OnlineDominoModel(
+        draft_model=draft_model,
+        target_lm_head=target_components.lm_head,
+        target_embed_tokens=target_components.embed_tokens,
+        block_size=draft_model.block_size,
+        mask_token_id=mask_token_id,
+        attention_backend=attention_backend,
+        num_anchors=num_anchors,
+        shift_label=draft_model.shift_label,
+    ).cuda()
+    width = len(draft_model.target_layer_ids) * hidden
+    return domino_model, width, target_dir, list(draft_model.target_layer_ids)

@@ -3,8 +3,7 @@ import unittest
 import torch
 
 from specforge.core.loss import LogSoftmaxLoss, _compute_loss
-
-from .utils import norm_tensor
+from tests.test_utils.utils import norm_tensor
 
 
 class TestLogSoftmaxLoss(unittest.TestCase):

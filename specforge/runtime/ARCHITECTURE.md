@@ -9,12 +9,12 @@ its own design note (see "Per-plane internals" below).
 - **Contracts** — the stdlib-only data records every plane exchanges (`PromptTask`, `SampleRef`, `FeatureSpec`, `FeatureHandle`, `TrainBatch`) plus `assert_no_tensors`, which enforces the no-tensor boundary. Control-plane records carry metadata only; `TrainBatch` is the sole tensor carrier and lives only on the trainer side.
 - **Control plane** — `DataFlowController` (a passive coordinator with no run loop), `MetadataStore` (commit dedup + the single durable ack transaction), `SampleRefQueue` (lease/ack/fail transport), and `TrainLease`. Moves metadata only; every record-accepting entrypoint runs `assert_no_tensors`.
 - **Data plane** — `FeatureStore`/`LocalFeatureStore` is the only holder of tensors, addressed by metadata-only `SampleRef`. `FeatureDataLoader` is the bridge that materializes refs + store into collated `TrainBatch`es; `OfflineManifestReader` turns precomputed `.ckpt` files into in-place `file://` refs.
-- **Inference (compute)** — `RolloutWorker` + `SGLangAdapter` extract features from the target engine and commit only `SampleRef` metadata; `SGLangAdapter._project_target` is the sole target to draft projection site and `verify_capture` is the loud pre-`put` validator.
+- **Inference (compute)** — `RolloutWorker` + `PolicyFeatureAdapter` (schema-parameterized; `SGLangAdapter`/`DFlashAdapter` are thin subclasses) extract features from the target engine and commit only `SampleRef` metadata; `PolicyFeatureAdapter._project_target` is the sole target to draft projection site and `verify_capture` is the loud pre-`put` validator.
 - **Training (compute)** — `TrainerController` -> `TrainerCore` -> `DraftTrainStrategy` + `FSDPTrainingBackend` turn `TrainBatch`es into optimizer steps and checkpoints; the strategy owns projection/loss, the core is branch-free.
 
 ## End-to-end flow
 
-**Online:** `RolloutWorker.run_once` leases prompts (`lease_prompt_tasks`), calls `generate_features` (which drives `generate_eagle3_data`), runs `verify_capture`, then `FeatureStore.put` writes tensors **directly to the data plane**. Only the resulting `SampleRef` metadata goes to the controller via `commit_samples`, which dedups through `MetadataStore.commit_sample` and enqueues fresh refs onto `SampleRefQueue`.
+**Online:** `RolloutWorker.run_once` leases prompts (`lease_prompt_tasks`), calls `generate_features` (which drives the engine's generic `TargetEngine.capture`), runs `verify_capture`, then `FeatureStore.put` writes tensors **directly to the data plane**. Only the resulting `SampleRef` metadata goes to the controller via `commit_samples`, which dedups through `MetadataStore.commit_sample` and enqueues fresh refs onto `SampleRefQueue`.
 
 **Offline:** `OfflineManifestReader.read()` emits in-place `file://` `SampleRef`s (no tensor copy) and the launcher calls `enqueue_offline_refs`, which dedups and enqueues onto the **same** `SampleRefQueue`.
 
@@ -35,8 +35,8 @@ flowchart TD
 
   subgraph COMPUTE[compute autonomous loops]
     RW[RolloutWorker run_once loop]
-    SG[SGLangAdapter generate_features]
-    TGT[Eagle3TargetModel generate_eagle3_data]
+    SG[PolicyFeatureAdapter generate_features]
+    TGT[TargetEngine capture via SGLangCaptureBackend]
     TR[TrainerController fit loop]
     CORE[TrainerCore train_step]
     STRAT[Eagle3TrainStrategy forward_loss]
@@ -59,7 +59,7 @@ flowchart TD
   RW -->|register_rollout_worker| CTRL
   RW -->|lease_prompt_tasks| CTRL
   RW -->|generate_features| SG
-  SG -->|generate_eagle3_data| TGT
+  SG -->|capture| TGT
   RW -.->|put| STORE
   RW -->|commit_samples| CTRL
   RW -->|fail_prompt_tasks| CTRL
@@ -96,8 +96,8 @@ flowchart TD
 |---|---|---|---|
 | RolloutWorker | register_rollout_worker | control | Register worker, obtain authoritative worker_id (no-tensor guard on info) |
 | RolloutWorker | lease_prompt_tasks | control | Pop up to max_tasks pending PromptTasks, mark leased to worker_id |
-| RolloutWorker | generate_features | compute | Ask the FeatureSource (SGLangAdapter) for one feature dict per task |
-| SGLangAdapter | generate_eagle3_data | compute | Run the target engine's batched forward to extract hidden_states/target |
+| RolloutWorker | generate_features | compute | Ask the FeatureSource (PolicyFeatureAdapter) for one feature dict per task |
+| PolicyFeatureAdapter | TargetEngine.capture | compute | Run the target engine's batched forward (sglang glue in SGLangCaptureBackend) to extract a typed TargetCaptureBatch (hidden_states/target) |
 | RolloutWorker | put | data | Persist verified feature tensors directly to FeatureStore, get back a SampleRef |
 | RolloutWorker | abort | data | Clean up a partial/failed write so no corrupt sample is left |
 | RolloutWorker | commit_samples | control | Commit metadata-only SampleRefs; dedup + enqueue fresh refs |
@@ -118,7 +118,7 @@ flowchart TD
 | FeatureDataLoader | release | data | Release the lease immediately after clone-on-fetch so prefetch can't race |
 | TrainerController | for batch in loader (__iter__) | compute | Drive the loader to yield collated TrainBatch objects |
 | TrainerController | train_step | compute | Run each micro-batch; read optimizer_stepped boundary signal |
-| TrainerController | eval_step | compute | Run eval batches and aggregate metrics |
+| TrainerController | Evaluator.run (over forward_loss) | compute | Run eval batches; aggregate per-position counts across the pass and DP ranks |
 | TrainerController | ack_fn -> ack_train_refs | control | Close the ack loop: ack consumed sample_ids at the optimizer-step boundary |
 | TrainerCore | forward_loss | compute | Delegate model-specific forward + loss to the strategy |
 | TrainerCore | backward | compute | Run backward on the accumulation-scaled loss each micro-step |

@@ -6,21 +6,31 @@ import unittest
 
 import torch
 
+from specforge.inference.adapters.eagle3 import SGLangAdapter
+from specforge.inference.capture import CaptureConfig
 from specforge.runtime.contracts import PromptTask
-from specforge.runtime.inference.capture import CaptureConfig
-from specforge.runtime.inference.sglang_adapter import SGLangAdapter
 
 H, V = 4, 16
 
 
 class FakeTarget:
-    """Records each generate_eagle3_data call's batch size; encodes the first
-    token id into hidden_states so per-sample slicing can be verified."""
+    """Records each capture() call's batch size; encodes the first token id into
+    hidden_states so per-sample slicing can be verified. Mirrors the TargetEngine
+    contract the adapter now speaks: capture() dispatches to generate_eagle3_data
+    (the back-compat method), exactly like the real engine."""
 
     aux_hidden_states_layers = [1, 2, 3]
 
     def __init__(self):
         self.call_batch_sizes = []
+
+    def capture(self, input_ids, attention_mask, loss_mask, **kwargs):
+        return self.generate_eagle3_data(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            **kwargs,
+        )
 
     def generate_eagle3_data(
         self, input_ids, attention_mask, loss_mask, shard_returns=False

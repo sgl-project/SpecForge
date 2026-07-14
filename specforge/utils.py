@@ -45,7 +45,27 @@ def load_tokenizer(pretrained_model_name_or_path, **kwargs):
     serialized in ``tokenizer.json``, we reload faithfully via
     ``PreTrainedTokenizerFast``, which uses ``tokenizer.json`` as-is.
     """
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+    faithful_kwargs = {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+    except (AttributeError, ValueError) as exc:
+        # The old eager SGLang target import happened to register some remote
+        # model configs (for example DeepSeek-V3.2) before tokenizer loading.
+        # The refactored target-engine boundary intentionally removed that side
+        # effect. A generic fast tokenizer can load tokenizer.json directly and
+        # does not need the model config to be registered.
+        logger.warning(
+            "AutoTokenizer could not resolve %s (%s: %s); loading "
+            "tokenizer.json with PreTrainedTokenizerFast instead.",
+            pretrained_model_name_or_path,
+            type(exc).__name__,
+            exc,
+        )
+        return PreTrainedTokenizerFast.from_pretrained(
+            pretrained_model_name_or_path, **faithful_kwargs
+        )
 
     if not getattr(tokenizer, "is_fast", False):
         return tokenizer
@@ -95,7 +115,6 @@ def load_tokenizer(pretrained_model_name_or_path, **kwargs):
         sorted(loaded_types) or "none",
     )
     # PreTrainedTokenizerFast loads tokenizer.json verbatim and needs no remote code.
-    faithful_kwargs = {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
     return PreTrainedTokenizerFast.from_pretrained(
         pretrained_model_name_or_path, **faithful_kwargs
     )

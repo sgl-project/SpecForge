@@ -127,6 +127,43 @@ class InMemoryMetadataStore(MetadataStore):
             }
 
 
+class NoOpMetadataStore(MetadataStore):
+    """MetadataStore implementation for ``local_colocated`` runs.
+
+    It retains no committed refs or ack marker. ``commit_sample`` always reports
+    a fresh ref so the existing controller path still enqueues it; status and
+    recovery surfaces stay empty. Use a retaining store for cross-process or
+    restart-reconcilable runs.
+    """
+
+    def commit_sample(self, ref: SampleRef) -> bool:
+        return True
+
+    def is_committed(self, sample_id: str) -> bool:
+        return False
+
+    def get_committed(self, sample_id: str) -> Optional[SampleRef]:
+        return None
+
+    def committed_count(self) -> int:
+        return 0
+
+    def all_committed_ids(self) -> List[str]:
+        return []
+
+    def record_train_ack(
+        self,
+        sample_ids: List[str],
+        *,
+        global_step: Optional[int],
+        optimizer_durable: bool,
+    ) -> None:
+        pass
+
+    def durable_marker(self) -> Dict[str, Any]:
+        return {"acked": set(), "global_step": None, "optimizer_durable": False}
+
+
 # ---------------------------------------------------------------------------
 # SampleRef <-> JSON (the only metadata-store payload that needs persisting)
 # ---------------------------------------------------------------------------
@@ -288,6 +325,7 @@ class SQLiteMetadataStore(MetadataStore):
 __all__ = [
     "MetadataStore",
     "InMemoryMetadataStore",
+    "NoOpMetadataStore",
     "SQLiteMetadataStore",
     "sample_ref_to_json",
     "sample_ref_from_json",
