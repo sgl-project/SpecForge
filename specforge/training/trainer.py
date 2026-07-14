@@ -17,13 +17,14 @@ ref source + store the Trainer is handed — the loader IS the stream.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Optional
 
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
-from specforge.training.strategies.registry import StrategySpec, resolve_strategy
+from specforge.training.strategies.registry import StrategySpec
 
 
 class Trainer:
@@ -55,6 +56,7 @@ class Trainer:
         durable_ack: bool = True,
         resume_from: Optional[str] = None,
         max_checkpoints: int = 0,
+        fit_context=None,
     ):
         # Fixed offline refs never enter an online staging queue. The loader
         # releases each feature as it consumes it and can re-iterate the same
@@ -198,30 +200,45 @@ class Trainer:
             start_samples=resume["epoch_samples"] if resume else 0,
         )
 
-        # Runtime pieces exposed for direct callers (and for
-        # launch._assemble_trainer's (controller, loader) tuple).
+        # Runtime pieces remain inspectable behind the single Trainer lifecycle.
         self.spec = spec
+        self.run_id = run_id
+        self.output_dir = output_dir
+        self.batch_size = batch_size
+        self.max_steps = max_steps
+        self.max_checkpoints = max_checkpoints
         self.dataflow_controller = controller
         self.trainer_id = trainer_id
         self.backend = backend
         self.core = core
-        #: the runtime TrainerController (has fit / save_checkpoint)
-        self.controller = controller_obj
-        #: the FeatureDataLoader -> TrainBatch iterator (the canonical "stream")
-        self.loader = loader
+        self._controller = controller_obj
+        self._loader = loader
+        self._fit_context = fit_context
 
-    @classmethod
-    def from_strategy_name(cls, strategy: str, **kwargs) -> "Trainer":
-        """Resolve the :class:`StrategySpec` by name, then assemble."""
-        return cls(spec=resolve_strategy(strategy), **kwargs)
+    @property
+    def global_step(self) -> int:
+        return self._controller.global_step
+
+    @property
+    def micro_step(self) -> int:
+        return self._controller.micro_step
+
+    @property
+    def last_checkpoint_step(self) -> Optional[int]:
+        return self._controller.last_checkpoint_step
 
     def fit(self) -> int:
-        """Run the training loop over the loader; returns the final global step."""
-        return self.controller.fit(self.loader)
+        """Run the one trainer lifecycle and leave a final checkpoint."""
+        context = self._fit_context if self._fit_context is not None else nullcontext()
+        with context:
+            step = self._controller.fit(self._loader)
+        if step > 0 and self.last_checkpoint_step != step:
+            self.save_checkpoint()
+        return step
 
-    def save_checkpoint(self, step: Optional[int] = None):
-        step = self.controller.global_step if step is None else step
-        return self.controller.save_checkpoint(step)
+    def save_checkpoint(self):
+        """Persist the current optimizer step through the one trainer surface."""
+        return self._controller.save_checkpoint(self.global_step)
 
 
 __all__ = ["Trainer"]

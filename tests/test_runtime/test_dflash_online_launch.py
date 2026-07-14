@@ -74,7 +74,7 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
+        trainer = build_online_runtime(
             strategy="dflash",
             target_model=target,
             prompts=prompts,
@@ -89,18 +89,18 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
         )
 
         # Build is metadata-only; rollout starts when the trainer requests a batch.
-        self.assertEqual(controller.sample_queue.depth(), 0)
-        assert_no_tensors(controller.status())
+        self.assertEqual(trainer.dataflow_controller.sample_queue.depth(), 0)
+        assert_no_tensors(trainer.dataflow_controller.status())
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
 
-        step = run_interleaved()
+        step = trainer.fit()
 
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
-        self.assertEqual(loader.queue.produced_count, ACC * MAX_OPT_STEPS)
-        self.assertLessEqual(loader.queue.peak_resident_samples, 1)
+        self.assertEqual(trainer.rollout_stream.produced_count, ACC * MAX_OPT_STEPS)
+        self.assertLessEqual(trainer.rollout_stream.peak_resident_samples, 1)
         self.assertTrue(
             all(torch.isfinite(p).all() for p in module.parameters()),
             "draft params became non-finite — loss was NaN/inf?",

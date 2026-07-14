@@ -7,6 +7,7 @@ checkpoint record shape, and DFlash plug-in wiring.
 
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -73,7 +74,12 @@ class TestParallelConfigHandles(unittest.TestCase):
         self.assertEqual(pc.sharding_strategy, "SHARD_GRAD_OP")
 
     def test_from_distributed_no_dist(self):
-        pc = ParallelConfig.from_distributed()
+        # Keep this test independent of process groups initialized by earlier
+        # GPU launcher tests in the same unittest process.
+        with mock.patch(
+            "specforge.training.backend.dist.is_initialized", return_value=False
+        ):
+            pc = ParallelConfig.from_distributed()
         self.assertIsNone(pc.fsdp_process_group)
 
 

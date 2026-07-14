@@ -5,30 +5,17 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from functools import partial
 
 import torch
 
+from specforge.data.preprocessing import process_offline_eagle3_sample
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
-
-def _offline_eagle3_process_data(raw):
-    """Mirror of OfflineEagle3Dataset.process_data (the aux<->target swap)."""
-    max_len = 2048
-    hidden_state = raw["aux_hidden_state"].squeeze(0)[:max_len][None, :]
-    target = raw["hidden_state"].squeeze(0)[:max_len][None, :]
-    input_ids = raw["input_ids"][:max_len][None, :]
-    loss_mask = raw["loss_mask"][:max_len][None, :].clone()
-    loss_mask[0, -1] = 0
-    return {
-        "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),
-        "loss_mask": loss_mask,
-        "target": target,
-        "hidden_state": hidden_state,
-        "input_ids": input_ids,
-    }
+_OFFLINE_EAGLE3_TRANSFORM = partial(process_offline_eagle3_sample, max_len=2048)
 
 
 def _simple_collate(features):
@@ -74,7 +61,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 q,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
             )
             batches = list(loader)
             self.assertEqual(len(batches), 2)  # 4 samples / batch 2
@@ -99,7 +86,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 refs=refs,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
                 drop_last=True,
             )
             batches = list(loader)
@@ -115,7 +102,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 q,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
                 drop_last=True,
             )
             with self.assertRaisesRegex(RuntimeError, "incomplete batch"):
@@ -138,7 +125,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 q,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
             )
             with self.assertRaises(ValueError):
                 list(loader)
@@ -155,7 +142,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 refs=refs,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
             )
             epoch1 = [b.sample_ids for b in loader]
             epoch2 = [b.sample_ids for b in loader]
@@ -173,7 +160,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 refs=refs,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
             )
             full = [b.sample_ids for b in loader]
             self.assertEqual(len(full), 3)
@@ -200,7 +187,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 refs=refs,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
             )
             with self.assertRaisesRegex(ValueError, "skips past the end of the data"):
                 loader.seek(4)  # 6 refs / batch 2 = 3 batches
@@ -217,7 +204,7 @@ class TestFeatureDataLoader(unittest.TestCase):
                 refs=refs,
                 batch_size=2,
                 collate_fn=_simple_collate,
-                per_sample_transform=_offline_eagle3_process_data,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
                 drop_last=False,
             )
             loader.seek(3)  # ceil(5/2) = 3: the trailing partial batch counts
@@ -233,7 +220,7 @@ class TestFeatureDataLoader(unittest.TestCase):
 
             def counting_transform(raw):
                 transform_calls.append(1)
-                return _offline_eagle3_process_data(raw)
+                return _OFFLINE_EAGLE3_TRANSFORM(raw)
 
             loader = FeatureDataLoader(
                 store,
@@ -248,6 +235,23 @@ class TestFeatureDataLoader(unittest.TestCase):
         # only the yielded batch's 2 refs are fetched/transformed
         self.assertEqual(store.gets, 2)
         self.assertEqual(len(transform_calls), 2)
+
+    def test_offline_transform_does_not_mutate_raw_loss_mask(self):
+        raw = {
+            "input_ids": torch.arange(4),
+            "loss_mask": torch.ones(4, dtype=torch.long),
+            "hidden_state": torch.randn(1, 4, 2),
+            "aux_hidden_state": torch.randn(1, 4, 6),
+        }
+        original_loss_mask = raw["loss_mask"].clone()
+
+        transformed = process_offline_eagle3_sample(raw, max_len=3)
+
+        self.assertTrue(torch.equal(raw["loss_mask"], original_loss_mask))
+        self.assertEqual(transformed["input_ids"].shape, (1, 3))
+        self.assertEqual(transformed["hidden_state"].shape, (1, 3, 6))
+        self.assertEqual(transformed["target"].shape, (1, 3, 2))
+        self.assertEqual(transformed["loss_mask"].tolist(), [[1, 1, 0]])
 
     def test_requires_exactly_one_source(self):
         store = LocalFeatureStore("st")

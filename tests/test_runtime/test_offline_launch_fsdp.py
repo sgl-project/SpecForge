@@ -45,7 +45,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader = build_offline_runtime(
+        trainer = build_offline_runtime(
             strategy="eagle3",
             hidden_states_path=feat_dir,
             draft_model=eagle3_model,
@@ -68,17 +68,15 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
         )
         self.assertIsNotNone(trainer.core.backend.optimizer)
 
-        step = trainer.fit(loader)
+        step = trainer.fit()
 
         # Issue 2: global_step == optimizer steps; micro_step == ACC * optimizer steps
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.global_step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
 
-        # a checkpoint can be written through the FSDP FULL_STATE_DICT path
-        ckpt = trainer.save_checkpoint(trainer.global_step)
-        self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
-        self.assertEqual(ckpt.global_step, MAX_OPT_STEPS)
+        # The unified Trainer lifecycle writes the final FSDP checkpoint.
+        self.assertEqual(trainer.last_checkpoint_step, MAX_OPT_STEPS)
 
 
 if __name__ == "__main__":

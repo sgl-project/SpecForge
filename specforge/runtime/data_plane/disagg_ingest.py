@@ -50,9 +50,8 @@ def ingest_offline_features(
     Returns the ``disagg://`` ``SampleRef``s, in the same deterministic file
     order as ``OfflineManifestReader``. The raw EAGLE3 keys
     (``input_ids``/``loss_mask``/``hidden_state``/``aux_hidden_state``) are stored
-    verbatim — the consumer applies the identical ``OfflineEagle3Dataset``
-    aux->input / hidden->target swap at load time, so an offline run and a
-    disaggregated run see byte-identical tensors.
+    verbatim — the consumer applies ``process_offline_eagle3_sample`` at load
+    time, so colocated and disaggregated offline runs see byte-identical tensors.
     """
     paths = list_feature_files(hidden_states_path)
     if limit is not None:

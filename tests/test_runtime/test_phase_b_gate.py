@@ -107,7 +107,7 @@ class PhaseBLossReproducibilityTest(unittest.TestCase):
 
         losses = []
 
-        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
+        trainer = build_online_runtime(
             strategy="eagle3",
             target_model=target,
             prompts=prompts,
@@ -124,11 +124,10 @@ class PhaseBLossReproducibilityTest(unittest.TestCase):
             batch_size=1,
             accumulation_steps=ACC,
             max_steps=MAX_OPT_STEPS,
+            logger=lambda metrics, step: losses.append(metrics["loss"]),
+            log_interval=1,
         )
-        # capture per-optimizer-step loss via the controller's logger hook
-        trainer.logger = lambda metrics, step: losses.append(metrics["loss"])
-        trainer.log_interval = 1
-        run_interleaved()
+        trainer.fit()
         return losses
 
     def test_online_eagle3_losses_reproducible(self):

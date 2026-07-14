@@ -20,22 +20,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
-from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
-
-
-class Eagle3Model(nn.Module):
-    pass
 
 
 def _compute_loss_and_acceptance_rate(
@@ -47,10 +42,6 @@ def _compute_loss_and_acceptance_rate(
     lk_loss_type: Optional[str],
     kl_scale: float,
     kl_decay: float,
-    reduce_metrics_fn: Optional[
-        Callable[..., Tuple[torch.Tensor, torch.Tensor]]
-    ] = None,
-    reduce_loss_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute step loss and acceptance rate for KL/LK objectives.
 
@@ -62,19 +53,14 @@ def _compute_loss_and_acceptance_rate(
         lk_loss_type: LK objective mode (`None`, `"alpha"`, or `"lambda"`).
         kl_scale: Scale factor for lambda LK mixing weight.
         kl_decay: Decay factor for lambda LK mixing weight.
-        reduce_metrics_fn: Optional distributed reducer for metric numer/denom.
-        reduce_loss_fn: Optional distributed reducer for KL loss.
     """
     kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-    if reduce_loss_fn is not None:
-        kl_loss = reduce_loss_fn(kl_loss)
 
     with torch.set_grad_enabled(lk_loss_type is not None):
         acceptance_rate, log_acceptance_rate = compute_acceptance_rate(
             logits=logits,
             target_probs=target_p_on_draft,
             position_mask=position_mask,
-            reduce_fn=reduce_metrics_fn,
         )
 
     if lk_loss_type is None:
@@ -91,7 +77,7 @@ def _compute_loss_and_acceptance_rate(
     return acceptance_rate.detach(), loss
 
 
-class OnlineEagle3Model(Eagle3Model):
+class OnlineEagle3Model(nn.Module):
     """
     In sgl-spec, we implement offline/online training.
     Online training means we have the target hidden_states available during training.
@@ -128,9 +114,6 @@ class OnlineEagle3Model(Eagle3Model):
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
 
-    def _make_adapter(self) -> BackendAdapter:
-        return SdpaLikeAdapter(self)
-
     def _acc_and_loss(
         self,
         *,
@@ -140,7 +123,6 @@ class OnlineEagle3Model(Eagle3Model):
         target_token_ids: torch.Tensor,
         position_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        adapter: BackendAdapter,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -159,9 +141,6 @@ class OnlineEagle3Model(Eagle3Model):
                 (pred_target_token_ids == target_token_ids) * loss_mask.squeeze(-1)
             ).sum()
             local_denom = loss_mask.sum().clamp_min(1e-6)
-            local_correct, local_denom = adapter.reduce_metrics(
-                local_correct=local_correct, local_denom=local_denom
-            )
             acc = local_correct / local_denom
 
         acceptance_rate, loss = _compute_loss_and_acceptance_rate(
@@ -172,8 +151,6 @@ class OnlineEagle3Model(Eagle3Model):
             lk_loss_type=self.lk_loss_type,
             kl_scale=self.kl_scale,
             kl_decay=self.kl_decay,
-            reduce_metrics_fn=adapter.reduce_metrics,
-            reduce_loss_fn=adapter.reduce_loss,
         )
         loss_denom = torch.tensor(
             logits.shape[0] * logits.shape[1],
@@ -300,7 +277,6 @@ class OnlineEagle3Model(Eagle3Model):
         metric_denoms = []
         metric_losses = []
         metric_loss_denoms = []
-        adapter = self._make_adapter()
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
@@ -312,33 +288,23 @@ class OnlineEagle3Model(Eagle3Model):
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
-            state = adapter.step_view(
-                idx=idx,
-                ttt_length=self.length,
-                global_input_ids=global_input_ids,
-                attention_mask=attention_mask,
-                loss_mask=loss_mask,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                target_p_padded=target_p_padded,
-                target_p_on_draft_padded=target_p_on_draft_padded,
-                target_token_ids_padded=target_token_ids_padded,
-                position_mask=position_mask,
-                seq_length=seq_length,
-            )
+            step_slice = slice(idx, idx + seq_length)
+            target_p = target_p_padded[:, step_slice, :].contiguous()
+            target_p_on_draft = target_p_on_draft_padded[:, step_slice, :].contiguous()
+            target_token_ids = target_token_ids_padded[:, step_slice].contiguous()
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            inputs_embeds = self.draft_model.embed_input_ids(state.input_ids)
+            inputs_embeds = self.draft_model.embed_input_ids(global_input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
-                hidden_states=state.hidden_states,
+                hidden_states=hidden_states,
                 cache_hidden=cache_hidden,
-                attention_mask=state.attention_mask,
-                position_ids=state.position_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
@@ -360,12 +326,11 @@ class OnlineEagle3Model(Eagle3Model):
                 loss_denom,
             ) = self._acc_and_loss(
                 logits=logits,
-                target_p=state.target_p,
-                target_p_on_draft=state.target_p_on_draft,
-                target_token_ids=state.target_token_ids,
-                position_mask=state.position_mask,
-                loss_mask=state.loss_mask,
-                adapter=adapter,
+                target_p=target_p,
+                target_p_on_draft=target_p_on_draft,
+                target_token_ids=target_token_ids,
+                position_mask=position_mask,
+                loss_mask=loss_mask,
             )
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)

@@ -55,25 +55,35 @@ class TrainingRun:
     """A fully assembled run with one lifecycle for rollout and training."""
 
     trainer: Any = None
-    loader: Any = None
     execute: Optional[Callable[[], int]] = None
+    on_success: Optional[Callable[[int], None]] = None
+    on_failure: Optional[Callable[[BaseException], None]] = None
+    on_finally: Optional[Callable[[], None]] = None
+
+    def __post_init__(self) -> None:
+        if (self.trainer is None) == (self.execute is None):
+            raise ValueError("a training run needs exactly one trainer or executor")
+        if self.execute is not None and any(
+            hook is not None
+            for hook in (self.on_success, self.on_failure, self.on_finally)
+        ):
+            raise ValueError("lifecycle hooks belong to trainer-bearing runs only")
 
     def run(self) -> int:
         if self.execute is not None:
-            result = self.execute()
-        else:
-            result = self.trainer.fit(self.loader)
-
-        # A CLI training run must always leave a resumable/exportable final
-        # checkpoint, even when save_interval=0 or the final step is not an
-        # interval boundary. Producers have no trainer and therefore skip this.
-        if (
-            self.trainer is not None
-            and result > 0
-            and getattr(self.trainer, "last_checkpoint_step", None) != result
-        ):
-            self.trainer.save_checkpoint(result)
-        return result
+            return self.execute()
+        try:
+            result = self.trainer.fit()
+            if self.on_success is not None:
+                self.on_success(result)
+            return result
+        except BaseException as exc:
+            if self.on_failure is not None:
+                self.on_failure(exc)
+            raise
+        finally:
+            if self.on_finally is not None:
+                self.on_finally()
 
 
 def _draft_config_path(path: str) -> str:
@@ -613,7 +623,7 @@ def build_training_run(cfg: Config) -> TrainingRun:
     if cfg.mode == "offline":
         from specforge.launch import build_offline_runtime
 
-        trainer, loader = build_offline_runtime(
+        trainer = build_offline_runtime(
             hidden_states_path=cfg.data.hidden_states_path,
             draft_model=bundle.model,
             target_head=bundle.target_head,
@@ -623,7 +633,7 @@ def build_training_run(cfg: Config) -> TrainingRun:
             resume_from=t.resume_from,
             **common,
         )
-        return TrainingRun(trainer=trainer, loader=loader)
+        return TrainingRun(trainer=trainer)
 
     from specforge.launch import build_online_runtime
 
@@ -641,7 +651,7 @@ def build_training_run(cfg: Config) -> TrainingRun:
         accumulation_steps=t.accumulation_steps,
         num_epochs=1,
     )
-    trainer, loader, _workers, _controller, run_interleaved = build_online_runtime(
+    trainer = build_online_runtime(
         target_model=bundle.target_engine,
         prompts=prompts,
         draft_model=bundle.model,
@@ -654,11 +664,7 @@ def build_training_run(cfg: Config) -> TrainingRun:
         prompt_epochs=t.num_epochs,
         **common,
     )
-    return TrainingRun(
-        trainer=trainer,
-        loader=loader,
-        execute=run_interleaved,
-    )
+    return TrainingRun(trainer=trainer)
 
 
 __all__ = [

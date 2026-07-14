@@ -74,7 +74,7 @@ class TestOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
+        trainer = build_online_runtime(
             strategy="eagle3",
             target_model=target,
             prompts=prompts,
@@ -92,9 +92,9 @@ class TestOnlineLaunch(unittest.TestCase):
         )
 
         # Build does not eagerly materialize the prompt pool.
-        self.assertEqual(controller.sample_queue.depth(), 0)
+        self.assertEqual(trainer.dataflow_controller.sample_queue.depth(), 0)
         # control plane carries metadata only
-        assert_no_tensors(controller.status())
+        assert_no_tensors(trainer.dataflow_controller.status())
 
         # FSDP must be in the forward path; optimizer exists.
         module = trainer.core.strategy.trainable_module()
@@ -103,14 +103,14 @@ class TestOnlineLaunch(unittest.TestCase):
         )
         self.assertIsNotNone(trainer.core.backend.optimizer)
 
-        step = run_interleaved()
+        step = trainer.fit()
 
         # global_step counts OPTIMIZER steps; micro_step counts micro-batches.
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.global_step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
-        self.assertEqual(loader.queue.produced_count, ACC * MAX_OPT_STEPS)
-        self.assertLessEqual(loader.queue.peak_resident_samples, 1)
+        self.assertEqual(trainer.rollout_stream.produced_count, ACC * MAX_OPT_STEPS)
+        self.assertLessEqual(trainer.rollout_stream.peak_resident_samples, 1)
 
 
 if __name__ == "__main__":
