@@ -28,6 +28,8 @@ REMOVED_MODULE_FILES = (
     "specforge/args.py",
     "specforge/inference/adapters/dflash.py",
     "specforge/inference/adapters/eagle3.py",
+    "specforge/inference/adapters/policy.py",
+    "specforge/runtime/data_plane/local_rollout_stream.py",
     "specforge/inference/target_engine/capture_policy.py",
     "specforge/inference/target_engine/dflash_target_model.py",
     "specforge/inference/target_engine/eagle3_target_model.py",
@@ -61,7 +63,6 @@ CAPABILITY_TEST_REPLACEMENTS = {
         "tests/test_runtime/test_disagg_multiserver.py",
     ),
     "tests/test_runtime/test_dflash_launch.py": (
-        "tests/test_runtime/test_dflash_online_launch.py",
         "tests/test_runtime/test_dflash_offline_launch.py",
     ),
     "tests/test_runtime/test_disagg_online_shared_plane.py": (
@@ -75,9 +76,6 @@ CAPABILITY_TEST_REPLACEMENTS = {
     "tests/test_runtime/test_resharding.py": (
         "tests/test_runtime/test_ref_distributor.py",
     ),
-    "tests/test_runtime/test_soak.py": (
-        "tests/test_runtime/test_local_rollout_stream.py",
-    ),
     "tests/test_scripts/test_compact_teacher_integration.py": (
         "tests/test_runtime/test_compact_teacher_strategy.py",
     ),
@@ -86,7 +84,6 @@ CAPABILITY_TEST_REPLACEMENTS = {
     ),
     "tests/test_scripts/test_train_eagle3.py": (
         "tests/test_runtime/test_single_entry.py",
-        "tests/test_runtime/test_online_launch.py",
         "tests/test_runtime/test_offline_launch_fsdp.py",
     ),
     "tests/test_scripts/test_train_eagle3_cache_key.py": (
@@ -102,9 +99,6 @@ CAPABILITY_TEST_REPLACEMENTS = {
     ),
     "tests/test_utils/test_compact_teacher.py": (
         "tests/test_runtime/test_compact_teacher_strategy.py",
-    ),
-    "tests/test_vlm/test_qwenvl_loss_mask.py": (
-        "tests/test_runtime/test_vlm_unified_path.py",
     ),
 }
 
@@ -150,6 +144,10 @@ OPERATIONAL_EXAMPLE_REPLACEMENTS = {
 
 REMOVED_PACKAGE_DIRECTORIES = (
     "specforge/modeling/target/sglang_backend",
+    "specforge/modeling/target/custom_backend",
+    "specforge/inference/target_engine",
+    "tests/test_modeling/test_target/test_custom_backend",
+    "tests/test_modeling/test_target/test_sglang_backend",
     "specforge/runtime/inference",
     "specforge/runtime/training",
 )
@@ -160,11 +158,15 @@ REMOVED_MODULE_PREFIXES = (
     "specforge.modeling.target.dflash_target_model",
     "specforge.modeling.target.eagle3_target_model",
     "specforge.modeling.target.sglang_backend",
+    "specforge.modeling.target.custom_backend",
     "specforge.runtime.inference",
     "specforge.runtime.training",
     "specforge.args",
     "specforge.inference.adapters.dflash",
     "specforge.inference.adapters.eagle3",
+    "specforge.inference.adapters.policy",
+    "specforge.inference.target_engine",
+    "specforge.runtime.data_plane.local_rollout_stream",
     "specforge.inference.target_engine.capture_policy",
     "specforge.inference.target_engine.dflash_target_model",
     "specforge.inference.target_engine.eagle3_target_model",
@@ -202,6 +204,7 @@ LEGACY_ENTRY_GLOBS = (
 
 LEGACY_API_NAMES = {
     "AutoEagle3DraftModel",
+    "AutoDistributedTargetModel",
     "CAPTURE_POLICIES",
     "CapturePolicy",
     "CaptureSpec",
@@ -218,6 +221,7 @@ LEGACY_API_NAMES = {
     "build_offline_eagle3_controller",
     "build_offline_eagle3_runtime",
     "build_online_eagle3_runtime",
+    "build_online_runtime",
     "get_dflash_target_model",
     "get_eagle3_target_model",
     "register_capture_policy",
@@ -244,7 +248,6 @@ CANONICAL_LAUNCH_EXPORTS = {
     "build_disagg_online_consumer",
     "build_disagg_online_producer",
     "build_offline_runtime",
-    "build_online_runtime",
 }
 
 DRAFT_MODEL_BUILDERS = CANONICAL_LAUNCH_EXPORTS - {
@@ -566,21 +569,12 @@ class TestPackageArchitecture(unittest.TestCase):
                     self.assertEqual([], node.keywords, relative_path)
                 self.assertNotEqual("save_checkpoint", node.func.attr, relative_path)
 
-    def test_online_builders_have_one_fresh_stream_path(self):
+    def test_server_only_builders_have_one_stream_path(self):
         functions = {
             node.name: node
             for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        online_parameters = {
-            arg.arg
-            for arg in functions["build_online_runtime"].args.args
-            + functions["build_online_runtime"].args.kwonlyargs
-        }
-        self.assertIn("resume_from", online_parameters)
-        self.assertTrue({"resume", "num_epochs"}.isdisjoint(online_parameters))
-        self.assertNotIn("ttt_length", online_parameters)
-
         consumer_parameters = {
             arg.arg
             for arg in functions["build_disagg_online_consumer"].args.args
@@ -689,14 +683,15 @@ class TestPackageArchitecture(unittest.TestCase):
             )
         )
 
-    def test_offline_capture_uses_only_the_canonical_target_engine_contract(self):
+    def test_offline_capture_uses_only_the_dedicated_local_capture(self):
         source = (REPO_ROOT / "scripts" / "prepare_hidden_states.py").read_text()
         self.assertNotIn("--enable-aux-hidden-states", source)
         self.assertNotIn("--aux-hidden-states-layers", source)
         self.assertNotIn("Eagle3TargetModel", source)
-        self.assertIn("get_target_engine", source)
-        self.assertIn("return_last_hidden_states=True", source)
-        self.assertIn("return_logits=False", source)
+        self.assertNotIn("get_target_engine", source)
+        self.assertNotIn("return_last_hidden_states=True", source)
+        self.assertNotIn("return_logits=False", source)
+        self.assertIn("load_offline_eagle3_capture", source)
 
     def test_only_canonical_draft_configs_are_checked_in(self):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}

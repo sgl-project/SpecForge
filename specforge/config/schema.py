@@ -16,7 +16,9 @@ overrides both re-validate through the same schema.
 
 from __future__ import annotations
 
+import copy
 import json
+import os
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -46,13 +48,14 @@ class ModelConfig(StrictConfigModel):
     #: Optional DFlash block-size override (auto-generated default: 16).
     draft_block_size: Optional[int] = Field(default=None, gt=0)
     target_backend: Literal["sglang", "hf", "custom"] = "sglang"
-    #: Let colocated SGLang return only this target-TP rank's batch partition.
-    #: HF/custom and multimodal targets capture the full batch and partition
-    #: locally after the frozen-target forward.
+    #: Retained for offline/config migration only. The server-only online path
+    #: transports complete feature records and does not shard target outputs in
+    #: the trainer.
     shard_target_output: bool = False
-    #: Input family consumed by the frozen target.  Multimodal tensors are
-    #: materialized inside rollout and never enter the control-plane payload.
-    input_modality: Literal["text", "qwen2_5_vl"] = "text"
+    #: Input family consumed by the capture provider. Keeping modality explicit
+    #: lets future server providers add VLM schemas without changing the public
+    #: run-config shape.
+    input_modality: str = "text"
     trust_remote_code: bool = False
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
@@ -80,6 +83,19 @@ class ModelConfig(StrictConfigModel):
     sglang_max_running_requests: Optional[int] = Field(default=None, gt=0)
     sglang_max_total_tokens: Optional[int] = Field(default=None, gt=0)
 
+    @model_validator(mode="after")
+    def _validate_input_modality(self):
+        if (
+            not self.input_modality
+            or self.input_modality.strip() != self.input_modality
+            or any(character.isspace() for character in self.input_modality)
+        ):
+            raise ValueError(
+                "model.input_modality must be a non-empty plugin identifier "
+                "without whitespace"
+            )
+        return self
+
 
 class DataConfig(StrictConfigModel):
     #: online mode — raw conversation JSON/JSONL.
@@ -103,9 +119,6 @@ class DataConfig(StrictConfigModel):
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
     max_prompts: Optional[int] = Field(default=None, ge=0)
-    #: Qwen2.5-VL image-resolution bounds (64 and 1024 28x28 patches).
-    min_pixels: int = Field(default=50176, gt=0)
-    max_pixels: int = Field(default=802816, gt=0)
 
     @model_validator(mode="after")
     def _exactly_one_source(self):
@@ -120,8 +133,6 @@ class DataConfig(StrictConfigModel):
                 "data.prompts_path (pre-tokenized online data), or "
                 "data.hidden_states_path (offline features)"
             )
-        if self.max_pixels < self.min_pixels:
-            raise ValueError("data.max_pixels must be >= data.min_pixels")
         return self
 
 
@@ -417,9 +428,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
 class DeploymentConfig(StrictConfigModel):
     """User-facing launch topology for ``specforge train``."""
 
-    #: ``None`` preserves legacy configs whose deployment fields still live
-    #: under ``training``. New recipes always set this explicitly.
-    mode: Optional[Literal["local_colocated", "disaggregated"]] = None
+    mode: Literal["local_colocated", "disaggregated"] = "local_colocated"
     trainer: TrainerDeploymentConfig = Field(default_factory=TrainerDeploymentConfig)
     disaggregated: Optional[DisaggregatedDeploymentConfig] = None
 
@@ -493,38 +502,14 @@ class TrainingConfig(StrictConfigModel):
     compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
-    #: Colocated process or split producer/consumer deployment.
-    deployment_mode: Literal["local_colocated", "disaggregated"] = "local_colocated"
-    #: ``all`` is a colocated run. Disaggregated online runs launch producer
-    #: and consumer as separate ``specforge train`` processes with the same
-    #: config and different roles.
+    #: ``all`` is an offline colocated run. Online runs launch producer and
+    #: consumer as separate ``specforge train`` processes with the same config
+    #: and different roles.
     role: Literal["auto", "all", "producer", "consumer"] = "all"
-    server_urls: List[str] = Field(default_factory=list)
-    metadata_db_path: Optional[str] = None
     seed: int = 42
 
     @model_validator(mode="after")
-    def _validate_strategy_options(self):
-        from specforge.training.strategies.registry import resolve_strategy
-
-        try:
-            spec = resolve_strategy(self.strategy)
-        except KeyError as exc:
-            raise ValueError(str(exc)) from exc
-        if self.attention_backend not in spec.supported_attention_backends:
-            raise ValueError(
-                f"strategy {self.strategy!r} does not support attention_backend="
-                f"{self.attention_backend!r}; supported: "
-                f"{sorted(spec.supported_attention_backends)}"
-            )
-        if (
-            spec.required_batch_size is not None
-            and self.batch_size != spec.required_batch_size
-        ):
-            raise ValueError(
-                f"strategy {self.strategy!r} requires training.batch_size="
-                f"{spec.required_batch_size}"
-            )
+    def _validate_training_shape(self):
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:
@@ -533,16 +518,6 @@ class TrainingConfig(StrictConfigModel):
             raise ValueError(
                 "training.down_sample_ratio_min must be in "
                 "(0, training.down_sample_ratio]"
-            )
-        if self.role != "all" and self.deployment_mode != "disaggregated":
-            raise ValueError(
-                "training.role=auto/producer/consumer requires "
-                "training.deployment_mode=disaggregated"
-            )
-        if self.deployment_mode == "disaggregated" and self.role == "all":
-            raise ValueError(
-                "training.deployment_mode=disaggregated requires "
-                "training.role=auto, producer, or consumer"
             )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
@@ -562,6 +537,72 @@ class TrainingConfig(StrictConfigModel):
         return self
 
 
+def migrate_legacy_config(values: dict) -> dict:
+    """Translate legacy deployment keys before constructing the domain config.
+
+    Compatibility exists only at this raw loader boundary. The returned domain
+    model never projects canonical deployment state back into ``training``.
+    """
+
+    if not isinstance(values, dict):
+        return values
+    raw = copy.deepcopy(values)
+    training = raw.get("training")
+    if not isinstance(training, dict):
+        return raw
+
+    has_legacy_mode = "deployment_mode" in training
+    has_legacy_urls = "server_urls" in training
+    has_legacy_database = "metadata_db_path" in training
+    if not (has_legacy_mode or has_legacy_urls or has_legacy_database):
+        return raw
+
+    legacy_mode = training.pop("deployment_mode", None)
+    legacy_urls = training.pop("server_urls", None)
+    legacy_database = training.pop("metadata_db_path", None)
+    deployment = raw.setdefault("deployment", {})
+    if not isinstance(deployment, dict):
+        return raw
+
+    canonical_mode = deployment.get("mode")
+    if legacy_mode is not None:
+        if canonical_mode is not None and canonical_mode != legacy_mode:
+            raise ValueError(
+                "deployment.mode conflicts with legacy training.deployment_mode"
+            )
+        deployment["mode"] = legacy_mode
+    elif canonical_mode is None and (legacy_urls or legacy_database):
+        deployment["mode"] = "disaggregated"
+
+    if legacy_urls is not None or legacy_database is not None:
+        disaggregated = deployment.setdefault("disaggregated", {})
+        if not isinstance(disaggregated, dict):
+            return raw
+        if legacy_urls is not None:
+            canonical_urls = disaggregated.get("server_urls")
+            if canonical_urls is not None and canonical_urls != legacy_urls:
+                raise ValueError(
+                    "deployment.disaggregated.server_urls conflicts with legacy "
+                    "training.server_urls"
+                )
+            disaggregated["server_urls"] = legacy_urls
+        if legacy_database:
+            if os.path.basename(legacy_database) != "consumer.sqlite":
+                raise ValueError(
+                    "legacy training.metadata_db_path must end in consumer.sqlite; "
+                    "use deployment.disaggregated.consumer_state_dir instead"
+                )
+            state_dir = os.path.dirname(legacy_database) or "."
+            canonical_state_dir = disaggregated.get("consumer_state_dir")
+            if canonical_state_dir is not None and canonical_state_dir != state_dir:
+                raise ValueError(
+                    "deployment.disaggregated.consumer_state_dir conflicts with "
+                    "legacy training.metadata_db_path"
+                )
+            disaggregated["consumer_state_dir"] = state_dir
+    return raw
+
+
 class Config(StrictConfigModel):
     model: ModelConfig
     data: DataConfig
@@ -575,92 +616,50 @@ class Config(StrictConfigModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _merge_deployment_surface(cls, values):
-        """Project the new launch surface onto the retained assembly fields."""
-        if not isinstance(values, dict) or "deployment" not in values:
+    def _default_role_for_deployment(cls, values):
+        """Resolve the process-role default from the canonical topology."""
+        if not isinstance(values, dict):
             return values
         raw = dict(values)
         deployment = dict(raw.get("deployment") or {})
-        if not isinstance(deployment, dict):
-            return values
-        mode = deployment.get("mode")
-        if mode is None:
-            return values
         training = dict(raw.get("training") or {})
-        legacy_mode = training.get("deployment_mode")
-        if legacy_mode is not None and legacy_mode != mode:
-            raise ValueError("deployment.mode conflicts with training.deployment_mode")
-        training["deployment_mode"] = mode
+        mode = deployment.get("mode", "local_colocated")
         training.setdefault("role", "auto" if mode == "disaggregated" else "all")
-        disaggregated = dict(deployment.get("disaggregated") or {})
-        if disaggregated:
-            has_new_urls = "server_urls" in disaggregated
-            has_legacy_urls = "server_urls" in training
-            new_urls = disaggregated.get("server_urls")
-            legacy_urls = training.get("server_urls")
-            if has_new_urls and has_legacy_urls and new_urls != legacy_urls:
-                raise ValueError(
-                    "deployment.disaggregated.server_urls conflicts with "
-                    "training.server_urls"
-                )
-            if has_new_urls:
-                training["server_urls"] = new_urls
-            elif has_legacy_urls:
-                disaggregated["server_urls"] = legacy_urls
-                deployment["disaggregated"] = disaggregated
-                raw["deployment"] = deployment
         raw["training"] = training
         return raw
 
     @model_validator(mode="after")
-    def _validate_capability_matrix(self):
-        strategy = self.training.strategy
-        from specforge.training.strategies.registry import resolve_strategy
-
-        spec = resolve_strategy(strategy)
-        draft_policy = spec.assembly.draft_config
+    def _validate_run_structure(self):
+        """Validate topology and cross-field shape without resolving algorithms."""
         mode = self.mode
-        deployment = self.training.deployment_mode
-        layers = self.model.aux_hidden_state_layer_ids
-        modality = self.model.input_modality
-        shard_target_output = self.model.shard_target_output
+        deployment = self.deployment.mode
+        role = self.training.role
+
+        if mode == "online" and deployment != "disaggregated":
+            raise ValueError(
+                "online training requires deployment.mode=disaggregated; "
+                "colocated online training is no longer supported"
+            )
+        if mode == "online" and self.model.target_backend != "sglang":
+            raise ValueError(
+                "online training uses an external SGLang capture server and "
+                "requires model.target_backend=sglang"
+            )
+        if role != "all" and deployment != "disaggregated":
+            raise ValueError(
+                "training.role=auto/producer/consumer requires "
+                "deployment.mode=disaggregated"
+            )
+        if deployment == "disaggregated" and role == "all":
+            raise ValueError(
+                "deployment.mode=disaggregated requires "
+                "training.role=auto, producer, or consumer"
+            )
+
         eval_sources = [
             bool(self.data.eval_data_path),
             bool(self.data.eval_hidden_states_path),
         ]
-        if (
-            not self.model.draft_model_config
-            and not self.model.draft_checkpoint_path
-            and not draft_policy.supports_auto_generation
-        ):
-            raise ValueError(
-                f"training.strategy={strategy!r} requires "
-                "model.draft_model_config; automatic target-derived configs are "
-                "not registered for this strategy"
-            )
-        if self.model.draft_num_hidden_layers is not None:
-            if not draft_policy.supports_num_hidden_layers_override:
-                raise ValueError(
-                    f"strategy {strategy!r} does not support "
-                    "model.draft_num_hidden_layers"
-                )
-            if (
-                draft_policy.required_num_hidden_layers is not None
-                and self.model.draft_num_hidden_layers
-                != draft_policy.required_num_hidden_layers
-            ):
-                raise ValueError(
-                    f"strategy {strategy!r} requires "
-                    "model.draft_num_hidden_layers="
-                    f"{draft_policy.required_num_hidden_layers} or no override"
-                )
-        if (
-            self.model.draft_block_size is not None
-            and not draft_policy.supports_block_size_override
-        ):
-            raise ValueError(
-                f"strategy {strategy!r} does not support model.draft_block_size"
-            )
         if (
             self.model.draft_checkpoint_path is not None
             and self.training.resume_from is not None
@@ -695,74 +694,19 @@ class Config(StrictConfigModel):
                 "data.eval_hidden_states_path requires an offline training data "
                 "source"
             )
-        if has_eval_source and mode == "online" and deployment == "disaggregated":
+        if has_eval_source and mode == "online":
             raise ValueError(
-                "online disaggregated evaluation is not supported; use a "
-                "colocated online eval stream"
+                "online evaluation is not yet supported by the server-only "
+                "capture path"
             )
-        if spec.allows_aux_layer_override:
-            if layers is not None and (len(layers) != 3 or any(i < 0 for i in layers)):
-                raise ValueError(
-                    "model.aux_hidden_state_layer_ids must contain "
-                    "exactly three non-negative layer ids"
-                )
-        elif layers is not None:
-            raise ValueError(
-                f"strategy {strategy!r} gets capture layers from its draft config; "
-                "model.aux_hidden_state_layer_ids would be ignored"
-            )
-        if mode not in spec.supported_modes:
-            raise ValueError(
-                f"strategy {strategy!r} does not support {mode} training; "
-                f"supported: {sorted(spec.supported_modes)}"
-            )
-        if deployment not in spec.supported_deployments:
-            raise ValueError(
-                f"strategy {strategy!r} does not support deployment_mode="
-                f"{deployment!r}; supported: {sorted(spec.supported_deployments)}"
-            )
-        if self.training.compact_teacher:
-            if (
-                not spec.supports_compact_teacher
-                or mode != "offline"
-                or modality != "text"
-            ):
-                raise ValueError(
-                    f"strategy {strategy!r} does not support compact teacher for "
-                    f"mode={mode!r}, modality={modality!r}"
-                )
-        elif self.training.compact_teacher_chunk_size is not None:
+        if (
+            not self.training.compact_teacher
+            and self.training.compact_teacher_chunk_size is not None
+        ):
             raise ValueError(
                 "training.compact_teacher_chunk_size requires "
                 "training.compact_teacher=true"
             )
-        if (
-            spec.requires_disaggregated_vocab_mapping
-            and deployment == "disaggregated"
-            and not self.model.vocab_mapping_path
-        ):
-            raise ValueError(
-                f"strategy {strategy!r} disaggregated runs require "
-                "model.vocab_mapping_path "
-                "because producer and consumer cannot derive one shared mapping"
-            )
-        if (
-            mode == "online"
-            and deployment == "disaggregated"
-            and self.model.target_backend != "sglang"
-        ):
-            raise ValueError(
-                "disaggregated online capture uses an SGLang server and requires "
-                "model.target_backend=sglang"
-            )
-        if self.model.target_backend == "sglang":
-            ep_size = self.model.sglang_ep_size
-            tp_size = self.training.tp_size
-            if ep_size > tp_size or tp_size % ep_size:
-                raise ValueError(
-                    "model.sglang_ep_size must be no larger than and evenly "
-                    "divide training.tp_size"
-                )
         if (
             mode == "online"
             and deployment == "disaggregated"
@@ -793,11 +737,6 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "node-local consumer_state_dir currently requires "
                     "deployment.trainer.nnodes=1"
-                )
-            if self.training.metadata_db_path is not None:
-                raise ValueError(
-                    "training.metadata_db_path conflicts with "
-                    "deployment.disaggregated.consumer_state_dir"
                 )
         if managed_local is not None:
             if mode != "online":
@@ -845,6 +784,20 @@ class Config(StrictConfigModel):
                     "managed_local trainer_cuda_visible_devices count must equal "
                     "deployment.trainer.nproc_per_node"
                 )
+            ep_size = self.model.sglang_ep_size
+            incompatible_tp_sizes = sorted(
+                {
+                    server.tp_size
+                    for server in managed_local.capture_servers
+                    if ep_size > server.tp_size or server.tp_size % ep_size
+                }
+            )
+            if incompatible_tp_sizes:
+                raise ValueError(
+                    "model.sglang_ep_size must be no larger than and evenly "
+                    "divide every managed capture-server tp_size; incompatible "
+                    f"tp sizes: {incompatible_tp_sizes}"
+                )
         if (
             mode == "online"
             and deployment == "disaggregated"
@@ -857,60 +810,6 @@ class Config(StrictConfigModel):
             )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
-        if self.training.metadata_db_path is not None and not (
-            mode == "online"
-            and deployment == "disaggregated"
-            and self.training.role in ("auto", "consumer")
-        ):
-            raise ValueError(
-                "training.metadata_db_path belongs to the online consumer only"
-            )
-        if (
-            mode == "online"
-            and self.model.target_backend not in spec.supported_target_backends
-        ):
-            raise ValueError(
-                f"strategy {strategy!r} does not support target_backend="
-                f"{self.model.target_backend!r}; supported: "
-                f"{sorted(spec.supported_target_backends)}"
-            )
-        if modality not in spec.supported_modalities:
-            raise ValueError(
-                f"strategy {strategy!r} does not support input_modality="
-                f"{modality!r}; supported: {sorted(spec.supported_modalities)}"
-            )
-        if modality == "qwen2_5_vl":
-            if mode != "online":
-                raise ValueError("Qwen2.5-VL input requires online target capture")
-            if deployment != "local_colocated":
-                raise ValueError(
-                    "Qwen2.5-VL currently requires deployment_mode=local_colocated"
-                )
-            if self.data.prompts_path:
-                raise ValueError(
-                    "Qwen2.5-VL requires raw data.train_data_path so image metadata "
-                    "can be re-materialized during rollout"
-                )
-            if self.training.attention_backend == "usp":
-                raise ValueError("Qwen2.5-VL does not support USP attention")
-        if shard_target_output:
-            if not spec.supports_sharded_target_output or mode != "online":
-                raise ValueError(
-                    f"strategy {strategy!r} does not support sharded target "
-                    f"output in {mode} mode"
-                )
-            if deployment != "local_colocated":
-                raise ValueError(
-                    "model.shard_target_output requires a colocated target"
-                )
-            if self.model.target_backend != "sglang":
-                raise ValueError(
-                    "model.shard_target_output requires target_backend=sglang"
-                )
-            if modality != "text":
-                raise ValueError(
-                    "model.shard_target_output is not supported for VLM capture"
-                )
         if self.training.attention_backend == "usp":
             if mode != "offline":
                 raise ValueError("USP attention currently requires offline features")
@@ -960,13 +859,12 @@ class Config(StrictConfigModel):
                 raw = yaml.safe_load(f)
             else:
                 raw = json.load(f)
-        return cls.model_validate(raw)
+        return cls.model_validate(migrate_legacy_config(raw))
 
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
     """Apply dotted ``section.field=value`` overrides, re-validating the result."""
     raw = config.model_dump()
-    overridden_paths = set()
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
@@ -990,20 +888,6 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
                     f"override {path!r} contains an invalid structured value"
                 ) from exc
         node[keys[-1]] = value  # pydantic coerces scalars on re-validation
-        overridden_paths.add(path)
-
-    if "deployment.mode" in overridden_paths:
-        raw["training"]["deployment_mode"] = raw["deployment"]["mode"]
-    elif "training.deployment_mode" in overridden_paths:
-        raw["deployment"]["mode"] = raw["training"]["deployment_mode"]
-
-    new_urls_path = "deployment.disaggregated.server_urls"
-    legacy_urls_path = "training.server_urls"
-    disaggregated = raw["deployment"].get("disaggregated")
-    if new_urls_path in overridden_paths:
-        raw["training"]["server_urls"] = disaggregated["server_urls"]
-    elif legacy_urls_path in overridden_paths and disaggregated is not None:
-        disaggregated["server_urls"] = raw["training"]["server_urls"]
     return Config.model_validate(raw)
 
 
@@ -1028,6 +912,7 @@ __all__ = [
     "DeploymentConfig",
     "TrainingConfig",
     "Config",
+    "migrate_legacy_config",
     "load_config",
     "apply_overrides",
 ]

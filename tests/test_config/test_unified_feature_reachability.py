@@ -7,13 +7,13 @@ from unittest import mock
 
 from pydantic import ValidationError
 
+from specforge.application import resolve_run
 from specforge.config import Config
 from specforge.training.assembly import (
     _configured_logger,
     _dataloader_num_workers,
     _logger,
     _profiling_options,
-    _strategy_kwargs,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -89,8 +89,8 @@ EXPECTED_TRACKING = {
         "wandb_project": "specforge-qwen3-8b-dta",
         "wandb_name": "qwen3-8b-dta-perfectblend",
     },
-    "qwen3-8b-eagle3-online.yaml": {"report_to": "tensorboard"},
-    "qwen3-8b-peagle-online.yaml": {"report_to": "wandb"},
+    "qwen3-8b-eagle3-disaggregated.yaml": {"report_to": "tensorboard"},
+    "qwen3-8b-peagle-disaggregated.yaml": {"report_to": "wandb"},
     "qwen3-coder-30b-a3b-eagle3-online.yaml": {
         "report_to": "wandb",
         "wandb_project": "specforge-qwen3-coder",
@@ -132,9 +132,7 @@ LEGACY_DIST_TIMEOUT_OVERRIDES = {
     "gpt-oss-120b-eagle3-online.yaml": 60,
     "gpt-oss-20b-eagle3-online.yaml": 60,
     "ling-flash-2.0-eagle3-online.yaml": 60,
-    "qwen2.5-vl-32b-eagle3-online.yaml": 360,
-    "qwen2.5-vl-7b-eagle3-online.yaml": 360,
-    "qwen3-8b-peagle-online.yaml": 120,
+    "qwen3-8b-peagle-disaggregated.yaml": 120,
     "qwen3-coder-30b-a3b-eagle3-online.yaml": 60,
 }
 
@@ -153,9 +151,14 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 57)
+        self.assertEqual(len(paths), 55)
 
-        configs = {path.name: Config.from_file(str(path)) for path in paths}
+        resolved_runs = {
+            path.name: resolve_run(Config.from_file(str(path))) for path in paths
+        }
+        configs = {
+            filename: resolved.config for filename, resolved in resolved_runs.items()
+        }
 
         dpace = configs["qwen3-8b-dpace-online.yaml"]
         self.assertEqual(dpace.training.strategy, "dflash")
@@ -183,7 +186,9 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                 self.assertEqual(configs[filename].training.num_epochs, epochs)
 
         self.assertEqual(
-            configs["qwen3-8b-eagle3-online.yaml"].model.sglang_mem_fraction_static,
+            configs[
+                "qwen3-8b-eagle3-disaggregated.yaml"
+            ].model.sglang_mem_fraction_static,
             0.3,
         )
         self.assertTrue(
@@ -193,24 +198,15 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             configs["qwen3-next-80b-a3b-eagle3-online.yaml"].training.batch_size,
             2,
         )
-        vlm_7b = configs["qwen2.5-vl-7b-eagle3-online.yaml"]
-        vlm_32b = configs["qwen2.5-vl-32b-eagle3-online.yaml"]
-        for config in (vlm_7b, vlm_32b):
-            self.assertEqual(config.model.input_modality, "qwen2_5_vl")
-            self.assertEqual(config.model.target_backend, "sglang")
-            self.assertEqual(config.training.strategy, "eagle3")
-            self.assertEqual(config.training.deployment_mode, "local_colocated")
-            self.assertEqual(config.training.dist_timeout, 360)
-        self.assertEqual(vlm_7b.training.tp_size, 1)
-        self.assertEqual(vlm_32b.training.tp_size, 4)
-        qwen36 = configs["qwen3.6-27b-dflash-online.yaml"]
-        self.assertEqual(
-            qwen36.data.eval_data_path,
-            "./cache/dataset/nemotron_v2_eval.jsonl",
-        )
-        self.assertEqual(qwen36.training.eval_interval, 2000)
+        for filename, config in configs.items():
+            if config.mode != "online":
+                continue
+            with self.subTest(config=filename, contract="server-only online"):
+                self.assertEqual(config.deployment.mode, "disaggregated")
+                self.assertEqual(config.model.target_backend, "sglang")
+                self.assertEqual(config.model.input_modality, "text")
 
-    def test_compact_teacher_reaches_the_eagle3_strategy_kwargs(self):
+    def test_compact_teacher_reaches_the_eagle3_step_provider(self):
         cfg = Config.model_validate(
             {
                 **OFFLINE_EAGLE3,
@@ -220,9 +216,10 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                 },
             }
         )
+        resolved = resolve_run(cfg)
 
         self.assertEqual(
-            _strategy_kwargs(cfg),
+            resolved.algorithm.providers.step.options(cfg),
             {
                 "compact_teacher": True,
                 "compact_teacher_chunk_size": 2048,
@@ -230,67 +227,90 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         )
 
     def test_loader_and_profiler_options_reach_the_canonical_trainer(self):
-        eagle = Config.model_validate(OFFLINE_EAGLE3)
-        dflash = Config.model_validate(
-            {
-                **OFFLINE_EAGLE3,
-                "training": {"strategy": "dflash"},
-            }
+        eagle = resolve_run(Config.model_validate(OFFLINE_EAGLE3))
+        dflash = resolve_run(
+            Config.model_validate(
+                {
+                    **OFFLINE_EAGLE3,
+                    "training": {"strategy": "dflash"},
+                }
+            )
         )
-        explicit = Config.model_validate(
-            {
-                **OFFLINE_EAGLE3,
-                "data": {
-                    **OFFLINE_EAGLE3["data"],
-                    "dataloader_num_workers": 2,
-                },
-                "profiling": {
-                    "enabled": True,
-                    "start_step": 3,
-                    "num_steps": 2,
-                    "record_shapes": True,
-                },
-            }
+        explicit = resolve_run(
+            Config.model_validate(
+                {
+                    **OFFLINE_EAGLE3,
+                    "data": {
+                        **OFFLINE_EAGLE3["data"],
+                        "dataloader_num_workers": 2,
+                    },
+                    "profiling": {
+                        "enabled": True,
+                        "start_step": 3,
+                        "num_steps": 2,
+                        "record_shapes": True,
+                    },
+                }
+            )
         )
 
-        self.assertEqual(_dataloader_num_workers(eagle), 4)
-        self.assertEqual(_dataloader_num_workers(dflash), 8)
-        self.assertEqual(_dataloader_num_workers(explicit), 2)
-        options = _profiling_options(explicit)
+        self.assertEqual(_dataloader_num_workers(eagle.config, eagle.algorithm), 4)
+        self.assertEqual(_dataloader_num_workers(dflash.config, dflash.algorithm), 8)
+        self.assertEqual(
+            _dataloader_num_workers(explicit.config, explicit.algorithm), 2
+        )
+        options = _profiling_options(explicit.config)
         self.assertTrue(options.enabled)
         self.assertEqual((options.start_step, options.num_steps), (3, 2))
         self.assertTrue(options.record_shapes)
 
     def test_compact_teacher_rejects_incompatible_entry_configs(self):
-        cases = (
-            (
-                {
-                    **OFFLINE_EAGLE3,
-                    "data": {"train_data_path": "train.jsonl"},
-                    "training": {"compact_teacher": True},
+        online = {
+            **OFFLINE_EAGLE3,
+            "model": {
+                **OFFLINE_EAGLE3["model"],
+                "target_backend": "sglang",
+            },
+            "data": {"train_data_path": "train.jsonl"},
+            "training": {"compact_teacher": True, "max_steps": 1},
+            "deployment": {
+                "mode": "disaggregated",
+                "disaggregated": {
+                    "control_dir": "/control",
+                    "backend": "mooncake",
+                    "server_urls": ["http://127.0.0.1:30000"],
                 },
-                "does not support compact teacher for mode='online'",
-            ),
-            (
-                {
-                    **OFFLINE_EAGLE3,
-                    "training": {"strategy": "dflash", "compact_teacher": True},
-                },
-                "strategy 'dflash' does not support compact teacher",
-            ),
-            (
+            },
+        }
+        with self.assertRaisesRegex(
+            ValueError, "does not support compact teacher for mode='streaming'"
+        ):
+            resolve_run(Config.model_validate(online))
+
+        with self.assertRaisesRegex(
+            ValueError, "algorithm 'dflash' does not support compact teacher"
+        ):
+            resolve_run(
+                Config.model_validate(
+                    {
+                        **OFFLINE_EAGLE3,
+                        "training": {
+                            "strategy": "dflash",
+                            "compact_teacher": True,
+                        },
+                    }
+                )
+            )
+
+        with self.assertRaisesRegex(
+            ValidationError, "requires training.compact_teacher=true"
+        ):
+            Config.model_validate(
                 {
                     **OFFLINE_EAGLE3,
                     "training": {"compact_teacher_chunk_size": 1024},
-                },
-                "requires training.compact_teacher=true",
-            ),
-        )
-
-        for payload, message in cases:
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(ValidationError, message):
-                    Config.model_validate(payload)
+                }
+            )
 
     def test_tracking_config_reaches_the_existing_tracker_adapter(self):
         cfg = Config.model_validate(

@@ -8,28 +8,25 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Server-side spec-capture rollout source (zero-copy Mooncake transport).
 
-The *server* transport (vs the in-process ``PolicyFeatureAdapter``): a live
-SGLang server patched with ``patches/sglang/v0.5.14/spec-capture.patch`` runs
+An external SGLang server patched with
+``patches/sglang/v0.5.14/spec-capture.patch`` runs
 the prefill and writes captured features straight into Mooncake in
 :class:`MooncakeFeatureStore`'s key layout. Tensors never pass through this
 process — the ``/generate`` response's ``meta_info["spec_capture"]`` carries
 only key/shape/dtype, from which :meth:`SGLangServerCaptureAdapter.produce_refs`
 builds committed-ready ``SampleRef``s.
 
-Strategy-agnostic: the server knows only generic artifacts (``aux`` = capture
-layers concatenated, ``last_hidden`` = post-norm final hidden) plus passthrough
-tensors; :class:`ServerCaptureSchema` maps them onto each strategy's feature
-names/shapes (eagle3 / dflash / domino below; add more via
-:func:`register_server_capture_schema`). eagle3 stores the target as the last
-hidden state (``target_repr="hidden_state"``, offline convention — the trainer
-re-runs the frozen ``TargetHead``), not logits (~50x the traffic).
+The server knows only generic artifacts (``aux`` = capture layers
+concatenated, ``last_hidden`` = post-norm final hidden) plus passthrough
+tensors.  The application composition root injects an algorithm-owned
+:class:`ServerCaptureSchema`; this transport never resolves an algorithm name.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from specforge.inference.capture import (
     CaptureConfig,
@@ -52,82 +49,10 @@ class ServerCaptureSchema:
     ``attention_mask_feature`` is synthesized all-ones (PromptTasks are unpadded).
     """
 
-    strategy: str
     aux_feature: Optional[str]
     last_hidden_feature: Optional[str]
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: Optional[str] = None
-
-
-_SERVER_CAPTURE_SCHEMAS: Dict[str, ServerCaptureSchema] = {}
-
-
-def register_server_capture_schema(schema: ServerCaptureSchema) -> None:
-    existing = _SERVER_CAPTURE_SCHEMAS.get(schema.strategy)
-    if existing is not None and existing != schema:
-        raise ValueError(
-            f"server-capture schema for {schema.strategy!r} already registered"
-        )
-    _SERVER_CAPTURE_SCHEMAS[schema.strategy] = schema
-
-
-def resolve_server_capture_schema(strategy: str) -> ServerCaptureSchema:
-    schema = _SERVER_CAPTURE_SCHEMAS.get(strategy)
-    if schema is None:
-        raise KeyError(
-            f"no server-capture schema registered for strategy {strategy!r}; "
-            f"registered: {sorted(_SERVER_CAPTURE_SCHEMAS)}"
-        )
-    return schema
-
-
-register_server_capture_schema(
-    ServerCaptureSchema(
-        strategy="eagle3",
-        aux_feature="hidden_state",
-        last_hidden_feature="target",  # target_repr="hidden_state"
-        passthrough=(
-            ("input_ids", "input_ids", ()),
-            # (1, L): the hidden_state train path mirrors the OFFLINE
-            # convention — TargetHead.preprocess adds the trailing mask dim.
-            ("loss_mask", "loss_mask", ()),
-        ),
-        attention_mask_feature="attention_mask",
-    )
-)
-register_server_capture_schema(
-    ServerCaptureSchema(
-        strategy="dflash",
-        aux_feature="hidden_states",
-        last_hidden_feature=None,  # hard-label training: no target distribution
-        passthrough=(
-            ("input_ids", "input_ids", ()),
-            ("loss_mask", "loss_mask", ()),
-        ),
-    )
-)
-register_server_capture_schema(
-    ServerCaptureSchema(
-        strategy="domino",
-        aux_feature="hidden_states",
-        last_hidden_feature=None,
-        passthrough=(
-            ("input_ids", "input_ids", ()),
-            ("loss_mask", "loss_mask", ()),
-        ),
-    )
-)
-register_server_capture_schema(
-    ServerCaptureSchema(
-        strategy="dspark",
-        aux_feature="hidden_states",
-        last_hidden_feature="target_last_hidden_states",
-        passthrough=(
-            ("input_ids", "input_ids", ()),
-            ("loss_mask", "loss_mask", ()),
-        ),
-    )
-)
 
 
 @dataclass(frozen=True)
@@ -205,8 +130,9 @@ class SGLangServerCaptureAdapter:
         store,
         *,
         run_id: str,
-        strategy: str = "eagle3",
-        schema: Optional[ServerCaptureSchema] = None,
+        algorithm: str,
+        schema: ServerCaptureSchema,
+        request_input_adapter=None,
         timeout_s: float = 300.0,
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
@@ -219,8 +145,19 @@ class SGLangServerCaptureAdapter:
         self.base_url = base_url.rstrip("/")
         self.store = store
         self.run_id = run_id
-        self.schema = schema or resolve_server_capture_schema(strategy)
-        self.strategy = self.schema.strategy
+        if not isinstance(schema, ServerCaptureSchema):
+            raise TypeError("schema must be an injected ServerCaptureSchema")
+        if not algorithm:
+            raise ValueError("algorithm must be non-empty")
+        self.schema = schema
+        self.strategy = algorithm
+        if request_input_adapter is not None and not callable(
+            getattr(request_input_adapter, "build_request_inputs", None)
+        ):
+            raise TypeError(
+                "request_input_adapter must expose build_request_inputs(tasks)"
+            )
+        self.request_input_adapter = request_input_adapter
         self.timeout_s = timeout_s
         self.post_fn = post_fn or _default_post
         self.target_model_version = target_model_version
@@ -229,6 +166,29 @@ class SGLangServerCaptureAdapter:
     # -- request construction -------------------------------------------------
     def _sample_id(self, task: PromptTask) -> str:
         return f"{self.run_id}:{task.task_id}"
+
+    def _request_inputs(self, tasks: List[PromptTask]) -> Dict[str, Any]:
+        """Build only model-input fields, keeping transport keys runtime-owned."""
+
+        if self.request_input_adapter is None:
+            return {"input_ids": [list(task.payload["input_ids"]) for task in tasks]}
+        request_inputs = self.request_input_adapter.build_request_inputs(tasks)
+        if not isinstance(request_inputs, Mapping):
+            raise TypeError(
+                "ServerInputAdapter.build_request_inputs must return a mapping"
+            )
+        reserved = {"sampling_params", "spec_capture"}
+        conflicts = sorted(reserved & set(request_inputs))
+        if conflicts:
+            raise ValueError(
+                "ServerInputAdapter cannot set runtime-owned request fields: "
+                f"{conflicts}"
+            )
+        if not request_inputs:
+            raise ValueError(
+                "ServerInputAdapter.build_request_inputs returned no model inputs"
+            )
+        return dict(request_inputs)
 
     def _spec_capture_payload(self, task: PromptTask) -> Dict[str, Any]:
         input_ids = list(task.payload["input_ids"])
@@ -354,11 +314,9 @@ class SGLangServerCaptureAdapter:
                 "parse": 0.0,
             }
         _t = _time.monotonic()
-        body = {
-            "input_ids": [list(t.payload["input_ids"]) for t in tasks],
-            "sampling_params": {"temperature": 0.0, "max_new_tokens": 1},
-            "spec_capture": [self._spec_capture_payload(t) for t in tasks],
-        }
+        body = self._request_inputs(tasks)
+        body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 1}
+        body["spec_capture"] = [self._spec_capture_payload(t) for t in tasks]
         if _prof:
             self._hs["build"] += _time.monotonic() - _t
             self._hs["tok"] += sum(len(t.payload["input_ids"]) for t in tasks)
@@ -520,6 +478,4 @@ __all__ = [
     "ServerCaptureSchema",
     "ServerCaptureFailure",
     "SGLangServerCaptureAdapter",
-    "register_server_capture_schema",
-    "resolve_server_capture_schema",
 ]

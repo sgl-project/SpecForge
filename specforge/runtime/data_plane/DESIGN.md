@@ -19,11 +19,6 @@ See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the complete topology.
 
 ```mermaid
 flowchart TD
-  subgraph CO[online colocated]
-    CR[RolloutWorker] --> CLS[LocalFeatureStore]
-    CR --> LRS[LocalRolloutStream]
-  end
-
   subgraph DO[offline disaggregated]
     ING[offline ingest producer] --> DSTORE[SharedDir or Mooncake store]
     ING --> MAN[static ref manifest]
@@ -40,11 +35,9 @@ flowchart TD
   end
 
   OFF[local offline file refs] --> DL[FeatureDataLoader]
-  LRS --> DL
   MAN --> DL
   Q0 --> DL
   QN --> DL
-  CLS -.-> DL
   DSTORE -.-> DL
   MC -.-> DL
   DL --> TB[TrainBatch]
@@ -61,13 +54,11 @@ directly.
 
 [`feature_store.py`](feature_store.py) defines storage lifecycle operations:
 `put`, `get`, `release`, `abort`, and `gc`. `LocalFeatureStore` supports
-in-memory `mem://` samples for colocated online capture and `file://` samples
-for colocated offline training.
+`file://` samples for colocated offline training. Its in-memory mode remains a
+useful test utility but is not a canonical online topology.
 
 `get` returns tensors plus a lease handle. The loader clones when required and
-then releases the handle. Online in-memory samples are consume-once and free on
-their last current-generation release. Offline file refs never become a
-consume-once in-memory stream and remain available for later epochs.
+then releases the handle. Offline file refs remain available for later epochs.
 
 `abort` removes failed or abandoned samples. Optional resident-byte limits and
 `gc` bound leaks from stranded online objects.
@@ -93,13 +84,6 @@ that fixed ref list.
 Both paths feed `FeatureDataLoader` in refs mode. They support multiple epochs
 and an offline checkpoint can seek the next iteration to its saved sample
 position.
-
-### Colocated online pull-through
-
-[`local_rollout_stream.py`](local_rollout_stream.py) implements a bounded queue
-facade over the controller's private local queue. When the loader requests a
-batch, the stream runs only enough rollout work to fill it. This bounds local
-feature residency and keeps target inference on the training thread.
 
 ### Online-disaggregated source channel
 
@@ -146,8 +130,7 @@ Ranks never train or silently drop a partial global optimizer window.
 [`feature_dataloader.py`](feature_dataloader.py) has two input modes:
 
 - `refs`: a fixed, re-iterable offline list;
-- `queue`: a consume-once online source (`LocalRolloutStream` or a rank's
-  `StreamingRefQueue`).
+- `queue`: a rank's consume-once online `StreamingRefQueue`.
 
 For every ref it performs `store.get -> clone if needed -> store.release`, then
 applies the injected per-sample transform and collator. The loader contains no

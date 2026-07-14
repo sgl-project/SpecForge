@@ -159,11 +159,12 @@ def build_offline_eagle3_loader(
     ref_slice: slice | None = None,
 ):
     """Build the canonical fixed-ref EAGLE3 loader used by runtime tests."""
+    from specforge.algorithms.builtin import builtin_algorithm_registry
     from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
-    from specforge.training.strategies.registry import resolve_strategy
 
-    spec = resolve_strategy("eagle3")
-    reader = spec.make_offline_reader(
+    algorithm = builtin_algorithm_registry().resolve("eagle3")
+    provider = algorithm.providers.offline_for("text")
+    reader = provider.build_reader(
         hidden_states_path,
         run_id=run_id,
         ttt_length=ttt_length,
@@ -176,47 +177,15 @@ def build_offline_eagle3_loader(
         LocalFeatureStore(f"{run_id}-features"),
         refs=refs,
         batch_size=batch_size,
-        collate_fn=spec.make_offline_collate(),
-        per_sample_transform=spec.make_offline_transform(max_len),
-        strategy=spec.name,
+        collate_fn=provider.build_collator(),
+        per_sample_transform=provider.build_normalizer(max_len),
+        strategy=algorithm.name,
     )
-
-
-def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4)):
-    """Build a tiny HF Llama target wrapped by the SpecForge HF eagle3 backend."""
-    from transformers import LlamaConfig, LlamaForCausalLM
-
-    from specforge.inference.target_engine import get_target_engine
-
-    cfg = LlamaConfig(
-        hidden_size=hidden,
-        intermediate_size=2 * hidden,
-        num_hidden_layers=layers,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        vocab_size=vocab,
-        max_position_embeddings=512,
-        rms_norm_eps=1e-5,
-        tie_word_embeddings=False,
-    )
-    torch.manual_seed(1234)
-    model = LlamaForCausalLM(cfg)
-    target_dir = os.path.join(workdir, "hf_target")
-    model.save_pretrained(target_dir)
-    target = get_target_engine(
-        target_dir,
-        strategy="eagle3",
-        backend="hf",
-        torch_dtype=torch.bfloat16,
-        device="cuda",
-    )
-    target.set_capture_layers(list(aux_layer_ids))
-    return target, target_dir, list(aux_layer_ids)
 
 
 def build_eagle3(workdir, ttt=3):
     """Build (eagle3_model, target_head) sharing one set of weights, on cuda."""
-    from specforge.core.eagle3 import OnlineEagle3Model
+    from specforge.algorithms.eagle3.model import OnlineEagle3Model
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
     from specforge.modeling.target.target_head import TargetHead
 
@@ -281,7 +250,7 @@ def build_dflash(
     """
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
-    from specforge.core.dflash import OnlineDFlashModel
+    from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
     from specforge.modeling.draft.dflash import DFlashDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
@@ -349,7 +318,7 @@ def build_domino(
     """
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
-    from specforge.core.dflash import OnlineDominoModel
+    from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
     from specforge.modeling.draft.domino import DominoDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
@@ -419,7 +388,7 @@ def build_dspark(
     """Build a tiny OnlineDSparkModel on CUDA without model downloads."""
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
-    from specforge.core.dflash import OnlineDSparkModel
+    from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
     from specforge.modeling.draft.dspark import DSparkDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 

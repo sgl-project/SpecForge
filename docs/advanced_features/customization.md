@@ -13,7 +13,7 @@ For one-off changes, use dotted overrides rather than adding another launcher:
 
 ```bash
 specforge train \
-  --config examples/configs/qwen3-8b-eagle3-online.yaml \
+  --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml \
   model.target_model_path=/models/my-target \
   data.train_data_path=/datasets/my-training-data.jsonl \
   training.learning_rate=5e-5
@@ -49,11 +49,11 @@ data:
   max_length: 4096
 ```
 
-The unified runtime accepts text input and Qwen2.5-VL input through
-`model.input_modality: qwen2_5_vl`. Multimodal tensors stay inside rollout;
-the control plane retains JSON-safe image/conversation metadata and the
-feature store retains only M-RoPE position IDs. Other multimodal model config
-fields are rejected. Attention backends are a closed, strategy-specific set:
+The server capture runtime currently accepts text input. The explicit
+`model.input_modality` field remains part of the contract, but
+`qwen2_5_vl` is rejected until an algorithm-owned provider defines how media
+and M-RoPE tensors are serialized through the streaming data plane. Attention
+backends are a closed, strategy-specific set:
 
 | Strategy | Accepted `training.attention_backend` values |
 | --- | --- |
@@ -75,55 +75,11 @@ model:
   lm_head_key: lm_head.weight
 ```
 
-`model.target_backend` is also strategy- and topology-specific. Online
-disaggregation requires `sglang`. A `custom` backend is accepted only for
-EAGLE3 and P-EAGLE; DFlash-family strategies use `sglang` or `hf` where the
-selected topology supports them. For compatibility with the earlier VLM entry,
-`custom` plus `input_modality: qwen2_5_vl` is an observable alias for the
-effective `hf` target backend and emits a warning at assembly time.
-
-Large target models may use a tensor-parallel custom implementation under
-`specforge/modeling/target/custom_backend`. `training.tp_size` defines each
-target capture group. SGLang targets, sharded custom targets, and text EAGLE3's
-supported HF TP path use that group to shard model weights. DFlash and Domino
-with `model.target_backend: hf` do not: every rank loads a complete target
-replica, and `tp_size` only coordinates the shared capture batch and rank-local
-batch partition. A larger world size creates target-DP groups that receive
-disjoint prompt or offline-reference shards.
-
-Colocated text EAGLE3 with SGLang can additionally set
-`model.shard_target_output: true` to return only each target-TP rank's local
-batch partition. Other target paths, including VLM, capture the full target
-batch and partition outputs locally. This output partitioning is independent
-of whether the target model's weights are tensor-sharded.
-
-Follow the existing Transformers `PreTrainedModel` implementations and use
-SpecForge's parallel linear layers where the target model is sharded:
-
-```python
-from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
-
-
-class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin):
-    ...
-
-    def load_weights(self, state_dict):
-        ...
-```
-
-Register the target config class in `AutoDistributedTargetModel` in
-`specforge/modeling/auto.py`, then select `model.target_backend: custom`:
-
-```diff
-class AutoDistributedTargetModel(AutoModelForCausalLMBase):
-    _model_mapping = {
-        Llama4TextConfig: [Llama4ForCausalLM],
-+       MyModelConfig: [MyModelForCausalLM],
-    }
-```
-
-The target backend implements target inference only. Run orchestration remains
-in the `specforge train` assembly path.
+Every online run uses `model.target_backend: sglang`. Add target-model support
+to the SGLang capture server instead of adding an HF/custom target loader to
+the trainer. Target TP/EP and model-specific inference stay on that server;
+the SpecForge consumer receives only the algorithm's versioned feature schema.
+Offline feature training performs no target inference.
 
 EAGLE3 offline sequence parallelism is selected with
 `training.attention_backend: usp` plus `training.sp_ulysses_size` and
@@ -174,5 +130,9 @@ model assembler resolve both the config and model class from the registry; do
 not add a method-specific training launcher.
 
 An architecture alone does not define a new loss. A genuinely new training
-algorithm also needs a `DraftTrainStrategy` and `StrategySpec` registration in
-`specforge/training/strategies`, plus a corresponding validated strategy value.
+algorithm also needs a pure `AlgorithmSpec`, executable `AlgorithmProviders`,
+and one immutable `AlgorithmRegistration` under `specforge/algorithms`. Its
+step provider may construct a `DraftTrainStrategy`, while its model and data
+providers own algorithm-specific assembly. Add builtin registrations to the
+explicit catalog used by the application composition root; do not add a
+method-specific launcher or a second mutable registry.

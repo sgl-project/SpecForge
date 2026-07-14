@@ -1,6 +1,7 @@
 model:
   target_model_path: "meta-llama/Llama-3.3-70B-Instruct"
   draft_model_config: "configs/llama3-70B-ealge3.json"
+  vocab_mapping_path: cache/vocab_mapping/llama3.3-70b-eagle3.pt
   target_backend: "sglang"
   embedding_key: "model.embed_tokens.weight"
   torch_dtype: "bfloat16"
@@ -13,12 +14,13 @@ data:
 training:
   strategy: "eagle3"
   num_epochs: 10
+  max_steps: 10000
   batch_size: 1
   learning_rate: 0.0001
   max_grad_norm: 0.5
   ttt_length: 7
   attention_backend: "flex_attention"
-  tp_size: 4
+  tp_size: 1
   save_interval: 1000
   log_interval: 50
   dist_timeout: 20
@@ -27,7 +29,16 @@ run_id: "llama3.3-70b-eagle3-online"
 output_dir: "./outputs/llama3.3-70b-eagle3-online"
 
 deployment:
-  mode: local_colocated
+  mode: disaggregated
   trainer:
     nnodes: 1
     nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/llama3.3-70b-eagle3-online/control
+    consumer_state_dir: outputs/llama3.3-70b-eagle3-online/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

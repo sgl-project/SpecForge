@@ -27,9 +27,9 @@ class TestCliConfigBuild(unittest.TestCase):
 
         import yaml
 
+        from specforge.application import build_application_run, resolve_run
         from specforge.config import load_config
         from specforge.training import Trainer
-        from specforge.training.assembly import build_training_run
 
         workdir = tempfile.mkdtemp(prefix="cli_cfg_")
         cfg_path = fx.write_draft_config(os.path.join(workdir, "draft.json"))
@@ -62,7 +62,7 @@ class TestCliConfigBuild(unittest.TestCase):
             yaml.safe_dump(run_config, f)
 
         cfg = load_config(yaml_path, ["training.max_steps=2"])  # override applies
-        run = build_training_run(cfg)
+        run = build_application_run(resolve_run(cfg))
         trainer = run.trainer
 
         # package-level assembly is the single wiring the CLI executes
@@ -84,14 +84,15 @@ class TestCliConfigBuild(unittest.TestCase):
 
 
 class TestCliDispatch(unittest.TestCase):
-    def test_train_command_dispatches_one_validated_config(self):
+    def test_train_command_dispatches_one_resolved_run(self):
+        from specforge.application import ResolvedRun
         from specforge.cli import main
         from specforge.config import Config
 
         cfg = Config.model_validate(
             {
                 "model": {"target_model_path": "t", "draft_model_config": "d"},
-                "data": {"prompts_path": "/prompts.jsonl"},
+                "data": {"hidden_states_path": "/features"},
                 "training": {"strategy": "dflash"},
             }
         )
@@ -101,7 +102,11 @@ class TestCliDispatch(unittest.TestCase):
         ):
             self.assertEqual(main(["train", "--config", "run.yaml"]), 0)
         load.assert_called_once_with("run.yaml", [])
-        train.assert_called_once_with(cfg)
+        train.assert_called_once()
+        resolved = train.call_args.args[0]
+        self.assertIsInstance(resolved, ResolvedRun)
+        self.assertEqual(resolved.config, cfg)
+        self.assertEqual(resolved.algorithm.name, "dflash")
 
 
 if __name__ == "__main__":

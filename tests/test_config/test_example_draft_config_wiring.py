@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from typing import Optional
 
-from specforge.training.strategies.registry import resolve_strategy
+from specforge.algorithms.builtin import builtin_algorithm_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
@@ -41,24 +41,26 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
     def test_local_draft_architecture_matches_recipe_strategy(self):
         recipes = list(_local_draft_configs())
         self.assertTrue(recipes)
+        registry = builtin_algorithm_registry()
 
         for recipe, strategy, draft_config in recipes:
             with self.subTest(recipe=recipe.name):
-                spec = resolve_strategy(strategy)
+                algorithm = registry.resolve(strategy)
+                draft_provider = algorithm.providers.model.draft_config
                 self.assertTrue(draft_config.is_file(), draft_config)
                 payload = json.loads(draft_config.read_text())
                 self.assertEqual(
                     payload.get("architectures"),
-                    [spec.assembly.draft_config.architecture],
+                    [draft_provider.architecture],
                 )
-                expected_auto_model = spec.assembly.draft_config.expected_auto_map_model
+                expected_auto_model = draft_provider.expected_auto_map_model
                 if expected_auto_model is not None:
                     self.assertEqual(
                         payload.get("auto_map", {}).get("AutoModel"),
                         expected_auto_model,
                     )
 
-    def test_every_checked_in_draft_config_has_a_unified_yaml_recipe(self):
+    def test_only_future_vlm_draft_configs_lack_a_unified_recipe(self):
         referenced = {
             draft_config.resolve()
             for _, _, draft_config in _local_draft_configs()
@@ -66,7 +68,13 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
         }
         checked_in = {path.resolve() for path in DRAFT_CONFIG_DIR.glob("*.json")}
 
-        self.assertEqual(checked_in, referenced)
+        self.assertEqual(
+            {path.name for path in checked_in - referenced},
+            {
+                "qwen2-5-vl-7b-eagle3.json",
+                "qwen2.5-vl-32b-eagle3.json",
+            },
+        )
 
 
 if __name__ == "__main__":

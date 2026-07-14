@@ -17,6 +17,7 @@ from urllib.error import HTTPError
 
 from pydantic import ValidationError
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
 from specforge.launch_plan import (
@@ -25,16 +26,27 @@ from specforge.launch_plan import (
     ReadinessSpec,
     ServiceSpec,
     _http_ready,
-    build_launch_plan,
-    run_commands,
 )
+from specforge.launch_plan import build_launch_plan as _build_launch_plan
+from specforge.launch_plan import run_commands
 from specforge.training.capture_contract import ServerCaptureContract
+
+ALGORITHM = builtin_algorithm_registry().resolve("dflash")
+
+
+def build_launch_plan(cfg, **kwargs):
+    """Build every test plan with one already-resolved registration."""
+    return _build_launch_plan(cfg, algorithm=ALGORITHM, **kwargs)
 
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
     raw = {
         "model": {"target_model_path": "target", "draft_model_config": "draft"},
-        "data": {"prompts_path": "prompts.jsonl"},
+        "data": (
+            {"prompts_path": "prompts.jsonl"}
+            if mode == "disaggregated"
+            else {"hidden_states_path": "features"}
+        ),
         "training": {"strategy": "dflash", "max_steps": 1},
         "deployment": {
             "mode": mode,
@@ -59,7 +71,6 @@ def _offline_disaggregated_config(*, backend="mooncake", producer_segment_size=N
     raw["data"] = {"hidden_states_path": "features"}
     raw["deployment"]["disaggregated"]["backend"] = backend
     raw["deployment"]["disaggregated"]["server_urls"] = []
-    raw["training"]["server_urls"] = []
     if backend == "shared_dir":
         raw["deployment"]["disaggregated"]["store_root"] = "/shared/features"
     if producer_segment_size is not None:
@@ -72,7 +83,6 @@ def _offline_disaggregated_config(*, backend="mooncake", producer_segment_size=N
 def _managed_config(control_dir, *, nproc=2, servers=None):
     raw = _config(mode="disaggregated", nproc=nproc).model_dump()
     raw["deployment"]["disaggregated"]["server_urls"] = []
-    raw["training"]["server_urls"] = []
     raw["deployment"]["disaggregated"]["managed_local"] = {
         "trainer_cuda_visible_devices": [str(i + 4) for i in range(nproc)],
         "mooncake": {
@@ -336,12 +346,6 @@ class LaunchPlanTest(unittest.TestCase):
                 ),
                 "requires deployment.trainer.nnodes=1",
             ),
-            "explicit metadata db": (
-                lambda raw: raw["training"].update(
-                    metadata_db_path="/other/consumer.sqlite"
-                ),
-                "conflicts with",
-            ),
             "surrounding whitespace": (
                 lambda raw: raw["deployment"]["disaggregated"].update(
                     consumer_state_dir=" /local/attempt-state"
@@ -446,11 +450,8 @@ class LaunchPlanTest(unittest.TestCase):
         cfg = _managed_config("/fresh/managed-attempt")
         invalid_cases = {
             "server urls": (
-                lambda raw: (
-                    raw["deployment"]["disaggregated"].update(
-                        server_urls=["http://external:30000"]
-                    ),
-                    raw["training"].update(server_urls=["http://external:30000"]),
+                lambda raw: raw["deployment"]["disaggregated"].update(
+                    server_urls=["http://external:30000"]
                 ),
                 "derives capture server URLs",
             ),
@@ -477,16 +478,6 @@ class LaunchPlanTest(unittest.TestCase):
             "persisted role": (
                 lambda raw: raw["training"].update(role="producer"),
                 "persisted training role",
-            ),
-            "VLM": (
-                lambda raw: (
-                    raw["training"].update(strategy="eagle3"),
-                    raw["model"].update(
-                        input_modality="qwen2_5_vl",
-                        vocab_mapping_path="vocab-map.pt",
-                    ),
-                ),
-                "requires deployment_mode=local_colocated",
             ),
             "SGLang DP": (
                 lambda raw: raw["model"].update(sglang_enable_dp_attention=True),
@@ -775,7 +766,6 @@ class LaunchPlanTest(unittest.TestCase):
     def test_capture_server_urls_are_required_only_for_producers(self):
         raw = _config(mode="disaggregated").model_dump()
         raw["deployment"]["disaggregated"]["server_urls"] = []
-        raw["training"]["server_urls"] = []
         cfg = Config.model_validate(raw)
         with self.assertRaisesRegex(ValueError, "requires server URLs"):
             build_launch_plan(
@@ -875,12 +865,6 @@ class LaunchPlanTest(unittest.TestCase):
                     env=MOONCAKE_ENV,
                 )
 
-    def test_new_deployment_surface_rejects_legacy_conflicts(self):
-        raw = _config().model_dump()
-        raw["training"]["deployment_mode"] = "disaggregated"
-        with self.assertRaisesRegex(ValidationError, "conflicts"):
-            Config.model_validate(raw)
-
     def test_online_disaggregated_schema_rejects_shared_directory_store(self):
         raw = _config(mode="disaggregated").model_dump()
         raw["deployment"]["disaggregated"]["backend"] = "shared_dir"
@@ -888,7 +872,7 @@ class LaunchPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "backend=mooncake"):
             Config.model_validate(raw)
 
-    def test_deployment_server_url_override_updates_assembly_view(self):
+    def test_deployment_server_url_override_updates_canonical_view(self):
         cfg = _config(mode="disaggregated")
         updated = apply_overrides(
             cfg,
@@ -898,35 +882,15 @@ class LaunchPlanTest(unittest.TestCase):
             updated.deployment.disaggregated.server_urls,
             ["http://new-capture:31000"],
         )
-        self.assertEqual(
-            updated.training.server_urls,
-            ["http://new-capture:31000"],
-        )
 
-        legacy_updated = apply_overrides(
-            updated,
-            ["training.server_urls=[http://legacy-name:32000]"],
-        )
-        self.assertEqual(
-            legacy_updated.deployment.disaggregated.server_urls,
-            ["http://legacy-name:32000"],
-        )
-
-    def test_deployment_aliases_round_trip_and_survive_unrelated_overrides(self):
+    def test_deployment_round_trip_survives_unrelated_overrides(self):
         cfg = _config(mode="disaggregated")
         self.assertEqual(Config.model_validate(cfg.model_dump()), cfg)
         updated = apply_overrides(cfg, ["training.batch_size=2"])
-        self.assertEqual(updated.training.server_urls, cfg.training.server_urls)
         self.assertEqual(
             updated.deployment.disaggregated.server_urls,
             cfg.deployment.disaggregated.server_urls,
         )
-
-    def test_conflicting_server_url_aliases_fail_loudly(self):
-        raw = _config(mode="disaggregated").model_dump()
-        raw["training"]["server_urls"] = ["http://legacy:30000"]
-        with self.assertRaisesRegex(ValidationError, "server_urls conflicts"):
-            Config.model_validate(raw)
 
     def test_cli_plan_is_json_and_does_not_execute(self):
         with tempfile.TemporaryDirectory() as root:
@@ -947,11 +911,12 @@ class LaunchPlanTest(unittest.TestCase):
             self.assertEqual(set(payload), {"kind", "role", "commands", "worker_env"})
             self.assertNotIn("--plan", payload["commands"][0]["argv"])
 
-    def test_cli_producer_projection_ignores_consumer_only_settings(self):
+    def test_cli_producer_projection_preserves_canonical_consumer_state(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "run.json")
             raw = _config(mode="disaggregated").model_dump(mode="json")
-            raw["training"]["metadata_db_path"] = os.path.join(root, "consumer.sqlite")
+            state_dir = os.path.join(root, "consumer-state")
+            raw["deployment"]["disaggregated"]["consumer_state_dir"] = state_dir
             raw["profiling"]["enabled"] = True
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(raw, stream)
@@ -966,9 +931,13 @@ class LaunchPlanTest(unittest.TestCase):
                 )
 
             projected = train.call_args.args[0]
-            self.assertEqual(projected.training.role, "producer")
-            self.assertIsNone(projected.training.metadata_db_path)
-            self.assertFalse(projected.profiling.enabled)
+            self.assertEqual(projected.config.training.role, "producer")
+            self.assertEqual(
+                projected.config.deployment.disaggregated.consumer_state_dir,
+                state_dir,
+            )
+            self.assertFalse(projected.config.profiling.enabled)
+            self.assertEqual(projected.algorithm.name, ALGORITHM.name)
 
     def test_plan_redacts_secret_overrides(self):
         plan = build_launch_plan(

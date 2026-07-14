@@ -7,6 +7,8 @@ import types
 import unittest
 from unittest import mock
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
+from specforge.application import bind_run
 from specforge.cli import (
     _bootstrap_single_process_env,
     _train,
@@ -20,6 +22,19 @@ from specforge.training.disaggregated import (
     _claim_fresh_control_path,
     build_disaggregated_run,
 )
+
+ALGORITHM = builtin_algorithm_registry().resolve("dflash")
+
+
+def _disaggregated_deployment(control_dir, *, server_urls=()):
+    return {
+        "mode": "disaggregated",
+        "disaggregated": {
+            "control_dir": control_dir,
+            "backend": "mooncake",
+            "server_urls": list(server_urls),
+        },
+    }
 
 
 class _FakeTrainer:
@@ -123,10 +138,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         "data": {"prompts_path": "/prompts.jsonl"},
                         "training": {
                             "strategy": "dflash",
-                            "deployment_mode": "disaggregated",
                             "role": role,
                             "max_steps": 1,
                         },
+                        "deployment": _disaggregated_deployment(root),
                     }
                 )
 
@@ -147,6 +162,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "assembly exploded"):
                         build_disaggregated_run(
                             cfg,
+                            algorithm=ALGORITHM,
                             build_model_bundle=mock.Mock(),
                             prepare_prompts=mock.Mock(),
                             optimizer_factory=mock.Mock(),
@@ -169,10 +185,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 "data": {"prompts_path": "/prompts.jsonl"},
                 "training": {
                     "strategy": "dflash",
-                    "deployment_mode": "disaggregated",
                     "role": "producer",
                     "max_steps": 1,
                 },
+                "deployment": _disaggregated_deployment(root),
             }
         )
         with (
@@ -185,6 +201,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "claim rejected"):
                 build_disaggregated_run(
                     cfg,
+                    algorithm=ALGORITHM,
                     build_model_bundle=mock.Mock(),
                     prepare_prompts=mock.Mock(),
                     optimizer_factory=mock.Mock(),
@@ -205,35 +222,46 @@ class TestCliLifecycle(unittest.TestCase):
                 "data": {"train_data_path": "train.jsonl"},
                 "training": {
                     "strategy": "dflash",
-                    "deployment_mode": "disaggregated",
                     "role": "producer",
-                    "server_urls": ["http://capture"],
                     "total_steps": 1,
                 },
+                "deployment": _disaggregated_deployment(
+                    "/shared/attempt",
+                    server_urls=("http://capture",),
+                ),
             }
         )
         run = mock.Mock()
         run.run.return_value = 3
         assembly = types.ModuleType("specforge.training.assembly")
         assembly.build_training_run = mock.Mock(return_value=run)
+        accelerate = types.ModuleType("accelerate")
+        accelerate_utils = types.ModuleType("accelerate.utils")
+        accelerate_utils.set_seed = mock.Mock()
+        accelerate.utils = accelerate_utils
 
         with mock.patch.dict(
             sys.modules,
             {
+                "accelerate": accelerate,
+                "accelerate.utils": accelerate_utils,
                 "specforge.distributed": None,
                 "specforge.training.assembly": assembly,
             },
         ):
-            self.assertEqual(_train(cfg), 3)
+            self.assertEqual(_train(bind_run(cfg, ALGORITHM)), 3)
 
-        assembly.build_training_run.assert_called_once_with(cfg)
+        assembly.build_training_run.assert_called_once_with(
+            cfg,
+            algorithm=ALGORITHM,
+        )
         run.run.assert_called_once_with()
 
     def test_world_size_matches_the_configured_parallel_topology(self):
         local = Config.model_validate(
             {
                 "model": {"target_model_path": "t", "draft_model_config": "d"},
-                "data": {"prompts_path": "/prompts.jsonl"},
+                "data": {"hidden_states_path": "/features"},
                 "training": {"tp_size": 2},
             }
         )
@@ -247,10 +275,10 @@ class TestCliLifecycle(unittest.TestCase):
                 "data": {"prompts_path": "/prompts.jsonl"},
                 "training": {
                     "strategy": "dflash",
-                    "deployment_mode": "disaggregated",
                     "role": "consumer",
                     "total_steps": 10,
                 },
+                "deployment": _disaggregated_deployment("/shared/attempt"),
             }
         )
         _validate_world_size(consumer, 8)

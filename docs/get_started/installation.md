@@ -44,9 +44,10 @@ python -m pip install -e .
 ```
 
 The file pins a ROCm 7.2 PyTorch stack. Use a wheel index and driver combination
-compatible with the host if your ROCm version differs. HF target capture with
-SDPA is the portable starting point; PyTorch exposes ROCm accelerators through
-its `torch.cuda` API and uses NCCL for distributed runs.
+compatible with the host if your ROCm version differs. Online runs require a
+ROCm-compatible SGLang capture service; offline feature consumers can start
+without target inference. PyTorch exposes ROCm accelerators through its
+`torch.cuda` API and uses NCCL for distributed runs.
 
 ### Ascend NPU
 
@@ -55,6 +56,7 @@ SpecForge. The checked-in
 [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml)
 and
 [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml)
-recipes use HF target capture with SDPA. The unified launcher detects the NPU
+recipes use external SGLang server capture with SDPA consumers. Install a
+compatible SGLang/Mooncake service first. The unified launcher detects the NPU
 device, self-launches the process count recorded in YAML, and selects HCCL; see
 the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu).

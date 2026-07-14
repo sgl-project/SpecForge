@@ -9,7 +9,7 @@
 """Domain ``Trainer``: the caller-facing training object.
 
 Composes (ref source + FeatureStore) -> FeatureDataLoader (the data path) and
-model + spec.make_strategy -> FSDPTrainingBackend -> TrainerCore ->
+model + an injected step factory -> FSDPTrainingBackend -> TrainerCore ->
 TrainerController (the trainer seam) behind one object with a ``.fit()``.
 Online / offline / disaggregated is invisible here: it is fully absorbed by the
 ref source + store the Trainer is handed — the loader IS the stream.
@@ -26,7 +26,6 @@ from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
-from specforge.training.strategies.registry import StrategySpec
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +36,8 @@ class Trainer:
     def __init__(
         self,
         *,
-        spec: StrategySpec,
+        algorithm_name: str,
+        make_step_strategy: Callable,
         controller,  # runtime.control_plane.DataFlowController (metadata only)
         store: FeatureStore,
         ref_source: dict,  # {"refs": [...]} (offline) | {"queue": q} (online)
@@ -108,7 +108,7 @@ class Trainer:
             collate_fn=collate_fn,
             per_sample_transform=per_sample_transform,
             drop_last=True,
-            strategy=spec.name,
+            strategy=algorithm_name,
             ack=not defer_queue_ack,
             num_workers=dataloader_num_workers,
         )
@@ -187,10 +187,10 @@ class Trainer:
                 else CheckpointManager.read_resume_state(resume_from)
             )
             saved_strategy = state.get("strategy")
-            if saved_strategy != spec.name:
+            if saved_strategy != algorithm_name:
                 raise ValueError(
                     f"checkpoint {resume_from} was written by strategy "
-                    f"{saved_strategy!r}; this run trains {spec.name!r}"
+                    f"{saved_strategy!r}; this run trains {algorithm_name!r}"
                 )
             import torch.distributed as dist
 
@@ -201,14 +201,10 @@ class Trainer:
             }
             for key, current in resume_contract.items():
                 persisted = state.get(key)
-                if (
-                    spec.name == "peagle"
-                    and key.startswith("peagle_")
-                    and persisted is None
-                ):
+                if key in custom_checkpoint_extra and persisted is None:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
-                        f"P-EAGLE resume semantic {key}; start a fresh run "
+                        f"algorithm resume semantic {key}; start a fresh run "
                         "rather than guessing the prior objective"
                     )
                 if persisted is not None and persisted != current:
@@ -296,7 +292,7 @@ class Trainer:
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
         if resume is not None:
             backend.load_state_dict(resume["backend"])
-        strategy = spec.make_strategy(
+        strategy = make_step_strategy(
             wrapped, target_head=target_head, **(strategy_kwargs or {})
         )
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
@@ -346,7 +342,8 @@ class Trainer:
             controller_obj.last_checkpoint_step = resume["global_step"]
 
         # Runtime pieces remain inspectable behind the single Trainer lifecycle.
-        self.spec = spec
+        self.algorithm_name = algorithm_name
+        self.make_step_strategy = make_step_strategy
         self.run_id = run_id
         self.output_dir = output_dir
         self.batch_size = batch_size

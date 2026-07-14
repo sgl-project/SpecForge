@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Package-level assembly for the single ``specforge train`` entry point.
+"""Training-object assembly driven by the application composition root.
 
-The DataFlow launch module owns topology wiring and the strategy registry owns
-per-step loss behavior.  This module is the missing seam between typed run
-configuration and those two layers: it builds the draft composite, frozen target
-pieces, prompt tasks and optimizer without importing anything from ``scripts``.
+The application resolves one immutable algorithm registration and passes it
+through every builder.  This module never resolves an algorithm name and never
+constructs an in-process online target engine; online capture comes exclusively
+from an external SGLang server through the disaggregated runtime.
 
 Heavy model/data dependencies stay lazy so importing :mod:`specforge.training`
 does not load Transformers, datasets, or a target backend.
@@ -32,6 +32,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from specforge.algorithms.contracts import FeatureMode
+from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
 
 
@@ -41,11 +43,8 @@ class ModelBundle:
 
     model: Any
     draft_model: Any
-    tokenizer: Any = None
-    processor: Any = None
-    input_preparer: Any = None
-    feature_schema: Any = None
-    target_engine: Any = None
+    draft_config: Any
+    input_tools: Any = None
     target_head: Any = None
     target_hidden_size: int = 0
     target_vocab_size: int = 0
@@ -106,140 +105,78 @@ def _device():
     return get_local_device()
 
 
-def _strategy_spec(cfg: Config):
-    from specforge.training.strategies.registry import resolve_strategy
-
-    return resolve_strategy(cfg.training.strategy)
-
-
-def _load_draft(cfg: Config):
+def _load_draft(cfg: Config, algorithm: AlgorithmRegistration):
     """Construct the configured draft model without any legacy trainer code."""
     from specforge.modeling.draft.registry import resolve_draft
     from specforge.training.model_loading import resolve_draft_config
-    from specforge.training.strategies.registry import resolve_strategy
 
-    spec = resolve_strategy(cfg.training.strategy)
-    draft_config = resolve_draft_config(cfg)
-    draft_model = spec.assembly.make_draft_model(cfg, draft_config)
-    architecture = spec.assembly.draft_config.architecture
+    provider = algorithm.providers.model
+    draft_config = resolve_draft_config(cfg, provider=provider.draft_config)
+    draft_model = provider.build_draft(cfg, draft_config)
+    architecture = provider.draft_config.architecture
     expected_type = resolve_draft(architecture)
     if not isinstance(draft_model, expected_type):
         raise ValueError(
-            f"training.strategy={spec.name!r} requires {architecture}, but "
+            f"training.strategy={algorithm.name!r} requires {architecture}, but "
             f"the resolved draft config builds "
             f"{type(draft_model).__name__}"
         )
     return draft_config, draft_model
 
 
-def _load_online_inputs(cfg: Config):
-    """Load text or multimodal input tooling for the shared rollout path."""
-    if cfg.model.input_modality == "qwen2_5_vl":
-        from transformers import AutoProcessor
-
-        from specforge.data.vlm import QwenVLInputPreparer
-
-        processor = AutoProcessor.from_pretrained(
-            cfg.model.target_model_path,
-            min_pixels=cfg.data.min_pixels,
-            max_pixels=cfg.data.max_pixels,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
+def _load_text_tokenizer(cfg: Config):
+    """Load tokenizer tooling used by current built-in text providers."""
+    if cfg.model.input_modality != "text":
+        raise ValueError(
+            "built-in algorithms currently provide training-model input tooling "
+            f"only for modality 'text', got {cfg.model.input_modality!r}; "
+            "another modality must add its own input provider"
         )
-        return (
-            processor.tokenizer,
-            processor,
-            QwenVLInputPreparer(processor, cfg.data.chat_template),
-        )
-
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(
+    return AutoTokenizer.from_pretrained(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
-    return tokenizer, None, None
 
 
-def _build_target_engine(cfg: Config, capture_layers, spec):
-    import warnings
+def _load_input_tools(
+    cfg: Config,
+    algorithm: AlgorithmRegistration,
+    *,
+    input_adapter=None,
+):
+    """Load modality tooling through the provider port or the text default."""
 
-    from specforge.inference.target_engine import get_target_engine
-
-    engine_strategy = spec.assembly.capture_engine_strategy or spec.name
-    effective_backend = cfg.model.target_backend
-    if cfg.model.input_modality == "qwen2_5_vl" and effective_backend == "custom":
-        effective_backend = "hf"
-        warnings.warn(
-            "model.target_backend='custom' with input_modality='qwen2_5_vl' "
-            "is a compatibility alias for the Hugging Face VLM loader; using "
-            "effective target backend 'hf'",
-            UserWarning,
-            stacklevel=2,
-        )
-    backend_kwargs = {}
-    if effective_backend == "sglang":
-        target_batch_size = cfg.training.tp_size * cfg.training.batch_size
-        backend_kwargs = {
-            "attention_backend": cfg.model.sglang_attention_backend,
-            "mem_fraction_static": cfg.model.sglang_mem_fraction_static,
-            "context_length": (cfg.model.sglang_context_length or cfg.data.max_length),
-            "enable_nccl_nvls": cfg.model.sglang_enable_nccl_nvls,
-            "enable_symm_mem": cfg.model.sglang_enable_symm_mem,
-            "enable_torch_compile": cfg.model.sglang_enable_torch_compile,
-            "enable_dp_attention": cfg.model.sglang_enable_dp_attention,
-            "enable_dp_lm_head": cfg.model.sglang_enable_dp_lm_head,
-            "ep_size": cfg.model.sglang_ep_size,
-            "max_running_requests": (
-                cfg.model.sglang_max_running_requests or target_batch_size
-            ),
-            "max_total_tokens": (
-                cfg.model.sglang_max_total_tokens
-                or target_batch_size * cfg.data.max_length
-            ),
-        }
-    elif effective_backend == "hf":
-        backend_kwargs = {"input_modality": cfg.model.input_modality}
-    target = get_target_engine(
-        cfg.model.target_model_path,
-        strategy=engine_strategy,
-        backend=effective_backend,
-        trust_remote_code=cfg.model.trust_remote_code,
-        torch_dtype=_torch_dtype(cfg.model.torch_dtype),
-        device=str(_device()),
-        cache_dir=cfg.model.cache_dir,
-        **backend_kwargs,
-    )
-    target.set_capture_layers(capture_layers)
-    return target
+    if input_adapter is None and cfg.mode == "online":
+        streaming = algorithm.providers.server_streaming_for(cfg.model.input_modality)
+        input_adapter = streaming.create_input_adapter(cfg)
+    if input_adapter is not None:
+        return input_adapter.load_input_tools(cfg)
+    return _load_text_tokenizer(cfg)
 
 
-def _strategy_kwargs(cfg: Config) -> Dict[str, Any]:
-    return _strategy_spec(cfg).assembly.make_strategy_kwargs(cfg)
-
-
-def _strategy_resume_contract(cfg: Config, bundle: ModelBundle) -> Dict[str, Any]:
+def _strategy_resume_contract(
+    cfg: Config,
+    bundle: ModelBundle,
+    algorithm: AlgorithmRegistration,
+) -> Dict[str, Any]:
     """Return resolved strategy semantics that a checkpoint must preserve."""
-    return _strategy_spec(cfg).assembly.resume_contract(
+    return algorithm.providers.step.resume_contract(
         cfg, bundle.draft_model, bundle.model
     )
 
 
-def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> ModelBundle:
+def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:
     """Build the method-specific composite model and frozen target pieces."""
     import torch
     from transformers import AutoConfig
 
-    from specforge.training.strategies.assembly import OnlineCaptureMode
-    from specforge.training.strategies.registry import resolve_strategy
-
-    spec = resolve_strategy(cfg.training.strategy)
-    draft_config, draft_model = _load_draft(cfg)
-    needs_input_tools = spec.assembly.needs_input_tools(cfg, draft_model)
-    tokenizer, processor, input_preparer = (
-        _load_online_inputs(cfg) if needs_input_tools else (None, None, None)
-    )
+    provider = algorithm.providers.model
+    draft_config, draft_model = _load_draft(cfg, algorithm)
+    needs_input_tools = provider.needs_input_tools(cfg, draft_model)
+    input_tools = _load_input_tools(cfg, algorithm) if needs_input_tools else None
     target_config = AutoConfig.from_pretrained(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
@@ -252,26 +189,13 @@ def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> Model
         getattr(draft_config, "draft_vocab_size", draft_config.vocab_size)
     )
 
-    target_engine = None
-    parts = spec.assembly.make_model(
-        cfg, draft_model, draft_config, target_config, tokenizer
+    parts = provider.build_training_model(
+        cfg, draft_model, draft_config, target_config, input_tools
     )
     if cfg.mode == "online" and parts.capture_layers is None:
-        parts.capture_layers = spec.assembly.resolve_capture_layers(
+        parts.capture_layers = provider.resolve_capture_layers(
             cfg, draft_config, target_config
         )
-
-    if load_target_engine and cfg.mode == "online":
-        if spec.online_capture is OnlineCaptureMode.SERVER_ONLY:
-            raise NotImplementedError(
-                f"{spec.name} requires disaggregated online server capture; "
-                "it cannot load a colocated target engine"
-            )
-        if spec.online_capture is OnlineCaptureMode.UNSUPPORTED:
-            raise NotImplementedError(
-                f"online capture for strategy {spec.name!r} is not wired"
-            )
-        target_engine = _build_target_engine(cfg, parts.capture_layers, spec)
 
     # Keep the composite and target parts bf16 while avoiding accidental target
     # gradients. The optimizer still receives the strategy's trainable module.
@@ -281,17 +205,14 @@ def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> Model
     return ModelBundle(
         model=parts.model,
         draft_model=draft_model,
-        tokenizer=tokenizer,
-        processor=processor,
-        input_preparer=input_preparer,
-        feature_schema=spec.feature_schema_for(cfg.model.input_modality),
-        target_engine=target_engine,
+        draft_config=draft_config,
+        input_tools=input_tools,
         target_head=parts.target_head,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
         capture_layers=parts.capture_layers,
-        strategy_kwargs=spec.assembly.make_strategy_kwargs(cfg),
+        strategy_kwargs=algorithm.providers.step.options(cfg),
     )
 
 
@@ -385,8 +306,6 @@ def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
         "draft_block_size": cfg.model.draft_block_size,
         "strategy": cfg.training.strategy,
         "input_modality": cfg.model.input_modality,
-        "min_pixels": cfg.data.min_pixels,
-        "max_pixels": cfg.data.max_pixels,
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
@@ -394,8 +313,9 @@ def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
 def _prepare_prompts(
     cfg: Config,
     tokenizer,
-    processor=None,
     *,
+    algorithm: AlgorithmRegistration,
+    draft_config,
     path: Optional[str] = None,
     cache_key: Optional[str] = None,
 ) -> List[dict]:
@@ -404,6 +324,12 @@ def _prepare_prompts(
     Training keeps the configured cache key. Evaluation supplies its own path
     and derived key so it can never read or overwrite the training prompt cache.
     """
+    if cfg.model.input_modality != "text":
+        raise ValueError(
+            "the built-in prompt preparer supports only modality 'text'; "
+            f"algorithm {algorithm.name!r} must provide a ServerInputAdapter "
+            f"for {cfg.model.input_modality!r}"
+        )
     from specforge.data.prompt_builder import prepare_prompt_tasks
 
     configured_path = cfg.data.prompts_path or cfg.data.train_data_path
@@ -416,7 +342,7 @@ def _prepare_prompts(
             if path is None and cfg.data.cache_key is not None
             else _prompt_cache_key(cfg, path=source_path)
         )
-    min_loss_tokens = _strategy_spec(cfg).assembly.min_loss_tokens(cfg)
+    min_loss_tokens = algorithm.providers.model.minimum_loss_tokens(cfg, draft_config)
     return prepare_prompt_tasks(
         source_path,
         tokenizer,
@@ -429,8 +355,6 @@ def _prepare_prompts(
         num_proc=cfg.data.build_dataset_num_proc,
         min_loss_tokens=min_loss_tokens,
         max_prompts=cfg.data.max_prompts,
-        input_modality=cfg.model.input_modality,
-        processor=processor,
     )
 
 
@@ -487,13 +411,16 @@ def _install_dataset_vocab_mapping(
 
 
 def _ensure_vocab_mapping(
-    cfg: Config, bundle: ModelBundle, prompts: List[dict]
+    cfg: Config,
+    bundle: ModelBundle,
+    prompts: List[dict],
+    algorithm: AlgorithmRegistration,
 ) -> None:
     """Generate the online EAGLE-family map from its prepared prompt plan."""
     # Avoid walking (and validating) the prompt payload when no mapping can be
     # needed.  This is common for equal-vocabulary targets and keeps assembly
     # independent of the online prompt schema for non-mapping runs.
-    if "online" not in _strategy_spec(cfg).assembly.vocab_mapping_modes:
+    if FeatureMode.STREAMING not in algorithm.providers.vocab_mapping_modes:
         return
     if (
         cfg.model.vocab_mapping_path
@@ -515,9 +442,13 @@ def _ensure_vocab_mapping(
     )
 
 
-def _ensure_offline_vocab_mapping(cfg: Config, bundle: ModelBundle) -> None:
+def _ensure_offline_vocab_mapping(
+    cfg: Config,
+    bundle: ModelBundle,
+    algorithm: AlgorithmRegistration,
+) -> None:
     """Derive a local-offline map from the exact feature ids and loss masks."""
-    if "offline" not in _strategy_spec(cfg).assembly.vocab_mapping_modes:
+    if FeatureMode.OFFLINE not in algorithm.providers.vocab_mapping_modes:
         return
     if (
         cfg.model.vocab_mapping_path
@@ -553,12 +484,12 @@ def _ensure_offline_vocab_mapping(cfg: Config, bundle: ModelBundle) -> None:
     )
 
 
-def _dataloader_num_workers(cfg: Config) -> int:
+def _dataloader_num_workers(cfg: Config, algorithm: AlgorithmRegistration) -> int:
     dataloader_num_workers = cfg.data.dataloader_num_workers
     if dataloader_num_workers is None:
-        dataloader_num_workers = _strategy_spec(
-            cfg
-        ).assembly.default_dataloader_num_workers
+        dataloader_num_workers = (
+            algorithm.providers.model.default_dataloader_num_workers
+        )
     return dataloader_num_workers
 
 
@@ -573,17 +504,12 @@ def _profiling_options(cfg: Config):
     )
 
 
-def _online_collate_override(cfg: Config):
-    """Return the modality-specific online collator override, if any."""
-    if cfg.model.input_modality != "qwen2_5_vl":
-        return None
-    from specforge.data.utils import DataCollatorWithPadding
-
-    return DataCollatorWithPadding()
-
-
 def _common_launch_kwargs(
-    cfg: Config, bundle: ModelBundle, *, logger=_logger
+    cfg: Config,
+    bundle: ModelBundle,
+    algorithm: AlgorithmRegistration,
+    *,
+    logger=_logger,
 ) -> Dict[str, Any]:
     t = cfg.training
     # USP shards one logical sample over ``sp_size`` ranks.  Preserve the
@@ -593,7 +519,8 @@ def _common_launch_kwargs(
     if t.attention_backend == "usp":
         accumulation_steps *= t.sp_ulysses_size * t.sp_ring_size
     return dict(
-        strategy=t.strategy,
+        algorithm=algorithm,
+        modality=cfg.model.input_modality,
         optimizer_factory=_optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
@@ -610,27 +537,58 @@ def _common_launch_kwargs(
         tp_size=t.tp_size,
         sp_ulysses_size=t.sp_ulysses_size,
         sp_ring_size=t.sp_ring_size,
-        dataloader_num_workers=_dataloader_num_workers(cfg),
+        dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )
 
 
-def build_training_run(cfg: Config) -> TrainingRun:
-    """Assemble the configured colocated or disaggregated run role."""
+def build_training_run(
+    cfg: Config,
+    *,
+    algorithm: AlgorithmRegistration,
+) -> TrainingRun:
+    """Assemble one validated run from an already-resolved algorithm.
+
+    Offline training may run in one process or with a disaggregated feature
+    source.  Online training is always disaggregated and captures through
+    external SGLang servers; colocated online execution is intentionally absent.
+    """
+
+    if algorithm.name != cfg.training.strategy:
+        raise ValueError(
+            "resolved algorithm does not match training.strategy: "
+            f"{algorithm.name!r} != {cfg.training.strategy!r}"
+        )
+
     t = cfg.training
     if t.role != "producer":
         import torch.distributed as dist
 
         cfg.validate_world_size(dist.get_world_size() if dist.is_initialized() else 1)
-    if t.deployment_mode == "disaggregated":
+
+    if cfg.mode == "online" and cfg.deployment.mode != "disaggregated":
+        raise ValueError(
+            "online training is server-only and requires "
+            "deployment.mode='disaggregated'"
+        )
+
+    if cfg.deployment.mode == "disaggregated":
         from specforge.training.disaggregated import build_disaggregated_run
 
         run_logger = _configured_logger(cfg)
         try:
             return build_disaggregated_run(
                 cfg,
-                build_model_bundle=build_model_bundle,
-                prepare_prompts=_prepare_prompts,
+                algorithm=algorithm,
+                build_model_bundle=lambda run_cfg: build_model_bundle(
+                    run_cfg, algorithm=algorithm
+                ),
+                prepare_prompts=lambda run_cfg, tokenizer, **kwargs: _prepare_prompts(
+                    run_cfg,
+                    tokenizer,
+                    algorithm=algorithm,
+                    **kwargs,
+                ),
                 optimizer_factory=_optimizer_factory,
                 logger=run_logger,
             )
@@ -638,161 +596,32 @@ def build_training_run(cfg: Config) -> TrainingRun:
             _close_configured_logger(run_logger)
             raise
 
-    bundle = build_model_bundle(cfg)
-    if cfg.mode == "offline":
-        from specforge.launch import build_offline_runtime
+    if cfg.mode != "offline":
+        raise ValueError("colocated execution supports offline training only")
 
-        _ensure_offline_vocab_mapping(cfg, bundle)
+    bundle = build_model_bundle(cfg, algorithm=algorithm)
+    from specforge.launch import build_offline_runtime
 
-        run_logger = _configured_logger(cfg)
-        try:
-            trainer = build_offline_runtime(
-                hidden_states_path=cfg.data.hidden_states_path,
-                eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
-                draft_model=bundle.model,
-                target_head=bundle.target_head,
-                ttt_length=t.ttt_length,
-                max_len=cfg.data.max_length,
-                num_epochs=t.num_epochs,
-                use_usp_preprocess=(t.attention_backend == "usp"),
-                seed=t.seed,
-                resume_from=t.resume_from,
-                **_common_launch_kwargs(cfg, bundle, logger=run_logger),
-            )
-        except BaseException:
-            _close_configured_logger(run_logger)
-            raise
-        return TrainingRun(trainer=trainer)
-
-    from specforge.launch import (
-        _plan_online_prompt_stream,
-        _preposition_online_prompts,
-        _target_dp_layout,
-        build_online_runtime,
-    )
-
-    prompts = _prepare_prompts(cfg, bundle.tokenizer, bundle.processor)
-    if not prompts:
-        raise ValueError("online data preparation produced no trainable prompts")
-    eval_prompts = None
-    if cfg.data.eval_data_path:
-        eval_prompts = _prepare_prompts(
-            cfg,
-            bundle.tokenizer,
-            bundle.processor,
-            path=cfg.data.eval_data_path,
-            cache_key="eval-" + _prompt_cache_key(cfg, path=cfg.data.eval_data_path),
-        )
-        if not eval_prompts:
-            raise ValueError(
-                "online eval data preparation produced no trainable prompts"
-            )
-    _ensure_vocab_mapping(cfg, bundle, prompts)
-    source_prompt_count = len(prompts)
-    prompts = _plan_online_prompt_stream(
-        prompts,
-        num_epochs=t.num_epochs,
-        seed=t.seed,
-        tp_size=t.tp_size,
-        batch_size=t.batch_size,
-        shuffle=True,
-    )
-    if not prompts:
-        raise ValueError(
-            "online prompt planning produced no complete target batch after "
-            "target-DP sharding; provide at least tp_size * batch_size prompts "
-            "per target-DP replica"
-        )
-    # The flattened target stream contains all logical epochs, each truncated
-    # independently to complete TP-wide capture batches. Every TP rank trains
-    # one ``1 / tp_size`` slice, so checkpoint dataset_size is rank-local.
-    dataset_size = len(prompts) // t.tp_size
-    if eval_prompts is not None:
-        eval_prompts = _plan_online_prompt_stream(
-            eval_prompts,
-            num_epochs=1,
-            seed=t.seed,
-            tp_size=t.tp_size,
-            batch_size=t.batch_size,
-            shuffle=False,
-        )
-
-    resume_state = None
-    remaining_prompts = prompts
-    if t.resume_from is not None:
-        from specforge.training.checkpoint import CheckpointManager
-
-        resume_state = CheckpointManager.read_resume_state(t.resume_from)
-        checkpoint_epoch = int(resume_state.get("epoch", 0))
-        can_preposition = all(
-            resume_state.get(key) in (None, current)
-            for key, current in (
-                ("dataset_size", dataset_size),
-                ("batch_size", t.batch_size),
-                ("tp_size", t.tp_size),
-            )
-        )
-        if checkpoint_epoch == 0 and can_preposition:
-            remaining_prompts = _preposition_online_prompts(
-                prompts,
-                local_samples=int(resume_state.get("epoch_samples", 0)),
-                tp_size=t.tp_size,
-            )
-        elif checkpoint_epoch == 1 or not can_preposition:
-            remaining_prompts = []
-        else:
-            # Trainer owns the canonical resume validation and error text. Avoid
-            # indexing an invalid epoch while preserving the loaded state for it.
-            remaining_prompts = []
-
-    from specforge.training.schedule import resolve_total_steps
-
-    effective_accumulation_steps = t.accumulation_steps
-    if t.attention_backend == "usp":
-        effective_accumulation_steps *= t.sp_ulysses_size * t.sp_ring_size
-    total_steps = resolve_total_steps(
-        total_steps=t.total_steps,
-        max_steps=t.max_steps,
-        num_samples=dataset_size,
-        batch_size=t.batch_size,
-        accumulation_steps=effective_accumulation_steps,
-        num_epochs=1,
-    )
-    _, target_dp_size = _target_dp_layout()
-    checkpoint_extra = {
-        "online_prompt_plan_version": 1,
-        "prompt_source_size": source_prompt_count,
-        "prompt_seed": t.seed,
-        "prompt_epochs": t.num_epochs,
-        "target_dp_size": target_dp_size,
-        **_strategy_resume_contract(cfg, bundle),
-    }
+    _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
     run_logger = _configured_logger(cfg)
     try:
-        common = _common_launch_kwargs(cfg, bundle, logger=run_logger)
-        common["total_steps"] = total_steps
-        trainer = build_online_runtime(
-            target_model=bundle.target_engine,
-            prompts=remaining_prompts,
-            eval_prompts=eval_prompts,
+        trainer = build_offline_runtime(
+            hidden_states_path=cfg.data.hidden_states_path,
+            eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
             draft_model=bundle.model,
-            target_hidden_size=bundle.target_hidden_size,
-            target_vocab_size=bundle.target_vocab_size,
-            draft_vocab_size=bundle.draft_vocab_size,
-            target_repr=_strategy_spec(cfg).assembly.colocated_target_repr,
-            aux_hidden_state_layer_ids=bundle.capture_layers,
-            t2d=getattr(bundle.draft_model, "t2d", None),
-            prompt_epochs=1,
-            feature_schema=bundle.feature_schema,
-            input_preparer=bundle.input_preparer,
-            shard_target_output=cfg.model.shard_target_output,
-            device=str(_device()),
+            target_head=bundle.target_head,
+            ttt_length=t.ttt_length,
+            max_len=cfg.data.max_length,
+            num_epochs=t.num_epochs,
+            use_usp_preprocess=(t.attention_backend == "usp"),
+            seed=t.seed,
             resume_from=t.resume_from,
-            resume_state=resume_state,
-            dataset_size=dataset_size,
-            checkpoint_extra=checkpoint_extra,
-            collate_fn=_online_collate_override(cfg),
-            **common,
+            **_common_launch_kwargs(
+                cfg,
+                bundle,
+                algorithm,
+                logger=run_logger,
+            ),
         )
     except BaseException:
         _close_configured_logger(run_logger)

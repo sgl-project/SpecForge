@@ -21,6 +21,7 @@ import os
 import time
 from typing import Callable, Optional, Sequence
 
+from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
@@ -174,15 +175,27 @@ def _offline_store(cfg: Config, *, retain_on_release: bool = False):
 
 
 def _server_urls(cfg: Config) -> list[str]:
-    if cfg.training.server_urls:
-        return list(cfg.training.server_urls)
+    deployment = cfg.deployment.disaggregated
+    if deployment is not None and deployment.server_urls:
+        return list(deployment.server_urls)
     raw = os.environ.get("DISAGG_SERVER_URLS") or os.environ.get("DISAGG_SERVER_URL")
     if not raw:
         raise ValueError(
-            "online producer requires training.server_urls, DISAGG_SERVER_URLS, "
-            "or DISAGG_SERVER_URL"
+            "online producer requires deployment.disaggregated.server_urls, "
+            "DISAGG_SERVER_URLS, or DISAGG_SERVER_URL"
         )
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _consumer_database_path(cfg: Config) -> Optional[str]:
+    configured = os.environ.get("DISAGG_DB")
+    if configured:
+        return configured
+    deployment = cfg.deployment.disaggregated
+    if deployment is None:
+        return None
+    state_dir = deployment.consumer_state_dir or deployment.control_dir
+    return os.path.join(state_dir, "consumer.sqlite")
 
 
 def _wait_for(
@@ -238,6 +251,7 @@ def _cleanup_offline_mooncake_refs(store, refs: Sequence, *, reason: str) -> Non
 def _build_offline(
     cfg: Config,
     *,
+    algorithm: AlgorithmRegistration,
     build_model_bundle: Callable,
     optimizer_factory: Callable,
     logger: Callable,
@@ -269,7 +283,10 @@ def _build_offline(
                 refs = ingest_offline_features(
                     store,
                     cfg.data.hidden_states_path,
-                    strategy=cfg.training.strategy,
+                    algorithm_name=algorithm.name,
+                    build_reader=algorithm.providers.offline_for(
+                        cfg.model.input_modality
+                    ).build_reader,
                     run_id=cfg.run_id,
                     ttt_length=cfg.training.ttt_length,
                     max_len=cfg.data.max_length,
@@ -322,12 +339,13 @@ def _build_offline(
     from specforge.launch import build_disagg_offline_runtime
     from specforge.runtime.data_plane.disagg_ingest import read_ref_manifest
 
-    bundle = build_model_bundle(cfg, load_target_engine=False)
+    bundle = build_model_bundle(cfg)
     accumulation_steps = cfg.training.accumulation_steps
     if cfg.training.attention_backend == "usp":
         accumulation_steps *= cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
     trainer = build_disagg_offline_runtime(
-        strategy=cfg.training.strategy,
+        algorithm=algorithm,
+        modality=cfg.model.input_modality,
         feature_store=_offline_store(cfg, retain_on_release=True),
         refs=read_ref_manifest(manifest),
         draft_model=bundle.model,
@@ -355,7 +373,7 @@ def _build_offline(
         sp_ring_size=cfg.training.sp_ring_size,
         use_usp_preprocess=(cfg.training.attention_backend == "usp"),
         seed=cfg.training.seed,
-        dataloader_num_workers=_dataloader_num_workers(cfg),
+        dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )
 
@@ -373,10 +391,10 @@ def _build_offline(
     )
 
 
-def _producer_capture_metadata(cfg: Config):
+def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
     from specforge.training.capture_contract import resolve_server_capture_contract
 
-    contract = resolve_server_capture_contract(cfg)
+    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
     return (
         list(contract.aux_layer_ids),
         contract.target_hidden_size,
@@ -388,6 +406,7 @@ def _producer_capture_metadata(cfg: Config):
 def _build_online(
     cfg: Config,
     *,
+    algorithm: AlgorithmRegistration,
     build_model_bundle: Callable,
     prepare_prompts: Callable,
     optimizer_factory: Callable,
@@ -399,10 +418,8 @@ def _build_online(
         _profiling_options,
     )
 
-    strategy = cfg.training.strategy
-    from specforge.training.strategies.registry import resolve_strategy
-
-    spec = resolve_strategy(strategy)
+    modality = cfg.model.input_modality
+    streaming = algorithm.providers.server_streaming_for(modality)
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
         _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
@@ -416,31 +433,58 @@ def _build_online(
     channel = StreamingRefChannel(channel_path)
 
     if cfg.training.role == "producer":
-        from transformers import AutoTokenizer
-
         from specforge.inference.adapters.server_capture import (
+            ServerCaptureSchema,
             SGLangServerCaptureAdapter,
         )
         from specforge.launch import build_disagg_online_producer
+        from specforge.training.model_loading import resolve_draft_config
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.target_model_path,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
+        input_adapter = streaming.create_input_adapter(cfg)
+        input_tools = _load_input_tools(
+            cfg,
+            algorithm,
+            input_adapter=input_adapter,
         )
-        prompts = prepare_prompts(cfg, tokenizer)
-        layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(cfg)
+        draft_config = resolve_draft_config(
+            cfg,
+            provider=algorithm.providers.model.draft_config,
+        )
+        if input_adapter is None:
+            prompts = prepare_prompts(
+                cfg,
+                input_tools,
+                draft_config=draft_config,
+            )
+        else:
+            prompts = input_adapter.prepare_prompts(
+                cfg,
+                input_tools,
+                draft_config=draft_config,
+            )
+        layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
+            cfg, algorithm
+        )
+        layout = streaming.layout
+        capture_schema = ServerCaptureSchema(
+            aux_feature=layout.aux_feature,
+            last_hidden_feature=layout.last_hidden_feature,
+            passthrough=layout.passthrough,
+            attention_mask_feature=layout.attention_mask_feature,
+        )
         adapters = [
             SGLangServerCaptureAdapter(
                 url,
                 store,
                 run_id=cfg.run_id,
-                strategy=strategy,
+                algorithm=algorithm.name,
+                schema=capture_schema,
+                request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
             )
             for url in _server_urls(cfg)
         ]
-        target_repr = spec.assembly.server_target_repr
+        target_repr = streaming.target_representation
         peer_wait_timeout_s = float(os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800"))
         high_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
         in_flight_high_watermark = int(
@@ -459,7 +503,8 @@ def _build_online(
             )
         )
         _workers, drive = build_disagg_online_producer(
-            strategy=strategy,
+            algorithm=algorithm,
+            modality=modality,
             prompts=prompts,
             feature_store=store,
             channel=channel,
@@ -559,9 +604,10 @@ def _build_online(
 
     from specforge.launch import build_disagg_online_consumer
 
-    bundle = build_model_bundle(cfg, load_target_engine=False)
+    bundle = build_model_bundle(cfg)
     trainer = build_disagg_online_consumer(
-        strategy=strategy,
+        algorithm=algorithm,
+        modality=modality,
         feature_store=store,
         channel=channel,
         draft_model=bundle.model,
@@ -575,9 +621,7 @@ def _build_online(
         total_steps=cfg.training.total_steps,
         save_interval=cfg.training.save_interval,
         idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0")) or None,
-        metadata_db_path=(
-            cfg.training.metadata_db_path or os.environ.get("DISAGG_DB") or None
-        ),
+        metadata_db_path=_consumer_database_path(cfg),
         logger=logger,
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
@@ -587,7 +631,7 @@ def _build_online(
         sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
         resume_from=cfg.training.resume_from,
-        dataloader_num_workers=_dataloader_num_workers(cfg),
+        dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )
 
@@ -597,6 +641,7 @@ def _build_online(
 def build_disaggregated_run(
     cfg: Config,
     *,
+    algorithm: AlgorithmRegistration,
     build_model_bundle: Callable,
     prepare_prompts: Callable,
     optimizer_factory: Callable,
@@ -611,12 +656,14 @@ def build_disaggregated_run(
         if cfg.mode == "offline":
             return _build_offline(
                 cfg,
+                algorithm=algorithm,
                 build_model_bundle=build_model_bundle,
                 optimizer_factory=optimizer_factory,
                 logger=logger,
             )
         return _build_online(
             cfg,
+            algorithm=algorithm,
             build_model_bundle=build_model_bundle,
             prepare_prompts=prepare_prompts,
             optimizer_factory=optimizer_factory,

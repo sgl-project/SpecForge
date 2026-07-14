@@ -1,88 +1,48 @@
-# SGLang Patch Inventory & Supported-Version Matrix (M4 / B7-B8)
+# SGLang patch inventory and supported version
 
-This is the published inventory the M4 exit gate requires: every place SpecForge
-depends on SGLang internals to extract EAGLE3/DFlash features, and the SGLang
-versions that are validated against the extraction-correctness gate
-(`test_extraction_vs_hf_reference`).
+SpecForge pins `sglang==0.5.14`. There are two deliberately separate SGLang
+integration surfaces.
 
-The SGLang patch surface is treated as a **version-pinned fork**, surfaced
-through one in-process boundary:
-[`target_engine/sglang_backend`](target_engine/sglang_backend). The generic
-[`SGLangTargetEngine`](target_engine/sglang.py) delegates capture there, while
-the rollout adapters consume the typed engine output. The decision is
-**versioned `.patch` files + a declared version matrix + a CI extraction-drift
-gate**, not runtime monkey-patching, so a patch is auditable and an SGLang
-upgrade can never silently change what is extracted.
+## Online: external spec-capture server
 
-## Extraction surface (what we depend on)
+Online training uses
+[`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch).
+The patch adds `--enable-spec-capture` and a server-side sink that:
 
-| # | Dependency | Where | Why it can break on upgrade |
-|---|---|---|---|
-| 1 | `CaptureHiddenMode.FULL` + `LogitsProcessorForEAGLE3` returning `aux_hidden_states` / `last_hidden_states` | `target_engine/sglang_backend/` | SGLang may rename the capture mode, change `logits_output` fields, or change aux-state layout |
-| 2 | `model.set_eagle3_layers_to_capture(layer_ids)` | `SGLangTargetEngine.set_capture_layers` -> `SGLangCaptureBackend.set_eagle3_capture_layers` | Aux-layer registration API may move/rename |
-| 3 | `ScheduleBatch` / `ForwardBatch` / `ModelRunner` construction signature | `_extend` | New required ctor args on minor releases (e.g. `is_draft_worker`, `moe_dp_rank`) |
-| 4 | Per-request split of `aux_hidden_states` by `input_lens` | `_extend`, `_get_sharded_return` | Token packing / padding convention changes |
-| 5 | `wrap_eagle3_logits_processors_in_module(..., return_full_logits=False)` | `from_pretrained` | Logits-processor wrapping hook may change |
+1. captures requested auxiliary and final hidden states during prefill;
+2. writes tensors directly into Mooncake using
+   `MooncakeFeatureStore`'s key layout; and
+3. returns only key, shape, and dtype metadata in
+   `meta_info["spec_capture"]`.
 
-`SGLangCaptureBackend` is the only in-process code that touches these SGLang
-internals. Everything downstream sees a typed `TargetEngine.capture` result;
-the single [`PolicyFeatureAdapter`](adapters/policy.py) normalizes it into
-per-sample feature dictionaries according to the strategy schema.
+The client boundary is
+[`adapters/server_capture.py`](adapters/server_capture.py). Algorithm-owned
+providers map generic server artifacts (`aux`, `last_hidden`, passthrough
+inputs) to training feature names. No trainer or producer process imports
+SGLang model-runner internals or loads a target model.
 
-## Supported version matrix
+Apply the patch with `scripts/apply_sglang_spec_capture_patch.sh`. The
+server-capture unit and GPU gates must pass before updating the SGLang pin.
 
-The extraction-correctness gate must be green on every pinned version. `status`:
-**validated** = `test_extraction_vs_hf_reference` green in CI on this version;
-**target** = intended next pin.
+## Offline: dedicated local capture
 
-| SGLang version | torch / transformers | Backend(s) | Aux capture | Status |
-|---|---|---|---|---|
-| `0.5.5` (`lmsysorg/sglang:v0.5.5`) | 2.x / 4.x | sglang, hf, custom | `set_eagle3_layers_to_capture` | validated (repo CI image) |
-| `dev` (`lmsysorg/sglang:dev`) | 2.11 / 5.8 | sglang, hf, custom | `set_eagle3_layers_to_capture` | validated (H200 box) |
-| `0.5.9` (pyproject pin) | 2.9.1 / 4.57.1 | sglang, hf, custom | `set_eagle3_layers_to_capture` | superseded by 0.5.14 |
-| `0.5.14` (pyproject pin) | 2.11 / 5.8 | sglang, hf, custom, **server (spec-capture patch)** | `set_eagle3_layers_to_capture` / `--enable-spec-capture` | current pin; server transport gated by `test_server_capture_gate` |
+[`../offline_capture`](../offline_capture) is used exclusively by
+`scripts/prepare_hidden_states.py`. Its `sglang_backend` owns the local,
+version-pinned APIs required for offline EAGLE3 preprocessing:
 
-`0.5.9` remains in the table as upgrade history; `pyproject.toml` is the source
-of truth for the current dependency pin.
+| Dependency | Upgrade risk |
+|---|---|
+| `CaptureHiddenMode.FULL` and logits-processor replacement | hidden-state output fields or pruning behavior may change |
+| `set_eagle3_layers_to_capture` | layer-selection API may move |
+| `ScheduleBatch`, `ForwardBatch`, and `ModelRunner` construction | constructor and memory-pool setup may change |
+| splitting captured states by request input length | token packing conventions may change |
+| DP-attention/model-parallel initialization patches | distributed group signatures may change |
 
-The **HF backend** path (`HFTargetEngine`, forward hooks on the aux layers)
-is version-robust and is what `test_extraction_vs_hf_reference` exercises in CI
-without a GPU SGLang server; the **sglang backend** is validated on the GPU box.
+This package computes no logits and supports only the text EAGLE3 state capture
+needed by the preprocessing script. It does not provide HF/custom backends,
+DFlash/VLM capture, online rollout, or a general target-engine factory.
 
-## CI extraction-drift gate
-
-`test_extraction_vs_hf_reference` asserts the adapter's extracted aux hidden
-states equal an independent HF `output_hidden_states=True` forward at the
-recorded layer IDs (and target logits match a direct `lm_head`) within a
-documented bf16 tolerance (`rtol=atol=2e-2`). Run it against each pinned image;
-a failure on a new image blocks the version bump.
-
-## Patch files
-
-When an SGLang upgrade requires source changes to the extraction surface, add a
-versioned patch under `patches/sglang/<version>/` and record it in the matrix
-above. The in-process backends need none (extraction goes through the public
-capture API).
-
-### `patches/sglang/v0.5.14/spec-capture.patch` — server-side capture sink
-
-The **server transport**: 8 small hooks + one self-contained module
-(`sglang/srt/spec_capture_sink.py`) that let a live SGLang server, launched
-with `--enable-spec-capture [--spec-capture-aux-layer-ids ...]
---chunked-prefill-size -1 --disable-radix-cache`, capture per-request aux/last
-hidden states during
-prefill and write them straight into a Mooncake store in
-`MooncakeFeatureStore`'s zero-copy key layout
-(`{store_id}/{sample_id}/g{gen}/{name}`, raw bytes, hard-pinned). The response
-`meta_info["spec_capture"]` carries only keys/shapes/dtypes; the client side is
-`specforge/inference/adapters/server_capture.py`. Apply to an installed sglang
-with `scripts/apply_sglang_spec_capture_patch.sh`. Strategy naming is decided
-per request by the client (eagle3 / dflash / domino registered;
-`register_server_capture_schema` for new ones). It also answers the stock
-`model_runner.py` TODO ("expose this to server args?") — the aux-capture
-upstream proposal from the O1.3 spike (PR #641) is exactly this surface.
-
-This raw-buffer layout is also the only client-side Mooncake transport.
-`MooncakeFeatureStore` requires `put_from`/`get_into` at construction and fails
-fast when an installed client predates that API, so the server sink and trainer
-cannot silently select different wire formats.
+`tests/test_runtime/test_sglang_0514_compat.py` guards the patched 0.5.14 API
+seams, and
+`tests/test_offline_capture/test_sglang_backend.py`
+provides the GPU smoke coverage for dense and MoE offline capture.

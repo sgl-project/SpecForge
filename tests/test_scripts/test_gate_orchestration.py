@@ -367,29 +367,42 @@ fi
         self.assertIn("serving-gate.json", readme)
         self.assertIn("Reusable leaf checks", readme)
 
-    def test_docs_distinguish_hf_replicas_from_target_weight_tp(self):
+    def test_docs_describe_server_only_target_ownership(self):
         training = TRAINING_GUIDE.read_text(encoding="utf-8")
         customization = CUSTOMIZATION_GUIDE.read_text(encoding="utf-8")
         recipes = CONFIG_README.read_text(encoding="utf-8")
 
-        for document in (training, customization, recipes):
-            self.assertIn("DFlash", document)
-            self.assertIn("Domino", document)
-            self.assertIn("complete target", document)
-            self.assertIn("replica", document)
-
-        self.assertIn("SGLang target TP + target-DP", training)
-        self.assertIn("SGLang target TP + target-DP", recipes)
-        self.assertIn("Batch partitioning is therefore not evidence", training)
-        self.assertIn("with `model.target_backend: hf` do not", customization)
-        self.assertIn("output partitioning is independent", customization)
-        self.assertIn("does not shard target weights", recipes)
-        self.assertNotIn(
-            "| DFlash | Yes, target TP + target-DP |",
+        self.assertIn(
+            "Online target inference never runs in the trainer",
             training,
         )
-        self.assertNotIn(
-            "| Domino | target TP + target-DP |",
+        self.assertIn(
+            "Online target TP/EP belongs to each external SGLang capture server",
+            training,
+        )
+        self.assertIn(
+            "every trainer rank receives a disjoint feature stream",
+            training,
+        )
+        self.assertIn(
+            "Every online run uses `model.target_backend: sglang`",
+            customization,
+        )
+        self.assertIn(
+            "instead of adding an HF/custom target loader",
+            customization,
+        )
+        self.assertIn(
+            "Target TP/EP and model-specific inference stay on that server",
+            customization,
+        )
+        self.assertIn("HF/custom online target loading is unsupported", recipes)
+        self.assertIn(
+            "Online disaggregated consumers must keep it at 1",
+            recipes,
+        )
+        self.assertIn(
+            "configure target TP on capture servers",
             recipes,
         )
 

@@ -34,10 +34,12 @@ def _optimizer_factory(module):
 class TestEquivTrainerSplit(unittest.TestCase):
     def test_trainer_fit_matches_current_core_step(self):
         fx.build_single_rank_distributed(port="29562")
+        from specforge.algorithms.builtin import builtin_algorithm_registry
         from specforge.launch import build_offline_runtime
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerCore
-        from specforge.training.strategies.registry import resolve_strategy
+
+        algorithm = builtin_algorithm_registry().resolve("eagle3")
 
         previous_deterministic = torch.are_deterministic_algorithms_enabled()
         previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -60,7 +62,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
 
                 logged = []
                 trainer = build_offline_runtime(
-                    strategy="eagle3",
+                    algorithm=algorithm,
                     hidden_states_path=feature_dir,
                     draft_model=fit_model,
                     target_head=fit_head,
@@ -84,9 +86,11 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     wrap=True,
                     optimizer_target=core_model.draft_model,
                 )
-                spec = resolve_strategy("eagle3")
                 core = TrainerCore(
-                    spec.make_strategy(wrapped, target_head=core_head),
+                    algorithm.providers.step.build(
+                        wrapped,
+                        target_head=core_head,
+                    ),
                     backend,
                     accumulation_steps=1,
                 )

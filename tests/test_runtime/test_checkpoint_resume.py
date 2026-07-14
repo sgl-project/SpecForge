@@ -576,7 +576,7 @@ class TestCheckpointResume(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29563")
 
-        from specforge.core.eagle3 import OnlineEagle3Model
+        from specforge.algorithms.eagle3.model import OnlineEagle3Model
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer

@@ -37,7 +37,7 @@ def _has_standard_flash_attention() -> bool:
 
 
 def _build_model(workdir: str, attention_backend: str):
-    from specforge.core.eagle3 import OnlineEagle3Model
+    from specforge.algorithms.eagle3.model import OnlineEagle3Model
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
@@ -67,12 +67,12 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     try:
         import torch.distributed as dist
 
+        from specforge.algorithms.builtin import builtin_algorithm_registry
         from specforge.distributed import get_draft_sp_group, get_tp_group
         from specforge.launch import _shard_offline_refs, build_offline_runtime
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
-        from specforge.training.strategies.registry import resolve_strategy
 
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
@@ -85,8 +85,9 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
         )
 
-        spec = resolve_strategy("eagle3")
-        source_refs = spec.make_offline_reader(
+        algorithm = builtin_algorithm_registry().resolve("eagle3")
+        provider = algorithm.providers.offline_for("text")
+        source_refs = provider.build_reader(
             os.path.join(workdir, "features"),
             run_id="usp-reference",
             ttt_length=3,
@@ -107,19 +108,22 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             LocalFeatureStore(f"usp-reference-{rank}"),
             refs=[rank_refs[-1]],
             batch_size=1,
-            collate_fn=spec.make_offline_collate(),
-            per_sample_transform=spec.make_offline_transform(
+            collate_fn=provider.build_collator(),
+            per_sample_transform=provider.build_normalizer(
                 512,
                 ttt_length=3,
                 use_usp_preprocess=False,
             ),
-            strategy=spec.name,
+            strategy=algorithm.name,
         )
         reference_batch = next(iter(reference_loader))
         reference_model.train()
         with torch.no_grad():
             expected_loss = (
-                spec.make_strategy(reference_model, target_head=target_head)
+                algorithm.providers.step.build(
+                    reference_model,
+                    target_head=target_head,
+                )
                 .forward_loss(reference_batch)
                 .loss.detach()
             )
@@ -137,7 +141,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
 
         logged = []
         trainer = build_offline_runtime(
-            strategy="eagle3",
+            algorithm=algorithm,
             hidden_states_path=os.path.join(workdir, "features"),
             draft_model=usp_model,
             target_head=target_head,

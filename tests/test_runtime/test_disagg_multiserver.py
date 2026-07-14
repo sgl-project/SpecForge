@@ -24,7 +24,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
+from specforge.algorithms.builtin import builtin_algorithm_registry
+from specforge.inference.adapters.server_capture import (
+    ServerCaptureSchema,
+    SGLangServerCaptureAdapter,
+)
 from specforge.launch import build_disagg_online_producer
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
@@ -34,6 +38,8 @@ from tests.test_runtime.test_server_capture import (
     _FakeMooncakeStore,
     _StubCaptureServer,
 )
+
+ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
 
 def _SLEEP(_s):  # injected drive sleep: keep retry/backpressure spins bounded
@@ -54,15 +60,26 @@ def _prompts(n, seq=6):
 
 
 def _adapter(store, post_fn, url="http://server:30000"):
+    layout = ALGORITHM.providers.server_streaming_for("text").layout
     return SGLangServerCaptureAdapter(
-        url, store, run_id="run0", strategy="dflash", post_fn=post_fn
+        url,
+        store,
+        run_id="run0",
+        algorithm=ALGORITHM.name,
+        schema=ServerCaptureSchema(
+            aux_feature=layout.aux_feature,
+            last_hidden_feature=layout.last_hidden_feature,
+            passthrough=layout.passthrough,
+            attention_mask_feature=layout.attention_mask_feature,
+        ),
+        post_fn=post_fn,
     )
 
 
 def _build(adapters, prompts, store, channel, **kw):
     channel.publish_consumer_quantum(kw.pop("consumer_quantum", 1))
     return build_disagg_online_producer(
-        strategy="dflash",
+        algorithm=ALGORITHM,
         feature_source=adapters,
         prompts=prompts,
         feature_store=store,

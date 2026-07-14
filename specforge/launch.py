@@ -6,22 +6,14 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Launch helpers that wire the DataFlow runtime from a RunConfig.
-
-The named builders span the topology axis (offline vs online, colocated vs
-disaggregated); the draft model is the ``strategy=`` parameter, resolved to a
-:class:`StrategySpec` (``specforge.training.strategies.registry``) — adding a model
-is a registry entry, not a new ``build_*`` family.
-"""
+"""Internal wiring helpers used by the application composition root."""
 
 from __future__ import annotations
 
-import copy
-import itertools
 import logging
-from contextlib import contextmanager
 from typing import Callable, List, Optional, Tuple
 
+from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.control_plane.metadata_store import (
@@ -34,11 +26,8 @@ from specforge.runtime.data_plane import (
     FeatureDataLoader,
     FeatureStore,
     LocalFeatureStore,
-    LocalRolloutStream,
     drain_feature_store_removals,
 )
-from specforge.training.strategies.assembly import OnlineCaptureMode
-from specforge.training.strategies.registry import StrategySpec, resolve_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 def _assemble_trainer(
     *,
-    spec: StrategySpec,
+    algorithm: AlgorithmRegistration,
     controller: DataFlowController,
     store: FeatureStore,
     ref_source: dict,  # {"refs": [...]} re-iterable (offline) | {"queue": q} stream (online)
@@ -94,7 +83,8 @@ def _assemble_trainer(
     from specforge.training import Trainer
 
     trainer = Trainer(
-        spec=spec,
+        algorithm_name=algorithm.name,
+        make_step_strategy=algorithm.providers.step.build,
         controller=controller,
         store=store,
         ref_source=ref_source,
@@ -136,21 +126,16 @@ def _assemble_trainer(
 
 
 def _offline_io(
-    spec: StrategySpec,
+    algorithm: AlgorithmRegistration,
+    modality: str,
     max_len: int,
     *,
     ttt_length: int,
     use_usp_preprocess: bool,
 ):
-    """Resolve (collate_fn, per_sample_transform); raise if not wired for offline."""
-    if spec.make_offline_collate is None or spec.make_offline_transform is None:
-        raise NotImplementedError(
-            f"offline data path for strategy {spec.name!r} is not wired yet: its "
-            f"StrategySpec needs make_offline_transform + make_offline_collate "
-            f"(DFlash/Domino use their own feature schema). See "
-            f"specforge.training.strategies.registry."
-        )
-    return spec.make_offline_collate(), spec.make_offline_transform(
+    """Resolve the algorithm-owned normalizer and collator for one modality."""
+    provider = algorithm.providers.offline_for(modality)
+    return provider.build_collator(), provider.build_normalizer(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
@@ -202,25 +187,6 @@ def _shard_offline_refs(
     return [refs[index] for index in indices]
 
 
-def _target_dp_layout(*, dp_rank=None, dp_size=None):
-    """Return the target-DP rank/size, with an explicit seam for CPU tests."""
-    if (dp_rank is None) != (dp_size is None):
-        raise ValueError("dp_rank and dp_size must be provided together")
-    if dp_rank is not None:
-        if dp_size < 1 or not 0 <= dp_rank < dp_size:
-            raise ValueError(f"invalid target-DP layout rank={dp_rank}, size={dp_size}")
-        return int(dp_rank), int(dp_size)
-
-    import torch.distributed as dist
-
-    if not (dist.is_available() and dist.is_initialized()):
-        return 0, 1
-    from specforge.distributed import get_dp_group
-
-    group = get_dp_group()
-    return dist.get_rank(group), dist.get_world_size(group)
-
-
 def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle=True):
     """Reproduce ``DistributedSampler(drop_last=False)`` index generation."""
     import math
@@ -244,116 +210,10 @@ def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle
     return indices[dp_rank:total_size:dp_size]
 
 
-def _shard_online_prompts(
-    prompts,
-    *,
-    seed=0,
-    epoch=0,
-    tp_size=1,
-    batch_size=1,
-    shuffle=True,
-    dp_rank=None,
-    dp_size=None,
-):
-    """Plan one independently shuffled and tail-truncated online epoch.
-
-    This matches ``DistributedSampler(seed=seed, drop_last=False)`` through the
-    target-DP split. All target-TP peers use the same ``dp_rank`` and therefore
-    receive the same shard. The rank-local tail is then dropped to a whole
-    target capture batch (``tp_size * batch_size``), so the final partial batch
-    can never be combined with the next epoch.
-    """
-
-    prompts = list(prompts)
-    if tp_size < 1 or batch_size < 1:
-        raise ValueError("tp_size and batch_size must be positive")
-    rank, replicas = _target_dp_layout(dp_rank=dp_rank, dp_size=dp_size)
-    selected = _distributed_sampler_indices(
-        len(prompts),
-        dp_rank=rank,
-        dp_size=replicas,
-        seed=seed,
-        epoch=epoch,
-        shuffle=shuffle,
-    )
-    target_batch_size = tp_size * batch_size
-    selected = selected[: len(selected) // target_batch_size * target_batch_size]
-    sharded = []
-    for slot, source_index in enumerate(selected):
-        item = dict(prompts[source_index])
-        metadata = dict(item.get("metadata") or {})
-        if "task_id" in item:
-            metadata.setdefault("base_task_id", str(item["task_id"]))
-        metadata.update(
-            {
-                "source_prompt_index": source_index,
-                "prompt_epoch": epoch,
-                "target_dp_rank": rank,
-                "target_dp_slot": slot,
-            }
-        )
-        item["metadata"] = metadata
-        item["task_id"] = (
-            f"target-dp{rank:04d}-epoch{epoch:08d}-"
-            f"slot{slot:012d}-prompt{source_index:012d}"
-        )
-        sharded.append(item)
-    return sharded
-
-
-def _plan_online_prompt_stream(
-    prompts,
-    *,
-    num_epochs,
-    seed,
-    tp_size,
-    batch_size,
-    shuffle=True,
-    dp_rank=None,
-    dp_size=None,
-):
-    """Flatten independently planned epochs into one deterministic stream."""
-    if num_epochs < 1:
-        raise ValueError("num_epochs must be positive")
-    prompts = list(prompts)
-    rank, replicas = _target_dp_layout(dp_rank=dp_rank, dp_size=dp_size)
-    planned = []
-    for epoch in range(num_epochs):
-        planned.extend(
-            _shard_online_prompts(
-                prompts,
-                seed=seed,
-                epoch=epoch,
-                tp_size=tp_size,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                dp_rank=rank,
-                dp_size=replicas,
-            )
-        )
-    return planned
-
-
-def _preposition_online_prompts(prompts, *, local_samples, tp_size):
-    """Drop the trained TP-wide prefix from a deterministic prompt stream."""
-    if local_samples < 0:
-        raise ValueError("checkpoint epoch_samples cannot be negative")
-    if tp_size < 1:
-        raise ValueError("tp_size must be positive")
-    prompts = list(prompts)
-    target_samples = local_samples * tp_size
-    if target_samples > len(prompts):
-        raise ValueError(
-            "checkpoint resume position skips past the online prompt stream: "
-            f"{local_samples} rank-local samples require {target_samples} target "
-            f"prompts, but the planned stream has {len(prompts)}"
-        )
-    return prompts[target_samples:]
-
-
 def _make_offline_eval_data_factory(
     *,
-    spec: StrategySpec,
+    algorithm: AlgorithmRegistration,
+    modality: str,
     hidden_states_path: str,
     run_id: str,
     batch_size: int,
@@ -363,18 +223,16 @@ def _make_offline_eval_data_factory(
     dataloader_num_workers: int,
 ):
     """Build a fresh re-iterable eval loader over the offline feature path."""
-    if spec.make_offline_reader is None:
-        raise NotImplementedError(
-            f"offline eval for strategy {spec.name!r} needs make_offline_reader"
-        )
+    provider = algorithm.providers.offline_for(modality)
     collate_fn, per_sample_transform = _offline_io(
-        spec,
+        algorithm,
+        modality,
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
     )
     eval_run_id = f"{run_id}-eval"
-    refs = spec.make_offline_reader(
+    refs = provider.build_reader(
         hidden_states_path,
         run_id=eval_run_id,
         ttt_length=ttt_length,
@@ -393,24 +251,22 @@ def _make_offline_eval_data_factory(
             collate_fn=collate_fn,
             per_sample_transform=per_sample_transform,
             drop_last=False,
-            strategy=spec.name,
+            strategy=algorithm.name,
             num_workers=dataloader_num_workers,
         )
 
     return build_loader
 
 
-def _online_collate(spec: StrategySpec, collate_fn):
-    """Resolve the online/streamed collate; raise if the strategy has none wired."""
+def _streaming_collate(
+    algorithm: AlgorithmRegistration,
+    modality: str,
+    collate_fn,
+):
+    """Resolve an algorithm-owned server-streaming collator."""
     if collate_fn is not None:
         return collate_fn
-    if spec.make_online_collate is None:
-        raise NotImplementedError(
-            f"online data path for strategy {spec.name!r} is not wired yet: its "
-            f"StrategySpec needs make_online_collate (or pass an explicit collate_fn). "
-            f"See specforge.training.strategies.registry."
-        )
-    return spec.make_online_collate()
+    return algorithm.providers.server_streaming_for(modality).build_collator()
 
 
 def _resolve_metadata_store(
@@ -509,57 +365,27 @@ def _epoch_online_prompts(prompts, epoch: int, prompt_epochs: int):
     return out
 
 
-def _assemble_rollout_workers(
+def _assemble_server_rollout_workers(
     *,
-    spec: StrategySpec,
+    algorithm: AlgorithmRegistration,
+    modality: str,
     controller: DataFlowController,
     store: FeatureStore,
     run_id: str,
     target_hidden_size: int,
     target_vocab_size: Optional[int],
     draft_vocab_size: Optional[int],
-    target_repr: str,
+    target_repr: Optional[str],
     aux_hidden_state_layer_ids,
     vocab_map_version: Optional[str],
-    t2d,
     num_rollout_workers: int,
-    device: str,
-    target_model=None,
-    feature_source=None,
-    feature_schema=None,
-    input_preparer=None,
-    batch_partition=None,
-    shard_target_output: bool = False,
+    feature_source,
 ):
-    """Build the rollout producer workers (colocated-online + disagg producer).
+    """Build workers over injected SGLang-server ref sources only."""
 
-    ``feature_source`` overrides the in-process adapter with a pre-built
-    FeatureSource/RefSource (e.g. the server-capture transport, whose live
-    SGLang server writes features straight to the store — no ``target_model``
-    is loaded here). Otherwise an in-process adapter is built over
-    ``target_model``.
-
-    A *sequence* of feature sources fans out to one worker per source (the
-    multi-server topology: 1 server : 1 adapter : 1 worker). All workers share
-    the one controller, whose per-``worker_id`` leases keep their prompt slices
-    disjoint. A single source may be shared by ``num_rollout_workers`` workers.
-    """
-    if spec.online_capture is OnlineCaptureMode.UNSUPPORTED:
-        raise NotImplementedError(
-            f"online capture for strategy {spec.name!r} is not wired; set an "
-            "explicit online_capture mode on its StrategySpec"
-        )
-    from specforge.inference.batch_partition import TargetBatchPartition
-    from specforge.inference.capture import CaptureConfig
-    from specforge.inference.rollout_worker import RolloutWorker
-
-    batch_partition = batch_partition or TargetBatchPartition()
-    if shard_target_output and getattr(target_model, "backend", None) != "sglang":
-        raise ValueError("shard_target_output requires an SGLang target engine")
-
-    if aux_hidden_state_layer_ids is None:
-        aux_hidden_state_layer_ids = tuple(
-            getattr(target_model, "capture_layers", ()) or ()
+    if feature_source is None:
+        raise ValueError(
+            "online rollout requires an injected SGLang server feature source"
         )
     if isinstance(feature_source, (list, tuple)):
         if not feature_source:
@@ -569,60 +395,34 @@ def _assemble_rollout_workers(
                 f"num_rollout_workers={num_rollout_workers} conflicts with "
                 f"{len(feature_source)} feature sources (one worker per source)"
             )
-        adapters = list(feature_source)
-    elif feature_source is not None:
-        adapters = [feature_source] * num_rollout_workers
+        sources = list(feature_source)
     else:
-        if spec.online_capture is OnlineCaptureMode.SERVER_ONLY:
-            raise NotImplementedError(
-                f"{spec.name} online capture requires a server feature source; "
-                "colocated target capture is not supported"
-            )
-        from specforge.inference.adapters.policy import PolicyFeatureAdapter
+        sources = [feature_source] * num_rollout_workers
 
-        active_schema = feature_schema or spec.feature_schema
-        if active_schema is None:
-            raise ValueError(
-                f"strategy {spec.name!r} selects policy capture but has no "
-                "feature schema"
-            )
-        adapters = [
-            PolicyFeatureAdapter(
-                target_model,
-                schema=active_schema,
-                device=device,
-                t2d=t2d,
-                shard_returns=True if shard_target_output else None,
-                output_partition=(batch_partition if shard_target_output else None),
-                input_preparer=input_preparer,
-            )
-        ] * num_rollout_workers
-    active_schema = feature_schema or spec.feature_schema
+    from specforge.inference.capture import CaptureConfig
+    from specforge.inference.rollout_worker import RolloutWorker
+
+    contract = algorithm.spec.feature_contract("streaming", modality)
     capture_config = CaptureConfig.from_strategy(
-        required_features=(
-            active_schema.names if active_schema is not None else spec.required_features
-        ),
-        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids),
+        required_features=contract.required_tensors,
+        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids or ()),
         target_repr=target_repr,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
         vocab_map_version=vocab_map_version,
     )
-    # strategy=spec.name: committed refs must pass the loader's strategy check
     return [
         RolloutWorker(
             controller,
             store,
-            adapter,
+            source,
             capture_config,
             run_id=run_id,
-            worker_id=f"rollout-{i}",
-            strategy=spec.name,
-            batch_partition=batch_partition,
-            feature_source_returns_local_batch=shard_target_output,
+            worker_id=f"rollout-{index}",
+            strategy=algorithm.name,
         )
-        for i, adapter in enumerate(adapters)
+        for index, source in enumerate(sources)
     ]
 
 
@@ -633,7 +433,8 @@ def _assemble_rollout_workers(
 
 def build_offline_runtime(
     *,
-    strategy: str = "eagle3",
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
     hidden_states_path: str,
     draft_model,
     target_head,
@@ -666,19 +467,14 @@ def build_offline_runtime(
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
-    ``draft_model`` is the composite model for ``strategy`` and must expose its
+    ``draft_model`` is the composite model for ``algorithm`` and must expose its
     trainable module as ``.draft_model``. Colocated offline refs are fixed and
     re-iterable, so this path does not allocate a training ledger or ref queue.
     """
-    spec = resolve_strategy(strategy)
-    if spec.make_offline_reader is None:
-        raise NotImplementedError(
-            f"offline data path for strategy {spec.name!r} is not wired yet: its "
-            f"StrategySpec needs make_offline_reader. See "
-            f"specforge.training.strategies.registry."
-        )
+    provider = algorithm.providers.offline_for(modality)
     collate_fn, per_sample_transform = _offline_io(
-        spec,
+        algorithm,
+        modality,
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
@@ -688,7 +484,7 @@ def build_offline_runtime(
         metadata_store=NoOpMetadataStore(),
         enable_sample_queue=False,
     )
-    source_refs = spec.make_offline_reader(
+    source_refs = provider.build_reader(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
 
@@ -708,7 +504,8 @@ def build_offline_runtime(
                 "pass either eval_hidden_states_path or eval_data_factory, not both"
             )
         eval_data_factory = _make_offline_eval_data_factory(
-            spec=spec,
+            algorithm=algorithm,
+            modality=modality,
             hidden_states_path=eval_hidden_states_path,
             run_id=run_id,
             batch_size=batch_size,
@@ -718,12 +515,14 @@ def build_offline_runtime(
             dataloader_num_workers=dataloader_num_workers,
         )
     return _assemble_trainer(
-        spec=spec,
+        algorithm=algorithm,
         controller=controller,
         store=store,
         ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
-        target_head=target_head if spec.uses_target_head else None,
+        target_head=(
+            target_head if algorithm.providers.step.uses_external_target_head else None
+        ),
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
@@ -758,7 +557,8 @@ def build_offline_runtime(
 
 def build_disagg_offline_runtime(
     *,
-    strategy: str = "eagle3",
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
     feature_store: FeatureStore,
     refs: List[SampleRef],
     draft_model,
@@ -796,9 +596,9 @@ def build_disagg_offline_runtime(
     ``disagg://`` refs its producer published. Same trainer assembly as the
     colocated offline path, so results match within determinism tolerance.
     """
-    spec = resolve_strategy(strategy)
     collate_fn, per_sample_transform = _offline_io(
-        spec,
+        algorithm,
+        modality,
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
@@ -825,7 +625,8 @@ def build_disagg_offline_runtime(
                 "pass either eval_hidden_states_path or eval_data_factory, not both"
             )
         eval_data_factory = _make_offline_eval_data_factory(
-            spec=spec,
+            algorithm=algorithm,
+            modality=modality,
             hidden_states_path=eval_hidden_states_path,
             run_id=run_id,
             batch_size=batch_size,
@@ -835,12 +636,14 @@ def build_disagg_offline_runtime(
             dataloader_num_workers=dataloader_num_workers,
         )
     return _assemble_trainer(
-        spec=spec,
+        algorithm=algorithm,
         controller=controller,
         store=feature_store,
         ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
-        target_head=target_head if spec.uses_target_head else None,
+        target_head=(
+            target_head if algorithm.providers.step.uses_external_target_head else None
+        ),
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
@@ -874,242 +677,15 @@ def build_disagg_offline_runtime(
 
 
 # ---------------------------------------------------------------------------
-# Online (colocated + disaggregated producer/consumer + one-process interleaved).
+# Online disaggregated producer/consumer.  Capture is always delegated to an
+# externally managed SGLang server source.
 # ---------------------------------------------------------------------------
-
-
-def _make_online_eval_data_factory(
-    *,
-    spec: StrategySpec,
-    prompts,
-    run_id: str,
-    batch_size: int,
-    collate_fn,
-    rollout_worker_kwargs: dict,
-    dataloader_num_workers: int,
-):
-    """Create one private rollout/control/data plane for every eval interval."""
-    prompts = copy.deepcopy(list(prompts))
-    if not prompts:
-        raise ValueError("online evaluation data preparation produced no prompts")
-    rollout_worker_kwargs = dict(rollout_worker_kwargs)
-    pass_ids = itertools.count(1)
-
-    def build_eval_data():
-        eval_run_id = f"{run_id}-eval-{next(pass_ids):06d}"
-        controller = DataFlowController(
-            eval_run_id,
-            metadata_store=NoOpMetadataStore(),
-        )
-        # Controller/PromptTask instances are pass-local. In particular, eval
-        # cannot consume leases or refs from the still-open training stream.
-        controller.ingest_prompts(copy.deepcopy(prompts))
-        store = LocalFeatureStore(eval_run_id)
-        workers = _assemble_rollout_workers(
-            spec=spec,
-            controller=controller,
-            store=store,
-            run_id=eval_run_id,
-            **rollout_worker_kwargs,
-        )
-        rollout_stream = LocalRolloutStream(
-            controller=controller,
-            workers=workers,
-            feature_store=store,
-            max_resident_samples=batch_size,
-            capture_batch_multiplier=rollout_worker_kwargs["batch_partition"].size,
-        )
-        loader = FeatureDataLoader(
-            store,
-            queue=rollout_stream,
-            batch_size=batch_size,
-            collate_fn=collate_fn,
-            per_sample_transform=None,
-            drop_last=False,
-            strategy=spec.name,
-            num_workers=dataloader_num_workers,
-        )
-
-        @contextmanager
-        def managed_eval_data():
-            try:
-                yield loader
-            except BaseException:
-                rollout_stream.close(reason="evaluation_failed")
-                raise
-            else:
-                rollout_stream.close(reason="evaluation_finished")
-            finally:
-                loader.close()
-
-        return managed_eval_data()
-
-    return build_eval_data
-
-
-def build_online_runtime(
-    *,
-    strategy: str = "eagle3",
-    target_model,
-    prompts,
-    draft_model,
-    optimizer_factory,
-    run_id: str,
-    output_dir: str,
-    target_hidden_size: int,
-    target_vocab_size: Optional[int] = None,
-    draft_vocab_size: Optional[int] = None,
-    target_repr: str = "logits",
-    aux_hidden_state_layer_ids=None,
-    vocab_map_version: Optional[str] = None,
-    t2d=None,
-    num_rollout_workers: int = 1,
-    device: str = "cuda",
-    batch_size: int = 1,
-    accumulation_steps: int = 1,
-    max_steps: Optional[int] = None,
-    total_steps: Optional[int] = None,
-    save_interval: int = 0,
-    eval_interval: int = 0,
-    eval_prompts=None,
-    eval_data_factory=None,
-    tp_size: int = 1,
-    sp_ulysses_size: int = 1,
-    sp_ring_size: int = 1,
-    collate_fn=None,
-    logger=None,
-    log_interval: int = 50,
-    resume_from: Optional[str] = None,
-    resume_state: Optional[dict] = None,
-    dataset_size: Optional[int] = None,
-    checkpoint_extra: Optional[dict] = None,
-    max_checkpoints: int = 0,
-    strategy_kwargs: Optional[dict] = None,
-    prompt_epochs: int = 1,
-    feature_schema=None,
-    input_preparer=None,
-    shard_target_output: bool = False,
-    dataloader_num_workers: int = 0,
-    profiling_options=None,
-):
-    """Assemble the colocated online dataflow and return its ``Trainer``.
-
-    ``Trainer.fit()`` owns the complete local lifecycle. The loader pulls one
-    bounded rollout batch at a time and trains it before asking for more, so the
-    prompt pool is never materialized into GPU-resident features all at once.
-    ``target_head`` is ``None`` on purpose: online rollout already materialized
-    the target distribution.
-    """
-    spec = resolve_strategy(strategy)
-    from specforge.inference.batch_partition import TargetBatchPartition
-
-    batch_partition = TargetBatchPartition.from_distributed(tp_size)
-    resolved_collate = _online_collate(spec, collate_fn)
-    rollout_worker_kwargs = {
-        "target_model": target_model,
-        "target_hidden_size": target_hidden_size,
-        "target_vocab_size": target_vocab_size,
-        "draft_vocab_size": draft_vocab_size,
-        "target_repr": target_repr,
-        "aux_hidden_state_layer_ids": aux_hidden_state_layer_ids,
-        "vocab_map_version": vocab_map_version,
-        "t2d": t2d,
-        "num_rollout_workers": num_rollout_workers,
-        "device": device,
-        "feature_schema": feature_schema,
-        "input_preparer": input_preparer,
-        "batch_partition": batch_partition,
-        "shard_target_output": shard_target_output,
-    }
-    if eval_prompts is not None:
-        if eval_data_factory is not None:
-            raise ValueError("pass either eval_prompts or eval_data_factory, not both")
-        eval_data_factory = _make_online_eval_data_factory(
-            spec=spec,
-            prompts=eval_prompts,
-            run_id=run_id,
-            batch_size=batch_size,
-            collate_fn=resolved_collate,
-            rollout_worker_kwargs=rollout_worker_kwargs,
-            dataloader_num_workers=dataloader_num_workers,
-        )
-    # Keep colocated online on a private queue; durable online runs use the
-    # disagg builders with a shared store and streaming ref channel.
-    controller = DataFlowController(
-        run_id,
-        metadata_store=NoOpMetadataStore(),
-    )
-    prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
-    if prompt_epochs == 1:
-        controller.ingest_prompts(prompts)
-    else:
-        prompts = list(prompts)
-        for epoch in range(prompt_epochs):
-            controller.ingest_prompts(
-                _epoch_online_prompts(prompts, epoch, prompt_epochs)
-            )
-    store = LocalFeatureStore(run_id)
-
-    workers = _assemble_rollout_workers(
-        spec=spec,
-        controller=controller,
-        store=store,
-        run_id=run_id,
-        **rollout_worker_kwargs,
-    )
-    rollout_stream = LocalRolloutStream(
-        controller=controller,
-        workers=workers,
-        feature_store=store,
-        max_resident_samples=batch_size,
-        capture_batch_multiplier=batch_partition.size,
-    )
-
-    trainer = _assemble_trainer(
-        spec=spec,
-        controller=controller,
-        store=store,
-        ref_source={"queue": rollout_stream, "prepositioned": resume_from is not None},
-        model=draft_model,
-        target_head=None,
-        optimizer_factory=optimizer_factory,
-        run_id=run_id,
-        output_dir=output_dir,
-        batch_size=batch_size,
-        accumulation_steps=accumulation_steps,
-        num_epochs=1,
-        max_steps=max_steps,
-        total_steps=total_steps,
-        save_interval=save_interval,
-        eval_interval=eval_interval,
-        eval_data_factory=eval_data_factory,
-        logger=logger,
-        log_interval=log_interval,
-        collate_fn=resolved_collate,
-        strategy_kwargs=strategy_kwargs,
-        per_sample_transform=None,
-        durable_ack=False,
-        resume_from=resume_from,
-        resume_state=resume_state,
-        dataset_size=dataset_size,
-        checkpoint_extra=checkpoint_extra,
-        max_checkpoints=max_checkpoints,
-        tp_size=tp_size,
-        sp_ulysses_size=sp_ulysses_size,
-        sp_ring_size=sp_ring_size,
-        dataloader_num_workers=dataloader_num_workers,
-        profiling_options=profiling_options,
-        fit_context=rollout_stream,
-    )
-    trainer.rollout_workers = workers
-    trainer.rollout_stream = rollout_stream
-    return trainer
 
 
 def build_disagg_online_producer(
     *,
-    strategy: str = "eagle3",
-    target_model=None,
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
     prompts,
     feature_store: FeatureStore,
     channel,
@@ -1117,12 +693,10 @@ def build_disagg_online_producer(
     target_hidden_size: int,
     target_vocab_size: Optional[int] = None,
     draft_vocab_size: Optional[int] = None,
-    target_repr: str = "logits",
+    target_repr: Optional[str] = None,
     aux_hidden_state_layer_ids=None,
     vocab_map_version: Optional[str] = None,
-    t2d=None,
     num_rollout_workers: int = 1,
-    device: str = "cuda",
     feature_source=None,
     lease: int = 8,
     in_flight_high_watermark: int = 256,
@@ -1136,16 +710,14 @@ def build_disagg_online_producer(
     max_prompt_attempts: Optional[int] = 5,
     sleep=None,
     prompt_epochs: int = 1,
-    feature_schema=None,
-    input_preparer=None,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
     Workers put() into a cross-node ``feature_store``; committed refs stream to
-    the consumer via ``channel``. Pass ``feature_source`` for the server-capture
-    transport (live SGLang server writes to the store; ``target_model`` stays
-    None) — a *sequence* of sources fans out to one worker per source (the
-    multi-server topology; each worker drives its own server concurrently).
+    the consumer via ``channel``. ``feature_source`` is an injected SGLang
+    server-capture transport; a *sequence* of sources fans out to one worker
+    per source (the multi-server topology; each worker drives its own server
+    concurrently).  There is intentionally no in-process target-model path.
     The producer has no training ledger or local ref queue; the consumer owns
     deduplication and durable acknowledgements. Returns ``(workers,
     drive_producer)``:
@@ -1190,7 +762,24 @@ def build_disagg_online_producer(
     def elapsed(start: float) -> str:
         return f"{time.perf_counter() - start:.3f}s"
 
-    spec = resolve_strategy(strategy)
+    streaming = algorithm.providers.server_streaming_for(modality)
+    contract = algorithm.spec.feature_contract("streaming", modality)
+    if target_repr is None:
+        target_repr = streaming.target_representation
+    allowed_target_representations = contract.allowed_target_representations
+    if allowed_target_representations and (
+        target_repr not in allowed_target_representations
+    ):
+        raise ValueError(
+            f"target representation {target_repr!r} is not supported by "
+            f"algorithm {algorithm.name!r} for modality {modality!r}; "
+            f"expected one of {sorted(allowed_target_representations)}"
+        )
+    if not allowed_target_representations and target_repr is not None:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} for modality {modality!r} does not "
+            f"consume a target representation, got {target_repr!r}"
+        )
     sleep = sleep or time.sleep
     flow_control = ProducerFlowControl(
         FlowControlLimits(
@@ -1223,7 +812,8 @@ def build_disagg_online_producer(
     base_prompt_count = len(prompts) if hasattr(prompts, "__len__") else "unknown"
     producer_timing(
         "build_disagg_online_producer enter "
-        f"strategy={strategy} base_prompts={base_prompt_count} "
+        f"algorithm={algorithm.name} modality={modality} "
+        f"base_prompts={base_prompt_count} "
         f"prompt_epochs={prompt_epochs} "
         f"lease={worker_lease} workers={num_rollout_workers} "
         f"watermarks={in_flight_high_watermark}/"
@@ -1240,9 +830,9 @@ def build_disagg_online_producer(
 
     phase = time.perf_counter()
     producer_timing("assemble rollout workers start")
-    workers = _assemble_rollout_workers(
-        spec=spec,
-        target_model=target_model,
+    workers = _assemble_server_rollout_workers(
+        algorithm=algorithm,
+        modality=modality,
         feature_source=feature_source,
         controller=controller,
         store=feature_store,
@@ -1253,11 +843,7 @@ def build_disagg_online_producer(
         target_repr=target_repr,
         aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
         vocab_map_version=vocab_map_version,
-        t2d=t2d,
         num_rollout_workers=num_rollout_workers,
-        device=device,
-        feature_schema=feature_schema,
-        input_preparer=input_preparer,
     )
     producer_timing(
         "assemble rollout workers done "
@@ -1646,7 +1232,8 @@ def build_disagg_online_producer(
 
 def build_disagg_online_consumer(
     *,
-    strategy: str = "eagle3",
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
     feature_store: FeatureStore,
     channel,
     draft_model,
@@ -1701,7 +1288,7 @@ def build_disagg_online_consumer(
     )
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
-    spec = resolve_strategy(strategy)
+    algorithm.providers.server_streaming_for(modality)
     distributed = dist.is_available() and dist.is_initialized()
     world = dist.get_world_size() if distributed else 1
     actual_rank = dist.get_rank() if distributed else 0
@@ -1932,7 +1519,7 @@ def build_disagg_online_consumer(
 
     try:
         trainer = _assemble_trainer(
-            spec=spec,
+            algorithm=algorithm,
             controller=controller,
             store=feature_store,
             ref_source={
@@ -1941,7 +1528,11 @@ def build_disagg_online_consumer(
                 "defer_ack_until_durable": True,
             },
             model=draft_model,
-            target_head=target_head if spec.uses_target_head else None,
+            target_head=(
+                target_head
+                if algorithm.providers.step.uses_external_target_head
+                else None
+            ),
             optimizer_factory=optimizer_factory,
             run_id=run_id,
             output_dir=output_dir,
@@ -1955,7 +1546,7 @@ def build_disagg_online_consumer(
             eval_data_factory=eval_data_factory,
             logger=logger,
             log_interval=log_interval,
-            collate_fn=_online_collate(spec, collate_fn),
+            collate_fn=_streaming_collate(algorithm, modality, collate_fn),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
             max_checkpoints=max_checkpoints,
@@ -1986,7 +1577,6 @@ def build_disagg_online_consumer(
 __all__ = [
     "build_offline_runtime",
     "build_disagg_offline_runtime",
-    "build_online_runtime",
     "build_disagg_online_producer",
     "build_disagg_online_consumer",
 ]

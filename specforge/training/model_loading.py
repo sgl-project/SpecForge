@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from specforge.algorithms.common.providers import DraftConfigProvider
     from specforge.config import Config
 
 logger = logging.getLogger(__name__)
@@ -76,12 +77,6 @@ class WarmStartReport:
     loaded_keys: int
     missing_keys: Tuple[str, ...]
     loaded_embedding: bool
-
-
-def _assembly_spec(strategy: str):
-    from specforge.training.strategies.registry import resolve_strategy
-
-    return resolve_strategy(strategy).assembly
 
 
 def _without_file_uri(source: str) -> str:
@@ -211,12 +206,14 @@ def _serializable_config_value(value: Any) -> Any:
     return value
 
 
-def _generate_draft_config(cfg: "Config") -> "PretrainedConfig":
-    strategy = cfg.training.strategy
-    policy = _assembly_spec(strategy).draft_config
-    if not policy.supports_auto_generation:
+def _generate_draft_config(
+    cfg: "Config", provider: "DraftConfigProvider"
+) -> "PretrainedConfig":
+    defaults = provider.target_defaults
+    if defaults is None:
         raise ValueError(
-            f"training.strategy={strategy!r} requires model.draft_model_config "
+            f"training.strategy={cfg.training.strategy!r} requires "
+            "model.draft_model_config "
             "or a pretrained model.draft_checkpoint_path containing config.json"
         )
 
@@ -240,32 +237,37 @@ def _generate_draft_config(cfg: "Config") -> "PretrainedConfig":
             f"target config {cfg.model.target_model_path!r} cannot generate a "
             f"draft config; missing {required}"
         )
-    payload["architectures"] = [policy.architecture]
-    payload["model_type"] = policy.auto_model_type
-    payload["num_hidden_layers"] = policy.auto_num_hidden_layers
+    payload["architectures"] = [provider.architecture]
+    payload["model_type"] = defaults.model_type
+    payload["num_hidden_layers"] = defaults.num_hidden_layers
     payload["tie_word_embeddings"] = False
     payload["use_cache"] = True
     if payload.get("pad_token_id") is None:
         payload["pad_token_id"] = 0
-    if policy.auto_draft_vocab_size is not None:
-        payload["draft_vocab_size"] = policy.auto_draft_vocab_size
-    if policy.populate_generated is not None:
-        policy.populate_generated(payload, target_config, cfg)
+    if defaults.draft_vocab_size is not None:
+        payload["draft_vocab_size"] = defaults.draft_vocab_size
+    if defaults.populate is not None:
+        defaults.populate(payload, target_config, cfg)
     return _draft_config_from_dict(payload)
 
 
-def _apply_draft_overrides(cfg: "Config", draft_config: "PretrainedConfig") -> None:
+def _apply_draft_overrides(
+    cfg: "Config",
+    draft_config: "PretrainedConfig",
+    provider: "DraftConfigProvider",
+) -> None:
     num_layers = cfg.model.draft_num_hidden_layers
     if num_layers is not None:
         draft_config.num_hidden_layers = num_layers
     if cfg.model.draft_block_size is not None:
         draft_config.block_size = cfg.model.draft_block_size
-    apply_overrides = _assembly_spec(cfg.training.strategy).draft_config.apply_overrides
-    if apply_overrides is not None:
-        apply_overrides(cfg, draft_config)
+    if provider.apply_overrides is not None:
+        provider.apply_overrides(cfg, draft_config)
 
 
-def resolve_draft_config(cfg: "Config") -> "PretrainedConfig":
+def resolve_draft_config(
+    cfg: "Config", *, provider: "DraftConfigProvider"
+) -> "PretrainedConfig":
     """Resolve and validate the draft architecture for one typed run config."""
 
     source = cfg.model.draft_model_config
@@ -278,23 +280,25 @@ def resolve_draft_config(cfg: "Config") -> "PretrainedConfig":
             trust_remote_code=cfg.model.trust_remote_code,
         )
     else:
-        draft_config = _generate_draft_config(cfg)
+        draft_config = _generate_draft_config(cfg, provider)
 
-    expected = _assembly_spec(cfg.training.strategy).draft_config.architecture
+    expected = provider.architecture
     architectures = list(getattr(draft_config, "architectures", None) or [])
     if architectures != [expected]:
         raise ValueError(
             f"training.strategy={cfg.training.strategy!r} requires draft "
             f"architecture {expected}, got {architectures!r}"
         )
-    _apply_draft_overrides(cfg, draft_config)
+    _apply_draft_overrides(cfg, draft_config, provider)
     return draft_config
 
 
-def draft_config_dict(cfg: "Config") -> Dict[str, Any]:
+def draft_config_dict(
+    cfg: "Config", *, provider: "DraftConfigProvider"
+) -> Dict[str, Any]:
     """JSON-compatible resolved draft config for capture-only producer roles."""
 
-    return resolve_draft_config(cfg).to_dict()
+    return resolve_draft_config(cfg, provider=provider).to_dict()
 
 
 def _has_pretrained_weights(path: str) -> bool:
@@ -392,6 +396,7 @@ def warm_start_draft_model(
     *,
     draft_config: "PretrainedConfig",
     strategy: str,
+    allow_missing_embedding: bool = False,
     cache_dir: Optional[str] = None,
     trust_remote_code: bool = False,
 ) -> WarmStartReport:
@@ -427,7 +432,7 @@ def warm_start_draft_model(
             f"unexpected={sorted(result.unexpected_keys)}"
         )
     allowed_missing = set()
-    if _assembly_spec(strategy).allow_missing_warm_start_embedding:
+    if allow_missing_embedding:
         allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:

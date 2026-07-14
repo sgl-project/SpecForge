@@ -1,12 +1,11 @@
 # SpecForge runtime architecture
 
 SpecForge has one public training entry point, `specforge train`. A typed run
-configuration selects a strategy and a topology; it does not select a second
-trainer. The launch layer exposes exactly five topology builders:
+configuration selects an algorithm and a topology; it does not select a second
+trainer. The launch layer exposes exactly four topology builders:
 
 - `build_offline_runtime`
 - `build_disagg_offline_runtime`
-- `build_online_runtime`
 - `build_disagg_online_producer`
 - `build_disagg_online_consumer`
 
@@ -19,9 +18,8 @@ the reference source and feature-store backend change.
 | Mode | Producer side | Consumer reference source | Feature store | Iteration contract |
 | --- | --- | --- | --- | --- |
 | Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
-| Disaggregated offline | `run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
-| Colocated online | `RolloutWorker` captures on demand | `LocalRolloutStream` | Private `LocalFeatureStore` | Consume once; deterministic resume rebuilds the untrained prompt suffix; no second pass over produced refs |
-| Disaggregated online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
+| Disaggregated offline | `CONFIG=path/to/offline-disagg.yaml run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
+| Online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
 
 `training.num_epochs` on an online run controls how many prompt passes the
 producer creates. Each pass receives new task and sample ids. The consumer
@@ -35,9 +33,9 @@ stream as a second trainer epoch.
 - The data plane carries feature tensors behind `FeatureStore` URIs.
 - `FeatureDataLoader` is the only bridge from refs plus a store to a
   tensor-carrying `TrainBatch`.
-- The inference plane captures target features through the generic
-  `TargetEngine`/server-capture adapter and commits only refs.
-- The training plane resolves a `DraftTrainStrategy`; the core training loop
+- The inference plane sends model inputs to an external spec-capture server,
+  adopts its Mooncake-backed refs, and commits only metadata.
+- The training plane resolves an algorithm step provider; the core training loop
   does not branch on online, offline, colocated, or disaggregated deployment.
 
 ## Canonical online-disaggregated flow
@@ -121,17 +119,7 @@ its inboxes. Consumer-only recovery may instead reuse the retained ledger,
 channel/inboxes, Mooncake objects, and an exactly matching checkpoint; it
 reconciles the unacknowledged suffix but never restarts the producer.
 
-## Other topology flows
-
-### Colocated online
-
-`LocalRolloutStream` is a bounded pull-through queue facade. The loader asks for
-one batch, rollout workers capture only enough refs to satisfy it, and the
-trainer consumes those refs before requesting more. The controller's private
-in-process queue is an implementation detail of this local lifecycle; it is not
-the disaggregated transport.
-
-### Offline
+## Offline topology
 
 Offline consumers receive a fixed ref list. Colocated refs point directly at
 precomputed files. The disaggregated producer copies or publishes those

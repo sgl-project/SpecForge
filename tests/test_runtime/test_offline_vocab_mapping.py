@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.training.assembly import (
     _ensure_offline_vocab_mapping,
@@ -16,6 +17,8 @@ from specforge.training.assembly import (
     _prompt_cache_key,
 )
 from specforge.training.vocab_mapping import count_effective_feature_tokens
+
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
 
 class _DraftWithMapping(torch.nn.Module):
@@ -39,11 +42,25 @@ class OfflineVocabMappingTest(unittest.TestCase):
                 {
                     "model": {
                         "target_model_path": "target/model",
-                        "target_backend": "hf",
+                        "target_backend": "sglang",
                     },
                     "data": {
                         "train_data_path": "train.jsonl",
                         "cache_dir": directory,
+                    },
+                    "training": {"max_steps": 1},
+                    "deployment": {
+                        "mode": "disaggregated",
+                        "disaggregated": {
+                            "control_dir": f"{directory}/control",
+                            "backend": "mooncake",
+                            "server_urls": ["http://capture.invalid:30000"],
+                            "mooncake_metadata_server": (
+                                "http://metadata.invalid:35880/metadata"
+                            ),
+                            "mooncake_master_server_addr": "master.invalid:35551",
+                            "mooncake_protocol": "tcp",
+                        },
                     },
                 }
             )
@@ -142,7 +159,7 @@ class OfflineVocabMappingTest(unittest.TestCase):
                 target_vocab_size=8,
                 draft_vocab_size=4,
             )
-            _ensure_offline_vocab_mapping(cfg, first)
+            _ensure_offline_vocab_mapping(cfg, first, ALGORITHM)
             cached = list((root / "cache" / "vocab_mapping").glob("*.pt"))
             self.assertEqual(len(cached), 1)
             self.assertTrue(first_draft.vocab_mapping_loaded)
@@ -153,7 +170,7 @@ class OfflineVocabMappingTest(unittest.TestCase):
                 target_vocab_size=8,
                 draft_vocab_size=4,
             )
-            _ensure_offline_vocab_mapping(cfg, second)
+            _ensure_offline_vocab_mapping(cfg, second, ALGORITHM)
 
         self.assertTrue(second_draft.vocab_mapping_loaded)
         self.assertTrue(torch.equal(first_draft.t2d, second_draft.t2d))

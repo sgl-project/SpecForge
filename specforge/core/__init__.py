@@ -1,5 +1,6 @@
-"""Training model composites.
+"""Shared training math and backend adapters.
 
-The unified assembly imports each strategy implementation from its owning
-module; this package does not maintain a second aggregate model API.
+Algorithm-specific model implementations live in their owning
+``specforge.algorithms`` packages; this package does not expose an aggregate
+model API.
 """

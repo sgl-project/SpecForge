@@ -5,14 +5,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
-
-_SERVER_CAPTURE_METHODS = {
-    "eagle3": "eagle3",
-    "dflash": "dflash",
-    "domino": "dflash",
-    "dspark": "dflash",
-}
 
 
 @dataclass(frozen=True)
@@ -24,20 +18,17 @@ class ServerCaptureContract:
     draft_vocab_size: int
 
 
-def resolve_server_capture_contract(cfg: Config) -> ServerCaptureContract:
+def resolve_server_capture_contract(
+    cfg: Config,
+    *,
+    algorithm: AlgorithmRegistration,
+) -> ServerCaptureContract:
     """Resolve engine flags and feature dimensions from canonical model config."""
     from transformers import AutoConfig
 
     from specforge.training.model_loading import draft_config_dict
-    from specforge.training.strategies.registry import resolve_strategy
 
-    try:
-        method = _SERVER_CAPTURE_METHODS[cfg.training.strategy]
-    except KeyError as exc:
-        raise ValueError(
-            f"strategy {cfg.training.strategy!r} has no managed server-capture "
-            "method"
-        ) from exc
+    streaming = algorithm.providers.server_streaming_for(cfg.model.input_modality)
 
     target_cfg = AutoConfig.from_pretrained(
         cfg.model.target_model_path,
@@ -45,9 +36,9 @@ def resolve_server_capture_contract(cfg: Config) -> ServerCaptureContract:
         trust_remote_code=cfg.model.trust_remote_code,
     )
     target_cfg = getattr(target_cfg, "text_config", target_cfg)
-    draft_cfg = draft_config_dict(cfg)
-    strategy = resolve_strategy(cfg.training.strategy)
-    layers = strategy.assembly.resolve_capture_layers(cfg, draft_cfg, target_cfg)
+    model_provider = algorithm.providers.model
+    draft_cfg = draft_config_dict(cfg, provider=model_provider.draft_config)
+    layers = model_provider.resolve_capture_layers(cfg, draft_cfg, target_cfg)
     if not layers:
         raise ValueError("draft config does not define target capture layer ids")
     if any(
@@ -64,7 +55,7 @@ def resolve_server_capture_contract(cfg: Config) -> ServerCaptureContract:
         )
 
     return ServerCaptureContract(
-        method=method,
+        method=streaming.capture_method,
         aux_layer_ids=tuple(layers),
         target_hidden_size=int(target_cfg.hidden_size),
         target_vocab_size=int(target_cfg.vocab_size),

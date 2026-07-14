@@ -6,13 +6,16 @@ Disaggregation is a launch topology of the canonical training command:
 specforge train -c run.yaml
 ```
 
-The producer captures or ingests features and the consumer runs the same
-trainer used by colocated runs. There is no separate Python training entry.
+The producer captures or ingests features and the consumer runs the canonical
+trainer. Online training always uses this producer/consumer topology; there is
+no colocated target-inference path and no separate Python training entry.
 
 The checked-in recipes are:
 
 | Workflow | Config |
 | --- | --- |
+| Online EAGLE3 | `examples/configs/qwen3-8b-eagle3-disaggregated.yaml` |
+| Online P-EAGLE | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` |
 | Online DFlash | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` |
 | Managed-local one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
 | Online Domino | `examples/configs/qwen3-8b-domino-disaggregated.yaml` |
@@ -61,9 +64,10 @@ requires fresh control and consumer-state directories. `store_id` defaults to
 `run_id` and can be set explicitly when the Mooncake deployment requires
 another namespace.
 
-The launcher accepts the former `training.deployment_mode`, `training.role`,
-`training.server_urls`, and `training.metadata_db_path` fields for migration,
-but new recipes use `deployment` and the CLI role selector only.
+The file loader translates the former `training.deployment_mode`,
+`training.server_urls`, and `training.metadata_db_path` fields at its migration
+boundary. New recipes use `deployment`; `training.role` remains the canonical
+persisted role selection and normally stays `auto` for a shared config.
 
 ## Single-node producer and consumer
 
@@ -305,9 +309,11 @@ node-local deployment values.
 The online producer sends prompts to the URLs in
 `deployment.disaggregated.server_urls`. Start a patched SGLang server separately
 with the model, capture method, and auxiliary layer ids matching the draft
-config. DFlash, Domino, and DSpark use the DFlash capture contract; EAGLE3 uses
-the EAGLE3 capture contract. Capture rejects chunked prefill and radix-cache
-paths that can truncate the captured sequence.
+config. DFlash, Domino, and DSpark use the DFlash capture contract; EAGLE3 and
+P-EAGLE use the EAGLE3 capture contract. Capture rejects chunked prefill and
+radix-cache paths that can truncate the captured sequence. Qwen2.5-VL is
+temporarily unsupported until its provider defines a server-side media and
+M-RoPE streaming schema.
 
 The repository's strict e2e gate remains a full local test-stack orchestrator:
 

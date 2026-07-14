@@ -28,11 +28,11 @@ create a second copy of the recipe in documentation.
 specforge train --config examples/configs/llama3.1-8b-eagle3-online.yaml
 ```
 
-The same recipe supports target TP and target-DP by changing the typed
-`deployment.trainer` topology; the CLI self-launches the required workers. See
+The recipe points at an external SGLang capture server and starts the
+disaggregated producer/consumer roles. Configure target TP on the SGLang
+server; `deployment.trainer` controls only consumer data parallelism. See
 [Parallel topologies](../basic_usage/training.md#parallel-topologies). For a
-short smoke run, append a small `training.max_steps` dotted override to the
-same command.
+short smoke run, append a small `training.max_steps` dotted override.
 
 ## 4. Export and benchmark
 
@@ -41,8 +41,8 @@ reference draft checkpoint is available at
 [zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct).
 
 The runtime checkpoint contains training state but is not directly loadable by
-the SGLang speculative decoder. A colocated online run can resume it with
-`training.resume_from`; export the final checkpoint before serving:
+the SGLang speculative decoder. Online resume is consumer-only and reuses the
+retained transport state; export the final checkpoint before serving:
 
 ```bash
 specforge export --to sglang \

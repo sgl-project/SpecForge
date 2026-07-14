@@ -21,6 +21,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
+
 try:
     import torch.distributed as dist
 except ModuleNotFoundError:  # Dependency-light local checks may not install torch.
@@ -28,6 +30,7 @@ except ModuleNotFoundError:  # Dependency-light local checks may not install tor
 
 
 WORLD_SIZE = 2
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 _GLOO_AVAILABLE = bool(
     dist is not None
     and dist.is_available()
@@ -136,6 +139,7 @@ def _rank0_setup_error_worker(
 
         try:
             build_disagg_online_consumer(
+                algorithm=ALGORITHM,
                 feature_store=_RetainingFeatureStore(),
                 channel=_PathOnlyChannel(os.path.join(work_dir, "refs.jsonl")),
                 draft_model=None,
@@ -428,6 +432,7 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
             mock.patch("specforge.launch._assemble_trainer", side_effect=assemble),
         ):
             trainer = build_disagg_online_consumer(
+                algorithm=ALGORITHM,
                 feature_store=feature_store or _RetainingFeatureStore(),
                 channel=channel,
                 draft_model=object(),

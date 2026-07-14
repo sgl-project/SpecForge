@@ -1,4 +1,5 @@
-"""Target-side trainable modeling components.
+"""Trainable target-head components used by offline EAGLE3 training.
 
-Frozen inference engines live exclusively in :mod:`specforge.inference`.
+Frozen online capture runs in an external server; standalone preprocessing uses
+:mod:`specforge.offline_capture`.
 """

@@ -10,9 +10,13 @@ from typing import get_args
 import torch
 import torch.nn as nn
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.runtime.contracts import DraftStrategyName, TrainBatch
 from specforge.training.strategies.base import PEagleTrainStrategy
-from specforge.training.strategies.registry import resolve_strategy
+
+REGISTRY = builtin_algorithm_registry()
+EAGLE3 = REGISTRY.resolve("eagle3")
+PEAGLE = REGISTRY.resolve("peagle")
 
 
 class _FakeDraftModel(nn.Module):
@@ -82,24 +86,23 @@ def _batch(*, target_repr: str = "logits", include_lengths: bool = False) -> Tra
 
 
 class TestPEagleStrategy(unittest.TestCase):
-    def test_strategy_name_is_in_runtime_contract_and_registry(self):
+    def test_strategy_name_is_in_runtime_contract_and_builtin_registration(self):
         self.assertIn("peagle", get_args(DraftStrategyName))
-        spec = resolve_strategy("peagle")
+        contract = PEAGLE.spec.feature_contract("streaming", "text")
         self.assertEqual(
-            spec.required_features,
+            contract.required_tensors,
             frozenset(PEagleTrainStrategy.required_features),
         )
-        self.assertTrue(spec.supports_online)
-        self.assertTrue(spec.uses_target_head)
-        self.assertIsNone(spec.make_offline_reader)
-        self.assertIsNone(spec.make_offline_transform)
-        self.assertIsNone(spec.make_offline_collate)
+        self.assertTrue(PEAGLE.spec.supports_online)
+        self.assertTrue(PEAGLE.providers.step.uses_external_target_head)
+        self.assertEqual((), PEAGLE.providers.offline)
 
-    def test_registry_reuses_eagle3_online_capture(self):
-        peagle = resolve_strategy("peagle")
-        eagle3 = resolve_strategy("eagle3")
-        self.assertIs(peagle.feature_schema, eagle3.feature_schema)
-        self.assertIs(peagle.make_online_collate(), eagle3.make_online_collate())
+    def test_provider_reuses_eagle3_online_capture(self):
+        peagle = PEAGLE.providers.server_streaming_for("text")
+        eagle3 = EAGLE3.providers.server_streaming_for("text")
+        self.assertEqual(peagle.capture_method, eagle3.capture_method)
+        self.assertEqual(peagle.layout, eagle3.layout)
+        self.assertIs(peagle.build_collator, eagle3.build_collator)
 
     def test_online_logits_map_hidden_state_and_derive_length(self):
         model = _FakePEagleModel()
@@ -181,7 +184,12 @@ class TestPEagleStrategy(unittest.TestCase):
 
         contract = _strategy_resume_contract(
             cfg,
-            ModelBundle(model=model, draft_model=draft_model),
+            ModelBundle(
+                model=model,
+                draft_model=draft_model,
+                draft_config=SimpleNamespace(),
+            ),
+            PEAGLE,
         )
 
         self.assertEqual(

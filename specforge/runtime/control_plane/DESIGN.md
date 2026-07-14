@@ -11,8 +11,8 @@ The whole-system topology is documented in
 
 - prompt ingest, leasing, retry, and terminal failure;
 - `SampleRef` commit deduplication;
-- an in-process lease/ack/fail queue used by colocated online and as private
-  rank-0 staging inside the online distributor;
+- optional sample-ref lease/ack/fail primitives used by tests and internal
+  staging, but disabled on the canonical online producer;
 - trainer registration and optimizer-boundary ack transactions;
 - status for active prompt, queue, and durable-ack state.
 
@@ -25,7 +25,6 @@ loop and never calls a rollout worker or trainer.
 | --- | --- | --- |
 | Colocated offline | No ledger or staging queue | Fixed, re-iterable ref list |
 | Disaggregated offline | No training ledger; producer publishes a static manifest | Fixed, re-iterable manifest refs |
-| Colocated online | One controller owns prompt lifecycle and its private local queue | `LocalRolloutStream` pulls from that queue |
 | Disaggregated online producer | Prompt lifecycle only; `NoOpMetadataStore`; local sample enqueue is disabled | Publishes refs directly to the shared `StreamingRefChannel` |
 | Disaggregated online consumer | Rank 0 owns the only fresh retaining ledger; every rank owns a `DPAckController` view | `RefDistributor -> per-rank InboxChannel -> StreamingRefQueue` |
 

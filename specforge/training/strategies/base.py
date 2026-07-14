@@ -196,7 +196,6 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         )
         validate_compact_teacher_enabled(
             is_online=False,
-            is_vlm=False,
             draft_vocab_size=draft_vocab_size,
             vocab_size=vocab_size,
             t2d=draft_model.t2d,

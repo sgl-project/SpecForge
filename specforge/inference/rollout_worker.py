@@ -8,9 +8,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """RolloutWorker: PromptTask -> features/refs -> SampleRef commit.
 
-The worker is deliberately small and strategy-agnostic: it leases prompt tasks,
-asks a ``feature_source`` (e.g. a wrapper over the target model's
-``PolicyFeatureAdapter`` or server capture) for per-sample features,
+The worker is deliberately small and algorithm-agnostic: it leases prompt tasks,
+asks an external-server ``feature_source`` for per-sample features,
 verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. A server-side capture source may instead return already-written
