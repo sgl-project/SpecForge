@@ -138,6 +138,10 @@ model:
   draft_checkpoint_path: ./outputs/base/base-step1000
 ```
 
+For an online disaggregated run, the producer may receive the same field. It
+uses only the warm source's draft configuration to derive the capture contract;
+the consumer alone loads the draft weights and optimizer.
+
 Set exactly one data source:
 
 - `data.train_data_path` for raw conversation or preformatted online data;

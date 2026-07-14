@@ -90,7 +90,7 @@ class ModelLoadingSchemaTest(unittest.TestCase):
                 }
             )
 
-    def test_warm_start_belongs_to_a_trainer_role(self):
+    def test_disaggregated_producer_can_resolve_warm_start_metadata(self):
         payload = _payload(
             "dflash",
             draft_checkpoint_path="org/dflash-draft",
@@ -102,8 +102,8 @@ class ModelLoadingSchemaTest(unittest.TestCase):
             "role": "producer",
             "total_steps": 1,
         }
-        with self.assertRaisesRegex(ValidationError, "trainer role"):
-            Config.model_validate(payload)
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.model.draft_checkpoint_path, "org/dflash-draft")
 
 
 if __name__ == "__main__":

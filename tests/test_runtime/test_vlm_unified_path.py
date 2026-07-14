@@ -145,10 +145,6 @@ class _TrainablePathVLMTarget:
         self.saw_media = False
 
     def capture(self, input_ids, attention_mask, loss_mask, *, media_inputs):
-        from specforge.inference.target_engine.target_capture_policy import (
-            TargetCaptureBatch,
-        )
-
         self.saw_media = isinstance(media_inputs, MediaInputs)
         batch, length = input_ids.shape
         hidden = torch.arange(
@@ -165,7 +161,7 @@ class _TrainablePathVLMTarget:
             device=input_ids.device,
         )
         target.scatter_(-1, input_ids.unsqueeze(-1), 8.0)
-        return TargetCaptureBatch(
+        return Eagle3TargetOutput(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask.unsqueeze(-1),
