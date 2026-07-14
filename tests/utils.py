@@ -27,7 +27,10 @@ def get_available_port():
 
 
 def execute_shell_command(
-    command: str, disable_proxy: bool = False, enable_hf_mirror: bool = False
+    command: str,
+    disable_proxy: bool = False,
+    enable_hf_mirror: bool = False,
+    sglang_use_modelscope: bool = False,
 ):
     """
     Execute a shell command and return its process handle.
@@ -46,6 +49,8 @@ def execute_shell_command(
 
     if enable_hf_mirror:
         env["HF_ENDPOINT"] = "https://hf-mirror.com"
+    if sglang_use_modelscope:
+        env["SGLANG_USE_MODELSCOPE"] = "true"
     return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 

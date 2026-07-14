@@ -27,6 +27,7 @@ class TestRegenerateTrainData(unittest.TestCase):
         """,
             disable_proxy=True,
             enable_hf_mirror=False,
+            sglang_use_modelscope=True,
         )
         wait_for_server(f"http://localhost:30000", disable_proxy=True)
 
