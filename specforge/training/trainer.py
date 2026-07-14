@@ -17,6 +17,8 @@ ref source + store the Trainer is handed — the loader IS the stream.
 
 from __future__ import annotations
 
+import logging
+import sys
 from contextlib import nullcontext
 from typing import Callable, Optional
 
@@ -25,6 +27,8 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 from specforge.training.strategies.registry import StrategySpec
+
+logger = logging.getLogger(__name__)
 
 
 class Trainer:
@@ -364,6 +368,15 @@ class Trainer:
 
     def fit(self) -> int:
         """Run training and configured evaluation through one lifecycle."""
+        loader_close_attempted = False
+
+        def close_loader() -> None:
+            nonlocal loader_close_attempted
+            loader_close_attempted = True
+            close = getattr(self._loader, "close", None)
+            if callable(close):
+                close()
+
         try:
             context = (
                 self._fit_context if self._fit_context is not None else nullcontext()
@@ -372,6 +385,10 @@ class Trainer:
                 step = self._controller.fit(self._loader)
             if step > 0 and self.last_checkpoint_step != step:
                 self.save_checkpoint()
+            # A distributed consumer is not successful until prefetch has
+            # stopped and every never-yielded lease has an explicit outcome.
+            # Run this before on_fit_success publishes consumer_done.
+            close_loader()
             if self._on_fit_success is not None:
                 self._on_fit_success(step)
             return step
@@ -380,16 +397,52 @@ class Trainer:
                 self._on_fit_failure(exc)
             raise
         finally:
-            try:
-                self._controller.close_profiler()
-            finally:
+            primary_exception = sys.exception()
+            cleanup_errors: list[tuple[str, BaseException]] = []
+
+            def capture_cleanup(label: str, action) -> None:
                 try:
-                    if self._on_fit_finally is not None:
-                        self._on_fit_finally()
-                finally:
-                    close_logger = getattr(self._logger, "close", None)
-                    if callable(close_logger):
-                        close_logger()
+                    action()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append((label, cleanup_error))
+
+            if not loader_close_attempted:
+                capture_cleanup("FeatureDataLoader.close", close_loader)
+            capture_cleanup(
+                "TrainerController.close_profiler",
+                self._controller.close_profiler,
+            )
+            if self._on_fit_finally is not None:
+                capture_cleanup("on_fit_finally", self._on_fit_finally)
+            close_logger = getattr(self._logger, "close", None)
+            if callable(close_logger):
+                capture_cleanup("logger.close", close_logger)
+
+            if cleanup_errors and primary_exception is not None:
+                for label, cleanup_error in cleanup_errors:
+                    note = (
+                        f"{label} also failed during cleanup: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    primary_exception.add_note(note)
+                    logger.error(
+                        "%s",
+                        note,
+                        exc_info=(
+                            type(cleanup_error),
+                            cleanup_error,
+                            cleanup_error.__traceback__,
+                        ),
+                    )
+            elif cleanup_errors:
+                label, cleanup_error = cleanup_errors[0]
+                for other_label, other_error in cleanup_errors[1:]:
+                    cleanup_error.add_note(
+                        f"{other_label} also failed during cleanup: "
+                        f"{type(other_error).__name__}: {other_error}"
+                    )
+                cleanup_error.add_note(f"cleanup owner: {label}")
+                raise cleanup_error
 
     def save_checkpoint(self):
         """Persist the current optimizer step through the one trainer surface."""

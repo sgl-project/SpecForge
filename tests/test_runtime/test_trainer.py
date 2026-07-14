@@ -11,6 +11,10 @@ import torch
 import torch.nn as nn
 
 from specforge.runtime.contracts import TrainBatch
+from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
+from specforge.runtime.data_plane.feature_store import LocalFeatureStore
+from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import Checkpoint, TrainerController, TrainerCore
@@ -83,6 +87,10 @@ class FakeBackend(TrainingBackend):
         pass
 
 
+class RetryableCloseQueue(SampleRefQueue):
+    loader_close_retryable = True
+
+
 def _batch():
     return TrainBatch(
         sample_ids=["s"], strategy="fake", tensors={"x": torch.ones(2)}, metadata={}
@@ -140,6 +148,54 @@ class TestTrainerController(unittest.TestCase):
             self.assertIsInstance(ckpt, Checkpoint)
             self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
             self.assertEqual(ckpt.global_step, 3)
+
+    def test_max_steps_closes_prefetch_and_requeues_unyielded_refs(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            for index in range(4):
+                torch.save(
+                    {"x": torch.ones(2) * (index + 1)},
+                    os.path.join(d, f"{index:03d}.ckpt"),
+                )
+            refs = OfflineManifestReader(
+                d,
+                run_id="run",
+                strategy="fake",
+                feature_keys=("x",),
+                target_repr=None,
+            ).read()
+            refs_by_id = {ref.sample_id: ref for ref in refs}
+            queue = RetryableCloseQueue()
+            queue.put(refs)
+            store = LocalFeatureStore("st")
+            loader = FeatureDataLoader(
+                store,
+                queue,
+                batch_size=1,
+                strategy="fake",
+                ack=False,
+                num_workers=2,
+            )
+
+            def ack(ids, _step):
+                queue.ack([refs_by_id[sample_id] for sample_id in ids])
+
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=1,
+                num_epochs=1,
+                ack_fn=ack,
+            )
+            self.assertEqual(ctrl.fit(loader), 1)
+
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(queue.depth(), 3)
+        self.assertEqual(store.health()["active_leases"], 0)
+        self.assertIsNone(loader._prefetch_state)
 
     def test_public_trainer_fit_has_no_eval_side_channel(self):
         from specforge.training.trainer import Trainer

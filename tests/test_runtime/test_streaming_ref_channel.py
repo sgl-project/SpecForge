@@ -3,6 +3,8 @@
 
 import os
 import tempfile
+import threading
+import time
 import unittest
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
@@ -187,6 +189,37 @@ class TestStreamingRefChannel(unittest.TestCase):
         queue.ack_ids(["s0"])
         self.assertEqual(producer.consumed_remote(), 1)
         self.assertEqual(queue.in_flight_ids(), [])
+
+    def test_queue_interruptible_get_stops_while_channel_is_open(self):
+        queue = StreamingRefQueue(
+            StreamingRefChannel(self.path),
+            poll_s=0.01,
+        )
+        stop = threading.Event()
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(queue.get_interruptible(1, stop_event=stop))
+        )
+        worker.start()
+        time.sleep(0.02)
+        stop.set()
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [[]])
+        self.assertEqual(queue.in_flight_ids(), [])
+
+    def test_retryable_fail_requeues_without_advancing_consumed_sidecar(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        queue = StreamingRefQueue(StreamingRefChannel(self.path), poll_s=0.0)
+
+        refs = queue.get(1)
+        queue.fail(refs, reason="loader closed", retryable=True)
+
+        self.assertEqual(producer.consumed_remote(), 0)
+        self.assertEqual(queue.in_flight_ids(), [])
+        self.assertEqual([ref.sample_id for ref in queue.get(1)], ["s0"])
 
 
 if __name__ == "__main__":

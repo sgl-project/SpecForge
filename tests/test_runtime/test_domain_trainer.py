@@ -25,6 +25,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         checkpointed_step=None,
         fit_context=None,
         fit_error=None,
+        loader_close_error=None,
         save_error=None,
         events=None,
         on_fit_success=None,
@@ -44,6 +45,11 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap["loader_store"] = store
                 cap["loader_kw"] = kw
                 cap["loader"] = self
+
+            def close(self):
+                cap["loader_closes"] = cap.get("loader_closes", 0) + 1
+                if loader_close_error is not None:
+                    raise loader_close_error
 
         class FakeParallel:
             @classmethod
@@ -87,6 +93,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap.setdefault("saves", []).append(step)
                 self.last_checkpoint_step = step
                 return SimpleNamespace(global_step=step)
+
+            def close_profiler(self):
+                cap["profiler_closes"] = cap.get("profiler_closes", 0) + 1
 
         dfc_calls = []
 
@@ -200,10 +209,12 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(out, 42)
         self.assertIs(cap["fit"], cap["loader"])
         self.assertEqual(cap["saves"], [42])
+        self.assertEqual(cap["loader_closes"], 1)
 
         # Re-entering at an already durable step does not write it twice.
         self.assertEqual(trainer.fit(), 42)
         self.assertEqual(cap["saves"], [42])
+        self.assertEqual(cap["loader_closes"], 2)
 
     def test_offline_loader_rebuilds_the_ref_plan_on_set_epoch(self):
         try:
@@ -275,7 +286,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             self.skipTest("torch unavailable")
         events = []
         error = RuntimeError("fit failed")
-        trainer, _, _, _ = self._build(
+        trainer, cap, _, _ = self._build(
             {"refs": list(range(6))},
             fit_error=error,
             events=events,
@@ -287,6 +298,64 @@ class DomainTrainerWiringTest(unittest.TestCase):
             trainer.fit()
         self.assertIs(raised.exception, error)
         self.assertEqual(events, ["fit", "failure:fit failed", "finally"])
+        self.assertEqual(cap["loader_closes"], 1)
+
+    def test_loader_cleanup_failure_does_not_mask_primary_fit_error(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        primary = RuntimeError("optimizer failed first")
+        cleanup = RuntimeError("prefetch worker stayed blocked")
+        trainer, cap, _, _ = self._build(
+            {"refs": list(range(6))},
+            fit_error=primary,
+            loader_close_error=cleanup,
+            events=events,
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+
+        with (
+            self.assertLogs("specforge.training.trainer", level="ERROR") as logs,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            trainer.fit()
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(cap["loader_closes"], 1)
+        self.assertEqual(events, ["fit", "failure:optimizer failed first", "finally"])
+        self.assertTrue(
+            any("prefetch worker stayed blocked" in note for note in primary.__notes__)
+        )
+        self.assertIn("prefetch worker stayed blocked", "\n".join(logs.output))
+
+    def test_loader_close_failure_signals_failure_before_final_cleanup(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        cleanup = RuntimeError("prefetch close failed")
+        trainer, cap, _, _ = self._build(
+            {"refs": list(range(6))},
+            loader_close_error=cleanup,
+            events=events,
+            on_fit_success=lambda step: events.append(f"success:{step}"),
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            trainer.fit()
+
+        self.assertIs(raised.exception, cleanup)
+        self.assertEqual(cap["loader_closes"], 1)
+        self.assertEqual(
+            events,
+            ["fit", "save", "failure:prefetch close failed", "finally"],
+        )
 
     def test_zero_step_skips_final_checkpoint(self):
         try:
