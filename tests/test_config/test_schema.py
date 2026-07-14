@@ -69,6 +69,50 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(missing)
         self.assertEqual(Config.model_validate(MINIMAL).mode, "offline")
 
+    def test_resume_is_limited_to_offline_trainer_roles(self):
+        local = Config.model_validate(
+            {
+                **MINIMAL,
+                "training": {"resume_from": "/checkpoints/run-latest"},
+            }
+        )
+        self.assertEqual(local.training.resume_from, "/checkpoints/run-latest")
+
+        disaggregated_consumer = Config.model_validate(
+            {
+                **MINIMAL,
+                "training": {
+                    "deployment_mode": "disaggregated",
+                    "role": "consumer",
+                    "resume_from": "/checkpoints/run-latest",
+                },
+            }
+        )
+        self.assertEqual(
+            disaggregated_consumer.training.resume_from,
+            "/checkpoints/run-latest",
+        )
+
+        with self.assertRaisesRegex(ValidationError, "online resume"):
+            Config.model_validate(
+                {
+                    **MINIMAL,
+                    "data": {"train_data_path": "/data.jsonl"},
+                    "training": {"resume_from": "/checkpoints/run-latest"},
+                }
+            )
+        with self.assertRaisesRegex(ValidationError, "trainer role"):
+            Config.model_validate(
+                {
+                    **MINIMAL,
+                    "training": {
+                        "deployment_mode": "disaggregated",
+                        "role": "producer",
+                        "resume_from": "/checkpoints/run-latest",
+                    },
+                }
+            )
+
     def test_unknown_backend_rejected(self):
         bad = {**MINIMAL, "model": {**MINIMAL["model"], "target_backend": "vllm"}}
         with self.assertRaises(ValidationError):

@@ -31,9 +31,10 @@ through here. Builders go from ``topologies x models`` to
 ``topologies + one spec per model``.
 
 Import-light: this module references only the (light) strategy classes; the
-model/dataset-heavy imports (``OfflineEagle3Dataset``, ``DataCollatorWithPadding``,
-``OfflineManifestReader``) stay lazy inside the factory callables so importing
-the registry never drags in a GPU/model environment.
+model/dataset-heavy imports (``process_offline_eagle3_sample``,
+``DataCollatorWithPadding``, ``OfflineManifestReader``) stay lazy inside the
+factory callables so importing the registry never drags in a GPU/model
+environment.
 """
 
 from __future__ import annotations
@@ -135,9 +136,11 @@ def _eagle3_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
 
 
 def _eagle3_offline_transform(max_len):
-    from specforge.data.preprocessing import OfflineEagle3Dataset
+    from functools import partial
 
-    return lambda raw: OfflineEagle3Dataset.process_data(raw, max_len)
+    from specforge.data.preprocessing import process_offline_eagle3_sample
+
+    return partial(process_offline_eagle3_sample, max_len=max_len)
 
 
 def _eagle3_offline_collate():

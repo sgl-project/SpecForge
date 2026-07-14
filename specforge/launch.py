@@ -66,10 +66,11 @@ def _assemble_trainer(
     durable_ack: bool = True,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    fit_context=None,
 ):
     """Delegate to the domain ``Trainer`` (``specforge.training``) — the one
     assembly (FSDP wrap, optimizer-after-wrap, per-step strategy, loader, acks)
-    shared by every builder; returns ``(trainer.controller, trainer.loader)``.
+    shared by every trainer-bearing builder.
     """
     from specforge.training import Trainer
 
@@ -97,8 +98,9 @@ def _assemble_trainer(
         durable_ack=durable_ack,
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
+        fit_context=fit_context,
     )
-    return trainer.controller, trainer.loader
+    return trainer
 
 
 def _offline_io(spec: StrategySpec, max_len: int):
@@ -459,14 +461,13 @@ def build_online_runtime(
     strategy_kwargs: Optional[dict] = None,
     prompt_epochs: int = 1,
 ):
-    """Assemble the colocated online dataflow; return
-    ``(trainer, loader, workers, controller, run_interleaved)``.
+    """Assemble the colocated online dataflow and return its ``Trainer``.
 
-    ``run_interleaved()`` owns the complete local lifecycle.  The loader pulls
-    one bounded rollout batch at a time and trains it before asking for more, so
-    the prompt pool is never materialized into GPU-resident features all at
-    once. ``target_head`` is ``None`` on purpose: online rollout already
-    materialized the target distribution.
+    ``Trainer.fit()`` owns the complete local lifecycle. The loader pulls one
+    bounded rollout batch at a time and trains it before asking for more, so the
+    prompt pool is never materialized into GPU-resident features all at once.
+    ``target_head`` is ``None`` on purpose: online rollout already materialized
+    the target distribution.
     """
     spec = resolve_strategy(strategy)
     # Keep colocated online on a private queue; durable online runs use the
@@ -509,7 +510,7 @@ def build_online_runtime(
         max_resident_samples=batch_size,
     )
 
-    trainer, loader = _assemble_trainer(
+    trainer = _assemble_trainer(
         spec=spec,
         controller=controller,
         store=store,
@@ -532,14 +533,11 @@ def build_online_runtime(
         per_sample_transform=None,
         durable_ack=False,
         max_checkpoints=max_checkpoints,
+        fit_context=rollout_stream,
     )
-
-    def run_interleaved() -> int:
-        """Train while rollout is pulled batch-by-batch; always stop workers."""
-        with rollout_stream:
-            return trainer.fit(loader)
-
-    return trainer, loader, workers, controller, run_interleaved
+    trainer.rollout_workers = workers
+    trainer.rollout_stream = rollout_stream
+    return trainer
 
 
 def build_disagg_online_producer(
@@ -1114,7 +1112,7 @@ def build_disagg_online_consumer(
     inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
     queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
 
-    trainer, loader = _assemble_trainer(
+    trainer = _assemble_trainer(
         spec=spec,
         controller=controller,
         store=feature_store,
@@ -1142,7 +1140,7 @@ def build_disagg_online_consumer(
     trainer.ref_distributor = distributor
     if distributor is not None:
         distributor.start()
-    return trainer, loader
+    return trainer
 
 
 __all__ = [

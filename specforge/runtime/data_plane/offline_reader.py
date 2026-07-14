@@ -13,10 +13,9 @@ The reader walks a directory of SpecForge offline feature files (the ``.ckpt`` /
 metadata-only ``SampleRef`` per file, referencing the file in place via a
 ``file://`` URI (read-only existing-file mode — no tensor copy, no tensor
 through the controller). The actual per-sample normalization (the
-``OfflineEagle3Dataset.process_data`` swap: stored ``aux_hidden_state`` becomes
-the draft input ``hidden_state`` and stored ``hidden_state`` becomes the
-``target``) is the FeatureDataLoader's job, keeping this reader independent of
-the model code.
+``process_offline_eagle3_sample`` swap: stored ``aux_hidden_state`` becomes the
+draft input ``hidden_state`` and stored ``hidden_state`` becomes ``target``) is
+the FeatureDataLoader's job, keeping this reader independent of model code.
 """
 
 from __future__ import annotations

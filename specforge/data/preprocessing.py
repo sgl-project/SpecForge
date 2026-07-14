@@ -20,8 +20,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gzip
-import io
 import json
 import os
 import warnings
@@ -286,95 +284,34 @@ def build_eagle3_dataset(
 
 
 # ==============================
-# Offline Eagle3 Dataset
+# Offline Eagle3 feature normalization
 # ==============================
-# modified from https://github.com/NickL77/BaldEagle/blob/master/train/modules/data/data.py
-def list_local_files(path, suffixes=None):
-    if suffixes is None:
-        suffixes = [".ckpt", ".ckpt.gz"]
-    datapaths = []
-    for root, directories, files in os.walk(path):
-        for file in files:
-            file_path = os.path.join(root, file)
-            datapaths.append(file_path)
-    if suffixes:
-        datapaths = [
-            f_name
-            for f_name in datapaths
-            if any(f_name.endswith(suffix) for suffix in suffixes)
-        ]
-    datapaths.sort()  # Sort to ensure deterministic order across ranks
-    return datapaths
+def process_offline_eagle3_sample(
+    raw: Dict[str, torch.Tensor], max_len: int
+) -> Dict[str, torch.Tensor]:
+    """Normalize one prepared EAGLE3 feature sample for the canonical loader.
 
-
-class OfflineEagle3Dataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        datapath,
-        transform=None,
-        max_len=2048,
-    ):
-        """
-        Args:
-            datapath: List of file paths.
-            transform: Optional transform to apply.
-            max_len: Maximum sequence length to load.
-        """
-        self.datapaths = datapath
-        self.transform = transform
-        self._epoch = 0
-        self.max_len = max_len
-
-    @staticmethod
-    def process_data(data, max_len, transform=None):
-        new_data = {}
-        # Squeeze due to our data generation script adding a batch dimension
-        hidden_state = data["aux_hidden_state"].squeeze(0)[:max_len][None, :]
-        target = data["hidden_state"].squeeze(0)[:max_len][None, :]
-
-        input_ids = data["input_ids"][:max_len][None, :]
-        loss_mask = data["loss_mask"][:max_len][None, :]
+    ``scripts/prepare_hidden_states.py`` stores the target model's final hidden
+    state under ``hidden_state`` and its auxiliary layers under
+    ``aux_hidden_state``. Training consumes those tensors as ``target`` and
+    ``hidden_state`` respectively. The returned tensors are newly shaped views,
+    except for ``loss_mask``, which is cloned before its terminal token is
+    masked so this transform never mutates the feature-store payload.
+    """
+    hidden_state = raw["aux_hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    target = raw["hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
+    if loss_mask.numel() > 0:
         loss_mask[0, -1] = 0
 
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["target"] = target
-        new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = input_ids
-        if transform:
-            new_data = transform(new_data)
-        return new_data
-
-    def __len__(self):
-        return len(self.datapaths)
-
-    def _open_file(self, index):
-        """
-        Opens the file with memory mapping.
-        This operation is virtually instant and consumes negligible RAM
-        because no data is actually read from disk yet.
-        """
-        data_path = self.datapaths[index]
-        if data_path.endswith(".gz"):
-            with gzip.open(data_path, "rb") as f:
-                return torch.load(io.BytesIO(f.read()), weights_only=False)
-        return torch.load(data_path, weights_only=False, mmap=True)
-
-    def __getitem__(self, index):
-        try:
-            data = self._open_file(index)
-        except Exception as e:
-            print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
-            data = self._open_file(0)
-
-        return self.process_data(
-            data,
-            self.max_len,
-            self.transform,
-        )
-
-    def set_epoch(self, epoch):
-        self._epoch = epoch
+    return {
+        "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),
+        "loss_mask": loss_mask,
+        "target": target,
+        "hidden_state": hidden_state,
+        "input_ids": input_ids,
+    }
 
 
 def process_token_dict_to_mappings(

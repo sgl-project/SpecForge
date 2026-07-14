@@ -39,7 +39,7 @@ class FakeTarget:
         )
 
 
-class TestAdapterBatching(unittest.TestCase):
+class TestPolicyFeatureAdapter(unittest.TestCase):
     def _capture(self):
         return CaptureConfig.from_strategy(
             required_features={

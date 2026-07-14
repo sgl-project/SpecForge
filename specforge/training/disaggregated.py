@@ -262,7 +262,7 @@ def _build_offline(
     from specforge.runtime.data_plane.disagg_ingest import read_ref_manifest
 
     bundle = build_model_bundle(cfg, load_target_engine=False)
-    trainer, loader = build_disagg_offline_runtime(
+    trainer = build_disagg_offline_runtime(
         strategy="eagle3",
         feature_store=_offline_store(cfg, retain_on_release=True),
         refs=read_ref_manifest(manifest),
@@ -285,19 +285,18 @@ def _build_offline(
         max_checkpoints=cfg.training.max_checkpoints,
     )
 
-    def consume() -> int:
-        try:
-            step = trainer.fit(loader)
-            if step > 0 and trainer.last_checkpoint_step != step:
-                trainer.save_checkpoint(step)
-            if _primary_rank():
-                _write_control(manifest + ".consumed")
-            return step
-        except BaseException as exc:
-            _publish_control_failure(manifest + ".consumer_failed", exc)
-            raise
+    def mark_consumed(_step: int) -> None:
+        if _primary_rank():
+            _write_control(manifest + ".consumed")
 
-    return TrainingRun(trainer=trainer, loader=loader, execute=consume)
+    def mark_consumer_failed(exc: BaseException) -> None:
+        _publish_control_failure(manifest + ".consumer_failed", exc)
+
+    return TrainingRun(
+        trainer=trainer,
+        on_success=mark_consumed,
+        on_failure=mark_consumer_failed,
+    )
 
 
 def _producer_capture_metadata(cfg: Config):
@@ -463,7 +462,7 @@ def _build_online(
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
-    trainer, loader = build_disagg_online_consumer(
+    trainer = build_disagg_online_consumer(
         strategy=strategy,
         feature_store=store,
         channel=channel,
@@ -488,29 +487,30 @@ def _build_online(
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
     )
 
-    def consume() -> int:
-        try:
-            step = trainer.fit(loader)
-            if step > 0 and trainer.last_checkpoint_step != step:
-                trainer.save_checkpoint(step)
-            if _primary_rank():
-                channel.mark_consumer_done()
-            return step
-        except BaseException as exc:
-            try:
-                channel.mark_consumer_failed(f"{type(exc).__name__}: {exc}")
-            except Exception as signal_exc:
-                print(
-                    f"failed to publish consumer failure: {signal_exc}",
-                    flush=True,
-                )
-            raise
-        finally:
-            distributor = getattr(trainer, "ref_distributor", None)
-            if distributor is not None:
-                distributor.stop()
+    def mark_consumer_done(_step: int) -> None:
+        if _primary_rank():
+            channel.mark_consumer_done()
 
-    return TrainingRun(trainer=trainer, loader=loader, execute=consume)
+    def mark_consumer_failed(exc: BaseException) -> None:
+        try:
+            channel.mark_consumer_failed(f"{type(exc).__name__}: {exc}")
+        except Exception as signal_exc:
+            print(
+                f"failed to publish consumer failure: {signal_exc}",
+                flush=True,
+            )
+
+    def stop_distributor() -> None:
+        distributor = getattr(trainer, "ref_distributor", None)
+        if distributor is not None:
+            distributor.stop()
+
+    return TrainingRun(
+        trainer=trainer,
+        on_success=mark_consumer_done,
+        on_failure=mark_consumer_failed,
+        on_finally=stop_distributor,
+    )
 
 
 def build_disaggregated_run(

@@ -101,7 +101,7 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
             )
 
         # consumer pool: channel + Mooncake -> FSDP train
-        trainer, loader = build_disagg_online_consumer(
+        trainer = build_disagg_online_consumer(
             feature_store=consumer_store,
             channel=channel,
             draft_model=eagle3_model,
@@ -122,7 +122,7 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         self.assertEqual(produced, N)
         self.assertEqual(channel.published, N)
 
-        step = trainer.fit(loader)
+        step = trainer.fit()
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
 

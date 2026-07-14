@@ -28,8 +28,8 @@ class TestCliConfigBuild(unittest.TestCase):
         import yaml
 
         from specforge.config import load_config
+        from specforge.training import Trainer
         from specforge.training.assembly import build_training_run
-        from specforge.training.controller import TrainerController
 
         workdir = tempfile.mkdtemp(prefix="cli_cfg_")
         cfg_path = fx.write_draft_config(os.path.join(workdir, "draft.json"))
@@ -63,21 +63,24 @@ class TestCliConfigBuild(unittest.TestCase):
 
         cfg = load_config(yaml_path, ["training.max_steps=2"])  # override applies
         run = build_training_run(cfg)
-        trainer, loader = run.trainer, run.loader
+        trainer = run.trainer
 
         # package-level assembly is the single wiring the CLI executes
-        self.assertIsInstance(trainer, TrainerController)
+        self.assertIsInstance(trainer, Trainer)
         self.assertEqual(trainer.run_id, "cli-gate")
         self.assertEqual(trainer.max_steps, 2)
-        self.assertEqual(trainer._checkpoint_manager().max_checkpoints, 2)
+        self.assertEqual(trainer.max_checkpoints, 2)
         self.assertEqual(trainer.output_dir, run_config["output_dir"])
+        self.assertEqual(trainer.batch_size, 2)
         self.assertEqual(trainer.core.accumulation_steps, 1)
         self.assertEqual(trainer.core.strategy.name, "eagle3")
-        self.assertEqual(loader.batch_size, 2)
 
         # and it actually trains to the configured step cap
         step = run.run()
         self.assertEqual(step, 2)
+        self.assertTrue(
+            os.path.islink(os.path.join(run_config["output_dir"], "cli-gate-latest"))
+        )
 
 
 class TestCliDispatch(unittest.TestCase):

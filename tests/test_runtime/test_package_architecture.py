@@ -58,6 +58,11 @@ REMOVED_DUPLICATE_PATH_TESTS = (
     "tests/test_runtime/test_backpressure.py",
 )
 
+REMOVED_OFFLINE_DATASET_API_NAMES = (
+    "OfflineEagle3Dataset",
+    "list_local_files",
+)
+
 REMOVED_PACKAGE_DIRECTORIES = (
     "benchmarks",
     "specforge/eval",
@@ -448,6 +453,24 @@ class TestPackageArchitecture(unittest.TestCase):
             f"tests for removed duplicate paths reintroduced: {duplicate_tests}",
         )
 
+    def test_legacy_offline_dataset_api_stays_deleted(self):
+        violations = []
+        this_file = Path(__file__).resolve()
+        for source_root in SOURCE_ROOTS:
+            for path in sorted(source_root.rglob("*.py")):
+                if path.resolve() == this_file:
+                    continue
+                source = path.read_text()
+                for name in REMOVED_OFFLINE_DATASET_API_NAMES:
+                    if name in source:
+                        relative_path = path.relative_to(REPO_ROOT)
+                        violations.append(f"{relative_path}: {name}")
+        self.assertEqual(
+            [],
+            violations,
+            "legacy offline Dataset API reintroduced:\n" + "\n".join(violations),
+        )
+
     def test_repository_does_not_import_removed_modules(self):
         violations = []
         for source_root in SOURCE_ROOTS:
@@ -492,6 +515,131 @@ class TestPackageArchitecture(unittest.TestCase):
             CANONICAL_LAUNCH_EXPORTS,
             _literal_all(REPO_ROOT / "specforge" / "launch.py"),
         )
+
+    def test_public_training_lifecycle_has_one_surface(self):
+        trainer_tree = _module_tree(REPO_ROOT / "specforge" / "training" / "trainer.py")
+        trainer_class = next(
+            node
+            for node in trainer_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "Trainer"
+        )
+        methods = {
+            node.name: node
+            for node in trainer_class.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertNotIn("from_strategy_name", methods)
+        for name in ("fit", "save_checkpoint"):
+            args = methods[name].args
+            self.assertEqual(["self"], [arg.arg for arg in args.args], name)
+            self.assertEqual([], args.kwonlyargs, name)
+            self.assertIsNone(args.vararg, name)
+            self.assertIsNone(args.kwarg, name)
+
+        init_attrs = {
+            node.attr
+            for node in ast.walk(methods["__init__"])
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        }
+        self.assertTrue({"_controller", "_loader"}.issubset(init_attrs))
+        self.assertTrue({"controller", "loader"}.isdisjoint(init_attrs))
+
+        assembly_tree = _module_tree(
+            REPO_ROOT / "specforge" / "training" / "assembly.py"
+        )
+        run_class = next(
+            node
+            for node in assembly_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "TrainingRun"
+        )
+        run_fields = {
+            node.target.id
+            for node in run_class.body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        }
+        self.assertNotIn("loader", run_fields)
+        run_method = next(
+            node
+            for node in run_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run"
+        )
+        fit_calls = [
+            node
+            for node in ast.walk(run_method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "fit"
+        ]
+        self.assertEqual(1, len(fit_calls))
+        self.assertEqual([], fit_calls[0].args)
+        self.assertEqual([], fit_calls[0].keywords)
+
+        launch_tree = _module_tree(REPO_ROOT / "specforge" / "launch.py")
+        launch_functions = {
+            node.name: node
+            for node in launch_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assembler_returns = [
+            node
+            for node in ast.walk(launch_functions["_assemble_trainer"])
+            if isinstance(node, ast.Return)
+        ]
+        self.assertEqual(1, len(assembler_returns))
+        self.assertIsInstance(assembler_returns[0].value, ast.Name)
+        self.assertEqual("trainer", assembler_returns[0].value.id)
+
+        trainer_builders = CANONICAL_LAUNCH_EXPORTS - {"build_disagg_online_producer"}
+        for name in trainer_builders:
+            returns = [
+                node
+                for node in ast.walk(launch_functions[name])
+                if isinstance(node, ast.Return) and node.value is not None
+            ]
+            self.assertTrue(returns, name)
+            for node in returns:
+                self.assertNotIsInstance(node.value, ast.Tuple, name)
+                self.assertFalse(
+                    isinstance(node.value, ast.Name) and node.value.id == "loader",
+                    name,
+                )
+                self.assertFalse(
+                    isinstance(node.value, ast.Attribute)
+                    and node.value.attr in {"controller", "loader"},
+                    name,
+                )
+        self.assertNotIn(
+            "run_interleaved", (REPO_ROOT / "specforge" / "launch.py").read_text()
+        )
+
+        for relative_path in (
+            "specforge/training/assembly.py",
+            "specforge/training/disaggregated.py",
+        ):
+            for node in ast.walk(_module_tree(REPO_ROOT / relative_path)):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "trainer"
+                ):
+                    self.assertNotIn(
+                        node.attr,
+                        {"controller", "loader"},
+                        relative_path,
+                    )
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "trainer"
+                ):
+                    continue
+                if node.func.attr == "fit":
+                    self.assertEqual([], node.args, relative_path)
+                    self.assertEqual([], node.keywords, relative_path)
+                self.assertNotEqual("save_checkpoint", node.func.attr, relative_path)
 
     def test_online_builders_have_one_fresh_stream_path(self):
         functions = {

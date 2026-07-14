@@ -16,15 +16,27 @@ from unittest import mock
 
 
 class DomainTrainerWiringTest(unittest.TestCase):
-    def _build(self, ref_source, *, durable_ack=False):
+    def _build(
+        self,
+        ref_source,
+        *,
+        durable_ack=False,
+        fit_step=42,
+        checkpointed_step=None,
+        fit_context=None,
+        save_error=None,
+        events=None,
+    ):
         import specforge.training.trainer as tr
 
         cap = {}
+        events = [] if events is None else events
 
         class FakeLoader:
             def __init__(self, store, **kw):
                 cap["loader_store"] = store
                 cap["loader_kw"] = kw
+                cap["loader"] = self
 
         class FakeParallel:
             @classmethod
@@ -50,10 +62,22 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap["ctrl_core"] = core
                 cap["ctrl_kw"] = kw
                 self.global_step = 0
+                self.micro_step = 0
+                self.last_checkpoint_step = checkpointed_step
 
             def fit(self, loader):
                 cap["fit"] = loader
-                return 42
+                events.append("fit")
+                self.global_step = fit_step
+                return fit_step
+
+            def save_checkpoint(self, step):
+                events.append("save")
+                if save_error is not None:
+                    raise save_error
+                cap.setdefault("saves", []).append(step)
+                self.last_checkpoint_step = step
+                return SimpleNamespace(global_step=step)
 
         dfc_calls = []
 
@@ -104,6 +128,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 log_interval=50,
                 collate_fn="COLLATE",
                 durable_ack=durable_ack,
+                fit_context=fit_context,
             )
         return trainer, cap, dfc_calls, model
 
@@ -146,7 +171,54 @@ class DomainTrainerWiringTest(unittest.TestCase):
         trainer, cap, _, _ = self._build({"refs": list(range(6))})
         out = trainer.fit()
         self.assertEqual(out, 42)
-        self.assertIs(cap["fit"], trainer.loader)
+        self.assertIs(cap["fit"], cap["loader"])
+        self.assertEqual(cap["saves"], [42])
+
+        # Re-entering at an already durable step does not write it twice.
+        self.assertEqual(trainer.fit(), 42)
+        self.assertEqual(cap["saves"], [42])
+
+    def test_fit_exits_topology_context_before_final_checkpoint(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+
+        class FitContext:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, *_exc):
+                events.append("exit")
+
+        trainer, _, _, _ = self._build(
+            {"refs": list(range(6))},
+            fit_context=FitContext(),
+            events=events,
+        )
+        self.assertEqual(trainer.fit(), 42)
+        self.assertEqual(events, ["enter", "fit", "exit", "save"])
+
+    def test_zero_step_skips_final_checkpoint(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        trainer, cap, _, _ = self._build({"refs": list(range(6))}, fit_step=0)
+        self.assertEqual(trainer.fit(), 0)
+        self.assertNotIn("saves", cap)
+
+    def test_final_checkpoint_failure_propagates(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        error = RuntimeError("checkpoint failed")
+        trainer, _, _, _ = self._build({"refs": list(range(6))}, save_error=error)
+        with self.assertRaises(RuntimeError) as raised:
+            trainer.fit()
+        self.assertIs(raised.exception, error)
 
     def test_streaming_durable_ack_routes_through_controller(self):
         try:

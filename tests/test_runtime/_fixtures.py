@@ -1,10 +1,10 @@
 # coding=utf-8
-"""Shared tiny synthetic fixtures for runtime GPU equivalence tests.
+"""Shared tiny synthetic fixtures for canonical runtime GPU tests.
 
 Not a test module (no ``test_`` prefix). Builds a tiny EAGLE3 draft model, a
 ``TargetHead``, a vocab mapping, and offline ``.ckpt`` feature files — all from
-random tensors, with NO model download — so the differential-equivalence tests
-compare the old vs new code path on identical inputs/weights.
+random tensors, with NO model download. Offline batches are materialized through
+the same manifest-reader and feature-loader path used by training.
 """
 
 import json
@@ -138,6 +138,39 @@ def write_offline_files(d, n=4, seq=16, hidden=H, vocab=V, seed=0):
             os.path.join(d, f"{i:04d}.ckpt"),
         )
     return d
+
+
+def build_offline_eagle3_loader(
+    hidden_states_path: str,
+    *,
+    batch_size: int,
+    run_id: str = "data",
+    ttt_length: int = 3,
+    max_len: int = 512,
+    ref_slice: slice | None = None,
+):
+    """Build the canonical fixed-ref EAGLE3 loader used by runtime tests."""
+    from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
+    from specforge.training.strategies.registry import resolve_strategy
+
+    spec = resolve_strategy("eagle3")
+    reader = spec.make_offline_reader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+    )
+    refs = reader.read()
+    if ref_slice is not None:
+        refs = refs[ref_slice]
+    return FeatureDataLoader(
+        LocalFeatureStore(f"{run_id}-features"),
+        refs=refs,
+        batch_size=batch_size,
+        collate_fn=spec.make_offline_collate(),
+        per_sample_transform=spec.make_offline_transform(max_len),
+        strategy=spec.name,
+    )
 
 
 def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4)):

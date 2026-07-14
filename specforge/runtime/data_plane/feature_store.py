@@ -157,7 +157,7 @@ class FeatureStore(abc.ABC):
 
 
 def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
-    """Load a SpecForge offline feature file (mirrors OfflineEagle3Dataset)."""
+    """Load one prepared SpecForge offline feature file."""
     if path.endswith(".gz"):
         with gzip.open(path, "rb") as f:
             return torch.load(io.BytesIO(f.read()), weights_only=False)

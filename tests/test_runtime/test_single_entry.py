@@ -17,38 +17,69 @@ from specforge.training.disaggregated import (
 
 
 class _FakeTrainer:
-    def __init__(self, *, fit_step=3, last_checkpoint_step=None):
+    def __init__(self, *, fit_step=3, error=None, events=None):
         self.fit_step = fit_step
-        self.last_checkpoint_step = last_checkpoint_step
-        self.saved = []
+        self.error = error
+        self.events = events
+        self.fit_calls = 0
 
-    def fit(self, loader):
+    def fit(self):
+        self.fit_calls += 1
+        if self.events is not None:
+            self.events.append("fit")
+        if self.error is not None:
+            raise self.error
         return self.fit_step
-
-    def save_checkpoint(self, step):
-        self.saved.append(step)
-        self.last_checkpoint_step = step
 
 
 class TestTrainingRunLifecycle(unittest.TestCase):
-    def test_final_checkpoint_is_always_saved(self):
+    def test_training_run_delegates_to_the_one_trainer_entry(self):
         trainer = _FakeTrainer(fit_step=3)
-        self.assertEqual(TrainingRun(trainer=trainer, loader=[]).run(), 3)
-        self.assertEqual(trainer.saved, [3])
+        self.assertEqual(TrainingRun(trainer=trainer).run(), 3)
+        self.assertEqual(trainer.fit_calls, 1)
 
-    def test_final_checkpoint_is_not_duplicated(self):
-        trainer = _FakeTrainer(fit_step=3, last_checkpoint_step=3)
-        self.assertEqual(TrainingRun(trainer=trainer, loader=[]).run(), 3)
-        self.assertEqual(trainer.saved, [])
-
-    def test_execute_lifecycle_keeps_the_same_final_checkpoint_contract(self):
+    def test_trainer_cannot_be_bypassed_by_an_executor(self):
         trainer = _FakeTrainer(fit_step=4)
-        run = TrainingRun(trainer=trainer, execute=lambda: 4)
+        with self.assertRaisesRegex(ValueError, "exactly one trainer or executor"):
+            TrainingRun(trainer=trainer, execute=lambda: 4)
+
+    def test_consumer_hooks_wrap_the_one_trainer_entry_in_order(self):
+        events = []
+        trainer = _FakeTrainer(fit_step=4, events=events)
+        run = TrainingRun(
+            trainer=trainer,
+            on_success=lambda step: events.append(f"success:{step}"),
+            on_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_finally=lambda: events.append("finally"),
+        )
         self.assertEqual(run.run(), 4)
-        self.assertEqual(trainer.saved, [4])
+        self.assertEqual(events, ["fit", "success:4", "finally"])
+
+    def test_consumer_failure_hook_precedes_cleanup(self):
+        events = []
+        error = RuntimeError("fit failed")
+        trainer = _FakeTrainer(error=error, events=events)
+        run = TrainingRun(
+            trainer=trainer,
+            on_success=lambda step: events.append(f"success:{step}"),
+            on_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_finally=lambda: events.append("finally"),
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            run.run()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(events, ["fit", "failure:fit failed", "finally"])
 
     def test_producer_result_does_not_require_a_trainer(self):
         self.assertEqual(TrainingRun(execute=lambda: 7).run(), 7)
+
+    def test_missing_lifecycle_fails_loudly(self):
+        with self.assertRaisesRegex(ValueError, "exactly one trainer or executor"):
+            TrainingRun()
+
+    def test_producer_executor_cannot_take_trainer_hooks(self):
+        with self.assertRaisesRegex(ValueError, "hooks belong to trainer-bearing"):
+            TrainingRun(execute=lambda: 1, on_finally=lambda: None)
 
     def test_disaggregated_producer_requires_fresh_attempt_path(self):
         import tempfile

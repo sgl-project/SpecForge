@@ -168,7 +168,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader = build_disagg_offline_runtime(
+        trainer = build_disagg_offline_runtime(
             strategy="eagle3",
             feature_store=store,
             refs=consumer_refs,
@@ -189,12 +189,11 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
             module, FSDP, "strategy must hold the FSDP-wrapped module"
         )
 
-        step = trainer.fit(loader)
+        step = trainer.fit()
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
 
-        ckpt = trainer.save_checkpoint(trainer.global_step)
-        self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
+        self.assertEqual(trainer.last_checkpoint_step, trainer.global_step)
 
 
 if __name__ == "__main__":

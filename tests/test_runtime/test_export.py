@@ -28,12 +28,9 @@ class TestExporters(unittest.TestCase):
         fx.build_single_rank_distributed(port="29591")
 
         from specforge.core.eagle3 import OnlineEagle3Model
-        from specforge.data.preprocessing import OfflineEagle3Dataset
-        from specforge.data.utils import DataCollatorWithPadding
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
@@ -58,20 +55,15 @@ class TestExporters(unittest.TestCase):
             dm, length=TTT, attention_backend="flex_attention"
         ).cuda()
         head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
-        ds = OfflineEagle3Dataset(
-            sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir)),
-            max_len=512,
-        )
-        collate = DataCollatorWithPadding()
-        batches = [
-            TrainBatch(
-                sample_ids=[str(j) for j in range(s, s + BS)],
-                strategy="eagle3",
-                tensors=dict(collate([ds[j] for j in range(s, s + BS)])),
-                metadata={"target_repr": "hidden_state", "ttt_length": TTT},
+        batches = list(
+            fx.build_offline_eagle3_loader(
+                feat_dir,
+                batch_size=BS,
+                run_id="export-data",
+                ttt_length=TTT,
+                max_len=512,
             )
-            for s in range(0, N, BS)
-        ]
+        )
 
         opt = BF16Optimizer(
             dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10

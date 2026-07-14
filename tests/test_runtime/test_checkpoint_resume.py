@@ -223,9 +223,9 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         out = os.path.join(workdir, "out")
         t1, model1, seen1 = self._make_trainer(out, feat_dir=feat_dir, max_steps=2)
         self.assertEqual(t1.fit(), 2)
-        self.assertEqual(t1.controller._epoch_batch, 2)
-        ck = t1.save_checkpoint()
-        self.assertEqual(ck.global_step, 2)
+        self.assertEqual(t1._controller._epoch_batch, 2)
+        self.assertEqual(t1.last_checkpoint_step, 2)
+        checkpoint_uri = f"file://{os.path.abspath(os.path.join(out, 'rz-latest'))}"
         w_cut = model1.draft_model.w.detach().clone()
         masters_cut = [
             t.detach().cpu().clone() for t in t1.backend.optimizer.fp32_params
@@ -233,7 +233,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
 
         # Phase 2: resume through the production entrypoint (file:// URI).
         t2, model2, seen2 = self._make_trainer(
-            out, feat_dir=feat_dir, max_steps=4, resume_from=ck.checkpoint_uri
+            out, feat_dir=feat_dir, max_steps=4, resume_from=checkpoint_uri
         )
         self.assertTrue(torch.equal(model2.draft_model.w.detach(), w_cut))
         # exact fp32 masters restored, not re-cloned from the trained weights
@@ -242,7 +242,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         # scheduler position survived — a reset would read 0 (warmup 0: the
         # cosine after_scheduler carries the position, not the outer wrapper)
         self.assertEqual(t2.backend.optimizer.scheduler.after_scheduler.last_epoch, 2)
-        ctrl = t2.controller
+        ctrl = t2._controller
         self.assertEqual(
             (ctrl.global_step, ctrl._epoch_batch, ctrl._epoch_samples), (2, 2, 4)
         )
@@ -266,7 +266,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             os.path.join(workdir, "noop"),
             feat_dir=feat_dir,
             max_steps=2,
-            resume_from=ck.checkpoint_uri,
+            resume_from=checkpoint_uri,
         )
         self.assertEqual(t3.fit(), 2)
         self.assertEqual(seen3, [])
@@ -393,12 +393,9 @@ class TestCheckpointResume(unittest.TestCase):
         fx.build_single_rank_distributed(port="29563")
 
         from specforge.core.eagle3 import OnlineEagle3Model
-        from specforge.data.preprocessing import OfflineEagle3Dataset
-        from specforge.data.utils import DataCollatorWithPadding
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
@@ -426,24 +423,13 @@ class TestCheckpointResume(unittest.TestCase):
             ).cuda()
 
         head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
-        ds = OfflineEagle3Dataset(
-            sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir)), max_len=512
+        loader = fx.build_offline_eagle3_loader(
+            feat_dir,
+            batch_size=BS,
+            run_id="checkpoint-data",
+            ttt_length=TTT,
+            max_len=512,
         )
-        collate = DataCollatorWithPadding()
-
-        def make_batches():
-            out = []
-            for s in range(0, N, BS):
-                data = collate([ds[j] for j in range(s, s + BS)])
-                out.append(
-                    TrainBatch(
-                        sample_ids=[str(j) for j in range(s, s + BS)],
-                        strategy="eagle3",
-                        tensors=dict(data),
-                        metadata={"target_repr": "hidden_state", "ttt_length": TTT},
-                    )
-                )
-            return out
 
         model = build_model()
         opt = BF16Optimizer(
@@ -461,7 +447,7 @@ class TestCheckpointResume(unittest.TestCase):
         ctrl = TrainerController(
             core, run_id="r", output_dir=out_dir, max_steps=3, num_epochs=2
         )
-        step = ctrl.fit(make_batches())
+        step = ctrl.fit(loader)
         self.assertEqual(step, 3)
         ck = ctrl.save_checkpoint(step)
 
@@ -536,10 +522,7 @@ class TestCheckpointResume(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29564")
 
-        from specforge.data.preprocessing import OfflineEagle3Dataset
-        from specforge.data.utils import DataCollatorWithPadding
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
@@ -550,19 +533,14 @@ class TestCheckpointResume(unittest.TestCase):
         feat_dir = fx.write_offline_files(
             os.path.join(workdir, "features"), n=BS * TOTAL
         )
-        files = sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir))
-        ds = OfflineEagle3Dataset(files, max_len=512)
-        collate = DataCollatorWithPadding()
-        batches = []
-        for i in range(TOTAL):
-            data = collate([ds[j] for j in range(i * BS, (i + 1) * BS)])
-            batches.append(
-                TrainBatch(
-                    sample_ids=[str(j) for j in range(i * BS, (i + 1) * BS)],
-                    strategy="eagle3",
-                    tensors=dict(data),
-                    metadata={"target_repr": "hidden_state", "ttt_length": TTT},
-                )
+
+        def build_loader():
+            return fx.build_offline_eagle3_loader(
+                feat_dir,
+                batch_size=BS,
+                run_id="continuity-data",
+                ttt_length=TTT,
+                max_len=512,
             )
 
         def build_run():
@@ -598,7 +576,7 @@ class TestCheckpointResume(unittest.TestCase):
             ),
         )
         torch.manual_seed(0)
-        ctrl_r.fit(batches)
+        ctrl_r.fit(build_loader())
         self.assertEqual(len(losses_ref), TOTAL)
 
         # Interrupted phase 1: CUT steps, then save.
@@ -614,7 +592,7 @@ class TestCheckpointResume(unittest.TestCase):
             logger=lambda m, s: losses_a.append(m["loss"]),
         )
         torch.manual_seed(0)
-        ctrl_a.fit(batches)
+        ctrl_a.fit(build_loader())
         ck = ctrl_a.save_checkpoint(CUT)
         self.assertEqual(ctrl_a._epoch_batch, CUT)  # data position at the cut
         # phase 1 mirrors the reference exactly for the first CUT steps
@@ -681,7 +659,7 @@ class TestCheckpointResume(unittest.TestCase):
         )
         # No reseed: the RNG came from the checkpoint. fit skips the first CUT
         # batches of the interrupted epoch and trains the rest.
-        ctrl_b.fit(batches)
+        ctrl_b.fit(build_loader())
         self.assertEqual(len(losses_b), TOTAL - CUT)
 
         # Weights, fp32 masters, optimizer, scheduler, RNG and data position are

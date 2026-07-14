@@ -27,12 +27,9 @@ def _worker(rank, world_size, workdir, results_dir):
     fx.init_rank_distributed(rank, world_size, port="29581")
 
     from specforge.core.eagle3 import OnlineEagle3Model
-    from specforge.data.preprocessing import OfflineEagle3Dataset
-    from specforge.data.utils import DataCollatorWithPadding
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
     from specforge.modeling.target.target_head import TargetHead
     from specforge.optimizer import BF16Optimizer
-    from specforge.runtime.contracts import TrainBatch
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
     from specforge.training.controller import TrainerCore
     from specforge.training.strategies.base import Eagle3TrainStrategy
@@ -61,17 +58,17 @@ def _worker(rank, world_size, workdir, results_dir):
     model_b.draft_model.load_state_dict(model_a.draft_model.state_dict())  # identical
     head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
 
-    files = sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir))
-    ds = OfflineEagle3Dataset(files, max_len=512)
     # DISTINCT shard per rank — with identical shards a broken (skipped/no-op)
     # cross-rank reduction would be invisible.
-    data = DataCollatorWithPadding()([ds[j] for j in range(rank * BS, (rank + 1) * BS)])
-    batch = TrainBatch(
-        sample_ids=[f"r{rank}-{j}" for j in range(BS)],
-        strategy="eagle3",
-        tensors=dict(data),
-        metadata={"target_repr": "hidden_state", "ttt_length": TTT},
+    loader = fx.build_offline_eagle3_loader(
+        feat_dir,
+        batch_size=BS,
+        run_id="no-sync-data",
+        ttt_length=TTT,
+        max_len=512,
+        ref_slice=slice(rank * BS, (rank + 1) * BS),
     )
+    batch = next(iter(loader))
 
     def opt_factory(m):
         return BF16Optimizer(

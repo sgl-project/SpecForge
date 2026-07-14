@@ -99,7 +99,7 @@ class TestDominoOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
+        trainer = build_online_runtime(
             strategy="domino",
             target_model=target,
             prompts=prompts,
@@ -113,15 +113,15 @@ class TestDominoOnlineLaunch(unittest.TestCase):
             max_steps=MAX_OPT_STEPS,
         )
 
-        self.assertEqual(controller.sample_queue.depth(), 0)
+        self.assertEqual(trainer.dataflow_controller.sample_queue.depth(), 0)
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
 
-        step = run_interleaved()
+        step = trainer.fit()
         self.assertEqual(step, MAX_OPT_STEPS)
-        self.assertEqual(loader.queue.produced_count, ACC * MAX_OPT_STEPS)
-        self.assertLessEqual(loader.queue.peak_resident_samples, 1)
+        self.assertEqual(trainer.rollout_stream.produced_count, ACC * MAX_OPT_STEPS)
+        self.assertLessEqual(trainer.rollout_stream.peak_resident_samples, 1)
         self.assertTrue(
             all(torch.isfinite(p).all() for p in module.parameters()),
             "draft params became non-finite — loss was NaN/inf?",
