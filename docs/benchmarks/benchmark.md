@@ -47,3 +47,33 @@ GPU microbenchmarks `bench_domino_mfu.py`,
 `specforge/benchmarks/benchmark_flex_attention.py`, and
 `specforge/benchmarks/benchmark_loss.py` cover trainer MFU, attention, and loss
 kernel behavior respectively.
+
+HumanEval and MBPP execute model-generated Python while scoring. Run those two
+benchmarks only in an isolated container or devbox with no credentials or
+production data mounted.
+
+## Retained validation artifacts
+
+The repository keeps the existing training-equivalence and convergence plots
+as provenance for the runtime cutover. They are reference results, not a
+substitute for rerunning the benchmark suite on the current commit.
+
+### DataFlow cutover equivalence
+
+These 100-step traces compare the former trainer (`main`) with colocated and
+disaggregated DataFlow execution. Keeping them next to the benchmark suite
+makes the behavioral evidence available after the duplicate trainers are
+removed.
+
+![Qwen2.5-0.5B DFlash legacy, colocated, and disaggregated loss equivalence](../../examples/assets/qwen2.5-0.5b-dflash-vs-main.png)
+
+![Qwen2.5-0.5B EAGLE3 legacy, colocated, and disaggregated loss equivalence](../../examples/assets/qwen2.5-0.5b-eagle3-vs-main.png)
+
+### Qwen3.6-27B DFlash training curves
+
+The retained curves cover both the eight-H200 colocated run and the two-GPU
+online-disaggregated producer/consumer run.
+
+![Qwen3.6-27B DFlash colocated training loss and draft-token accuracy](../../examples/assets/qwen36-27b-dflash-nemotron-6ep.png)
+
+![Qwen3.6-27B DFlash online-disaggregated training loss and draft-token accuracy](../../examples/disagg/assets/qwen36-27b-dflash-nemotron-disagg.png)
