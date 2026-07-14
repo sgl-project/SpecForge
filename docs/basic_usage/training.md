@@ -1,62 +1,246 @@
-## 🚀 Training
+# Training
 
-## 📍 Overview
+SpecForge has one public training entry point for every strategy and runtime
+topology:
 
-Existing speculative decoding methods such as EAGLE3 requires training in the feature-space, which means the draft model relies on the hidden states generated from the target model for autoregressive prediction. In SpecForge, we provide two orthogonal paths to cater to the users' specific needs when training this kind of draft models. We name these two methods as `Online` and `Offline`. By definition, it is easy to understandd them:
+```bash
+specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
+```
 
-- **`Online`**: the hidden states are generated on the fly during training.
-- **`Offline`**: the hidden states are generated beforehand, stored to the disk, and loaded back to GPU during training.
+The YAML file is the run contract. It selects the draft strategy, target model,
+data source, optimizer settings, and deployment mode. Method-specific Python
+trainers are not part of the public interface.
 
-Online training is suitable for users with limited disk space but sufficient GPUs while offline training is suitable for users with sufficient disk space but limited GPUs.
+This is an intentional hard cutover. The old `scripts/train_*.py` commands and
+temporary move-only Python import paths were removed rather than deprecated.
+Downstream launchers should migrate to a typed run config and `specforge train`;
+there is no compatibility dispatch to the previous trainers.
 
-| Method | Target Model | Disk Space Requirement | GPU Requirement | One-liner rationale |
+## Launch a run
+
+Colocated and offline inputs currently run in one process because they are not
+yet data-parallel sharded. Invoke `specforge` directly:
+
+```bash
+specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
+```
+
+The online disaggregated consumer is the supported multi-GPU data-parallel
+topology and is launched with `torchrun` in the disaggregation section below.
+
+Paths in a config are resolved from the current working directory. The example
+configs assume that the command is run from the repository root.
+
+You can override an existing value without copying the YAML. Overrides use
+validated `section.field=value` syntax:
+
+```bash
+specforge train \
+  --config examples/configs/qwen3-8b-eagle3-online.yaml \
+  training.learning_rate=5e-5 \
+  training.max_steps=100 \
+  output_dir=./outputs/eagle3-smoke
+```
+
+Unknown config fields and unknown override paths are errors. This keeps a
+misspelled or retired option from being silently ignored.
+
+## Run config
+
+A run config has four top-level sections:
+
+```yaml
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-eagle3.json
+  target_backend: sglang
+  torch_dtype: bfloat16
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 4096
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: eagle3
+  deployment_mode: local_colocated
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 1.0e-4
+  save_interval: 1000
+
+run_id: qwen3-8b-eagle3-online
+output_dir: ./outputs/qwen3-8b-eagle3-online
+```
+
+Set exactly one data source:
+
+- `data.train_data_path` for raw conversation or preformatted online data;
+- `data.prompts_path` for pre-tokenized online JSONL containing `input_ids`
+  and `loss_mask`;
+- `data.hidden_states_path` for precomputed offline feature checkpoints.
+
+The checked-in examples are the canonical starting points:
+
+| Strategy and mode | Config |
+| --- | --- |
+| EAGLE3 online | [`qwen3-8b-eagle3-online.yaml`](../../examples/configs/qwen3-8b-eagle3-online.yaml) |
+| EAGLE3 offline | [`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/qwen3-8b-eagle3-offline.yaml) |
+| DFlash online | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/qwen3-8b-dflash-online.yaml) |
+| Domino online | [`qwen3-8b-domino-online.yaml`](../../examples/configs/qwen3-8b-domino-online.yaml) |
+| P-EAGLE online | [`qwen3-8b-peagle-online.yaml`](../../examples/configs/qwen3-8b-peagle-online.yaml) |
+| DFlash disaggregated | [`qwen3-8b-dflash-disaggregated.yaml`](../../examples/configs/qwen3-8b-dflash-disaggregated.yaml) |
+| DSpark disaggregated | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/qwen3-4b-dspark-disaggregated.yaml) |
+| EAGLE3 offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) |
+
+## Online and offline data
+
+Online training captures target features while the run is active. It uses
+little disk space but keeps target inference available during training.
+Offline training reads feature checkpoints generated ahead of time, so only
+the draft model must fit on the training GPUs at the cost of substantially
+more storage.
+
+| Mode | Target during training | Disk use | Data config |
+| --- | --- | --- | --- |
+| Online | Loaded locally or exposed by capture servers | Low | `train_data_path` or `prompts_path` |
+| Offline | Not loaded by the trainer | High | `hidden_states_path` |
+
+Prepare raw datasets and offline features as described in [Data
+Preparation](data_preparation.md), then update the matching example YAML before
+launching it.
+
+## Supported combinations
+
+The unified runtime currently supports text-only training in these
+combinations:
+
+| Strategy | Colocated online | Local/dataflow offline | Disaggregated online | Disaggregated offline |
 | --- | --- | --- | --- | --- |
-| Online | Used during training | Small | More GPUs are needed if your target model is large | Generating auxiliary hidden states on the fly |
-| Offline | Only used during data preparation | Huge (e.g. ultrachat+sharegpt will need 12TB storage ) | as low as 1 GPU, as only need to accommodate the draft model  | Preparing auxiliary hidden states beforehand and only once |
+| EAGLE3 | Yes, 1 rank | Yes, 1 rank | Yes, consumer DP | Yes, 1 rank |
+| DFlash | Yes, 1 rank | No | Yes, consumer DP | No |
+| Domino | Yes, 1 rank | No | Yes, consumer DP | No |
+| DSpark | No | No | Yes, consumer DP | No |
+| P-EAGLE | Yes, 1 rank and batch size 1 | No | No | No |
 
-> **Why does disk matter?**
-> During Eagle3 training, the frozen target model will first generate the hidden states for each token given the data sample. The hidden states are fed to the draft model for training.
-> Offline mode stores these hidden states to the local disk, so a small disk can be filled up fast.
-> Online mode only generates these hidden states on the fly without storing them to the disk, but needs to keep the target model resident in memory during training, trading GPU RAM for almost-zero disk footprint.
+Unsupported combinations fail explicitly during config validation or run
+assembly. In particular:
 
-## 🏎️ Online Training
+- multimodal/VLM input is not accepted by the typed run schema;
+- attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
+  `flex_attention`, or `fa`; P-EAGLE requires `flex_attention`; DFlash,
+  Domino, and DSpark accept `eager`, `sdpa`, or `flex_attention`;
+- Ulysses/USP and arbitrary backend names are not wired into this runtime;
+- P-EAGLE and online EAGLE3 require `training.batch_size=1`;
+- DSpark requires disaggregated server capture;
+- offline features currently use the EAGLE3 feature contract only;
+- every online disaggregated run uses `model.target_backend=sglang` and sets
+  either `training.total_steps` or `training.max_steps`;
+- EAGLE3 offline and EAGLE3 disaggregated runs require
+  `model.vocab_mapping_path`.
 
-We have provided training scripts for the EAGLE3 models in the `examples` directory. These scripts cover a wide range of models range from Llama to Qwen, small to large and dense to MoE. Online training is often conducted in two steps and we will use ShareGPT and Llama3-8B-Instruct as an example.
+There is no fallback to a removed training script.
 
-**Step 1: Prepare the dataset**
+Step limits are global optimizer updates. `training.max_steps` is a stop cap
+and becomes the optimizer/loss schedule horizon when `training.total_steps` is
+omitted. `training.total_steps` can describe a longer schedule, but does not by
+itself stop an online stream.
+
+## Disaggregated roles
+
+A disaggregated run starts the same config twice, once per role. For online
+capture, start the patched SGLang capture server and Mooncake services first,
+then export the transport settings used by both pools:
 
 ```bash
-# prepare the dataset
-python scripts/prepare_data.py --dataset sharegpt
+export CONFIG=examples/configs/qwen3-8b-dflash-disaggregated.yaml
+export DISAGG_STORE_ID=qwen3-8b-dflash-disaggregated
+export DISAGG_REF_CHANNEL=/shared/control/qwen3-8b.refs.jsonl
+export DISAGG_DB=/shared/control/qwen3-8b-consumer.sqlite
+export DISAGG_SERVER_URL=http://capture-server:30000
+export MOONCAKE_METADATA_SERVER=http://metadata-server:8080/metadata
+export MOONCAKE_MASTER_SERVER_ADDR=mooncake-master:50051
 ```
 
-**Step 2: Start the training**
+Set `MOONCAKE_LOCAL_HOSTNAME` on each pool to that host's routable address.
+
+Launch the producer on the inference pool:
 
 ```bash
-# train llama3-8B-instruct
-bash ./examples/run_llama3.1_8b_eagle3_online.sh
+MOONCAKE_LOCAL_HOSTNAME=producer-host \
+  specforge train --config "$CONFIG" training.role=producer
 ```
 
-## 💨 Offline Training
-
-The difference between online and offline training is that we need to generate the hidden states before training. We also use ShareGPT and Llama3-8B-Instruct as an example.
-
-**Step 1: Prepare the dataset**
-
-Same as above
-
-**Step 2: Generate the hidden states and train**
+Launch the consumer on the training pool:
 
 ```bash
-# train llama3-8B-instruct in an offline manner
-bash ./examples/run_llama3.1_8b_eagle3_offline.sh
+MOONCAKE_LOCAL_HOSTNAME=trainer-host \
+  torchrun --standalone --nproc_per_node 8 \
+  "$(which specforge)" train --config "$CONFIG" training.role=consumer
 ```
 
-It is important to note that the `run_llama3.1_8b_eagle3_offline.sh` script consists of two steps:
+The producer and consumer use identical model, data, and training settings.
+Only `training.role` differs. See the [disaggregated example
+guide](../../examples/disagg/README.md) for transport and offline-ingestion
+details.
 
-1. Generate the hidden states using the `prepare_hidden_states.py` script. This script will generate the hidden states for the test and train datasets and save them to the disk.
-2. Train the model: suppling the `--train-hidden-states-path` argument to the script so that the script will load the hidden states from the disk during training.
+Use a new, attempt-specific `DISAGG_REF_CHANNEL` and `DISAGG_DB` for each
+online launch. The database path must be visible to every consumer rank; it is
+runtime coordination state, not a supported online-resume mechanism.
 
-## 📈 Experiment Tracking
+## Checkpoints and resume
 
-This project supports logging training progress to Wandb, TensorBoard, and SwanLab. You can enable tracking by adding the `--report-to` argument to the command line in your shell script.
+`training.save_interval` controls checkpoint frequency and
+`training.max_checkpoints` controls rotation. Checkpoints are written beneath
+`output_dir`. A completed trainer run always saves its final runtime checkpoint,
+even when `save_interval` is zero or the final step is not an interval boundary.
+The `<run_id>-latest` symlink resolves to the newest complete checkpoint.
+
+The supported CLI resume path in this PR is a single-rank local offline run.
+Resume it by overriding `training.resume_from`:
+
+```bash
+specforge train \
+  --config examples/configs/qwen3-8b-eagle3-offline.yaml \
+  training.resume_from=./outputs/qwen3-8b-eagle3-offline/qwen3-8b-eagle3-offline-latest
+```
+
+No online run accepts `training.resume_from` in this PR, including colocated
+online and disaggregated online runs. Runtime checkpoints still contain
+training state and can be exported, but a new online attempt must start with a
+fresh run, channel, and coordination database.
+
+Training metrics are printed every `training.log_interval` steps.
+
+## Export a trained draft
+
+Runtime checkpoints contain training state and are not serving model
+directories. Export the final checkpoint before loading it with SGLang or
+Transformers.
+
+For EAGLE3 SGLang serving:
+
+```bash
+specforge export --to sglang \
+  --checkpoint ./outputs/qwen3-8b-eagle3-online/qwen3-8b-eagle3-online-latest \
+  --draft-config configs/qwen3-8b-eagle3.json \
+  --output-dir ./exports/qwen3-8b-eagle3-sglang
+```
+
+`--to sglang` currently implements the EAGLE3 serving-key contract. Use
+`--to hf` for DFlash, Domino, DSpark, and P-EAGLE model directories. For an
+EAGLE-family self-contained Hugging Face directory, provide the target model as
+the source of the frozen embedding when it is absent from the runtime
+checkpoint:
+
+```bash
+specforge export --to hf \
+  --checkpoint ./outputs/qwen3-8b-eagle3-online/qwen3-8b-eagle3-online-latest \
+  --draft-config configs/qwen3-8b-eagle3.json \
+  --embedding-source Qwen/Qwen3-8B \
+  --output-dir ./exports/qwen3-8b-eagle3-hf
+```
+
+Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
+mapping buffers or when you intentionally need to refresh them.

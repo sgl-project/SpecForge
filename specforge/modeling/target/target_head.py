@@ -13,10 +13,17 @@ from specforge.utils import get_local_device, padding
 
 
 class TargetHead(nn.Module):
-    def __init__(self, model_path, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model_path,
+        trust_remote_code: bool = False,
+        cache_dir: Optional[str] = None,
+    ):
         super().__init__()
         self.config = AutoConfig.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code
+            model_path,
+            trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
         )
         # Fall back to ``text_config`` when present so that VLM models load correctly.
         self.text_config = getattr(self.config, "text_config", self.config)
@@ -34,7 +41,11 @@ class TargetHead(nn.Module):
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
     ) -> "TargetHead":
-        target_head = cls(model_path, trust_remote_code=trust_remote_code)
+        target_head = cls(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
+        )
         target_head.load_weights(
             model_path=model_path,
             lm_head_key=lm_head_key,
@@ -56,7 +67,7 @@ class TargetHead(nn.Module):
         if os.path.exists(model_path):
             self.model_path = model_path
         else:
-            self.model_path = snapshot_download(repo_id=model_path)
+            self.model_path = snapshot_download(repo_id=model_path, cache_dir=cache_dir)
 
         # model_path is a local directory
         # check if there is file ending with index.json

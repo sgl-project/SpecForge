@@ -50,7 +50,11 @@ from specforge.inference.adapters.policy import (
     EAGLE3_FEATURE_SCHEMA,
     FeatureSchema,
 )
-from specforge.training.strategies.base import DraftTrainStrategy, Eagle3TrainStrategy
+from specforge.training.strategies.base import (
+    DraftTrainStrategy,
+    Eagle3TrainStrategy,
+    PEagleTrainStrategy,
+)
 
 
 def concat_collate(feats: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -162,6 +166,44 @@ register_strategy(
         ),
         uses_target_head=True,
         make_offline_reader=_eagle3_offline_reader,
+        make_offline_transform=_eagle3_offline_transform,
+        make_offline_collate=_eagle3_offline_collate,
+        make_online_collate=lambda: concat_collate,
+        feature_schema=EAGLE3_FEATURE_SCHEMA,
+        make_adapter=_make_eagle3_adapter,
+        supports_online=True,
+    )
+)
+
+
+# --- P-EAGLE ----------------------------------------------------------------
+# P-EAGLE consumes the same target features as EAGLE3. The only schema-level
+# difference is the strategy tag on offline refs; the per-step strategy maps
+# hidden_state -> OnlinePEagleModel's hidden_states argument and runs COD loss.
+
+
+def _peagle_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        strategy="peagle",
+        ttt_length=ttt_length,
+        max_len=max_len,
+        target_repr="hidden_state",
+    )
+
+
+register_strategy(
+    StrategySpec(
+        name="peagle",
+        required_features=frozenset(PEagleTrainStrategy.required_features),
+        make_strategy=lambda wrapped, *, target_head=None: PEagleTrainStrategy(
+            wrapped, target_head=target_head
+        ),
+        uses_target_head=True,
+        make_offline_reader=_peagle_offline_reader,
         make_offline_transform=_eagle3_offline_transform,
         make_offline_collate=_eagle3_offline_collate,
         make_online_collate=lambda: concat_collate,
@@ -329,7 +371,8 @@ def _dspark_online_collate():
 def _dspark_server_capture_only_adapter(*args, **kwargs):
     raise NotImplementedError(
         "DSpark online training is wired only for the disaggregated "
-        "server-capture path. Use examples/disagg/run_disagg_dspark.py."
+        "server-capture path through `specforge train` with "
+        "training.deployment_mode=disaggregated."
     )
 
 

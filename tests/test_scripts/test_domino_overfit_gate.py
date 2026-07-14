@@ -1,7 +1,6 @@
 import importlib.util
 import json
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -263,32 +262,6 @@ class TestDominoOverfitGate(unittest.TestCase):
                     max_loss=1e-4,
                     min_accuracy=1.0,
                 )
-
-
-class TestDominoOverfitLauncher(unittest.TestCase):
-    def test_shared_launcher_contract_and_syntax(self):
-        launcher = ROOT / "examples/disagg/run_domino_disagg_overfit_gate.sh"
-        subprocess.run(["bash", "-n", str(launcher)], check=True)
-        text = launcher.read_text()
-        for required in (
-            "${TARGET_MODEL_PATH:?set TARGET_MODEL_PATH to the target model}",
-            "${DRAFT_CONFIG_PATH:?set DRAFT_CONFIG_PATH to a Domino draft config}",
-            "${SOURCE_DATA_PATH:?set SOURCE_DATA_PATH to validated ShareGPT JSONL}",
-            "DISAGG_MAX_PROMPTS=${DISAGG_MAX_PROMPTS:-1}",
-            "DISAGG_MAX_STEPS=${DISAGG_MAX_STEPS:-400}",
-            "MIN_LOSS_TOKENS=$((2 * BLOCK_SIZE))",
-            '--reasoning-policy "$REASONING_POLICY"',
-            '--embedding-key "$EMBEDDING_KEY"',
-            '--mask-token-id "$MASK_TOKEN_ID"',
-            '--block-size "$BLOCK_SIZE"',
-            '--context-length "$MAX_LENGTH"',
-            '--prompt-output-path "$PROMPT_ARTIFACT_PATH"',
-            'if [[ -e "$WORK_DIR" ]]',
-            "scripts/gates/check_overfit_metrics.py",
-            'LATEST_CHECKPOINT="$CONSUMER_OUTPUT_DIR/$DISAGG_STORE_ID-step$DISAGG_MAX_STEPS"',
-            '[[ ! -f "$LATEST_CHECKPOINT/training_state.pt" ]]',
-        ):
-            self.assertIn(required, text)
 
 
 if __name__ == "__main__":

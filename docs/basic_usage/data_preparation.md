@@ -208,15 +208,18 @@ If you already have conversations formatted with a specific chat template, you c
 
 This format is useful when you have pre-formatted prompts that were used during training of the target model and have raw generations from the target model.
 
-To use pre-formatted datasets, add the `--is-preformatted` flag to your training command. Note that the `--chat-template` parameter is still needed and should match the template used in your pre-formatted text, as it is used to identify user/assistant tokens to determine the assistant spans and generate the corresponding loss mask.
+To use preformatted datasets, set `data.is_preformatted: true` in the run
+config. `data.chat_template` is still required and must match the template used
+to create the text. SpecForge uses it to identify assistant spans and build the
+loss mask.
 
 ```bash
-# Online training with pre-formatted data
-torchrun --standalone --nproc_per_node 8 \
-    scripts/train_eagle3.py \
-    --is-preformatted \
-    --train-data-path ./your_preformatted_dataset.jsonl \
-    # ... other arguments
+# After copying an online example YAML, set these data fields:
+# data:
+#   train_data_path: ./your_preformatted_dataset.jsonl
+#   is_preformatted: true
+#   chat_template: llama3
+specforge train --config ./my-eagle3-online.yaml
 ```
 
 For offline training, you can also use `--is-preformatted` when generating hidden states:
@@ -233,7 +236,12 @@ torchrun --nproc_per_node=8 \
     --max-length 2048
 ```
 
-Once you have the `jsonl` file ready, you can proceed with online training or generate hidden states for offline training. See the Training guide for more details.
+This `torchrun` command parallelizes feature preparation only. The subsequent
+offline `specforge train` run is single-rank.
+
+Once the `jsonl` file is ready, use it in an online run config or generate
+hidden states for an offline config. See the [Training](training.md) guide for
+the complete run schema and supported combinations.
 
 
 ## ➕ Handling Multiple Datasets

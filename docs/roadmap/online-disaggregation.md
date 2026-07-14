@@ -1,5 +1,15 @@
 # Online Disaggregation Roadmap
 
+> O1 server capture and the two-role `specforge train --config ...` run surface
+> are implemented. This document now serves as design history for O1 and a
+> forward-looking roadmap for O2/O3. For current launch instructions, see
+> [Training](../basic_usage/training.md).
+>
+> The public hard-cut run surface in this PR rejects
+> `training.resume_from` for every online config. Lower-level reconciliation and
+> `resume=True` references below describe historical/programmatic seams, not a
+> supported CLI online-resume workflow.
+
 Live disaggregated training: a rollout pool runs the **frozen target** model autoregressively
 over a fixed prompt set and streams its hidden states across the network into a separate trainer
 pool. This folds PR #618's online roadmap into the consolidated tree and applies the shared
@@ -15,8 +25,9 @@ There is no separate hidden-state stream source of truth — `FeatureDataLoader`
 `SampleRef` + `FeatureStore` *is* the stream; online/offline/disagg vary only in the ref source +
 the `FeatureStore` backend, shielded from training. See [domain-refactor](./domain-refactor.md)
 for the domain `Trainer`/managers that wrap the runtime training seam and for Phase B's
-`TargetEngine` that O1.3 depends on, [eval-and-breadth](./eval-and-breadth.md) for the orthogonal
-eval/algorithm track, and the top-level [plan](../../plan.md).
+`TargetEngine` that O1.3 depends on and
+[eval-and-breadth](./eval-and-breadth.md) for the orthogonal eval/algorithm
+track.
 
 ---
 
@@ -49,7 +60,7 @@ live-engine + async control loop**. Reuse, do not rewrite:
 | Live generation (train-with-decode) | **GAP** — in-process generator stub today; no server | live autoregressive rollout streaming | offline regen-to-disk |
 | Cross-pool backpressure | policy exists, off by default | pool-byte feedback + capacity await | n/a |
 | Online weight sync / staleness | n/a — out of scope (frozen target) | **also absent** (not needed) | absent |
-| Fault tolerance | `reconcile_on_restart` + checkpoint resume | checkpoint resume (≈ parity) | n/a |
+| Fault tolerance | Reconciliation seam; public online CLI resume is disabled | checkpoint resume | n/a |
 
 **Read:** the data plane is at or ahead of parity; the competitive gap is orchestration + the
 live engine + the async control loop. DeepSpec's separate edge (breadth + eval) is orthogonal and
@@ -57,7 +68,7 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
 
 ---
 
-### O1.1 — Shared cross-process control plane · size M · CPU · status: in-review
+### O1.1 — Shared cross-process control plane · size M · CPU · status: implemented
 - **Goal** Producer and consumer attach to **one** durable control plane instead of each building
   its own `InMemoryMetadataStore`, so commit/lease/ack/dedup and restart-reconcile work across
   processes (~PR #624).
@@ -83,7 +94,7 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
 - **Done when** A separate producer and consumer share commit/lease/ack via the durable store, and
   the single-host-in-process-index caveat is removed for the shared-store path.
 
-### O1.2 — Async streaming loop + one-process builder · size M · CPU / small-GPU · status: in-review
+### O1.2 — Async streaming loop + one-process builder · size M · CPU / small-GPU · status: implemented
 - **Goal** Replace synchronous drain-then-fit with an async streaming loop, using the **existing
   in-process generator** as a stub so this milestone carries no engine risk (~PR #625).
 - **Target state** End-to-end live 1+1 run with in-process generation: producer pulls prompts →
@@ -100,9 +111,9 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
     halves and dispatches to `run_disagg_online_interleaved`.
   - The producer's `drive_producer(should_stop=...)` applies channel backpressure (pauses while
     `channel.in_flight_remote()` exceeds `in_flight_high_watermark`) and closes the channel on exit.
-  - In-process generator stub: `SGLangAdapter.generate_features` over the SpecForge
-    `Eagle3TargetModel.generate_eagle3_data` path (`inference/sglang_adapter.py`), driven by
-    `RolloutWorker` (`inference/rollout_worker.py`).
+  - In-process generator stub: `SGLangAdapter.generate_features` over the
+    generic `TargetEngine.capture` path (`inference/adapters/eagle3.py`), driven
+    by `RolloutWorker` (`inference/rollout_worker.py`).
 - **Tests / gates** Tiny-model 1+1 online run: trainer consumes a **streamed** (not precomputed)
   ref set; metrics align with the offline baseline on the same prompts/seed. Interleaved
   shutdown is hang-free in all three orderings. `tests/test_runtime/test_disagg_online_launch.py`,
@@ -110,24 +121,20 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
 - **Done when** An end-to-end live 1+1 run drives training from an in-process generator over the
   streaming channel, with no precomputed features.
 
-### O1.3 — Live SGLang-server hidden-state capture · size L · GPU + engine · status: in review (PR #641, reforward transport; spike findings + upstream proposal in ./o13-capture-spike.md)
-> 🔴 **GATING RISK — run the capture spike first.** The unknown is how far
-> `Eagle3TargetModel.generate_eagle3_data` is from server-backed capture. The spike is the
-> difference between O1.3 being days vs. a quarter; SpecForge is SGLang's own project so reuse is
-> plausible (TorchSpec needed an SGLang codebase patch). Run it before/with O1.1.
+### O1.3 — Live SGLang-server hidden-state capture · size L · GPU + engine · status: implemented
 - **Goal** Replace the in-process generator with a real SGLang **server** emitting aux + final
   hidden states straight into `MooncakeFeatureStore`.
 - **Target state** A live SGLang server feeds training with **zero** precomputed features: server
   generates → hidden states land in the store → consumer trains; acceptance metrics match the
   offline baseline.
 - **Implementation**
-  - Depends on [domain-refactor](./domain-refactor.md) Phase B's `TargetEngine` abstraction
-    (`SGLangServerEngine`) — O1.3 is the online consumer of that engine.
-  - `inference/sglang_adapter.py` — a server-backed `FeatureSource` (launch/attach an SGLang
-    server) alongside the existing in-process `SGLangAdapter`; the capture hook is engine-side,
-    writing aux + final hidden states to the `FeatureStore`. Reuse the `CaptureConfig` /
-    `verify_capture` contract (`inference/capture.py`) so an aux-layer-id / width / target-dim
-    mismatch fails loudly. See `inference/sglang_patch_inventory.md` for the patch surface.
+  - `inference/adapters/server_capture.py` — `SGLangServerCaptureAdapter`
+    attaches to a patched SGLang server; the engine-side hook writes aux +
+    final hidden states directly to `MooncakeFeatureStore`.
+  - The adapter reuses the `CaptureConfig` / `verify_capture` contract
+    (`inference/capture.py`) so an aux-layer-id / width / target-dim mismatch
+    fails loudly. See `inference/sglang_patch_inventory.md` for the patch
+    surface.
   - `inference/rollout_worker.py` — the producer uses the server-backed source; committed
     `SampleRef`s flow through the same `StreamingRefChannel`.
 - **Tests / gates** (gated GPU) Server generates → hidden states resident in the store → consumer
@@ -136,7 +143,7 @@ lives in [eval-and-breadth](./eval-and-breadth.md).
 - **Done when** A live SGLang server feeds training with zero precomputed features and acceptance
   metrics match the in-process / offline baseline.
 
-### O2 — Scale-out orchestration (Ray = OPEN) · size L · infra · status: later
+### O2 — Scale-out orchestration (Ray = OPEN) · size L · infra · status: planned
 - **Goal** Move from 1+1 to N producers + M trainers with per-DP-rank leasing, cross-pool
   backpressure, and a managed streaming-pool lifetime — and **decide** the orchestration layer.
 - **Target state** Independent N producers and M trainers scale without re-leasing or dropping
@@ -205,7 +212,7 @@ framework.
   is a bounded-memory backpressure signal; the streaming-pool bugs are closed; the orchestration
   decision gate has been evaluated against a real N+M run.
 
-### O3 — Hardening · size L · infra · status: later
+### O3 — Hardening · size L · infra · status: planned
 - **Goal** Make the live disaggregated path production-operable.
 - **Target state** RDMA path runs without per-op buffer churn; actor/process restart and health are
   handled; the run is observable.

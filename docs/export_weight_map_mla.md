@@ -1,7 +1,8 @@
 # Export weight-name maps (trainer → SGLang spec-decoder loader)
 
-`specforge export --to sglang` renames trainer-side draft weights to whatever
-SGLang's spec-decoder loader expects. Weight-name compatibility is **silent
+`specforge export --to sglang` currently handles EAGLE3 checkpoints and renames
+trainer-side draft weights to what SGLang's spec-decoder loader expects. Other
+strategies use `specforge export --to hf`. Weight-name compatibility is **silent
 when wrong** — a key the loader does not recognize is skipped and the draft
 serves with uninitialized weights — so the per-architecture map is a documented
 artifact, mirrored in code as `specforge/export/to_sglang.py::WEIGHT_MAPS`, and
@@ -11,7 +12,7 @@ than hoping.
 ## LlamaForCausalLMEagle3 (identity map)
 
 SpecForge's trainer module names are exactly the names sglang's EAGLE3 draft
-loader (`sglang/srt/models/llama_eagle3.py`, pinned `sglang==0.5.9`) reads, so
+loader (`sglang/srt/models/llama_eagle3.py`, pinned by `pyproject.toml`) reads, so
 `WEIGHT_MAPS["LlamaForCausalLMEagle3"] = {}`:
 
 | Trainer key | SGLang spec-decoder loader key |

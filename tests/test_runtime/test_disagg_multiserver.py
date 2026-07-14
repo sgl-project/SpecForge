@@ -5,16 +5,16 @@ The multi-server topology: ``build_disagg_online_producer(feature_source=[...])`
 builds one RolloutWorker per SGLangServerCaptureAdapter (1 server : 1 adapter :
 1 worker), all leasing DISJOINT prompts from the one controller and publishing
 into the one channel, concurrently. Each stub ``post_fn`` stands in for one
-patched SGLang server writing into the SHARED fake Mooncake backend — exactly
-the shape of ``examples/disagg/run_qwen3.6_27b_dflash_disagg_multiserver.sh``.
+patched SGLang server writing into the shared fake Mooncake backend — the same
+topology configured through ``specforge train`` producer and consumer roles.
 
 Covers the failure matrix the single-server path never hits:
 - disjoint + complete production across two live servers;
 - one dead server: its leases fail retryable, the survivor re-leases and
   finishes the pool (no truncation, no hang);
-- all servers dead: loud RuntimeError, channel still closed;
-- a poisoned prompt (server rejects it every time): terminal after
-  ``max_prompt_attempts`` instead of spinning the drained-detection loop.
+- all servers dead: loud RuntimeError and a failure sentinel;
+- a poisoned prompt (server rejects it every time): terminal failure after
+  ``max_prompt_attempts`` instead of a partial-success EOF.
 """
 
 import os
@@ -218,8 +218,8 @@ class TestMultiServerProducer(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             drive(max_rounds=10_000)
-        # EOF still reaches the consumer — a crashed producer must not hang it.
-        self.assertTrue(channel.is_closed())
+        self.assertFalse(channel.is_closed())
+        self.assertIn("RuntimeError", channel.failure())
 
     def test_poisoned_prompt_goes_terminal_not_infinite(self):
         # PR654 known rough edge: an all-failed round used to read as
@@ -239,11 +239,12 @@ class TestMultiServerProducer(unittest.TestCase):
             lease=2,
             max_prompt_attempts=3,
         )
-        produced = drive(max_rounds=10_000)
-        self.assertEqual(produced, N - 1)  # p0 terminal, everything else through
+        with self.assertRaisesRegex(RuntimeError, "terminally failed prompt"):
+            drive(max_rounds=10_000)
         ids = _published_sample_ids(channel.path)
         self.assertEqual(set(ids), {f"run0:p{i}" for i in range(1, N)})
-        self.assertTrue(channel.is_closed())
+        self.assertFalse(channel.is_closed())
+        self.assertIn("terminally failed prompt", channel.failure())
 
     def test_source_count_worker_count_conflict_raises(self):
         backend = _FakeMooncakeStore()

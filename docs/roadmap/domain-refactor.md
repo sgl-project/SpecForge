@@ -1,5 +1,13 @@
 # Domain / Architecture Refactor Track
 
+> **Historical planning record.** The layout consolidation, typed config, and
+> single `specforge train --config ...` surface described by this track are now
+> implemented. This file preserves design rationale; it is not a usage guide or
+> a migration contract. See [Training](../basic_usage/training.md) for the
+> current supported interface. The public CLI currently supports resume only
+> for single-rank local offline training; every online config rejects
+> `training.resume_from`.
+
 This is the **domain/architecture** track — making the runtime support multiple
 draft algorithms (eagle3 / dflash / domino / future) and a real product surface,
 *orthogonal* to the online-disaggregation scale-out work in
@@ -9,19 +17,17 @@ keeps the runtime training seam (`TrainerCore` / `DraftTrainStrategy` /
 `TrainingBackend` + `StepContext`) and only *wraps* it with domain objects. The
 online target is FROZEN — there is **no** weight-sync, no `HiddenStateStream`
 source of truth, and `draft_weight_version` survives only as provenance metadata.
-Sibling tracks: [./online-disaggregation.md](./online-disaggregation.md),
-[./eval-and-breadth.md](./eval-and-breadth.md). Top-level plan:
-[../../plan.md](../../plan.md) (the detailed §4.2–4.8 sketches this track lands
-incrementally are mirrored in [../redesign-draft-legacy.md](../redesign-draft-legacy.md)).
+Sibling tracks: [./online-disaggregation.md](./online-disaggregation.md) and
+[./eval-and-breadth.md](./eval-and-breadth.md).
 
-**Dependency order:** A (in review) → B → {C, D}; D → E0 → E (C is parallel — not a prerequisite
+**Historical dependency order:** A → B → {C, D}; D → E0 → E (C is parallel — not a prerequisite
 of E). `E0` is a move-only layout consolidation (zero functional change) that runs at the front of
 E so E's composition work lands in the final layout. B's `TargetEngine` extraction also unblocks
 the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-disaggregation.md).
 
 ---
 
-### A — Composable launch · size L · GPU · status: in review (PRs #627/#628/#629, validated)
+### A — Composable launch · size L · GPU · status: implemented
 - **Goal** One strategy-parameterized launch path so adding an algorithm is a
   registry entry, not a new `build_*` family — and so a schedule-dependent loss
   (domino) flows through the same `TrainerCore`.
@@ -39,8 +45,8 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
   - `launch.py` — `_assemble_trainer` / `_offline_io` / `_assemble_rollout_workers`
     plus topology builders `build_offline_runtime`, `build_disagg_offline_runtime`,
     `build_online_runtime`, `build_disagg_online_{producer,consumer,runtime}`;
-    every one resolves the spec. Legacy `build_*_eagle3_*` names are kept as
-    aliases.
+    every one resolves the spec. The final public run surface does not expose
+    method-specific builder aliases.
   - `training/strategy.py` — `DraftTrainStrategy` ABC + `Eagle3TrainStrategy`,
     `DFlashTrainStrategy`, `DominoTrainStrategy`; `StepContext`
     (`global_step` / `total_steps`) is threaded into `forward_loss` so domino's
@@ -57,7 +63,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### B — Domain abstractions · size L · GPU · status: in review (PRs #631/#632/#633/#635, validated)
+### B — Domain abstractions · size L · GPU · status: implemented
 - **Goal** De-EAGLE3 the target boundary and give the runtime a domain `Trainer`
   that *wraps* (does not replace) the runtime controller, so the architecture
   reads in product terms while the seam stays intact.
@@ -77,8 +83,9 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
      (`generate_eagle3_data`, `aux_hidden_states_layers`,
      `set_aux_hidden_states_layers`) moved into an `Eagle3TargetEngine` subclass;
      `DFlashTargetModel` (`dflash_target_model.py:33`, `set_capture_layers`)
-     becomes a sibling subclass. Keep `get_eagle3_target_model(backend=...)`
-     working as a thin shim during migration, then rename to a generic factory.
+     becomes a sibling subclass. Replace
+     `get_eagle3_target_model(backend=...)` with the generic target-engine
+     factory at the package boundary.
   2. Add an explicit `backend` attribute on each engine (today `SGLangAdapter.health`
      / `DFlashAdapter.health` read `getattr(target_model, "backend", "unknown")`
      — make it real), and add the `sglang_server` backend branch to the factory
@@ -107,7 +114,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### C — Colocated lightweight path · size M · CPU · status: in review (PR #636, validated)
+### C — Colocated lightweight path · size M · CPU · status: implemented
 - **Goal** Make colocated runs (W1/W2) pay nothing for the disagg control plane,
   on the *same* code path — not a fork.
 - **Target state** One canonical path. For colocated, the control plane is
@@ -145,7 +152,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### D — Training managers · size L · GPU · status: in review (PR #637, validated)
+### D — Training managers · size L · GPU · status: implemented
 - **Goal** Bring the training loop up to production parity: real grad
   accumulation, full resume, checkpoint lifecycle, and an evaluator — the pieces
   `runtime/training` does not have yet.
@@ -155,7 +162,8 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
     but `FSDPTrainingBackend.backward` is a bare `loss.backward()`, so FSDP
     all-reduces gradients **every micro-step**. Add `no_sync()` over the
     non-boundary micro-steps so the reduction fires once per optimizer step.
-  - **Full resume.** `TrainerController.save_checkpoint` persists only
+  - **Full resume (offline public surface; library seam elsewhere).**
+    `TrainerController.save_checkpoint` persists only
     `draft_state_dict` + step/epoch; `FSDPTrainingBackend.load_state_dict` only
     half-loads the optimizer. Add optimizer + LR-scheduler + RNG state — per
     rank (they are FSDP-shard-local) — plus the mid-epoch data position, and a
@@ -164,7 +172,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
     draft weights restore bit-for-bit and the data stream repositions exactly;
     the loss curve is tolerance-continuous, not bit-exact, because
     `BF16Optimizer` rebuilds its fp32 master from the persisted bf16 weights
-    (matches the legacy trainer; persisting the master would change the
+    (matches the previous optimizer behavior; persisting the master would change the
     optimizer itself and is out of scope here).
   - **CheckpointManager** — rotation (keep-last-N), `best` (by eval metric) and
     `latest` symlinks; owns the `output_dir` layout the controller writes today.
@@ -183,8 +191,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
     computing acc-len. Replace the inline `save_checkpoint` body with a
     `CheckpointManager`.
   - New `training/checkpoint.py` (`CheckpointManager`) and `eval/evaluator.py`
-    (`Evaluator`) — see [../../plan.md](../../plan.md) §4 (`training/checkpoint.py`,
-    `eval/evaluator.py`, `eval/cache.py`).
+    (`Evaluator`), with eval caching in `eval/cache.py`.
 - **Tests / gates** `tests/test_runtime/test_checkpoint_resume.py` extended to
   assert loss-curve continuity across a save→resume boundary (optimizer + RNG);
   a `no_sync` gate asserting one all-reduce per optimizer step (and identical
@@ -198,10 +205,10 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### E0 — Layout consolidation (move-only) · size M · CPU · status: in review
+### E0 — Layout consolidation (move-only) · size M · CPU · status: implemented
 - **Goal** Collapse the scattered execution code into **one implementation home per concern** with
   **zero functional change**, so E's composition work is written in the final layout rather than
-  re-moved afterward. This is the §2.3 target tree in [../../plan.md](../../plan.md): `runtime/` =
+  re-moved afterward. In the consolidated target tree, `runtime/` =
   substrate only; top-level `training/` and `inference/` are the single execution homes; `modeling/`
   is model definitions only; no facade package.
 - **Target state** `runtime/` contains only `contracts.py` + `control_plane/` + `data_plane/`.
@@ -224,8 +231,8 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
   | `runtime/launch.py` | `launch.py` (top-level; topology assembly only) |
   | `modeling/target/{target_head.py, custom_backend/}` | **stays** in `modeling/target/` (model defs) |
 
-  Keep import shims at the old module paths for one release (re-export from the new location) so
-  in-flight branches and legacy scripts don't break.
+  The completed hard cut removes the old module-path shims after internal
+  consumers have migrated to the consolidated homes.
 - **Tests / gates** The full `tests/test_runtime` suite stays green **unchanged** (only import paths
   move); the Phase-B byte-identical gate (`test_phase_b_gate.py`) still passes bit-for-bit — a
   move-only change must not alter a single tensor or loss value.
@@ -235,7 +242,7 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 
 ---
 
-### E — Composition & run surface · size L · GPU · status: later (after E0)
+### E — Composition & run surface · size L · GPU · status: implemented
 - **Goal** A real product surface, built **on the consolidated layout from `E0`**: a
   draft-architecture registry (separate axis from the strategy registry), the (algorithm × backend)
   target-engine collapse, MLA Eagle3, a typed config + CLI, and exporters.
@@ -267,24 +274,20 @@ the online O1.3 multi-backend producer in [./online-disaggregation.md](./online-
 - **Implementation**
   - `modeling/draft/registry.py` (new) — `DRAFT_REGISTRY` + `register_draft`
     decorator; register the existing eagle3 / dflash drafts and the new MLA
-    eagle3 draft. See [../../plan.md](../../plan.md) §4.2.
+    eagle3 draft.
   - `inference/target_engine/` — collapse the `eagle3.py` / `dflash.py` per-algorithm files
     (relocated in `E0`) into `hf.py` / `sglang.py` / `custom.py` + a per-algorithm `CaptureSpec`;
     `sglang_server.py` is filled by online O1.3.
   - `training/strategies/` (relocated in `E0`) — finalize the `StrategySpec` registry + the
     per-algorithm specs; keep `register_strategy` / `resolve_strategy` import-compatible.
   - `config/schema.py` (new) — Pydantic config; `specforge` CLI entry in
-    `pyproject.toml` `[project.scripts]`. See [../../plan.md](../../plan.md)
-    §4.6 (`config/schema.py`).
+    `pyproject.toml` `[project.scripts]`.
   - `export/to_sglang.py`, `export/to_hf.py` (new) — exporters + the MLA
-    weight-name map. See [../../plan.md](../../plan.md) §4 (`export/to_sglang.py`).
-  - Detailed sketches for all of the above are in
-    [../redesign-draft-legacy.md](../redesign-draft-legacy.md) (legacy redesign
-    draft §4.2–4.8).
+    weight-name map.
 - **Tests / gates** A round-trip export test (train → `to_sglang` → load in
   sglang serving → speculative decode runs); a `to_hf` load test; an MLA-eagle3
   draft training smoke test; a CLI/config test (config parses → builds the same
   `Trainer` the programmatic path does).
-- **Done when** A user trains via `specforge <config>`, registers a new draft
+- **Done when** A user trains via `specforge train --config <config>`, registers a new draft
   architecture with `@register_draft`, trains an MLA Eagle3 draft, and exports a
   checkpoint that loads in both sglang and HF — all from the consolidated layout.

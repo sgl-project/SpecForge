@@ -67,6 +67,12 @@ def export_to_sglang(
     checkpoint predates them.
     """
     state = resolve_training_state(checkpoint_path)
+    if state.get("strategy") != "eagle3":
+        raise ValueError(
+            "the specialized SGLang exporter currently supports EAGLE3 "
+            f"checkpoints only, got strategy={state.get('strategy')!r}; use "
+            "--to hf for DFlash-family and P-EAGLE draft model directories"
+        )
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )

@@ -69,7 +69,7 @@ def _scalar(x: Any) -> float:
 def _dp_mean(x: Any) -> Any:
     """Average a scalar metric tensor across all ranks before it is logged.
 
-    Matches stock ``train_dflash.py`` (``dist.all_reduce(acc); acc /= world``):
+    Uses the established DFlash metric convention (DP mean):
     without it the disagg consumer logs a single rank's local-batch accuracy
     (~1 rank x batch x anchors), which is ~sqrt(world) noisier and spikes because
     each rank's few round-robin refs can be all-easy or all-hard. Reducing across
@@ -179,7 +179,7 @@ class TrainerCore:
 
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
         # DP-average loss AND accuracy across ranks before logging, matching stock
-        # train_dflash.py (all_reduce(loss)/world, all_reduce(acc)/world).
+        # DFlash reports a data-parallel mean for loss and accuracy.
         metrics: Dict[str, Any] = {"loss": _scalar(_dp_mean(out.loss))}
         for key in ("acces", "acceptance_rates", "plosses"):
             if key in out.metrics:
@@ -187,7 +187,7 @@ class TrainerCore:
                     out.metrics[key]
                 )
         if "accuracy" in out.metrics:
-            # DP-average the accuracy across ranks (matches stock train_dflash.py)
+            # DP-average the accuracy across ranks.
             # so the logged curve is smooth, not a single rank's noisy local batch.
             metrics["acc"] = _scalar(_dp_mean(out.metrics["accuracy"]))
         gn = _scalar(grad_norm) if grad_norm is not None else None
@@ -202,9 +202,12 @@ class TrainerCore:
 
 
 class TrainerController:
-    """Lifecycle: fit / evaluate / checkpoint. The training script becomes a
-    launcher; weight publishing is not implemented — ``save_checkpoint`` persists
-    resume state and returns a :class:`Checkpoint`."""
+    """Lifecycle: fit / evaluate / checkpoint.
+
+    ``save_checkpoint`` persists resumable draft state and returns a
+    :class:`Checkpoint`; ``specforge export`` materializes that state into the
+    serving or Hugging Face model format.
+    """
 
     def __init__(
         self,
@@ -267,6 +270,7 @@ class TrainerController:
         self._epoch_batch = start_batch
         self._epoch_samples = start_samples
         self.last_metrics: Dict[str, Any] = {}
+        self.last_checkpoint_step: Optional[int] = None
 
     def fit(
         self, data: Iterable[TrainBatch], eval_data: Optional[Iterable] = None
@@ -457,6 +461,11 @@ class TrainerController:
                     return self.global_step
             self._epoch_batch = 0
             self._epoch_samples = 0
+            # Persist the *next* epoch after a naturally exhausted pass.  A
+            # checkpoint taken after fit() returns must describe completed
+            # work, not epoch ``N`` at batch zero (which would replay that
+            # entire epoch on resume).
+            self.epoch = epoch + 1
         return self.global_step
 
     @torch.no_grad()
@@ -527,6 +536,7 @@ class TrainerController:
             step,
             rank_state={"optimizer": full["optimizer"], "rng": full["rng"]},
         )
+        self.last_checkpoint_step = step
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
             global_step=step,

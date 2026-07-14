@@ -2,7 +2,7 @@
 
 View the interactive benchmark dashboard to explore SpecForge performance results:
 
-**[🚀 Spec Bundle](../dashboard/index.html)**
+**[🚀 Spec Bundle](../spec_bundle/index.html)**
 
 
 The dashboard displays the following key metrics:

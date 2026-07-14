@@ -147,10 +147,11 @@ Because the loops are autonomous and only the coordinator is shared, moving comp
 
 ## Per-plane internals
 
-Each plane carries its own design note (landed with that plane's PR):
+Each plane carries its own design note. Compute-plane notes live beside their
+top-level packages; only the transport substrate remains under `runtime/`:
 
 - `contracts.py` / `CONTRACTS.md` — shared metadata records + `assert_no_tensors`
 - `data_plane/DESIGN.md` — storage, queue, loader, lifecycle
 - `control_plane/DESIGN.md` — controller, metadata store, lease/durability
-- `inference/DESIGN.md` — rollout worker, capture, sglang seam
-- `training/DESIGN.md` — trainer core, strategy, FSDP backend
+- [`../inference/DESIGN.md`](../inference/DESIGN.md) — rollout worker, capture, sglang seam
+- [`../training/DESIGN.md`](../training/DESIGN.md) — trainer core, strategy, FSDP backend

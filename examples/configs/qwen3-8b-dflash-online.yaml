@@ -1,0 +1,31 @@
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dflash.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-8b_regen.jsonl
+  max_length: 3072
+  chat_template: qwen
+  build_dataset_num_proc: 32
+  cache_dir: ./cache
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  batch_size: 4
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  save_interval: 1000
+  log_interval: 50
+  deployment_mode: local_colocated
+  seed: 42
+
+run_id: qwen3-8b-dflash-online
+output_dir: ./outputs/qwen3-8b-dflash-online

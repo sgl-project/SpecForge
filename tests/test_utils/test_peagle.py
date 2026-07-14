@@ -1,12 +1,10 @@
 import tempfile
 import unittest
-from argparse import Namespace
 from unittest.mock import MagicMock, patch
 
 import torch
 from transformers import LlamaConfig
 
-from scripts.train_peagle import resolve_mask_token_id
 from specforge.core.peagle import (
     OnlinePEagleModel,
     compute_peagle_metrics,
@@ -15,6 +13,7 @@ from specforge.core.peagle import (
 )
 from specforge.modeling.auto import AutoEagle3DraftModel
 from specforge.modeling.draft.peagle import PEagleDraftModel
+from specforge.training.model_utils import resolve_mask_token_id
 
 
 class TestPEagleTrainingSemantics(unittest.TestCase):
@@ -220,70 +219,59 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
 
 
 class TestPEagleMaskTokenResolution(unittest.TestCase):
-    def _args(self, mask_token_id=None):
-        return Namespace(
-            mask_token_id=mask_token_id,
-            target_model_path="target",
-            trust_remote_code=False,
+    def _resolve(self, tokenizer, explicit=None):
+        return resolve_mask_token_id(
+            explicit=explicit,
+            tokenizer=tokenizer,
+            embedding_vocab_size=32,
         )
 
     def test_explicit_mask_token_is_validated(self):
+        tokenizer = MagicMock()
         with self.assertRaises(ValueError):
-            resolve_mask_token_id(self._args(mask_token_id=33), embedding_vocab_size=32)
+            self._resolve(tokenizer, explicit=33)
         with self.assertRaises(ValueError):
-            resolve_mask_token_id(self._args(mask_token_id=-1), embedding_vocab_size=32)
+            self._resolve(tokenizer, explicit=-1)
 
-        self.assertEqual(
-            resolve_mask_token_id(
-                self._args(mask_token_id=31), embedding_vocab_size=32
-            ),
-            31,
-        )
+        self.assertEqual(self._resolve(tokenizer, explicit=31), 31)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_tokenizer_mask_token_takes_priority(self, mock_auto_tokenizer):
+    def test_tokenizer_mask_token_takes_priority(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = 7
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
+        tokenizer.__len__.return_value = 30
 
-        self.assertEqual(resolve_mask_token_id(self._args(), 32), 7)
+        self.assertEqual(self._resolve(tokenizer), 7)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_unused_embedding_slot_takes_priority_over_pad(self, mock_auto_tokenizer):
+    def test_unused_embedding_slot_takes_priority_over_pad(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = None
         tokenizer.pad_token_id = 3
         tokenizer.eos_token_id = 4
         tokenizer.unk_token_id = 5
         tokenizer.__len__.return_value = 30
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
 
-        self.assertEqual(resolve_mask_token_id(self._args(), 32), 30)
+        self.assertEqual(self._resolve(tokenizer), 30)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_pad_fallback_when_no_mask_or_unused_slot(self, mock_auto_tokenizer):
+    def test_pad_fallback_when_no_mask_or_unused_slot(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = None
         tokenizer.pad_token_id = 3
         tokenizer.eos_token_id = 4
         tokenizer.unk_token_id = 5
         tokenizer.__len__.return_value = 32
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
 
-        self.assertEqual(resolve_mask_token_id(self._args(), 32), 3)
+        self.assertEqual(self._resolve(tokenizer), 3)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_fallback_token_must_fit_embedding_vocab(self, mock_auto_tokenizer):
+    def test_fallback_token_must_fit_embedding_vocab(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = None
         tokenizer.pad_token_id = 33
         tokenizer.eos_token_id = None
         tokenizer.unk_token_id = None
         tokenizer.__len__.return_value = 32
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
 
         with self.assertRaises(ValueError):
-            resolve_mask_token_id(self._args(), 32)
+            self._resolve(tokenizer)
 
 
 if __name__ == "__main__":

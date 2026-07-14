@@ -1,11 +1,10 @@
 # coding=utf-8
 """Launcher path (DFlash, online): build_online_runtime(strategy="dflash") end to end.
 
-Online analog of test_dflash_launch: drives a RolloutWorker with the new
-DFlashAdapter (HF DFlash target, no sglang) calling generate_dflash_data to
-materialize {input_ids, hidden_states, loss_mask} SampleRefs into the mem:// store,
-then trains through the queue with FSDP. Proves the strategy-parameterized rollout
-assembler (spec.make_adapter + strategy tag) drives a non-eagle3 model. GPU-only.
+Online analog of test_dflash_launch: interleaves a RolloutWorker with the new
+DFlashAdapter (HF DFlash target, no sglang) and FSDP training through the bounded
+mem:// stream. Proves the strategy-parameterized rollout assembler
+(spec.make_adapter + strategy tag) drives a non-eagle3 model. GPU-only.
 """
 
 import os
@@ -19,7 +18,7 @@ CUDA = torch.cuda.is_available()
 
 @unittest.skipUnless(CUDA, "DFlash online launcher path requires CUDA")
 class TestDFlashOnlineLaunch(unittest.TestCase):
-    def test_online_rollout_then_fsdp_train(self):
+    def test_online_rollout_is_interleaved_with_fsdp_train(self):
         torch.manual_seed(0)
         from tests.test_runtime import _fixtures as fx
 
@@ -76,7 +75,7 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, drive_rollout = build_online_runtime(
+        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
             strategy="dflash",
             target_model=target,
             prompts=prompts,
@@ -91,19 +90,19 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
             max_steps=MAX_OPT_STEPS,
         )
 
-        # the DFlashAdapter produced one SampleRef per prompt, control plane tensor-free
-        produced = drive_rollout()
-        self.assertEqual(produced, N)
-        self.assertEqual(controller.sample_queue.depth(), N)
+        # Build is metadata-only; rollout starts when the trainer requests a batch.
+        self.assertEqual(controller.sample_queue.depth(), 0)
         assert_no_tensors(controller.status())
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
 
-        step = trainer.fit(loader)
+        step = run_interleaved()
 
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
+        self.assertEqual(loader.queue.produced_count, ACC * MAX_OPT_STEPS)
+        self.assertLessEqual(loader.queue.peak_resident_samples, 1)
         self.assertTrue(
             all(torch.isfinite(p).all() for p in module.parameters()),
             "draft params became non-finite — loss was NaN/inf?",

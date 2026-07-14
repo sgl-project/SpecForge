@@ -18,7 +18,6 @@ dependencies = [
     "datasets",
     "setuptools",
     "tqdm",
-    "wandb",
     "psutil",
     "numpy",
     "accelerate",
@@ -29,7 +28,6 @@ dependencies = [
     "ninja",
     "packaging",
     "yunchang",
-    "tensorboard",
 ]
 
 [project.scripts]
