@@ -225,7 +225,10 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         self.assertEqual(t1.fit(), 2)
         self.assertEqual(t1._controller._epoch_batch, 2)
         self.assertEqual(t1.last_checkpoint_step, 2)
-        checkpoint_uri = f"file://{os.path.abspath(os.path.join(out, 'rz-latest'))}"
+        # Pin the immutable step-2 directory. ``rz-latest`` advances to step 4
+        # when phase 2 completes, so retaining that mutable symlink would make
+        # the later no-op check resume a different checkpoint than ``w_cut``.
+        checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
         w_cut = model1.draft_model.w.detach().clone()
         masters_cut = [
             t.detach().cpu().clone() for t in t1.backend.optimizer.fp32_params
