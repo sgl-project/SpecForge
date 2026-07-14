@@ -450,6 +450,7 @@ class LaunchPlanTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(raw, stream)
             with (
+                mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch("specforge.launch_plan.run_commands") as run,
                 mock.patch("builtins.print") as output,
             ):

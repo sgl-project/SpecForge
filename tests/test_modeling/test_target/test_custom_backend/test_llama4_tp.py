@@ -16,7 +16,7 @@ from specforge.modeling.target.custom_backend.llama4 import (
 from tests.utils import get_available_port
 
 
-def test_llama4_tp(rank, world_size, temp_dir, port):
+def _run_llama4_tp_worker(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -94,7 +94,11 @@ class TestLlama4TP(unittest.TestCase):
 
     def test_llama4_tp(self):
         port = get_available_port()
-        mp.spawn(test_llama4_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(
+            _run_llama4_tp_worker,
+            nprocs=2,
+            args=(2, self.temp_dir.name, port),
+        )
 
 
 if __name__ == "__main__":

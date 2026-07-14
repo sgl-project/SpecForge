@@ -185,6 +185,7 @@ class NPURNGTest(unittest.TestCase):
 class NPUTargetAssemblyTest(unittest.TestCase):
     def test_hf_target_uses_the_bound_local_device(self):
         from specforge.training.assembly import _build_target_engine
+        from specforge.training.strategies.registry import resolve_strategy
 
         target = mock.Mock()
         cfg = SimpleNamespace(
@@ -206,7 +207,7 @@ class NPUTargetAssemblyTest(unittest.TestCase):
             ) as get_engine,
             mock.patch("specforge.training.assembly._device", return_value="npu:3"),
         ):
-            result = _build_target_engine(cfg, [1, 2])
+            result = _build_target_engine(cfg, [1, 2], resolve_strategy("dflash"))
 
         self.assertIs(result, target)
         self.assertEqual(get_engine.call_args.kwargs["device"], "npu:3")

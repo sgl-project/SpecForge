@@ -52,7 +52,7 @@ def cleanup_distributed():
 
 
 @torch.no_grad()
-def test_target_model_backend(rank, world_size, port, tp_size):
+def _run_target_model_backend_worker(rank, world_size, port, tp_size):
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -154,14 +154,18 @@ class TestTargetModelBackend(unittest.TestCase):
         world_size = 2
         port = get_available_port()
         mp.spawn(
-            test_target_model_backend, nprocs=world_size, args=(world_size, port, 1)
+            _run_target_model_backend_worker,
+            nprocs=world_size,
+            args=(world_size, port, 1),
         )
 
     def test_target_model_backend_tp(self):
         world_size = 2
         port = get_available_port()
         mp.spawn(
-            test_target_model_backend, nprocs=world_size, args=(world_size, port, 2)
+            _run_target_model_backend_worker,
+            nprocs=world_size,
+            args=(world_size, port, 2),
         )
 
 

@@ -73,9 +73,15 @@ class ModelLoadingSchemaTest(unittest.TestCase):
         self.assertEqual(dflash.model.draft_num_hidden_layers, 3)
         self.assertEqual(dflash.model.draft_block_size, 8)
 
-        with self.assertRaisesRegex(ValidationError, "EAGLE3 has one"):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "requires model.draft_num_hidden_layers=1",
+        ):
             Config.model_validate(_payload("eagle3", draft_num_hidden_layers=2))
-        with self.assertRaisesRegex(ValidationError, "DFlash only"):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "does not support model.draft_block_size",
+        ):
             Config.model_validate(_payload("peagle", draft_block_size=8))
 
     def test_warm_start_and_full_resume_are_mutually_exclusive(self):

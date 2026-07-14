@@ -16,7 +16,7 @@ from specforge.modeling.target.custom_backend.qwen3_moe import (
 from tests.utils import get_available_port
 
 
-def test_qwen3_moe_tp(rank, world_size, temp_dir, port, num_heads, num_kv_heads):
+def _run_qwen3_moe_tp_worker(rank, world_size, temp_dir, port, num_heads, num_kv_heads):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -96,11 +96,19 @@ class TestQwen3MoeTP(unittest.TestCase):
     def test_qwen3_moe_tp_no_kv_head_replicas(self):
         # Set to 2 as only 2 GPU avaialble in CI
         port = get_available_port()
-        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port, 8, 4))
+        mp.spawn(
+            _run_qwen3_moe_tp_worker,
+            nprocs=2,
+            args=(2, self.temp_dir.name, port, 8, 4),
+        )
 
     def test_qwen3_moe_tp_kv_head_replicas(self):
         port = get_available_port()
-        mp.spawn(test_qwen3_moe_tp, nprocs=2, args=(2, self.temp_dir.name, port, 8, 1))
+        mp.spawn(
+            _run_qwen3_moe_tp_worker,
+            nprocs=2,
+            args=(2, self.temp_dir.name, port, 8, 1),
+        )
 
 
 if __name__ == "__main__":

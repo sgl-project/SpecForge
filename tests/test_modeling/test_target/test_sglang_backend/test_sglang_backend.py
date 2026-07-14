@@ -73,11 +73,11 @@ def _run_capture(rank, world_size, port, tp_size, model_path, **load_kwargs):
     cleanup_distributed()
 
 
-def test_dense(rank, world_size, port, tp_size):
+def _run_dense_worker(rank, world_size, port, tp_size):
     _run_capture(rank, world_size, port, tp_size, "unsloth/Llama-3.2-1B")
 
 
-def test_moe(rank, world_size, port, tp_size):
+def _run_moe_worker(rank, world_size, port, tp_size):
     _run_capture(
         rank,
         world_size,
@@ -89,7 +89,7 @@ def test_moe(rank, world_size, port, tp_size):
 
 
 @torch.no_grad()
-def test_vlm(rank, world_size, port, tp_size):
+def _run_vlm_worker(rank, world_size, port, tp_size):
     """Exercise the canonical multimodal capture contract across target TP."""
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -162,7 +162,7 @@ class TestTargetModelBackend(unittest.TestCase):
     def test_sglang_backend_with_dense(self):
         world_size = 2
         mp.spawn(
-            test_dense,
+            _run_dense_worker,
             nprocs=world_size,
             args=(world_size, get_available_port(), 2),
         )
@@ -170,7 +170,7 @@ class TestTargetModelBackend(unittest.TestCase):
     def test_sglang_backend_with_moe(self):
         world_size = 2
         mp.spawn(
-            test_moe,
+            _run_moe_worker,
             nprocs=world_size,
             args=(world_size, get_available_port(), 2),
         )
@@ -178,7 +178,7 @@ class TestTargetModelBackend(unittest.TestCase):
     def test_sglang_backend_with_vlm(self):
         world_size = 2
         mp.spawn(
-            test_vlm,
+            _run_vlm_worker,
             nprocs=world_size,
             args=(world_size, get_available_port(), 2),
         )

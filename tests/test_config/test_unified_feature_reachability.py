@@ -244,14 +244,14 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                     "data": {"train_data_path": "train.jsonl"},
                     "training": {"compact_teacher": True},
                 },
-                "offline text EAGLE3",
+                "does not support compact teacher for mode='online'",
             ),
             (
                 {
                     **OFFLINE_EAGLE3,
                     "training": {"strategy": "dflash", "compact_teacher": True},
                 },
-                "offline text EAGLE3",
+                "strategy 'dflash' does not support compact teacher",
             ),
             (
                 {
