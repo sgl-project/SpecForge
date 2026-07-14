@@ -1,8 +1,9 @@
 # Customize a training run
 
 Customization starts from a typed YAML config. Pick the closest checked-in
-file under [`examples/configs`](../../examples/configs), change model and data
-paths, and keep the same training entry point:
+file under
+[`examples/configs`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs),
+change model and data paths, and keep the same training entry point:
 
 ```bash
 specforge train --config ./my-run.yaml
