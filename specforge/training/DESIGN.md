@@ -14,6 +14,10 @@ tensor-carrying `TrainBatch` stream into optimizer steps and checkpoints.
 topology-owned stream context, invokes the internal `TrainerController` over its
 private loader, exits the context, and writes the final checkpoint when the
 last optimizer step was not already saved by the periodic checkpoint path.
+For the disaggregated online consumer, that same lifecycle then publishes its
+terminal done/failed signal and always stops the rank-0 ref distributor. Direct
+Python builder callers therefore receive the same cleanup guarantees as the
+CLI; there is no second wrapper-owned training lifecycle.
 
 Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
