@@ -3,9 +3,9 @@ import tempfile
 import unittest
 
 import torch
+from datasets import Dataset
 from transformers import AutoTokenizer
 
-from datasets import Dataset
 from specforge.data.preprocessing import build_eagle3_dataset
 from specforge.utils import safe_conversations_generator
 

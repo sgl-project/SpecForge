@@ -39,10 +39,10 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+from datasets import Dataset
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from datasets import Dataset
 from specforge.data.preprocessing import build_eagle3_dataset
 from specforge.data.utils import prepare_dp_dataloaders
 from specforge.distributed import (
