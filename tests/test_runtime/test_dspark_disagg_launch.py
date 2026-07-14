@@ -14,9 +14,11 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
 
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("dspark")
 
 
 @unittest.skipUnless(CUDA, "DSpark disaggregated optimizer gate requires CUDA")
@@ -61,7 +63,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
         logged_metrics = []
 
         trainer = build_disagg_online_consumer(
-            strategy="dspark",
+            algorithm=ALGORITHM,
             feature_store=consumer_store,
             channel=channel,
             draft_model=model,

@@ -14,7 +14,10 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
+
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("domino")
 
 
 class TestDominoLambdaSchedule(unittest.TestCase):
@@ -81,7 +84,7 @@ class TestDominoOfflineLaunch(unittest.TestCase):
             )
 
         trainer = build_offline_runtime(
-            strategy="domino",
+            algorithm=ALGORITHM,
             hidden_states_path=feature_dir,
             draft_model=model,
             target_head=None,

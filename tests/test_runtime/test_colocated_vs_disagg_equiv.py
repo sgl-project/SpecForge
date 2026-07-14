@@ -12,9 +12,11 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
 
 def _optimizer_factory(module):
@@ -76,7 +78,7 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
 
                 local_losses = []
                 local_trainer = build_offline_runtime(
-                    strategy="eagle3",
+                    algorithm=ALGORITHM,
                     hidden_states_path=feature_dir,
                     draft_model=local_model,
                     target_head=local_head,
@@ -94,7 +96,7 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
                 )
                 disagg_losses = []
                 disagg_trainer = build_disagg_offline_runtime(
-                    strategy="eagle3",
+                    algorithm=ALGORITHM,
                     feature_store=shared_store,
                     refs=disagg_refs,
                     draft_model=disagg_model,

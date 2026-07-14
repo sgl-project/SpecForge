@@ -13,9 +13,11 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
 
 def _optimizer_factory(module):
@@ -80,7 +82,7 @@ class TestEquivOfflineEagle3(unittest.TestCase):
 
                 logged = []
                 trainer = build_offline_runtime(
-                    strategy="eagle3",
+                    algorithm=ALGORITHM,
                     hidden_states_path=feature_dir,
                     draft_model=model,
                     target_head=target_head,

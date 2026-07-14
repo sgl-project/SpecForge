@@ -7,7 +7,10 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
+
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
 
 @unittest.skipUnless(CUDA, "DFlash offline launcher requires CUDA")
@@ -49,7 +52,7 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
             )
 
         trainer = build_offline_runtime(
-            strategy="dflash",
+            algorithm=ALGORITHM,
             hidden_states_path=feature_dir,
             draft_model=model,
             target_head=None,
