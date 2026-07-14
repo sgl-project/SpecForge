@@ -1,0 +1,1 @@
+"""Static package-boundary tests."""
