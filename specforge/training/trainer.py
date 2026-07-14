@@ -18,7 +18,7 @@ ref source + store the Trainer is handed — the loader IS the stream.
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Optional
+from typing import Callable, Optional
 
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -57,6 +57,9 @@ class Trainer:
         resume_from: Optional[str] = None,
         max_checkpoints: int = 0,
         fit_context=None,
+        on_fit_success: Optional[Callable[[int], None]] = None,
+        on_fit_failure: Optional[Callable[[BaseException], None]] = None,
+        on_fit_finally: Optional[Callable[[], None]] = None,
     ):
         # Fixed offline refs never enter an online staging queue. The loader
         # releases each feature as it consumes it and can re-iterate the same
@@ -214,6 +217,9 @@ class Trainer:
         self._controller = controller_obj
         self._loader = loader
         self._fit_context = fit_context
+        self._on_fit_success = on_fit_success
+        self._on_fit_failure = on_fit_failure
+        self._on_fit_finally = on_fit_finally
 
     @property
     def global_step(self) -> int:
@@ -229,12 +235,24 @@ class Trainer:
 
     def fit(self) -> int:
         """Run the one trainer lifecycle and leave a final checkpoint."""
-        context = self._fit_context if self._fit_context is not None else nullcontext()
-        with context:
-            step = self._controller.fit(self._loader)
-        if step > 0 and self.last_checkpoint_step != step:
-            self.save_checkpoint()
-        return step
+        try:
+            context = (
+                self._fit_context if self._fit_context is not None else nullcontext()
+            )
+            with context:
+                step = self._controller.fit(self._loader)
+            if step > 0 and self.last_checkpoint_step != step:
+                self.save_checkpoint()
+            if self._on_fit_success is not None:
+                self._on_fit_success(step)
+            return step
+        except BaseException as exc:
+            if self._on_fit_failure is not None:
+                self._on_fit_failure(exc)
+            raise
+        finally:
+            if self._on_fit_finally is not None:
+                self._on_fit_finally()
 
     def save_checkpoint(self):
         """Persist the current optimizer step through the one trainer surface."""

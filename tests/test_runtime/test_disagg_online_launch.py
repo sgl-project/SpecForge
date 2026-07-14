@@ -115,7 +115,6 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         )
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
-        self.addCleanup(trainer.ref_distributor.stop)
 
         # Consumer setup publishes the optimizer-window contract before capture.
         produced = drive_producer()
@@ -130,6 +129,10 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         self.assertEqual(len(marker["acked"]), N)
         self.assertEqual(marker["global_step"], MAX_OPT_STEPS)
         self.assertTrue(marker["optimizer_durable"])
+        self.assertTrue(os.path.exists(channel.path + ".consumer_done"))
+        self.assertFalse(os.path.exists(channel.path + ".consumer_failed"))
+        self.assertIsNotNone(trainer.ref_distributor._thread)
+        self.assertFalse(trainer.ref_distributor._thread.is_alive())
         # Consume-once release occurs while materializing each ref, before the
         # final yielded batch can return to the inbox-ack generator.
         self.assertEqual(backend._d, {})

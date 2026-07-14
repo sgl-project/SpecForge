@@ -24,8 +24,12 @@ class DomainTrainerWiringTest(unittest.TestCase):
         fit_step=42,
         checkpointed_step=None,
         fit_context=None,
+        fit_error=None,
         save_error=None,
         events=None,
+        on_fit_success=None,
+        on_fit_failure=None,
+        on_fit_finally=None,
     ):
         import specforge.training.trainer as tr
 
@@ -68,6 +72,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
             def fit(self, loader):
                 cap["fit"] = loader
                 events.append("fit")
+                if fit_error is not None:
+                    raise fit_error
                 self.global_step = fit_step
                 return fit_step
 
@@ -129,6 +135,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 collate_fn="COLLATE",
                 durable_ack=durable_ack,
                 fit_context=fit_context,
+                on_fit_success=on_fit_success,
+                on_fit_failure=on_fit_failure,
+                on_fit_finally=on_fit_finally,
             )
         return trainer, cap, dfc_calls, model
 
@@ -199,6 +208,42 @@ class DomainTrainerWiringTest(unittest.TestCase):
         )
         self.assertEqual(trainer.fit(), 42)
         self.assertEqual(events, ["enter", "fit", "exit", "save"])
+
+    def test_fit_owns_terminal_success_and_cleanup_after_checkpoint(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        trainer, _, _, _ = self._build(
+            {"refs": list(range(6))},
+            events=events,
+            on_fit_success=lambda step: events.append(f"success:{step}"),
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+        self.assertEqual(trainer.fit(), 42)
+        self.assertEqual(events, ["fit", "save", "success:42", "finally"])
+
+    def test_fit_owns_terminal_failure_and_cleanup(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        error = RuntimeError("fit failed")
+        trainer, _, _, _ = self._build(
+            {"refs": list(range(6))},
+            fit_error=error,
+            events=events,
+            on_fit_success=lambda step: events.append(f"success:{step}"),
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            trainer.fit()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(events, ["fit", "failure:fit failed", "finally"])
 
     def test_zero_step_skips_final_checkpoint(self):
         try:

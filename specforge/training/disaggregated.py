@@ -487,30 +487,7 @@ def _build_online(
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
     )
 
-    def mark_consumer_done(_step: int) -> None:
-        if _primary_rank():
-            channel.mark_consumer_done()
-
-    def mark_consumer_failed(exc: BaseException) -> None:
-        try:
-            channel.mark_consumer_failed(f"{type(exc).__name__}: {exc}")
-        except Exception as signal_exc:
-            print(
-                f"failed to publish consumer failure: {signal_exc}",
-                flush=True,
-            )
-
-    def stop_distributor() -> None:
-        distributor = getattr(trainer, "ref_distributor", None)
-        if distributor is not None:
-            distributor.stop()
-
-    return TrainingRun(
-        trainer=trainer,
-        on_success=mark_consumer_done,
-        on_failure=mark_consumer_failed,
-        on_finally=stop_distributor,
-    )
+    return TrainingRun(trainer=trainer)
 
 
 def build_disaggregated_run(

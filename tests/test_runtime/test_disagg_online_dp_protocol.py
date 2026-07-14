@@ -18,6 +18,8 @@ import traceback
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 try:
     import torch.distributed as dist
@@ -38,6 +40,25 @@ class _PathOnlyChannel:
 
     def __init__(self, path: str) -> None:
         self.path = path
+
+
+class _FakeRefDistributor:
+    """Lifecycle probe used before any model/FSDP construction."""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.started = False
+        self.stopped = False
+
+    @staticmethod
+    def inbox_path(inbox_dir: str, dp_rank: int) -> str:
+        return os.path.join(inbox_dir, f"inbox-rank{dp_rank}.jsonl")
+
+    def start(self):
+        self.started = True
+        return self
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 def _write_result(results_dir: str, rank: int, payload: dict) -> None:
@@ -271,6 +292,79 @@ class TestDisaggOnlineDPProtocol(unittest.TestCase):
             self.assertEqual(acked, ["rank-0", "rank-1", "shared"])
             self.assertEqual(json.loads(marker["global_step"]), 17)
             self.assertTrue(json.loads(marker["optimizer_durable"]))
+
+
+@unittest.skipUnless(dist is not None and dist.is_available(), "requires torch")
+class TestSingleRankConsumerLifecycle(unittest.TestCase):
+    def _build(self, work: str, *, assembly_error=None):
+        from specforge.launch import build_disagg_online_consumer
+        from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
+        from specforge.runtime.data_plane.streaming_ref_channel import (
+            StreamingRefChannel,
+        )
+
+        captured = {}
+
+        def assemble(**kwargs):
+            captured.update(kwargs)
+            if assembly_error is not None:
+                raise assembly_error
+            return SimpleNamespace()
+
+        channel = StreamingRefChannel(os.path.join(work, "refs.jsonl"))
+        with (
+            mock.patch.object(dist, "is_initialized", return_value=False),
+            mock.patch(
+                "specforge.runtime.data_plane.ref_distributor.RefDistributor",
+                _FakeRefDistributor,
+            ),
+            mock.patch("specforge.launch._assemble_trainer", side_effect=assemble),
+        ):
+            trainer = build_disagg_online_consumer(
+                feature_store=object(),
+                channel=channel,
+                draft_model=object(),
+                optimizer_factory=object(),
+                run_id="consumer-lifecycle",
+                output_dir=work,
+                metadata_store=InMemoryMetadataStore(),
+                inbox_dir=os.path.join(work, "inboxes"),
+            )
+        return trainer, channel, captured
+
+    def test_direct_builder_success_signals_done_and_stops_distributor(self):
+        with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_") as work:
+            trainer, channel, captured = self._build(work)
+            self.assertTrue(trainer.ref_distributor.started)
+
+            captured["on_fit_success"](3)
+            captured["on_fit_finally"]()
+
+            self.assertTrue(channel.consumer_stopped())
+            self.assertIsNone(channel.consumer_failure())
+            self.assertTrue(trainer.ref_distributor.stopped)
+
+    def test_direct_builder_failure_signals_and_stops_distributor(self):
+        with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_") as work:
+            trainer, channel, captured = self._build(work)
+
+            captured["on_fit_failure"](RuntimeError("optimizer failed"))
+            captured["on_fit_finally"]()
+
+            self.assertEqual(
+                channel.consumer_failure(), "RuntimeError: optimizer failed"
+            )
+            self.assertTrue(trainer.ref_distributor.stopped)
+
+    def test_assembly_failure_notifies_producer_before_fit_exists(self):
+        with tempfile.TemporaryDirectory(prefix="consumer_lifecycle_") as work:
+            error = RuntimeError("assembly failed")
+            with self.assertRaises(RuntimeError) as raised:
+                self._build(work, assembly_error=error)
+            self.assertIs(raised.exception, error)
+            channel_path = os.path.join(work, "refs.jsonl")
+            with open(channel_path + ".consumer_failed", encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), "RuntimeError: assembly failed")
 
 
 if __name__ == "__main__":

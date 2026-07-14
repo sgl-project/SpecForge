@@ -17,7 +17,7 @@ is a registry entry, not a new ``build_*`` family.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from specforge.runtime.contracts import SampleRef
 from specforge.runtime.control_plane import DataFlowController
@@ -67,6 +67,9 @@ def _assemble_trainer(
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
     fit_context=None,
+    on_fit_success: Optional[Callable[[int], None]] = None,
+    on_fit_failure: Optional[Callable[[BaseException], None]] = None,
+    on_fit_finally: Optional[Callable[[], None]] = None,
 ):
     """Delegate to the domain ``Trainer`` (``specforge.training``) — the one
     assembly (FSDP wrap, optimizer-after-wrap, per-step strategy, loader, acks)
@@ -99,6 +102,9 @@ def _assemble_trainer(
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
         fit_context=fit_context,
+        on_fit_success=on_fit_success,
+        on_fit_failure=on_fit_failure,
+        on_fit_finally=on_fit_finally,
     )
     return trainer
 
@@ -1112,35 +1118,62 @@ def build_disagg_online_consumer(
     inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
     queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
 
-    trainer = _assemble_trainer(
-        spec=spec,
-        controller=controller,
-        store=feature_store,
-        ref_source={"queue": queue},
-        model=draft_model,
-        target_head=target_head if spec.uses_target_head else None,
-        optimizer_factory=optimizer_factory,
-        run_id=run_id,
-        output_dir=output_dir,
-        batch_size=batch_size,
-        accumulation_steps=accumulation_steps,
-        num_epochs=1,
-        max_steps=max_steps,
-        total_steps=total_steps,
-        save_interval=save_interval,
-        logger=logger,
-        log_interval=log_interval,
-        collate_fn=_online_collate(spec, collate_fn),
-        strategy_kwargs=strategy_kwargs,
-        per_sample_transform=None,
-        max_checkpoints=max_checkpoints,
-    )
-    #: rank 0's RefDistributor handle (None elsewhere) — callers may
-    #: stop() it after fit for a clean early (max_steps) shutdown.
-    trainer.ref_distributor = distributor
-    if distributor is not None:
-        distributor.start()
-    return trainer
+    def mark_consumer_done(_step: int) -> None:
+        if dp_rank == 0:
+            channel.mark_consumer_done()
+
+    def mark_consumer_failed(exc: BaseException) -> None:
+        # Every rank may report failure: a non-authority rank can fail while
+        # rank 0 is blocked in a distributed collective. Publishing the same
+        # terminal sidecar is idempotent and lets the producer stop promptly.
+        try:
+            channel.mark_consumer_failed(f"{type(exc).__name__}: {exc}")
+        except Exception as signal_exc:
+            print(f"failed to publish consumer failure: {signal_exc}", flush=True)
+
+    def stop_distributor() -> None:
+        if distributor is not None:
+            distributor.stop()
+
+    try:
+        trainer = _assemble_trainer(
+            spec=spec,
+            controller=controller,
+            store=feature_store,
+            ref_source={"queue": queue},
+            model=draft_model,
+            target_head=target_head if spec.uses_target_head else None,
+            optimizer_factory=optimizer_factory,
+            run_id=run_id,
+            output_dir=output_dir,
+            batch_size=batch_size,
+            accumulation_steps=accumulation_steps,
+            num_epochs=1,
+            max_steps=max_steps,
+            total_steps=total_steps,
+            save_interval=save_interval,
+            logger=logger,
+            log_interval=log_interval,
+            collate_fn=_online_collate(spec, collate_fn),
+            strategy_kwargs=strategy_kwargs,
+            per_sample_transform=None,
+            max_checkpoints=max_checkpoints,
+            on_fit_success=mark_consumer_done,
+            on_fit_failure=mark_consumer_failed,
+            on_fit_finally=stop_distributor,
+        )
+        #: Rank 0's lifecycle-owned RefDistributor handle (None elsewhere), exposed
+        #: for runtime observability. ``Trainer.fit()`` always stops it.
+        trainer.ref_distributor = distributor
+        if distributor is not None:
+            distributor.start()
+        return trainer
+    except BaseException as exc:
+        # The canonical builder also owns failures before ``Trainer.fit`` can
+        # take over, so a direct Python caller cannot strand its producer.
+        mark_consumer_failed(exc)
+        stop_distributor()
+        raise
 
 
 __all__ = [
