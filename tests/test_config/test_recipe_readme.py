@@ -18,7 +18,6 @@ from specforge.config import (
     TrainingConfig,
 )
 
-
 ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "examples" / "configs" / "README.md"
 
@@ -54,4 +53,6 @@ def test_recipe_readme_names_every_typed_config_field():
             if f"`{path}`" not in text:
                 missing.append(path)
 
-    assert not missing, f"examples/configs/README.md is missing config fields: {missing}"
+    assert (
+        not missing
+    ), f"examples/configs/README.md is missing config fields: {missing}"
