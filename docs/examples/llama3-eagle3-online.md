@@ -1,75 +1,104 @@
-# Eagle3 for Llama3 - Online
+# EAGLE3 for Llama 3.1 8B: online training
 
-## Introduction
+Online training captures the target model's hidden states while the draft model
+is training. This walkthrough uses ShareGPT for a small example; a broader,
+target-regenerated dataset is recommended for production checkpoints.
 
-This document provides a step-by-step guide on how to train the EAGLE3 model for the Llama3.1-8B-Instruct model in an online manner. In online training, we generate the hidden states required by EAGLE3 draft model on the fly during training. This example is using `ShareGPT` dataset for training, the performance is not optimal due to the size and limited coverage of the dataset. If you look for optimal performance, we recommend you to try more diverse datasets such as [`Perfect-Blend`](https://huggingface.co/datasets/facebook/perfect-blend). We have also included a section on training on `Perfect-Blend` dataset at the end of this document.
+## 1. Prepare ShareGPT
 
+Run from the repository root:
 
-## Training on ShareGPT dataset
-
-### **Step 1. Prepare ShareGPT dataset**
-
-First of all, we should download the dataset.
-
-```shell
+```bash
 python ./scripts/prepare_data.py --dataset sharegpt
 ```
 
-### **Step 2. Launch Online Training**
+## 2. Create the run config
 
-```shell
-torchrun \
-    --standalone \
-    --nproc_per_node 8 \
-    scripts/train_eagle3.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config configs/llama3-8B-eagle3.json \
-    --train-data-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-dir ./outputs/llama3-8b-eagle3 \
-    --num-epochs 2 \
-    --batch-size 1 \
-    --learning-rate 1e-4 \
-    --max-length 4096 \
-    --chat-template llama3 \
-    --target-model-backend sglang \
+Create `llama3-eagle3-online.yaml` with the following contents. This is the same
+typed contract used by the checked-in [Qwen online
+example](../../examples/configs/qwen3-8b-eagle3-online.yaml).
+
+```yaml
+model:
+  target_model_path: meta-llama/Llama-3.1-8B-Instruct
+  draft_model_config: configs/llama3-8B-eagle3.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 4096
+  chat_template: llama3
+  build_dataset_num_proc: 32
+  cache_dir: ./cache
+
+training:
+  strategy: eagle3
+  deployment_mode: local_colocated
+  num_epochs: 2
+  batch_size: 1
+  learning_rate: 1.0e-4
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: flex_attention
+  save_interval: 1000
+  log_interval: 50
+
+run_id: llama3-8b-eagle3-online
+output_dir: ./outputs/llama3-8b-eagle3-online
 ```
 
-### **Step 3. Benchmark**
+## 3. Train
 
-For `Llama3.1-8B`, we add a system prompt to all training data, following the approach used in the official repository. Consequently, when benchmarking, we should also include this system prompt to obtain the full accept length. Please uncomment the corresponding line and add the system prompt.
+```bash
+specforge train --config ./llama3-eagle3-online.yaml
+```
 
-The four numbers in the config represent: `batch_size, num_steps, topk, num_verify_tokens`.  You can adjust the values in the config list to experiment with different test cases.
+Colocated training is currently single-rank. For a short smoke run, override
+`training.max_steps` to a small value.
 
-A pre-trained EAGLE model is available at [zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct) for reference.
+To train on Perfect-Blend, prepare it with
+`python ./scripts/prepare_data.py --dataset perfectblend`, then point the same
+config at the generated file:
 
-```shell
-cd benchmarks
+```bash
+specforge train \
+  --config ./llama3-eagle3-online.yaml \
+  data.train_data_path=./cache/dataset/perfectblend_train.jsonl
+```
 
+## 4. Export and benchmark
+
+Llama 3.1 8B training and benchmarking should use the same system prompt. A
+reference draft checkpoint is available at
+[zhuyksir/EAGLE3-Llama-3.1-8B-Instruct](https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct).
+
+The runtime checkpoint contains training state, but the unified CLI does not
+support resuming any online stream in this PR. It is also not directly loadable
+by the SGLang speculative decoder. Export the final checkpoint first:
+
+```bash
+specforge export --to sglang \
+  --checkpoint ./outputs/llama3-8b-eagle3-online/llama3-8b-eagle3-online-latest \
+  --draft-config configs/llama3-8B-eagle3.json \
+  --output-dir ./exports/llama3-8b-eagle3-sglang
+```
+
+From the `benchmarks` directory, point `--speculative-draft-model-path` at the
+exported directory:
+
+```bash
 config_list=(
     "4,3,1,4"
     "4,7,10,60"
 )
 python3 bench_eagle3.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path /YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/epoch_0 \
+    --speculative-draft-model-path ../exports/llama3-8b-eagle3-sglang \
     --port 30000 \
     --mem-fraction-static 0.8 \
     --tp-size 1 \
     --config-list "${config_list[@]}" \
     --benchmark-list mtbench gsm8k humaneval math500
 ```
-
-
-## Training on Perfect-Blend dataset
-
-### **Step 1. Prepare Perfect-Blend dataset**
-
-First of all, we should download the dataset.
-
-```shell
-python ./scripts/prepare_data.py --dataset perfectblend
-```
-
-### **Step 2. Launch Online Training**
-
-We just need to change the `--train-data-path` to the path of the Perfect-Blend dataset (e.g. `./cache/dataset/perfectblend_train.jsonl`), then we can launch training smoothly.

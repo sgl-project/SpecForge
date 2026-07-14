@@ -17,13 +17,19 @@ lever below is an env knob that is off by default.
 
 ```bash
 U=http://127.0.0.1:30000
+export DISAGG_REF_CHANNEL=/shared/control/domino-dp7.refs.jsonl
+export DISAGG_DB=/shared/control/domino-dp7.sqlite
 export DISAGG_SERVER_URLS="$U,$U,$U,$U,$U,$U,$U,$U"   # 8 concurrent producer workers
 export CLONE_ON_FETCH=0        # skip the redundant clone on the mooncake zero-copy path
 export LOADER_PREFETCH=2       # background-thread batch prefetch (hide fetch latency)
 export SERVER_MEM_FRACTION=0.5 # right-size the server KV reservation (126 GB -> ~78 GB)
 ACCUM=8 BATCH_SIZE=2 MOONCAKE_PROTOCOL=rdma MOONCAKE_RDMA_DEVICES=mlx5_0,...,mlx5_7
-# then the usual run_qwen3_8b_domino_disagg_1srv_dp7.sh invocation
+# then run the producer/consumer roles through examples/disagg/run_role.sh
 ```
+
+The channel and database paths are required launch state, not tuning knobs.
+Choose fresh paths for each attempt, and place `DISAGG_DB` where every consumer
+rank can see it. The public CLI does not resume online runs in this PR.
 
 ## What each lever does (and why)
 

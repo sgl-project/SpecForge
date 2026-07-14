@@ -221,6 +221,17 @@ class TestRefDistributor(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ref-distributor died"):
                 StreamingRefQueue(reader).get(1)
 
+    def test_producer_failure_immediately_poisons_all_inboxes(self):
+        dist = self._distributor(dp_size=2)
+        self.producer.fail("capture server died")
+        dist._run_guarded()
+        self.assertIsInstance(dist.error, RuntimeError)
+        self.assertIn("capture server died", str(dist.error))
+        for rank in range(2):
+            reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            with self.assertRaisesRegex(RuntimeError, "capture server died"):
+                StreamingRefQueue(reader).get(1)
+
     def test_idle_timeout_raises_when_producer_silent(self):
         clock = {"t": 0.0}
         dist = self._distributor(

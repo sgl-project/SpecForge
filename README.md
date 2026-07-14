@@ -18,7 +18,8 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 We have seen many open-source projects for speculative decoding, but most of them are not well-maintained or not directly compatible with SGLang. We prepared this project because we wish that the open-source community can enjoy a speculative decoding framework that is
 - regularly maintained by the SpecForge team: the code is runnable out-of-the-box
 - directly compatible with SGLang: there is no additional efforts for porting to SGLang
-- provide performant training capabilities: we provided online/offline/tensor-parallel/FSDP to suit your needs
+- provide one-GPU colocated/offline training and online-disaggregated
+  data-parallel training through one runtime
 
 
 Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get started.
@@ -26,11 +27,28 @@ Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get star
 
 ## 🔧 Supported Methods
 
-| Method | Description | Training | Example | Optimization |
-| --- | --- | --- | --- | --- |
-| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [`scripts/train_eagle3.py`](./scripts/train_eagle3.py) | [`examples/run_qwen3_8b_eagle3_online.sh`](./examples/run_qwen3_8b_eagle3_online.sh) | [LK loss](https://arxiv.org/pdf/2602.23881)
-| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [`scripts/train_dflash.py`](./scripts/train_dflash.py) | [`examples/run_qwen3_8b_dflash_online.sh`](./examples/run_qwen3_8b_dflash_online.sh) | [D-PACE](https://arxiv.org/abs/2605.18810), [D²SD](https://arxiv.org/abs/2606.04446)
-| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [`scripts/train_domino.py`](./scripts/train_domino.py) | [`examples/run_qwen3_8b_domino_online.sh`](./examples/run_qwen3_8b_domino_online.sh) |
+Every method uses the same typed training entry point:
+
+```bash
+specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
+```
+
+Colocated and offline configs currently run on one GPU. Multi-GPU data parallel
+is supported by the online disaggregated consumer described in the training guide.
+Configuration selects the method, data source, and runtime topology; there are
+no method-specific Python training entry points.
+
+| Method | Description | Example config | Optimization |
+| --- | --- | --- | --- |
+| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online](./examples/configs/qwen3-8b-eagle3-online.yaml) / [Offline](./examples/configs/qwen3-8b-eagle3-offline.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
+| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online](./examples/configs/qwen3-8b-dflash-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-dflash-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
+| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online](./examples/configs/qwen3-8b-domino-online.yaml) | — |
+| **DSpark** | Server-captured block-parallel drafting | [Disaggregated](./examples/configs/qwen3-4b-dspark-disaggregated.yaml) | — |
+| **P-EAGLE** | Parallel EAGLE training | [Online](./examples/configs/qwen3-8b-peagle-online.yaml) | — |
+
+See the [training guide](./docs/basic_usage/training.md) for the supported
+method/topology matrix. Unsupported combinations are rejected during config
+validation or run assembly instead of falling back to an older trainer.
 
 
 ## 🚀 Accelerate with SpecBundle
@@ -47,7 +65,6 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 ## 🎉 News
 
-- [2026-06] 🔥 Added D²SD's DTA training as an optional training mode for DFlash training
 - [2026-06] 🔥 Added D-PACE as an optional loss for DFlash training.
 - [2026-06] 🔥 Added Domino online training for DFlash draft models.
 - [2026-01] 🔥 Added DFlash block-parallel online training with SGLang serving support.

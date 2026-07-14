@@ -1,9 +1,10 @@
-# Inference Plane Design (PR 5/7 — `runtime/inference`)
+# Inference Plane Design (`specforge.inference`)
 
 This is the design note for the **inference**, scoped to this plane.
 The cross-plane picture (whole-system map, endpoint reference, autonomy) lives in
-`ARCHITECTURE.md`, added in the integration PR (7/7); the shared records every
-plane exchanges are in [`../contracts.py`](../contracts.py).
+[`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md); the shared records
+every plane exchanges are in
+[`../runtime/contracts.py`](../runtime/contracts.py).
 
 ## Responsibility
 

@@ -23,22 +23,17 @@ in-process ``OfflineManifestReader.read()`` list. The control-plane invariant
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from typing import List, Optional
 
-from specforge.runtime.contracts import (
-    SCHEMA_VERSION,
-    FeatureSpec,
-    SampleRef,
-    assert_no_tensors,
-)
+from specforge.runtime.contracts import SCHEMA_VERSION, SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.feature_store import FeatureStore, load_feature_file
 from specforge.runtime.data_plane.offline_reader import (
     _OFFLINE_EAGLE3_KEYS,
     list_feature_files,
 )
+from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
 
 
 def ingest_offline_features(
@@ -88,18 +83,6 @@ def ingest_offline_features(
     return refs
 
 
-def _ref_to_dict(ref: SampleRef) -> dict:
-    return dataclasses.asdict(ref)  # nested FeatureSpec -> dict; shape tuple -> list
-
-
-def _ref_from_dict(d: dict) -> SampleRef:
-    specs = {
-        name: FeatureSpec(**{**spec, "shape": tuple(spec["shape"])})
-        for name, spec in d["feature_specs"].items()
-    }
-    return SampleRef(**{**d, "feature_specs": specs})
-
-
 def write_ref_manifest(refs: List[SampleRef], path: str) -> None:
     """Atomically write the tensor-free ref manifest the consumer reads.
 
@@ -109,7 +92,7 @@ def write_ref_manifest(refs: List[SampleRef], path: str) -> None:
     assert_no_tensors(refs)
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "refs": [_ref_to_dict(r) for r in refs],
+        "refs": [ref_to_dict(r) for r in refs],
     }
     tmp = path + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -122,7 +105,7 @@ def read_ref_manifest(path: str) -> List[SampleRef]:
     """Read a ref manifest written by :func:`write_ref_manifest`."""
     with open(path) as f:
         payload = json.load(f)
-    return [_ref_from_dict(d) for d in payload["refs"]]
+    return [ref_from_dict(d) for d in payload["refs"]]
 
 
 __all__ = ["ingest_offline_features", "write_ref_manifest", "read_ref_manifest"]

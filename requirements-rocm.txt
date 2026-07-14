@@ -8,11 +8,9 @@ qwen-vl-utils==0.0.11
 datasets
 setuptools
 tqdm
-wandb
 psutil
 numpy
 accelerate
 pydantic
 sglang[all]==0.5.4
 openai-harmony
-tensorboard

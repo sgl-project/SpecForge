@@ -1,7 +1,8 @@
 # SpecForge DataFlow Runtime (M1–M4)
 
-A minimal, DataFlow-centered layer over the existing SpecForge model/data code.
-It moves SpecForge from a trainer-centered god-script toward explicit contracts:
+A minimal, DataFlow-centered substrate over the existing SpecForge model/data
+code. It moves SpecForge from a trainer-centered god-script toward explicit
+contracts:
 
 ```
 PromptTask -> RolloutWorker -> SampleRef -> FeatureDataLoader -> TrainBatch -> Trainer
@@ -14,29 +15,34 @@ trainer path has no online/offline branch. Existing model/data/distributed code
 is reused, not rewritten — the runtime is plumbing around the existing ops, which
 is why the equivalence gates are bit-exact.
 
+`specforge.runtime` contains only the shared contracts plus the control and data
+planes. The inference and training compute planes live in their top-level
+packages; old `specforge.runtime.{inference,training}` import paths are not kept.
+
 ## Layout
 
 ```
-specforge/runtime/
-  contracts.py            # PromptTask, FeatureSpec, SampleRef, FeatureHandle,
+specforge/
+  runtime/                # transport substrate; no compute-plane compatibility shims
+    contracts.py          # PromptTask, FeatureSpec, SampleRef, FeatureHandle,
                           #   TrainBatch, assert_no_tensors
-  control_plane/
-    controller.py         # DataFlowController (in-process; no-tensor invariant)
-  data_plane/
-    feature_store.py      # FeatureStore ABC + LocalFeatureStore (mem + file + dump)
-    sample_ref_queue.py   # SampleRefQueue (lease / ack / fail / depth)
-    offline_reader.py     # OfflineManifestReader (.ckpt -> SampleRef)
-    feature_dataloader.py # FeatureDataLoader (SampleRef -> TrainBatch)
-  inference/
+    control_plane/
+      controller.py       # DataFlowController (in-process; no-tensor invariant)
+    data_plane/
+      feature_store.py    # FeatureStore ABC + LocalFeatureStore (mem + file + dump)
+      sample_ref_queue.py # SampleRefQueue (lease / ack / fail / depth)
+      offline_reader.py   # OfflineManifestReader (.ckpt -> SampleRef)
+      feature_dataloader.py # FeatureDataLoader (SampleRef -> TrainBatch)
+  inference/              # rollout/capture compute plane
     capture.py            # CaptureConfig + verify_capture (B7/B8)
     rollout_worker.py     # RolloutWorker (strategy-agnostic)
-    adapters/             # PolicyFeatureAdapter.generate_features (the SpecForge<->engine seam)
-    sglang_patch_inventory.md  # patch surface + supported-version matrix (M4)
-  training/
-    strategy.py           # DraftTrainStrategy ABC + Eagle3/DFlash strategies
-    backend.py            # TrainingBackend ABC + FSDPTrainingBackend + ParallelConfig
-    trainer.py            # TrainerCore (branch-free) + TrainerController + Checkpoint
-  launch.py               # wire the offline-EAGLE3 dataflow from a config
+    adapters/             # PolicyFeatureAdapter (SpecForge <-> engine seam)
+    target_engine/        # TargetEngine backends and capture policies
+  training/               # training compute plane
+    controller.py         # TrainerCore + TrainerController
+    backend.py            # TrainingBackend + FSDPTrainingBackend
+    strategies/           # DraftTrainStrategy implementations and registry
+  launch.py               # wire DataFlow runs from typed config
 ```
 
 ## Key decisions honored (ADRs)
@@ -54,11 +60,9 @@ specforge/runtime/
 
 ## Milestone status & exit-gate tests
 
-This branch implements the local DataFlow spine and the focused tests below. It
-does **not** complete every acceptance item from the refactor plan: the
-`WeightVersion` serving accept-length gate, full optimizer/scheduler resume, and
-moving the production DFlash script onto the shared lifecycle remain follow-up
-work.
+The DataFlow spine is the sole training lifecycle for EAGLE3, DFlash, Domino,
+DSpark, and P-EAGLE. The focused gates below cover its control/data contracts,
+checkpoint lifecycle, and strategy seams.
 
 | M | Gate test (`tests/test_runtime/`) | Where it runs |
 |---|---|---|
@@ -66,7 +70,7 @@ work.
 | **M1** | `test_equiv_offline_eagle3.py` (offline bit-exact vs `run_forward`) | GPU (rcli) |
 | **M2** | `test_equiv_online_eagle3.py` (online vs legacy, BS=1) | GPU (rcli) |
 | **M2** | `test_sample_ref_queue.py`, `test_rollout_worker.py` (lease/ack, commit) | CPU/CI |
-| **M3** | `test_equiv_trainer_split.py` (paired single step) | GPU (rcli) |
+| **M3** | `test_no_sync_equiv.py` (accumulation/FSDP equivalence) | GPU (rcli) |
 | **M3** | `test_checkpoint_resume.py` | GPU (rcli) |
 | **M3** | `test_trainer.py`, `test_seam_fixes.py` (core/accum/checkpoint/DFlash plug-in) | CPU/CI |
 | **M4** | `test_extraction_vs_hf_reference.py::test_extraction_vs_hf_reference` | GPU (rcli) |

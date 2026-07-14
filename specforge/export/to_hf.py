@@ -9,8 +9,9 @@
 """Export a DataFlow training checkpoint to an HF-format draft directory.
 
 The output loads back through ``AutoEagle3DraftModel.from_pretrained`` (e.g. to
-finetune from it). Embeddings are absent by design — training reloads them from
-the target via ``load_embedding``.
+finetune from it). EAGLE-family embeddings may be absent by design — training
+reloads frozen embeddings from the target — while DFlash-family drafts do not
+own an embedding at all.
 """
 
 from __future__ import annotations
@@ -82,7 +83,9 @@ def export_to_hf(
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )
-    if "embed_tokens.weight" not in state["draft_state_dict"]:
+    full_state = dict(model.state_dict())
+    owns_embedding = hasattr(model, "embed_tokens")
+    if owns_embedding and "embed_tokens.weight" not in state["draft_state_dict"]:
         if not embedding_source:
             raise ValueError(
                 "checkpoint has no embed_tokens.weight (draft checkpoints "
@@ -92,9 +95,9 @@ def export_to_hf(
         load_embedding = getattr(model, "load_embedding", None)
         if load_embedding is not None:
             load_embedding(embedding_source, embedding_key=embedding_key)
-    full_state = dict(model.state_dict())
     if (
-        "embed_tokens.weight" not in full_state
+        owns_embedding
+        and "embed_tokens.weight" not in full_state
         and "embed_tokens.weight" not in state["draft_state_dict"]
     ):
         if not embedding_source:

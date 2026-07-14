@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
+from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import Checkpoint, TrainerController, TrainerCore
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
@@ -224,6 +225,41 @@ class TestResumeDataPosition(unittest.TestCase):
         # epoch 0 resumes at b3; epoch 1 is complete
         self.assertEqual(strat.seen, ["b3", "b4", "b0", "b1", "b2", "b3", "b4"])
         self.assertEqual(ctrl._epoch_batch, 0)  # reset when the epoch completes
+
+    def test_natural_exhaustion_checkpoint_records_completed_epochs(self):
+        strat = RecordingStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        data = [_named_batch(i) for i in range(2)]
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core, run_id="r", output_dir=d, num_epochs=2
+            )
+            step = ctrl.fit(data)
+            self.assertEqual(ctrl.epoch, 2)
+            checkpoint = ctrl.save_checkpoint(step)
+            state = CheckpointManager.read_resume_state(checkpoint.checkpoint_uri)
+
+            self.assertEqual(state["epoch"], 2)
+            self.assertEqual(state["epoch_batch"], 0)
+            self.assertEqual(state["epoch_samples"], 0)
+
+            resumed = RecordingStrategy()
+            resumed_core = TrainerCore(
+                resumed, FakeBackend(resumed.model), accumulation_steps=1
+            )
+            resumed_ctrl = TrainerController(
+                resumed_core,
+                run_id="r2",
+                output_dir=d,
+                num_epochs=2,
+                start_step=state["global_step"],
+                start_epoch=state["epoch"],
+                start_batch=state["epoch_batch"],
+                start_samples=state["epoch_samples"],
+            )
+            self.assertEqual(resumed_ctrl.fit(data), step)
+            self.assertEqual(resumed.seen, [])
 
     def test_ctor_rejects_half_specified_position(self):
         # start_batch/start_samples describe ONE position; one without the other

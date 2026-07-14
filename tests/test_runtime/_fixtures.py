@@ -246,7 +246,7 @@ def build_dflash(
     mask_token_id=0,
     attention_backend="sdpa",
 ):
-    """Build a tiny OnlineDFlashModel on cuda, mirroring scripts/train_dflash.build_models.
+    """Build a tiny OnlineDFlashModel on CUDA through the package model pieces.
 
     Returns (dflash_model, hidden_states_width, target_dir, target_layer_ids).
     target_dir holds the saved tiny Qwen3 target (load it as an HF DFlash target for
@@ -259,7 +259,7 @@ def build_dflash(
     from specforge.modeling.draft.dflash import DFlashDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
-    # tiny Qwen3 target saved to disk (draft config is derived from it, as in train_dflash)
+    # Tiny Qwen3 target saved to disk; the draft config is derived from it.
     tcfg = Qwen3Config(
         hidden_size=hidden,
         intermediate_size=2 * hidden,
@@ -315,7 +315,7 @@ def build_domino(
     mask_token_id=0,
     attention_backend="sdpa",
 ):
-    """Build a tiny OnlineDominoModel on cuda, mirroring scripts/train_domino.
+    """Build a tiny OnlineDominoModel on CUDA through the package model pieces.
 
     Domino uses a DFlash-backed DominoDraftModel with a GRU prefix + embed
     projection head. Returns

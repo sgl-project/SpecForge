@@ -1,10 +1,9 @@
 # coding=utf-8
 """Launcher path (online): build_online_eagle3_runtime end to end, single rank.
 
-Online analog of test_offline_launch_fsdp. Drives a RolloutWorker (HF target,
-no sglang) to materialize SampleRefs into the mem:// store, then trains through
-the queue with FSDP + gradient accumulation. Asserts:
-- rollout produced one ref per prompt and the controller carries no tensors;
+Online analog of test_offline_launch_fsdp. Interleaves a RolloutWorker (HF
+target, no sglang) with FSDP training through the bounded mem:// stream. Asserts:
+- rollout residency stays bounded and the controller carries no tensors;
 - the strategy runs forward through the FSDP-wrapped module;
 - fit's global_step counts OPTIMIZER steps (micro_step = ACC * optimizer steps).
 
@@ -23,7 +22,7 @@ CUDA = torch.cuda.is_available()
 
 @unittest.skipUnless(CUDA, "online launcher path requires CUDA")
 class TestOnlineLaunch(unittest.TestCase):
-    def test_online_rollout_then_fsdp_train(self):
+    def test_online_rollout_is_interleaved_with_fsdp_train(self):
         torch.manual_seed(0)
         from tests.test_runtime import _fixtures as fx
 
@@ -79,7 +78,7 @@ class TestOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, drive_rollout = (
+        trainer, loader, workers, controller, run_interleaved = (
             build_online_eagle3_runtime(
                 target_model=target,
                 prompts=prompts,
@@ -98,10 +97,8 @@ class TestOnlineLaunch(unittest.TestCase):
             )
         )
 
-        # Rollout produces exactly one SampleRef per prompt, on the queue.
-        produced = drive_rollout()
-        self.assertEqual(produced, N)
-        self.assertEqual(controller.sample_queue.depth(), N)
+        # Build does not eagerly materialize the prompt pool.
+        self.assertEqual(controller.sample_queue.depth(), 0)
         # control plane carries metadata only
         assert_no_tensors(controller.status())
 
@@ -112,12 +109,14 @@ class TestOnlineLaunch(unittest.TestCase):
         )
         self.assertIsNotNone(trainer.core.backend.optimizer)
 
-        step = trainer.fit(loader)
+        step = run_interleaved()
 
         # global_step counts OPTIMIZER steps; micro_step counts micro-batches.
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.global_step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
+        self.assertEqual(loader.queue.produced_count, ACC * MAX_OPT_STEPS)
+        self.assertLessEqual(loader.queue.peak_resident_samples, 1)
 
 
 if __name__ == "__main__":

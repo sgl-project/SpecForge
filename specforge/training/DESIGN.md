@@ -1,9 +1,10 @@
-# Training Plane Design (PR 6/7 — `runtime/training`)
+# Training Plane Design (`specforge.training`)
 
 This is the design note for the **training**, scoped to this plane.
 The cross-plane picture (whole-system map, endpoint reference, autonomy) lives in
-`ARCHITECTURE.md`, added in the integration PR (7/7); the shared records every
-plane exchanges are in [`../contracts.py`](../contracts.py).
+[`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md); the shared records
+every plane exchanges are in
+[`../runtime/contracts.py`](../runtime/contracts.py).
 
 ## Responsibility
 

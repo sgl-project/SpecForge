@@ -1,57 +1,83 @@
-# Eagle3 for Llama3 - Offline
+# EAGLE3 for Llama 3.1 8B: offline training
 
-## Introduction
+Offline training captures target features ahead of time and reads them from
+disk while training the draft. It reduces GPU memory pressure during training,
+but feature storage can be much larger than the source dataset.
 
-This document provides a step-by-step guide on how to train the EAGLE3 model for the Llama3.1-8B-Instruct model in an offline manner. In offline training, we generate the hidden states required by EAGLE3 draft model beforehand and store them to the disk. During training, we load them back to the GPU memory. As offline training requires a lot of disk space, we do not recommend running this on large datasets such as Perfect-Blend.
+## 1. Prepare ShareGPT
 
-## Training on ShareGPT dataset
-
-### **Step 1. Prepare ShareGPT dataset**
-
-First of all, we should download the dataset.
-
-```shell
+```bash
 python ./scripts/prepare_data.py --dataset sharegpt
 ```
 
-### **Step 2. Prepare Hidden States**
+## 2. Capture hidden states
 
-We need to prepare the hidden states for the training.
+Feature preparation is a data-processing step, not a second training entry
+point:
 
-```shell
-torchrun \
-    --standalone \
-    --nproc_per_node 8 \
-    scripts/prepare_hidden_states.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --enable-aux-hidden-states \
-    --data-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
-    --chat-template llama3 \
-    --max-length 4096 \
-    --tp-size 1 \
-    --batch-size 32
+```bash
+torchrun --standalone --nproc_per_node 8 \
+  scripts/prepare_hidden_states.py \
+  --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+  --enable-aux-hidden-states \
+  --data-path ./cache/dataset/sharegpt_train.jsonl \
+  --output-path ./cache/hidden_states/sharegpt-llama3-8b \
+  --chat-template llama3 \
+  --max-length 4096 \
+  --tp-size 1 \
+  --batch-size 32
 ```
 
-The hidden states will be saved to the disk in the `output-path` directory.
+The output directory contains the feature checkpoints consumed by the unified
+trainer. Offline EAGLE3 with a compact draft vocabulary also needs a matching
+`t2d`/`d2t` mapping generated from the same tokenized training corpus.
 
-### **Step 3. Start Training**
+## 3. Create the run config
 
-```shell
-torchrun \
-    --standalone \
-    --nproc_per_node 8 \
-    ./scripts/train_eagle3.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path ./cache/dataset/sharegpt_train.jsonl \
-    --train-hidden-states-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
-    --output-dir ./outputs/llama3-8b-eagle3-sharegpt-offline \
-    --num-epochs 10 \
-    --batch-size 1 \
-    --tp-size 1 \
-    --learning-rate 1e-4 \
-    --max-length 4096 \
-    --chat-template llama3 \
-    --cache-dir ./cache
+Create `llama3-eagle3-offline.yaml`:
+
+```yaml
+model:
+  target_model_path: meta-llama/Llama-3.1-8B-Instruct
+  draft_model_config: configs/llama3-8B-eagle3.json
+  embedding_key: model.embed_tokens.weight
+  vocab_mapping_path: ./cache/vocab_mapping/llama3-8b-eagle3.pt
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/sharegpt-llama3-8b
+  max_length: 4096
+  chat_template: llama3
+  cache_dir: ./cache
+
+training:
+  strategy: eagle3
+  deployment_mode: local_colocated
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 1.0e-4
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: flex_attention
+  save_interval: 1000
+  log_interval: 50
+
+run_id: llama3-8b-eagle3-offline
+output_dir: ./outputs/llama3-8b-eagle3-offline
 ```
+
+The checked-in [Qwen offline
+config](../../examples/configs/qwen3-8b-eagle3-offline.yaml) is another complete
+reference.
+
+## 4. Train
+
+```bash
+specforge train --config ./llama3-eagle3-offline.yaml
+```
+
+Only EAGLE3 currently accepts offline feature checkpoints. Other strategies
+fail during run assembly instead of interpreting those checkpoints through an
+incompatible feature schema.
+Offline training is currently single-rank; the hidden-state preparation step
+above may still use multiple target-inference workers.

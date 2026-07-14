@@ -453,6 +453,22 @@ class LocalFeatureStore(FeatureStore):
         with self._lock:
             self._free_sample_locked(sample_id)
 
+    def abort_all(self, *, reason: str = "aborted") -> int:
+        """Evict all in-memory samples owned by this private local store.
+
+        Colocated-online runs create one store per lifecycle.  A worker can
+        commit valid samples and then raise on a later sample in the same
+        capture batch, so the caller may not receive every ref needed for
+        per-sample cleanup.  Lifecycle shutdown uses this local-only operation
+        to make that partial-commit path leak-free.  Returns samples evicted.
+        """
+        del reason
+        with self._lock:
+            sample_ids = list(self._mem)
+            for sample_id in sample_ids:
+                self._free_sample_locked(sample_id)
+            return len(sample_ids)
+
     # -- garbage collection / reclamation ----------------------------------
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         """Independent reclamation sweep. Idempotent; safe to call on a timer.

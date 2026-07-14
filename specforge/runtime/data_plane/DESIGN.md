@@ -4,10 +4,10 @@ This is the design note for the **data plane**: the large-tensor storage and
 transfer boundary, plus the two metadata-only iteration sources that feed it and
 the loader that turns references into training batches.
 
-It is one slice of the larger DataFlow refactor. The end-to-end motivation and
-staged plan live in `docs/dataflow_centered_scaleout_refactor_plan.md` on the
-`refactor/specforge-redesign` branch; the shared records this layer exchanges are
-defined in [`runtime/contracts.py`](../contracts.py).
+It is one slice of the DataFlow runtime. The current component boundaries are
+documented in [`runtime/ARCHITECTURE.md`](../ARCHITECTURE.md), while the shared
+records this layer exchanges are defined in
+[`runtime/contracts.py`](../contracts.py).
 
 ## The one load-bearing invariant
 

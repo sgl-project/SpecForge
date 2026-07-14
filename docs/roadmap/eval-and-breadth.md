@@ -1,20 +1,25 @@
 # Eval + Algorithm-Breadth Track
 
+> **Historical planning record.** The evaluator and typed training surface
+> referenced here are implemented. This file records remaining breadth ideas;
+> current commands and supported combinations live in
+> [Training](../basic_usage/training.md).
+
 This track runs **parallel and orthogonal** to the domain refactor (./domain-refactor.md)
 and the online/disagg work (./online-disaggregation.md): it is where DeepSpec's edge actually
 shows up — a trustworthy acceptance-length number and a low-cost path to new draft algorithms.
 It has **no Ray and no weight-sync content** by construction: the eval target is the same
-**frozen** online/offline target the rest of the system uses (see the weight-sync-out-of-scope
-decision in ../../plan.md), so there is nothing to re-sync and no staleness to model. Both
+**frozen** online/offline target the rest of the system uses, so there is
+nothing to re-sync and no staleness to model. Both
 phases build directly on the canonical Substrate (SampleRef + FeatureStore + FeatureDataLoader)
 and the runtime training seam (`TrainerCore` / `DraftTrainStrategy` / `StrategySpec`) rather than
 replacing any of it.
 
-Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan ../../plan.md.
+Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md.
 
 ---
 
-### E1 — Acceptance-length eval harness · size M · GPU · status: in review
+### E1 — Acceptance-length eval harness · size M · GPU · status: implemented
 - **Goal** Produce a correct, cache-backed `simulated_acc_len` / `avg_loss` / `avg_acc` eval
   pass that is batch-size-independent and tracks the best checkpoint. This is the same
   `Evaluator` the domain refactor's Phase D wires into the domain `Trainer` — see Phase D in
@@ -34,9 +39,8 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
     per-position **sum/count** tensors that `Eagle3TrainStrategy.forward_loss` already emits
     (`acc_corrects`, `acc_denoms` in `StepOutput.metrics`) — do **not** reduce them to scalars in
     the eval path.
-  - Add `specforge/eval/evaluator.py` (top-level domain layer, per plan.md §2.3 — **not** under
-    `runtime/`) with `Evaluator` + `EvalConfig`, following the
-    sketch in ../../docs/redesign-draft-legacy.md (§4.4 Evaluation system). It consumes a
+  - Add `specforge/eval/evaluator.py` (top-level domain layer — **not** under
+    `runtime/`) with `Evaluator` + `EvalConfig`. It consumes a
     `forward_fn` (a thin wrapper over `TrainerCore.eval_step`) and an eval stream that is a plain
     `FeatureDataLoader` over SampleRef+FeatureStore — there is no separate eval source of truth.
   - Aggregation contract (the load-bearing bit): keep running `per_pos_acc_sum` and
@@ -77,12 +81,13 @@ Sibling tracks: ./domain-refactor.md · ./online-disaggregation.md · root plan 
   best-checkpoint tracking landed with domain-refactor Phase D (#637); `EvalConfig` + `EvalCache`
   (injective JSON-encoded key, atomic-rename produce-once) landed as the E1 PR. One scope note:
   the launch builders still take a pre-produced `hidden_states_path`, so the cache is consumed
-  programmatically (`EvalCache.for_config` + `get_or_produce`) until Phase E's typed config + CLI
-  own eval-data production and wire it in front.
+  programmatically (`EvalCache.for_config` + `get_or_produce`). The typed config
+  and CLI are now available; automatic eval-data production remains a separate
+  concern.
 
 ---
 
-### E2 — Algorithm breadth · size L · GPU · status: later
+### E2 — Algorithm breadth · size L · GPU · status: ongoing
 - **Goal** Make "add a new speculative-decoding algorithm" a small, well-bounded contribution:
   a `DraftTrainStrategy` + a `StrategySpec` entry (+ optionally a draft arch), reusing the entire
   runtime spine. The first new targets are **MTP** and **Medusa**.

@@ -29,7 +29,11 @@ from specforge.runtime.control_plane.metadata_store import (
     MetadataStore,
     SQLiteMetadataStore,
 )
-from specforge.runtime.data_plane import FeatureStore, LocalFeatureStore
+from specforge.runtime.data_plane import (
+    FeatureStore,
+    LocalFeatureStore,
+    LocalRolloutStream,
+)
 from specforge.training.strategies.registry import StrategySpec, resolve_strategy
 
 logger = logging.getLogger(__name__)
@@ -364,6 +368,7 @@ def build_offline_runtime(
     metadata_db_path: Optional[str] = None,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    strategy_kwargs: Optional[dict] = None,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
@@ -410,6 +415,7 @@ def build_offline_runtime(
         logger=logger,
         log_interval=log_interval,
         collate_fn=collate_fn,
+        strategy_kwargs=strategy_kwargs,
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
         resume_from=resume_from,
@@ -442,6 +448,7 @@ def build_disagg_offline_runtime(
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    strategy_kwargs: Optional[dict] = None,
 ):
     """Consumer side of a disaggregated OFFLINE run.
 
@@ -475,6 +482,7 @@ def build_disagg_offline_runtime(
         logger=logger,
         log_interval=log_interval,
         collate_fn=collate_fn,
+        strategy_kwargs=strategy_kwargs,
         per_sample_transform=per_sample_transform,
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
@@ -520,19 +528,31 @@ def build_online_runtime(
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    strategy_kwargs: Optional[dict] = None,
+    prompt_epochs: int = 1,
 ):
     """Assemble the colocated online dataflow; return
-    ``(trainer, loader, workers, controller, drive_rollout)``.
+    ``(trainer, loader, workers, controller, run_interleaved)``.
 
-    Call ``drive_rollout()`` (runs the RolloutWorkers until the prompt pool
-    drains) before ``trainer.fit(loader)``. ``target_head`` is ``None`` on
-    purpose: online rollout already materialized the target distribution.
+    ``run_interleaved()`` owns the complete local lifecycle.  The loader pulls
+    one bounded rollout batch at a time and trains it before asking for more, so
+    the prompt pool is never materialized into GPU-resident features all at
+    once. ``target_head`` is ``None`` on purpose: online rollout already
+    materialized the target distribution.
     """
     spec = resolve_strategy(strategy)
     # Keep colocated online on a private queue; durable online runs use the
     # disagg builders with a shared store and streaming ref channel.
     controller, durable_ack = build_control_plane_for_mode("local_colocated", run_id)
-    controller.ingest_prompts(prompts)
+    prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
+    if prompt_epochs == 1:
+        controller.ingest_prompts(prompts)
+    else:
+        prompts = list(prompts)
+        for epoch in range(prompt_epochs):
+            controller.ingest_prompts(
+                _epoch_online_prompts(prompts, epoch, prompt_epochs)
+            )
     store = LocalFeatureStore(run_id)
 
     workers = _assemble_rollout_workers(
@@ -551,12 +571,18 @@ def build_online_runtime(
         num_rollout_workers=num_rollout_workers,
         device=device,
     )
+    rollout_stream = LocalRolloutStream(
+        controller=controller,
+        workers=workers,
+        feature_store=store,
+        max_resident_samples=batch_size,
+    )
 
     trainer, loader = _assemble_trainer(
         spec=spec,
         controller=controller,
         store=store,
-        ref_source={"queue": controller.sample_queue},
+        ref_source={"queue": rollout_stream},
         model=eagle3_model,
         target_head=None,
         optimizer_factory=optimizer_factory,
@@ -575,26 +601,19 @@ def build_online_runtime(
         logger=logger,
         log_interval=log_interval,
         collate_fn=_online_collate(spec, collate_fn),
+        strategy_kwargs=strategy_kwargs,
         per_sample_transform=None,
         durable_ack=durable_ack,
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
     )
 
-    def drive_rollout(max_rounds: int = 100_000) -> int:
-        """Run the workers until the prompt pool drains; returns refs produced."""
-        for w in workers:
-            w.start()
-        produced = 0
-        lease = max(batch_size * 8, 8)
-        for _ in range(max_rounds):
-            got = sum(len(w.run_once(max_tasks=lease)) for w in workers)
-            if got == 0:
-                break
-            produced += got
-        return produced
+    def run_interleaved() -> int:
+        """Train while rollout is pulled batch-by-batch; always stop workers."""
+        with rollout_stream:
+            return trainer.fit(loader)
 
-    return trainer, loader, workers, controller, drive_rollout
+    return trainer, loader, workers, controller, run_interleaved
 
 
 def build_disagg_online_producer(
@@ -618,6 +637,7 @@ def build_disagg_online_producer(
     lease: int = 8,
     in_flight_high_watermark: int = 256,
     backpressure_poll_s: float = 0.2,
+    peer_wait_timeout_s: Optional[float] = None,
     max_worker_failures: int = 3,
     max_prompt_attempts: Optional[int] = 5,
     metadata_store: Optional[MetadataStore] = None,
@@ -634,9 +654,11 @@ def build_disagg_online_producer(
     multi-server topology; each worker drives its own server concurrently).
     ``metadata_store``/``metadata_db_path`` must be the same durable store
     the consumer opens. Returns ``(workers, drive_producer)``:
-    ``drive_producer(should_stop=...)`` runs until the prompt pool drains, pauses
-    above ``in_flight_high_watermark``, and always closes the channel on exit
-    (EOF terminates the consumer's loader).
+    ``drive_producer(should_stop=...)`` runs until the prompt pool drains and
+    pauses above ``in_flight_high_watermark``. A successful or cooperative stop
+    closes the channel; a failure publishes a distinct failure sentinel.
+    ``peer_wait_timeout_s`` bounds a backpressure wait when the consumer dies
+    before it can publish its stop sentinel.
 
     ``prompt_epochs`` repeats the prompt stream on the producer side by minting
     epoch-tagged task/sample ids. This keeps the consumer path consume-once while
@@ -770,6 +792,7 @@ def build_disagg_online_producer(
                 _t = time.monotonic()
                 _infl = channel.in_flight_remote()
                 # backpressure: in_flight = published - consumer-acked
+                backpressure_started = time.monotonic()
                 while _infl >= in_flight_high_watermark:
                     now = time.perf_counter()
                     if (
@@ -788,6 +811,16 @@ def build_disagg_online_producer(
                         last_backpressure_log = now
                     if should_stop is not None and should_stop():
                         return
+                    if (
+                        peer_wait_timeout_s is not None
+                        and time.monotonic() - backpressure_started
+                        > peer_wait_timeout_s
+                    ):
+                        raise TimeoutError(
+                            "producer backpressure timed out after "
+                            f"{peer_wait_timeout_s:.0f}s waiting for consumer "
+                            f"progress (in_flight={_infl})"
+                        )
                     sleep(backpressure_poll_s)
                     _infl = channel.in_flight_remote()
                 if _prof:
@@ -938,11 +971,18 @@ def build_disagg_online_producer(
                     f"elapsed={elapsed(drive_start)}"
                 )
             st = controller.status()
-            if st["prompts_failed"]:
-                logger.warning(
-                    "producer finished with %d terminally failed prompts "
-                    "(see controller status for reasons)",
-                    st["prompts_failed"],
+            stopped = should_stop is not None and should_stop()
+            if st["prompts_failed"] and not stopped:
+                raise RuntimeError(
+                    "producer finished with "
+                    f"{st['prompts_failed']} terminally failed prompt(s); "
+                    "refusing to publish a successful EOF for partial data"
+                )
+            if not stopped and (st["prompts_pending"] or st["prompts_leased"]):
+                raise RuntimeError(
+                    "producer exhausted max_rounds before draining the prompt "
+                    f"pool: pending={st['prompts_pending']} "
+                    f"leased={st['prompts_leased']}"
                 )
             producer_timing(
                 "drive_producer returning "
@@ -950,13 +990,23 @@ def build_disagg_online_producer(
                 f"pending={st['prompts_pending']} leased={st['prompts_leased']} "
                 f"elapsed={elapsed(drive_start)}"
             )
-            return state["produced"]
-        finally:
+            produced = state["produced"]
+        except BaseException as exc:
             producer_timing(
-                f"drive_producer closing channel produced={state['produced']} "
+                f"drive_producer failing channel produced={state['produced']} "
                 f"elapsed={elapsed(drive_start)}"
             )
-            channel.close()  # EOF -> the consumer's loader terminates once drained
+            try:
+                channel.fail(f"{type(exc).__name__}: {exc}")
+            except Exception:
+                logger.exception("failed to publish producer failure sentinel")
+            raise
+        producer_timing(
+            f"drive_producer closing channel produced={produced} "
+            f"elapsed={elapsed(drive_start)}"
+        )
+        channel.close()  # successful EOF; a failure uses channel.fail()
+        return produced
 
     return workers, drive_producer
 
@@ -970,6 +1020,7 @@ def build_disagg_online_consumer(
     optimizer_factory,
     run_id: str,
     output_dir: str,
+    target_head=None,
     batch_size: int = 1,
     accumulation_steps: int = 1,
     num_epochs: int = 1,
@@ -1145,7 +1196,7 @@ def build_disagg_online_consumer(
         store=feature_store,
         ref_source={"queue": queue},
         model=eagle3_model,
-        target_head=None,
+        target_head=target_head if spec.uses_target_head else None,
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,

@@ -1,9 +1,8 @@
 # coding=utf-8
 """Resharding contract: consumer re-partitions a stable committed pool (M6).
 
-The numerical correctness of resharding tensors across a different rank layout is
-the GPU gate (``test_equiv_4rank.py``). These CPU tests lock down the *control*
-side: partitioning is a stable, consumer-side function of ``sample_id``, so the
+These CPU tests lock down the control side: partitioning is a stable,
+consumer-side function of ``sample_id``, so the
 same pool re-distributes cleanly when the consumer's DP width changes — and no
 sample is leased twice or dropped across a reshard.
 """

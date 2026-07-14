@@ -6,7 +6,10 @@ import tempfile
 import unittest
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
-from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+from specforge.runtime.data_plane.streaming_ref_channel import (
+    StreamingRefChannel,
+    StreamingRefQueue,
+)
 
 
 def _ref(sid="s0", gen=1):
@@ -109,6 +112,43 @@ class TestStreamingRefChannel(unittest.TestCase):
         it = r.stream(poll_s=0.1, idle_timeout_s=5.0, clock=clock, sleep=sleep)
         with self.assertRaises(TimeoutError):
             next(it)
+
+    def test_producer_failure_is_not_normal_eof(self):
+        producer = StreamingRefChannel(self.path)
+        consumer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        producer.fail("rollout exploded")
+
+        stream = consumer.stream(poll_s=0.0)
+        self.assertEqual(next(stream).sample_id, "s0")
+        with self.assertRaisesRegex(RuntimeError, "rollout exploded"):
+            next(stream)
+        self.assertFalse(producer.is_closed())
+
+    def test_queue_failure_wins_over_closed_sentinel(self):
+        producer = StreamingRefChannel(self.path)
+        consumer = StreamingRefChannel(self.path)
+        producer.close()
+        producer.fail("partial rollout")
+
+        queue = StreamingRefQueue(consumer, poll_s=0.0)
+        with self.assertRaisesRegex(RuntimeError, "partial rollout"):
+            queue.get(1)
+
+    def test_consumer_outcome_roundtrip(self):
+        producer = StreamingRefChannel(self.path)
+        consumer = StreamingRefChannel(self.path)
+        self.assertFalse(producer.consumer_stopped())
+        consumer.mark_consumer_failed("optimizer failed")
+        self.assertTrue(producer.consumer_stopped())
+        self.assertEqual(producer.consumer_failure(), "optimizer failed")
+
+        other_path = os.path.join(self.dir, "done.jsonl")
+        producer = StreamingRefChannel(other_path)
+        consumer = StreamingRefChannel(other_path)
+        consumer.mark_consumer_done()
+        self.assertTrue(producer.consumer_stopped())
+        self.assertIsNone(producer.consumer_failure())
 
 
 if __name__ == "__main__":

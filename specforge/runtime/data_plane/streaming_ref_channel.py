@@ -24,8 +24,11 @@ that control-plane channel.
   (``mark_consumed``) in a sidecar counter the writer reads back, so the producer
   can apply backpressure (``in_flight_remote``) without any shared in-process
   state -- the same split-process model as the rest of disaggregation.
-* **Explicit close.** ``close()`` drops an EOF sentinel so the reader's
-  :meth:`stream` terminates once the file is drained instead of polling forever.
+* **Explicit outcome.** ``close()`` drops an EOF sentinel only for a successful
+  producer. ``fail()`` publishes the producer exception separately, so a remote
+  trainer cannot mistake a truncated rollout for a normal end of input.
+* **Peer stop.** The consumer publishes done/failed sentinels. A producer that is
+  blocked on its in-flight watermark can then stop without process supervision.
 
 This is the framework, intentionally filesystem-backed (works over any shared
 control mount). A networked control plane (Redis/the durable MetadataStore)
@@ -40,10 +43,13 @@ import time
 from typing import Iterator, List, Optional, Set
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
-from specforge.runtime.data_plane.disagg_ingest import _ref_from_dict, _ref_to_dict
+from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
 
 _CLOSED_SUFFIX = ".closed"
 _CONSUMED_SUFFIX = ".consumed_count"
+_FAILED_SUFFIX = ".failed"
+_CONSUMER_DONE_SUFFIX = ".consumer_done"
+_CONSUMER_FAILED_SUFFIX = ".consumer_failed"
 
 
 class StreamingRefChannel:
@@ -69,7 +75,7 @@ class StreamingRefChannel:
     def publish(self, ref: SampleRef) -> None:
         """Append one tensor-free ref. Durable (fsync) so a remote reader sees it."""
         assert_no_tensors([ref])
-        line = json.dumps(_ref_to_dict(ref), separators=(",", ":")) + "\n"
+        line = json.dumps(ref_to_dict(ref), separators=(",", ":")) + "\n"
         with open(self.path, "a") as f:
             f.write(line)
             f.flush()
@@ -82,7 +88,48 @@ class StreamingRefChannel:
 
     def close(self) -> None:
         """Drop the EOF sentinel so the reader's stream() terminates when drained."""
-        open(self.path + _CLOSED_SUFFIX, "w").close()
+        self._write_sidecar(_CLOSED_SUFFIX, "")
+
+    def fail(self, reason: str) -> None:
+        """Publish a terminal producer failure for the remote consumer."""
+        self._write_sidecar(_FAILED_SUFFIX, reason or "producer failed")
+
+    def failure(self) -> Optional[str]:
+        """Return the producer failure reason, if one has been published."""
+        return self._read_sidecar(_FAILED_SUFFIX)
+
+    def mark_consumer_done(self) -> None:
+        """Tell a split producer that training completed successfully."""
+        self._write_sidecar(_CONSUMER_DONE_SUFFIX, "")
+
+    def mark_consumer_failed(self, reason: str) -> None:
+        """Tell a split producer that training failed and it must stop."""
+        self._write_sidecar(_CONSUMER_FAILED_SUFFIX, reason or "consumer failed")
+
+    def consumer_failure(self) -> Optional[str]:
+        """Return the consumer failure reason, if one has been published."""
+        return self._read_sidecar(_CONSUMER_FAILED_SUFFIX)
+
+    def consumer_stopped(self) -> bool:
+        """Whether the remote consumer completed or failed."""
+        return os.path.exists(
+            self.path + _CONSUMER_DONE_SUFFIX
+        ) or os.path.exists(self.path + _CONSUMER_FAILED_SUFFIX)
+
+    def _write_sidecar(self, suffix: str, value: str) -> None:
+        tmp = f"{self.path}{suffix}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, self.path + suffix)
+
+    def _read_sidecar(self, suffix: str) -> Optional[str]:
+        try:
+            with open(self.path + suffix, encoding="utf-8") as stream:
+                return stream.read().strip() or "unknown remote failure"
+        except FileNotFoundError:
+            return None
 
     @property
     def published(self) -> int:
@@ -132,7 +179,7 @@ class StreamingRefChannel:
             line, self._buf = self._buf.split("\n", 1)
             line = line.strip()
             if line:
-                out.append(_ref_from_dict(json.loads(line)))
+                out.append(ref_from_dict(json.loads(line)))
         return out
 
     def mark_consumed(self, n: int) -> None:
@@ -177,6 +224,11 @@ class StreamingRefChannel:
                 for ref in batch:
                     yield ref
                 continue
+            failure = self.failure()
+            if failure is not None:
+                raise RuntimeError(
+                    f"StreamingRefChannel {self.path}: producer failed: {failure}"
+                )
             if self._is_closed():
                 # one final drain after close, then stop
                 tail = self.poll()
@@ -275,6 +327,12 @@ class StreamingRefQueue:
                 if new:
                     self._buf.extend(new)
                 continue
+            failure = self.channel.failure()
+            if failure is not None:
+                raise RuntimeError(
+                    f"StreamingRefChannel {self.channel.path}: producer failed: "
+                    f"{failure}"
+                )
             if self.channel.is_closed():
                 drain, _ = self._poll()
                 self._buf.extend(drain)  # final drain

@@ -1,0 +1,25 @@
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dflash.json
+  target_backend: sglang
+data:
+  train_data_path: cache/dataset/perfectblend_qwen3-8b_regen.jsonl
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: cache
+  build_dataset_num_proc: 32
+training:
+  strategy: dflash
+  deployment_mode: disaggregated
+  role: producer
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 4
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  save_interval: 1000
+run_id: qwen3-8b-dflash-disaggregated
+output_dir: outputs/qwen3-8b-dflash-disaggregated

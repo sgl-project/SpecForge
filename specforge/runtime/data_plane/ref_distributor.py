@@ -75,6 +75,12 @@ class InboxChannel(StreamingRefChannel):
                 raise RuntimeError(f"ref-distributor died:\n{f.read()}")
         return super().is_closed()
 
+    def failure(self) -> Optional[str]:
+        failure = super().failure()
+        if failure is None:
+            return None
+        return f"ref-distributor died:\n{failure}"
+
     _is_closed = is_closed
 
 
@@ -171,6 +177,9 @@ class RefDistributor:
         """
         if self.finished:
             return False
+        source_failure = self.source.failure()
+        if source_failure is not None:
+            raise RuntimeError(f"source producer failed: {source_failure}")
         progress = False
 
         raw = self.source.poll()
@@ -303,8 +312,7 @@ class RefDistributor:
         text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         for inbox in self._inboxes:
             try:
-                with open(inbox.path + _FAILED_SUFFIX, "w") as f:
-                    f.write(text)
+                inbox.fail(text)
             except OSError:  # best effort; ranks still have idle_timeout_s
                 logger.exception("ref-distributor: could not poison %s", inbox.path)
 
