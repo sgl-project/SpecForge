@@ -202,7 +202,7 @@ bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 
 Besides the provided datasets, you can also prepare your own dataset. We support two formats:
 
-#### Option 1: Conversation Format
+### Option 1: Conversation Format
 
 You should prepare the dataset in jsonl format and the schema should look like this:
 
@@ -218,7 +218,7 @@ You should prepare the dataset in jsonl format and the schema should look like t
 }
 ```
 
-#### Option 2: Pre-formatted Text Format
+### Option 2: Pre-formatted Text Format
 
 If you already have conversations formatted with a specific chat template, you can use the pre-formatted text directly:
 

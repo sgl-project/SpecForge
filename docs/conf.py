@@ -43,7 +43,7 @@ master_doc = "index"
 
 language = "en"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "README.md", "Thumbs.db", ".DS_Store"]
 
 pygments_style = "sphinx"
 
