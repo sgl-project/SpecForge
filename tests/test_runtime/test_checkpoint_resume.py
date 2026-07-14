@@ -11,7 +11,6 @@ import contextlib
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -180,13 +179,12 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         seen = [] if seen is None else seen
         model = Composite() if model is None else model
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
-        spec = SimpleNamespace(
-            name=spec_name,
-            make_strategy=lambda wrapped, *, target_head: Strategy(wrapped, seen),
-        )
         with _no_fsdp_wrap():
             trainer = Trainer(
-                spec=spec,
+                algorithm_name=spec_name,
+                make_step_strategy=lambda wrapped, *, target_head: Strategy(
+                    wrapped, seen
+                ),
                 controller=DataFlowController(run_id),
                 store=LocalFeatureStore("st"),
                 ref_source={"refs": refs},
