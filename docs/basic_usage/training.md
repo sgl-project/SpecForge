@@ -149,45 +149,16 @@ itself stop an online stream.
 
 ## Disaggregated roles
 
-A disaggregated run starts the same config twice, once per role. For online
-capture, start the patched SGLang capture server and Mooncake services first,
-then export the transport settings used by both pools:
+A disaggregated run starts the same typed config once per role. The repository
+provides one topology-specific wrapper for online server capture and one for
+offline feature ingestion: `examples/disagg/run_online.sh` and
+`examples/disagg/run_offline.sh`.
 
-```bash
-export CONFIG=examples/configs/qwen3-8b-dflash-disaggregated.yaml
-export DISAGG_STORE_ID=qwen3-8b-dflash-disaggregated
-export DISAGG_REF_CHANNEL=/shared/control/qwen3-8b.refs.jsonl
-export DISAGG_DB=/shared/control/qwen3-8b-consumer.sqlite
-export DISAGG_SERVER_URL=http://capture-server:30000
-export MOONCAKE_METADATA_SERVER=http://metadata-server:8080/metadata
-export MOONCAKE_MASTER_SERVER_ADDR=mooncake-master:50051
-```
-
-Set `MOONCAKE_LOCAL_HOSTNAME` on each pool to that host's routable address.
-
-Launch the producer on the inference pool:
-
-```bash
-MOONCAKE_LOCAL_HOSTNAME=producer-host \
-  specforge train --config "$CONFIG" training.role=producer
-```
-
-Launch the consumer on the training pool:
-
-```bash
-MOONCAKE_LOCAL_HOSTNAME=trainer-host \
-  torchrun --standalone --nproc_per_node 8 \
-  "$(which specforge)" train --config "$CONFIG" training.role=consumer
-```
-
-The producer and consumer use identical model, data, and training settings.
-Only `training.role` differs. See the [disaggregated example
-guide](../../examples/disagg/README.md) for transport and offline-ingestion
-details.
-
-Use a new, attempt-specific `DISAGG_REF_CHANNEL` and `DISAGG_DB` for each
-online launch. The database path must be visible to every consumer rank; it is
-runtime coordination state, not a supported online-resume mechanism.
+These scripts validate the environment and dispatch to the same
+`specforge train` entry point; they are not additional trainers. See the
+[disaggregated training guide](disaggregated_training.md) for the patched
+SGLang command, complete environment contract, fresh-attempt rules, and both
+launch procedures.
 
 ## Checkpoints and resume
 
