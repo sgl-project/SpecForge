@@ -364,7 +364,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             key: current for key, _saved, current in peagle_semantics
         }
         with self.assertRaisesRegex(
-            ValueError, "does not record required P-EAGLE resume semantic"
+            ValueError, "does not record required algorithm resume semantic"
         ):
             self._make_trainer(
                 os.path.join(workdir, "out_peagle_missing_contract"),
