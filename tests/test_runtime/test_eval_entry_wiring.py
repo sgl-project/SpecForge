@@ -244,6 +244,7 @@ class TestEvalLaunch(unittest.TestCase):
                 max_len=128,
                 ttt_length=5,
                 use_usp_preprocess=False,
+                dataloader_num_workers=3,
             )
 
         first = factory()
@@ -254,6 +255,7 @@ class TestEvalLaunch(unittest.TestCase):
         self.assertIs(first.collate_fn, collate)
         self.assertIs(first.per_sample_transform, transform)
         self.assertFalse(first.drop_last)
+        self.assertEqual(first.num_workers, 3)
         self.assertEqual(
             reader_calls,
             [
@@ -345,6 +347,7 @@ class TestEvalLaunch(unittest.TestCase):
                 batch_size=2,
                 collate_fn="collate",
                 rollout_worker_kwargs=worker_kwargs,
+                dataloader_num_workers=3,
             )
             first = factory()
             second = factory()
@@ -368,6 +371,7 @@ class TestEvalLaunch(unittest.TestCase):
         for call, stream in zip(loader_cls.call_args_list, streams):
             self.assertIs(call.kwargs["queue"], stream)
             self.assertFalse(call.kwargs["drop_last"])
+            self.assertEqual(call.kwargs["num_workers"], 3)
 
     def test_online_builder_passes_the_eval_factory_to_the_one_trainer(self):
         from specforge.launch import build_online_runtime

@@ -184,7 +184,9 @@ def init_distributed(
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _DEVICE_MESH, _TP_DEVICE_MESH, _TP_GROUP
+    global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _SP_ULYSSES_GROUP, _SP_RING_GROUP
     # Teardown must never crash the process. Several handles can alias the same
     # underlying group (e.g. DP and draft-DP when there is no sequence
     # parallelism), and degenerate single-rank SP groups (created when
@@ -212,7 +214,23 @@ def destroy_distributed():
     # The all-ranks DP group may alias the default group, in which case
     # destroying it above already tore the default group down.
     if dist.is_initialized():
-        dist.destroy_process_group()
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+    # Process-group and DeviceMesh objects are invalid after teardown. Keeping
+    # them reachable makes a later single-process load look initialized while
+    # collectives fail against stale handles.
+    _DEVICE_MESH = None
+    _TP_DEVICE_MESH = None
+    _TP_GROUP = None
+    _DP_DEVICE_MESH = None
+    _DP_GROUP = None
+    _DRAFT_DP_GROUP = None
+    _DRAFT_SP_GROUP = None
+    _SP_ULYSSES_GROUP = None
+    _SP_RING_GROUP = None
 
 
 def shard_tensor(

@@ -127,6 +127,7 @@ class TestTrainerCore(unittest.TestCase):
             StepOutput(
                 loss=torch.tensor(2.0),
                 metrics={
+                    "loss": torch.tensor(99.0),
                     "accuracy": torch.tensor(0.5),
                     "ce_loss": torch.tensor(1.25),
                     "lambda_base": 0.75,
@@ -137,6 +138,7 @@ class TestTrainerCore(unittest.TestCase):
             stepped=False,
         )
 
+        self.assertEqual(result.metrics["loss"], 2.0)
         self.assertEqual(result.metrics["acc"], 0.5)
         self.assertEqual(result.metrics["ce_loss"], 1.25)
         self.assertEqual(result.metrics["lambda_base"], 0.75)
