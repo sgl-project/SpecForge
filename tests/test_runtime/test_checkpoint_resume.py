@@ -200,10 +200,6 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 num_epochs=1,
                 max_steps=max_steps,
                 save_interval=0,
-                eval_interval=0,
-                tp_size=1,
-                sp_ulysses_size=1,
-                sp_ring_size=1,
                 logger=None,
                 log_interval=50,
                 collate_fn=_x_collate,
@@ -396,14 +392,11 @@ class TestCheckpointResume(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29563")
 
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
-        )
+        from specforge.core.eagle3 import OnlineEagle3Model
         from specforge.data.preprocessing import OfflineEagle3Dataset
         from specforge.data.utils import DataCollatorWithPadding
-        from specforge.modeling.target import TargetHead
+        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+        from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -421,7 +414,7 @@ class TestCheckpointResume(unittest.TestCase):
         draft_config = AutoDraftModelConfig.from_file(cfg)
 
         def build_model():
-            dm = AutoEagle3DraftModel.from_config(
+            dm = AutoDraftModel.from_config(
                 draft_config,
                 attention_backend="flex_attention",
                 torch_dtype=torch.bfloat16,

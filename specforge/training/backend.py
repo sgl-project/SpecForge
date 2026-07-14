@@ -8,19 +8,17 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-FSDP-only for now. ``ParallelConfig`` carries the parallel handles created by
-``init_distributed`` rather than re-deriving them; distributed imports stay
-lazy so the module is importable without a GPU.
+FSDP-only for now. ``ParallelConfig`` carries the FSDP process group without
+mixing target-model tensor-parallel topology into the draft trainer.
 """
 
 from __future__ import annotations
 
 import abc
 import contextlib
-import logging
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -29,95 +27,33 @@ import torch.nn as nn
 
 @dataclass
 class ParallelConfig:
-    """Handles describing the active parallel layout. Carried, not re-derived."""
+    """The FSDP layout used by draft training."""
 
-    world_size: int = 1
-    tp_size: int = 1
-    sp_ulysses_size: int = 1
-    sp_ring_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
     param_dtype: torch.dtype = torch.bfloat16
-    # opaque process-group / device-mesh handles snapshotted from
-    # init_distributed, never re-derived (None in single-process).
     fsdp_process_group: Any = None
-    dp_group: Any = None
-    draft_dp_group: Any = None
-    tp_group: Any = None
-    sp_ulysses_group: Any = None
-    sp_ring_group: Any = None
-    draft_sp_group: Any = None
-    device_mesh: Any = None
-    tp_device_mesh: Any = None
-    extra: dict = field(default_factory=dict)
-
-    @property
-    def sp_size(self) -> int:
-        return self.sp_ulysses_size * self.sp_ring_size
 
     @classmethod
     def from_distributed(
         cls,
         *,
-        tp_size: int = 1,
-        sp_ulysses_size: int = 1,
-        sp_ring_size: int = 1,
         sharding_strategy: str = "SHARD_GRAD_OP",
         param_dtype: torch.dtype = torch.bfloat16,
     ) -> "ParallelConfig":
-        """Snapshot all parallel handles (DP/TP/SP groups, device meshes) from
-        ``init_distributed``; a missing getter is logged, never silently skipped."""
+        """Use the whole initialized world as the draft FSDP/DP group."""
         # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
         # runs DDP-style (full params replicated, one grad all-reduce, no param
         # all-gather). Default unchanged when the env var is unset.
         sharding_strategy = os.environ.get("FSDP_SHARDING", sharding_strategy)
         if not dist.is_initialized():
             return cls(
-                world_size=1,
-                tp_size=tp_size,
-                sp_ulysses_size=sp_ulysses_size,
-                sp_ring_size=sp_ring_size,
                 sharding_strategy=sharding_strategy,
                 param_dtype=param_dtype,
             )
-        handles: Dict[str, Any] = {}
-        try:
-            from specforge import distributed as sfdist
-
-            for name, getter in (
-                ("dp_group", "get_dp_group"),
-                ("draft_dp_group", "get_draft_dp_group"),
-                ("tp_group", "get_tp_group"),
-                ("sp_ulysses_group", "get_sp_ulysses_group"),
-                ("sp_ring_group", "get_sp_ring_group"),
-                ("draft_sp_group", "get_draft_sp_group"),
-                ("device_mesh", "get_device_mesh"),
-                ("tp_device_mesh", "get_tp_device_mesh"),
-            ):
-                fn = getattr(sfdist, getter, None)
-                if fn is None:
-                    continue
-                try:
-                    handles[name] = fn()
-                except Exception as exc:  # group not built for this config
-                    logging.getLogger(__name__).warning(
-                        "ParallelConfig.from_distributed: %s() unavailable: %s",
-                        getter,
-                        exc,
-                    )
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "ParallelConfig.from_distributed: specforge.distributed import failed: %s",
-                exc,
-            )
         return cls(
-            world_size=dist.get_world_size(),
-            tp_size=tp_size,
-            sp_ulysses_size=sp_ulysses_size,
-            sp_ring_size=sp_ring_size,
             sharding_strategy=sharding_strategy,
             param_dtype=param_dtype,
             fsdp_process_group=dist.group.WORLD,
-            **handles,
         )
 
 
@@ -141,7 +77,7 @@ class TrainingBackend(abc.ABC):
 
 
 class FSDPTrainingBackend(TrainingBackend):
-    """FSDP1 backend mirroring the legacy SpecForge training math: FSDP with
+    """FSDP1 backend for the canonical SpecForge training math: FSDP with
     ``use_orig_params=True`` / bf16 mixed precision over the configured process
     group, optimizer targeting the inner trainable submodule."""
 
@@ -296,21 +232,11 @@ class FSDPTrainingBackend(TrainingBackend):
 
     @staticmethod
     def _set_rng_state(rng: dict) -> None:
-        cpu_state = rng.get("torch", rng.get("cpu"))  # "cpu" = legacy key
-        if cpu_state is not None:
-            torch.set_rng_state(cpu_state)
-        cuda_state = rng.get("cuda")
+        torch.set_rng_state(rng["torch"])
+        cuda_state = rng["cuda"]
         if cuda_state is None or not torch.cuda.is_available():
             return
         device = torch.cuda.current_device()
-        if isinstance(cuda_state, list):  # legacy get_rng_state_all format
-            if device >= len(cuda_state):
-                raise ValueError(
-                    f"legacy RNG checkpoint holds {len(cuda_state)} CUDA states "
-                    f"but this rank's bound device index is {device}; it was "
-                    "saved with fewer visible devices and cannot be restored here"
-                )
-            cuda_state = cuda_state[device]
         torch.cuda.set_rng_state(cuda_state, device)
 
 

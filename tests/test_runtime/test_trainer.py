@@ -1,8 +1,6 @@
 # coding=utf-8
 """TrainerCore grad-accum + TrainerController fit/checkpoint (CPU)."""
 
-import json
-import os
 import tempfile
 import unittest
 
@@ -140,61 +138,21 @@ class TestTrainerController(unittest.TestCase):
             self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
             self.assertEqual(ckpt.global_step, 3)
 
-
-class TestBestTracking(unittest.TestCase):
-    def test_best_fires_on_misaligned_eval_and_save_intervals(self):
-        # eval_interval=1, save_interval=2: the intervals NEVER coincide on step 1,
-        # yet the first eval (the run's best score) must create the best pointer —
-        # a checkpoint is persisted on demand for it.
+    def test_natural_eos_rejects_incomplete_accumulation(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
+        core = TrainerCore(strat, backend, accumulation_steps=2)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
-                run_id="r",
-                output_dir=d,
-                max_steps=3,
-                num_epochs=1,
-                eval_interval=1,
-                save_interval=2,
-            )
-            ctrl.fit([_batch() for _ in range(5)], eval_data=[_batch()])
-            # FakeStrategy's accuracy is constant 0.5, so step 1 is the best.
-            self.assertTrue(os.path.isdir(os.path.join(d, "r-step1")))
-            with open(os.path.join(d, "r.best_meta.json")) as fh:
-                meta = json.load(fh)
-            self.assertEqual(meta["step"], 1)
-            self.assertAlmostEqual(meta["score"], 0.5, places=6)
+            ctrl = TrainerController(core, run_id="r", output_dir=d)
+            with self.assertRaisesRegex(
+                RuntimeError, "incomplete gradient accumulation"
+            ):
+                ctrl.fit([_batch() for _ in range(3)])
 
-
-class TestEvalMetricsFlow(unittest.TestCase):
-    def test_eval_metrics_reach_logger_and_last_metrics(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
-        logged = []
-        with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
-                run_id="r",
-                output_dir=d,
-                max_steps=2,
-                num_epochs=1,
-                eval_interval=1,
-                log_interval=50,  # train metrics never hit the logger in 2 steps
-                logger=lambda m, s: logged.append((dict(m), s)),
-            )
-            ctrl.fit([_batch() for _ in range(3)], eval_data=[_batch()])
-        # eval metrics are logged at EVERY eval step, independent of log_interval
-        self.assertEqual([s for _, s in logged], [1, 2])
-        for m, _ in logged:
-            self.assertIn("eval/avg_loss", m)
-            self.assertAlmostEqual(m["eval/avg_acc"], 0.5, places=6)
-        # merged next to the train keys
-        self.assertIn("eval/avg_acc", ctrl.last_metrics)
-        self.assertIn("loss", ctrl.last_metrics)
-        self.assertNotIn("mode", ctrl.last_metrics)
+        self.assertEqual(ctrl.global_step, 1)
+        self.assertEqual(backend.steps, 1)
+        self.assertEqual(core.accumulation_remainder, 1)
+        self.assertEqual(backend.boundaries, [False, True, False])
 
 
 def _named_batch(i):

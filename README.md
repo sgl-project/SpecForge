@@ -71,7 +71,6 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 - [2026-06] 🔥 Added Domino online training for DFlash draft models.
 - [2026-01] 🔥 Added DFlash block-parallel online training with SGLang serving support.
 - [2025-12] 🎉 Released SpecBundle (phase 1) and SpecForge v0.2. Check out our blog at [LMSYS.org](https://lmsys.org/blog/2025-12-23-spec-bundle-phase-1/)
-- [2025-12] 🔔 Released the roadmap for 2026 Q1.
 - [2025-08] 🔔 SpecForge is listed as a [flagship project](https://lmsys.org/about/) in LMSYS. Congratulations to the SpecForge team!
 - [2025-08] 🔥 SpecForge powered the Eagle3 draft model for GPT-OSS. Check out the blog at [LMSYS.org](https://lmsys.org/blog/2025-08-27-gpt-oss/)
 - [2025-07] 🔥 SpecForge is released together with Llama4-Eagle3 checkpoints. Check out our blog at [LMSYS.org](https://lmsys.org/blog/2025-07-25-spec-forge/)

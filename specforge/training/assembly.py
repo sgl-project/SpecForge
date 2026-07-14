@@ -102,7 +102,7 @@ def _device():
 
 def _load_draft(cfg: Config):
     """Construct the configured draft model without any legacy trainer code."""
-    from specforge.modeling.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+    from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
 
     strategy = cfg.training.strategy
     draft_config = AutoDraftModelConfig.from_file(
@@ -118,7 +118,7 @@ def _load_draft(cfg: Config):
             norm_before_residual=cfg.training.norm_before_residual,
         )
     elif strategy == "eagle3":
-        draft_model = AutoEagle3DraftModel.from_config(
+        draft_model = AutoDraftModel.from_config(
             draft_config,
             attention_backend=cfg.training.attention_backend,
             torch_dtype=dtype,
@@ -128,7 +128,7 @@ def _load_draft(cfg: Config):
         # the projector_type dispatch) and take their attention implementation
         # from the config rather than a constructor keyword.
         draft_config._attn_implementation = cfg.training.attention_backend
-        draft_model = AutoEagle3DraftModel.from_config(
+        draft_model = AutoDraftModel.from_config(
             draft_config,
             torch_dtype=dtype,
         )
@@ -311,7 +311,7 @@ def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> Model
             kl_decay=cfg.training.kl_decay,
         ).to(device=_device(), dtype=_torch_dtype(cfg.model.torch_dtype))
         if cfg.mode == "offline":
-            from specforge.modeling.target import TargetHead
+            from specforge.modeling.target.target_head import TargetHead
 
             target_head = TargetHead.from_pretrained(
                 cfg.model.target_model_path,
@@ -578,19 +578,14 @@ def _common_launch_kwargs(cfg: Config, bundle: ModelBundle) -> Dict[str, Any]:
         optimizer_factory=_optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
-        ttt_length=t.ttt_length,
         batch_size=t.batch_size,
         accumulation_steps=t.accumulation_steps,
         max_steps=t.max_steps,
         total_steps=t.total_steps,
         save_interval=t.save_interval,
         max_checkpoints=t.max_checkpoints,
-        tp_size=1,
-        sp_ulysses_size=1,
-        sp_ring_size=1,
         logger=_logger,
         log_interval=t.log_interval,
-        resume_from=t.resume_from,
         strategy_kwargs=bundle.strategy_kwargs,
     )
 
@@ -620,12 +615,12 @@ def build_training_run(cfg: Config) -> TrainingRun:
 
         trainer, loader = build_offline_runtime(
             hidden_states_path=cfg.data.hidden_states_path,
-            eagle3_model=bundle.model,
+            draft_model=bundle.model,
             target_head=bundle.target_head,
+            ttt_length=t.ttt_length,
             max_len=cfg.data.max_length,
             num_epochs=t.num_epochs,
-            deployment_mode=t.deployment_mode,
-            metadata_db_path=t.metadata_db_path,
+            resume_from=t.resume_from,
             **common,
         )
         return TrainingRun(trainer=trainer, loader=loader)
@@ -649,16 +644,13 @@ def build_training_run(cfg: Config) -> TrainingRun:
     trainer, loader, _workers, _controller, run_interleaved = build_online_runtime(
         target_model=bundle.target_engine,
         prompts=prompts,
-        eagle3_model=bundle.model,
+        draft_model=bundle.model,
         target_hidden_size=bundle.target_hidden_size,
         target_vocab_size=bundle.target_vocab_size,
         draft_vocab_size=bundle.draft_vocab_size,
         target_repr="logits" if t.strategy in ("eagle3", "peagle") else None,
         aux_hidden_state_layer_ids=bundle.capture_layers,
         t2d=getattr(bundle.draft_model, "t2d", None),
-        # Online features are consume-once. The producer repeats prompts with
-        # unique epoch ids; the trainer consumes the one resulting stream once.
-        num_epochs=1,
         prompt_epochs=t.num_epochs,
         **common,
     )

@@ -40,7 +40,6 @@ from transformers.models.llama4.modeling_llama4 import (
     Llama4TextL2Norm,
     Llama4TextRMSNorm,
     Llama4TextRotaryEmbedding,
-    Llama4VisionModel,
     apply_rotary_emb,
     eager_attention_forward,
 )
@@ -397,9 +396,6 @@ class Llama4PreTrainedModel(PreTrainedModel):
         elif isinstance(module, Llama4TextExperts):
             module.gate_up_proj.data.normal_(mean=0.0, std=std)
             module.down_proj.data.normal_(mean=0.0, std=std)
-        elif isinstance(module, Llama4VisionModel):
-            module.class_embedding.data.normal_(std=module.scale)
-            module.positional_embedding_vlm.data.normal_(std=module.scale)
 
 
 @auto_docstring

@@ -1,11 +1,9 @@
 # coding=utf-8
 """Gate: the (algorithm x backend) engine matrix collapses onto policies.
 
-The per-algorithm target-capture/load code lives once, in
-``target_capture_policy``; the legacy per-algorithm leaf classes delegate to it
-(their behavior gates are the existing ``test_phase_b_gate`` / backend-parity
-tests), and a NEW algorithm gets hf/sglang/custom engines by registering a
-target-capture policy — no engine classes.
+Algorithm-specific target capture lives in ``target_capture_policy``. A new
+algorithm gets the generic HF/SGLang/custom engines by registering one policy;
+it does not add backend-specific engine classes.
 """
 
 import ast
@@ -15,10 +13,7 @@ import unittest
 import torch
 
 from specforge.inference.target_engine import (
-    CAPTURE_POLICIES,
     TARGET_CAPTURE_POLICIES,
-    CapturePolicy,
-    CaptureSpec,
     DFlashCapturePolicy,
     Eagle3CapturePolicy,
     HFTargetEngine,
@@ -28,7 +23,6 @@ from specforge.inference.target_engine import (
     available_target_engines,
     get_target_engine,
     register_target_capture_policy,
-    resolve_capture_policy,
     resolve_target_capture_policy,
 )
 from specforge.inference.target_engine.target_capture_policy import (
@@ -70,22 +64,6 @@ class PolicyRegistryTest(unittest.TestCase):
         self.assertFalse(df.sglang_build_kwargs["wrap_eagle3_logits"])
         self.assertFalse(df.sglang_strict_capture_layers)
 
-    def test_legacy_policy_names_are_aliases(self):
-        self.assertIs(CaptureSpec, TargetCaptureSpec)
-        self.assertIs(CapturePolicy, TargetCapturePolicy)
-        self.assertIs(CAPTURE_POLICIES, TARGET_CAPTURE_POLICIES)
-        self.assertIs(
-            resolve_capture_policy("eagle3"), resolve_target_capture_policy("eagle3")
-        )
-
-    def test_legacy_module_path_is_a_shim(self):
-        # the old module name keeps working and resolves to the same objects
-        from specforge.inference.target_engine import capture_policy as legacy
-
-        self.assertIs(legacy.TargetCapturePolicy, TargetCapturePolicy)
-        self.assertIs(legacy.CAPTURE_POLICIES, TARGET_CAPTURE_POLICIES)
-        self.assertIs(legacy.Eagle3TargetOutput, Eagle3TargetOutput)
-
     def test_policy_outputs_are_typed_capture_batches(self):
         # the policy layer's contract with the runtime adapter: typed batches
         self.assertTrue(issubclass(Eagle3TargetOutput, TargetCaptureBatch))
@@ -99,6 +77,48 @@ class PolicyRegistryTest(unittest.TestCase):
         self.assertEqual(layers, [1, 15, 28])
         with self.assertRaises(AssertionError):
             Eagle3CapturePolicy().resolve_capture_layers(None, [1, 2])
+
+    def test_offline_sglang_capture_requests_last_hidden_states_without_logits(self):
+        class RecordingBackend:
+            def __init__(self):
+                self.kwargs = None
+
+            def extend_eagle3(
+                self, input_ids, attention_mask, loss_mask, **kwargs
+            ):
+                self.kwargs = kwargs
+                return (
+                    [[input_ids, attention_mask, loss_mask]],
+                    [None],
+                    [torch.ones(3, 2)],
+                    [torch.ones(3, 4)],
+                )
+
+        backend = RecordingBackend()
+        input_ids = torch.tensor([[1, 2, 3]])
+        attention_mask = torch.ones_like(input_ids)
+        loss_mask = torch.ones_like(input_ids)
+
+        captured = Eagle3CapturePolicy().sglang_capture(
+            backend,
+            input_ids,
+            attention_mask,
+            loss_mask,
+            return_last_hidden_states=True,
+            return_logits=False,
+        )
+
+        self.assertEqual(
+            backend.kwargs,
+            {
+                "return_last_hidden_states": True,
+                "return_logits": False,
+                "shard_returns": False,
+            },
+        )
+        self.assertIsNone(captured.target)
+        self.assertEqual(captured.hidden_states.shape, (1, 3, 2))
+        self.assertEqual(captured.last_hidden_states.shape, (1, 3, 4))
 
 
 class _RecordingPolicy(TargetCapturePolicy):
@@ -188,46 +208,6 @@ class PolicyModuleIsSglangFreeTest(unittest.TestCase):
         self.assertEqual(
             hits, [], f"target_capture_policy leaks sglang imports: {hits}"
         )
-
-
-class LegacyDelegationTest(unittest.TestCase):
-    """The legacy leaves route through the same policy code (one implementation)."""
-
-    def test_hf_eagle3_leaf_delegates_to_policy(self):
-        from specforge.inference.target_engine.eagle3_target_model import (
-            HFEagle3TargetEngine,
-        )
-
-        calls = {}
-
-        class SpyPolicy(Eagle3CapturePolicy):
-            def hf_capture(self, model, layers, *a, **k):
-                calls["layers"] = layers
-                return Eagle3TargetOutput(
-                    hidden_states=torch.zeros(1),
-                    target=torch.zeros(1),
-                    loss_mask=torch.zeros(1),
-                    input_ids=torch.zeros(1),
-                    attention_mask=torch.zeros(1),
-                )
-
-        import specforge.inference.target_engine.eagle3_target_model as m
-
-        engine = HFEagle3TargetEngine.__new__(HFEagle3TargetEngine)
-        engine.aux_hidden_states_layers = [1, 5, 9]
-        engine.model = torch.nn.Linear(2, 2)
-        original = m._EAGLE3
-        m._EAGLE3 = SpyPolicy()
-        try:
-            out = engine.capture(
-                input_ids=torch.zeros(1, 3, dtype=torch.long),
-                attention_mask=torch.ones(1, 3, dtype=torch.long),
-                loss_mask=torch.ones(1, 3, dtype=torch.long),
-            )
-        finally:
-            m._EAGLE3 = original
-        self.assertIsInstance(out, Eagle3TargetOutput)
-        self.assertEqual(calls["layers"], [1, 5, 9])
 
 
 if __name__ == "__main__":

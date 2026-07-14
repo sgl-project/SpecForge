@@ -1,12 +1,5 @@
-from .dflash import OnlineDFlashModel, OnlineDominoModel, OnlineDSparkModel
-from .eagle3 import OnlineEagle3Model, QwenVLOnlineEagle3Model
-from .peagle import OnlinePEagleModel
+"""Training model composites.
 
-__all__ = [
-    "OnlineDFlashModel",
-    "OnlineDominoModel",
-    "OnlineDSparkModel",
-    "OnlineEagle3Model",
-    "OnlinePEagleModel",
-    "QwenVLOnlineEagle3Model",
-]
+The unified assembly imports each strategy implementation from its owning
+module; this package does not maintain a second aggregate model API.
+"""

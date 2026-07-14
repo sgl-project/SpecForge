@@ -131,7 +131,6 @@ assembly. In particular:
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, or `fa`; P-EAGLE requires `flex_attention`; DFlash,
   Domino, and DSpark accept `eager`, `sdpa`, or `flex_attention`;
-- Ulysses/USP and arbitrary backend names are not wired into this runtime;
 - P-EAGLE and online EAGLE3 require `training.batch_size=1`;
 - DSpark requires disaggregated server capture;
 - offline features currently use the EAGLE3 feature contract only;

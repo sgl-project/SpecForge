@@ -10,7 +10,7 @@
 
 ``TrainerCore`` runs exactly one branch-free step (strategy forward/loss, backend
 backward/step) plus the grad-accumulation boundary. ``TrainerController`` owns
-the lifecycle: fit / evaluate / save_checkpoint. EAGLE3 and DFlash share this
+the lifecycle: fit / save_checkpoint. EAGLE3 and DFlash share this
 unchanged — only the strategy differs.
 """
 
@@ -106,6 +106,11 @@ class TrainerCore:
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
 
+    @property
+    def accumulation_remainder(self) -> int:
+        """Micro-batches whose gradients have not reached an optimizer step."""
+        return self._micro % self.accumulation_steps
+
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
@@ -173,10 +178,6 @@ class TrainerCore:
                 self._prof2 = None
         return self._result(out, grad_norm, stepped)
 
-    # Deliberately no eval_step: evaluation runs ``Evaluator.run`` on raw
-    # ``forward_loss`` outputs — ``_result`` scalarizes away the per-position
-    # count tensors that correct acc-len aggregation needs.
-
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
         # DP-average loss AND accuracy across ranks before logging, matching stock
         # DFlash reports a data-parallel mean for loss and accuracy.
@@ -202,7 +203,7 @@ class TrainerCore:
 
 
 class TrainerController:
-    """Lifecycle: fit / evaluate / checkpoint.
+    """Lifecycle: fit / checkpoint.
 
     ``save_checkpoint`` persists resumable draft state and returns a
     :class:`Checkpoint`; ``specforge export`` materializes that state into the
@@ -216,7 +217,6 @@ class TrainerController:
         run_id: str,
         output_dir: str = "./output",
         save_interval: int = 0,
-        eval_interval: int = 0,
         log_interval: int = 50,
         max_steps: Optional[int] = None,
         total_steps: Optional[int] = None,
@@ -240,9 +240,8 @@ class TrainerController:
         self.run_id = run_id
         self.output_dir = output_dir
         self.save_interval = save_interval
-        self.eval_interval = eval_interval
         self.log_interval = log_interval
-        # Injected manager (rotation, best metric) or the lazy default layout.
+        # Injected manager (checkpoint layout/rotation) or the lazy default.
         self._checkpoint_mgr = checkpoint_manager
         # Extra entries merged into the shared checkpoint payload at save
         # (e.g. dataset_size / accumulation_steps, validated on resume).
@@ -272,9 +271,7 @@ class TrainerController:
         self.last_metrics: Dict[str, Any] = {}
         self.last_checkpoint_step: Optional[int] = None
 
-    def fit(
-        self, data: Iterable[TrainBatch], eval_data: Optional[Iterable] = None
-    ) -> int:
+    def fit(self, data: Iterable[TrainBatch]) -> int:
         if self.max_steps is not None and self.global_step >= self.max_steps:
             logger.info(
                 "fit: global_step=%d already at max_steps=%d; nothing to train",
@@ -284,9 +281,6 @@ class TrainerController:
             return self.global_step
         module = self.core.strategy.trainable_module()
         module.train()
-        # Rank0-broadcast once: a rank-local eval_data view must not let ranks
-        # enter or skip the evaluator's collectives alone.
-        eval_enabled = self._rank0_decision(eval_data is not None)
         pending_ack: List[str] = []
         import time as _time
 
@@ -428,35 +422,11 @@ class TrainerController:
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     self.logger(result.metrics, self.global_step)
-                eval_metrics: Optional[Dict[str, Any]] = None
                 if (
-                    self.eval_interval
-                    and eval_enabled
-                    and self.global_step % self.eval_interval == 0
-                ):
-                    eval_metrics = self.evaluate(eval_data)
-                    module.train()
-                    if eval_metrics:
-                        if self.logger:
-                            self.logger(eval_metrics, self.global_step)
-                        self.last_metrics = {**self.last_metrics, **eval_metrics}
-                # is_better is a collective (rank0 verdict broadcast inside the
-                # manager); its guard is rank-identical because eval_metrics is
-                # DP-reduced. Empty ({}) eval metrics skip best entirely.
-                interval_hit = bool(
-                    self.save_interval and self.global_step % self.save_interval == 0
-                )
-                is_best = bool(
                     self.save_interval
-                    and eval_metrics
-                    and self._checkpoint_manager().is_better(eval_metrics)
-                )
-                if interval_hit or is_best:
+                    and self.global_step % self.save_interval == 0
+                ):
                     self.save_checkpoint(self.global_step)
-                if is_best:
-                    self._checkpoint_manager().update_best(
-                        self.global_step, eval_metrics
-                    )
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
             self._epoch_batch = 0
@@ -466,36 +436,15 @@ class TrainerController:
             # work, not epoch ``N`` at batch zero (which would replay that
             # entire epoch on resume).
             self.epoch = epoch + 1
+        remainder = self.core.accumulation_remainder
+        if remainder:
+            raise RuntimeError(
+                "training stream ended with incomplete gradient accumulation: "
+                f"received {remainder} of {self.core.accumulation_steps} "
+                "micro-batches after the last optimizer step; no partial "
+                "optimizer step or durable acknowledgement was committed"
+            )
         return self.global_step
-
-    @torch.no_grad()
-    def evaluate(self, data: Optional[Iterable[TrainBatch]]) -> Dict[str, Any]:
-        """Full-pass eval via :class:`Evaluator`: rank-identical ``eval/*``
-        metrics, ``{}`` when zero batches were processed globally. ``data=None``
-        (empty local shard) still joins the evaluator's collectives."""
-        from specforge.eval import Evaluator
-
-        module = self.core.strategy.trainable_module()
-        module.eval()
-        # Same StepContext as the train path so schedule-dependent losses
-        # (Domino's lambda_base) evaluate at the live step, not at step 0.
-        ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
-        return Evaluator().run(
-            lambda batch: self.core.strategy.forward_loss(batch, ctx), data
-        )
-
-    @staticmethod
-    def _rank0_decision(flag: bool) -> bool:
-        """Broadcast rank0's verdict so a collective-bearing branch is entered by
-        every rank or by none."""
-        if (
-            not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() == 1
-        ):
-            return bool(flag)
-        verdict = [bool(flag)]
-        torch.distributed.broadcast_object_list(verdict, src=0)
-        return bool(verdict[0])
 
     def _checkpoint_manager(self):
         # Lazily built in its S-home so the runtime seam does not import the domain

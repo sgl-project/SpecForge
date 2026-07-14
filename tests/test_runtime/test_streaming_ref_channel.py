@@ -150,6 +150,15 @@ class TestStreamingRefChannel(unittest.TestCase):
         self.assertTrue(producer.consumer_stopped())
         self.assertIsNone(producer.consumer_failure())
 
+    def test_consumer_quantum_is_single_claimed_attempt_contract(self):
+        consumer = StreamingRefChannel(self.path)
+        producer = StreamingRefChannel(self.path)
+        self.assertIsNone(producer.consumer_quantum())
+        consumer.publish_consumer_quantum(32)
+        self.assertEqual(producer.consumer_quantum(), 32)
+        with self.assertRaisesRegex(ValueError, "fresh reference channel"):
+            consumer.publish_consumer_quantum(32)
+
 
 if __name__ == "__main__":
     unittest.main()

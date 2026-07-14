@@ -304,7 +304,6 @@ class PEagleTrainStrategy(DraftTrainStrategy):
             correct = torch.as_tensor(correct, device=device)
             denominator = torch.as_tensor(denominator, device=device)
             metrics["accuracy"] = correct / denominator.clamp_min(1)
-            metrics["accuracy_denom"] = denominator
 
         return StepOutput(loss=loss.reshape(()), metrics=metrics)
 
@@ -346,18 +345,14 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        loss, accuracy, model_metrics = self.dflash_model(
+        loss, accuracy, _ = self.dflash_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
         )
         return StepOutput(
             loss=loss,
-            metrics={
-                "accuracy": accuracy.detach(),
-                # the accuracy's own denominator, so eval can weight it exactly
-                "accuracy_denom": model_metrics["accuracy_denom"],
-            },
+            metrics={"accuracy": accuracy.detach()},
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -404,7 +399,6 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         )
         metrics = {
             "accuracy": accuracy.detach(),
-            "accuracy_denom": model_metrics["accuracy_denom"],
         }
         for name in (
             "ce_loss",
@@ -467,7 +461,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         lambda_base = self._lambda_base(ctx)
-        loss, accuracy, model_metrics = self.domino_model(
+        loss, accuracy, _ = self.domino_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
@@ -477,8 +471,6 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss=loss,
             metrics={
                 "accuracy": accuracy.detach(),
-                # the accuracy's own denominator, so eval can weight it exactly
-                "accuracy_denom": model_metrics["accuracy_denom"],
                 "lambda_base": torch.tensor(float(lambda_base)),
             },
         )

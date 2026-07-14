@@ -38,14 +38,6 @@ class SGLangTargetEngine(TargetEngine):
         """The underlying sglang ModelRunner."""
         return self._backend.model_runner
 
-    @property
-    def hf_config(self):
-        return self._backend.hf_config
-
-    @property
-    def is_vlm(self) -> bool:
-        return self._backend.is_vlm
-
     @classmethod
     def from_pretrained(
         cls,

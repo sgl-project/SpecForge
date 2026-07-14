@@ -11,23 +11,18 @@ description = "SpecForge: Speculative Decoding Training Framework"
 authors = [{name = "SGLang Team"}]
 urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
 dependencies = [
-    "pre-commit",
     "torch==2.11.0",
     "transformers==5.8.1",
-    "qwen-vl-utils==0.0.11",
     "datasets",
-    "setuptools",
     "tqdm",
-    "psutil",
-    "numpy",
     "accelerate",
+    "huggingface-hub",
     "pydantic",
     "pyyaml",
+    "safetensors",
     "sglang==0.5.14",
-    "openai-harmony",
-    "ninja",
-    "packaging",
-    "yunchang",
+    "requests",
+    "typing-extensions",
 ]
 
 [project.scripts]
@@ -37,11 +32,11 @@ specforge = "specforge.cli:main"
 exclude = ["configs*", "scripts*", "tests*"]
 
 [project.optional-dependencies]
+data = ["openai"]
 dev = [
     "pre-commit",
-    "unittest"
 ]
-fa = ["flash-attn"]
+fa = ["flash-attn", "ninja", "packaging"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}

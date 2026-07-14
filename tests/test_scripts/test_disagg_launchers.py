@@ -199,14 +199,11 @@ class TestDisaggregatedLaunchers(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("DISAGG_DB", result.stderr)
 
-    def test_online_single_rank_consumer_allows_no_database(self):
+    def test_online_single_rank_consumer_requires_database(self):
         env = self._online_env()
         result = self._run(ONLINE, "consumer", env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("torchrun")[-1],
-            "training.role=consumer",
-        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("DISAGG_DB", result.stderr)
 
     def test_online_database_env_overrides_the_config_path(self):
         env = self._online_env()

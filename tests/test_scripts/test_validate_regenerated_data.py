@@ -128,6 +128,17 @@ class TestValidateRegeneratedData(TestCase):
 
 
 class TestRegenerationGuards(TestCase):
+    def test_missing_openai_client_has_actionable_error(self):
+        with (
+            patch("scripts.regenerate_train_data.OpenAI", None),
+            self.assertRaisesRegex(ModuleNotFoundError, "specforge\\[data\\]"),
+        ):
+            call_sglang(
+                SimpleNamespace(),
+                "localhost:30000",
+                {"conversations": [{"role": "user", "content": "question"}]},
+            )
+
     def test_input_precheck_rejects_bad_role_order_and_content(self):
         bad_order = {
             "conversations": [
@@ -393,7 +404,7 @@ os.execv(sys.executable, [sys.executable, *args])
         error_rows: int = 0,
         drop_rows: int = 0,
         trailing_newline: bool = True,
-        entrypoint: str = "run_qwen_sharegpt_regeneration.sh",
+        model_profile: str = "qwen3.6-27b",
     ):
         directory = Path(tmpdir)
         input_path = directory / "input.jsonl"
@@ -415,7 +426,7 @@ os.execv(sys.executable, [sys.executable, *args])
         )
         env = {
             **os.environ,
-            "MODEL_PROFILE": "qwen3.6-27b",
+            "MODEL_PROFILE": model_profile,
             "PYTHON": str(self._make_fake_python(directory)),
             "INPUT_FILE": str(input_path),
             "OUTPUT_FILE": str(output_path),
@@ -424,7 +435,10 @@ os.execv(sys.executable, [sys.executable, *args])
             "FAKE_DROP_ROWS": str(drop_rows),
         }
         result = subprocess.run(
-            ["bash", f"examples/data_regeneration/{entrypoint}"],
+            [
+                "bash",
+                "examples/data_regeneration/run_qwen_sharegpt_regeneration.sh",
+            ],
             cwd=Path(__file__).resolve().parents[2],
             env=env,
             capture_output=True,
@@ -444,12 +458,9 @@ os.execv(sys.executable, [sys.executable, *args])
         self.assertEqual(args[args.index("--reasoning") + 1], "save")
         self.assertEqual(args[args.index("--max-tokens") + 1], "32768")
 
-    def test_qwen3_8b_compatibility_wrapper_selects_non_reasoning_profile(self):
+    def test_qwen3_8b_profile_uses_non_reasoning_contract(self):
         with TemporaryDirectory() as tmpdir:
-            result, args = self._run_recipe(
-                tmpdir,
-                entrypoint="run_qwen3_8b_sharegpt_non_reasoning.sh",
-            )
+            result, args = self._run_recipe(tmpdir, model_profile="qwen3-8b")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(args[args.index("--model") + 1], "Qwen/Qwen3-8B")

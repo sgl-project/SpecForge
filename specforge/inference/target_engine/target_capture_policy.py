@@ -26,11 +26,9 @@ target logits; DFlash reads ``output_hidden_states`` and selects layers with no
 target distribution. The SGLang side shares :class:`SGLangCaptureBackend` and
 differs only in build flags, the extend call, and output shaping.
 
-The target-capture bodies here are the single implementation behind the
-``{HF,SGLang,Custom}Eagle3TargetEngine`` / ``{HF,SGLang}DFlashTargetEngine``
-methods; those classes delegate to these policies, so the extraction stays
-byte-identical (enforced by ``test_phase_b_gate`` and the backend-parity
-tests).
+The target-capture bodies here are the single implementation used by the
+generic HF, SGLang, and custom engines. Backend-parity tests enforce that each
+engine returns the same typed capture contract.
 """
 
 from __future__ import annotations
@@ -64,7 +62,7 @@ class TargetCaptureBatch:
 @dataclass
 class Eagle3TargetOutput(TargetCaptureBatch):
     hidden_states: torch.Tensor
-    target: torch.Tensor
+    target: Optional[torch.Tensor]
     loss_mask: torch.Tensor
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
@@ -308,38 +306,20 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
         input_ids,
         attention_mask,
         loss_mask,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        is_vlm: bool = False,
         shard_returns: bool = False,
-        **kwargs,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = True,
     ) -> Eagle3TargetOutput:
-        if kwargs:
-            logger.debug(f"unused kwargs {list(kwargs.keys())}")
-
-        if is_vlm:
-            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                backend.extend_eagle3_vlm(
-                    input_ids,
-                    attention_mask,
-                    loss_mask,
-                    return_last_hidden_states=False,
-                    return_logits=True,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                )
+        data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
+            backend.extend_eagle3(
+                input_ids,
+                attention_mask,
+                loss_mask,
+                return_last_hidden_states=return_last_hidden_states,
+                return_logits=return_logits,
+                shard_returns=shard_returns,
             )
-        else:
-            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-                backend.extend_eagle3(
-                    input_ids,
-                    attention_mask,
-                    loss_mask,
-                    return_last_hidden_states=False,
-                    return_logits=True,
-                    shard_returns=shard_returns,
-                )
-            )
+        )
         aux_hidden_states_out = []
         target_out = []
         loss_mask_out = []
@@ -518,8 +498,6 @@ class DFlashCapturePolicy(TargetCapturePolicy):
 
 
 TARGET_CAPTURE_POLICIES: Dict[str, TargetCapturePolicy] = {}
-# Back-compat name retained for existing imports/tests.
-CAPTURE_POLICIES = TARGET_CAPTURE_POLICIES
 
 
 def register_target_capture_policy(name: str, policy: TargetCapturePolicy) -> None:
@@ -542,43 +520,20 @@ def resolve_target_capture_policy(name: str) -> TargetCapturePolicy:
         ) from None
 
 
-def register_capture_policy(name: str, policy: TargetCapturePolicy) -> None:
-    """Back-compat alias for :func:`register_target_capture_policy`."""
-    register_target_capture_policy(name, policy)
-
-
-def resolve_capture_policy(name: str) -> TargetCapturePolicy:
-    """Back-compat alias for :func:`resolve_target_capture_policy`."""
-    return resolve_target_capture_policy(name)
-
-
 register_target_capture_policy("eagle3", Eagle3CapturePolicy())
 register_target_capture_policy("dflash", DFlashCapturePolicy())
 # Domino trains on the same captured features as DFlash (same capture path).
 register_target_capture_policy("domino", TARGET_CAPTURE_POLICIES["dflash"])
 
-
-# Back-compat aliases for the original shorter names. New code should prefer
-# TargetCaptureSpec/TargetCapturePolicy to avoid confusion with
-# inference.capture.CaptureConfig.
-CaptureSpec = TargetCaptureSpec
-CapturePolicy = TargetCapturePolicy
-
-
 __all__ = [
     "TargetCaptureBatch",
     "TargetCaptureSpec",
     "TargetCapturePolicy",
-    "CaptureSpec",
-    "CapturePolicy",
     "Eagle3CapturePolicy",
     "DFlashCapturePolicy",
     "Eagle3TargetOutput",
     "DFlashTargetOutput",
     "TARGET_CAPTURE_POLICIES",
-    "CAPTURE_POLICIES",
     "register_target_capture_policy",
     "resolve_target_capture_policy",
-    "register_capture_policy",
-    "resolve_capture_policy",
 ]

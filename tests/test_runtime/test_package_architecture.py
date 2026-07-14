@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import tokenize
 import tomllib
 import unittest
@@ -25,6 +26,15 @@ REMOVED_MODULE_FILES = (
     "specforge/runtime/inference/sglang_adapter.py",
     "specforge/runtime/training/__init__.py",
     "specforge/tracker.py",
+    "specforge/args.py",
+    "specforge/core/compact_teacher.py",
+    "specforge/inference/adapters/dflash.py",
+    "specforge/inference/adapters/eagle3.py",
+    "specforge/inference/target_engine/capture_policy.py",
+    "specforge/inference/target_engine/dflash_target_model.py",
+    "specforge/inference/target_engine/eagle3_target_model.py",
+    "specforge/modeling/utils.py",
+    "specforge/runtime/control_plane/backpressure.py",
 )
 
 REMOVED_TRAINING_ENTRY_FILES = (
@@ -39,13 +49,27 @@ REMOVED_TRAINING_ENTRY_FILES = (
     "examples/disagg/run_disagg_dspark.py",
 )
 
+REMOVED_DUPLICATE_PATH_TESTS = (
+    "tests/test_runtime/test_colocated_vs_disagg_equiv.py",
+    "tests/test_runtime/test_disagg_online.py",
+    "tests/test_runtime/test_disagg_online_interleave.py",
+    "tests/test_runtime/test_disagg_online_shared_plane.py",
+    "tests/test_runtime/test_soak.py",
+    "tests/test_runtime/test_backpressure.py",
+)
+
 REMOVED_PACKAGE_DIRECTORIES = (
+    "benchmarks",
+    "specforge/eval",
+    "specforge/layers/ring",
     "specforge/modeling/target/sglang_backend",
     "specforge/runtime/inference",
     "specforge/runtime/training",
 )
 
 REMOVED_MODULE_PREFIXES = (
+    "specforge.eval",
+    "specforge.layers.ring",
     "specforge.modeling.target.base",
     "specforge.modeling.target.factory",
     "specforge.modeling.target.dflash_target_model",
@@ -54,6 +78,15 @@ REMOVED_MODULE_PREFIXES = (
     "specforge.runtime.inference",
     "specforge.runtime.training",
     "specforge.tracker",
+    "specforge.args",
+    "specforge.core.compact_teacher",
+    "specforge.inference.adapters.dflash",
+    "specforge.inference.adapters.eagle3",
+    "specforge.inference.target_engine.capture_policy",
+    "specforge.inference.target_engine.dflash_target_model",
+    "specforge.inference.target_engine.eagle3_target_model",
+    "specforge.modeling.utils",
+    "specforge.runtime.control_plane.backpressure",
     "scripts.train_eagle3",
     "scripts.train_eagle3_dataflow",
     "scripts.train_dflash",
@@ -64,6 +97,7 @@ REMOVED_MODULE_PREFIXES = (
     "train_dflash",
     "train_domino",
     "train_peagle",
+    "yunchang",
 )
 
 SOURCE_ROOTS = (
@@ -71,6 +105,157 @@ SOURCE_ROOTS = (
     REPO_ROOT / "scripts",
     REPO_ROOT / "examples",
     REPO_ROOT / "tests",
+)
+
+PRODUCTION_ROOTS = (
+    REPO_ROOT / "specforge",
+    REPO_ROOT / "scripts",
+    REPO_ROOT / "examples",
+)
+
+TEXT_ONLY_RUNTIME_FILES = (
+    "scripts/prepare_hidden_states.py",
+    "specforge/core/eagle3.py",
+    "specforge/data/preprocessing.py",
+    "specforge/data/utils.py",
+    "specforge/inference/target_engine/sglang.py",
+    "specforge/inference/target_engine/sglang_backend/capture.py",
+    "specforge/inference/target_engine/target_capture_policy.py",
+    "specforge/modeling/draft/llama3_eagle.py",
+    "specforge/modeling/target/custom_backend/llama4.py",
+    "specforge/modeling/target/target_head.py",
+)
+
+REMOVED_VLM_API_NAMES = {
+    "BaseMultimodalProcessor",
+    "ImageProcessingMixin",
+    "LlamaMutiRotaryEmbedding",
+    "MRotaryEmbedding",
+    "MultimodalInputs",
+    "QwenVLOnlineEagle3Model",
+    "VlmDataCollatorWithPadding",
+    "apply_multimodal_rotary_pos_emb",
+    "extend_eagle3_vlm",
+    "extend_vlm",
+    "get_rope_index",
+    "image_grid_thw",
+    "is_vlm",
+    "pixel_values",
+    "preprocess_vlm_conversations",
+    "qwen_vl_utils",
+    "vision_config",
+}
+
+REMOVED_VLM_SOURCE_TERMS = (
+    "mrope",
+    "multimodal",
+    "qwen_vl",
+    "vlm",
+)
+
+REMOVED_DRAFT_PARALLEL_API_NAMES = {
+    "Gather",
+    "LlamaUSPFlashAttention",
+    "SeqAllToAll4D",
+    "UspAdapter",
+    "all_gather_tensor",
+    "draft_dp_group",
+    "draft_sp_group",
+    "gather_outputs_and_unpad",
+    "gather_tensor",
+    "get_device_mesh",
+    "get_draft_dp_group",
+    "get_draft_sp_group",
+    "get_sp_ring_group",
+    "get_sp_ulysses_group",
+    "process_data_usp",
+    "sp_ring_group",
+    "sp_ring_size",
+    "sp_ulysses_group",
+    "sp_ulysses_size",
+    "use_usp_preprocess",
+}
+
+LEGACY_ENTRY_GLOBS = (
+    "scripts/train_*.py",
+    "examples/run_*online*.sh",
+    "examples/disagg/run_disagg_*.py",
+)
+
+LEGACY_API_NAMES = {
+    "AutoEagle3DraftModel",
+    "CAPTURE_POLICIES",
+    "CapturePolicy",
+    "CaptureSpec",
+    "CustomEagle3TargetModel",
+    "DFlashAdapter",
+    "DFlashTargetModel",
+    "Eagle3TargetModel",
+    "HFEagle3TargetModel",
+    "SGLangAdapter",
+    "SGLangEagle3TargetModel",
+    "build_disagg_eagle3_runtime",
+    "build_disagg_online_eagle3_runtime",
+    "build_disagg_online_runtime",
+    "build_offline_eagle3_controller",
+    "build_offline_eagle3_runtime",
+    "build_online_eagle3_runtime",
+    "get_dflash_target_model",
+    "get_eagle3_target_model",
+    "register_capture_policy",
+    "resolve_capture_policy",
+    "run_disagg_online_interleaved",
+    "_is_closed",
+    "_remap_legacy_draft_head_keys",
+    "all_committed_ids",
+    "TrainLease",
+    "cap_train_lease",
+    "dp_partition",
+    "dataflow_colocated",
+    "enqueue_offline_refs",
+    "fail_refs",
+    "lease_train_refs",
+    "max_train_lease",
+    "note_trainer_starved",
+    "partition_key",
+    "reconcile_on_restart",
+    "seed_consumed",
+    "skip_ids",
+    "split_eval",
+    "train_lease",
+    "build_control_plane_for_mode",
+}
+
+CANONICAL_LAUNCH_EXPORTS = {
+    "build_disagg_offline_runtime",
+    "build_disagg_online_consumer",
+    "build_disagg_online_producer",
+    "build_offline_runtime",
+    "build_online_runtime",
+}
+
+DRAFT_MODEL_BUILDERS = CANONICAL_LAUNCH_EXPORTS - {
+    "build_disagg_online_producer",
+}
+
+CANONICAL_DRAFT_CONFIGS = {
+    "llama3-8B-eagle3.json",
+    "qwen3-4b-dspark.json",
+    "qwen3-8b-dflash.json",
+    "qwen3-8b-domino.json",
+    "qwen3-8b-eagle3.json",
+    "qwen3-8b-peagle.json",
+}
+
+CANONICAL_DATASET_PRESETS = ("ultrachat", "sharegpt")
+
+DOC_ONLY_PACKAGE_INITIALIZERS = (
+    "specforge/__init__.py",
+    "specforge/core/__init__.py",
+    "specforge/data/__init__.py",
+    "specforge/inference/__init__.py",
+    "specforge/modeling/__init__.py",
+    "specforge/modeling/target/__init__.py",
 )
 
 
@@ -92,6 +277,27 @@ def _imported_modules(path: Path) -> Iterator[tuple[int, str]]:
             yield node.lineno, node.module
 
 
+def _module_tree(path: Path) -> ast.Module:
+    with tokenize.open(path) as source_file:
+        return ast.parse(source_file.read(), filename=str(path))
+
+
+def _literal_all(path: Path) -> set[str]:
+    return set(_literal_assignment(path, "__all__"))
+
+
+def _literal_assignment(path: Path, name: str):
+    for node in _module_tree(path).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(
+        f"{path.relative_to(REPO_ROOT)} has no literal assignment for {name}"
+    )
+
+
 class TestPackageArchitecture(unittest.TestCase):
     def test_package_exposes_one_training_cli(self):
         with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
@@ -108,6 +314,105 @@ class TestPackageArchitecture(unittest.TestCase):
             item.split("[", 1)[0].split("=", 1)[0].lower() for item in dependencies
         }
         self.assertTrue({"wandb", "tensorboard"}.isdisjoint(names))
+
+    def test_typed_runtime_stays_text_only(self):
+        violations = []
+        for relative_path in TEXT_ONLY_RUNTIME_FILES:
+            path = REPO_ROOT / relative_path
+            source = path.read_text()
+            for node in ast.walk(_module_tree(path)):
+                name = None
+                if isinstance(node, ast.Name):
+                    name = node.id
+                elif isinstance(node, ast.Attribute):
+                    name = node.attr
+                elif isinstance(node, ast.alias):
+                    name = node.name.rsplit(".", 1)[-1]
+                elif isinstance(node, ast.arg):
+                    name = node.arg
+                elif isinstance(node, ast.keyword):
+                    name = node.arg
+                if name in REMOVED_VLM_API_NAMES:
+                    violations.append(f"{relative_path}:{node.lineno}: {name}")
+            for term in REMOVED_VLM_SOURCE_TERMS:
+                if term in source.lower():
+                    violations.append(f"{relative_path}: source term {term!r}")
+        self.assertEqual(
+            [],
+            violations,
+            "typed runtime must not reintroduce VLM APIs:\n" + "\n".join(violations),
+        )
+
+        with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
+            project = tomllib.load(project_file)["project"]
+        self.assertNotIn("vlm", project.get("optional-dependencies", {}))
+        dependencies = "\n".join(project["dependencies"]).lower()
+        self.assertNotIn("qwen-vl", dependencies)
+
+    def test_draft_sequence_parallel_stays_deleted(self):
+        violations = []
+        for source_root in PRODUCTION_ROOTS:
+            for path in sorted(source_root.rglob("*.py")):
+                for node in ast.walk(_module_tree(path)):
+                    name = None
+                    if isinstance(node, ast.Name):
+                        name = node.id
+                    elif isinstance(node, ast.Attribute):
+                        name = node.attr
+                    elif isinstance(node, ast.alias):
+                        name = node.name.rsplit(".", 1)[-1]
+                    elif isinstance(node, ast.arg):
+                        name = node.arg
+                    elif isinstance(node, ast.keyword):
+                        name = node.arg
+                    elif isinstance(node, ast.Constant) and node.value == "usp":
+                        name = node.value
+                    if name == "usp" or name in REMOVED_DRAFT_PARALLEL_API_NAMES:
+                        relative_path = path.relative_to(REPO_ROOT)
+                        violations.append(f"{relative_path}:{node.lineno}: {name}")
+        self.assertEqual(
+            [],
+            violations,
+            "draft sequence-parallel APIs reintroduced:\n" + "\n".join(violations),
+        )
+
+        with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
+            dependencies = tomllib.load(project_file)["project"]["dependencies"]
+        names = {
+            item.split("[", 1)[0].split("=", 1)[0].lower() for item in dependencies
+        }
+        self.assertNotIn("yunchang", names)
+
+        distributed_functions = {
+            node.name: node
+            for node in _module_tree(REPO_ROOT / "specforge" / "distributed.py").body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        init_parameters = {
+            arg.arg
+            for arg in distributed_functions["init_distributed"].args.args
+            + distributed_functions["init_distributed"].args.kwonlyargs
+        }
+        self.assertIn("tp_size", init_parameters)
+
+        launch_functions = {
+            node.name: node
+            for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in CANONICAL_LAUNCH_EXPORTS:
+            parameters = {
+                arg.arg
+                for arg in launch_functions[name].args.args
+                + launch_functions[name].args.kwonlyargs
+            }
+            self.assertNotIn("tp_size", parameters, name)
+        consumer_parameters = {
+            arg.arg
+            for arg in launch_functions["build_disagg_online_consumer"].args.args
+            + launch_functions["build_disagg_online_consumer"].args.kwonlyargs
+        }
+        self.assertTrue({"dp_rank", "dp_size"}.issubset(consumer_parameters))
 
     def test_removed_move_shims_stay_deleted(self):
         present = [
@@ -127,6 +432,24 @@ class TestPackageArchitecture(unittest.TestCase):
             [], present, f"legacy training entries reintroduced: {present}"
         )
 
+        globbed = sorted(
+            str(path.relative_to(REPO_ROOT))
+            for pattern in LEGACY_ENTRY_GLOBS
+            for path in REPO_ROOT.glob(pattern)
+        )
+        self.assertEqual([], globbed, f"legacy entry pattern reintroduced: {globbed}")
+
+        duplicate_tests = [
+            path
+            for path in REMOVED_DUPLICATE_PATH_TESTS
+            if (REPO_ROOT / path).exists()
+        ]
+        self.assertEqual(
+            [],
+            duplicate_tests,
+            f"tests for removed duplicate paths reintroduced: {duplicate_tests}",
+        )
+
     def test_repository_does_not_import_removed_modules(self):
         violations = []
         for source_root in SOURCE_ROOTS:
@@ -142,6 +465,220 @@ class TestPackageArchitecture(unittest.TestCase):
             "imports must use specforge.inference or specforge.training:\n"
             + "\n".join(violations),
         )
+
+    def test_production_does_not_reference_legacy_api_symbols(self):
+        violations = []
+        for source_root in PRODUCTION_ROOTS:
+            for path in sorted(source_root.rglob("*.py")):
+                for node in ast.walk(_module_tree(path)):
+                    name = None
+                    if isinstance(node, ast.Name):
+                        name = node.id
+                    elif isinstance(node, ast.Attribute):
+                        name = node.attr
+                    elif isinstance(node, ast.alias):
+                        name = node.name.rsplit(".", 1)[-1]
+                    elif isinstance(node, ast.arg):
+                        name = node.arg
+                    elif isinstance(node, ast.keyword):
+                        name = node.arg
+                    if name in LEGACY_API_NAMES:
+                        relative_path = path.relative_to(REPO_ROOT)
+                        violations.append(f"{relative_path}:{node.lineno}: {name}")
+        self.assertEqual([], violations, "legacy API references:\n" + "\n".join(violations))
+
+    def test_launch_exports_only_canonical_topology_builders(self):
+        self.assertEqual(
+            CANONICAL_LAUNCH_EXPORTS,
+            _literal_all(REPO_ROOT / "specforge" / "launch.py"),
+        )
+
+    def test_online_builders_have_one_fresh_stream_path(self):
+        functions = {
+            node.name: node
+            for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in ("build_online_runtime", "build_disagg_online_consumer"):
+            parameters = {
+                arg.arg
+                for arg in functions[name].args.args
+                + functions[name].args.kwonlyargs
+            }
+            self.assertTrue(
+                {"resume", "resume_from", "num_epochs"}.isdisjoint(parameters),
+                name,
+            )
+        online_parameters = {
+            arg.arg
+            for arg in functions["build_online_runtime"].args.args
+            + functions["build_online_runtime"].args.kwonlyargs
+        }
+        self.assertNotIn("ttt_length", online_parameters)
+
+        offline_parameters = {
+            arg.arg
+            for arg in functions["build_offline_runtime"].args.args
+            + functions["build_offline_runtime"].args.kwonlyargs
+        }
+        self.assertTrue(
+            {"deployment_mode", "metadata_db_path"}.isdisjoint(
+                offline_parameters
+            )
+        )
+
+        producer_parameters = {
+            arg.arg
+            for arg in functions["build_disagg_online_producer"].args.args
+            + functions["build_disagg_online_producer"].args.kwonlyargs
+        }
+        self.assertTrue(
+            {"metadata_store", "metadata_db_path"}.isdisjoint(producer_parameters)
+        )
+
+        consumer = functions["build_disagg_online_consumer"]
+        called = [
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr
+            for node in ast.walk(consumer)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, (ast.Name, ast.Attribute))
+        ]
+        self.assertEqual(1, called.count("RefDistributor"))
+        self.assertIn("DPAckController", called)
+        self.assertNotIn("DataFlowController", called)
+        self.assertIn("publish_consumer_quantum", called)
+        queue_call = next(
+            node
+            for node in ast.walk(consumer)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "StreamingRefQueue"
+        )
+        self.assertIsInstance(queue_call.args[0], ast.Name)
+        self.assertEqual("inbox", queue_call.args[0].id)
+
+        producer = functions["build_disagg_online_producer"]
+        controller_call = next(
+            node
+            for node in ast.walk(producer)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "DataFlowController"
+        )
+        keywords = {keyword.arg: keyword.value for keyword in controller_call.keywords}
+        self.assertIs(keywords["enable_sample_queue"].value, False)
+        self.assertEqual("NoOpMetadataStore", keywords["metadata_store"].func.id)
+
+        for name in ("build_offline_runtime", "build_disagg_offline_runtime"):
+            controller_call = next(
+                node
+                for node in ast.walk(functions[name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "DataFlowController"
+            )
+            controller_keywords = {
+                keyword.arg: keyword.value for keyword in controller_call.keywords
+            }
+            self.assertIs(
+                controller_keywords["enable_sample_queue"].value, False, name
+            )
+
+    def test_aggregate_packages_stay_doc_only(self):
+        for relative_path in DOC_ONLY_PACKAGE_INITIALIZERS:
+            body = _module_tree(REPO_ROOT / relative_path).body
+            self.assertEqual(1, len(body), relative_path)
+            self.assertIsInstance(body[0], ast.Expr, relative_path)
+            self.assertIsInstance(body[0].value, ast.Constant, relative_path)
+            self.assertIsInstance(body[0].value.value, str, relative_path)
+
+    def test_data_regeneration_dependency_is_explicit(self):
+        with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
+            extras = tomllib.load(project_file)["project"]["optional-dependencies"]
+        self.assertEqual(["openai"], extras["data"])
+
+    def test_launch_builders_use_generic_draft_model_parameter(self):
+        functions = {
+            node.name: node
+            for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in CANONICAL_LAUNCH_EXPORTS:
+            parameters = {
+                arg.arg
+                for arg in functions[name].args.args
+                + functions[name].args.kwonlyargs
+            }
+            self.assertNotIn("eagle3_model", parameters, name)
+            if name in DRAFT_MODEL_BUILDERS:
+                self.assertIn("draft_model", parameters, name)
+
+    def test_canonical_launch_builders_have_no_eval_side_channel(self):
+        functions = {
+            node.name: node
+            for node in _module_tree(REPO_ROOT / "specforge" / "launch.py").body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in CANONICAL_LAUNCH_EXPORTS:
+            parameters = {
+                arg.arg
+                for arg in functions[name].args.args
+                + functions[name].args.kwonlyargs
+            }
+            self.assertNotIn("eval_interval", parameters, name)
+
+    def test_data_preparation_exposes_only_canonical_presets(self):
+        script_path = REPO_ROOT / "scripts" / "prepare_data.py"
+        self.assertEqual(
+            CANONICAL_DATASET_PRESETS,
+            _literal_assignment(script_path, "CANONICAL_DATASETS"),
+        )
+
+        source = script_path.read_text()
+        self.assertNotIn("--opc-subset", source)
+        self.assertNotIn("--split-eval", source)
+        self.assertNotIn("_test.jsonl", source)
+
+    def test_offline_capture_uses_only_the_canonical_target_engine_contract(self):
+        source = (REPO_ROOT / "scripts" / "prepare_hidden_states.py").read_text()
+        self.assertNotIn("--enable-aux-hidden-states", source)
+        self.assertNotIn("--aux-hidden-states-layers", source)
+        self.assertNotIn("Eagle3TargetModel", source)
+        self.assertIn("get_target_engine", source)
+        self.assertIn("return_last_hidden_states=True", source)
+        self.assertIn("return_logits=False", source)
+
+    def test_only_canonical_draft_configs_are_checked_in(self):
+        present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
+        self.assertEqual(CANONICAL_DRAFT_CONFIGS, present)
+
+    def test_examples_and_scripts_do_not_bypass_the_cli(self):
+        direct_imports = []
+        for root in (REPO_ROOT / "scripts", REPO_ROOT / "examples"):
+            for path in sorted(root.rglob("*.py")):
+                for line_number, module in _imported_modules(path):
+                    if module == "specforge.launch" or module.startswith(
+                        "specforge.training"
+                    ):
+                        direct_imports.append(
+                            f"{path.relative_to(REPO_ROOT)}:{line_number}: {module}"
+                        )
+        self.assertEqual([], direct_imports, "CLI bypass imports:\n" + "\n".join(direct_imports))
+
+        allowed = {
+            Path("examples/disagg/run_online.sh"),
+            Path("examples/disagg/run_offline.sh"),
+        }
+        bypasses = []
+        train_command = re.compile(r"\btrain\s+--config\b")
+        for root in (REPO_ROOT / "scripts", REPO_ROOT / "examples"):
+            for path in sorted(root.rglob("*.sh")):
+                relative = path.relative_to(REPO_ROOT)
+                if train_command.search(path.read_text()) and relative not in allowed:
+                    bypasses.append(str(relative))
+        self.assertEqual([], bypasses, f"non-canonical shell training entries: {bypasses}")
 
 
 if __name__ == "__main__":

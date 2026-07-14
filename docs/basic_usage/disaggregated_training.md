@@ -29,8 +29,14 @@ pip install mooncake-transfer-engine
 # CUDA 13 or later
 pip install mooncake-transfer-engine-cuda13
 
-python -c 'from mooncake.store import MooncakeDistributedStore'
+python -c 'from mooncake.store import MooncakeDistributedStore as S; s=S(); assert callable(getattr(s, "put_from", None)) and callable(getattr(s, "get_into", None))'
 ```
+
+SpecForge uses one Mooncake wire contract: a hard-pinned object per tensor,
+written with `put_from` and read with `get_into`. Clients without those methods
+are rejected at startup with an upgrade command; the serialized object API is
+not supported. Run the check above on every capture, producer, and consumer
+image before starting an attempt.
 
 For a development deployment, start the master with its embedded HTTP metadata
 server in a separate terminal or service unit:
@@ -145,14 +151,54 @@ NPROC_PER_NODE=8 examples/disagg/run_online.sh consumer \
 
 The consumer can start before the producer; it waits for references. The
 launcher uses `torchrun --standalone`, so `NPROC_PER_NODE` covers GPUs on one
-training node. The launcher requires `DISAGG_DB` for multi-rank training or
-when `DISAGG_INBOX_DIR` is set, and pins `training.metadata_db_path` to the same
-fresh path it checked. A direct `specforge train` invocation can instead set the
-field in YAML, but the public launcher keeps each attempt's coordination state
-explicit.
+training node. The launcher requires `DISAGG_DB` for every consumer, including
+a single-rank run, and pins `training.metadata_db_path` to the same fresh path
+it checked. A direct `specforge train` invocation can instead set the field in
+YAML, but the public launcher keeps each attempt's coordination state explicit.
+Every rank uses the same RefDistributor/inbox path; there is no separate
+single-rank consumer implementation.
 
-Online resume is not supported. Start a new attempt with new control paths,
-store id, run id, and output directory.
+### Online runtime contract
+
+The online producer owns prompt scheduling and publication only. Captured
+tensors go to Mooncake and `SampleRef` metadata goes directly to
+`DISAGG_REF_CHANNEL`; the producer has no training ledger and does not retain a
+local training queue.
+
+Consumer rank 0 is the only source-channel reader and the only writer to the
+fresh SQLite ledger. The consumer path is fixed for every DP size:
+
+```text
+RefDistributor (rank 0)
+  -> one InboxChannel per rank
+  -> one StreamingRefQueue per rank
+  -> FeatureDataLoader
+  -> DPAckController at the optimizer boundary
+```
+
+Before the producer captures any prompt, rank 0 publishes the global dispatch
+quantum:
+
+```text
+quantum = dp_size * batch_size * accumulation_steps
+```
+
+The producer waits for this handshake. Its in-flight high watermark must be at
+least `quantum`; set it with `DISAGG_IN_FLIGHT_HIGH_WATERMARK` (default `256`).
+The distributor dispatches only complete quantum-sized windows, so every rank
+receives exactly `batch_size * accumulation_steps` refs for one optimizer step.
+
+If producer EOF leaves a partial quantum, the attempt fails instead of training
+an incomplete global step. The distributor fails those refs terminally, aborts
+their feature-store objects best-effort, settles their source-channel count,
+and sends failure sentinels to every rank inbox.
+
+Online resume is not supported. The consumer reads its consume-once stream one
+time; it never starts a second epoch over already consumed refs. For an online
+configuration with `training.num_epochs > 1`, the producer creates that many
+prompt passes with fresh task/sample ids and all passes still form one consumer
+stream. Restart a failed run as a new attempt with new reference channel,
+inbox, SQLite database, store id, run id, and output directory.
 
 ## Offline EAGLE3 ingestion
 

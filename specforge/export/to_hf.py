@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Export a DataFlow training checkpoint to an HF-format draft directory.
 
-The output loads back through ``AutoEagle3DraftModel.from_pretrained`` (e.g. to
+The output loads back through ``AutoDraftModel.from_pretrained`` (e.g. to
 finetune from it). EAGLE-family embeddings may be absent by design — training
 reloads frozen embeddings from the target — while DFlash-family drafts do not
 own an embedding at all.

@@ -6,118 +6,78 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Phase B — TargetEngine ABC / de-EAGLE3 extraction (structure, no behavior change).
-
-These assertions are about the *abstraction*, not the GPU forward: the generic
-``TargetEngine`` ABC, the real ``.backend`` tags, the ``capture`` /
-``set_capture_layers`` dispatch onto the algorithm-specific methods, the
-back-compat aliases, and the generic ``get_target_engine`` factory. They do not
-load a model. (They still import torch, so run on the GPU box like the rest of
-tests/test_runtime.)
-"""
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Structural tests for the canonical, policy-driven target engines."""
 
 import unittest
+from unittest import mock
 
-import torch
-
-from specforge.inference.target_engine.base import KNOWN_BACKENDS
-from specforge.modeling.target import (
-    CustomEagle3TargetEngine,
-    CustomEagle3TargetModel,
-    Eagle3TargetEngine,
-    Eagle3TargetModel,
-    HFEagle3TargetEngine,
-    HFEagle3TargetModel,
-    SGLangEagle3TargetEngine,
-    SGLangEagle3TargetModel,
+from specforge.inference.target_engine import (
+    CustomTargetEngine,
+    HFTargetEngine,
+    SGLangTargetEngine,
     TargetEngine,
     available_target_engines,
     get_target_engine,
 )
+from specforge.inference.target_engine.base import KNOWN_BACKENDS
 
 
 class TargetEngineABCTest(unittest.TestCase):
     def test_base_is_abstract(self):
         with self.assertRaises(TypeError):
-            TargetEngine()  # abstract: from_pretrained + capture unimplemented
+            TargetEngine()
 
-    def test_eagle3_hierarchy_under_target_engine(self):
-        # The EAGLE3 algorithm ABC is now a TargetEngine subclass ...
-        self.assertTrue(issubclass(Eagle3TargetEngine, TargetEngine))
-        # ... and the concrete backends sit under it.
-        for cls in (
-            HFEagle3TargetEngine,
-            SGLangEagle3TargetEngine,
-            CustomEagle3TargetEngine,
-        ):
-            self.assertTrue(issubclass(cls, Eagle3TargetEngine))
+    def test_generic_backends_share_one_abc(self):
+        for engine_cls in (HFTargetEngine, SGLangTargetEngine, CustomTargetEngine):
+            with self.subTest(engine=engine_cls.__name__):
+                self.assertTrue(issubclass(engine_cls, TargetEngine))
+                self.assertIn(engine_cls.backend, KNOWN_BACKENDS)
 
-    def test_backend_tags_are_real(self):
-        # Previously the adapters read getattr(target, "backend", "unknown") and
-        # always got "unknown" — the tag is now a real class attribute.
-        self.assertEqual(SGLangEagle3TargetEngine.backend, "sglang")
-        self.assertEqual(HFEagle3TargetEngine.backend, "hf")
-        self.assertEqual(CustomEagle3TargetEngine.backend, "custom")
+    def test_backend_tags_are_explicit(self):
+        self.assertEqual(HFTargetEngine.backend, "hf")
+        self.assertEqual(SGLangTargetEngine.backend, "sglang")
+        self.assertEqual(CustomTargetEngine.backend, "custom")
         self.assertEqual(TargetEngine.backend, "unknown")
-        for cls in (
-            SGLangEagle3TargetEngine,
-            HFEagle3TargetEngine,
-            CustomEagle3TargetEngine,
+
+    def test_factory_routes_to_generic_hf_engine(self):
+        sentinel = object()
+        with mock.patch.object(
+            HFTargetEngine, "from_pretrained", return_value=sentinel
+        ) as load:
+            engine = get_target_engine(
+                "some/path", strategy="eagle3", backend="hf", device="cuda"
+            )
+        self.assertIs(engine, sentinel)
+        self.assertEqual(load.call_args.args, ("some/path",))
+        self.assertEqual(load.call_args.kwargs["device"], "cuda")
+        self.assertEqual(load.call_args.kwargs["policy"].spec.name, "eagle3")
+
+    def test_factory_routes_to_generic_sglang_and_custom_engines(self):
+        for backend, engine_cls in (
+            ("sglang", SGLangTargetEngine),
+            ("custom", CustomTargetEngine),
         ):
-            self.assertIn(cls.backend, KNOWN_BACKENDS)
+            with self.subTest(backend=backend), mock.patch.object(
+                engine_cls, "from_pretrained", return_value=backend
+            ) as load:
+                self.assertEqual(
+                    get_target_engine("some/path", strategy="dflash", backend=backend),
+                    backend,
+                )
+                self.assertEqual(load.call_args.kwargs["policy"].spec.name, "dflash")
 
-    def test_backcompat_aliases_are_identical(self):
-        # Pre-Phase-B names resolve to the exact same classes (import-compatible).
-        self.assertIs(Eagle3TargetModel, Eagle3TargetEngine)
-        self.assertIs(HFEagle3TargetModel, HFEagle3TargetEngine)
-        self.assertIs(SGLangEagle3TargetModel, SGLangEagle3TargetEngine)
-        self.assertIs(CustomEagle3TargetModel, CustomEagle3TargetEngine)
-
-    def test_capture_dispatches_to_generate_eagle3_data(self):
-        calls = {}
-
-        class FakeEagle3(Eagle3TargetEngine):
-            backend = "custom"
-
-            @classmethod
-            def from_pretrained(cls, *a, **k):  # pragma: no cover - not used
-                return cls()
-
-            def generate_eagle3_data(
-                self, input_ids, attention_mask, loss_mask, **kwargs
-            ):
-                calls["args"] = (input_ids, attention_mask, loss_mask)
-                calls["kwargs"] = kwargs
-                return "sentinel"
-
-        eng = FakeEagle3()
-        out = eng.capture(
-            input_ids=torch.zeros(1, 3, dtype=torch.long),
-            attention_mask=torch.ones(1, 3, dtype=torch.long),
-            loss_mask=torch.ones(1, 3, dtype=torch.long),
-            shard_returns=True,
-        )
-        self.assertEqual(out, "sentinel")
-        # capture forwards extraction kwargs verbatim (byte-identical path).
-        self.assertEqual(calls["kwargs"], {"shard_returns": True})
-
-    def test_set_capture_layers_maps_to_aux_layers(self):
-        class FakeEagle3(Eagle3TargetEngine):
-            @classmethod
-            def from_pretrained(cls, *a, **k):  # pragma: no cover
-                return cls()
-
-            def generate_eagle3_data(self, *a, **k):  # pragma: no cover
-                raise NotImplementedError
-
-        eng = FakeEagle3()
-        eng.set_capture_layers([1, 5, 9])  # generic hook -> aux layers
-        self.assertEqual(eng.aux_hidden_states_layers, [1, 5, 9])
-
-    def test_factory_lists_and_rejects_unknown_strategy(self):
+    def test_factory_lists_and_rejects_unknown_values(self):
         self.assertEqual(available_target_engines(), ["dflash", "domino", "eagle3"])
         with self.assertRaises(ValueError):
             get_target_engine("some/path", strategy="does-not-exist")
+        with self.assertRaises(ValueError):
+            get_target_engine("some/path", strategy="eagle3", backend="other")
 
 
 if __name__ == "__main__":

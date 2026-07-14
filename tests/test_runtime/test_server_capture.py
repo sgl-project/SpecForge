@@ -541,6 +541,7 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
         channel = StreamingRefChannel(
             os.path.join(tempfile.mkdtemp(prefix="sc_prod_"), "refs.jsonl")
         )
+        channel.publish_consumer_quantum(1)
         _workers, drive = build_disagg_online_producer(
             strategy="dflash",
             feature_source=adapter,

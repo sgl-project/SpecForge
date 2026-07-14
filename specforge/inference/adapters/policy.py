@@ -22,8 +22,8 @@ feature-dict schema. The engine side hands back only a typed
 :class:`~specforge.inference.target_engine.target_capture_policy.TargetCaptureBatch`;
 anything else is rejected loudly.
 
-``SGLangAdapter`` (eagle3) and ``DFlashAdapter`` remain as thin schema-pinning
-subclasses for back-compat.
+Every colocated strategy uses this adapter; server-capture sources implement the
+same feature-source protocol at the transport boundary.
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ class PolicyFeatureAdapter:
         self._healthy = True
 
     def _recorded_aux_layer_ids(self) -> tuple:
-        ids = getattr(self.target_model, "aux_hidden_states_layers", None)
+        ids = getattr(self.target_model, "capture_layers", None)
         return tuple(ids) if ids is not None else ()
 
     def _project_target(

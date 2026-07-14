@@ -11,7 +11,7 @@ from specforge.core.peagle import (
     create_peagle_mask_mod,
     generate_cod_sample_indices,
 )
-from specforge.modeling.auto import AutoEagle3DraftModel
+from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.peagle import PEagleDraftModel
 from specforge.training.model_utils import resolve_mask_token_id
 
@@ -65,7 +65,7 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         with tempfile.TemporaryDirectory() as output_dir:
             model.save_pretrained(output_dir)
             direct = PEagleDraftModel.from_pretrained(output_dir)
-            automatic = AutoEagle3DraftModel.from_pretrained(output_dir)
+            automatic = AutoDraftModel.from_pretrained(output_dir)
 
         for reloaded in (direct, automatic):
             self.assertIsInstance(reloaded, PEagleDraftModel)

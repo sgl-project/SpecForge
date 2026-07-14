@@ -33,7 +33,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a hard torch depende
 SCHEMA_VERSION = 1
 
 RunMode = Literal["online", "offline"]
-DeploymentMode = Literal["local_colocated", "dataflow_colocated", "disaggregated"]
 DraftStrategyName = Literal["eagle3", "dflash", "domino", "dspark", "peagle"]
 # Tagged union for the EAGLE3 target feature. The *strategy* owns the
 # projection so the trainer core stays branch-free:
@@ -184,7 +183,6 @@ def assert_no_tensors(obj: Any, *, _path: str = "<root>") -> None:
 __all__ = [
     "SCHEMA_VERSION",
     "RunMode",
-    "DeploymentMode",
     "DraftStrategyName",
     "TargetRepr",
     "PromptTask",

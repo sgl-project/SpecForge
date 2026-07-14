@@ -90,21 +90,15 @@ class TestPEagleStrategy(unittest.TestCase):
         )
         self.assertTrue(spec.supports_online)
         self.assertTrue(spec.uses_target_head)
-        self.assertIsNotNone(spec.make_offline_reader)
-        self.assertIsNotNone(spec.make_offline_transform)
-        self.assertIsNotNone(spec.make_offline_collate)
+        self.assertIsNone(spec.make_offline_reader)
+        self.assertIsNone(spec.make_offline_transform)
+        self.assertIsNone(spec.make_offline_collate)
 
-    def test_registry_reuses_eagle3_capture_and_tags_offline_refs(self):
+    def test_registry_reuses_eagle3_online_capture(self):
         peagle = resolve_strategy("peagle")
         eagle3 = resolve_strategy("eagle3")
         self.assertIs(peagle.feature_schema, eagle3.feature_schema)
-        self.assertIs(peagle.make_adapter, eagle3.make_adapter)
-
-        reader = peagle.make_offline_reader(
-            "/unused", run_id="run", ttt_length=1, max_len=32
-        )
-        self.assertEqual(reader.strategy, "peagle")
-        self.assertEqual(reader.target_repr, "hidden_state")
+        self.assertIs(peagle.make_online_collate(), eagle3.make_online_collate())
 
     def test_online_logits_map_hidden_state_and_derive_length(self):
         model = _FakePEagleModel()
@@ -121,7 +115,6 @@ class TestPEagleStrategy(unittest.TestCase):
         )
         self.assertEqual(model.forward_kwargs["lengths"].tolist(), [3])
         self.assertAlmostEqual(float(output.metrics["accuracy"]), 0.75)
-        self.assertEqual(float(output.metrics["accuracy_denom"]), 4.0)
         self.assertFalse(output.metrics["loss_sum"].requires_grad)
 
     def test_offline_target_hidden_state_is_shifted_and_projected(self):

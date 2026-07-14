@@ -2,7 +2,7 @@
 """E gate: exporters round-trip a DataFlow checkpoint to HF / sglang formats.
 
 Train a few tiny steps, save through the CheckpointManager layout, then:
-to_hf output must reload through AutoEagle3DraftModel.from_pretrained with
+to_hf output must reload through AutoDraftModel.from_pretrained with
 bit-identical draft weights; to_sglang output must carry exactly the serving
 key set (no trainer prefixes, no embeddings, t2d/d2t present).
 
@@ -27,14 +27,11 @@ class TestExporters(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29591")
 
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
-        )
+        from specforge.core.eagle3 import OnlineEagle3Model
         from specforge.data.preprocessing import OfflineEagle3Dataset
         from specforge.data.utils import DataCollatorWithPadding
-        from specforge.modeling.target import TargetHead
+        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+        from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -50,7 +47,7 @@ class TestExporters(unittest.TestCase):
         cls.out_dir = os.path.join(cls.workdir, "out")
 
         draft_config = AutoDraftModelConfig.from_file(cls.cfg_path)
-        dm = AutoEagle3DraftModel.from_config(
+        dm = AutoDraftModel.from_config(
             draft_config,
             attention_backend="flex_attention",
             torch_dtype=torch.bfloat16,
@@ -102,8 +99,8 @@ class TestExporters(unittest.TestCase):
 
         from safetensors.torch import save_file
 
-        from specforge import AutoEagle3DraftModel
         from specforge.export import export_to_hf
+        from specforge.modeling.auto import AutoDraftModel
 
         emb_src = os.path.join(self.workdir, "emb_src")
         os.makedirs(emb_src, exist_ok=True)
@@ -127,7 +124,7 @@ class TestExporters(unittest.TestCase):
             os.path.join(self.workdir, "hf_export"),
             embedding_source=emb_src,
         )
-        reloaded = AutoEagle3DraftModel.from_pretrained(out, torch_dtype=torch.bfloat16)
+        reloaded = AutoDraftModel.from_pretrained(out, torch_dtype=torch.bfloat16)
         fresh_sd = reloaded.state_dict()
         # the exported embedding is the source's, not a random re-init
         self.assertTrue(

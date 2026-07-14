@@ -244,38 +244,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
         self._init_draft_head(config, dflash_config)
-        self.register_load_state_dict_pre_hook(self._remap_legacy_draft_head_keys)
         self.post_init()
-
-    @staticmethod
-    def _remap_legacy_draft_head_keys(
-        module,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        legacy_prefixes = (
-            ("logit_head.prefix_gru.", "prefix_gru."),
-            ("logit_head.embed_proj.", "embed_proj."),
-            ("logit_head.markov_head.", "markov_head."),
-            ("logit_head.confidence_head.", "confidence_head."),
-        )
-        for key in list(state_dict.keys()):
-            if not key.startswith(prefix):
-                continue
-            local_key = key[len(prefix) :]
-            for old_prefix, new_prefix in legacy_prefixes:
-                if local_key.startswith(old_prefix):
-                    new_key = prefix + new_prefix + local_key[len(old_prefix) :]
-                    if new_key not in state_dict:
-                        state_dict[new_key] = state_dict[key]
-                    state_dict.pop(key)
-                    break
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config

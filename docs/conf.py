@@ -1,9 +1,5 @@
-import os
-import sys
 from datetime import datetime
 from pathlib import Path
-
-sys.path.insert(0, os.path.abspath("../.."))
 
 DOCS_PATH = Path(__file__).parent
 ROOT_PATH = DOCS_PATH.parent
@@ -12,7 +8,7 @@ version_file = ROOT_PATH.joinpath("version.txt")
 with open(version_file, "r") as f:
     __version__ = f.read().strip()
 
-project = "SGLang"
+project = "SpecForge"
 copyright = f"2025-{datetime.now().year}, SpecForge"
 author = "SpecForge Team"
 
@@ -20,25 +16,9 @@ version = __version__
 release = __version__
 
 extensions = [
-    "sphinx.ext.autodoc",
-    "sphinx.ext.autosummary",
-    "sphinx.ext.napoleon",
-    "sphinx.ext.viewcode",
-    "sphinx.ext.autosectionlabel",
-    "sphinx.ext.intersphinx",
-    "sphinx_tabs.tabs",
     "myst_parser",
     "sphinx_copybutton",
-    "sphinxcontrib.mermaid",
-    "nbsphinx",
-    "sphinx.ext.mathjax",
 ]
-
-nbsphinx_allow_errors = True
-nbsphinx_execute = "never"
-
-autosectionlabel_prefix_document = True
-nbsphinx_allow_directives = True
 
 
 myst_enable_extensions = [
@@ -52,30 +32,7 @@ myst_enable_extensions = [
 
 myst_heading_anchors = 5
 
-nbsphinx_kernel_name = "python3"
-nbsphinx_execute_arguments = [
-    "--InlineBackend.figure_formats={'svg', 'pdf'}",
-    "--InlineBackend.rc={'figure.dpi': 96}",
-]
-
-
-nb_render_priority = {
-    "html": (
-        "application/vnd.jupyter.widget-view+json",
-        "application/javascript",
-        "text/html",
-        "image/svg+xml",
-        "image/png",
-        "image/jpeg",
-        "text/markdown",
-        "text/latex",
-        "text/plain",
-    )
-}
-
 myst_ref_domains = ["std", "py"]
-
-templates_path = ["_templates"]
 
 source_suffix = {
     ".rst": "restructuredtext",
@@ -98,7 +55,7 @@ html_copy_source = True
 html_last_updated_fmt = ""
 
 html_theme_options = {
-    "repository_url": "https://github.com/sgl-project/sgl-project.github.io",
+    "repository_url": "https://github.com/sgl-project/SpecForge",
     "repository_branch": "main",
     "show_navbar_depth": 3,
     "max_navbar_depth": 4,
@@ -115,36 +72,37 @@ html_theme_options = {
 html_context = {
     "display_github": True,
     "github_user": "sgl-project",
-    "github_repo": "sgl-project.github.io",
+    "github_repo": "SpecForge",
     "github_version": "main",
     "conf_py_path": "/docs/",
 }
 
-html_static_path = ["_static", "spec_bundle/public"]
-html_css_files = ["css/custom_log.css"]
+html_static_path = ["_static"]
 
 
-def setup(app):
-    app.add_css_file("css/custom_log.css")
-
-
-htmlhelp_basename = "sglangdoc"
+htmlhelp_basename = "specforgedoc"
 
 latex_elements = {}
 
 latex_documents = [
-    (master_doc, "sglang.tex", "sglang Documentation", "SGLang Team", "manual"),
+    (
+        master_doc,
+        "specforge.tex",
+        "SpecForge Documentation",
+        "SpecForge Team",
+        "manual",
+    ),
 ]
 
-man_pages = [(master_doc, "sglang", "sglang Documentation", [author], 1)]
+man_pages = [(master_doc, "specforge", "SpecForge Documentation", [author], 1)]
 
 texinfo_documents = [
     (
         master_doc,
-        "sglang",
-        "sglang Documentation",
+        "specforge",
+        "SpecForge Documentation",
         author,
-        "sglang",
+        "specforge",
         "One line description of project.",
         "Miscellaneous",
     ),
@@ -157,32 +115,4 @@ epub_exclude_files = ["search.html"]
 copybutton_prompt_text = r">>> |\.\.\. "
 copybutton_prompt_is_regexp = True
 
-autodoc_preserve_defaults = True
 navigation_with_keys = False
-
-autodoc_mock_imports = [
-    "torch",
-    "transformers",
-    "triton",
-]
-
-intersphinx_mapping = {
-    "python": ("https://docs.python.org/3.12", None),
-    "typing_extensions": ("https://typing-extensions.readthedocs.io/en/latest", None),
-    "pillow": ("https://pillow.readthedocs.io/en/stable", None),
-    "numpy": ("https://numpy.org/doc/stable", None),
-    "torch": ("https://pytorch.org/docs/stable", None),
-}
-
-html_theme = "sphinx_book_theme"
-
-
-nbsphinx_prolog = """
-.. raw:: html
-
-    <style>
-        .output_area.stderr, .output_area.stdout {
-            color: #d3d3d3 !important; /* light gray */
-        }
-    </style>
-"""
