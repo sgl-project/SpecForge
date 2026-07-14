@@ -1,9 +1,9 @@
 """Gate one overfit draft artifact through real SGLang DFLASH chat serving.
 
 This script is tied to the SGLang DFLASH serving API, not to a particular draft
-architecture. A method-specific launcher should export its checkpoint into an
-SGLang-compatible draft artifact, start the server with ``--speculative-algorithm
-DFLASH``, then call this checker with the prompt artifact produced by
+architecture. ``run_dflash_serving_gate.sh`` exports the checkpoint into an
+SGLang-compatible draft artifact, starts the server with ``--speculative-algorithm
+DFLASH``, then calls this checker with the prompt artifact produced by
 ``select_overfit_sample.py``.
 
 Future DFLASH draft methods can reuse this checker when they expose the same
