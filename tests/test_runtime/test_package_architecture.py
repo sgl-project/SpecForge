@@ -60,6 +60,10 @@ CAPABILITY_TEST_REPLACEMENTS = {
         "tests/test_runtime/test_flow_control.py",
         "tests/test_runtime/test_disagg_multiserver.py",
     ),
+    "tests/test_runtime/test_dflash_launch.py": (
+        "tests/test_runtime/test_dflash_online_launch.py",
+        "tests/test_runtime/test_dflash_offline_launch.py",
+    ),
     "tests/test_runtime/test_disagg_online_shared_plane.py": (
         "tests/test_runtime/test_disagg_online_shared_plane.py",
         "tests/test_runtime/test_ref_distributor.py",
@@ -73,6 +77,34 @@ CAPABILITY_TEST_REPLACEMENTS = {
     ),
     "tests/test_runtime/test_soak.py": (
         "tests/test_runtime/test_local_rollout_stream.py",
+    ),
+    "tests/test_scripts/test_compact_teacher_integration.py": (
+        "tests/test_runtime/test_compact_teacher_strategy.py",
+    ),
+    "tests/test_scripts/test_disagg_dflash_mask_token.py": (
+        "tests/test_runtime/test_disagg_launch.py",
+    ),
+    "tests/test_scripts/test_train_eagle3.py": (
+        "tests/test_runtime/test_single_entry.py",
+        "tests/test_runtime/test_online_launch.py",
+        "tests/test_runtime/test_offline_launch_fsdp.py",
+    ),
+    "tests/test_scripts/test_train_eagle3_cache_key.py": (
+        "tests/test_runtime/test_offline_vocab_mapping.py",
+    ),
+    "tests/test_scripts/test_train_eagle3_optimizer.py": (
+        "tests/test_runtime/test_domain_trainer.py",
+        "tests/test_runtime/test_trainer.py",
+    ),
+    "tests/test_scripts/test_train_peagle_resume.py": (
+        "tests/test_runtime/test_checkpoint_resume.py",
+        "tests/test_runtime/test_peagle_strategy.py",
+    ),
+    "tests/test_utils/test_compact_teacher.py": (
+        "tests/test_runtime/test_compact_teacher_strategy.py",
+    ),
+    "tests/test_vlm/test_qwenvl_loss_mask.py": (
+        "tests/test_runtime/test_vlm_unified_path.py",
     ),
 }
 
