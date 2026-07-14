@@ -193,7 +193,8 @@ class TrainerCore:
         # DP-average loss AND accuracy across ranks before logging, matching stock
         # DFlash reports a data-parallel mean for loss and accuracy.
         metrics: Dict[str, Any] = {"loss": _scalar(_dp_mean(out.loss))}
-        for key in ("acces", "acceptance_rates", "plosses"):
+        structured_metric_keys = ("acces", "acceptance_rates", "plosses")
+        for key in structured_metric_keys:
             if key in out.metrics:
                 metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
                     out.metrics[key]
@@ -202,6 +203,23 @@ class TrainerCore:
             # DP-average the accuracy across ranks.
             # so the logged curve is smooth, not a single rank's noisy local batch.
             metrics["acc"] = _scalar(_dp_mean(out.metrics["accuracy"]))
+        # Strategies may expose additional scalar diagnostics without teaching
+        # the generic trainer their algorithm-specific names. Move CPU schedule
+        # scalars (for example Domino's lambda_base) onto the loss device before
+        # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
+        reserved_metric_keys = set(structured_metric_keys) | {"accuracy"}
+        for key, value in out.metrics.items():
+            if key in reserved_metric_keys:
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                scalar = value.detach().reshape(()).to(out.loss.device)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                scalar = out.loss.detach().new_tensor(float(value))
+            else:
+                continue
+            metrics[key] = _scalar(_dp_mean(scalar))
         gn = _scalar(grad_norm) if grad_norm is not None else None
         if gn is not None:
             metrics["grad_norm"] = gn

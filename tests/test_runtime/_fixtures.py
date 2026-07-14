@@ -401,3 +401,79 @@ def build_domino(
     ).cuda()
     width = len(draft_model.target_layer_ids) * hidden
     return domino_model, width, target_dir, list(draft_model.target_layer_ids)
+
+
+def build_dspark(
+    workdir,
+    *,
+    hidden=H,
+    vocab=V,
+    target_layers=4,
+    draft_layers=1,
+    block_size=4,
+    num_anchors=2,
+    markov_rank=8,
+    mask_token_id=0,
+    attention_backend="sdpa",
+):
+    """Build a tiny OnlineDSparkModel on CUDA without model downloads."""
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    from specforge.core.dflash import OnlineDSparkModel
+    from specforge.modeling.draft.dspark import DSparkDraftModel
+    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+    target_config = Qwen3Config(
+        hidden_size=hidden,
+        intermediate_size=2 * hidden,
+        num_hidden_layers=target_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=vocab,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(1234)
+    target_dir = os.path.join(workdir, "dspark_target")
+    Qwen3ForCausalLM(target_config).save_pretrained(target_dir)
+
+    draft_config = AutoConfig.from_pretrained(target_dir)
+    draft_config.num_hidden_layers = draft_layers
+    draft_config.block_size = block_size
+    draft_config.num_target_layers = target_layers
+    draft_config.dflash_config = {
+        "projector_type": "dspark",
+        "mask_token_id": mask_token_id,
+        "markov_rank": markov_rank,
+        "markov_head_type": "vanilla",
+        "confidence_head_alpha": 1.0,
+        "enable_confidence_head": True,
+        "confidence_head_with_markov": True,
+    }
+    draft_config._attn_implementation = attention_backend
+
+    draft_model = DSparkDraftModel(draft_config).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    draft_model.mask_token_id = mask_token_id
+    target_components = TargetEmbeddingsAndHead.from_pretrained(
+        target_dir,
+        lm_head_key="lm_head.weight",
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    dspark_model = OnlineDSparkModel(
+        draft_model=draft_model,
+        target_lm_head=target_components.lm_head,
+        target_embed_tokens=target_components.embed_tokens,
+        block_size=draft_model.block_size,
+        mask_token_id=mask_token_id,
+        attention_backend=attention_backend,
+        num_anchors=num_anchors,
+        dspark_ce_loss_alpha=0.1,
+        dspark_l1_loss_alpha=0.9,
+        dspark_confidence_head_alpha=1.0,
+    ).cuda()
+    width = len(draft_model.target_layer_ids) * hidden
+    return dspark_model, width

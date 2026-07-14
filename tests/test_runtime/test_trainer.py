@@ -120,6 +120,28 @@ class TestTrainerCore(unittest.TestCase):
         rep = core.train_step(_batch())
         self.assertNotIn("mode", rep.metrics)
 
+    def test_strategy_scalar_metrics_are_preserved(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        result = core._result(
+            StepOutput(
+                loss=torch.tensor(2.0),
+                metrics={
+                    "accuracy": torch.tensor(0.5),
+                    "ce_loss": torch.tensor(1.25),
+                    "lambda_base": 0.75,
+                    "non_scalar_debug": torch.tensor([1.0, 2.0]),
+                },
+            ),
+            grad_norm=None,
+            stepped=False,
+        )
+
+        self.assertEqual(result.metrics["acc"], 0.5)
+        self.assertEqual(result.metrics["ce_loss"], 1.25)
+        self.assertEqual(result.metrics["lambda_base"], 0.75)
+        self.assertNotIn("non_scalar_debug", result.metrics)
+
     def test_validate_batch_missing_feature(self):
         strat = FakeStrategy()
         bad = TrainBatch(sample_ids=["s"], strategy="fake", tensors={}, metadata={})
