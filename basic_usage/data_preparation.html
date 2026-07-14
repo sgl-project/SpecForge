@@ -58,7 +58,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 03, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 14, 2026"/>
   </head>
   
   
@@ -415,7 +415,11 @@
                 <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">📍 Overview</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pre-supported-datasets">☁️ Pre-supported Datasets</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-datasets">↩️ Regenerate Datasets</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-datasets">↩️ Regenerate Datasets</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-turn-structured-reasoning">Multi-turn structured reasoning</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen-sharegpt-recipes">Qwen ShareGPT recipes</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-your-own-dataset">🤩 Prepare your own dataset</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-conversation-format">Option 1: Conversation Format</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-pre-formatted-text-format">Option 2: Pre-formatted Text Format</a></li>
@@ -487,7 +491,106 @@ python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--d
 </pre></div>
 </div>
 <p>For reasoning models, add <code class="docutils literal notranslate"><span class="pre">--reasoning</span> <span class="pre">save</span></code> to store <code class="docutils literal notranslate"><span class="pre">reasoning_content</span></code> in the regenerated dataset. To use a reasoning model with thinking disabled, add <code class="docutils literal notranslate"><span class="pre">--reasoning</span> <span class="pre">disable</span></code>, which forwards <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs.enable_thinking=false</span></code> to the SGLang server and does not save <code class="docutils literal notranslate"><span class="pre">reasoning_content</span></code>.</p>
+<section id="multi-turn-structured-reasoning">
+<h3>Multi-turn structured reasoning<a class="headerlink" href="#multi-turn-structured-reasoning" title="Link to this heading">#</a></h3>
+<p>A regenerated multi-turn reasoning conversation stores several assistant
+targets in one row. When training uses last-turn-only loss masking, only the
+final assistant target is supervised. Convert the validated conversation-level
+output into one generation-event row per assistant turn so every reasoning
+target is trained with the visible history available at its serving boundary:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/explode_generation_events.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--input-file-path<span class="w"> </span>./cache/dataset/sharegpt_train_regen_reasoning.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-file-path<span class="w"> </span>./cache/dataset/sharegpt_train_regen_reasoning_exploded.jsonl
+</pre></div>
+</div>
+<p>Each event ends at its current assistant target and preserves that turn’s
+<code class="docutils literal notranslate"><span class="pre">reasoning_content</span></code> and visible <code class="docutils literal notranslate"><span class="pre">content</span></code>. Historical assistant messages keep
+only visible <code class="docutils literal notranslate"><span class="pre">content</span></code>; their hidden reasoning is removed from the event
+context. Train the exploded output with the entry point’s
+<code class="docutils literal notranslate"><span class="pre">train_only_last_turn</span></code> option enabled.</p>
+<p>The converter accepts only successful rows with non-empty IDs, message content,
+and assistant <code class="docutils literal notranslate"><span class="pre">reasoning_content</span></code>. Invalid input is written to a skipped JSONL;
+if any turn is invalid, the entire source conversation is skipped. Output files
+must be fresh and distinct from the input.</p>
 <p>For maximum performance, we recommend to scale the number of GPUs to regenerate the dataset in data parallel mode. To do this, you can simply add more server addresses to the <code class="docutils literal notranslate"><span class="pre">--server-address</span></code> argument, e.g. <code class="docutils literal notranslate"><span class="pre">--server-address</span> <span class="pre">localhost:30000</span> <span class="pre">localhost:30001</span> <span class="pre">localhost:30002</span> <span class="pre">localhost:30003</span></code>.</p>
+</section>
+<section id="qwen-sharegpt-recipes">
+<h3>Qwen ShareGPT recipes<a class="headerlink" href="#qwen-sharegpt-recipes" title="Link to this heading">#</a></h3>
+<p>The Qwen recipe wraps regeneration, complete-row accounting, and output
+validation. It expects one or more SGLang servers to already be running; it does
+not launch or stop the servers itself.</p>
+<p>For Qwen3-8B non-reasoning regeneration, start a target server in one terminal:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model-path<span class="w"> </span>Qwen/Qwen3-8B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span>
+</pre></div>
+</div>
+<p>After <code class="docutils literal notranslate"><span class="pre">curl</span> <span class="pre">--fail</span> <span class="pre">http://127.0.0.1:30000/health</span></code> succeeds, run the recipe from
+the SpecForge repository root:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MODEL_PROFILE</span><span class="o">=</span>qwen3-8b<span class="w"> </span><span class="se">\</span>
+<span class="nv">INPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="nv">OUTPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train_regen_qwen3_8b_temperature0_non_reasoning.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">&quot;localhost:30000&quot;</span><span class="w"> </span><span class="se">\</span>
+bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
+</pre></div>
+</div>
+<p>This profile sets temperature to zero, disables thinking through
+<code class="docutils literal notranslate"><span class="pre">chat_template_kwargs.enable_thinking=false</span></code>, and rejects non-empty structured
+reasoning in successful rows.</p>
+<p>For Qwen3.6-27B structured-reasoning regeneration, start SGLang with the Qwen3
+reasoning parser so the OpenAI-compatible response includes
+<code class="docutils literal notranslate"><span class="pre">reasoning_content</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model-path<span class="w"> </span>Qwen/Qwen3.6-27B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--reasoning-parser<span class="w"> </span>qwen3<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span>
+</pre></div>
+</div>
+<p>After <code class="docutils literal notranslate"><span class="pre">curl</span> <span class="pre">--fail</span> <span class="pre">http://127.0.0.1:30000/health</span></code> succeeds, run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MODEL_PROFILE</span><span class="o">=</span>qwen3.6-27b<span class="w"> </span><span class="se">\</span>
+<span class="nv">INPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="nv">OUTPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train_regen_qwen3.6-27b_temperature0_reasoning.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">&quot;localhost:30000&quot;</span><span class="w"> </span><span class="se">\</span>
+bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
+</pre></div>
+</div>
+<p>The default maximum completion lengths are 4096 tokens for Qwen3-8B and 32768
+tokens for Qwen3.6-27B. The server context length must accommodate both the
+rendered prompt and <code class="docutils literal notranslate"><span class="pre">MAX_TOKENS</span></code>; override <code class="docutils literal notranslate"><span class="pre">MAX_TOKENS</span></code> when using a shorter
+server context.</p>
+<p><code class="docutils literal notranslate"><span class="pre">INPUT_FILE</span></code> may point to another dataset without changing the recipe as long
+as it is JSONL in the conversation format documented below, with a non-empty
+string <code class="docutils literal notranslate"><span class="pre">id</span></code> and alternating <code class="docutils literal notranslate"><span class="pre">user</span></code>/<code class="docutils literal notranslate"><span class="pre">assistant</span></code> messages. Always choose a fresh
+<code class="docutils literal notranslate"><span class="pre">OUTPUT_FILE</span></code>: the recipe deliberately refuses to overwrite or resume an
+existing run.</p>
+<p>For an output such as <code class="docutils literal notranslate"><span class="pre">dataset_regen.jsonl</span></code>, the recipe produces:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">dataset_regen.jsonl</span></code>: successful regenerated training rows;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dataset_regen_error.jsonl</span></code>: request or generation errors;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dataset_regen_skipped.jsonl</span></code>: schema-invalid inputs and outputs excluded by the
+selected reasoning contract.</p></li>
+</ul>
+<p>The run passes accounting only when
+<code class="docutils literal notranslate"><span class="pre">success</span> <span class="pre">+</span> <span class="pre">error</span> <span class="pre">+</span> <span class="pre">skipped</span> <span class="pre">==</span> <span class="pre">input</span></code>. It prints the success fraction without a
+fixed minimum threshold, then strictly validates every successful row,
+including its conversation structure, reasoning contract, and absence of raw
+<code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> markers.</p>
+<p>To distribute regeneration across independently launched servers, provide all
+addresses as a space-separated list, for example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">&quot;localhost:30000 localhost:30010&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">CONCURRENCY</span><span class="o">=</span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
+</pre></div>
+</div>
+</section>
 </section>
 <section id="prepare-your-own-dataset">
 <h2>🤩 Prepare your own dataset<a class="headerlink" href="#prepare-your-own-dataset" title="Link to this heading">#</a></h2>
@@ -599,7 +702,11 @@ torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span cl
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">📍 Overview</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pre-supported-datasets">☁️ Pre-supported Datasets</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-datasets">↩️ Regenerate Datasets</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-datasets">↩️ Regenerate Datasets</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-turn-structured-reasoning">Multi-turn structured reasoning</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen-sharegpt-recipes">Qwen ShareGPT recipes</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-your-own-dataset">🤩 Prepare your own dataset</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-conversation-format">Option 1: Conversation Format</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-pre-formatted-text-format">Option 2: Pre-formatted Text Format</a></li>
@@ -639,7 +746,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 03, 2026.
+  Last updated on Jul 14, 2026.
   <br/>
 </p>
   </div>
