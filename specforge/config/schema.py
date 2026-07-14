@@ -373,13 +373,6 @@ class Config(StrictConfigModel):
                 "model.draft_checkpoint_path (weights-only warm start) and "
                 "training.resume_from (full resume) are mutually exclusive"
             )
-        if (
-            self.training.role == "producer"
-            and self.model.draft_checkpoint_path is not None
-        ):
-            raise ValueError(
-                "model.draft_checkpoint_path is valid only for a trainer role"
-            )
         if self.training.role == "producer" and self.profiling.enabled:
             raise ValueError(
                 "profiling.enabled applies to trainer roles, not a capture-only "
