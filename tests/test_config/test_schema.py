@@ -60,7 +60,7 @@ class ConfigSchemaTest(unittest.TestCase):
 
         invalid = copy.deepcopy(payload)
         invalid["training"] = {"strategy": "dflash"}
-        with self.assertRaisesRegex(ValidationError, "EAGLE3 only"):
+        with self.assertRaisesRegex(ValidationError, "does not support input_modality"):
             Config.model_validate(invalid)
 
     def test_target_output_sharding_is_a_colocated_text_sglang_option(self):
@@ -354,6 +354,44 @@ class ConfigSchemaTest(unittest.TestCase):
                 }
             )
 
+    def test_registered_strategy_needs_no_schema_edit(self):
+        from specforge.training.strategies import registry as strategy_registry
+        from specforge.training.strategies.assembly import (
+            DraftConfigSpec,
+            StrategyAssemblySpec,
+            StrategyModelParts,
+        )
+        from specforge.training.strategies.registry import (
+            StrategySpec,
+            register_strategy,
+        )
+
+        name = "_config_registry_test"
+        register_strategy(
+            StrategySpec(
+                name=name,
+                required_features=frozenset({"input_ids"}),
+                make_strategy=lambda wrapped, *, target_head=None: None,
+                assembly=StrategyAssemblySpec(
+                    draft_config=DraftConfigSpec(architecture="UnusedDraft"),
+                    make_draft_model=lambda cfg, draft_config: None,
+                    make_model=(
+                        lambda cfg, draft, draft_config, target_config, tokenizer: (
+                            StrategyModelParts(model=None)
+                        )
+                    ),
+                ),
+                supported_modes=frozenset({"offline"}),
+                supported_attention_backends=frozenset({"flex_attention"}),
+            )
+        )
+        self.addCleanup(strategy_registry._REGISTRY.pop, name, None)
+
+        payload = copy.deepcopy(MINIMAL)
+        payload["training"] = {"strategy": name}
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.training.strategy, name)
+
     def test_strategy_specific_capture_and_attention_are_validated(self):
         online = {**MINIMAL, "data": {"train_data_path": "/data.jsonl"}}
         with self.assertRaisesRegex(ValidationError, "exactly three"):
@@ -378,7 +416,9 @@ class ConfigSchemaTest(unittest.TestCase):
                     "training": {"strategy": "dflash"},
                 }
             )
-        with self.assertRaisesRegex(ValidationError, "P-EAGLE"):
+        with self.assertRaisesRegex(
+            ValidationError, "does not support attention_backend"
+        ):
             Config.model_validate(
                 {
                     **online,
@@ -388,11 +428,15 @@ class ConfigSchemaTest(unittest.TestCase):
                     },
                 }
             )
-        with self.assertRaisesRegex(ValidationError, "EAGLE3 attention_backend"):
+        with self.assertRaisesRegex(
+            ValidationError, "does not support attention_backend"
+        ):
             Config.model_validate(
                 {**online, "training": {"attention_backend": "eager"}}
             )
-        with self.assertRaisesRegex(ValidationError, "DFlash-family"):
+        with self.assertRaisesRegex(
+            ValidationError, "does not support attention_backend"
+        ):
             Config.model_validate(
                 {
                     **online,

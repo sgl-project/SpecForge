@@ -326,15 +326,10 @@ def _producer_capture_metadata(cfg: Config):
     )
     target_cfg = getattr(target_cfg, "text_config", target_cfg)
     draft_cfg = draft_config_dict(cfg)
+    from specforge.training.strategies.registry import resolve_strategy
 
-    if cfg.training.strategy in ("eagle3", "peagle"):
-        from specforge.training.assembly import resolve_eagle_capture_layers
-
-        layers = resolve_eagle_capture_layers(cfg, draft_cfg, target_cfg)
-    else:
-        layers = list(
-            (draft_cfg.get("dflash_config") or {}).get("target_layer_ids", [])
-        )
+    spec = resolve_strategy(cfg.training.strategy)
+    layers = spec.assembly.resolve_capture_layers(cfg, draft_cfg, target_cfg)
     if not layers:
         raise ValueError("draft config does not define target capture layer ids")
     return (
@@ -360,8 +355,9 @@ def _build_online(
     )
 
     strategy = cfg.training.strategy
-    if strategy == "peagle":
-        raise NotImplementedError("P-EAGLE disaggregated capture is not wired")
+    from specforge.training.strategies.registry import resolve_strategy
+
+    spec = resolve_strategy(strategy)
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
         _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
@@ -399,7 +395,7 @@ def _build_online(
             )
             for url in _server_urls(cfg)
         ]
-        target_repr = "hidden_state" if strategy in ("eagle3", "dspark") else None
+        target_repr = spec.assembly.server_target_repr
         peer_wait_timeout_s = float(os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800"))
         high_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
         in_flight_high_watermark = int(
@@ -519,22 +515,12 @@ def _build_online(
     from specforge.launch import build_disagg_online_consumer
 
     bundle = build_model_bundle(cfg, load_target_engine=False)
-    target_head = None
-    if strategy == "eagle3":
-        from specforge.modeling.target.target_head import TargetHead
-
-        target_head = TargetHead.from_pretrained(
-            cfg.model.target_model_path,
-            lm_head_key=cfg.model.lm_head_key,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
     trainer = build_disagg_online_consumer(
         strategy=strategy,
         feature_store=store,
         channel=channel,
         draft_model=bundle.model,
-        target_head=target_head,
+        target_head=bundle.target_head,
         optimizer_factory=optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,

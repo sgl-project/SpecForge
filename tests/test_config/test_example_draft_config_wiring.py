@@ -5,23 +5,11 @@ import unittest
 from pathlib import Path
 from typing import Optional
 
+from specforge.training.strategies.registry import resolve_strategy
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
 DRAFT_CONFIG_DIR = REPO_ROOT / "configs"
-
-EXPECTED_ARCHITECTURE = {
-    "eagle3": "LlamaForCausalLMEagle3",
-    "peagle": "PEagleDraftModel",
-    "dflash": "DFlashDraftModel",
-    "domino": "DominoDraftModel",
-    "dspark": "DSparkDraftModel",
-}
-
-EXPECTED_AUTO_MODEL = {
-    "dflash": "dflash.DFlashDraftModel",
-    "domino": "domino.DominoDraftModel",
-    "dspark": "dspark.DSparkDraftModel",
-}
 
 
 def _yaml_scalar(path: Path, key: str) -> Optional[str]:
@@ -56,17 +44,18 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
 
         for recipe, strategy, draft_config in recipes:
             with self.subTest(recipe=recipe.name):
-                self.assertIn(strategy, EXPECTED_ARCHITECTURE)
+                spec = resolve_strategy(strategy)
                 self.assertTrue(draft_config.is_file(), draft_config)
                 payload = json.loads(draft_config.read_text())
                 self.assertEqual(
                     payload.get("architectures"),
-                    [EXPECTED_ARCHITECTURE[strategy]],
+                    [spec.assembly.draft_config.architecture],
                 )
-                if strategy in EXPECTED_AUTO_MODEL:
+                expected_auto_model = spec.assembly.draft_config.expected_auto_map_model
+                if expected_auto_model is not None:
                     self.assertEqual(
                         payload.get("auto_map", {}).get("AutoModel"),
-                        EXPECTED_AUTO_MODEL[strategy],
+                        expected_auto_model,
                     )
 
     def test_every_checked_in_draft_config_has_a_unified_yaml_recipe(self):

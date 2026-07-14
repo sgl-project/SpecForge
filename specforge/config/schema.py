@@ -194,7 +194,7 @@ class RuntimeConfig(StrictConfigModel):
 
 
 class TrainingConfig(StrictConfigModel):
-    strategy: Literal["eagle3", "dflash", "domino", "dspark", "peagle"] = "eagle3"
+    strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -261,24 +261,25 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_strategy_options(self):
-        if self.strategy == "peagle" and self.batch_size != 1:
-            raise ValueError("P-EAGLE currently requires training.batch_size=1")
-        if self.strategy == "eagle3" and self.attention_backend == "eager":
+        from specforge.training.strategies.registry import resolve_strategy
+
+        try:
+            spec = resolve_strategy(self.strategy)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+        if self.attention_backend not in spec.supported_attention_backends:
             raise ValueError(
-                "EAGLE3 attention_backend must be sdpa, flex_attention, fa, or usp"
+                f"strategy {self.strategy!r} does not support attention_backend="
+                f"{self.attention_backend!r}; supported: "
+                f"{sorted(spec.supported_attention_backends)}"
             )
-        if self.strategy == "peagle" and self.attention_backend != "flex_attention":
+        if (
+            spec.required_batch_size is not None
+            and self.batch_size != spec.required_batch_size
+        ):
             raise ValueError(
-                "P-EAGLE currently requires attention_backend=flex_attention"
-            )
-        if self.strategy in (
-            "dflash",
-            "domino",
-            "dspark",
-        ) and self.attention_backend in ("fa", "usp"):
-            raise ValueError(
-                "DFlash-family attention_backend must be eager, sdpa, or "
-                "flex_attention"
+                f"strategy {self.strategy!r} requires training.batch_size="
+                f"{spec.required_batch_size}"
             )
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
@@ -301,8 +302,6 @@ class TrainingConfig(StrictConfigModel):
             )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
-            if self.strategy != "eagle3":
-                raise ValueError("USP attention is supported for EAGLE3 only")
             if self.batch_size != 1:
                 raise ValueError(
                     "USP attention currently requires training.batch_size=1"
@@ -332,6 +331,10 @@ class Config(StrictConfigModel):
     @model_validator(mode="after")
     def _validate_capability_matrix(self):
         strategy = self.training.strategy
+        from specforge.training.strategies.registry import resolve_strategy
+
+        spec = resolve_strategy(strategy)
+        draft_policy = spec.assembly.draft_config
         mode = self.mode
         deployment = self.training.deployment_mode
         layers = self.model.aux_hidden_state_layer_ids
@@ -344,26 +347,36 @@ class Config(StrictConfigModel):
         if (
             not self.model.draft_model_config
             and not self.model.draft_checkpoint_path
-            and strategy not in ("eagle3", "peagle", "dflash")
+            and not draft_policy.supports_auto_generation
         ):
             raise ValueError(
                 f"training.strategy={strategy!r} requires "
                 "model.draft_model_config; automatic target-derived configs are "
-                "supported for EAGLE3, P-EAGLE, and DFlash"
+                "not registered for this strategy"
             )
         if self.model.draft_num_hidden_layers is not None:
-            if strategy not in ("eagle3", "peagle", "dflash"):
+            if not draft_policy.supports_num_hidden_layers_override:
                 raise ValueError(
-                    "model.draft_num_hidden_layers supports EAGLE3, P-EAGLE, "
-                    "and DFlash"
+                    f"strategy {strategy!r} does not support "
+                    "model.draft_num_hidden_layers"
                 )
-            if strategy == "eagle3" and self.model.draft_num_hidden_layers != 1:
+            if (
+                draft_policy.required_num_hidden_layers is not None
+                and self.model.draft_num_hidden_layers
+                != draft_policy.required_num_hidden_layers
+            ):
                 raise ValueError(
-                    "EAGLE3 has one draft decoder layer; use "
-                    "model.draft_num_hidden_layers=1 or omit it"
+                    f"strategy {strategy!r} requires "
+                    "model.draft_num_hidden_layers="
+                    f"{draft_policy.required_num_hidden_layers} or no override"
                 )
-        if self.model.draft_block_size is not None and strategy != "dflash":
-            raise ValueError("model.draft_block_size is an override for DFlash only")
+        if (
+            self.model.draft_block_size is not None
+            and not draft_policy.supports_block_size_override
+        ):
+            raise ValueError(
+                f"strategy {strategy!r} does not support model.draft_block_size"
+            )
         if (
             self.model.draft_checkpoint_path is not None
             and self.training.resume_from is not None
@@ -403,25 +416,36 @@ class Config(StrictConfigModel):
                 "online disaggregated evaluation is not supported; use a "
                 "colocated online eval stream"
             )
-        if strategy in ("eagle3", "peagle"):
+        if spec.allows_aux_layer_override:
             if layers is not None and (len(layers) != 3 or any(i < 0 for i in layers)):
                 raise ValueError(
-                    "EAGLE-family model.aux_hidden_state_layer_ids must contain "
+                    "model.aux_hidden_state_layer_ids must contain "
                     "exactly three non-negative layer ids"
                 )
         elif layers is not None:
             raise ValueError(
-                "DFlash-family capture layers come from draft_model_config; "
+                f"strategy {strategy!r} gets capture layers from its draft config; "
                 "model.aux_hidden_state_layer_ids would be ignored"
             )
-        if mode == "offline" and strategy not in ("eagle3", "dflash", "domino"):
+        if mode not in spec.supported_modes:
             raise ValueError(
-                "offline feature training supports EAGLE3, DFlash, and Domino"
+                f"strategy {strategy!r} does not support {mode} training; "
+                f"supported: {sorted(spec.supported_modes)}"
+            )
+        if deployment not in spec.supported_deployments:
+            raise ValueError(
+                f"strategy {strategy!r} does not support deployment_mode="
+                f"{deployment!r}; supported: {sorted(spec.supported_deployments)}"
             )
         if self.training.compact_teacher:
-            if strategy != "eagle3" or mode != "offline" or modality != "text":
+            if (
+                not spec.supports_compact_teacher
+                or mode != "offline"
+                or modality != "text"
+            ):
                 raise ValueError(
-                    "training.compact_teacher supports offline text EAGLE3 only"
+                    f"strategy {strategy!r} does not support compact teacher for "
+                    f"mode={mode!r}, modality={modality!r}"
                 )
         elif self.training.compact_teacher_chunk_size is not None:
             raise ValueError(
@@ -429,18 +453,15 @@ class Config(StrictConfigModel):
                 "training.compact_teacher=true"
             )
         if (
-            strategy == "eagle3"
+            spec.requires_disaggregated_vocab_mapping
             and deployment == "disaggregated"
             and not self.model.vocab_mapping_path
         ):
             raise ValueError(
-                "EAGLE3 disaggregated runs require model.vocab_mapping_path "
+                f"strategy {strategy!r} disaggregated runs require "
+                "model.vocab_mapping_path "
                 "because producer and consumer cannot derive one shared mapping"
             )
-        if strategy == "peagle" and deployment != "local_colocated":
-            raise ValueError("P-EAGLE currently supports colocated online runs only")
-        if strategy == "dspark" and deployment != "disaggregated":
-            raise ValueError("DSpark requires disaggregated server capture")
         if (
             mode == "online"
             and deployment == "disaggregated"
@@ -472,15 +493,19 @@ class Config(StrictConfigModel):
             )
         if (
             mode == "online"
-            and self.model.target_backend == "custom"
-            and strategy not in ("eagle3", "peagle")
+            and self.model.target_backend not in spec.supported_target_backends
         ):
             raise ValueError(
-                "the custom target backend currently supports EAGLE3 capture only"
+                f"strategy {strategy!r} does not support target_backend="
+                f"{self.model.target_backend!r}; supported: "
+                f"{sorted(spec.supported_target_backends)}"
+            )
+        if modality not in spec.supported_modalities:
+            raise ValueError(
+                f"strategy {strategy!r} does not support input_modality="
+                f"{modality!r}; supported: {sorted(spec.supported_modalities)}"
             )
         if modality == "qwen2_5_vl":
-            if strategy != "eagle3":
-                raise ValueError("Qwen2.5-VL input is supported for EAGLE3 only")
             if mode != "online":
                 raise ValueError("Qwen2.5-VL input requires online target capture")
             if deployment != "local_colocated":
@@ -499,9 +524,10 @@ class Config(StrictConfigModel):
             if self.training.attention_backend == "usp":
                 raise ValueError("Qwen2.5-VL does not support USP attention")
         if shard_target_output:
-            if strategy != "eagle3" or mode != "online":
+            if not spec.supports_sharded_target_output or mode != "online":
                 raise ValueError(
-                    "model.shard_target_output supports online EAGLE3 capture only"
+                    f"strategy {strategy!r} does not support sharded target "
+                    f"output in {mode} mode"
                 )
             if deployment != "local_colocated":
                 raise ValueError(

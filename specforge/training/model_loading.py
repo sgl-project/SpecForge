@@ -38,16 +38,6 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_FILE = "config.json"
 _STATE_FILE = "training_state.pt"
-_AUTO_CONFIG_STRATEGIES = frozenset({"eagle3", "peagle", "dflash"})
-_EXPECTED_ARCHITECTURES = {
-    "eagle3": "LlamaForCausalLMEagle3",
-    "peagle": "PEagleDraftModel",
-    "dflash": "DFlashDraftModel",
-    "domino": "DominoDraftModel",
-    "dspark": "DSparkDraftModel",
-}
-_AUTO_DRAFT_LAYERS = {"eagle3": 1, "peagle": 4, "dflash": 1}
-_AUTO_DFLASH_BLOCK_SIZE = 16
 
 # These are the architecture fields the legacy EAGLE generator copied from the
 # target, plus RoPE/attention fields needed by newer Qwen-family targets.  A
@@ -86,6 +76,12 @@ class WarmStartReport:
     loaded_keys: int
     missing_keys: Tuple[str, ...]
     loaded_embedding: bool
+
+
+def _assembly_spec(strategy: str):
+    from specforge.training.strategies.registry import resolve_strategy
+
+    return resolve_strategy(strategy).assembly
 
 
 def _without_file_uri(source: str) -> str:
@@ -216,7 +212,8 @@ def _serializable_config_value(value: Any) -> Any:
 
 def _generate_draft_config(cfg: "Config") -> "PretrainedConfig":
     strategy = cfg.training.strategy
-    if strategy not in _AUTO_CONFIG_STRATEGIES:
+    policy = _assembly_spec(strategy).draft_config
+    if not policy.supports_auto_generation:
         raise ValueError(
             f"training.strategy={strategy!r} requires model.draft_model_config "
             "or a pretrained model.draft_checkpoint_path containing config.json"
@@ -242,53 +239,29 @@ def _generate_draft_config(cfg: "Config") -> "PretrainedConfig":
             f"target config {cfg.model.target_model_path!r} cannot generate a "
             f"draft config; missing {required}"
         )
-    payload["architectures"] = [_EXPECTED_ARCHITECTURES[strategy]]
-    payload["model_type"] = "qwen3" if strategy == "dflash" else "llama"
-    payload["num_hidden_layers"] = _AUTO_DRAFT_LAYERS[strategy]
+    payload["architectures"] = [policy.architecture]
+    payload["model_type"] = policy.auto_model_type
+    payload["num_hidden_layers"] = policy.auto_num_hidden_layers
     payload["tie_word_embeddings"] = False
     payload["use_cache"] = True
     if payload.get("pad_token_id") is None:
         payload["pad_token_id"] = 0
-
-    if strategy in ("eagle3", "peagle"):
-        # This is the legacy EAGLE/P-EAGLE draft-head vocabulary default. The
-        # online data path builds the target-to-draft map when vocabularies differ.
-        payload["draft_vocab_size"] = 32000
-    else:
-        from specforge.modeling.draft.dflash import build_target_layer_ids
-
-        target_layers = getattr(target_config, "num_hidden_layers", None)
-        if not isinstance(target_layers, int) or target_layers < 1:
-            raise ValueError(
-                "DFlash auto-generation requires target num_hidden_layers, got "
-                f"{target_layers!r}"
-            )
-        payload["num_target_layers"] = target_layers
-        payload["block_size"] = _AUTO_DFLASH_BLOCK_SIZE
-        payload["dflash_config"] = {
-            "target_layer_ids": build_target_layer_ids(
-                target_layers, _AUTO_DRAFT_LAYERS[strategy]
-            )
-        }
+    if policy.auto_draft_vocab_size is not None:
+        payload["draft_vocab_size"] = policy.auto_draft_vocab_size
+    if policy.populate_generated is not None:
+        policy.populate_generated(payload, target_config, cfg)
     return _draft_config_from_dict(payload)
 
 
 def _apply_draft_overrides(cfg: "Config", draft_config: "PretrainedConfig") -> None:
-    strategy = cfg.training.strategy
     num_layers = cfg.model.draft_num_hidden_layers
     if num_layers is not None:
         draft_config.num_hidden_layers = num_layers
-        if strategy == "dflash":
-            from specforge.modeling.draft.dflash import build_target_layer_ids
-
-            target_layers = int(draft_config.num_target_layers)
-            method_config = dict(getattr(draft_config, "dflash_config", None) or {})
-            method_config["target_layer_ids"] = build_target_layer_ids(
-                target_layers, num_layers
-            )
-            draft_config.dflash_config = method_config
     if cfg.model.draft_block_size is not None:
         draft_config.block_size = cfg.model.draft_block_size
+    apply_overrides = _assembly_spec(cfg.training.strategy).draft_config.apply_overrides
+    if apply_overrides is not None:
+        apply_overrides(cfg, draft_config)
 
 
 def resolve_draft_config(cfg: "Config") -> "PretrainedConfig":
@@ -306,7 +279,7 @@ def resolve_draft_config(cfg: "Config") -> "PretrainedConfig":
     else:
         draft_config = _generate_draft_config(cfg)
 
-    expected = _EXPECTED_ARCHITECTURES[cfg.training.strategy]
+    expected = _assembly_spec(cfg.training.strategy).draft_config.architecture
     architectures = list(getattr(draft_config, "architectures", None) or [])
     if architectures != [expected]:
         raise ValueError(
@@ -453,7 +426,7 @@ def warm_start_draft_model(
             f"unexpected={sorted(result.unexpected_keys)}"
         )
     allowed_missing = set()
-    if strategy in ("eagle3", "peagle"):
+    if _assembly_spec(strategy).allow_missing_warm_start_embedding:
         allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:

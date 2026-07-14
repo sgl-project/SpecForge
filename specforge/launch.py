@@ -37,6 +37,7 @@ from specforge.runtime.data_plane import (
     LocalRolloutStream,
     drain_feature_store_removals,
 )
+from specforge.training.strategies.assembly import OnlineCaptureMode
 from specforge.training.strategies.registry import StrategySpec, resolve_strategy
 
 logger = logging.getLogger(__name__)
@@ -536,11 +537,10 @@ def _assemble_rollout_workers(
     the one controller, whose per-``worker_id`` leases keep their prompt slices
     disjoint. A single source may be shared by ``num_rollout_workers`` workers.
     """
-    if not spec.supports_online:
+    if spec.online_capture is OnlineCaptureMode.UNSUPPORTED:
         raise NotImplementedError(
-            f"online capture for strategy {spec.name!r} is not wired yet: it needs "
-            f"a {spec.name} capture path. Set feature_schema + "
-            f"supports_online=True on its StrategySpec."
+            f"online capture for strategy {spec.name!r} is not wired; set an "
+            "explicit online_capture mode on its StrategySpec"
         )
     from specforge.inference.batch_partition import TargetBatchPartition
     from specforge.inference.capture import CaptureConfig
@@ -566,13 +566,18 @@ def _assemble_rollout_workers(
     elif feature_source is not None:
         adapters = [feature_source] * num_rollout_workers
     else:
+        if spec.online_capture is OnlineCaptureMode.SERVER_ONLY:
+            raise NotImplementedError(
+                f"{spec.name} online capture requires a server feature source; "
+                "colocated target capture is not supported"
+            )
         from specforge.inference.adapters.policy import PolicyFeatureAdapter
 
         active_schema = feature_schema or spec.feature_schema
         if active_schema is None:
-            raise NotImplementedError(
-                f"{spec.name} online capture requires a server feature source; "
-                "colocated target capture is not supported"
+            raise ValueError(
+                f"strategy {spec.name!r} selects policy capture but has no "
+                "feature schema"
             )
         adapters = [
             PolicyFeatureAdapter(

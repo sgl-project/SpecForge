@@ -106,86 +106,29 @@ def _device():
     return get_local_device()
 
 
+def _strategy_spec(cfg: Config):
+    from specforge.training.strategies.registry import resolve_strategy
+
+    return resolve_strategy(cfg.training.strategy)
+
+
 def _load_draft(cfg: Config):
     """Construct the configured draft model without any legacy trainer code."""
-    from specforge.modeling.auto import AutoDraftModel
-    from specforge.training.model_loading import (
-        resolve_draft_config,
-        warm_start_draft_model,
-    )
+    from specforge.modeling.draft.registry import resolve_draft
+    from specforge.training.model_loading import resolve_draft_config
+    from specforge.training.strategies.registry import resolve_strategy
 
-    strategy = cfg.training.strategy
+    spec = resolve_strategy(cfg.training.strategy)
     draft_config = resolve_draft_config(cfg)
-    dtype = _torch_dtype(cfg.model.torch_dtype)
-
-    if strategy == "peagle":
-        from specforge.modeling.draft.peagle import PEagleDraftModel
-
-        draft_model = PEagleDraftModel(
-            draft_config,
-            norm_before_residual=cfg.training.norm_before_residual,
-        )
-    elif strategy == "eagle3":
-        draft_model = AutoDraftModel.from_config(
-            draft_config,
-            attention_backend=cfg.training.attention_backend,
-            torch_dtype=dtype,
-        )
-    else:
-        # DFlash, Domino and DSpark resolve through the draft registry (including
-        # the projector_type dispatch) and take their attention implementation
-        # from the config rather than a constructor keyword.
-        draft_config._attn_implementation = cfg.training.attention_backend
-        draft_model = AutoDraftModel.from_config(
-            draft_config,
-            torch_dtype=dtype,
-        )
-
-    expected = {
-        "eagle3": "LlamaForCausalLMEagle3",
-        "dflash": "DFlashDraftModel",
-        "domino": "DominoDraftModel",
-        "dspark": "DSparkDraftModel",
-        "peagle": "PEagleDraftModel",
-    }.get(strategy)
-    if expected is not None and type(draft_model).__name__ != expected:
+    draft_model = spec.assembly.make_draft_model(cfg, draft_config)
+    architecture = spec.assembly.draft_config.architecture
+    expected_type = resolve_draft(architecture)
+    if not isinstance(draft_model, expected_type):
         raise ValueError(
-            f"training.strategy={strategy!r} requires {expected}, but "
+            f"training.strategy={spec.name!r} requires {architecture}, but "
             f"the resolved draft config builds "
             f"{type(draft_model).__name__}"
         )
-
-    if strategy in ("eagle3", "peagle"):
-        # P-EAGLE trains embeddings, so target weights are the fallback and a
-        # complete warm checkpoint may overwrite them. EAGLE3 freezes target
-        # embeddings and therefore reloads them after warm-start weights.
-        if strategy == "peagle" and cfg.model.load_target_embedding:
-            draft_model.load_embedding(
-                cfg.model.target_model_path,
-                embedding_key=cfg.model.embedding_key,
-            )
-    if cfg.model.draft_checkpoint_path:
-        warm_start_draft_model(
-            draft_model,
-            cfg.model.draft_checkpoint_path,
-            draft_config=draft_config,
-            strategy=strategy,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
-
-    if strategy in ("eagle3", "peagle"):
-        if cfg.model.vocab_mapping_path:
-            draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
-        if strategy == "eagle3" and cfg.model.load_target_embedding:
-            draft_model.load_embedding(
-                cfg.model.target_model_path,
-                embedding_key=cfg.model.embedding_key,
-            )
-        # P-EAGLE trains its copied embedding; EAGLE3 intentionally freezes it.
-        if strategy == "eagle3":
-            draft_model.freeze_embedding()
-    draft_model = draft_model.to(device=_device(), dtype=dtype)
     return draft_config, draft_model
 
 
@@ -219,64 +162,10 @@ def _load_online_inputs(cfg: Config):
     return tokenizer, None, None
 
 
-def _draft_block_size(cfg: Config) -> int:
-    """Read the DFlash-family block size from its single source of truth."""
-    from specforge.training.model_loading import resolve_draft_config
-
-    draft_config = resolve_draft_config(cfg)
-    block_size = getattr(draft_config, "block_size", None)
-    if (
-        not isinstance(block_size, int)
-        or isinstance(block_size, bool)
-        or block_size < 1
-    ):
-        raise ValueError(
-            "DFlash-family draft config must define a positive integer block_size"
-        )
-    return block_size
-
-
-def resolve_eagle_capture_layers(cfg: Config, draft_config, target_config) -> List[int]:
-    """Resolve EAGLE capture layers: run override, draft config, then default."""
-    layers = cfg.model.aux_hidden_state_layer_ids
-    if layers is None:
-        eagle_config = (
-            draft_config.get("eagle_config", {})
-            if isinstance(draft_config, dict)
-            else getattr(draft_config, "eagle_config", {})
-        ) or {}
-        layers = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-    if layers is None:
-        target_config = _target_text_config(target_config)
-        num_layers = int(target_config.num_hidden_layers)
-        layers = [1, num_layers // 2 - 1, num_layers - 4]
-    layers = list(layers)
-    if len(layers) != 3 or any(not isinstance(i, int) or i < 0 for i in layers):
-        raise ValueError(
-            "resolved EAGLE capture layers must contain exactly three "
-            f"non-negative integers, got {layers!r}"
-        )
-    return layers
-
-
-def _resolve_mask_token_id(cfg: Config, draft_model, tokenizer) -> int:
-    from specforge.training.model_utils import resolve_mask_token_id
-
-    return resolve_mask_token_id(
-        explicit=cfg.model.mask_token_id,
-        tokenizer=tokenizer,
-        draft_model=draft_model,
-        embedding_vocab_size=int(draft_model.config.vocab_size),
-    )
-
-
-def _build_target_engine(cfg: Config, capture_layers):
+def _build_target_engine(cfg: Config, capture_layers, spec):
     from specforge.inference.target_engine import get_target_engine
 
-    # P-EAGLE consumes the exact EAGLE3 capture contract.
-    engine_strategy = (
-        "eagle3" if cfg.training.strategy == "peagle" else cfg.training.strategy
-    )
+    engine_strategy = spec.assembly.capture_engine_strategy or spec.name
     backend_kwargs = {}
     if cfg.model.target_backend == "sglang":
         target_batch_size = cfg.training.tp_size * cfg.training.batch_size
@@ -315,18 +204,7 @@ def _build_target_engine(cfg: Config, capture_layers):
 
 
 def _strategy_kwargs(cfg: Config) -> Dict[str, Any]:
-    t = cfg.training
-    if t.strategy == "eagle3":
-        return {
-            "compact_teacher": t.compact_teacher,
-            "compact_teacher_chunk_size": t.compact_teacher_chunk_size,
-        }
-    if t.strategy == "domino":
-        return {
-            "lambda_start": t.lambda_base_start,
-            "decay_ratio": t.lambda_base_decay_ratio,
-        }
-    return {}
+    return _strategy_spec(cfg).assembly.make_strategy_kwargs(cfg)
 
 
 def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> ModelBundle:
@@ -334,15 +212,12 @@ def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> Model
     import torch
     from transformers import AutoConfig
 
-    strategy = cfg.training.strategy
+    from specforge.training.strategies.assembly import OnlineCaptureMode
+    from specforge.training.strategies.registry import resolve_strategy
+
+    spec = resolve_strategy(cfg.training.strategy)
     draft_config, draft_model = _load_draft(cfg)
-    method_config = getattr(draft_model.config, "dflash_config", None) or {}
-    needs_mask_fallback = (
-        strategy in ("dflash", "domino", "dspark")
-        and cfg.model.mask_token_id is None
-        and method_config.get("mask_token_id") is None
-    )
-    needs_input_tools = cfg.mode == "online" or needs_mask_fallback
+    needs_input_tools = spec.assembly.needs_input_tools(cfg, draft_model)
     tokenizer, processor, input_preparer = (
         _load_online_inputs(cfg) if needs_input_tools else (None, None, None)
     )
@@ -358,143 +233,46 @@ def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> Model
         getattr(draft_config, "draft_vocab_size", draft_config.vocab_size)
     )
 
-    target_head = None
     target_engine = None
-    capture_layers = (
-        resolve_eagle_capture_layers(cfg, draft_config, target_config)
-        if cfg.mode == "online" and strategy in ("eagle3", "peagle")
-        else None
+    parts = spec.assembly.make_model(
+        cfg, draft_model, draft_config, target_config, tokenizer
     )
-
-    if strategy == "eagle3":
-        from specforge.core.eagle3 import OnlineEagle3Model
-
-        model = OnlineEagle3Model(
-            draft_model=draft_model,
-            length=cfg.training.ttt_length,
-            attention_backend=cfg.training.attention_backend,
-            lk_loss_type=cfg.training.lk_loss_type,
-            kl_scale=cfg.training.kl_scale,
-            kl_decay=cfg.training.kl_decay,
-        ).to(device=_device(), dtype=_torch_dtype(cfg.model.torch_dtype))
-        if cfg.mode == "offline":
-            from specforge.modeling.target.target_head import TargetHead
-
-            target_head = TargetHead.from_pretrained(
-                cfg.model.target_model_path,
-                lm_head_key=cfg.model.lm_head_key,
-                cache_dir=cfg.model.cache_dir,
-                trust_remote_code=cfg.model.trust_remote_code,
-            )
-    elif strategy == "peagle":
-        if cfg.mode != "online":
-            raise NotImplementedError(
-                "P-EAGLE is supported by the unified entry only in colocated "
-                "online text mode"
-            )
-        from specforge.core.peagle import OnlinePEagleModel
-
-        mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
-        model = OnlinePEagleModel(
-            draft_model=draft_model,
-            mask_token_id=mask_token_id,
-            num_depths=cfg.training.num_depths,
-            down_sample_ratio=cfg.training.down_sample_ratio,
-            down_sample_ratio_min=cfg.training.down_sample_ratio_min,
-        ).to(device=_device(), dtype=_torch_dtype(cfg.model.torch_dtype))
-    else:
-        from specforge.core.dflash import (
-            OnlineDFlashModel,
-            OnlineDominoModel,
-            OnlineDSparkModel,
+    if cfg.mode == "online" and parts.capture_layers is None:
+        parts.capture_layers = spec.assembly.resolve_capture_layers(
+            cfg, draft_config, target_config
         )
-        from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
-
-        mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
-        draft_model.mask_token_id = mask_token_id
-        method_config = getattr(draft_model.config, "dflash_config", None)
-        if method_config is None:
-            draft_model.config.dflash_config = {}
-            method_config = draft_model.config.dflash_config
-        method_config["mask_token_id"] = mask_token_id
-        method_config["target_layer_ids"] = list(draft_model.target_layer_ids)
-        capture_layers = list(draft_model.target_layer_ids)
-
-        target_parts = TargetEmbeddingsAndHead.from_pretrained(
-            cfg.model.target_model_path,
-            embed_key=cfg.model.embedding_key,
-            lm_head_key=cfg.model.lm_head_key,
-            cache_dir=cfg.model.cache_dir,
-            device=_device().type,
-            dtype=_torch_dtype(cfg.model.torch_dtype),
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
-        common = dict(
-            draft_model=draft_model,
-            target_lm_head=target_parts.lm_head,
-            target_embed_tokens=target_parts.embed_tokens,
-            mask_token_id=mask_token_id,
-            block_size=int(draft_model.block_size),
-            attention_backend=cfg.training.attention_backend,
-            num_anchors=cfg.training.num_anchors,
-            loss_decay_gamma=cfg.training.loss_decay_gamma,
-        )
-        if strategy == "dflash":
-            model = OnlineDFlashModel(
-                **common,
-                loss_type=cfg.training.loss_type,
-                dpace_alpha=cfg.training.dpace_alpha,
-            )
-        elif strategy == "domino":
-            model = OnlineDominoModel(
-                **common,
-                shift_label=bool(getattr(draft_model, "shift_label", False)),
-            )
-        elif strategy == "dspark":
-            model = OnlineDSparkModel(
-                **common,
-                dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
-                dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
-                dspark_confidence_head_alpha=(
-                    cfg.training.dspark_confidence_head_alpha
-                ),
-            )
-        else:  # guarded by Config's Literal, kept defensive for programmatic use
-            raise ValueError(f"unsupported training strategy: {strategy}")
-        model = model.to(device=_device(), dtype=_torch_dtype(cfg.model.torch_dtype))
 
     if load_target_engine and cfg.mode == "online":
-        if strategy == "dspark":
+        if spec.online_capture is OnlineCaptureMode.SERVER_ONLY:
             raise NotImplementedError(
-                "DSpark requires disaggregated online server capture; it cannot "
-                "load a colocated target engine"
+                f"{spec.name} requires disaggregated online server capture; "
+                "it cannot load a colocated target engine"
             )
-        target_engine = _build_target_engine(cfg, capture_layers)
+        if spec.online_capture is OnlineCaptureMode.UNSUPPORTED:
+            raise NotImplementedError(
+                f"online capture for strategy {spec.name!r} is not wired"
+            )
+        target_engine = _build_target_engine(cfg, parts.capture_layers, spec)
 
     # Keep the composite and target parts bf16 while avoiding accidental target
     # gradients. The optimizer still receives the strategy's trainable module.
-    if target_head is not None and isinstance(target_head, torch.nn.Module):
-        target_head.requires_grad_(False)
-    feature_schema = None
-    if cfg.model.input_modality == "qwen2_5_vl":
-        from specforge.inference.adapters.policy import EAGLE3_VLM_FEATURE_SCHEMA
-
-        feature_schema = EAGLE3_VLM_FEATURE_SCHEMA
+    if parts.target_head is not None and isinstance(parts.target_head, torch.nn.Module):
+        parts.target_head.requires_grad_(False)
 
     return ModelBundle(
-        model=model,
+        model=parts.model,
         draft_model=draft_model,
         tokenizer=tokenizer,
         processor=processor,
         input_preparer=input_preparer,
-        feature_schema=feature_schema,
+        feature_schema=spec.feature_schema_for(cfg.model.input_modality),
         target_engine=target_engine,
-        target_head=target_head,
+        target_head=parts.target_head,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
-        capture_layers=capture_layers,
-        strategy_kwargs=_strategy_kwargs(cfg),
+        capture_layers=parts.capture_layers,
+        strategy_kwargs=spec.assembly.make_strategy_kwargs(cfg),
     )
 
 
@@ -619,11 +397,7 @@ def _prepare_prompts(
             if path is None and cfg.data.cache_key is not None
             else _prompt_cache_key(cfg, path=source_path)
         )
-    min_loss_tokens = (
-        2 * _draft_block_size(cfg)
-        if cfg.training.strategy in ("dflash", "domino", "dspark")
-        else 1
-    )
+    min_loss_tokens = _strategy_spec(cfg).assembly.min_loss_tokens(cfg)
     return prepare_prompt_tasks(
         source_path,
         tokenizer,
@@ -649,8 +423,6 @@ def _install_dataset_vocab_mapping(
     dataset_identity: str,
 ) -> None:
     """Build, cache, and install one deterministic EAGLE vocabulary map."""
-    if cfg.training.strategy not in ("eagle3", "peagle"):
-        return
     if (
         cfg.model.vocab_mapping_path
         or bundle.draft_vocab_size == bundle.target_vocab_size
@@ -702,7 +474,7 @@ def _ensure_vocab_mapping(
     # Avoid walking (and validating) the prompt payload when no mapping can be
     # needed.  This is common for equal-vocabulary targets and keeps assembly
     # independent of the online prompt schema for non-mapping runs.
-    if cfg.training.strategy not in ("eagle3", "peagle"):
+    if "online" not in _strategy_spec(cfg).assembly.vocab_mapping_modes:
         return
     if (
         cfg.model.vocab_mapping_path
@@ -726,7 +498,7 @@ def _ensure_vocab_mapping(
 
 def _ensure_offline_vocab_mapping(cfg: Config, bundle: ModelBundle) -> None:
     """Derive a local-offline map from the exact feature ids and loss masks."""
-    if cfg.training.strategy != "eagle3":
+    if "offline" not in _strategy_spec(cfg).assembly.vocab_mapping_modes:
         return
     if (
         cfg.model.vocab_mapping_path
@@ -765,9 +537,9 @@ def _ensure_offline_vocab_mapping(cfg: Config, bundle: ModelBundle) -> None:
 def _dataloader_num_workers(cfg: Config) -> int:
     dataloader_num_workers = cfg.data.dataloader_num_workers
     if dataloader_num_workers is None:
-        dataloader_num_workers = (
-            4 if cfg.training.strategy in ("eagle3", "peagle") else 8
-        )
+        dataloader_num_workers = _strategy_spec(
+            cfg
+        ).assembly.default_dataloader_num_workers
     return dataloader_num_workers
 
 
@@ -978,7 +750,7 @@ def build_training_run(cfg: Config) -> TrainingRun:
             target_hidden_size=bundle.target_hidden_size,
             target_vocab_size=bundle.target_vocab_size,
             draft_vocab_size=bundle.draft_vocab_size,
-            target_repr="logits" if t.strategy in ("eagle3", "peagle") else None,
+            target_repr=_strategy_spec(cfg).assembly.colocated_target_repr,
             aux_hidden_state_layer_ids=bundle.capture_layers,
             t2d=getattr(bundle.draft_model, "t2d", None),
             prompt_epochs=1,
@@ -1003,5 +775,4 @@ __all__ = [
     "TrainingRun",
     "build_model_bundle",
     "build_training_run",
-    "resolve_eagle_capture_layers",
 ]

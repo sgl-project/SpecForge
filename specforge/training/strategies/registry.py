@@ -21,7 +21,10 @@ once per strategy, instead of being hardcoded into every ``build_*`` function:
   * ``make_online_collate``  — the online/streamed collate,
   * ``feature_schema``       — the store-ready dict shape the shared
                                ``PolicyFeatureAdapter`` emits online,
-  * ``supports_online``      — whether an online capture path exists yet.
+  * ``assembly``             — method-owned draft/model/capture/prompt hooks,
+  * ``online_capture``       — explicit shared-policy, server-only, or unsupported
+                               capture semantics,
+  * capability fields       — the modes/backends/modalities accepted by config.
 
 Registering a new model (dflash, domino, ...) is a ``StrategySpec`` entry next
 to its model code — NOT a new family of ``build_*_runtime`` functions. This is
@@ -40,14 +43,36 @@ environment.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional
 
 import torch
 
 from specforge.inference.adapters.policy import (
     DFLASH_FEATURE_SCHEMA,
     EAGLE3_FEATURE_SCHEMA,
+    EAGLE3_VLM_FEATURE_SCHEMA,
     FeatureSchema,
+)
+from specforge.training.strategies.assembly import (
+    DraftConfigSpec,
+    OnlineCaptureMode,
+    StrategyAssemblySpec,
+    apply_dflash_overrides,
+    build_dflash_model,
+    build_domino_model,
+    build_dspark_model,
+    build_eagle3_draft,
+    build_eagle3_model,
+    build_peagle_draft,
+    build_peagle_model,
+    build_registered_draft,
+    dflash_min_loss_tokens,
+    dflash_needs_input_tools,
+    domino_strategy_kwargs,
+    eagle3_strategy_kwargs,
+    populate_dflash_generated_config,
+    resolve_dflash_capture_layers,
+    resolve_eagle_capture_layers,
 )
 from specforge.training.strategies.base import (
     DraftTrainStrategy,
@@ -83,6 +108,7 @@ class StrategySpec:
     # (wrapped_model, *, target_head) -> DraftTrainStrategy. Strategies that own
     # their head (e.g. DFlash) accept and ignore target_head.
     make_strategy: Callable[..., DraftTrainStrategy]
+    assembly: StrategyAssemblySpec
     uses_target_head: bool = True
     # Offline data path.
     make_offline_reader: Optional[Callable[..., Any]] = None
@@ -91,9 +117,33 @@ class StrategySpec:
     # Online data path.
     make_online_collate: Optional[Callable[[], Callable]] = None
     # The store-ready dict shape the shared PolicyFeatureAdapter emits online.
-    # None with supports_online=True marks a server-capture-only strategy.
     feature_schema: Optional[FeatureSchema] = None
-    supports_online: bool = False
+    modality_feature_schemas: Optional[Mapping[str, FeatureSchema]] = None
+    # POLICY selects the shared PolicyFeatureAdapter. SERVER_ONLY requires a
+    # caller-provided server capture source. A bespoke colocated-adapter hook is
+    # intentionally not part of the contract until a strategy needs one.
+    online_capture: OnlineCaptureMode = OnlineCaptureMode.UNSUPPORTED
+    supported_modes: FrozenSet[str] = frozenset({"online"})
+    supported_deployments: FrozenSet[str] = frozenset({"local_colocated"})
+    supported_attention_backends: FrozenSet[str] = frozenset(
+        {"eager", "sdpa", "flex_attention", "fa", "usp"}
+    )
+    supported_target_backends: FrozenSet[str] = frozenset({"sglang", "hf"})
+    supported_modalities: FrozenSet[str] = frozenset({"text"})
+    required_batch_size: Optional[int] = None
+    allows_aux_layer_override: bool = False
+    supports_compact_teacher: bool = False
+    requires_disaggregated_vocab_mapping: bool = False
+    supports_sharded_target_output: bool = False
+
+    @property
+    def supports_online(self) -> bool:
+        return self.online_capture is not OnlineCaptureMode.UNSUPPORTED
+
+    def feature_schema_for(self, modality: str) -> Optional[FeatureSchema]:
+        if self.modality_feature_schemas and modality in self.modality_feature_schemas:
+            return self.modality_feature_schemas[modality]
+        return self.feature_schema
 
 
 _REGISTRY: Dict[str, StrategySpec] = {}
@@ -183,13 +233,42 @@ register_strategy(
         name="eagle3",
         required_features=frozenset(Eagle3TrainStrategy.required_features),
         make_strategy=_make_eagle3_strategy,
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="LlamaForCausalLMEagle3",
+                auto_model_type="llama",
+                auto_num_hidden_layers=1,
+                auto_draft_vocab_size=32000,
+                supports_num_hidden_layers_override=True,
+                required_num_hidden_layers=1,
+            ),
+            make_draft_model=build_eagle3_draft,
+            make_model=build_eagle3_model,
+            make_strategy_kwargs=eagle3_strategy_kwargs,
+            resolve_capture_layers=resolve_eagle_capture_layers,
+            vocab_mapping_modes=frozenset({"online", "offline"}),
+            default_dataloader_num_workers=4,
+            allow_missing_warm_start_embedding=True,
+            colocated_target_repr="logits",
+            server_target_repr="hidden_state",
+        ),
         uses_target_head=True,
         make_offline_reader=_eagle3_offline_reader,
         make_offline_transform=_eagle3_offline_transform,
         make_offline_collate=_eagle3_offline_collate,
         make_online_collate=lambda: concat_collate,
         feature_schema=EAGLE3_FEATURE_SCHEMA,
-        supports_online=True,
+        modality_feature_schemas={"qwen2_5_vl": EAGLE3_VLM_FEATURE_SCHEMA},
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_modes=frozenset({"online", "offline"}),
+        supported_deployments=frozenset({"local_colocated", "disaggregated"}),
+        supported_attention_backends=frozenset({"sdpa", "flex_attention", "fa", "usp"}),
+        supported_target_backends=frozenset({"sglang", "hf", "custom"}),
+        supported_modalities=frozenset({"text", "qwen2_5_vl"}),
+        allows_aux_layer_override=True,
+        supports_compact_teacher=True,
+        requires_disaggregated_vocab_mapping=True,
+        supports_sharded_target_output=True,
     )
 )
 
@@ -205,10 +284,31 @@ register_strategy(
         make_strategy=lambda wrapped, *, target_head=None: PEagleTrainStrategy(
             wrapped, target_head=target_head
         ),
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="PEagleDraftModel",
+                auto_model_type="llama",
+                auto_num_hidden_layers=4,
+                auto_draft_vocab_size=32000,
+                supports_num_hidden_layers_override=True,
+            ),
+            make_draft_model=build_peagle_draft,
+            make_model=build_peagle_model,
+            resolve_capture_layers=resolve_eagle_capture_layers,
+            vocab_mapping_modes=frozenset({"online"}),
+            default_dataloader_num_workers=4,
+            allow_missing_warm_start_embedding=True,
+            capture_engine_strategy="eagle3",
+            colocated_target_repr="logits",
+        ),
         uses_target_head=True,
         make_online_collate=lambda: concat_collate,
         feature_schema=EAGLE3_FEATURE_SCHEMA,
-        supports_online=True,
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_attention_backends=frozenset({"flex_attention"}),
+        supported_target_backends=frozenset({"sglang", "hf", "custom"}),
+        required_batch_size=1,
+        allows_aux_layer_override=True,
     )
 )
 
@@ -286,13 +386,34 @@ register_strategy(
         name="dflash",
         required_features=frozenset(DFlashTrainStrategy.required_features),
         make_strategy=lambda wrapped, *, target_head=None: DFlashTrainStrategy(wrapped),
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="DFlashDraftModel",
+                expected_auto_map_model="dflash.DFlashDraftModel",
+                auto_model_type="qwen3",
+                auto_num_hidden_layers=1,
+                populate_generated=populate_dflash_generated_config,
+                apply_overrides=apply_dflash_overrides,
+                supports_num_hidden_layers_override=True,
+                supports_block_size_override=True,
+            ),
+            make_draft_model=build_registered_draft,
+            make_model=build_dflash_model,
+            min_loss_tokens=dflash_min_loss_tokens,
+            needs_input_tools=dflash_needs_input_tools,
+            resolve_capture_layers=resolve_dflash_capture_layers,
+            default_dataloader_num_workers=8,
+        ),
         uses_target_head=False,
         make_offline_reader=_dflash_offline_reader,
         make_offline_transform=_dflash_offline_transform,
         make_offline_collate=_dflash_collate,
         make_online_collate=_dflash_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,
-        supports_online=True,
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_modes=frozenset({"online", "offline"}),
+        supported_deployments=frozenset({"local_colocated", "disaggregated"}),
+        supported_attention_backends=frozenset({"eager", "sdpa", "flex_attention"}),
     )
 )
 
@@ -343,9 +464,24 @@ register_strategy(
         name="dspark",
         required_features=frozenset(DSparkTrainStrategy.required_features),
         make_strategy=lambda wrapped, *, target_head=None: DSparkTrainStrategy(wrapped),
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="DSparkDraftModel",
+                expected_auto_map_model="dspark.DSparkDraftModel",
+            ),
+            make_draft_model=build_registered_draft,
+            make_model=build_dspark_model,
+            min_loss_tokens=dflash_min_loss_tokens,
+            needs_input_tools=dflash_needs_input_tools,
+            resolve_capture_layers=resolve_dflash_capture_layers,
+            default_dataloader_num_workers=8,
+            server_target_repr="hidden_state",
+        ),
         uses_target_head=False,
         make_online_collate=_dspark_online_collate,
-        supports_online=True,
+        online_capture=OnlineCaptureMode.SERVER_ONLY,
+        supported_deployments=frozenset({"disaggregated"}),
+        supported_attention_backends=frozenset({"eager", "sdpa", "flex_attention"}),
     )
 )
 
@@ -386,19 +522,36 @@ register_strategy(
         name="domino",
         required_features=frozenset(DominoTrainStrategy.required_features),
         make_strategy=_make_domino_strategy,
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="DominoDraftModel",
+                expected_auto_map_model="domino.DominoDraftModel",
+            ),
+            make_draft_model=build_registered_draft,
+            make_model=build_domino_model,
+            make_strategy_kwargs=domino_strategy_kwargs,
+            min_loss_tokens=dflash_min_loss_tokens,
+            needs_input_tools=dflash_needs_input_tools,
+            resolve_capture_layers=resolve_dflash_capture_layers,
+            default_dataloader_num_workers=8,
+        ),
         uses_target_head=False,
         make_offline_reader=_domino_offline_reader,
         make_offline_transform=_dflash_offline_transform,
         make_offline_collate=_dflash_collate,
         make_online_collate=_dflash_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,  # same capture path as DFlash
-        supports_online=True,
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_modes=frozenset({"online", "offline"}),
+        supported_deployments=frozenset({"local_colocated", "disaggregated"}),
+        supported_attention_backends=frozenset({"eager", "sdpa", "flex_attention"}),
     )
 )
 
 
 __all__ = [
     "StrategySpec",
+    "OnlineCaptureMode",
     "concat_collate",
     "register_strategy",
     "resolve_strategy",

@@ -433,15 +433,15 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        loss, accuracy, _ = self.dflash_model(
+        loss, accuracy, model_metrics = self.dflash_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
         )
-        return StepOutput(
-            loss=loss,
-            metrics={"accuracy": accuracy.detach()},
-        )
+        metrics = {"accuracy": accuracy.detach()}
+        if "accuracy_denom" in model_metrics:
+            metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target
@@ -489,6 +489,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             "accuracy": accuracy.detach(),
         }
         for name in (
+            "accuracy_denom",
             "ce_loss",
             "l1_loss",
             "confidence_loss",
@@ -549,19 +550,19 @@ class DominoTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         lambda_base = self._lambda_base(ctx)
-        loss, accuracy, _ = self.domino_model(
+        loss, accuracy, model_metrics = self.domino_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
             lambda_base=lambda_base,
         )
-        return StepOutput(
-            loss=loss,
-            metrics={
-                "accuracy": accuracy.detach(),
-                "lambda_base": torch.tensor(float(lambda_base)),
-            },
-        )
+        metrics = {
+            "accuracy": accuracy.detach(),
+            "lambda_base": torch.tensor(float(lambda_base)),
+        }
+        if "accuracy_denom" in model_metrics:
+            metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target

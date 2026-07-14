@@ -12,9 +12,11 @@ These lock the composition contract introduced by the launch refactor:
 No GPU / model environment required.
 """
 
+import ast
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -29,9 +31,13 @@ from specforge.training.strategies.base import (
     Eagle3TrainStrategy,
 )
 from specforge.training.strategies.registry import (
+    OnlineCaptureMode,
     available_strategies,
     resolve_strategy,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUILTIN_STRATEGIES = ("eagle3", "peagle", "dflash", "domino", "dspark")
 
 
 class TestStrategyRegistry(unittest.TestCase):
@@ -40,6 +46,47 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIn("dflash", available_strategies())
         self.assertIn("domino", available_strategies())
         self.assertIn("dspark", available_strategies())
+
+    def test_online_capture_mode_is_explicit(self):
+        for name in ("eagle3", "peagle", "dflash", "domino"):
+            with self.subTest(strategy=name):
+                self.assertIs(
+                    resolve_strategy(name).online_capture,
+                    OnlineCaptureMode.POLICY,
+                )
+        self.assertIs(
+            resolve_strategy("dspark").online_capture,
+            OnlineCaptureMode.SERVER_ONLY,
+        )
+
+    def test_strategy_spec_is_the_draft_architecture_source(self):
+        import specforge.modeling.draft  # noqa: F401
+        from specforge.modeling.draft.registry import resolve_draft
+
+        for name in BUILTIN_STRATEGIES:
+            with self.subTest(strategy=name):
+                spec = resolve_strategy(name)
+                model_type = resolve_draft(spec.assembly.draft_config.architecture)
+                self.assertEqual(
+                    model_type.__name__, spec.assembly.draft_config.architecture
+                )
+
+    def test_generic_assembly_modules_have_no_builtin_strategy_dispatch(self):
+        generic_modules = (
+            "specforge/training/assembly.py",
+            "specforge/training/model_loading.py",
+            "specforge/training/disaggregated.py",
+        )
+        for relative_path in generic_modules:
+            tree = ast.parse((REPO_ROOT / relative_path).read_text())
+            string_literals = {
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            for strategy in BUILTIN_STRATEGIES:
+                with self.subTest(module=relative_path, strategy=strategy):
+                    self.assertNotIn(strategy, string_literals)
 
     def test_dflash_offline_and_online_are_fully_wired(self):
         spec = resolve_strategy("dflash")
@@ -252,6 +299,22 @@ class TestStrategyRegistry(unittest.TestCase):
 
 
 class TestLaunchGuards(unittest.TestCase):
+    @staticmethod
+    def _assembly_spec():
+        from specforge.training.strategies.assembly import (
+            DraftConfigSpec,
+            StrategyAssemblySpec,
+            StrategyModelParts,
+        )
+
+        return StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(architecture="UnusedDraft"),
+            make_draft_model=lambda cfg, draft_config: None,
+            make_model=lambda cfg, draft, draft_config, target_config, tokenizer: (
+                StrategyModelParts(model=None)
+            ),
+        )
+
     def test_offline_builder_rejects_unwired_strategy(self):
         # A strategy with no offline reader must fail fast and actionably, before
         # any model/controller is touched. Register a throwaway unwired spec so
@@ -267,6 +330,7 @@ class TestLaunchGuards(unittest.TestCase):
                 name="_unwired_offline_test",
                 required_features=frozenset({"x"}),
                 make_strategy=lambda wrapped, *, target_head=None: None,
+                assembly=self._assembly_spec(),
             )
         )
         self.addCleanup(_reg._REGISTRY.pop, "_unwired_offline_test", None)
@@ -294,7 +358,7 @@ class TestLaunchGuards(unittest.TestCase):
                 name="_unwired_online_test",
                 required_features=frozenset({"x"}),
                 make_strategy=lambda wrapped, *, target_head=None: None,
-                supports_online=False,
+                assembly=self._assembly_spec(),
             )
         )
         self.addCleanup(_reg._REGISTRY.pop, "_unwired_online_test", None)
