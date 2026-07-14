@@ -11,6 +11,7 @@ from specforge.cli import _bootstrap_single_process_env, _validate_world_size, m
 from specforge.config import Config
 from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
+    _ONLINE_CONTROL_SUFFIXES,
     _claim_fresh_control_path,
     build_disaggregated_run,
 )
@@ -88,6 +89,15 @@ class TestTrainingRunLifecycle(unittest.TestCase):
         _claim_fresh_control_path(path, (".closed", ".failed"))
         with self.assertRaisesRegex(ValueError, "new attempt-specific path"):
             _claim_fresh_control_path(path, (".closed", ".failed"))
+
+    def test_online_fresh_attempt_rejects_stale_consumer_quantum(self):
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(prefix="attempt_quantum_"), "refs.jsonl")
+        with open(path + ".consumer_quantum", "w", encoding="utf-8") as stream:
+            stream.write("8")
+        with self.assertRaisesRegex(ValueError, "consumer_quantum"):
+            _claim_fresh_control_path(path, _ONLINE_CONTROL_SUFFIXES)
 
     def test_disaggregated_assembly_failure_notifies_the_peer(self):
         import tempfile

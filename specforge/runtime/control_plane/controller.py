@@ -219,12 +219,19 @@ class DataFlowController:
         requeued: List[str] = []
         released: List[str] = []
         for sample_id in self.store.all_committed_ids():
+            ref = self.store.get_committed(sample_id)
             if optimizer_durable and sample_id in acked:
                 released.append(sample_id)
                 if feature_store is not None:
+                    # A restarted authority owns a fresh Mooncake client. It may
+                    # never have materialized refs that belonged to another DP
+                    # rank, so seed generation/key bookkeeping from the durable
+                    # committed ref before asking it to remove remote objects.
+                    adopt = getattr(feature_store, "adopt", None)
+                    if callable(adopt) and ref is not None:
+                        adopt(ref)
                     feature_store.abort(sample_id, reason="reconciled-released")
                 continue
-            ref = self.store.get_committed(sample_id)
             if ref is not None:
                 self.sample_queue.put([ref])
                 requeued.append(sample_id)

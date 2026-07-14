@@ -156,9 +156,11 @@ model-specific loss logic and no topology branch.
 Queue acknowledgement has two layers in online disaggregation. Materialization
 only releases the feature read lease. At the optimizer boundary,
 `DPAckController` gathers every rank's sample ids, rank 0 records one durable
-ledger transaction and removes those features, then each private inbox advances
-its exact acknowledged prefix. This ordering keeps producer backpressure and
-restart accounting aligned with durable optimizer progress.
+ledger transaction, then every rank removes only its own shard through its own
+feature-store client. A second cleanup-error collective completes before each
+private inbox advances its exact acknowledged prefix. This ordering keeps
+producer backpressure and restart accounting aligned with durable optimizer
+progress.
 
 ## Attempt lifecycle
 
@@ -166,9 +168,11 @@ An online producer always claims a fresh attempt and cannot resume. A fresh
 consumer also rejects a non-empty ledger. A consumer restart is supported only
 when its SQLite ledger, original channel/inboxes, Mooncake objects, and matching
 checkpoint remain available: rank 0 skips the optimizer-durable prefix and
-requeues the unacknowledged tail. A second pass over consumed refs remains
-unsupported. Producer/consumer failures are propagated explicitly, and the
-producer cleans published Mooncake objects when the attempt finishes.
+requeues the unacknowledged tail. For an acked remote-rank ref, the fresh
+authority first adopts its durable key metadata before deleting it. A second
+pass over consumed refs remains unsupported. Producer/consumer failures are
+propagated explicitly, and both roles run a bounded pending-remove drain that
+fails loudly instead of hiding a hard-pinned Mooncake leak.
 
 Offline manifests and feature objects are intentionally stable instead. They
 remain available for repeated epochs and checkpoint resume.

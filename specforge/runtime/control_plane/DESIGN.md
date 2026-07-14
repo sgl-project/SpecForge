@@ -60,8 +60,10 @@ Rank 0 is the single bookkeeping authority:
    `DPAckController` and records one durable ack transaction.
 
 Non-authority ranks participate in the gather but never write the durable
-ledger. One-rank runs use this exact path as well; there is no direct-channel
-consumer branch.
+ledger. After rank 0 broadcasts commit success, every rank removes only its
+local feature ids and collectively reports cleanup failures before inbox ack.
+One-rank runs use this exact path as well; there is no direct-channel consumer
+branch.
 
 Inbox queue acknowledgements happen after each materialized micro-batch and are
 forwarded by the distributor to the source channel's consumed counter. Durable
