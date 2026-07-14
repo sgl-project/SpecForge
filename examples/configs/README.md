@@ -64,7 +64,7 @@ model:
   target_backend: sglang
 
 data:
-  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  train_data_path: dataset/sharegpt_train.jsonl
   max_length: 4096
   chat_template: qwen
 

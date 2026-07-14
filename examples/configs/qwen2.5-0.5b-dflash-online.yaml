@@ -6,7 +6,7 @@ model:
   torch_dtype: "bfloat16"
   mask_token_id: 151669
 data:
-  train_data_path: "./cache/dataset/sharegpt_train.jsonl"
+  train_data_path: "dataset/sharegpt_train.jsonl"
   max_length: 512
   chat_template: "qwen"
   build_dataset_num_proc: 32
