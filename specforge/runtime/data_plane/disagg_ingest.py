@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from specforge.runtime.contracts import SCHEMA_VERSION, SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.feature_store import FeatureStore, load_feature_file
@@ -41,6 +41,7 @@ def ingest_offline_features(
     ttt_length: int = 7,
     max_len: int = 2048,
     limit: Optional[int] = None,
+    on_ref: Optional[Callable[[SampleRef], None]] = None,
 ) -> List[SampleRef]:
     """Load offline ``.ckpt`` features and ``put()`` them into ``store``.
 
@@ -48,7 +49,9 @@ def ingest_offline_features(
     final/auxiliary target states, while DFlash and Domino store their shared
     ``hidden_states`` capture.  Tensors are copied verbatim; the consumer uses
     the same strategy transform as a colocated run, so both topologies receive
-    byte-identical normalized batches.
+    byte-identical normalized batches. ``on_ref`` runs immediately after every
+    successful ``put()`` so a lifecycle owner can retain the refs needed to
+    clean up a partially ingested attempt.
     """
     from specforge.training.strategies.registry import resolve_strategy
 
@@ -91,6 +94,8 @@ def ingest_offline_features(
             },
         )
         refs.append(ref)
+        if on_ref is not None:
+            on_ref(ref)
     return refs
 
 

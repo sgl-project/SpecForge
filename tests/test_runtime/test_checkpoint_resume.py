@@ -167,6 +167,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         run_id="rz",
         seen=None,
         model=None,
+        checkpoint_extra=None,
+        spec_name="eagle3",
     ):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import DataFlowController
@@ -179,7 +181,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         model = Composite() if model is None else model
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
         spec = SimpleNamespace(
-            name="eagle3",
+            name=spec_name,
             make_strategy=lambda wrapped, *, target_head: Strategy(wrapped, seen),
         )
         with _no_fsdp_wrap():
@@ -205,6 +207,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 collate_fn=_x_collate,
                 per_sample_transform=_x_transform,
                 resume_from=resume_from,
+                checkpoint_extra=checkpoint_extra,
             )
         return trainer, model, seen
 
@@ -336,6 +339,46 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         max_steps=4,
                         resume_from=write_ckpt(name, **overrides),
                     )
+
+        peagle_semantics = (
+            ("peagle_num_draft_layers", 2, 4),
+            ("peagle_norm_before_residual", False, True),
+            ("peagle_num_depths", 5, 6),
+            ("peagle_down_sample_ratio", 0.7, 0.8),
+            ("peagle_down_sample_ratio_min", 0.3, 0.2),
+            ("peagle_mask_token_id", 0, 31),
+        )
+        for key, saved, current in peagle_semantics:
+            with self.subTest(key):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"{key}={saved} but this run has {key}={current}",
+                ):
+                    self._make_trainer(
+                        os.path.join(workdir, f"out_{key}"),
+                        feat_dir=feat_dir,
+                        max_steps=4,
+                        resume_from=write_ckpt(key, **{key: saved}),
+                        checkpoint_extra={key: current},
+                    )
+
+        required_peagle_contract = {
+            key: current for key, _saved, current in peagle_semantics
+        }
+        with self.assertRaisesRegex(
+            ValueError, "does not record required P-EAGLE resume semantic"
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "out_peagle_missing_contract"),
+                feat_dir=feat_dir,
+                max_steps=4,
+                resume_from=write_ckpt(
+                    "peagle_missing_contract",
+                    strategy="peagle",
+                ),
+                checkpoint_extra=required_peagle_contract,
+                spec_name="peagle",
+            )
 
     def test_completed_checkpoint_resume_is_a_checkpoint_noop(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_complete_")

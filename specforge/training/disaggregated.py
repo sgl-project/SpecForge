@@ -214,6 +214,27 @@ def _hold_mooncake_producer(manifest: str) -> None:
     )
 
 
+def _cleanup_offline_mooncake_refs(store, refs: Sequence, *, reason: str) -> None:
+    """Remove every object owned by one terminal offline producer attempt."""
+    from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
+
+    cleanup_errors = []
+    for ref in refs:
+        try:
+            store.abort(ref.sample_id, reason=reason)
+        except Exception as exc:
+            cleanup_errors.append(f"{ref.sample_id}: {type(exc).__name__}: {exc}")
+    try:
+        drain_feature_store_removals(store)
+    except Exception as exc:
+        cleanup_errors.append(f"pending-remove drain: {type(exc).__name__}: {exc}")
+    if cleanup_errors:
+        raise RuntimeError(
+            "offline Mooncake cleanup did not remove every ingested sample: "
+            f"{cleanup_errors}"
+        )
+
+
 def _build_offline(
     cfg: Config,
     *,
@@ -239,6 +260,10 @@ def _build_offline(
                 write_ref_manifest,
             )
 
+            store = None
+            tracked_refs = []
+            produced = 0
+            primary_exc = None
             try:
                 store = _offline_store(cfg)
                 refs = ingest_offline_features(
@@ -248,14 +273,48 @@ def _build_offline(
                     run_id=cfg.run_id,
                     ttt_length=cfg.training.ttt_length,
                     max_len=cfg.data.max_length,
+                    on_ref=tracked_refs.append,
                 )
+                produced = len(refs)
                 write_ref_manifest(refs, manifest)
                 _write_control(done)
                 _hold_mooncake_producer(manifest)
-                return len(refs)
             except BaseException as exc:
-                _publish_control_failure(manifest + ".failed", exc)
-                raise
+                primary_exc = exc
+
+            cleanup_exc = None
+            if (
+                store is not None
+                and os.environ.get("DISAGG_BACKEND", "shared_dir") == "mooncake"
+            ):
+                try:
+                    _cleanup_offline_mooncake_refs(
+                        store,
+                        tracked_refs,
+                        reason=(
+                            "offline-attempt-failed"
+                            if primary_exc is not None
+                            else "offline-attempt-finished"
+                        ),
+                    )
+                except Exception as exc:
+                    cleanup_exc = exc
+
+            if primary_exc is not None and cleanup_exc is not None:
+                combined = RuntimeError(
+                    f"offline producer failed ({type(primary_exc).__name__}: "
+                    f"{primary_exc}) and Mooncake cleanup also failed "
+                    f"({type(cleanup_exc).__name__}: {cleanup_exc})"
+                )
+                _publish_control_failure(manifest + ".failed", combined)
+                raise combined from primary_exc
+            if primary_exc is not None:
+                _publish_control_failure(manifest + ".failed", primary_exc)
+                raise primary_exc
+            if cleanup_exc is not None:
+                _publish_control_failure(manifest + ".failed", cleanup_exc)
+                raise cleanup_exc
+            return produced
 
         return TrainingRun(execute=produce)
 
@@ -315,28 +374,14 @@ def _build_offline(
 
 
 def _producer_capture_metadata(cfg: Config):
-    from transformers import AutoConfig
+    from specforge.training.capture_contract import resolve_server_capture_contract
 
-    from specforge.training.model_loading import draft_config_dict
-
-    target_cfg = AutoConfig.from_pretrained(
-        cfg.model.target_model_path,
-        cache_dir=cfg.model.cache_dir,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
-    target_cfg = getattr(target_cfg, "text_config", target_cfg)
-    draft_cfg = draft_config_dict(cfg)
-    from specforge.training.strategies.registry import resolve_strategy
-
-    spec = resolve_strategy(cfg.training.strategy)
-    layers = spec.assembly.resolve_capture_layers(cfg, draft_cfg, target_cfg)
-    if not layers:
-        raise ValueError("draft config does not define target capture layer ids")
+    contract = resolve_server_capture_contract(cfg)
     return (
-        list(layers),
-        int(target_cfg.hidden_size),
-        int(target_cfg.vocab_size),
-        int(draft_cfg.get("draft_vocab_size") or draft_cfg["vocab_size"]),
+        list(contract.aux_layer_ids),
+        contract.target_hidden_size,
+        contract.target_vocab_size,
+        contract.draft_vocab_size,
     )
 
 

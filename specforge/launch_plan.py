@@ -3,23 +3,30 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Optional, Sequence
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from specforge.config import Config
 
 LaunchRole = Literal["auto", "all", "producer", "consumer", "both"]
-PlanKind = Literal["worker", "command", "supervisor"]
+PlanKind = Literal["worker", "command", "supervisor", "managed_supervisor"]
+ReadinessKind = Literal["http", "mooncake"]
 
 _DIST_ENV = ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT")
+_MANAGED_CHILD_ENV = "SPECFORGE_MANAGED_LOCAL_CHILD"
 _SECRET_NAMES = (
     "auth_token",
     "password",
@@ -94,20 +101,68 @@ class CommandSpec:
 
 
 @dataclass(frozen=True)
+class ReadinessSpec:
+    kind: ReadinessKind
+    url: str
+    timeout_s: float
+    tcp_host: Optional[str] = None
+    tcp_port: Optional[int] = None
+
+    def as_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "url": _redacted(self.url),
+            "timeout_s": self.timeout_s,
+            "tcp_host": self.tcp_host,
+            "tcp_port": self.tcp_port,
+        }
+
+
+@dataclass(frozen=True)
+class ServiceSpec:
+    command: CommandSpec
+    readiness: ReadinessSpec
+    log_path: str
+    phase: int
+
+    def as_dict(self) -> dict:
+        return {
+            "command": self.command.as_dict(),
+            "readiness": self.readiness.as_dict(),
+            "log_path": self.log_path,
+            "phase": self.phase,
+        }
+
+
+@dataclass(frozen=True)
 class LaunchPlan:
     kind: PlanKind
     role: Literal["all", "producer", "consumer", "both"]
     commands: tuple[CommandSpec, ...] = ()
     worker_env: Mapping[str, str] = field(default_factory=dict)
+    services: tuple[ServiceSpec, ...] = ()
+    managed_root: Optional[str] = None
+    managed_ports: tuple[int, ...] = ()
+    shutdown_grace_s: float = 5.0
 
     def render(self) -> str:
+        payload = {
+            "kind": self.kind,
+            "role": self.role,
+            "commands": [command.as_dict() for command in self.commands],
+            "worker_env": _redacted_env(self.worker_env),
+        }
+        if self.kind == "managed_supervisor":
+            payload.update(
+                {
+                    "services": [service.as_dict() for service in self.services],
+                    "managed_root": self.managed_root,
+                    "managed_ports": list(self.managed_ports),
+                    "shutdown_grace_s": self.shutdown_grace_s,
+                }
+            )
         return json.dumps(
-            {
-                "kind": self.kind,
-                "role": self.role,
-                "commands": [command.as_dict() for command in self.commands],
-                "worker_env": _redacted_env(self.worker_env),
-            },
+            payload,
             indent=2,
             sort_keys=True,
         )
@@ -266,6 +321,141 @@ def _disaggregated_env(
     return values
 
 
+def _managed_local_environment(cfg: Config) -> dict[str, str]:
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.managed_local is not None
+    managed = deployment.managed_local
+    mooncake = managed.mooncake
+    server_urls = [
+        f"http://127.0.0.1:{server.port}" for server in managed.capture_servers
+    ]
+    values = {
+        "MOONCAKE_METADATA_SERVER": (
+            f"http://127.0.0.1:{mooncake.metadata_port}/metadata"
+        ),
+        "MOONCAKE_MASTER_SERVER_ADDR": f"127.0.0.1:{mooncake.rpc_port}",
+        "MOONCAKE_LOCAL_HOSTNAME": mooncake.local_hostname,
+        "MOONCAKE_PROTOCOL": mooncake.protocol,
+        "DISAGG_SERVER_URLS": ",".join(server_urls),
+    }
+    if mooncake.rdma_devices:
+        values["MOONCAKE_RDMA_DEVICES"] = mooncake.rdma_devices
+    return values
+
+
+def _managed_local_services(cfg: Config) -> tuple[ServiceSpec, ...]:
+    from specforge.training.capture_contract import resolve_server_capture_contract
+
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.managed_local is not None
+    managed = deployment.managed_local
+    mooncake = managed.mooncake
+    control_dir = Path(deployment.control_dir)
+    log_dir = control_dir / "logs"
+    shared_env = _managed_local_environment(cfg)
+
+    mooncake_service = ServiceSpec(
+        command=CommandSpec(
+            "mooncake",
+            (
+                "mooncake_master",
+                "--enable_http_metadata_server=true",
+                "--http_metadata_server_host=127.0.0.1",
+                f"--rpc_port={mooncake.rpc_port}",
+                f"--http_metadata_server_port={mooncake.metadata_port}",
+                f"--metrics_port={mooncake.metrics_port}",
+            ),
+            {"CUDA_VISIBLE_DEVICES": ""},
+        ),
+        readiness=ReadinessSpec(
+            "mooncake",
+            shared_env["MOONCAKE_METADATA_SERVER"] + "?key=specforge-health-check",
+            mooncake.startup_timeout_s,
+            tcp_host="127.0.0.1",
+            tcp_port=mooncake.rpc_port,
+        ),
+        log_path=str(log_dir / "mooncake.log"),
+        phase=0,
+    )
+
+    contract = resolve_server_capture_contract(cfg)
+    capture_services = []
+    for index, server in enumerate(managed.capture_servers):
+        argv = [
+            sys.executable,
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            cfg.model.target_model_path,
+            "--dtype",
+            cfg.model.torch_dtype,
+        ]
+        if cfg.model.trust_remote_code:
+            argv.append("--trust-remote-code")
+        if cfg.model.cache_dir:
+            argv.extend(("--download-dir", cfg.model.cache_dir))
+        argv.extend(
+            [
+                "--skip-tokenizer-init",
+                "--tp-size",
+                str(server.tp_size),
+                "--context-length",
+                str(cfg.model.sglang_context_length or cfg.data.max_length),
+                "--mem-fraction-static",
+                str(server.mem_fraction_static),
+                "--chunked-prefill-size",
+                "-1",
+                "--disable-radix-cache",
+                "--enable-spec-capture",
+                "--spec-capture-method",
+                contract.method,
+                "--spec-capture-aux-layer-ids",
+                *[str(layer) for layer in contract.aux_layer_ids],
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(server.port),
+                "--attention-backend",
+                server.attention_backend or cfg.model.sglang_attention_backend,
+            ]
+        )
+        for enabled, flag in (
+            (cfg.model.sglang_enable_nccl_nvls, "--enable-nccl-nvls"),
+            (cfg.model.sglang_enable_symm_mem, "--enable-symm-mem"),
+            (cfg.model.sglang_enable_torch_compile, "--enable-torch-compile"),
+        ):
+            if enabled:
+                argv.append(flag)
+        for value, flag in (
+            (cfg.model.sglang_max_running_requests, "--max-running-requests"),
+            (cfg.model.sglang_max_total_tokens, "--max-total-tokens"),
+        ):
+            if value is not None:
+                argv.extend((flag, str(value)))
+        service_env = {
+            **shared_env,
+            "CUDA_VISIBLE_DEVICES": ",".join(server.cuda_visible_devices),
+            "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
+            "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
+        }
+        capture_services.append(
+            ServiceSpec(
+                command=CommandSpec(
+                    f"capture-server-{index}", tuple(argv), service_env
+                ),
+                readiness=ReadinessSpec(
+                    "http",
+                    f"http://127.0.0.1:{server.port}/health",
+                    server.startup_timeout_s,
+                ),
+                log_path=str(log_dir / f"capture-server-{index}.log"),
+                phase=1,
+            )
+        )
+    return (mooncake_service, *capture_services)
+
+
 def _worker_argv(
     command_prefix: Sequence[str],
     config_path: str,
@@ -384,6 +574,9 @@ def _validate_capture_urls(
         or role not in ("producer", "both")
     ):
         return
+    deployment = cfg.deployment.disaggregated
+    if deployment is not None and deployment.managed_local is not None:
+        return
     if cfg.training.server_urls:
         return
     if base_env.get("DISAGG_SERVER_URLS") or base_env.get("DISAGG_SERVER_URL"):
@@ -408,6 +601,35 @@ def build_launch_plan(
     """Resolve one validated config into a side-effect-free process plan."""
     base_env = os.environ if env is None else env
     distributed = _distributed_state(base_env)
+    deployment = cfg.deployment.disaggregated
+    managed_local = deployment.managed_local if deployment is not None else None
+    managed_child = base_env.get(_MANAGED_CHILD_ENV) == "1"
+    if managed_local is not None:
+        if managed_child:
+            if requested_role not in ("producer", "consumer"):
+                raise ValueError(
+                    "managed_local child workers require an explicit producer "
+                    "or consumer role"
+                )
+            if not Path(deployment.control_dir, "logs").is_dir():
+                raise ValueError(
+                    "managed_local child worker requires an active supervisor "
+                    f"control_dir: {deployment.control_dir}"
+                )
+        else:
+            if distributed:
+                raise ValueError("managed_local cannot run inside an existing torchrun")
+            if requested_role not in ("auto", "both"):
+                raise ValueError(
+                    "managed_local supports only --role auto or --role both"
+                )
+            if node_rank is not None:
+                raise ValueError("managed_local does not accept --node-rank")
+            if os.path.exists(deployment.control_dir):
+                raise ValueError(
+                    "managed_local requires a fresh control_dir, but it already "
+                    f"exists: {deployment.control_dir}"
+                )
     role = _resolve_role(cfg, requested_role, distributed=distributed)
     topology = cfg.deployment.trainer
     if role == "both" and topology.nnodes > 1:
@@ -423,10 +645,24 @@ def build_launch_plan(
     producer_env: dict[str, str] = {}
     consumer_env: dict[str, str] = {}
     if cfg.training.deployment_mode == "disaggregated":
+        role_base_env = base_env
+        managed_environment: dict[str, str] = {}
+        if managed_local is not None:
+            managed_environment = _managed_local_environment(cfg)
+            role_base_env = {**base_env, **managed_environment}
         if role in ("producer", "both"):
-            producer_env = _disaggregated_env(cfg, base_env, role="producer")
+            producer_env = _disaggregated_env(cfg, role_base_env, role="producer")
         if role in ("consumer", "both"):
-            consumer_env = _disaggregated_env(cfg, base_env, role="consumer")
+            consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
+        if managed_local is not None:
+            producer_env.update(managed_environment)
+            producer_env["CUDA_VISIBLE_DEVICES"] = ""
+            producer_env[_MANAGED_CHILD_ENV] = "1"
+            consumer_env.update(managed_environment)
+            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+                managed_local.trainer_cuda_visible_devices
+            )
+            consumer_env[_MANAGED_CHILD_ENV] = "1"
 
     _validate_capture_urls(cfg, role=role, base_env=base_env)
     _validate_consumer_database(
@@ -500,17 +736,34 @@ def build_launch_plan(
         node_rank=resolved_rank,
         env=consumer_env,
     )
+    if managed_local is not None:
+        return LaunchPlan(
+            "managed_supervisor",
+            "both",
+            commands=(producer, consumer),
+            services=_managed_local_services(cfg),
+            managed_root=deployment.control_dir,
+            managed_ports=(
+                managed_local.mooncake.rpc_port,
+                managed_local.mooncake.metadata_port,
+                managed_local.mooncake.metrics_port,
+                *[server.port for server in managed_local.capture_servers],
+            ),
+            shutdown_grace_s=managed_local.shutdown_grace_s,
+        )
     return LaunchPlan("supervisor", "both", commands=(producer, consumer))
 
 
-def _terminate_processes(processes: Sequence[subprocess.Popen]) -> None:
+def _terminate_processes(
+    processes: Sequence[subprocess.Popen], *, grace_s: float = 5.0
+) -> None:
     for process in processes:
         if process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except (AttributeError, ProcessLookupError):
                 process.terminate()
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline and any(
         process.poll() is None for process in processes
     ):
@@ -527,16 +780,171 @@ def _terminate_processes(processes: Sequence[subprocess.Popen]) -> None:
             pass
 
 
+def _managed_preflight(plan: LaunchPlan) -> None:
+    if plan.managed_root is None:
+        raise ValueError("managed supervisor plan is missing managed_root")
+    if os.path.exists(plan.managed_root):
+        raise ValueError(
+            f"managed_local requires a fresh control_dir: {plan.managed_root}"
+        )
+    if shutil.which("mooncake_master") is None:
+        raise RuntimeError("managed_local requires mooncake_master on PATH")
+    try:
+        mooncake_available = importlib.util.find_spec("mooncake.store") is not None
+    except ModuleNotFoundError:
+        mooncake_available = False
+    if not mooncake_available:
+        raise RuntimeError("managed_local requires the mooncake Python package")
+    try:
+        patched_sglang = (
+            importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
+        )
+    except ModuleNotFoundError:
+        patched_sglang = False
+    if not patched_sglang:
+        raise RuntimeError(
+            "managed_local requires patched SGLang spec capture; run "
+            "scripts/apply_sglang_spec_capture_patch.sh"
+        )
+
+    for port in plan.managed_ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"managed_local port 127.0.0.1:{port} is unavailable: {exc}"
+                ) from exc
+
+
+def _http_ready(readiness: ReadinessSpec) -> bool:
+    try:
+        with urllib_request.urlopen(readiness.url, timeout=1.0) as response:
+            status = getattr(response, "status", 200)
+            return readiness.kind == "mooncake" or 200 <= status < 300
+    except urllib_error.HTTPError as exc:
+        # Mooncake returns a 4xx missing-key response for this read-only probe.
+        # A 5xx means the service is listening but not yet healthy.
+        return readiness.kind == "mooncake" and 400 <= exc.code < 500
+    except (OSError, urllib_error.URLError):
+        return False
+
+
+def _readiness_satisfied(readiness: ReadinessSpec) -> bool:
+    if not _http_ready(readiness):
+        return False
+    if readiness.kind != "mooncake":
+        return True
+    assert readiness.tcp_host is not None and readiness.tcp_port is not None
+    try:
+        with socket.create_connection(
+            (readiness.tcp_host, readiness.tcp_port), timeout=1.0
+        ):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_service(
+    service: ServiceSpec,
+    process: subprocess.Popen,
+    started: Sequence[tuple[ServiceSpec, subprocess.Popen]],
+) -> None:
+    deadline = time.monotonic() + service.readiness.timeout_s
+    while time.monotonic() < deadline:
+        for active_service, active_process in started:
+            status = active_process.poll()
+            if status is not None:
+                raise RuntimeError(
+                    f"managed service {active_service.command.label!r} exited "
+                    f"with status {status}; see {active_service.log_path}"
+                )
+        if _readiness_satisfied(service.readiness):
+            return
+        time.sleep(0.25)
+    if process.poll() is not None:
+        raise RuntimeError(
+            f"managed service {service.command.label!r} exited during startup; "
+            f"see {service.log_path}"
+        )
+    raise TimeoutError(
+        f"managed service {service.command.label!r} did not become ready after "
+        f"{service.readiness.timeout_s:.1f}s; see {service.log_path}"
+    )
+
+
+def _spawn_command(
+    command: CommandSpec,
+    *,
+    popen: Callable[..., subprocess.Popen],
+    stdout=None,
+    stderr=None,
+) -> subprocess.Popen:
+    child_env = os.environ.copy()
+    child_env.update(command.env)
+    kwargs = {"env": child_env, "start_new_session": True}
+    if stdout is not None:
+        kwargs["stdout"] = stdout
+    if stderr is not None:
+        kwargs["stderr"] = stderr
+    return popen(command.argv, **kwargs)
+
+
+def _spawn_service(
+    service: ServiceSpec,
+    *,
+    popen: Callable[..., subprocess.Popen],
+) -> subprocess.Popen:
+    with open(service.log_path, "x", encoding="utf-8") as log:
+        return _spawn_command(
+            service.command,
+            popen=popen,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+
+
+def _stop_services(
+    started: Sequence[tuple[ServiceSpec, subprocess.Popen]], *, grace_s: float
+) -> None:
+    phases = sorted({service.phase for service, _ in started}, reverse=True)
+    for phase in phases:
+        processes = [process for service, process in started if service.phase == phase]
+        _terminate_processes(processes, grace_s=grace_s)
+
+
+def _normalized_status(status: int, *, unexpected_clean: bool = False) -> int:
+    if status < 0:
+        return 128 - status
+    if status == 0 and unexpected_clean:
+        return 1
+    return status
+
+
 def run_commands(
     plan: LaunchPlan,
     *,
     popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    managed_preflight: Optional[Callable[[LaunchPlan], None]] = None,
+    readiness_waiter: Optional[
+        Callable[
+            [
+                ServiceSpec,
+                subprocess.Popen,
+                Sequence[tuple[ServiceSpec, subprocess.Popen]],
+            ],
+            None,
+        ]
+    ] = None,
 ) -> int:
-    """Execute a command or supervise both disaggregated roles."""
+    """Execute workers and, when requested, their local capture services."""
     if plan.kind == "worker":
         raise ValueError("worker plans execute inside specforge.cli")
     processes: list[subprocess.Popen] = []
+    services: list[tuple[ServiceSpec, subprocess.Popen]] = []
     previous_handlers = {}
+    managed_preflight = managed_preflight or _managed_preflight
+    readiness_waiter = readiness_waiter or _wait_for_service
 
     def forward_signal(signum, _frame):
         raise _ForwardedSignal(signum)
@@ -554,10 +962,21 @@ def run_commands(
                     signal.signal(installed, handler)
                 previous_handlers.clear()
                 break
+        if plan.kind == "managed_supervisor":
+            managed_preflight(plan)
+            assert plan.managed_root is not None
+            Path(plan.managed_root, "logs").mkdir(parents=True, exist_ok=False)
+            phases = sorted({service.phase for service in plan.services})
+            for phase in phases:
+                current_phase = [
+                    service for service in plan.services if service.phase == phase
+                ]
+                for service in current_phase:
+                    services.append((service, _spawn_service(service, popen=popen)))
+                for service, process in services[-len(current_phase) :]:
+                    readiness_waiter(service, process, tuple(services))
         for command in plan.commands:
-            child_env = os.environ.copy()
-            child_env.update(command.env)
-            processes.append(popen(command.argv, env=child_env, start_new_session=True))
+            processes.append(_spawn_command(command, popen=popen))
         remaining = set(range(len(processes)))
         first_failure = 0
         while remaining:
@@ -567,18 +986,40 @@ def run_commands(
                     continue
                 remaining.remove(index)
                 if status != 0 and first_failure == 0:
-                    first_failure = 128 - status if status < 0 else status
-                    _terminate_processes([processes[item] for item in remaining])
+                    first_failure = _normalized_status(status)
+                    _terminate_processes(
+                        [processes[item] for item in remaining],
+                        grace_s=plan.shutdown_grace_s,
+                    )
+                    remaining.clear()
+                    break
+            if plan.kind == "managed_supervisor" and remaining and not first_failure:
+                for service, process in services:
+                    status = process.poll()
+                    if status is None:
+                        continue
+                    first_failure = _normalized_status(status, unexpected_clean=True)
+                    _terminate_processes(
+                        [processes[item] for item in remaining],
+                        grace_s=plan.shutdown_grace_s,
+                    )
                     remaining.clear()
                     break
             if remaining:
                 time.sleep(0.05)
+        if plan.kind == "managed_supervisor":
+            _stop_services(services, grace_s=plan.shutdown_grace_s)
+            services.clear()
         return first_failure
     except _ForwardedSignal as received:
-        _terminate_processes(processes)
+        _terminate_processes(processes, grace_s=plan.shutdown_grace_s)
+        _stop_services(services, grace_s=plan.shutdown_grace_s)
+        services.clear()
         return 128 + received.signum
     except BaseException:
-        _terminate_processes(processes)
+        _terminate_processes(processes, grace_s=plan.shutdown_grace_s)
+        _stop_services(services, grace_s=plan.shutdown_grace_s)
+        services.clear()
         raise
     finally:
         for signum, handler in previous_handlers.items():
@@ -589,6 +1030,8 @@ __all__ = [
     "CommandSpec",
     "LaunchPlan",
     "LaunchRole",
+    "ReadinessSpec",
+    "ServiceSpec",
     "build_launch_plan",
     "run_commands",
 ]

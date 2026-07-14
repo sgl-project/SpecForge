@@ -27,6 +27,14 @@ supervises both roles on one trainer node or selects a split role with
 `--role`, and `*-npu.yaml` retains the HF + SDPA Ascend recipes.
 Qwen2.5-VL has both 7B and 32B online recipes and uses the same EAGLE3 trainer.
 
+The `qwen3-8b-domino-multiserver-disaggregated.yaml` and
+`qwen3.6-27b-dflash-multiserver-disaggregated.yaml` recipes are opt-in local
+full-stack examples. Their typed `managed_local` blocks own Mooncake, two
+patched SGLang capture servers, and the trainer GPU allocation; the same
+`specforge train -c ...` command starts and cleans up each complete stack.
+Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
+for scheduler- or service-managed deployments.
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. GPU visibility, Mooncake
 addresses, and NPU runtime variables remain deployment concerns and are passed
@@ -86,6 +94,11 @@ control/data-plane state; capture producers always start a fresh attempt.
 
 Migration notes:
 
+- The latest pre-cleanup `run_qwen3_8b_domino_disagg_multiserver.sh` had been
+  reduced to one SGLang server and one URL despite its historical name. The
+  managed Qwen3-8B Domino recipe above restores a genuine two-server topology
+  without restoring the legacy trainer script; the external-service Domino
+  recipe also accepts any number of typed `deployment.disaggregated.server_urls`.
 - The former GPT-OSS-120B shell accidentally selected the 20B draft config;
   `gpt-oss-120b-eagle3-online.yaml` points to the matching 120B config.
 - The former Qwen3-235B shell accidentally launched Qwen3-Next-80B; the two now

@@ -218,6 +218,121 @@ class TrainerDeploymentConfig(StrictConfigModel):
         return self
 
 
+def _validate_cuda_devices(devices: List[str], *, field_name: str) -> None:
+    for device in devices:
+        if not device or device.strip() != device or "," in device:
+            raise ValueError(
+                f"{field_name} entries must be non-empty CUDA device tokens "
+                f"without whitespace or commas, got {device!r}"
+            )
+    if len(set(devices)) != len(devices):
+        raise ValueError(f"{field_name} must not contain duplicate CUDA devices")
+
+
+class ManagedLocalMooncakeConfig(StrictConfigModel):
+    """One loopback Mooncake master owned by the local CLI supervisor."""
+
+    rpc_port: int = Field(default=35551, gt=0, le=65535)
+    metadata_port: int = Field(default=35880, gt=0, le=65535)
+    metrics_port: int = Field(default=35903, gt=0, le=65535)
+    local_hostname: str = "127.0.0.1"
+    protocol: Literal["tcp", "rdma"] = "tcp"
+    rdma_devices: Optional[str] = None
+    global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
+    local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
+    startup_timeout_s: float = Field(default=60.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_endpoint(self):
+        ports = (self.rpc_port, self.metadata_port, self.metrics_port)
+        if len(set(ports)) != len(ports):
+            raise ValueError("managed_local Mooncake ports must be unique")
+        if (
+            not self.local_hostname
+            or self.local_hostname.strip() != self.local_hostname
+        ):
+            raise ValueError(
+                "managed_local.mooncake.local_hostname must be non-empty and "
+                "must not contain surrounding whitespace"
+            )
+        return self
+
+
+class ManagedLocalCaptureServerConfig(StrictConfigModel):
+    """One patched SGLang capture server owned by the local supervisor."""
+
+    port: int = Field(gt=0, le=65535)
+    cuda_visible_devices: List[str] = Field(min_length=1)
+    tp_size: int = Field(default=1, gt=0)
+    mem_fraction_static: float = Field(default=0.85, gt=0.0, le=1.0)
+    attention_backend: Optional[str] = None
+    startup_timeout_s: float = Field(default=1800.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_devices(self):
+        _validate_cuda_devices(
+            self.cuda_visible_devices,
+            field_name="managed_local.capture_servers[].cuda_visible_devices",
+        )
+        if len(self.cuda_visible_devices) != self.tp_size:
+            raise ValueError(
+                "managed_local capture server tp_size must equal the number of "
+                "cuda_visible_devices"
+            )
+        return self
+
+
+class ManagedLocalStackConfig(StrictConfigModel):
+    """Opt-in ownership of a complete single-node online capture stack."""
+
+    trainer_cuda_visible_devices: List[str] = Field(min_length=1)
+    mooncake: ManagedLocalMooncakeConfig = Field(
+        default_factory=ManagedLocalMooncakeConfig
+    )
+    capture_servers: List[ManagedLocalCaptureServerConfig] = Field(min_length=1)
+    shutdown_grace_s: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_local_resources(self):
+        _validate_cuda_devices(
+            self.trainer_cuda_visible_devices,
+            field_name="managed_local.trainer_cuda_visible_devices",
+        )
+        mooncake_ports = {
+            self.mooncake.rpc_port,
+            self.mooncake.metadata_port,
+            self.mooncake.metrics_port,
+        }
+        capture_ports = [server.port for server in self.capture_servers]
+        if len(set(capture_ports)) != len(capture_ports):
+            raise ValueError("managed_local capture server ports must be unique")
+        overlap = mooncake_ports.intersection(capture_ports)
+        if overlap:
+            raise ValueError(
+                "managed_local capture and Mooncake ports must not overlap: "
+                f"{sorted(overlap)}"
+            )
+
+        server_devices = [
+            device
+            for server in self.capture_servers
+            for device in server.cuda_visible_devices
+        ]
+        if len(set(server_devices)) != len(server_devices):
+            raise ValueError(
+                "managed_local capture servers must not share CUDA devices"
+            )
+        overlap_devices = set(server_devices).intersection(
+            self.trainer_cuda_visible_devices
+        )
+        if overlap_devices:
+            raise ValueError(
+                "managed_local capture and trainer CUDA devices must be disjoint: "
+                f"{sorted(overlap_devices)}"
+            )
+        return self
+
+
 class DisaggregatedDeploymentConfig(StrictConfigModel):
     """Shared, non-secret topology for producer/consumer launch planning."""
 
@@ -242,6 +357,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
+    managed_local: Optional[ManagedLocalStackConfig] = None
 
     @model_validator(mode="after")
     def _validate_store(self):
@@ -251,6 +367,34 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
             raise ValueError(
                 "deployment.disaggregated.store_root is required for shared_dir"
             )
+        if self.managed_local is not None:
+            if self.backend != "mooncake":
+                raise ValueError("managed_local requires backend=mooncake")
+            if self.store_root:
+                raise ValueError("managed_local does not use store_root")
+            if self.server_urls:
+                raise ValueError(
+                    "managed_local derives capture server URLs; do not set "
+                    "deployment.disaggregated.server_urls"
+                )
+            configured_endpoints = {
+                "mooncake_metadata_server": self.mooncake_metadata_server,
+                "mooncake_master_server_addr": self.mooncake_master_server_addr,
+                "mooncake_local_hostname": self.mooncake_local_hostname,
+                "mooncake_protocol": self.mooncake_protocol,
+                "mooncake_rdma_devices": self.mooncake_rdma_devices,
+            }
+            explicit = [name for name, value in configured_endpoints.items() if value]
+            if explicit:
+                raise ValueError(
+                    "managed_local derives Mooncake endpoints; do not set "
+                    f"{explicit}"
+                )
+            if self.producer_segment_size is not None:
+                raise ValueError(
+                    "managed_local online capture is server-owned; do not set "
+                    "producer_segment_size"
+                )
         return self
 
 
@@ -613,6 +757,43 @@ class Config(StrictConfigModel):
                 "online disaggregated training requires "
                 "deployment.disaggregated.backend=mooncake"
             )
+        managed_local = (
+            self.deployment.disaggregated.managed_local
+            if self.deployment.disaggregated is not None
+            else None
+        )
+        if managed_local is not None:
+            if mode != "online":
+                raise ValueError("managed_local supports online capture only")
+            if self.deployment.trainer.nnodes != 1:
+                raise ValueError("managed_local requires deployment.trainer.nnodes=1")
+            if self.training.role != "auto":
+                raise ValueError(
+                    "managed_local requires the persisted training role to be auto"
+                )
+            if self.training.resume_from is not None:
+                raise ValueError("managed_local does not support resume")
+            unsupported_dp_options = [
+                name
+                for name in (
+                    "sglang_enable_dp_attention",
+                    "sglang_enable_dp_lm_head",
+                )
+                if getattr(self.model, name)
+            ]
+            if unsupported_dp_options:
+                raise ValueError(
+                    "managed_local capture servers do not support SGLang DP "
+                    f"options: {unsupported_dp_options}"
+                )
+            if (
+                len(managed_local.trainer_cuda_visible_devices)
+                != self.deployment.trainer.nproc_per_node
+            ):
+                raise ValueError(
+                    "managed_local trainer_cuda_visible_devices count must equal "
+                    "deployment.trainer.nproc_per_node"
+                )
         if (
             mode == "online"
             and deployment == "disaggregated"
@@ -793,6 +974,9 @@ __all__ = [
     "ProfilingConfig",
     "RuntimeConfig",
     "TrainerDeploymentConfig",
+    "ManagedLocalMooncakeConfig",
+    "ManagedLocalCaptureServerConfig",
+    "ManagedLocalStackConfig",
     "DisaggregatedDeploymentConfig",
     "DeploymentConfig",
     "TrainingConfig",

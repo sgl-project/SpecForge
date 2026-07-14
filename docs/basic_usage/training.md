@@ -436,6 +436,18 @@ EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:
 
+Serving weight names are a fail-silent boundary in SGLang: an unrecognized key
+may be skipped while the server still starts. The exporter therefore validates
+the required `fc.weight`, `norm.weight`, `lm_head.weight`, `t2d`, and `d2t`
+keys and rejects any remaining trainer prefix. `LlamaForCausalLMEagle3` uses an
+identity map for its `midlayer.*` and required keys; `embed_tokens.weight` is
+deliberately omitted because serving reuses the target model embedding. A new
+architecture (including a future MLA draft) must add an explicit, loader-version
+matched weight map and required-key contract before SGLang export is enabled.
+The export tests cover key structure and tensor round-trip; loading the result
+in a real speculative-decoding server and measuring acceptance remains a GPU
+serving validation step.
+
 ```bash
 specforge export --to hf \
   --checkpoint ./outputs/qwen3-8b-eagle3-online/qwen3-8b-eagle3-online-latest \

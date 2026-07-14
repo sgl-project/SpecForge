@@ -207,6 +207,23 @@ def _strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return _strategy_spec(cfg).assembly.make_strategy_kwargs(cfg)
 
 
+def _strategy_resume_contract(cfg: Config, bundle: ModelBundle) -> Dict[str, Any]:
+    """Return resolved strategy semantics that a checkpoint must preserve."""
+    if cfg.training.strategy != "peagle":
+        return {}
+
+    draft_model = bundle.draft_model
+    model = bundle.model
+    return {
+        "peagle_num_draft_layers": len(draft_model.layers),
+        "peagle_norm_before_residual": bool(draft_model.norm_before_residual),
+        "peagle_num_depths": int(model.num_depths),
+        "peagle_down_sample_ratio": float(model.down_sample_ratio),
+        "peagle_down_sample_ratio_min": float(model.down_sample_ratio_min),
+        "peagle_mask_token_id": int(model.mask_token_id),
+    }
+
+
 def build_model_bundle(cfg: Config, *, load_target_engine: bool = True) -> ModelBundle:
     """Build the method-specific composite model and frozen target pieces."""
     import torch
@@ -737,6 +754,7 @@ def build_training_run(cfg: Config) -> TrainingRun:
         "prompt_seed": t.seed,
         "prompt_epochs": t.num_epochs,
         "target_dp_size": target_dp_size,
+        **_strategy_resume_contract(cfg, bundle),
     }
     run_logger = _configured_logger(cfg)
     try:

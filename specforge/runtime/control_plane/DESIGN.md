@@ -107,6 +107,11 @@ requeues the unacknowledged tail. A producer never resumes, and a consumed
 stream is never iterated as a second trainer epoch. A new producer attempt must
 use fresh channel, store-id, run-id, and output artifacts.
 
+The durable acknowledgement step must equal the restored checkpoint step.
+Acknowledgements can advance after the most recent periodic checkpoint, so a
+crash in that interval is intentionally non-resumable: recovery fails closed
+rather than replaying consumed refs against older optimizer state.
+
 Offline refs remain fixed and re-iterable, so offline checkpoint resume and
 multiple epochs keep their existing semantics.
 

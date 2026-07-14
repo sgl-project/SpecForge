@@ -15,9 +15,12 @@ The checked-in recipes are:
 | --- | --- |
 | Online DFlash | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` |
 | Online Domino | `examples/configs/qwen3-8b-domino-disaggregated.yaml` |
+| Managed-local two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
 | Online DSpark | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` |
 | Online Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-disaggregated.yaml` |
+| Managed-local two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
 | Offline EAGLE3 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` |
+| Offline Qwen2.5-7B EAGLE3 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` |
 
 ## One config owns the launch topology
 
@@ -84,6 +87,83 @@ specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml --plan
 
 Plan output redacts secret-shaped overrides and credentials embedded in URLs.
 
+## Multi-server capture
+
+`deployment.disaggregated.server_urls` is an ordered worker topology, not merely
+a set of endpoints. The producer creates one capture adapter and one rollout
+worker for every list entry. All workers lease disjoint prompts from one
+controller, write into the same Mooncake namespace, and publish references to
+the same channel concurrently:
+
+```yaml
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
+  disaggregated:
+    control_dir: outputs/qwen36-two-capture-servers/control
+    backend: mooncake
+    server_urls:
+      - http://capture-0.example:30000
+      - http://capture-1.example:30000
+```
+
+Every server must use the same target model, revision, capture method, and
+auxiliary layer ids. A server failure returns its leased prompts to the shared
+pool; surviving workers can lease and finish them. A worker is removed after
+repeated consecutive failures, and the producer fails loudly rather than
+publishing a successful partial stream if every worker is lost or a prompt
+exhausts its bounded retries.
+
+Repeating one URL is also intentional: each occurrence creates another worker
+that can issue a blocking capture request to the same server. This can improve
+prefill occupancy without allocating another target replica, subject to that
+server's request capacity. For example, the following temporary override uses
+four producer workers against one server while keeping the checked-in YAML as
+the source of every other setting:
+
+```bash
+specforge train -c examples/configs/qwen3-8b-domino-disaggregated.yaml \
+  'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]'
+```
+
+In the default external-services mode, listing one or more URLs never starts
+those servers. They must already be healthy and attached to the configured
+Mooncake deployment. The optional
+`deployment.disaggregated.managed_local` profile is a separate, explicit
+single-node development convenience: when configured, it owns local Mooncake
+and capture-server processes and derives their endpoints. Omitting that block
+preserves the external-services behavior exactly. Managed-local launch is for a
+fresh online Mooncake run with automatic producer + consumer supervision; it is
+not a remote scheduler, resume path, existing-torchrun path, or replacement for
+explicit producer and consumer pools.
+
+The checked-in Qwen3-8B Domino recipe records two TP=1 capture servers on GPUs
+0–1 and a DP=2 trainer on GPUs 2–3. It directly replaces the discoverable
+multi-server behavior of the deleted legacy shell while retaining the unified
+training entry:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml
+```
+
+The larger Qwen3.6 DFlash recipe records two TP=2 capture servers on GPUs 0–3
+and a DP=2 trainer on GPUs 4–5:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+```
+
+The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
+starts both capture servers and waits for every health endpoint, then starts the
+existing producer/consumer plan. A service or role failure terminates the owned
+stack; a clean producer exit leaves capture storage alive until the consumer
+finishes. Normal completion stops capture servers before Mooncake. Logs remain
+under the configured `control_dir/logs/`.
+
 ## Split pools and multi-node consumers
 
 The same YAML launches either role explicitly:
@@ -128,12 +208,31 @@ detected and used as the worker environment rather than nesting another
 torchrun. A producer is rejected inside a multi-rank torchrun to prevent
 duplicate capture/ingestion roles.
 
-## External Mooncake and SGLang services
+The separate-inference-node Qwen3-8B example keeps that scheduler boundary but
+restores full development-stack orchestration:
 
-The unified supervisor owns only SpecForge producer and consumer processes.
-Mooncake and patched SGLang are external, usually long-lived services managed by
-Kubernetes, Slurm, systemd, or the development environment. The training CLI
-does not start, stop, or assign GPUs to them.
+```bash
+export DISAGG_STORE_ID=qwen3-8b-two-node-attempt-001
+export DISAGG_RUN_ROOT=/shared/specforge/$DISAGG_STORE_ID
+rcli exec --per-node <job> \
+  'bash examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh'
+```
+
+Rank 0 starts and health-checks Mooncake and patched SGLang, then invokes the
+canonical producer role. Rank 1 invokes the canonical consumer role, whose
+process count still comes from the YAML. The wrapper coordinates only
+node-local services and shared lifecycle markers; it does not contain another
+trainer or construct `torchrun`. `NODE_RANK`/`NUM_NODES`/`HEAD_IP` may be used
+instead of the corresponding `RCLI_*` variables on another scheduler. Both
+nodes must see a fresh `DISAGG_RUN_ROOT`.
+
+## External and managed-local services
+
+Without `deployment.disaggregated.managed_local`, the unified supervisor owns
+only SpecForge producer and consumer processes. Mooncake and patched SGLang are
+external, usually long-lived services managed by Kubernetes, Slurm, systemd, or
+the development environment. In this default mode, the training CLI does not
+start, stop, or assign GPUs to them.
 
 Install a Mooncake client compatible with the store's `put_from`/`get_into`
 wire contract on the producer and consumer images:
@@ -261,6 +360,11 @@ With the default `--role auto`, a disaggregated config containing
 `training.resume_from` resolves to consumer-only. Explicit `--role both` is
 rejected because producers are never resumed. Reuse the same control directory,
 store id, run id, output directory, consumer topology, and Mooncake objects.
+The durable optimizer-step acknowledgement must equal the checkpoint step.
+Because acknowledgements may advance between periodic checkpoints, a crash in
+that interval is deliberately rejected instead of replaying already-consumed
+samples or silently skipping optimizer state; use a more frequent save interval
+when that recovery window matters.
 
 Offline disaggregated resume also launches only the consumer against the
 retained manifest/store. Changing trainer world size during exact optimizer

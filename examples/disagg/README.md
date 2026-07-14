@@ -51,16 +51,57 @@ specforge train -c run.yaml --role consumer --node-rank 1
 Automatic `--role both` is deliberately single-node. The CLI does not SSH into
 other machines or start scheduler jobs.
 
-## External service boundary
+For the common two-physical-node demonstration (inference services + producer
+on rank 0, one DP trainer pool on rank 1), run the checked-in infrastructure
+wrapper once per node through the cluster launcher:
 
-Online capture still requires a running Mooncake deployment and patched SGLang
-capture server. They are long-lived external services and are not started or
+```bash
+export DISAGG_STORE_ID=qwen3-8b-two-node-attempt-001
+export DISAGG_RUN_ROOT=/shared/specforge/$DISAGG_STORE_ID
+
+# The launcher supplies RCLI_NODE_RANK, RCLI_NUM_NODES, and RCLI_HEAD_IP.
+rcli exec --per-node <job> \
+  'bash examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh'
+```
+
+The wrapper owns Mooncake/SGLang readiness and cross-node lifecycle only. Both
+roles still execute `specforge train -c ...`; it contains no legacy Python
+trainer and constructs no `torchrun` command. Set `SERVER_GPUS`, `TRAINER_GPUS`,
+`TRAINER_NPROC`, and `CONFIG` when the allocation differs. Both nodes must see
+the fresh `DISAGG_RUN_ROOT` path.
+
+## External and managed-local services
+
+By default, online capture requires an already-running Mooncake deployment and
+patched SGLang capture server. Those long-lived services are not started or
 stopped by `specforge train`. Put stable, non-secret topology in the typed
 `deployment.disaggregated` section; inject authentication tokens, each node's
 Mooncake hostname, and device visibility through the deployment environment.
-The checked-in online recipes point at the standard local demo ports; replace
-those endpoint fields, or override them with environment values, for a remote
-deployment.
+The checked-in external-service recipes point at the standard local demo ports;
+replace those endpoint fields, or override them with environment values, for a
+remote deployment.
+
+For a self-contained single-node development run, the managed-local recipes
+record Mooncake, two capture servers, their GPU placement, and the DP trainer
+in one YAML. The Qwen3-8B Domino recipe restores the genuinely two-server
+behavior that existed before the legacy shell was reduced to a one-server
+launch:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml
+```
+
+The larger Qwen3.6 DFlash topology uses two TP=2 capture servers:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+```
+
+That opt-in profile starts, health-checks, and cleans up the owned local
+services. It does not change the default external-service boundary or attempt
+to schedule services on remote hosts.
 
 The strict e2e gate at
 `scripts/gates/run_disaggregated_overfit_gate.sh` retains full local test-stack

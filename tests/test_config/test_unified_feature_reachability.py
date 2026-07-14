@@ -59,6 +59,11 @@ EXPECTED_TRACKING = {
         "wandb_project": "qwen3-8b-domino-disagg",
         "wandb_name": "qwen3-8b-domino-disagg-dp4",
     },
+    "qwen3-8b-domino-multiserver-disaggregated.yaml": {
+        "report_to": "none",
+        "wandb_project": "qwen3-8b-domino-disagg",
+        "wandb_name": "qwen3-8b-domino-2srv-dp2",
+    },
     "qwen3-8b-domino-online.yaml": {
         "report_to": "wandb",
         "wandb_project": "specforge-qwen3-8b-domino",
@@ -95,6 +100,11 @@ EXPECTED_TRACKING = {
         "wandb_project": "qwen36-dflash-disagg",
         "wandb_name": "qwen36-27b-dflash-server-capture-dp2",
     },
+    "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": {
+        "report_to": "none",
+        "wandb_project": "qwen36-dflash-disagg",
+        "wandb_name": "qwen36-27b-dflash-2srv-dp2",
+    },
     "qwen3.6-27b-dflash-online.yaml": {
         "report_to": "wandb",
         "wandb_project": "qwen36-dflash-pr645",
@@ -128,7 +138,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 51)
+        self.assertEqual(len(paths), 54)
 
         configs = {path.name: Config.from_file(str(path)) for path in paths}
 

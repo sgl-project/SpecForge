@@ -14,6 +14,7 @@ CONFIG=examples/configs/qwen3-8b-domino-disaggregated.yaml \
 TARGET_MODEL_PATH=Qwen/Qwen3-8B \
 DRAFT_CONFIG_PATH=configs/qwen3-8b-domino.json \
 SOURCE_DATA_PATH=./cache/dataset/sharegpt_train.jsonl \
+REASONING_POLICY=forbidden ENABLE_THINKING=false \
 NPROC_PER_NODE=7 \
 CAPTURE_GPUS=0 \
 CONSUMER_GPUS=1,2,3,4,5,6,7 \
@@ -27,6 +28,57 @@ stack, exports through `specforge export --to hf`, starts real DFLASH serving,
 and validates acceptance metadata plus target-prefix agreement. EXIT, INT, and
 TERM traps stop every process owned by the gate; externally supervised services
 are never registered for cleanup.
+
+## Model and reasoning contracts
+
+The gate is model-parameterized, but the dataset contract must match the target
+chat template and the selected reasoning mode:
+
+| Target | Dataset contract | `CHAT_TEMPLATE` | Reasoning controls |
+| --- | --- | --- | --- |
+| Qwen3-8B | Non-reasoning responses | `qwen` | `REASONING_POLICY=forbidden`, `ENABLE_THINKING=false` |
+| Qwen3.6-27B | Structured reasoning responses | `qwen3.5` | `REASONING_POLICY=required`, `ENABLE_THINKING=true` |
+
+For example, the Qwen3.6 reasoning gate still uses the same canonical training
+entry; the selected YAML supplies the disaggregated topology while the gate
+passes the model, draft, data, and bounded-run values as typed overrides:
+
+```bash
+CONFIG=examples/configs/qwen3-8b-domino-disaggregated.yaml \
+TARGET_MODEL_PATH=Qwen/Qwen3.6-27B \
+DRAFT_CONFIG_PATH=configs/qwen3.6-27b-domino-full-attention.json \
+SOURCE_DATA_PATH=/path/to/validated_qwen36_reasoning.jsonl \
+CHAT_TEMPLATE=qwen3.5 \
+EMBEDDING_KEY=model.language_model.embed_tokens.weight \
+REASONING_POLICY=required ENABLE_THINKING=true MAX_LENGTH=2048 \
+CAPTURE_GPUS=0 CAPTURE_TP=1 \
+CONSUMER_GPUS=1,2,3,4,5,6,7 NPROC_PER_NODE=7 \
+bash scripts/gates/run_disaggregated_overfit_gate.sh
+```
+
+Mask token, block size, and auxiliary capture layers are read from the draft
+config. The selector rejects rows that violate the requested reasoning policy,
+would be truncated, or have fewer than `2 * block_size` trainable tokens after
+the real tokenizer and preprocessing path. It writes a prompt artifact with the
+exact rendered target suffix; the serving check consumes that artifact rather
+than trying to reconstruct structured reasoning from visible content.
+
+The training stage repeats exactly one selected row for the bounded optimizer
+run and succeeds only when all of these conditions hold:
+
+- the log reaches exactly `MAX_STEPS`;
+- final loss is at most `MAX_LOSS` (`0.0001` by default);
+- final token accuracy is at least `MIN_ACCURACY` (`1.0` by default);
+- the exact final `training_state.pt` checkpoint exists.
+
+The real-serving stage then exports that checkpoint, launches SGLang with the
+`DFLASH` speculative algorithm, and checks one `/v1/chat/completions` response.
+Request history must contain no `reasoning_content`, per-choice metadata must
+report `spec_accept_length >= block_size`, and generated output (reasoning plus
+visible content) must match at least the first `block_size` target tokens. The
+auditable response, request, server metadata, and prefix counts are written to
+`serving-gate.json`; aggregate server statistics are not accepted in place of
+per-request metadata.
 
 The required environment is `CONFIG`, `TARGET_MODEL_PATH`,
 `DRAFT_CONFIG_PATH`, and `SOURCE_DATA_PATH`. Common controls are:
@@ -42,6 +94,9 @@ The required environment is `CONFIG`, `TARGET_MODEL_PATH`,
 | `START_MOONCAKE` | Reuse an external Mooncake endpoint when `false` | `true` |
 | `START_CAPTURE_SERVER` | Reuse an external capture server when `false` | `true` |
 | `RUN_SERVING_GATE` | Chain export and real serving after overfit | `true` |
+| `REASONING_POLICY` | Require, forbid, or allow structured reasoning rows | `allow` |
+| `ENABLE_THINKING` | Preserve thinking mode in the prompt artifact and serving request | `false` |
+| `MAX_LOSS`, `MIN_ACCURACY` | Strict final training thresholds | `0.0001`, `1.0` |
 
 Mooncake addresses, disaggregated store paths, health polling, serving ports,
 GPU placement, and SGLang extra arguments can also be overridden through the

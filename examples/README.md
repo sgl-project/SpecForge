@@ -8,7 +8,7 @@ already recorded in the YAML:
 specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
 ```
 
-The representative Qwen3-8B configs are below. The complete 51-recipe catalog,
+The representative configs are below. The complete 54-recipe catalog,
 including VLM, NPU, offline, and disaggregated variants, is in
 [`examples/configs/README.md`](./configs/README.md).
 
@@ -17,13 +17,16 @@ including VLM, NPU, offline, and disaggregated variants, is in
 | `examples/configs/qwen3-8b-eagle3-online.yaml` | Online target capture | EAGLE3 |
 | `examples/configs/qwen3-8b-eagle3-offline.yaml` | Precomputed features | EAGLE3 |
 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
+| `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
 | `examples/configs/qwen3-8b-dflash-online.yaml` | Online target capture | DFlash |
 | `examples/configs/qwen3-8b-dpace-online.yaml` | Online D-PACE objective | DFlash |
 | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` | Disaggregated server capture | DFlash |
 | `examples/configs/qwen3-8b-domino-online.yaml` | Online target capture | Domino |
 | `examples/configs/qwen3-8b-domino-disaggregated.yaml` | Disaggregated server capture | Domino |
+| `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | Domino |
 | `examples/configs/qwen3-8b-peagle-online.yaml` | Online target capture | P-EAGLE |
 | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
+| `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
 | `examples/configs/qwen2.5-vl-7b-eagle3-online.yaml` | Online multimodal target capture | EAGLE3 |
 | `examples/configs/qwen2.5-vl-32b-eagle3-online.yaml` | Online multimodal target capture + target TP | EAGLE3 |
 | `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Ascend NPU online target capture | DFlash |

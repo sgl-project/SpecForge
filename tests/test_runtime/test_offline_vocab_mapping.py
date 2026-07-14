@@ -3,13 +3,18 @@
 
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
 from specforge.config import Config
-from specforge.training.assembly import _ensure_offline_vocab_mapping
+from specforge.training.assembly import (
+    _ensure_offline_vocab_mapping,
+    _install_dataset_vocab_mapping,
+    _prompt_cache_key,
+)
 from specforge.training.vocab_mapping import count_effective_feature_tokens
 
 
@@ -28,6 +33,44 @@ class _DraftWithMapping(torch.nn.Module):
 
 
 class OfflineVocabMappingTest(unittest.TestCase):
+    def test_vocab_sizes_only_change_the_mapping_cache_namespace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Config.model_validate(
+                {
+                    "model": {
+                        "target_model_path": "target/model",
+                        "target_backend": "hf",
+                    },
+                    "data": {
+                        "train_data_path": "train.jsonl",
+                        "cache_dir": directory,
+                    },
+                }
+            )
+            prompt_key = _prompt_cache_key(cfg)
+            counts = Counter({1: 3, 2: 2, 3: 1})
+
+            for target_vocab_size, draft_vocab_size in ((8, 4), (9, 4), (8, 5)):
+                bundle = SimpleNamespace(
+                    draft_model=_DraftWithMapping(
+                        target_vocab_size=target_vocab_size,
+                        draft_vocab_size=draft_vocab_size,
+                    ),
+                    target_vocab_size=target_vocab_size,
+                    draft_vocab_size=draft_vocab_size,
+                )
+                _install_dataset_vocab_mapping(
+                    cfg,
+                    bundle,
+                    counts=counts,
+                    dataset_identity=prompt_key,
+                )
+                self.assertEqual(_prompt_cache_key(cfg), prompt_key)
+
+            mapping_files = list((Path(directory) / "vocab_mapping").glob("*.pt"))
+
+        self.assertEqual(len(mapping_files), 3)
+
     def test_counts_only_loss_bearing_tokens_across_feature_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -82,7 +82,7 @@ CAPABILITY_TEST_REPLACEMENTS = {
         "tests/test_runtime/test_compact_teacher_strategy.py",
     ),
     "tests/test_scripts/test_disagg_dflash_mask_token.py": (
-        "tests/test_runtime/test_disagg_launch.py",
+        "tests/test_runtime/test_model_assembly_utils.py",
     ),
     "tests/test_scripts/test_train_eagle3.py": (
         "tests/test_runtime/test_single_entry.py",
@@ -105,6 +105,45 @@ CAPABILITY_TEST_REPLACEMENTS = {
     ),
     "tests/test_vlm/test_qwenvl_loss_mask.py": (
         "tests/test_runtime/test_vlm_unified_path.py",
+    ),
+}
+
+# High-value operational examples removed by the hard cutover must retain a
+# concrete, checked-in destination.  This is deliberately narrower than a
+# filename-for-filename migration of every legacy model shell: the complete
+# model catalog is guarded by the typed YAML reachability tests, while this map
+# protects disaggregated topology, performance, and gate behavior that cannot
+# be inferred from a draft config alone.
+OPERATIONAL_EXAMPLE_REPLACEMENTS = {
+    "examples/disagg/PERF_FINDINGS.md": (
+        "docs/benchmarks/domino-disaggregated-performance.md",
+    ),
+    "examples/disagg/run_qwen2.5_7b_eagle3_disagg.sh": (
+        "examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml",
+        "examples/disagg/run_offline.sh",
+    ),
+    "examples/disagg/run_qwen3.6_27b_dflash_disagg.sh": (
+        "examples/configs/qwen3.6-27b-dflash-disaggregated.yaml",
+    ),
+    "examples/disagg/run_qwen3.6_27b_dflash_disagg_multiserver.sh": (
+        "examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml",
+    ),
+    "examples/disagg/run_qwen3_8b_dflash_disagg_1srv_dp7.sh": (
+        "examples/configs/qwen3-8b-dflash-disaggregated.yaml",
+        "docs/benchmarks/domino-disaggregated-performance.md",
+    ),
+    "examples/disagg/run_qwen3_8b_domino_disagg_1srv_dp7.sh": (
+        "examples/configs/qwen3-8b-domino-disaggregated.yaml",
+        "docs/benchmarks/domino-disaggregated-performance.md",
+    ),
+    "examples/disagg/run_qwen3_8b_domino_disagg_multiserver.sh": (
+        "examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml",
+    ),
+    "examples/disagg/run_domino_dflash_serving_gate.sh": (
+        "scripts/gates/run_dflash_serving_gate.sh",
+    ),
+    "examples/disagg/run_domino_disagg_overfit_gate.sh": (
+        "scripts/gates/run_disaggregated_overfit_gate.sh",
     ),
 }
 
@@ -336,6 +375,25 @@ class TestPackageArchitecture(unittest.TestCase):
                 missing[capability] = absent
         self.assertEqual({}, invalid, f"invalid canonical test paths: {invalid}")
         self.assertEqual({}, missing, f"missing canonical capability gates: {missing}")
+
+    def test_removed_operational_examples_have_explicit_destinations(self):
+        restored_legacy = [
+            path
+            for path in OPERATIONAL_EXAMPLE_REPLACEMENTS
+            if (REPO_ROOT / path).exists()
+        ]
+        missing = {
+            path: [
+                replacement
+                for replacement in replacements
+                if not (REPO_ROOT / replacement).is_file()
+            ]
+            for path, replacements in OPERATIONAL_EXAMPLE_REPLACEMENTS.items()
+        }
+        missing = {path: paths for path, paths in missing.items() if paths}
+
+        self.assertEqual([], restored_legacy)
+        self.assertEqual({}, missing, f"missing operational migrations: {missing}")
 
     def test_repository_does_not_import_removed_modules(self):
         violations = []

@@ -66,8 +66,6 @@ def _validate_world_size(cfg: Config, world_size: int) -> None:
 def _train(cfg: Config) -> int:
     from accelerate.utils import set_seed
 
-    from specforge.distributed import destroy_distributed, init_distributed
-
     set_seed(cfg.training.seed)
     if cfg.training.role == "producer":
         # A server-capture/offline-ingest producer owns no trainer process
@@ -75,6 +73,9 @@ def _train(cfg: Config) -> int:
         from specforge.training.assembly import build_training_run
 
         return build_training_run(cfg).run()
+
+    from specforge.distributed import destroy_distributed, init_distributed
+
     _bootstrap_single_process_env()
     _validate_world_size(cfg, int(os.environ["WORLD_SIZE"]))
     init_distributed(
@@ -103,6 +104,12 @@ def _config_for_role(cfg: Config, role: str) -> Config:
     """
     raw = cfg.model_dump()
     raw["training"]["role"] = role
+    disaggregated = raw["deployment"].get("disaggregated")
+    if disaggregated is not None and disaggregated.get("managed_local") is not None:
+        # This field describes services owned by the parent supervisor.  A role
+        # child consumes the already-derived environment and must not attempt to
+        # validate or own that stack again.
+        disaggregated["managed_local"] = None
     if role == "producer":
         raw["training"]["metadata_db_path"] = None
         raw["profiling"]["enabled"] = False

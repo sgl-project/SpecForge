@@ -74,6 +74,10 @@ removed.
 The retained curves cover both the eight-H200 colocated run and the two-GPU
 online-disaggregated producer/consumer run.
 
+The separate [Domino disaggregated performance findings](domino-disaggregated-performance.md)
+preserve the measured one-server + DP7 tuning study, its MFU analysis, and the
+canonical YAML form of the relevant controls.
+
 ![Qwen3.6-27B DFlash colocated training loss and draft-token accuracy](../../examples/assets/qwen36-27b-dflash-nemotron-6ep.png)
 
 ![Qwen3.6-27B DFlash online-disaggregated training loss and draft-token accuracy](../../examples/disagg/assets/qwen36-27b-dflash-nemotron-disagg.png)

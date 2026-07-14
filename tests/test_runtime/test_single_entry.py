@@ -7,7 +7,12 @@ import types
 import unittest
 from unittest import mock
 
-from specforge.cli import _bootstrap_single_process_env, _validate_world_size, main
+from specforge.cli import (
+    _bootstrap_single_process_env,
+    _train,
+    _validate_world_size,
+    main,
+)
 from specforge.config import Config
 from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
@@ -189,6 +194,41 @@ class TestTrainingRunLifecycle(unittest.TestCase):
 
 
 class TestCliLifecycle(unittest.TestCase):
+    def test_capture_only_producer_does_not_import_distributed_cuda_runtime(self):
+        cfg = Config.model_validate(
+            {
+                "model": {
+                    "target_model_path": "target",
+                    "draft_model_config": "draft",
+                    "target_backend": "sglang",
+                },
+                "data": {"train_data_path": "train.jsonl"},
+                "training": {
+                    "strategy": "dflash",
+                    "deployment_mode": "disaggregated",
+                    "role": "producer",
+                    "server_urls": ["http://capture"],
+                    "total_steps": 1,
+                },
+            }
+        )
+        run = mock.Mock()
+        run.run.return_value = 3
+        assembly = types.ModuleType("specforge.training.assembly")
+        assembly.build_training_run = mock.Mock(return_value=run)
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "specforge.distributed": None,
+                "specforge.training.assembly": assembly,
+            },
+        ):
+            self.assertEqual(_train(cfg), 3)
+
+        assembly.build_training_run.assert_called_once_with(cfg)
+        run.run.assert_called_once_with()
+
     def test_world_size_matches_the_configured_parallel_topology(self):
         local = Config.model_validate(
             {

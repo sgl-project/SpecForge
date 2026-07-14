@@ -189,6 +189,8 @@ fi
                 "NPROC_PER_NODE": "2",
                 "CAPTURE_GPUS": "0,1",
                 "CAPTURE_TP": "2",
+                "CAPTURE_HOST": "127.0.0.2",
+                "CAPTURE_PORT": "31007",
                 "CONSUMER_GPUS": "2,3",
                 "GATE_DRY_RUN": "1",
                 "RUN_SERVING_GATE": "true",
@@ -226,6 +228,10 @@ fi
             self.assertIn("training.accumulation_steps=1", command)
             self.assertIn("tracking.report_to=none", command)
             self.assertIn("deployment.trainer.nproc_per_node=2", command)
+            self.assertIn(
+                'deployment.disaggregated.server_urls=["http://127.0.0.2:31007"]',
+                command,
+            )
             self.assertIn(
                 f"data.train_data_path={work_dir / 'single_sample.jsonl'}", command
             )
@@ -355,6 +361,10 @@ fi
         self.assertIn("bash scripts/gates/run_dflash_serving_gate.sh", readme)
         self.assertIn("GATE_DRY_RUN=1", readme)
         self.assertIn("examples/disagg/run_online.sh", readme)
+        self.assertIn("Qwen3.6-27B", readme)
+        self.assertIn("REASONING_POLICY=required", readme)
+        self.assertIn("spec_accept_length >= block_size", readme)
+        self.assertIn("serving-gate.json", readme)
         self.assertIn("Reusable leaf checks", readme)
 
     def test_docs_distinguish_hf_replicas_from_target_weight_tp(self):

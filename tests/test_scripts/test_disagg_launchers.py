@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
+TWO_NODE = ROOT / "examples" / "disagg" / "run_qwen3_8b_dflash_disagg_2node.sh"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
@@ -120,6 +121,52 @@ class DisaggregatedWrapperTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("--role", result.stdout)
             self.assertIn("producer and consumer", result.stdout)
+
+    def test_two_node_wrapper_keeps_training_on_the_unified_cli(self):
+        self.assertTrue(os.access(TWO_NODE, os.X_OK))
+        syntax = subprocess.run(
+            ["bash", "-n", str(TWO_NODE)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        shared_root = self.root / "shared-attempt"
+        base_env = self._env()
+        base_env.update(
+            {
+                "NUM_NODES": "2",
+                "HEAD_IP": "10.0.0.1",
+                "DISAGG_STORE_ID": "two-node-test",
+                "DISAGG_RUN_ROOT": str(shared_root),
+                "DRY_RUN": "1",
+            }
+        )
+        outputs = {}
+        for rank in ("0", "1"):
+            with self.subTest(rank=rank):
+                env = {**base_env, "NODE_RANK": rank}
+                result = subprocess.run(
+                    [str(TWO_NODE), "training.max_steps=1"],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outputs[rank] = result.stdout
+
+        self.assertIn("mooncake_master", outputs["0"])
+        self.assertIn("sglang.launch_server", outputs["0"])
+        self.assertIn("specforge train", outputs["0"])
+        self.assertIn("--role producer", outputs["0"])
+        self.assertIn("specforge train", outputs["1"])
+        self.assertIn("--role consumer", outputs["1"])
+        self.assertNotIn("run_disagg_dflash.py", "".join(outputs.values()))
+        self.assertNotIn("torchrun", "".join(outputs.values()))
+        self.assertFalse(shared_root.exists())
 
 
 if __name__ == "__main__":

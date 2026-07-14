@@ -201,6 +201,16 @@ class Trainer:
             }
             for key, current in resume_contract.items():
                 persisted = state.get(key)
+                if (
+                    spec.name == "peagle"
+                    and key.startswith("peagle_")
+                    and persisted is None
+                ):
+                    raise ValueError(
+                        f"checkpoint {resume_from} does not record required "
+                        f"P-EAGLE resume semantic {key}; start a fresh run "
+                        "rather than guessing the prior objective"
+                    )
                 if persisted is not None and persisted != current:
                     raise ValueError(
                         f"checkpoint {resume_from} was written with "

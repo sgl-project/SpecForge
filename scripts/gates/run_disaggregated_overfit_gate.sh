@@ -241,6 +241,7 @@ COMMON_OVERRIDES=(
     training.sp_ring_size=1
     "deployment.trainer.nproc_per_node=$NPROC_PER_NODE"
     "deployment.disaggregated.control_dir=$WORK_DIR"
+    "deployment.disaggregated.server_urls=[\"$DISAGG_SERVER_URL\"]"
     tracking.report_to=none
     "runtime.in_flight_high_watermark=$IN_FLIGHT_HIGH_WATERMARK"
     "runtime.in_flight_low_watermark=$IN_FLIGHT_LOW_WATERMARK"

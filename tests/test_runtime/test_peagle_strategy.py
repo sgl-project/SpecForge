@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from typing import get_args
 
 import torch
@@ -162,6 +163,38 @@ class TestPEagleStrategy(unittest.TestCase):
             {"embed_tokens.weight", "mask_hidden", "scale"},
         )
         self.assertTrue(model.draft_model.embed_tokens.weight.requires_grad)
+
+    def test_resume_contract_records_resolved_model_and_objective_semantics(self):
+        from specforge.training.assembly import ModelBundle, _strategy_resume_contract
+
+        cfg = SimpleNamespace(training=SimpleNamespace(strategy="peagle"))
+        draft_model = SimpleNamespace(
+            layers=[object(), object()],
+            norm_before_residual=True,
+        )
+        model = SimpleNamespace(
+            num_depths=5,
+            down_sample_ratio=0.7,
+            down_sample_ratio_min=0.3,
+            mask_token_id=0,
+        )
+
+        contract = _strategy_resume_contract(
+            cfg,
+            ModelBundle(model=model, draft_model=draft_model),
+        )
+
+        self.assertEqual(
+            contract,
+            {
+                "peagle_num_draft_layers": 2,
+                "peagle_norm_before_residual": True,
+                "peagle_num_depths": 5,
+                "peagle_down_sample_ratio": 0.7,
+                "peagle_down_sample_ratio_min": 0.3,
+                "peagle_mask_token_id": 0,
+            },
+        )
 
 
 if __name__ == "__main__":

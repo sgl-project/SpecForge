@@ -11,18 +11,24 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError
 
 from pydantic import ValidationError
 
-from specforge.cli import main
+from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
 from specforge.launch_plan import (
     CommandSpec,
     LaunchPlan,
+    ReadinessSpec,
+    ServiceSpec,
+    _http_ready,
     build_launch_plan,
     run_commands,
 )
+from specforge.training.capture_contract import ServerCaptureContract
 
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
@@ -63,6 +69,76 @@ def _offline_disaggregated_config(*, backend="mooncake", producer_segment_size=N
     return Config.model_validate(raw)
 
 
+def _managed_config(control_dir, *, nproc=2, servers=None):
+    raw = _config(mode="disaggregated", nproc=nproc).model_dump()
+    raw["deployment"]["disaggregated"]["server_urls"] = []
+    raw["training"]["server_urls"] = []
+    raw["deployment"]["disaggregated"]["managed_local"] = {
+        "trainer_cuda_visible_devices": [str(i + 4) for i in range(nproc)],
+        "mooncake": {
+            "rpc_port": 35551,
+            "metadata_port": 35880,
+            "metrics_port": 35903,
+            "global_segment_size_bytes": 4096,
+            "local_buffer_size_bytes": 1024,
+        },
+        "capture_servers": servers
+        or [
+            {
+                "port": 30000,
+                "cuda_visible_devices": ["0", "1"],
+                "tp_size": 2,
+            }
+        ],
+    }
+    raw["deployment"]["disaggregated"]["control_dir"] = control_dir
+    return Config.model_validate(raw)
+
+
+CAPTURE_CONTRACT = ServerCaptureContract(
+    method="dflash",
+    aux_layer_ids=(1, 9, 17, 25, 33),
+    target_hidden_size=4096,
+    target_vocab_size=151936,
+    draft_vocab_size=151936,
+)
+
+
+def _managed_plan(root):
+    log_dir = os.path.join(root, "logs")
+    return LaunchPlan(
+        "managed_supervisor",
+        "both",
+        commands=(
+            CommandSpec("producer", ("producer",)),
+            CommandSpec("consumer", ("consumer",)),
+        ),
+        services=(
+            ServiceSpec(
+                CommandSpec("mooncake", ("mooncake",)),
+                ReadinessSpec(
+                    "mooncake",
+                    "http://127.0.0.1:35880/metadata?key=health",
+                    1,
+                    tcp_host="127.0.0.1",
+                    tcp_port=35551,
+                ),
+                os.path.join(log_dir, "mooncake.log"),
+                0,
+            ),
+            ServiceSpec(
+                CommandSpec("capture-server-0", ("capture",)),
+                ReadinessSpec("http", "http://127.0.0.1:30000/health", 1),
+                os.path.join(log_dir, "capture.log"),
+                1,
+            ),
+        ),
+        managed_root=root,
+        managed_ports=(35551, 35880, 35903, 30000),
+        shutdown_grace_s=0.01,
+    )
+
+
 MOONCAKE_ENV = {
     "MOONCAKE_METADATA_SERVER": "http://metadata:8080/metadata",
     "MOONCAKE_MASTER_SERVER_ADDR": "master:50051",
@@ -72,11 +148,13 @@ MOONCAKE_ENV = {
 class _FakeProcess:
     _next_pid = 41000
 
-    def __init__(self, poll_results):
+    def __init__(self, poll_results, *, label=None, events=None):
         self.poll_results = list(poll_results)
         self.status = None
         self.terminated = False
         self.killed = False
+        self.label = label
+        self.events = events
         self.pid = self._next_pid
         type(self)._next_pid += 1
 
@@ -95,10 +173,14 @@ class _FakeProcess:
     def terminate(self):
         self.terminated = True
         self.status = -15
+        if self.events is not None:
+            self.events.append(f"terminate:{self.label}")
 
     def kill(self):
         self.killed = True
         self.status = -9
+        if self.events is not None:
+            self.events.append(f"kill:{self.label}")
 
     def wait(self, timeout=None):
         return self.status
@@ -233,6 +315,320 @@ class LaunchPlanTest(unittest.TestCase):
         )
         self.assertEqual((consumer.kind, consumer.role), ("command", "consumer"))
         self.assertIn("--nproc_per_node", consumer.commands[0].argv)
+
+    def test_managed_local_schema_round_trips_and_validates_resources(self):
+        cfg = _managed_config("/fresh/managed-attempt")
+        self.assertEqual(Config.model_validate(cfg.model_dump()), cfg)
+        managed = cfg.deployment.disaggregated.managed_local
+        self.assertEqual(managed.trainer_cuda_visible_devices, ["4", "5"])
+        self.assertEqual(managed.capture_servers[0].cuda_visible_devices, ["0", "1"])
+
+        invalid_cases = {
+            "trainer count": (
+                lambda raw: raw["deployment"]["disaggregated"]["managed_local"].update(
+                    trainer_cuda_visible_devices=["4"]
+                ),
+                "count must equal",
+            ),
+            "overlapping devices": (
+                lambda raw: raw["deployment"]["disaggregated"]["managed_local"].update(
+                    trainer_cuda_visible_devices=["0", "5"]
+                ),
+                "must be disjoint",
+            ),
+            "tp mismatch": (
+                lambda raw: raw["deployment"]["disaggregated"]["managed_local"][
+                    "capture_servers"
+                ][0].update(tp_size=1),
+                "tp_size must equal",
+            ),
+            "duplicate capture port": (
+                lambda raw: raw["deployment"]["disaggregated"]["managed_local"].update(
+                    capture_servers=[
+                        {
+                            "port": 30000,
+                            "cuda_visible_devices": ["0"],
+                            "tp_size": 1,
+                        },
+                        {
+                            "port": 30000,
+                            "cuda_visible_devices": ["1"],
+                            "tp_size": 1,
+                        },
+                    ]
+                ),
+                "ports must be unique",
+            ),
+            "mooncake port collision": (
+                lambda raw: raw["deployment"]["disaggregated"]["managed_local"][
+                    "mooncake"
+                ].update(rpc_port=30000),
+                "must not overlap",
+            ),
+            "invalid local hostname": (
+                lambda raw: raw["deployment"]["disaggregated"]["managed_local"][
+                    "mooncake"
+                ].update(local_hostname=" 127.0.0.1"),
+                "surrounding whitespace",
+            ),
+        }
+        for name, (mutate, message) in invalid_cases.items():
+            with self.subTest(case=name):
+                raw = cfg.model_dump()
+                mutate(raw)
+                with self.assertRaisesRegex(ValidationError, message):
+                    Config.model_validate(raw)
+
+    def test_managed_local_rejects_external_and_nonlocal_modes(self):
+        cfg = _managed_config("/fresh/managed-attempt")
+        invalid_cases = {
+            "server urls": (
+                lambda raw: (
+                    raw["deployment"]["disaggregated"].update(
+                        server_urls=["http://external:30000"]
+                    ),
+                    raw["training"].update(server_urls=["http://external:30000"]),
+                ),
+                "derives capture server URLs",
+            ),
+            "mooncake endpoint": (
+                lambda raw: raw["deployment"]["disaggregated"].update(
+                    mooncake_metadata_server="http://external/metadata"
+                ),
+                "derives Mooncake endpoints",
+            ),
+            "offline": (
+                lambda raw: raw.update(data={"hidden_states_path": "features"}),
+                "online capture only",
+            ),
+            "multi-node": (
+                lambda raw: raw["deployment"]["trainer"].update(
+                    nnodes=2, master_addr="trainer-0"
+                ),
+                "nnodes=1",
+            ),
+            "resume": (
+                lambda raw: raw["training"].update(resume_from="checkpoint"),
+                "does not support resume",
+            ),
+            "persisted role": (
+                lambda raw: raw["training"].update(role="producer"),
+                "persisted training role",
+            ),
+            "VLM": (
+                lambda raw: (
+                    raw["training"].update(strategy="eagle3"),
+                    raw["model"].update(
+                        input_modality="qwen2_5_vl",
+                        vocab_mapping_path="vocab-map.pt",
+                    ),
+                ),
+                "requires deployment_mode=local_colocated",
+            ),
+            "SGLang DP": (
+                lambda raw: raw["model"].update(sglang_enable_dp_attention=True),
+                "do not support SGLang DP",
+            ),
+        }
+        for name, (mutate, message) in invalid_cases.items():
+            with self.subTest(case=name):
+                raw = cfg.model_dump()
+                mutate(raw)
+                with self.assertRaisesRegex(ValidationError, message):
+                    Config.model_validate(raw)
+
+    def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
+        servers = [
+            {
+                "port": 30000,
+                "cuda_visible_devices": ["0", "1"],
+                "tp_size": 2,
+            },
+            {
+                "port": 30001,
+                "cuda_visible_devices": ["2", "3"],
+                "tp_size": 2,
+                "attention_backend": "triton",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            cfg = _managed_config(control_dir, servers=servers)
+            raw = cfg.model_dump()
+            raw["model"].update(
+                torch_dtype="float32",
+                cache_dir="/models/cache",
+                sglang_attention_backend="fa3",
+                sglang_enable_nccl_nvls=True,
+                sglang_enable_symm_mem=True,
+                sglang_enable_torch_compile=True,
+                sglang_max_running_requests=64,
+                sglang_max_total_tokens=8192,
+            )
+            cfg = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={},
+                )
+
+        self.assertEqual((plan.kind, plan.role), ("managed_supervisor", "both"))
+        self.assertEqual(
+            [service.command.label for service in plan.services],
+            ["mooncake", "capture-server-0", "capture-server-1"],
+        )
+        self.assertEqual([service.phase for service in plan.services], [0, 1, 1])
+        self.assertEqual(plan.managed_ports, (35551, 35880, 35903, 30000, 30001))
+        mooncake = plan.services[0]
+        self.assertEqual(
+            mooncake.command.argv,
+            (
+                "mooncake_master",
+                "--enable_http_metadata_server=true",
+                "--http_metadata_server_host=127.0.0.1",
+                "--rpc_port=35551",
+                "--http_metadata_server_port=35880",
+                "--metrics_port=35903",
+            ),
+        )
+        self.assertEqual(mooncake.readiness.kind, "mooncake")
+        for index, service in enumerate(plan.services[1:]):
+            argv = service.command.argv
+            self.assertIn("--enable-spec-capture", argv)
+            self.assertEqual(argv[argv.index("--dtype") + 1], "float32")
+            self.assertEqual(argv[argv.index("--download-dir") + 1], "/models/cache")
+            self.assertEqual(argv[argv.index("--spec-capture-method") + 1], "dflash")
+            layer_index = argv.index("--spec-capture-aux-layer-ids")
+            self.assertEqual(
+                argv[layer_index + 1 : layer_index + 6],
+                ("1", "9", "17", "25", "33"),
+            )
+            self.assertEqual(
+                service.command.env["CUDA_VISIBLE_DEVICES"],
+                "0,1" if index == 0 else "2,3",
+            )
+            self.assertEqual(
+                argv[argv.index("--attention-backend") + 1],
+                "fa3" if index == 0 else "triton",
+            )
+            for flag in (
+                "--enable-nccl-nvls",
+                "--enable-symm-mem",
+                "--enable-torch-compile",
+            ):
+                self.assertIn(flag, argv)
+            self.assertEqual(argv[argv.index("--max-running-requests") + 1], "64")
+            self.assertEqual(argv[argv.index("--max-total-tokens") + 1], "8192")
+        producer, consumer = plan.commands
+        expected_urls = "http://127.0.0.1:30000,http://127.0.0.1:30001"
+        self.assertEqual(producer.env["DISAGG_SERVER_URLS"], expected_urls)
+        self.assertEqual(producer.env["CUDA_VISIBLE_DEVICES"], "")
+        self.assertEqual(consumer.env["CUDA_VISIBLE_DEVICES"], "4,5")
+        self.assertEqual(consumer.env["MOONCAKE_MASTER_SERVER_ADDR"], "127.0.0.1:35551")
+        rendered = json.loads(plan.render())
+        self.assertEqual(len(rendered["services"]), 3)
+
+    def test_multiserver_example_yaml_builds_the_managed_plan(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml"
+        )
+        cfg = Config.from_file(str(path))
+        with (
+            mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ),
+            mock.patch("specforge.launch_plan.os.path.exists", return_value=False),
+        ):
+            plan = build_launch_plan(cfg, config_path=str(path), env={})
+
+        self.assertEqual((plan.kind, plan.role), ("managed_supervisor", "both"))
+        self.assertEqual(
+            [
+                service.command.env.get("CUDA_VISIBLE_DEVICES")
+                for service in plan.services
+            ],
+            ["", "0,1", "2,3"],
+        )
+        self.assertEqual(plan.commands[1].env["CUDA_VISIBLE_DEVICES"], "4,5")
+
+    def test_managed_local_plan_rejects_split_or_existing_runtime(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            with self.assertRaisesRegex(ValueError, "only --role auto"):
+                build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    requested_role="producer",
+                    env={},
+                )
+            distributed = {
+                "RANK": "0",
+                "WORLD_SIZE": "2",
+                "LOCAL_RANK": "0",
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": "29500",
+            }
+            with self.assertRaisesRegex(ValueError, "existing torchrun"):
+                build_launch_plan(cfg, config_path="run.yaml", env=distributed)
+
+            os.makedirs(cfg.deployment.disaggregated.control_dir)
+            with self.assertRaisesRegex(ValueError, "fresh control_dir"):
+                build_launch_plan(cfg, config_path="run.yaml", env={})
+
+    def test_managed_local_role_children_become_workers_without_recursion(self):
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            cfg = _managed_config(control_dir)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                parent = build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={},
+                )
+            os.makedirs(os.path.join(control_dir, "logs"))
+
+            producer = build_launch_plan(
+                cfg,
+                config_path="run.yaml",
+                requested_role="producer",
+                env=parent.commands[0].env,
+            )
+            self.assertEqual((producer.kind, producer.role), ("worker", "producer"))
+
+            consumer_env = {
+                **parent.commands[1].env,
+                "RANK": "0",
+                "WORLD_SIZE": "2",
+                "LOCAL_RANK": "0",
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": "29500",
+            }
+            consumer = build_launch_plan(
+                cfg,
+                config_path="run.yaml",
+                requested_role="consumer",
+                env=consumer_env,
+            )
+            self.assertEqual((consumer.kind, consumer.role), ("worker", "consumer"))
+
+            for role in ("producer", "consumer"):
+                with self.subTest(projected_role=role):
+                    projected = _config_for_role(cfg, role)
+                    self.assertEqual(projected.training.role, role)
+                    self.assertIsNone(projected.deployment.disaggregated.managed_local)
 
     def test_online_disaggregation_forces_server_owned_client_segments(self):
         raw = _config(mode="disaggregated").model_dump()
@@ -459,6 +855,7 @@ class LaunchPlanTest(unittest.TestCase):
             rendered = output.call_args.args[0]
             payload = json.loads(rendered)
             self.assertEqual(payload["kind"], "command")
+            self.assertEqual(set(payload), {"kind", "role", "commands", "worker_env"})
             self.assertNotIn("--plan", payload["commands"][0]["argv"])
 
     def test_cli_producer_projection_ignores_consumer_only_settings(self):
@@ -533,6 +930,208 @@ class LaunchPlanTest(unittest.TestCase):
                 requested_role="both",
                 env=MOONCAKE_ENV,
             )
+
+    def test_managed_supervisor_starts_services_by_phase_and_stops_in_reverse(self):
+        events = []
+        mooncake = _FakeProcess([None], label="mooncake", events=events)
+        capture = _FakeProcess([None], label="capture", events=events)
+        producer = _FakeProcess([0], label="producer", events=events)
+        consumer = _FakeProcess([0], label="consumer", events=events)
+        processes = iter((mooncake, capture, producer, consumer))
+        with tempfile.TemporaryDirectory() as parent:
+            plan = _managed_plan(os.path.join(parent, "attempt"))
+
+            def ready(service, _process, started):
+                events.append(f"ready:{service.command.label}")
+                if service.command.label == "mooncake":
+                    self.assertEqual(len(started), 1)
+                else:
+                    self.assertEqual(len(started), 2)
+
+            with mock.patch(
+                "specforge.launch_plan.os.killpg", side_effect=ProcessLookupError
+            ):
+                status = run_commands(
+                    plan,
+                    popen=lambda *_args, **_kwargs: next(processes),
+                    managed_preflight=lambda _plan: None,
+                    readiness_waiter=ready,
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(events[:2], ["ready:mooncake", "ready:capture-server-0"])
+        self.assertLess(
+            events.index("terminate:capture"), events.index("terminate:mooncake")
+        )
+
+    def test_managed_supervisor_service_failure_stops_both_roles(self):
+        mooncake = _FakeProcess([None])
+        capture = _FakeProcess([7])
+        producer = _FakeProcess([None])
+        consumer = _FakeProcess([None])
+        processes = iter((mooncake, capture, producer, consumer))
+        with tempfile.TemporaryDirectory() as parent:
+            plan = _managed_plan(os.path.join(parent, "attempt"))
+            with mock.patch(
+                "specforge.launch_plan.os.killpg", side_effect=ProcessLookupError
+            ):
+                status = run_commands(
+                    plan,
+                    popen=lambda *_args, **_kwargs: next(processes),
+                    managed_preflight=lambda _plan: None,
+                    readiness_waiter=lambda *_args: None,
+                )
+        self.assertEqual(status, 7)
+        self.assertTrue(producer.terminated)
+        self.assertTrue(consumer.terminated)
+        self.assertTrue(mooncake.terminated)
+
+    def test_managed_supervisor_allows_a_clean_producer_to_finish_early(self):
+        mooncake = _FakeProcess([None])
+        capture = _FakeProcess([None])
+        producer = _FakeProcess([0])
+        consumer = _FakeProcess([None, 0])
+        processes = iter((mooncake, capture, producer, consumer))
+        with tempfile.TemporaryDirectory() as parent:
+            plan = _managed_plan(os.path.join(parent, "attempt"))
+            with mock.patch(
+                "specforge.launch_plan.os.killpg", side_effect=ProcessLookupError
+            ):
+                status = run_commands(
+                    plan,
+                    popen=lambda *_args, **_kwargs: next(processes),
+                    managed_preflight=lambda _plan: None,
+                    readiness_waiter=lambda *_args: None,
+                )
+
+        self.assertEqual(status, 0)
+        self.assertFalse(consumer.terminated)
+        self.assertTrue(mooncake.terminated)
+
+    def test_managed_supervisor_signal_cleans_roles_and_services(self):
+        handlers = {}
+        events = []
+
+        def set_signal(signum, handler):
+            previous = handlers.get(signum, signal.SIG_DFL)
+            handlers[signum] = handler
+            return previous
+
+        class SignalProcess(_FakeProcess):
+            def __init__(self):
+                super().__init__([None])
+                self.sent = False
+
+            def poll(self):
+                if not self.sent:
+                    self.sent = True
+                    handlers[signal.SIGTERM](signal.SIGTERM, None)
+                return super().poll()
+
+        mooncake = _FakeProcess([None], label="mooncake", events=events)
+        capture = _FakeProcess([None], label="capture", events=events)
+        producer = SignalProcess()
+        consumer = _FakeProcess([None])
+        processes = iter((mooncake, capture, producer, consumer))
+        with tempfile.TemporaryDirectory() as parent:
+            plan = _managed_plan(os.path.join(parent, "attempt"))
+            with (
+                mock.patch(
+                    "specforge.launch_plan.signal.signal", side_effect=set_signal
+                ),
+                mock.patch(
+                    "specforge.launch_plan.os.killpg", side_effect=ProcessLookupError
+                ),
+            ):
+                status = run_commands(
+                    plan,
+                    popen=lambda *_args, **_kwargs: next(processes),
+                    managed_preflight=lambda _plan: None,
+                    readiness_waiter=lambda *_args: None,
+                )
+
+        self.assertEqual(status, 128 + signal.SIGTERM)
+        self.assertTrue(producer.terminated)
+        self.assertTrue(consumer.terminated)
+        self.assertLess(
+            events.index("terminate:capture"), events.index("terminate:mooncake")
+        )
+
+    def test_managed_supervisor_cleans_services_after_readiness_failure(self):
+        mooncake = _FakeProcess([None])
+        capture = _FakeProcess([None])
+        processes = iter((mooncake, capture))
+        with tempfile.TemporaryDirectory() as parent:
+            plan = _managed_plan(os.path.join(parent, "attempt"))
+
+            def ready(service, *_args):
+                if service.command.label.startswith("capture"):
+                    raise TimeoutError("capture timeout")
+
+            with (
+                mock.patch(
+                    "specforge.launch_plan.os.killpg", side_effect=ProcessLookupError
+                ),
+                self.assertRaisesRegex(TimeoutError, "capture timeout"),
+            ):
+                run_commands(
+                    plan,
+                    popen=lambda *_args, **_kwargs: next(processes),
+                    managed_preflight=lambda _plan: None,
+                    readiness_waiter=ready,
+                )
+        self.assertTrue(mooncake.terminated)
+        self.assertTrue(capture.terminated)
+
+    def test_managed_preflight_rejects_an_occupied_port_before_spawning(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "attempt")
+            port = 30000
+            plan = _managed_plan(root)
+            plan = LaunchPlan(
+                **{
+                    **plan.__dict__,
+                    "managed_ports": (port,),
+                }
+            )
+            port_probe = mock.MagicMock()
+            port_probe.__enter__.return_value = port_probe
+            port_probe.bind.side_effect = OSError("occupied")
+            with (
+                mock.patch(
+                    "specforge.launch_plan.shutil.which",
+                    return_value="/usr/bin/mooncake_master",
+                ),
+                mock.patch(
+                    "specforge.launch_plan.importlib.util.find_spec",
+                    return_value=object(),
+                ),
+                mock.patch(
+                    "specforge.launch_plan.socket.socket", return_value=port_probe
+                ),
+                self.assertRaisesRegex(RuntimeError, "is unavailable"),
+            ):
+                run_commands(plan, popen=mock.Mock())
+
+    def test_mooncake_readiness_accepts_missing_key_but_rejects_server_errors(self):
+        readiness = ReadinessSpec(
+            "mooncake",
+            "http://127.0.0.1:35880/metadata?key=missing",
+            1,
+            tcp_host="127.0.0.1",
+            tcp_port=35551,
+        )
+        for status, expected in ((404, True), (500, False), (503, False)):
+            with (
+                self.subTest(status=status),
+                mock.patch(
+                    "specforge.launch_plan.urllib_request.urlopen",
+                    side_effect=HTTPError(
+                        readiness.url, status, "response", None, None
+                    ),
+                ),
+            ):
+                self.assertEqual(_http_ready(readiness), expected)
 
     def test_supervisor_terminates_a_sibling_after_child_failure(self):
         producer = _FakeProcess([None])
