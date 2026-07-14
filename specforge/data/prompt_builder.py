@@ -29,6 +29,8 @@ def prepare_prompt_tasks(
     num_proc: int | None,
     min_loss_tokens: int = 1,
     max_prompts: int | None = None,
+    input_modality: str = "text",
+    processor: Any | None = None,
 ) -> list[PromptTaskDict]:
     """Prepare runtime prompt dictionaries from a JSONL file.
 
@@ -64,6 +66,24 @@ def prepare_prompt_tasks(
         )
 
     limit = None if max_prompts in (None, 0) else max_prompts
+    if input_modality == "qwen2_5_vl" and not has_input_ids:
+        if processor is None:
+            raise ValueError("Qwen2.5-VL prompt preparation requires a processor")
+        if is_preformatted:
+            raise ValueError("Qwen2.5-VL raw prompts cannot be preformatted")
+        return _prepare_raw_vlm_prompts(
+            path_string,
+            processor,
+            chat_template=chat_template,
+            max_length=max_length,
+            min_loss_tokens=min_loss_tokens,
+            limit=limit,
+        )
+    if input_modality != "text":
+        raise ValueError(
+            "pre-tokenized multimodal prompts are unsupported because they must "
+            "retain image and conversation metadata"
+        )
     if has_input_ids:
         rows = (
             (record, f"{path_string}:{line_number}")
@@ -89,6 +109,56 @@ def prepare_prompt_tasks(
         min_loss_tokens=min_loss_tokens,
         limit=limit,
     )
+
+
+def _prepare_raw_vlm_prompts(
+    path: str,
+    processor: Any,
+    *,
+    chat_template: str | None,
+    max_length: int,
+    min_loss_tokens: int,
+    limit: int | None,
+) -> list[PromptTaskDict]:
+    """Prepare Qwen2.5-VL tasks without putting image tensors in PromptTask."""
+    if chat_template is None:
+        raise ValueError("Qwen2.5-VL prompt preparation requires chat_template")
+
+    from .vlm import prepare_qwen_vl_record
+
+    prompts: list[PromptTaskDict] = []
+    for line_number, record in _iter_records(path):
+        missing = [name for name in ("image", "conversations") if name not in record]
+        if missing:
+            raise ValueError(
+                f"VLM record {line_number} in {path!r} is missing {missing}"
+            )
+        prepared = prepare_qwen_vl_record(
+            processor,
+            image=record["image"],
+            conversations=record["conversations"],
+            chat_template=chat_template,
+            max_length=max_length,
+        )
+        input_ids = [int(item) for item in prepared["input_ids"].reshape(-1)]
+        loss_mask = [int(item) for item in prepared["loss_mask"].reshape(-1)]
+        if sum(loss_mask) < min_loss_tokens:
+            continue
+        prompts.append(
+            {
+                "payload": {
+                    "input_ids": input_ids,
+                    "loss_mask": loss_mask,
+                    "media": {
+                        "image": record["image"],
+                        "conversations": record["conversations"],
+                    },
+                }
+            }
+        )
+        if limit is not None and len(prompts) >= limit:
+            break
+    return prompts
 
 
 def _prepare_raw_prompts(

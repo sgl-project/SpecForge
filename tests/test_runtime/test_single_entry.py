@@ -179,15 +179,17 @@ class TestTrainingRunLifecycle(unittest.TestCase):
 
 
 class TestCliLifecycle(unittest.TestCase):
-    def test_only_disaggregated_online_consumer_accepts_multiple_ranks(self):
+    def test_world_size_matches_the_configured_parallel_topology(self):
         local = Config.model_validate(
             {
                 "model": {"target_model_path": "t", "draft_model_config": "d"},
                 "data": {"prompts_path": "/prompts.jsonl"},
+                "training": {"tp_size": 2},
             }
         )
-        with self.assertRaisesRegex(ValueError, "only by an online"):
-            _validate_world_size(local, 2)
+        _validate_world_size(local, 2)
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            _validate_world_size(local, 3)
 
         consumer = Config.model_validate(
             {

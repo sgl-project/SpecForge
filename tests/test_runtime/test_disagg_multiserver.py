@@ -160,6 +160,92 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertEqual(produced, 2)
         self.assertTrue(channel.is_closed())
 
+    def test_byte_watermark_resumes_after_durable_consumer_ack(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            lease=1,
+            resident_high_watermark_bytes=1,
+            resident_low_watermark_bytes=0,
+        )
+
+        outcome = {}
+
+        def run_producer():
+            try:
+                outcome["produced"] = drive()
+            except BaseException as exc:  # expose a thread failure to the test
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run_producer, daemon=True)
+        thread.start()
+        reader = StreamingRefChannel(channel.path)
+        consumed = 0
+        observed_pauses = []
+        deadline = time.monotonic() + 10
+        while consumed < 3 and time.monotonic() < deadline:
+            refs = reader.poll()
+            if refs:
+                pause_deadline = time.monotonic() + 2
+                while time.monotonic() < pause_deadline:
+                    snapshot = drive.flow_control.snapshot(
+                        in_flight_refs=channel.in_flight_remote(),
+                        resident_bytes=sum(ref.estimated_bytes for ref in refs),
+                    )
+                    if snapshot["paused"]:
+                        break
+                    time.sleep(0.001)
+                observed_pause = snapshot["paused"]
+                # RefDistributor forwards this source-channel acknowledgement
+                # only after the inbox ack follows the durable optimizer marker.
+                reader.mark_consumed(len(refs))
+                consumed += len(refs)
+                observed_pauses.append(observed_pause)
+            else:
+                time.sleep(0.001)
+        thread.join(5)
+
+        self.assertFalse(thread.is_alive(), "producer stayed byte-throttled")
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome.get("produced"), 3)
+        self.assertEqual(consumed, 3)
+        self.assertEqual(observed_pauses, [True, True, True])
+        self.assertTrue(channel.is_closed())
+        snapshot = drive.flow_control.snapshot(
+            in_flight_refs=channel.in_flight_remote(), resident_bytes=0
+        )
+        self.assertGreaterEqual(snapshot["pause_transitions"], 1)
+        self.assertGreaterEqual(snapshot["resume_transitions"], 1)
+
+    def test_hard_byte_cap_aborts_unpublished_capture_and_fails_channel(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(1),
+            store,
+            channel,
+            lease=1,
+            feature_store_max_resident_bytes=1,
+        )
+
+        with self.assertRaisesRegex(MemoryError, "hard cap exceeded"):
+            drive()
+
+        self.assertEqual(channel.published, 0)
+        self.assertEqual(_published_refs(channel.path), [])
+        self.assertFalse(channel.is_closed())
+        self.assertIn("MemoryError", channel.failure())
+        self.assertEqual(backend._d, {})
+
     def test_prompt_epochs_republish_with_unique_sample_ids(self):
         backend = _FakeMooncakeStore()
         stub = _StubCaptureServer(backend)

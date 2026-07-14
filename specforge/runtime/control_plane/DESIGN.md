@@ -93,15 +93,17 @@ signals the producer to stop and clean published Mooncake objects.
 
 ## Freshness and recovery contract
 
-The canonical online launcher requires a new SQLite path for every consumer,
-including `dp_size=1`, and rejects an existing database, WAL, or SHM file. The
-runtime also rejects a ledger with committed rows. Inbox files are ephemeral
-and recreated by rank 0 for the fresh attempt.
+The canonical online launcher requires a new SQLite path for every fresh
+consumer, including `dp_size=1`, and rejects an existing database, WAL, or SHM
+file. The runtime also rejects a ledger with committed rows. Inbox files are
+ephemeral and recreated by rank 0 for a fresh attempt.
 
-Online resume is not supported. A failed online attempt is not reconciled into
-a new process and a consumed stream is never iterated for a second trainer
-epoch. Start again with new channel, inbox, store-id, run-id, output, and
-database paths.
+Online disaggregated recovery is consumer-only. With the original SQLite
+ledger, channel/inboxes, Mooncake objects, and matching checkpoint still
+available, rank 0 verifies the durable step, skips acknowledged refs, and
+requeues the unacknowledged tail. A producer never resumes, and a consumed
+stream is never iterated as a second trainer epoch. A new producer attempt must
+use fresh channel, store-id, run-id, and output artifacts.
 
 Offline refs remain fixed and re-iterable, so offline checkpoint resume and
 multiple epochs keep their existing semantics.

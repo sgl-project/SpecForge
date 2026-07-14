@@ -6,17 +6,18 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""On-disk checkpoint lifecycle: layout, rotation, latest pointer, resume reads.
+"""On-disk checkpoint lifecycle: layout, rotation, best tracking, resume reads.
 
 A checkpoint is ``{run_id}-step{N}/`` under ``output_dir``: ``training_state.pt``
 (rank0 shared payload) plus ``training_state_rank{r}.pt`` per rank (optimizer/RNG
-are rank-local under FSDP). A run-scoped ``{run_id}-latest`` link sits beside
-them; multi-rank runs need a shared filesystem.
+are rank-local under FSDP). Run-scoped ``{run_id}-latest``/``{run_id}-best`` links
+and ``{run_id}.best_meta.json`` sit beside them; multi-rank runs need a shared fs.
 """
 
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import os
 import re
@@ -37,10 +38,17 @@ class CheckpointManager:
         run_id: str,
         *,
         max_checkpoints: int = 0,
+        best_metric: str = "eval/simulated_acc_len",
+        best_min_delta: float = 0.0,
     ) -> None:
         self.output_dir = output_dir
         self.run_id = run_id
         self.max_checkpoints = max_checkpoints
+        self.best_metric = best_metric
+        self.best_min_delta = best_min_delta
+        self.best_score: Optional[float] = None
+        self.best_step: Optional[int] = None
+        self._load_best_meta()
 
     # -- layout ------------------------------------------------------------
     def checkpoint_dir(self, step: int) -> str:
@@ -52,6 +60,10 @@ class CheckpointManager:
     @staticmethod
     def _rank_file(rank: int) -> str:
         return f"training_state_rank{rank}.pt"
+
+    @property
+    def _best_meta_path(self) -> str:
+        return os.path.join(self.output_dir, f"{self.run_id}.best_meta.json")
 
     # -- save --------------------------------------------------------------
     def save(
@@ -94,7 +106,8 @@ class CheckpointManager:
         return ckpt_dir
 
     def _rewind(self, step: int) -> None:
-        # Fork semantics: saving step S invalidates on-disk steps >= S.
+        # Fork semantics: saving step S invalidates on-disk steps >= S, including
+        # a best record inside the deleted range.
         stale = sorted(path for s, path in self._step_dirs() if s >= step)
         if stale:
             logger.warning(
@@ -104,6 +117,15 @@ class CheckpointManager:
             )
             for path in stale:
                 shutil.rmtree(path)
+        if self.best_step is not None and self.best_step >= step:
+            self.best_score = None
+            self.best_step = None
+            best_link = os.path.join(self.output_dir, f"{self.run_id}-best")
+            for path in (self._best_meta_path, best_link):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass  # best-effort: reload ignores meta whose step dir is gone
 
     def _all_ok(self, err: str) -> None:
         # Barrier replacement: every rank learns every rank's outcome, so one
@@ -119,6 +141,74 @@ class CheckpointManager:
                 "checkpoint save failed: "
                 + "; ".join(f"rank {r}: {e}" for r, e in failures)
             )
+
+    # -- best tracking -----------------------------------------------------
+    def score(self, eval_metrics: Optional[Dict[str, Any]]) -> Optional[float]:
+        """Best-tracking score from an eval-metrics dict; None when absent."""
+        s = (eval_metrics or {}).get(self.best_metric)
+        return float(s) if s is not None else None
+
+    def is_better(self, eval_metrics: Optional[Dict[str, Any]]) -> bool:
+        """Rank-agreed verdict: do these metrics beat the tracked best (higher
+        wins, by more than ``best_min_delta``)? False for empty metrics.
+        Collective: rank0 decides and broadcasts, so every rank must call it.
+        """
+        verdict = False
+        if self.is_rank0():
+            s = self.score(eval_metrics)
+            verdict = s is not None and (
+                self.best_score is None or s > self.best_score + self.best_min_delta
+            )
+        return self._bcast_flag(verdict)
+
+    def update_best(self, step: int, eval_metrics: Dict[str, Any]) -> None:
+        """Record ``step`` as the tracked best unconditionally (callers gate with
+        ``is_better``); rank0 repoints ``{run_id}-best`` and persists the meta."""
+        self.best_score = self.score(eval_metrics)
+        self.best_step = step
+        if not self.is_rank0():
+            return
+        self._point(f"{self.run_id}-best", self.checkpoint_dir(step))
+        self._atomic_json(
+            {
+                "run_id": self.run_id,
+                "step": step,
+                "score": self.best_score,
+                "metric": self.best_metric,
+                "metrics": eval_metrics,
+            },
+            self._best_meta_path,
+        )
+
+    def _load_best_meta(self) -> None:
+        # Rehydrate so a restart neither rotates away the on-disk best nor lets
+        # a worse score overwrite it.
+        try:
+            with open(self._best_meta_path) as fh:
+                meta = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "ignoring unreadable best meta %s: %s", self._best_meta_path, exc
+            )
+            return
+        step = meta.get("step")
+        score = meta.get("score")
+        if (
+            meta.get("run_id") != self.run_id
+            or meta.get("metric") != self.best_metric
+            or not isinstance(step, int)
+            or not isinstance(score, (int, float))
+            or not os.path.isfile(self._state_path(self.checkpoint_dir(step)))
+        ):
+            logger.warning(
+                "ignoring best meta %s: run_id/metric mismatch, malformed, or its "
+                "checkpoint is gone",
+                self._best_meta_path,
+            )
+            return
+        self.best_score, self.best_step = float(score), int(step)
 
     # -- load --------------------------------------------------------------
     def load(self, step: Optional[int] = None, *, map_location="cpu") -> Dict[str, Any]:
@@ -141,13 +231,10 @@ class CheckpointManager:
         """Read a checkpoint into this rank's resume dict: the shared payload plus
         ``'backend'`` = this rank's ``training_state_rank{r}.pt`` content, passed
         through untouched (``{}`` when absent and ``require_full_state`` is False).
-        Accepts a checkpoint dir, its ``training_state.pt``, or a ``file://`` URI.
+        Accepts a checkpoint dir, its ``training_state.pt``, a ``file://`` URI,
+        or an output/run root containing exactly one checkpoint lineage.
         """
-        path = str(path)
-        if path.startswith("file://"):
-            path = path[len("file://") :]
-        if os.path.basename(path) == STATE_FILE:
-            path = os.path.dirname(path)
+        path = cls.resolve_resume_dir(path)
         state = torch.load(
             os.path.join(path, STATE_FILE),
             map_location=map_location,
@@ -173,6 +260,61 @@ class CheckpointManager:
                 f"weights and counters only"
             )
         return state
+
+    @classmethod
+    def resolve_resume_dir(cls, path: str) -> str:
+        """Resolve one unambiguous resume target to its checkpoint directory.
+
+        A run output directory is convenient in declarative configs, but it
+        must never choose between unrelated runs silently.  Prefer its single
+        complete ``*-latest`` pointer; when symlinks are unavailable, fall back
+        to the highest complete ``<run-id>-stepN`` directory only if all
+        candidates belong to the same run id.
+        """
+        path = str(path)
+        if path.startswith("file://"):
+            path = path[len("file://") :]
+        path = os.path.abspath(os.path.expanduser(path))
+        if os.path.basename(path) == STATE_FILE:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"checkpoint state file does not exist: {path}")
+            path = os.path.dirname(path)
+        if os.path.isfile(os.path.join(path, STATE_FILE)):
+            return path
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"checkpoint path does not exist: {path}")
+
+        latest = []
+        for candidate in glob.glob(os.path.join(glob.escape(path), "*-latest")):
+            resolved = os.path.realpath(candidate)
+            if os.path.isfile(os.path.join(resolved, STATE_FILE)):
+                latest.append(resolved)
+        latest = sorted(set(latest))
+        if len(latest) == 1:
+            return latest[0]
+        if len(latest) > 1:
+            raise ValueError(
+                f"resume root {path} contains multiple complete *-latest runs: "
+                f"{latest}; select one checkpoint explicitly"
+            )
+
+        by_run: Dict[str, list[Tuple[int, str]]] = {}
+        pattern = re.compile(r"^(.+)-step(\d+)$")
+        for candidate in glob.glob(os.path.join(glob.escape(path), "*-step*")):
+            match = pattern.match(os.path.basename(candidate))
+            if match and os.path.isfile(os.path.join(candidate, STATE_FILE)):
+                by_run.setdefault(match.group(1), []).append(
+                    (int(match.group(2)), candidate)
+                )
+        if not by_run:
+            raise FileNotFoundError(f"no complete checkpoint found under {path}")
+        if len(by_run) > 1:
+            raise ValueError(
+                f"resume root {path} contains multiple checkpoint runs: "
+                f"{sorted(by_run)}; select one checkpoint explicitly"
+            )
+        candidates = next(iter(by_run.values()))
+        return max(candidates, key=lambda item: item[0])[1]
 
     def latest_dir(self) -> Optional[str]:
         """Directory of the newest complete checkpoint, or None."""
@@ -201,9 +343,28 @@ class CheckpointManager:
             torch.distributed.barrier()
 
     @staticmethod
+    def _bcast_flag(flag: bool) -> bool:
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() == 1
+        ):
+            return bool(flag)
+        box = [bool(flag)]
+        torch.distributed.broadcast_object_list(box, src=0)
+        return bool(box[0])
+
+    @staticmethod
     def _atomic_save(obj: Any, path: str) -> None:
         tmp = path + ".tmp"
         torch.save(obj, tmp)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _atomic_json(obj: Dict[str, Any], path: str) -> None:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(obj, fh, indent=2)
         os.replace(tmp, path)
 
     def _point(self, name: str, ckpt_dir: str) -> None:
@@ -220,14 +381,14 @@ class CheckpointManager:
             # Relative target survives relocating output_dir to another mount.
             os.symlink(os.path.basename(ckpt_dir), link)
         except OSError:
-            return  # no symlink support: complete step dirs stay authoritative
+            return  # no symlink support: step dirs + best meta stay authoritative
 
     def _rotate(self, keep_step: int) -> None:
         if self.max_checkpoints <= 0:
             return
         dirs = sorted(self._all_checkpoints())
         for step, path in dirs[: -self.max_checkpoints]:
-            if step == keep_step:
+            if step == self.best_step or step == keep_step:
                 continue
             try:
                 shutil.rmtree(path)

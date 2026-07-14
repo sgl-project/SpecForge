@@ -1,6 +1,9 @@
 # coding=utf-8
-"""TrainerCore grad-accum + TrainerController fit/checkpoint (CPU)."""
+"""TrainerCore grad-accum + TrainerController fit/eval/checkpoint (CPU)."""
 
+import json
+import inspect
+import os
 import tempfile
 import unittest
 
@@ -138,6 +141,11 @@ class TestTrainerController(unittest.TestCase):
             self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
             self.assertEqual(ckpt.global_step, 3)
 
+    def test_public_trainer_fit_has_no_eval_side_channel(self):
+        from specforge.training.trainer import Trainer
+
+        self.assertEqual(list(inspect.signature(Trainer.fit).parameters), ["self"])
+
     def test_natural_eos_rejects_incomplete_accumulation(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
@@ -153,6 +161,116 @@ class TestTrainerController(unittest.TestCase):
         self.assertEqual(backend.steps, 1)
         self.assertEqual(core.accumulation_remainder, 1)
         self.assertEqual(backend.boundaries, [False, True, False])
+
+
+class TestBestTracking(unittest.TestCase):
+    def test_best_checkpoint_does_not_require_periodic_saves(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=2,
+                eval_interval=1,
+                eval_data_factory=lambda: [_batch()],
+                save_interval=0,
+            )
+            ctrl.fit([_batch(), _batch()])
+            self.assertTrue(os.path.isdir(os.path.join(d, "r-step1")))
+            with open(os.path.join(d, "r.best_meta.json")) as stream:
+                self.assertEqual(json.load(stream)["step"], 1)
+
+    def test_best_fires_on_misaligned_eval_and_save_intervals(self):
+        # eval_interval=1, save_interval=2: the first eval is still checkpointed
+        # on demand as the best even though it is not a periodic-save step.
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=3,
+                num_epochs=1,
+                eval_interval=1,
+                eval_data_factory=lambda: [_batch()],
+                save_interval=2,
+            )
+            ctrl.fit([_batch() for _ in range(5)])
+            self.assertTrue(os.path.isdir(os.path.join(d, "r-step1")))
+            with open(os.path.join(d, "r.best_meta.json")) as stream:
+                meta = json.load(stream)
+            self.assertEqual(meta["step"], 1)
+            self.assertAlmostEqual(meta["score"], 0.5, places=6)
+
+
+class TestEvalMetricsFlow(unittest.TestCase):
+    def test_eval_metrics_reach_logger_and_last_metrics(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        logged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=2,
+                num_epochs=1,
+                eval_interval=1,
+                eval_data_factory=lambda: [_batch()],
+                log_interval=50,
+                logger=lambda metrics, step: logged.append((dict(metrics), step)),
+            )
+            ctrl.fit([_batch() for _ in range(3)])
+        self.assertTrue(strat.model.training)
+        self.assertEqual([step for _, step in logged], [1, 2])
+        for metrics, _ in logged:
+            self.assertIn("eval/avg_loss", metrics)
+            self.assertAlmostEqual(metrics["eval/avg_acc"], 0.5, places=6)
+        self.assertIn("eval/avg_acc", ctrl.last_metrics)
+        self.assertIn("loss", ctrl.last_metrics)
+
+    def test_each_interval_gets_a_fresh_managed_eval_stream(self):
+        events = []
+
+        class ManagedEval:
+            def __init__(self, pass_id):
+                self.pass_id = pass_id
+
+            def __enter__(self):
+                events.append(("enter", self.pass_id))
+                return self
+
+            def __exit__(self, *_):
+                events.append(("exit", self.pass_id))
+
+            def __iter__(self):
+                yield _batch()
+
+        def factory():
+            pass_id = sum(event[0] == "enter" for event in events) + 1
+            return ManagedEval(pass_id)
+
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=2,
+                eval_interval=1,
+                eval_data_factory=factory,
+            )
+            ctrl.fit([_batch(), _batch()])
+        self.assertEqual(
+            events,
+            [("enter", 1), ("exit", 1), ("enter", 2), ("exit", 2)],
+        )
 
 
 def _named_batch(i):

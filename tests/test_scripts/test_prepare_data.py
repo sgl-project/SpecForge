@@ -10,16 +10,39 @@ from scripts import prepare_data
 
 
 class TestPrepareData(unittest.TestCase):
-    def test_parser_exposes_only_canonical_presets(self):
+    def test_parser_exposes_all_supported_presets(self):
         parser = prepare_data.build_parser()
         dataset_action = next(
             action for action in parser._actions if action.dest == "dataset"
         )
 
-        self.assertEqual(
-            ("ultrachat", "sharegpt"),
-            tuple(dataset_action.choices),
+        self.assertEqual(prepare_data.SUPPORTED_DATASETS, tuple(dataset_action.choices))
+        self.assertTrue(
+            {
+                "ultrachat",
+                "sharegpt",
+                "allava4v",
+                "opc",
+                "gsm8k",
+                "hendrycks_math",
+                "codealpaca-20k",
+                "camel",
+            }.issubset(dataset_action.choices)
         )
+
+    def test_parser_restores_eval_split_and_opc_subset(self):
+        args = prepare_data.parse_args(
+            [
+                "--dataset",
+                "opc",
+                "--opc-subset",
+                "all",
+                "--split-eval",
+            ]
+        )
+
+        self.assertEqual("all", args.opc_subset)
+        self.assertTrue(args.split_eval)
 
     def test_custom_data_path_is_limited_to_sharegpt_json(self):
         for suffix in (".json", ".jsonl"):
@@ -88,6 +111,34 @@ class TestPrepareData(unittest.TestCase):
             row,
         )
 
+    def test_math_and_code_presets_produce_conversation_rows(self):
+        math_row, skipped = prepare_data.process_gsm8k_row(
+            {"question": "1 + 1?", "answer": "2"}
+        )
+        code_row, code_skipped = prepare_data.process_codealpaca_row(
+            {"instruction": "return one", "output": "return 1"}
+        )
+
+        self.assertEqual(0, skipped)
+        self.assertEqual(0, code_skipped)
+        self.assertEqual("1 + 1?", math_row["conversations"][0]["content"])
+        self.assertEqual("2", math_row["conversations"][1]["content"])
+        self.assertEqual("return one", code_row["conversations"][0]["content"])
+        self.assertEqual("return 1", code_row["conversations"][1]["content"])
+
+    def test_gsm8k_preset_dispatches_to_its_hosted_dataset(self):
+        sentinel_dataset = object()
+        with patch.object(
+            prepare_data,
+            "_train_split",
+            return_value=sentinel_dataset,
+        ) as load_train:
+            dataset, processor = prepare_data.load_dataset_preset("gsm8k")
+
+        self.assertIs(sentinel_dataset, dataset)
+        self.assertIs(prepare_data.process_gsm8k_row, processor)
+        load_train.assert_called_once_with("openai/gsm8k", "main")
+
     def test_conversion_writes_only_the_training_jsonl(self):
         with TemporaryDirectory() as temporary_directory:
             output_directory = Path(temporary_directory)
@@ -118,6 +169,36 @@ class TestPrepareData(unittest.TestCase):
                 },
                 json.loads(output_path.read_text()),
             )
+
+    def test_conversion_can_write_the_restored_eval_split(self):
+        with TemporaryDirectory() as temporary_directory:
+            output_directory = Path(temporary_directory)
+            prepare_data.process_and_save_dataset(
+                [
+                    {
+                        "prompt_id": "train",
+                        "messages": [
+                            {"role": "user", "content": "question"},
+                            {"role": "assistant", "content": "answer"},
+                        ],
+                    }
+                ],
+                output_directory,
+                prepare_data.process_ultrachat_row,
+                "ultrachat",
+                eval_dataset=[
+                    {
+                        "prompt_id": "eval",
+                        "messages": [
+                            {"role": "user", "content": "eval question"},
+                            {"role": "assistant", "content": "eval answer"},
+                        ],
+                    }
+                ],
+            )
+
+            self.assertTrue((output_directory / "ultrachat_train.jsonl").exists())
+            self.assertTrue((output_directory / "ultrachat_test.jsonl").exists())
 
 
 if __name__ == "__main__":

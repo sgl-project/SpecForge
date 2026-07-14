@@ -42,6 +42,66 @@ class TestDominoLambdaSchedule(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
+class TestDominoOfflineLaunch(unittest.TestCase):
+    def test_domino_trains_from_precomputed_dflash_features(self):
+        from tests.test_runtime import _fixtures as fx
+
+        fx.build_single_rank_distributed(port="29571")
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        from specforge.launch import build_offline_runtime
+        from specforge.optimizer import BF16Optimizer
+
+        hidden, sequence_length = 64, 32
+        workdir = tempfile.mkdtemp(prefix="domino_offline_")
+        feature_dir = fx.write_offline_files_dflash(
+            os.path.join(workdir, "features"),
+            n=4,
+            seq=sequence_length,
+            hidden=hidden,
+        )
+        model, width, _target_dir, _layers = fx.build_domino(
+            workdir,
+            hidden=hidden,
+            block_size=4,
+            num_anchors=8,
+            attention_backend="sdpa",
+        )
+        self.assertEqual(width, hidden)
+
+        def optimizer_factory(module):
+            return BF16Optimizer(
+                module,
+                lr=1e-3,
+                max_grad_norm=0.5,
+                warmup_ratio=0.0,
+                total_steps=2,
+            )
+
+        trainer = build_offline_runtime(
+            strategy="domino",
+            hidden_states_path=feature_dir,
+            draft_model=model,
+            target_head=None,
+            optimizer_factory=optimizer_factory,
+            run_id="domino-offline",
+            output_dir=os.path.join(workdir, "out"),
+            max_len=sequence_length,
+            batch_size=1,
+            num_epochs=1,
+            max_steps=2,
+            total_steps=2,
+            strategy_kwargs={"lambda_start": 1.0, "decay_ratio": 0.5},
+        )
+
+        module = trainer.core.strategy.trainable_module()
+        self.assertIsInstance(module, FSDP)
+        self.assertEqual(trainer.fit(), 2)
+        self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
+
+
 @unittest.skipUnless(CUDA, "Domino online launcher path requires CUDA")
 class TestDominoOnlineLaunch(unittest.TestCase):
     def test_online_rollout_is_interleaved_with_fsdp_train(self):

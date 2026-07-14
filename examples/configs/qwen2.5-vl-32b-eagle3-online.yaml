@@ -1,0 +1,32 @@
+model:
+  target_model_path: "Qwen/Qwen2.5-VL-32B-Instruct"
+  draft_model_config: "configs/qwen2.5-vl-32b-eagle3.json"
+  target_backend: "sglang"
+  input_modality: "qwen2_5_vl"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  sglang_mem_fraction_static: 0.5
+data:
+  train_data_path: "./cache/dataset/allava4v_train.jsonl"
+  max_length: 4096
+  chat_template: "qwen2-vl"
+  build_dataset_num_proc: 64
+  cache_dir: "./cache"
+  min_pixels: 200704
+  max_pixels: 1003520
+training:
+  strategy: "eagle3"
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  tp_size: 4
+  dist_timeout: 360
+  save_interval: 1000
+  log_interval: 50
+  deployment_mode: "local_colocated"
+  seed: 0
+run_id: "qwen2.5-vl-32b-eagle3-online"
+output_dir: "./outputs/qwen2.5-vl-32b-eagle3-online"

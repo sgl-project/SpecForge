@@ -96,7 +96,6 @@ class TestRefDistributor(unittest.TestCase):
         dist = self._distributor(dp_size=2)
         for i in range(4):
             self.producer.publish(_ref(f"s{i}"))
-        self.producer.close()
         _pump_until_quiet(dist)
         q0 = StreamingRefQueue(
             StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, 0))
@@ -109,6 +108,8 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(ids0 & ids1, set())
         self.assertEqual(ids0 | ids1, {"s0", "s1", "s2", "s3"})
         # closed-and-drained: both readers terminate identically
+        self.producer.close()
+        _pump_until_quiet(dist)
         self.assertEqual(q0.get(1), [])
         self.assertEqual(q1.get(1), [])
 
@@ -132,6 +133,133 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(self.producer.in_flight_remote(), 0)
         self.producer.close()
         _pump_until_quiet(dist)
+
+    def test_resume_skips_acked_and_dispatches_reconciled_unacked(self):
+        ledger_path = os.path.join(self.dir, "resume.sqlite")
+        store = SQLiteMetadataStore(ledger_path)
+        original = DataFlowController("run0", metadata_store=store)
+        refs = [_ref("s0"), _ref("s1")]
+        for ref in refs:
+            self.producer.publish(ref)
+        original.commit_samples("old-distributor", refs)
+        original.ack_train_refs(
+            "trainer", ["s0"], global_step=1, optimizer_durable=True
+        )
+        # The prior consumer counted only the durably trained prefix.
+        self.source.mark_consumed(1)
+
+        restarted = DataFlowController("run0", metadata_store=store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        dist = self._distributor(
+            dp_size=1,
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+        )
+        _pump_until_quiet(dist)
+
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s1"])
+        self.assertEqual(dist.stats["skipped"], 1)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        queue = StreamingRefQueue(
+            StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, 0))
+        )
+        queue.ack(queue.get(1))
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 2)
+        self.producer.close()
+        _pump_until_quiet(dist)
+        store.close()
+
+    def test_resume_repairs_ack_committed_before_inbox_counter(self):
+        ledger_path = os.path.join(self.dir, "resume-counter.sqlite")
+        store = SQLiteMetadataStore(ledger_path)
+        original = DataFlowController("run0", metadata_store=store)
+        refs = [_ref("s0"), _ref("s1")]
+        for ref in refs:
+            self.producer.publish(ref)
+        original.commit_samples("old-distributor", refs)
+        original.ack_train_refs(
+            "trainer", ["s0"], global_step=1, optimizer_durable=True
+        )
+        # Crash here: the SQLite marker exists, but the rank-local inbox ack did
+        # not yet advance the source sidecar.
+        self.assertEqual(self.producer.consumed_remote(), 0)
+
+        restarted = DataFlowController("run0", metadata_store=store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        dist = self._distributor(
+            dp_size=1,
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+        )
+        self.assertEqual(self.producer.consumed_remote(), 1)
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s1"])
+        store.close()
+
+    def test_reconciled_unacked_refs_redistribute_across_consumer_dp_sizes(self):
+        """A fresh authority may repartition replayable refs after a DP change.
+
+        This is deliberately a control/ref-plane guarantee. It does not load or
+        reshard an FSDP model/optimizer checkpoint, whose world-size contract is
+        validated separately by the Trainer resume path.
+        """
+        ledger_path = os.path.join(self.dir, "consumer-dp-restart.sqlite")
+        original_store = SQLiteMetadataStore(ledger_path)
+        original = DataFlowController("run0", metadata_store=original_store)
+        for index in range(6):
+            self.producer.publish(_ref(f"s{index}"))
+
+        before_restart = self._distributor(dp_size=2, controller=original)
+        _pump_until_quiet(before_restart)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5"])
+        self.assertEqual(before_restart.stats["dispatched"], 6)
+
+        # Crash before any optimizer-durable ack. Reopen both durable ledger and
+        # source reader as a new consumer attempt would; ephemeral DP=2 inboxes
+        # must not define the replay partition.
+        original_store.close()
+        reopened_store = SQLiteMetadataStore(ledger_path)
+        restarted = DataFlowController("run0", metadata_store=reopened_store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        self.assertEqual(set(report["requeued"]), {f"s{i}" for i in range(6)})
+        self.assertEqual(report["released"], [])
+
+        self.source = StreamingRefChannel(self.src_path)
+        after_restart = self._distributor(
+            dp_size=3,
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+        )
+        _pump_until_quiet(after_restart)
+
+        shards = [set(_inbox_ids(self.inbox_dir, rank)) for rank in range(3)]
+        self.assertEqual(shards, [{"s0", "s3"}, {"s1", "s4"}, {"s2", "s5"}])
+        self.assertTrue(all(len(shard) == 2 for shard in shards))
+        self.assertEqual(set.union(*shards), {f"s{i}" for i in range(6)})
+        for index, left in enumerate(shards):
+            for right in shards[index + 1 :]:
+                self.assertTrue(left.isdisjoint(right))
+        self.assertEqual(after_restart.stats["dispatched"], 6)
+        self.assertEqual(after_restart.stats["duplicates"], 6)
+
+        # The new three-rank partition settles the original producer stream once.
+        for rank in range(3):
+            queue = StreamingRefQueue(
+                StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            )
+            refs = queue.get(2)
+            self.assertEqual(len(refs), 2)
+            queue.ack(refs)
+        _pump_until_quiet(after_restart)
+        self.assertEqual(self.producer.consumed_remote(), 6)
+        self.producer.close()
+        _pump_until_quiet(after_restart)
+        reopened_store.close()
 
     def test_inbox_acks_forward_to_source_counter(self):
         dist = self._distributor(dp_size=2)
@@ -238,6 +366,33 @@ class TestDPAckController(unittest.TestCase):
         marker = controller.store.durable_marker()
         self.assertEqual(sorted(marker["acked"]), ["s-other-rank", "s0"])
         self.assertTrue(marker["optimizer_durable"])
+        controller.store.close()
+
+    def test_feature_abort_happens_after_durable_marker(self):
+        observations = []
+        controller = None
+
+        class FeatureStore:
+            def abort(self, sample_id, *, reason):
+                marker = controller.store.durable_marker()
+                observations.append((sample_id, marker, reason))
+
+        controller = DPAckController(
+            "run0",
+            is_authority=True,
+            feature_store=FeatureStore(),
+            metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "order.db")),
+        )
+        controller.commit_samples("w0", [_ref("s0")])
+        controller.ack_train_refs("t0", ["s0"], global_step=3, optimizer_durable=True)
+
+        self.assertEqual(len(observations), 1)
+        sample_id, marker, reason = observations[0]
+        self.assertEqual(sample_id, "s0")
+        self.assertEqual(marker["global_step"], 3)
+        self.assertTrue(marker["optimizer_durable"])
+        self.assertIn("s0", marker["acked"])
+        self.assertEqual(reason, "optimizer-boundary-durable-ack")
         controller.store.close()
 
     def test_non_authority_participates_but_records_nothing(self):

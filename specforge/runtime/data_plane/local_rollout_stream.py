@@ -53,6 +53,7 @@ class LocalRolloutStream:
         workers: Sequence,
         feature_store,
         max_resident_samples: int,
+        capture_batch_multiplier: int = 1,
         max_stalled_rounds: int = 3,
     ) -> None:
         if not workers:
@@ -61,6 +62,8 @@ class LocalRolloutStream:
             raise ValueError("max_resident_samples must be >= 1")
         if max_stalled_rounds < 1:
             raise ValueError("max_stalled_rounds must be >= 1")
+        if capture_batch_multiplier < 1:
+            raise ValueError("capture_batch_multiplier must be >= 1")
         if not callable(getattr(feature_store, "abort_all", None)):
             raise TypeError(
                 "local rollout requires a private feature store with abort_all()"
@@ -70,6 +73,7 @@ class LocalRolloutStream:
         self.workers = tuple(workers)
         self.feature_store = feature_store
         self.max_resident_samples = int(max_resident_samples)
+        self.capture_batch_multiplier = int(capture_batch_multiplier)
         self.max_stalled_rounds = int(max_stalled_rounds)
         self._queue = controller.sample_queue
 
@@ -128,7 +132,8 @@ class LocalRolloutStream:
 
         worker = self.workers[self._next_worker]
         self._next_worker = (self._next_worker + 1) % len(self.workers)
-        refs = worker.run_once(max_tasks=min(max_tasks, capacity))
+        local_capacity = min(max_tasks, capacity)
+        refs = worker.run_once(max_tasks=local_capacity * self.capture_batch_multiplier)
         self._record_produced(refs)
         return refs
 

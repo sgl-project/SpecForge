@@ -1,0 +1,39 @@
+model:
+  target_model_path: "Qwen/Qwen3-8B"
+  draft_model_config: "configs/qwen3-8b-domino.json"
+  target_backend: "sglang"
+  trust_remote_code: true
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  mask_token_id: 151669
+data:
+  train_data_path: "./cache/dataset/perfectblend_qwen3-8b_regen.jsonl"
+  max_length: 3072
+  chat_template: "qwen"
+  build_dataset_num_proc: 32
+  cache_dir: "./cache"
+training:
+  strategy: "domino"
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 2
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 256
+  loss_decay_gamma: 7
+  lambda_base_start: 1
+  lambda_base_decay_ratio: 1
+  save_interval: 1000
+  log_interval: 10
+  deployment_mode: "disaggregated"
+  role: "producer"
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: "none"
+  wandb_project: "qwen3-8b-domino-disagg"
+  wandb_name: "qwen3-8b-domino-1srv-dp7"
+run_id: "qwen3-8b-domino-disaggregated"
+output_dir: "./outputs/qwen3-8b-domino-disaggregated"

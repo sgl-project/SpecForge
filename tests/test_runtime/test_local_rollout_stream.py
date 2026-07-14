@@ -190,6 +190,81 @@ class TestLocalRolloutStream(unittest.TestCase):
 
         self.assertEqual(store.health()["resident_samples"], 0)
 
+    def test_capture_batch_multiplier_keeps_only_the_local_batch_resident(self):
+        controller = DataFlowController("run")
+        controller.ingest_prompts(
+            [
+                {"task_id": f"task-{index}", "payload": {"input_ids": [index]}}
+                for index in range(4)
+            ]
+        )
+        store = _FakeFeatureStore()
+
+        class _PartitionedWorker(_FakeRolloutWorker):
+            def run_once(self, max_tasks):
+                self.requested_tasks = max_tasks
+                tasks = self.controller.lease_prompt_tasks(self.worker_id, max_tasks)
+                local_tasks = tasks[: len(tasks) // 2]
+                peer_tasks = tasks[len(tasks) // 2 :]
+                self.controller.complete_prompt_tasks(
+                    self.worker_id, [task.task_id for task in peer_tasks]
+                )
+                refs = [
+                    self.store.put(
+                        sample_id=f"run:{task.task_id}", source_task_id=task.task_id
+                    )
+                    for task in local_tasks
+                ]
+                self.controller.commit_samples(self.worker_id, refs)
+                return refs
+
+        worker = _PartitionedWorker(controller, store)
+        stream = LocalRolloutStream(
+            controller=controller,
+            workers=[worker],
+            feature_store=store,
+            max_resident_samples=2,
+            capture_batch_multiplier=2,
+        )
+
+        with stream:
+            refs = stream.get(2)
+            self.assertEqual(worker.requested_tasks, 4)
+            self.assertEqual(len(refs), 2)
+            self.assertEqual(store.health()["resident_samples"], 2)
+
+        self.assertEqual(controller.status()["prompts"], 0)
+
+    def test_sustained_rollout_soak_stays_batch_bounded_and_drains(self):
+        """The canonical pull-through stream replaces watermark throttling.
+
+        Exercise enough rounds to catch accidental eager capture or retention:
+        producer progress remains monotonic, peak residency never exceeds one
+        train batch, and the final lifecycle returns to zero resident samples.
+        """
+        num_prompts = 4096
+        batch_size = 8
+        controller, store, worker, stream = _runtime(
+            num_prompts, batch_size=batch_size
+        )
+        consumed = 0
+
+        with stream:
+            while refs := stream.get(batch_size):
+                self.assertLessEqual(
+                    store.health()["resident_samples"], batch_size
+                )
+                for ref in refs:
+                    store.release(ref.sample_id)
+                stream.ack(refs)
+                consumed += len(refs)
+
+        self.assertEqual(consumed, num_prompts)
+        self.assertEqual(stream.produced_count, num_prompts)
+        self.assertEqual(stream.peak_resident_samples, batch_size)
+        self.assertEqual(store.health()["resident_samples"], 0)
+        self.assertGreater(worker.calls, 100)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

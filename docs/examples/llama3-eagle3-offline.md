@@ -75,8 +75,16 @@ reference.
 specforge train --config ./llama3-eagle3-offline.yaml
 ```
 
-Only EAGLE3 currently accepts offline feature checkpoints. Other strategies
-fail during run assembly instead of interpreting those checkpoints through an
-incompatible feature schema.
-Offline training is currently single-rank; the hidden-state preparation step
-above may still use multiple target-inference workers.
+The same entry supports offline data parallelism:
+
+```bash
+torchrun --standalone --nproc_per_node=4 "$(command -v specforge)" \
+  train --config ./llama3-eagle3-offline.yaml
+```
+
+For long sequences, EAGLE3 offline can instead use USP by setting
+`training.attention_backend=usp` and choosing
+`training.sp_ulysses_size`/`training.sp_ring_size`. Offline feature training
+also supports DFlash and Domino when the feature checkpoints and draft config
+use that strategy's contract. `training.compact_teacher: true` enables the
+exact lower-memory teacher projection for offline text EAGLE3.

@@ -69,6 +69,10 @@ class SGLangTargetEngine(TargetEngine):
             self._backend, input_ids, attention_mask, loss_mask, **kwargs
         )
 
+    def get_rope_index(self, **kwargs):
+        """Return M-RoPE indices for a multimodal target batch."""
+        return self._backend.get_rope_index(**kwargs)
+
     def set_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
         self.capture_layers = layer_ids
         self._backend.set_eagle3_capture_layers(

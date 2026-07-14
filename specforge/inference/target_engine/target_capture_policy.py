@@ -153,6 +153,12 @@ def _get_transformer_layers(model: nn.Module):
     """
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
+    elif (
+        hasattr(model, "model")
+        and hasattr(model.model, "language_model")
+        and hasattr(model.model.language_model, "layers")
+    ):
+        return model.model.language_model.layers
     elif hasattr(model, "layers"):
         return model.layers
     elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
@@ -197,6 +203,7 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
         torch_dtype,
         device,
         cache_dir,
+        input_modality: str = "text",
         **kwargs,
     ):
         from specforge.distributed import get_tp_device_mesh, get_tp_group
@@ -214,7 +221,13 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
                 "device_map": device,
             }
 
-        return AutoModelForCausalLM.from_pretrained(
+        model_class = AutoModelForCausalLM
+        if input_modality == "qwen2_5_vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration
+
+            model_class = Qwen2_5_VLForConditionalGeneration
+
+        return model_class.from_pretrained(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             cache_dir=cache_dir,
@@ -230,6 +243,7 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
         input_ids,
         attention_mask,
         loss_mask,
+        media_inputs=None,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """Capture only the required layers via forward hooks (memory-light)."""
@@ -259,13 +273,31 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
                 )
 
         try:
+            media_kwargs = {}
+            if media_inputs is not None:
+                media_kwargs = {
+                    "pixel_values": media_inputs.pixel_values,
+                    "image_grid_thw": torch.cat(
+                        list(media_inputs.image_grid_thw), dim=0
+                    ),
+                }
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "output_hidden_states": False,
+                "output_attentions": False,
+                "use_cache": False,
+                **media_kwargs,
+            }
+            # ``output_router_logits`` is a causal-LM/MoE knob.  Qwen2.5-VL's
+            # multimodal wrapper accepts arbitrary Transformers kwargs and
+            # forwards them into the text stack, where this unrelated option is
+            # not part of the VLM contract.  Keep the text behavior without
+            # relying on permissive ``**kwargs`` in the VLM implementation.
+            if media_inputs is None:
+                forward_kwargs["output_router_logits"] = False
             outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=False,
-                output_attentions=False,
-                output_router_logits=False,
-                use_cache=False,
+                **forward_kwargs,
             )
             target = outputs.logits
         finally:
@@ -306,20 +338,36 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
         input_ids,
         attention_mask,
         loss_mask,
+        media_inputs=None,
         shard_returns: bool = False,
         return_last_hidden_states: bool = False,
         return_logits: bool = True,
     ) -> Eagle3TargetOutput:
-        data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
-            backend.extend_eagle3(
-                input_ids,
-                attention_mask,
-                loss_mask,
-                return_last_hidden_states=return_last_hidden_states,
-                return_logits=return_logits,
-                shard_returns=shard_returns,
+        if media_inputs is not None:
+            if shard_returns:
+                raise ValueError("VLM capture does not support shard_returns")
+            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
+                backend.extend_eagle3_vlm(
+                    input_ids,
+                    attention_mask,
+                    loss_mask,
+                    return_last_hidden_states=return_last_hidden_states,
+                    return_logits=return_logits,
+                    pixel_values=media_inputs.pixel_values,
+                    image_grid_thw=list(media_inputs.image_grid_thw),
+                )
             )
-        )
+        else:
+            data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
+                backend.extend_eagle3(
+                    input_ids,
+                    attention_mask,
+                    loss_mask,
+                    return_last_hidden_states=return_last_hidden_states,
+                    return_logits=return_logits,
+                    shard_returns=shard_returns,
+                )
+            )
         aux_hidden_states_out = []
         target_out = []
         loss_mask_out = []

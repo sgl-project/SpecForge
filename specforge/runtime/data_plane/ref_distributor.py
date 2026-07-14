@@ -22,12 +22,11 @@ cannot end on a partial batch or an unreduced FSDP accumulation step. An
 unaligned end-of-stream fails the attempt after cleaning the undispatched refs.
 
 The consumed counter on the source channel (the producer's backpressure signal)
-mirrors what the ranks actually consumed: each rank's loader acks its OWN inbox
-per micro-batch, and the distributor forwards the sum of the inbox sidecars to
-the source counter. The consumer publishes the global dispatch quantum before
-capture begins, and the producer rejects a watermark smaller than that first
-window. After dispatch starts, per-micro-batch acks release capacity
-incrementally. Dispatch itself does not count as consumption.
+mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
+the gathered SQLite ack/marker succeeds, and the distributor forwards the sum
+of the inbox sidecars to the source counter. The consumer publishes the global
+dispatch quantum before capture begins, and the producer rejects a watermark
+smaller than that first window. Dispatch itself does not count as consumption.
 
 If the distributor dies it drops a ``.failed`` sentinel (with the traceback)
 into every inbox; :class:`InboxChannel` readers raise on it at the next poll —
@@ -42,7 +41,7 @@ import os
 import threading
 import time
 import traceback
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from specforge.runtime.contracts import SampleRef
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
@@ -93,6 +92,8 @@ class RefDistributor:
         *,
         feature_store,
         refs_per_rank_step: int,
+        skip_ids: Optional[Iterable[str]] = None,
+        requeued_ids: Optional[Iterable[str]] = None,
         worker_id: str = "ref-distributor",
         poll_s: float = 0.05,
         idle_timeout_s: Optional[float] = None,
@@ -116,6 +117,8 @@ class RefDistributor:
         self.idle_timeout_s = idle_timeout_s
         self._clock = clock
         self._sleep = sleep
+        self._skip = set(skip_ids or ())
+        self._requeued = set(requeued_ids or ())
         # Inboxes are EPHEMERAL (the ledger is the durable state): recreate them
         # fresh so a restarted run cannot replay a previous attempt's dispatch.
         # Rank 0 broadcasts setup success before any rank opens a reader.
@@ -131,13 +134,25 @@ class RefDistributor:
             StreamingRefChannel(self.inbox_path(inbox_dir, rank))
             for rank in range(dp_size)
         ]
+        # Continue the producer-visible counter instead of rewinding it after a
+        # consumer restart. A crash can occur after SQLite commit/feature abort
+        # but before the rank-local inbox ack; repair that narrow window from
+        # the durable released prefix before the producer applies backpressure.
+        consumed = self.source.seed_consumed()
+        if len(self._skip) > consumed:
+            self.source.mark_consumed(len(self._skip) - consumed)
         self._inbox_consumed = 0  # last forwarded sum of the inbox sidecars
         self._window: List[SampleRef] = []
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.finished = False
         self.error: Optional[BaseException] = None
-        self.stats = {"dispatched": 0, "duplicates": 0, "dropped": 0}
+        self.stats = {
+            "dispatched": 0,
+            "skipped": 0,
+            "duplicates": 0,
+            "dropped": 0,
+        }
         # PROFILE_DISTRIB=<secs> -> periodic [dist] line: polled/dispatched
         # rates, per-ref commit + count cost, inbox-publish cost, rank lag.
         self._prof_s = float(os.environ.get("PROFILE_DISTRIB", "0"))
@@ -155,12 +170,7 @@ class RefDistributor:
         return os.path.join(inbox_dir, f"inbox-rank{dp_rank}.jsonl")
 
     def _forward_consumed(self) -> bool:
-        """Mirror the ranks' inbox acks onto the source counter (backpressure).
-
-        After the first complete optimizer window is dispatched, per-micro-batch
-        granularity lets the producer reuse capacity without waiting for the
-        whole optimizer step to finish.
-        """
+        """Mirror optimizer-durable inbox acks onto source backpressure."""
         consumed = sum(inbox.consumed_remote() for inbox in self._inboxes)
         delta = consumed - self._inbox_consumed
         if delta <= 0:
@@ -187,6 +197,10 @@ class RefDistributor:
             progress = True
             self._pd["polled"] += len(raw)
             for ref in raw:
+                if ref.sample_id in self._skip:
+                    self._skip.discard(ref.sample_id)
+                    self.stats["skipped"] += 1
+                    continue
                 _t = time.monotonic()
                 before = self.controller.store.committed_count()
                 self._pd["cnt"] += time.monotonic() - _t
@@ -197,9 +211,15 @@ class RefDistributor:
                 if self.controller.store.committed_count() == before:
                     # Duplicate publication within an attempt is idempotent.
                     self.stats["duplicates"] += 1
-                    # It will never reach an inbox, so settle its source-channel
-                    # publication immediately instead of pinning backpressure.
-                    self.source.mark_consumed(1)
+                    if ref.sample_id in self._requeued:
+                        # Reconciliation already put this unacked sample into
+                        # the transient queue. Its inbox ack will settle the
+                        # original publication exactly once.
+                        self._requeued.discard(ref.sample_id)
+                    else:
+                        # A same-attempt duplicate never reaches an inbox, so
+                        # settle that extra publication immediately.
+                        self.source.mark_consumed(1)
                 self._pd["cnt"] += time.monotonic() - _t
 
         # Dispatch complete optimizer-step windows. Round-robin assignment gives

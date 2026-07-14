@@ -30,6 +30,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
         on_fit_success=None,
         on_fit_failure=None,
         on_fit_finally=None,
+        tp_size=1,
+        sp_ulysses_size=1,
+        sp_ring_size=1,
     ):
         import specforge.training.trainer as tr
 
@@ -138,6 +141,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 on_fit_success=on_fit_success,
                 on_fit_failure=on_fit_failure,
                 on_fit_finally=on_fit_finally,
+                tp_size=tp_size,
+                sp_ulysses_size=sp_ulysses_size,
+                sp_ring_size=sp_ring_size,
             )
         return trainer, cap, dfc_calls, model
 
@@ -165,11 +171,23 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(cap["core"][2], 3)  # accumulation_steps threaded
 
         self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
+        self.assertEqual(
+            cap["parallel_kw"],
+            {"tp_size": 1, "sp_ulysses_size": 1, "sp_ring_size": 1},
+        )
 
         # run identity rides the shared checkpoint payload, validated on resume
         self.assertEqual(
             cap["ctrl_kw"]["checkpoint_extra"],
-            {"dataset_size": 6, "accumulation_steps": 3},
+            {
+                "dataset_size": 6,
+                "batch_size": 2,
+                "accumulation_steps": 3,
+                "num_epochs": 1,
+                "tp_size": 1,
+                "sp_ulysses_size": 1,
+                "sp_ring_size": 1,
+            },
         )
 
     def test_fit_delegates_to_controller_over_loader(self):
@@ -186,6 +204,31 @@ class DomainTrainerWiringTest(unittest.TestCase):
         # Re-entering at an already durable step does not write it twice.
         self.assertEqual(trainer.fit(), 42)
         self.assertEqual(cap["saves"], [42])
+
+    def test_offline_loader_rebuilds_the_ref_plan_on_set_epoch(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        calls = []
+
+        def refs_for_epoch(epoch):
+            calls.append(epoch)
+            return [f"e{epoch}-{index}" for index in range(6)]
+
+        _, cap, _, _ = self._build(
+            {
+                "refs": refs_for_epoch(0),
+                "refs_for_epoch": refs_for_epoch,
+            }
+        )
+        cap["loader"].set_epoch(3)
+        self.assertEqual(calls, [0, 3])
+        self.assertEqual(
+            cap["loader"]._refs,
+            ["e3-0", "e3-1", "e3-2", "e3-3", "e3-4", "e3-5"],
+        )
+        self.assertEqual(cap["loader"]._seek_batches, 0)
 
     def test_fit_exits_topology_context_before_final_checkpoint(self):
         try:

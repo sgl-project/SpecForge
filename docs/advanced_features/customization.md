@@ -49,12 +49,15 @@ data:
   max_length: 4096
 ```
 
-The unified runtime currently accepts text-only input. Multimodal/VLM config
+The unified runtime accepts text input and Qwen2.5-VL input through
+`model.input_modality: qwen2_5_vl`. Multimodal tensors stay inside rollout;
+the control plane retains JSON-safe image/conversation metadata and the
+feature store retains only M-RoPE position IDs. Other multimodal model config
 fields are rejected. Attention backends are a closed, strategy-specific set:
 
 | Strategy | Accepted `training.attention_backend` values |
 | --- | --- |
-| EAGLE3 | `sdpa`, `flex_attention`, `fa` |
+| EAGLE3 | `sdpa`, `flex_attention`, `fa`, offline `usp` |
 | P-EAGLE | `flex_attention` |
 | DFlash, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
 
@@ -78,11 +81,15 @@ EAGLE3 and P-EAGLE; DFlash-family strategies use `sglang` or `hf` where the
 selected topology supports them.
 
 Large target models may use a tensor-parallel custom implementation under
-`specforge/modeling/target/custom_backend`. This is an implementation detail of
-target inference inside the supported run; it does not make colocated or
-offline draft training multi-rank. Follow the existing Transformers
-`PreTrainedModel` implementations there and use SpecForge's parallel linear
-layers where the target model is sharded:
+`specforge/modeling/target/custom_backend`. `training.tp_size` defines each
+target-TP group; a larger world size creates target-DP groups that receive
+disjoint prompt or offline-reference shards. Colocated text EAGLE3 with SGLang
+can additionally set `model.shard_target_output: true` to return only each
+target-TP rank's local batch partition. Custom/HF targets and VLM capture the
+full target batch and partition it locally.
+
+Follow the existing Transformers `PreTrainedModel` implementations and use
+SpecForge's parallel linear layers where the target model is sharded:
 
 ```python
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -108,6 +115,12 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
 
 The target backend implements target inference only. Run orchestration remains
 in the `specforge train` assembly path.
+
+EAGLE3 offline sequence parallelism is selected with
+`training.attention_backend: usp` plus `training.sp_ulysses_size` and
+`training.sp_ring_size`. Evaluation, compact-teacher projection, and experiment
+tracking are also config features rather than custom launchers; see the
+[training guide](../basic_usage/training.md) for their validated combinations.
 
 ## Draft architectures
 

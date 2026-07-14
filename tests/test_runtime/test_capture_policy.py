@@ -9,6 +9,7 @@ it does not add backend-specific engine classes.
 import ast
 import os
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -29,6 +30,7 @@ from specforge.inference.target_engine.target_capture_policy import (
     DFlashTargetOutput,
     Eagle3TargetOutput,
 )
+from specforge.inference.media import MediaInputs
 
 _ENGINE_DIR = os.path.normpath(
     os.path.join(
@@ -117,6 +119,96 @@ class PolicyRegistryTest(unittest.TestCase):
         self.assertIsNone(captured.target)
         self.assertEqual(captured.hidden_states.shape, (1, 3, 2))
         self.assertEqual(captured.last_hidden_states.shape, (1, 3, 4))
+
+    def test_vlm_sglang_capture_uses_media_extend_without_sharding(self):
+        class RecordingBackend:
+            def __init__(self):
+                self.kwargs = None
+
+            def extend_eagle3_vlm(
+                self, input_ids, attention_mask, loss_mask, **kwargs
+            ):
+                self.kwargs = kwargs
+                return (
+                    [[input_ids, attention_mask, loss_mask]],
+                    [torch.ones(3, 8)],
+                    [torch.ones(3, 12)],
+                    [None],
+                )
+
+        backend = RecordingBackend()
+        input_ids = torch.tensor([[1, 2, 3]])
+        attention_mask = torch.ones_like(input_ids)
+        loss_mask = torch.ones_like(input_ids)
+        grid = torch.tensor([[1, 2, 2]])
+        media = MediaInputs(
+            pixel_values=torch.ones(4, 8), image_grid_thw=(grid,)
+        )
+
+        captured = Eagle3CapturePolicy().sglang_capture(
+            backend,
+            input_ids,
+            attention_mask,
+            loss_mask,
+            media_inputs=media,
+        )
+
+        self.assertIs(backend.kwargs["pixel_values"], media.pixel_values)
+        self.assertEqual(backend.kwargs["image_grid_thw"], [grid])
+        self.assertEqual(captured.hidden_states.shape, (1, 3, 12))
+        with self.assertRaisesRegex(ValueError, "shard_returns"):
+            Eagle3CapturePolicy().sglang_capture(
+                backend,
+                input_ids,
+                attention_mask,
+                loss_mask,
+                media_inputs=media,
+                shard_returns=True,
+            )
+
+    def test_vlm_hf_capture_passes_media_without_moe_only_kwargs(self):
+        class RecordingVLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                language_model = torch.nn.Module()
+                language_model.layers = torch.nn.ModuleList(
+                    [torch.nn.Identity() for _ in range(3)]
+                )
+                self.model = torch.nn.Module()
+                self.model.language_model = language_model
+                self.kwargs = None
+
+            def forward(self, **kwargs):
+                self.kwargs = kwargs
+                hidden = torch.ones(
+                    kwargs["input_ids"].shape[0], kwargs["input_ids"].shape[1], 4
+                )
+                for layer in self.model.language_model.layers:
+                    hidden = layer(hidden)
+                return SimpleNamespace(logits=torch.ones(*hidden.shape[:2], 8))
+
+        model = RecordingVLM()
+        input_ids = torch.tensor([[1, 2, 3]])
+        attention_mask = torch.ones_like(input_ids)
+        loss_mask = torch.ones_like(input_ids)
+        grid = torch.tensor([[1, 2, 2]])
+        media = MediaInputs(
+            pixel_values=torch.ones(4, 8), image_grid_thw=(grid,)
+        )
+
+        captured = Eagle3CapturePolicy().hf_capture(
+            model,
+            [0, 1, 2],
+            input_ids,
+            attention_mask,
+            loss_mask,
+            media_inputs=media,
+        )
+
+        self.assertNotIn("output_router_logits", model.kwargs)
+        self.assertIs(model.kwargs["pixel_values"], media.pixel_values)
+        self.assertTrue(torch.equal(model.kwargs["image_grid_thw"], grid))
+        self.assertEqual(captured.hidden_states.shape, (1, 3, 12))
 
 
 class _RecordingPolicy(TargetCapturePolicy):

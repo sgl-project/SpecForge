@@ -1,0 +1,28 @@
+model:
+  target_model_path: "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+  draft_model_config: "configs/qwen3-coder-480B-A35B-instruct-eagle3.json"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  vocab_mapping_path: "./cache/vocab_mapping/qwen3-coder-480b-a35b-eagle3.pt"
+  torch_dtype: "bfloat16"
+data:
+  hidden_states_path: "./cache/hidden_states/qwen3-coder-480b-a35b"
+  max_length: 2048
+  chat_template: "qwen"
+  cache_dir: "./cache"
+training:
+  strategy: "eagle3"
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  tp_size: 8
+  save_interval: 1000
+  log_interval: 50
+  deployment_mode: "local_colocated"
+  dist_timeout: 20
+  seed: 0
+run_id: "qwen3-coder-480b-a35b-eagle3-offline"
+output_dir: "./outputs/qwen3-coder-480b-a35b-eagle3-offline"

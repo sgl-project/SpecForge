@@ -6,10 +6,18 @@ Data is an important aspect of speculative decoding as the quality of the datase
 
 ## ☁️ Canonical Dataset Presets
 
-The preparation script intentionally exposes two canonical presets:
+`scripts/prepare_data.py --dataset NAME` exposes the same 21 conversion presets
+used by the checked-in recipes:
 
-1. [ultrachat](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k)
-2. [sharegpt](https://huggingface.co/datasets/Aeala/ShareGPT_Vicuna_unfiltered)
+| Family | Presets |
+| --- | --- |
+| General chat | `ultrachat`, `sharegpt`, `eaglechat`, `perfectblend`, `perfectblend-llama3.1-8b-instruct`, `perfectblend-llama3.3-70b-instruct`, `perfectblend-llama4-scout-instruct`, `perfectblend-llama4-maverick-instruct`, `magpie-qwen2.5-pro-1m-v0.1`, `nebius-llama31-8b-infinity-instruct` |
+| Vision-language | `allava4v`; `sharegpt4v` is recognized but fails with an explicit instruction to use `allava4v` because its image downloader is not supported |
+| Reasoning, math, and code | `opc`, `gsm8k`, `hendrycks_math`, `math_qa`, `codealpaca-20k`, `opencodeinstruct`, `magicoder-evol-instruct`, `sciq`, `camel` |
+
+Every successful preset writes the same stable `id` + `conversations` JSONL
+contract. Use `--split-eval` to create a deterministic 95/5 train/eval split;
+`opc` additionally accepts `--opc-subset`.
 
 Run the script from the repository root:
 
@@ -21,9 +29,9 @@ python scripts/prepare_data.py --dataset ultrachat
 python scripts/prepare_data.py --dataset sharegpt
 ```
 
-By default, each command writes one training file under `cache/dataset`:
-`ultrachat_train.jsonl` or `sharegpt_train.jsonl`. Use `--output-path` to choose
-another output directory and `--sample-size` to cap the number of source rows.
+By default, each command writes `<preset>_train.jsonl` under `cache/dataset`.
+Use `--output-path` to choose another output directory and `--sample-size` to
+cap the number of source rows.
 
 For a local ShareGPT-format dataset, pass a JSON or JSONL file with
 `--data-path`:
@@ -259,8 +267,10 @@ torchrun --nproc_per_node=8 \
     --max-length 2048
 ```
 
-This `torchrun` command parallelizes feature preparation only. The subsequent
-offline `specforge train` run is single-rank.
+This `torchrun` command parallelizes feature preparation. The subsequent
+offline run still uses the one `specforge train` entry and may be launched with
+`torchrun` for data parallelism or EAGLE3 USP; its world size and topology are
+independent of the feature-preparation job.
 
 Once the `jsonl` file is ready, use it in an online run config or generate
 hidden states for an offline config. See the [Training](training.md) guide for

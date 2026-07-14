@@ -13,7 +13,8 @@ validated :class:`~specforge.config.Config`, assembles the models, and runs
 training through the DataFlow launch builders — the same wiring the
 programmatic path uses, behind one typed config.
 
-Only an online-disaggregated consumer may run under multi-rank ``torchrun``:
+Trainer-bearing roles may run under multi-rank ``torchrun``; the validated
+config defines target TP and draft DP/USP groups:
     torchrun --standalone --nproc_per_node 8 $(which specforge) train --config run.yaml
 
 Model/data assembly lives in :mod:`specforge.training.assembly`; this module is
@@ -75,7 +76,13 @@ def _train(cfg: Config) -> int:
 
         return build_training_run(cfg).run()
     _bootstrap_single_process_env()
-    init_distributed(tp_size=1)
+    _validate_world_size(cfg, int(os.environ["WORLD_SIZE"]))
+    init_distributed(
+        timeout=cfg.training.dist_timeout,
+        tp_size=cfg.training.tp_size,
+        sp_ulysses_size=cfg.training.sp_ulysses_size,
+        sp_ring_size=cfg.training.sp_ring_size,
+    )
     try:
         import torch.distributed as dist
 

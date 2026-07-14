@@ -111,6 +111,22 @@ class DataFlowController:
                 out.append(self._prompts[task_id])
         return out
 
+    def complete_prompt_tasks(self, worker_id: str, task_ids: List[str]) -> None:
+        """Retire successfully captured prompts that belong to another TP rank.
+
+        Colocated target-TP ranks keep replicated prompt schedules so they can
+        execute the same frozen-target forward.  After capture, each rank trains
+        only its local batch partition; peer-owned prompts therefore complete on
+        this controller without producing a local ``SampleRef``.
+        """
+        with self._lock:
+            for task_id in task_ids:
+                owner = self._prompt_leased.get(task_id)
+                if owner is not None and owner != worker_id:
+                    continue
+                self._prompt_leased.pop(task_id, None)
+                self._prompts.pop(task_id, None)
+
     def fail_prompt_tasks(
         self, worker_id: str, task_ids: List[str], reason: str, retryable: bool
     ) -> None:
@@ -185,6 +201,39 @@ class DataFlowController:
         ]
         if self.sample_queue is not None:
             self.sample_queue.ack(refs)
+
+    def reconcile_on_restart(
+        self, feature_store: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """Rebuild the transient train queue from one durable online ledger.
+
+        Samples covered by an optimizer-durable ack are released. Every other
+        committed sample is requeued for at-least-once training. The operation
+        is idempotent because ``SampleRefQueue.put`` deduplicates by sample id.
+        """
+        if self.sample_queue is None:
+            raise ValueError("restart reconciliation requires a trainer sample queue")
+        marker = self.store.durable_marker()
+        acked = marker["acked"]
+        optimizer_durable = bool(marker["optimizer_durable"])
+        requeued: List[str] = []
+        released: List[str] = []
+        for sample_id in self.store.all_committed_ids():
+            if optimizer_durable and sample_id in acked:
+                released.append(sample_id)
+                if feature_store is not None:
+                    feature_store.abort(sample_id, reason="reconciled-released")
+                continue
+            ref = self.store.get_committed(sample_id)
+            if ref is not None:
+                self.sample_queue.put([ref])
+                requeued.append(sample_id)
+        return {
+            "requeued": requeued,
+            "released": released,
+            "global_step": marker["global_step"],
+            "optimizer_durable": optimizer_durable,
+        }
 
     # NOTE: weight publishing (publish_weight_version / latest_weight_version) is
     # not yet implemented; it lands with the rest of the weight-version lifecycle.

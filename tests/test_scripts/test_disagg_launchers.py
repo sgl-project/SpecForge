@@ -13,6 +13,13 @@ ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
 
 _DISAGG_ENV_PREFIXES = ("DISAGG_", "MOONCAKE_")
+_TORCHRUN_ENV_KEYS = {
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "NNODES",
+    "NODE_RANK",
+    "NPROC_PER_NODE",
+}
 
 
 class TestDisaggregatedLaunchers(unittest.TestCase):
@@ -44,7 +51,8 @@ class TestDisaggregatedLaunchers(unittest.TestCase):
             key: value
             for key, value in os.environ.items()
             if not key.startswith(_DISAGG_ENV_PREFIXES)
-            and key not in {"CONFIG", "NPROC_PER_NODE", "CAPTURE_DIR"}
+            and key not in _TORCHRUN_ENV_KEYS
+            and key not in {"CONFIG", "CAPTURE_DIR"}
         }
         env.update(
             {
@@ -170,6 +178,93 @@ class TestDisaggregatedLaunchers(unittest.TestCase):
             ],
         )
 
+    def test_online_consumer_dispatches_multinode_through_torchrun(self):
+        env = self._online_env()
+        database = self.root / "consumer.sqlite"
+        # A nonzero node may join after global rank 0 created the shared DB.
+        database.touch()
+        env.update(
+            {
+                "DISAGG_DB": str(database),
+                "NNODES": "2",
+                "NODE_RANK": "1",
+                "MASTER_ADDR": "trainer-0.example",
+                "MASTER_PORT": "29400",
+                "NPROC_PER_NODE": "4",
+            }
+        )
+        result = self._run(ONLINE, "consumer", env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._captured("torchrun"),
+            [
+                "--nnodes",
+                "2",
+                "--node_rank",
+                "1",
+                "--master_addr",
+                "trainer-0.example",
+                "--master_port",
+                "29400",
+                "--nproc_per_node",
+                "4",
+                str(self.bin_dir / "specforge"),
+                "train",
+                "--config",
+                str(self.config),
+                f"training.metadata_db_path={env['DISAGG_DB']}",
+                "training.role=consumer",
+            ],
+        )
+
+    def test_consumers_validate_multinode_rendezvous(self):
+        for launcher, base_env in (
+            (ONLINE, self._online_env()),
+            (OFFLINE, self._offline_env()),
+        ):
+            with self.subTest(launcher=launcher.name, case="missing node rank"):
+                env = dict(base_env)
+                env["NNODES"] = "2"
+                if launcher == ONLINE:
+                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
+                result = self._run(launcher, "consumer", env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("NODE_RANK", result.stderr)
+
+            with self.subTest(launcher=launcher.name, case="missing master"):
+                env = dict(base_env)
+                env.update({"NNODES": "2", "NODE_RANK": "0"})
+                if launcher == ONLINE:
+                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
+                result = self._run(launcher, "consumer", env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("MASTER_ADDR", result.stderr)
+
+            with self.subTest(launcher=launcher.name, case="rank out of range"):
+                env = dict(base_env)
+                env.update({"NNODES": "2", "NODE_RANK": "2"})
+                if launcher == ONLINE:
+                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
+                result = self._run(launcher, "consumer", env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("smaller than NNODES", result.stderr)
+
+            with self.subTest(launcher=launcher.name, case="invalid master port"):
+                env = dict(base_env)
+                env.update(
+                    {
+                        "NNODES": "2",
+                        "NODE_RANK": "0",
+                        "MASTER_ADDR": "trainer-0.example",
+                        "MASTER_PORT": "70000",
+                    }
+                )
+                if launcher == ONLINE:
+                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
+                result = self._run(launcher, "consumer", env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("MASTER_PORT", result.stderr)
+
     def test_online_rejects_missing_transport_and_stale_database(self):
         missing = self._online_env()
         del missing["DISAGG_REF_CHANNEL"]
@@ -184,6 +279,33 @@ class TestDisaggregatedLaunchers(unittest.TestCase):
         result = self._run(ONLINE, "consumer", stale)
         self.assertEqual(result.returncode, 2)
         self.assertIn("fresh attempt path", result.stderr)
+
+    def test_online_consumer_resume_reuses_only_an_existing_database(self):
+        env = self._online_env()
+        database = self.root / "retained.sqlite"
+        database.touch()
+        env["DISAGG_DB"] = str(database)
+        checkpoint = self.root / "run0-latest"
+
+        result = self._run(
+            ONLINE,
+            "consumer",
+            env,
+            f"training.resume_from={checkpoint}",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"training.resume_from={checkpoint}", self._captured("torchrun"))
+
+        missing = self._online_env()
+        missing["DISAGG_DB"] = str(self.root / "missing.sqlite")
+        result = self._run(
+            ONLINE,
+            "consumer",
+            missing,
+            f"training.resume_from={checkpoint}",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("retained DISAGG_DB", result.stderr)
 
     def test_online_consumer_requires_an_explicit_database_for_dp(self):
         env = self._online_env()
@@ -224,21 +346,80 @@ class TestDisaggregatedLaunchers(unittest.TestCase):
             ],
         )
 
-    def test_offline_roles_dispatch_directly_and_stay_single_rank(self):
-        for role in ("producer", "consumer"):
-            with self.subTest(role=role):
-                result = self._run(OFFLINE, role, self._offline_env())
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    self._captured("specforge"),
-                    ["train", "--config", str(self.config), f"training.role={role}"],
-                )
+    def test_offline_producer_is_direct_and_consumer_dispatches_dp_through_torchrun(
+        self,
+    ):
+        result = self._run(OFFLINE, "producer", self._offline_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._captured("specforge"),
+            ["train", "--config", str(self.config), "training.role=producer"],
+        )
+
+        result = self._run(OFFLINE, "consumer", self._offline_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._captured("torchrun"),
+            [
+                "--standalone",
+                "--nproc_per_node",
+                "1",
+                str(self.bin_dir / "specforge"),
+                "train",
+                "--config",
+                str(self.config),
+                "training.role=consumer",
+            ],
+        )
 
         multi_rank = self._offline_env()
         multi_rank["NPROC_PER_NODE"] = "2"
         result = self._run(OFFLINE, "consumer", multi_rank)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("single-rank", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._captured("torchrun")[1:3], ["--nproc_per_node", "2"])
+
+    def test_offline_consumer_dispatches_multinode_through_torchrun(self):
+        env = self._offline_env()
+        env.update(
+            {
+                "NNODES": "3",
+                "NODE_RANK": "2",
+                "MASTER_ADDR": "trainer-0.example",
+                "MASTER_PORT": "29500",
+                "NPROC_PER_NODE": "8",
+            }
+        )
+        result = self._run(OFFLINE, "consumer", env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._captured("torchrun"),
+            [
+                "--nnodes",
+                "3",
+                "--node_rank",
+                "2",
+                "--master_addr",
+                "trainer-0.example",
+                "--master_port",
+                "29500",
+                "--nproc_per_node",
+                "8",
+                str(self.bin_dir / "specforge"),
+                "train",
+                "--config",
+                str(self.config),
+                "training.role=consumer",
+            ],
+        )
+
+    def test_offline_consumer_rejects_invalid_dp_width(self):
+        for nproc in ("0", "-1", "not-a-number"):
+            with self.subTest(nproc=nproc):
+                env = self._offline_env()
+                env["NPROC_PER_NODE"] = nproc
+                result = self._run(OFFLINE, "consumer", env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("positive integer", result.stderr)
 
     def test_offline_mooncake_validates_its_transport_contract(self):
         env = self._offline_env()

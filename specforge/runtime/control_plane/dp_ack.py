@@ -58,19 +58,34 @@ def gather_id_union(ids: List[str]) -> List[str]:
     return out
 
 
+def _broadcast_authority_error(error: Optional[str]) -> Optional[str]:
+    """Return rank 0's post-commit result on every rank."""
+    try:
+        import torch.distributed as dist
+    except ModuleNotFoundError:
+        return error
+    if not (dist.is_available() and dist.is_initialized()):
+        return error
+    payload = [error]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
 class DPAckController(DataFlowController):
     """A :class:`DataFlowController` whose ``ack_train_refs`` is a DP collective.
 
     * ``is_authority=True`` (DP rank 0): holds the run's ONE durable store and
-      records the gathered union.
+      records the gathered union and removes its retained features only after
+      that durable transaction succeeds.
     * ``is_authority=False`` (other ranks): participates in the gather (the
       collective needs every rank) and records nothing; give it a throwaway
       in-memory store.
 
     Every rank must call ``ack_train_refs`` at every optimizer boundary — the
-    trainer's ``ack_fn`` already does exactly that. Producer backpressure is
-    NOT this class's job: the distributor mirrors the per-rank inbox acks onto
-    the source counter at micro-batch granularity.
+    trainer's ``ack_fn`` already does exactly that. Once rank 0 has committed
+    and removed the gathered union, every rank is released from the result
+    broadcast and may advance its inbox acknowledgement; the distributor then
+    mirrors those optimizer-boundary counts onto the source counter.
     """
 
     def __init__(
@@ -79,11 +94,17 @@ class DPAckController(DataFlowController):
         *,
         is_authority: bool = True,
         gather: Callable[[List[str]], List[str]] = gather_id_union,
+        sync_error: Callable[
+            [Optional[str]], Optional[str]
+        ] = _broadcast_authority_error,
+        feature_store=None,
         **kwargs,
     ) -> None:
         super().__init__(run_id, **kwargs)
         self.is_authority = is_authority
         self._gather = gather
+        self._sync_error = sync_error
+        self.feature_store = feature_store
 
     def ack_train_refs(
         self,
@@ -94,14 +115,28 @@ class DPAckController(DataFlowController):
         optimizer_durable: bool = False,
     ) -> None:
         union = self._gather(list(sample_ids))
-        if not self.is_authority:
-            return
-        super().ack_train_refs(
-            trainer_id,
-            union,
-            global_step=global_step,
-            optimizer_durable=optimizer_durable,
-        )
+        error = None
+        if self.is_authority:
+            try:
+                # The SQLite ack ids + optimizer marker commit first. Only
+                # after that durable fact exists may consume-once features be
+                # physically removed.
+                super().ack_train_refs(
+                    trainer_id,
+                    union,
+                    global_step=global_step,
+                    optimizer_durable=optimizer_durable,
+                )
+                if optimizer_durable and self.feature_store is not None:
+                    for sample_id in union:
+                        self.feature_store.abort(
+                            sample_id, reason="optimizer-boundary-durable-ack"
+                        )
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        error = self._sync_error(error)
+        if error is not None:
+            raise RuntimeError(f"durable DP acknowledgement failed: {error}")
 
 
 __all__ = ["DPAckController", "gather_id_union"]

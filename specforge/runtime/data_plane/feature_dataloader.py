@@ -52,6 +52,7 @@ class FeatureDataLoader:
         strategy: str = "eagle3",
         ack: bool = True,
         gc_interval_s: Optional[float] = 15.0,
+        num_workers: int = 0,
     ) -> None:
         if (queue is None) == (refs is None):
             raise ValueError(
@@ -72,6 +73,9 @@ class FeatureDataLoader:
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack
+        if num_workers < 0:
+            raise ValueError("num_workers must be >= 0")
+        self.num_workers = int(num_workers)
         self._seek_batches = 0
         # Remote stores defer a physical free while the get() read-lease is live
         # (Mooncake remove -> -706): release() parks it and gc() must retry.
@@ -203,11 +207,44 @@ class FeatureDataLoader:
     def _iter_refs(self) -> Iterator[TrainBatch]:
         # Acking (the durable marker) is the trainer's job here, not the loader's.
         skip, self._seek_batches = self._seek_batches, 0
+        chunks = []
         for start in range(skip * self.batch_size, len(self._refs), self.batch_size):
             chunk = self._refs[start : start + self.batch_size]
             if self.drop_last and len(chunk) < self.batch_size:
                 break
+            chunks.append(chunk)
+        if self.num_workers > 0:
+            yield from self._iter_refs_prefetch(chunks)
+            return
+        for chunk in chunks:
             yield self._make_batch(chunk)
+
+    def _iter_refs_prefetch(
+        self, chunks: List[List[SampleRef]]
+    ) -> Iterator[TrainBatch]:
+        """Materialize fixed offline batches concurrently while preserving order."""
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        chunk_iter = iter(chunks)
+        pending = deque()
+        with ThreadPoolExecutor(
+            max_workers=self.num_workers,
+            thread_name_prefix="feature-loader",
+        ) as executor:
+            for _ in range(self.num_workers):
+                try:
+                    chunk = next(chunk_iter)
+                except StopIteration:
+                    break
+                pending.append(executor.submit(self._make_batch, chunk))
+            while pending:
+                yield pending.popleft().result()
+                try:
+                    chunk = next(chunk_iter)
+                except StopIteration:
+                    continue
+                pending.append(executor.submit(self._make_batch, chunk))
 
     def seek(self, num_batches: int) -> None:
         """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
@@ -238,7 +275,7 @@ class FeatureDataLoader:
         # background thread so the training step never pays fetch latency
         # inline. Ack still happens on the consuming thread AFTER the trainer
         # has taken the batch (same in-flight semantics as the sync path).
-        depth = int(os.environ.get("LOADER_PREFETCH", "0"))
+        depth = self.num_workers or int(os.environ.get("LOADER_PREFETCH", "0"))
         if not getattr(self.queue, "loader_prefetch_safe", True):
             # A pull-through local rollout runs target inference inside get().
             # Keep that CUDA work on the training thread so early-stop and

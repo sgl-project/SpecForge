@@ -1,0 +1,29 @@
+# Corrects the legacy 120B shell recipe, which accidentally referenced the 20B draft config.
+model:
+  target_model_path: "openai/gpt-oss-120b"
+  draft_model_config: "configs/gpt-oss-120B-eagle3.json"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "./cache/dataset/perfect-blend-gptoss-120B.jsonl"
+  max_length: 4096
+  chat_template: "gpt-oss"
+  build_dataset_num_proc: 64
+  cache_dir: "./cache"
+training:
+  strategy: "eagle3"
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  tp_size: 8
+  save_interval: 1000
+  log_interval: 50
+  deployment_mode: "local_colocated"
+  dist_timeout: 60
+  seed: 0
+run_id: "gpt-oss-120b-eagle3-online"
+output_dir: "./outputs/gpt-oss-120b-eagle3-online"

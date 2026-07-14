@@ -94,6 +94,10 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
+        self.assertEqual(
+            {cls.__name__ for cls in trainer.backend.auto_wrap_block_classes},
+            {"Qwen3DFlashDecoderLayer"},
+        )
 
         step = trainer.fit()
 

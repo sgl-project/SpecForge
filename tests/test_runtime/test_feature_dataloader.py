@@ -3,6 +3,7 @@
 
 import os
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from functools import partial
@@ -252,6 +253,33 @@ class TestFeatureDataLoader(unittest.TestCase):
         self.assertEqual(transformed["hidden_state"].shape, (1, 3, 6))
         self.assertEqual(transformed["target"].shape, (1, 3, 2))
         self.assertEqual(transformed["loss_mask"].tolist(), [[1, 1, 0]])
+
+    def test_offline_workers_prefetch_without_reordering_batches(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=8)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            worker_names = []
+
+            def record_worker(raw):
+                worker_names.append(threading.current_thread().name)
+                return _OFFLINE_EAGLE3_TRANSFORM(raw)
+
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                refs=refs,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=record_worker,
+                num_workers=2,
+            )
+            batches = [batch.sample_ids for batch in loader]
+
+        self.assertEqual(
+            batches,
+            [[ref.sample_id for ref in refs[index : index + 2]] for index in range(0, 8, 2)],
+        )
+        self.assertEqual(len(worker_names), 8)
+        self.assertTrue(all(name.startswith("feature-loader") for name in worker_names))
 
     def test_requires_exactly_one_source(self):
         store = LocalFeatureStore("st")

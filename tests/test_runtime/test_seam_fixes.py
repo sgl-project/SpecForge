@@ -68,10 +68,12 @@ class TestMetadataStore(unittest.TestCase):
 
 
 class TestParallelConfigHandles(unittest.TestCase):
-    def test_carries_only_fsdp_parallel_state(self):
-        pc = ParallelConfig()
+    def test_carries_target_and_draft_parallel_state(self):
+        pc = ParallelConfig(tp_size=2, sp_ulysses_size=2, sp_ring_size=2)
         self.assertIsNone(pc.fsdp_process_group)
         self.assertEqual(pc.sharding_strategy, "SHARD_GRAD_OP")
+        self.assertEqual(pc.tp_size, 2)
+        self.assertEqual(pc.sp_size, 4)
 
     def test_from_distributed_no_dist(self):
         # Keep this test independent of process groups initialized by earlier
@@ -79,8 +81,11 @@ class TestParallelConfigHandles(unittest.TestCase):
         with mock.patch(
             "specforge.training.backend.dist.is_initialized", return_value=False
         ):
-            pc = ParallelConfig.from_distributed()
+            pc = ParallelConfig.from_distributed(tp_size=2, sp_ulysses_size=2)
         self.assertIsNone(pc.fsdp_process_group)
+        self.assertEqual(pc.world_size, 1)
+        self.assertEqual(pc.tp_size, 2)
+        self.assertEqual(pc.sp_size, 2)
 
 
 class _FakeBackend(TrainingBackend):

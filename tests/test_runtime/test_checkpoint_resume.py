@@ -308,6 +308,19 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 {"accumulation_steps": 4},
                 "accumulation_steps=4 but this run has",
             ),
+            ("batch", {"batch_size": 1}, "batch_size=1 but this run has"),
+            ("epochs", {"num_epochs": 2}, "num_epochs=2 but this run has"),
+            ("tp", {"tp_size": 2}, "tp_size=2 but this run has"),
+            (
+                "ulysses",
+                {"sp_ulysses_size": 2},
+                "sp_ulysses_size=2 but this run has",
+            ),
+            (
+                "ring",
+                {"sp_ring_size": 2},
+                "sp_ring_size=2 but this run has",
+            ),
             (
                 "weights",
                 {"draft_state_dict": {"bogus.weight": torch.zeros(1)}},
@@ -324,6 +337,30 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         resume_from=write_ckpt(name, **overrides),
                     )
 
+    def test_completed_checkpoint_resume_is_a_checkpoint_noop(self):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_complete_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        out = os.path.join(workdir, "out")
+        complete, model, _ = self._make_trainer(
+            out, feat_dir=feat_dir, max_steps=None
+        )
+        self.assertEqual(complete.fit(), 2)
+        self.assertEqual(complete._controller.epoch, 1)
+        checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
+        saved_weight = model.draft_model.w.detach().clone()
+
+        resumed, resumed_model, seen = self._make_trainer(
+            os.path.join(workdir, "resumed"),
+            feat_dir=feat_dir,
+            max_steps=None,
+            resume_from=checkpoint_uri,
+        )
+        with mock.patch.object(resumed, "save_checkpoint") as save:
+            self.assertEqual(resumed.fit(), 2)
+        save.assert_not_called()
+        self.assertEqual(seen, [])
+        self.assertTrue(torch.equal(resumed_model.draft_model.w, saved_weight))
+
 
 class TestFitReentry(unittest.TestCase):
     """fit() at/after max_steps and re-entry after a mid-epoch return (CPU fakes)."""
@@ -331,6 +368,7 @@ class TestFitReentry(unittest.TestCase):
     def _controller(self, seen, max_steps, out_dir, **kw):
         from specforge.training.controller import TrainerController, TrainerCore
 
+        num_epochs = kw.pop("num_epochs", 1)
         Composite, Strategy, Backend = _fake_seam()
         model = Composite()
         backend = Backend(model)
@@ -340,7 +378,7 @@ class TestFitReentry(unittest.TestCase):
             run_id="r",
             output_dir=out_dir,
             max_steps=max_steps,
-            num_epochs=1,
+            num_epochs=num_epochs,
             **kw,
         )
         return ctrl, backend
@@ -373,6 +411,88 @@ class TestFitReentry(unittest.TestCase):
             self.assertEqual(seen, [])
             self.assertEqual(backend.steps, 0)
 
+    def test_completed_epoch_returns_without_consuming(self):
+        class Explode:
+            def __iter__(self):
+                raise AssertionError("completed resume consumed its online queue")
+
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, backend = self._controller(
+                seen, None, d, start_step=3, start_epoch=1
+            )
+            self.assertEqual(ctrl.fit(Explode()), 3)
+            self.assertEqual(seen, [])
+            self.assertEqual(backend.steps, 0)
+
+    def test_prepositioned_online_queue_is_not_skipped_twice(self):
+        class PrepositionedQueue:
+            def __init__(self, batches):
+                self.batches = batches
+
+            def __iter__(self):
+                return iter(self.batches)
+
+            def seek(self, _):
+                raise AssertionError("prepositioned online queue was sought again")
+
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, backend = self._controller(
+                seen,
+                3,
+                d,
+                start_step=1,
+                start_batch=1,
+                start_samples=1,
+                data_prepositioned=True,
+            )
+            queue = PrepositionedQueue(self._batches(3)[1:])
+            self.assertEqual(ctrl.fit(queue), 3)
+            self.assertEqual(seen, ["b1", "b2"])
+            self.assertEqual(backend.steps, 2)
+
+    def test_offline_resume_sets_saved_epoch_before_seeking_samples(self):
+        class EpochData:
+            def __init__(self, batches):
+                self.batches = batches
+                self.current = []
+                self.skip = 0
+                self.calls = []
+
+            def set_epoch(self, epoch):
+                self.calls.append(("set_epoch", epoch))
+                self.current = self.batches[epoch]
+
+            def seek(self, batches):
+                self.calls.append(("seek", batches))
+                self.skip = batches
+
+            def __iter__(self):
+                skip, self.skip = self.skip, 0
+                return iter(self.current[skip:])
+
+        epoch0 = self._batches(2)
+        epoch1 = self._batches(2)
+        for index, batch in enumerate(epoch1):
+            batch.sample_ids = [f"epoch1-{index}"]
+        data = EpochData({0: epoch0, 1: epoch1})
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, _ = self._controller(
+                seen,
+                2,
+                d,
+                num_epochs=2,
+                start_step=1,
+                start_epoch=1,
+                start_batch=1,
+                start_samples=1,
+            )
+            self.assertEqual(ctrl.fit(data), 2)
+        self.assertEqual(data.calls[:2], [("set_epoch", 1), ("seek", 1)])
+        self.assertEqual(seen, ["epoch1-1"])
+
     def test_refit_after_midepoch_return_does_not_retrain_prefix(self):
         with tempfile.TemporaryDirectory() as d:
             seen = []
@@ -385,6 +505,28 @@ class TestFitReentry(unittest.TestCase):
             # the live epoch position drives the skip: b0/b1 are not re-trained
             self.assertEqual(seen, ["b0", "b1", "b2", "b3"])
             self.assertEqual(backend.steps, 4)
+
+    def test_flattened_online_epochs_checkpoint_as_one_midstream_epoch(self):
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, _ = self._controller(seen, 2, d, num_epochs=1)
+            # Assembly has already expanded and independently truncated all
+            # logical prompt epochs; TrainerController intentionally sees one
+            # deterministic queue epoch.
+            self.assertEqual(ctrl.fit(self._batches(4)), 2)
+            checkpoint = ctrl.save_checkpoint(2)
+            state = torch.load(
+                os.path.join(
+                    checkpoint.checkpoint_uri.removeprefix("file://"),
+                    "training_state.pt",
+                ),
+                map_location="cpu",
+                weights_only=False,
+            )
+        self.assertEqual(state["epoch"], 0)
+        self.assertEqual(state["epoch_batch"], 2)
+        self.assertEqual(state["epoch_samples"], 2)
+        self.assertEqual(state["global_step"], 2)
 
 
 @unittest.skipUnless(CUDA, "checkpoint resume requires CUDA")
@@ -492,9 +634,11 @@ class TestCheckpointResume(unittest.TestCase):
             self.assertEqual(t.dtype, torch.float32)
             self.assertEqual(t.device.type, "cpu")
         rng = ckpt["backend"]["rng"]
-        self.assertEqual(set(rng), {"torch", "cuda"})
+        self.assertEqual(set(rng), {"torch", "device_type", "cuda", "npu"})
         # single bound-device CUDA state, not the legacy per-device list
+        self.assertEqual(rng["device_type"], "cuda")
         self.assertIsInstance(rng["cuda"], torch.Tensor)
+        self.assertIsNone(rng["npu"])
 
         # Filter contract, checked against the LIVE trained module (not by
         # re-applying the filter): frozen-embed keys and nothing else dropped.

@@ -138,10 +138,72 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         *,
         target_head: Optional[nn.Module] = None,
         ploss_decay: float = 0.8,
+        compact_teacher: bool = False,
+        compact_teacher_chunk_size: Optional[int] = None,
     ) -> None:
         self.eagle3_model = eagle3_model
         self.target_head = target_head
         self.ploss_decay = ploss_decay
+        self.compact_teacher = compact_teacher
+        self.compact_teacher_chunk_size = compact_teacher_chunk_size
+        if compact_teacher:
+            self._validate_compact_teacher()
+
+    def _validate_compact_teacher(self) -> None:
+        """Validate the offline compact-teacher contract before the first step.
+
+        The strategy is constructed after the vocab mapping has been loaded and
+        after FSDP wrapping.  FSDP exposes the wrapped module as ``module``;
+        walking that one boundary keeps validation independent of the backend
+        while the actual forward still goes through the wrapped model.
+        """
+        if self.target_head is None:
+            raise ValueError(
+                "compact teacher requires the offline target_head; it is not "
+                "available for online capture"
+            )
+
+        model = self.eagle3_model
+        if not hasattr(model, "draft_model") and hasattr(model, "module"):
+            model = model.module
+        draft_model = getattr(model, "draft_model", None)
+        if draft_model is None:
+            raise ValueError(
+                "compact teacher requires an EAGLE3 model with a draft_model"
+            )
+
+        from specforge.core.compact_teacher import (
+            validate_compact_teacher_enabled,
+            validate_vocab_mapping_consistency,
+        )
+
+        target_head_weight = getattr(
+            getattr(self.target_head, "fc", None), "weight", None
+        )
+        vocab_size = (
+            int(target_head_weight.shape[0])
+            if target_head_weight is not None and target_head_weight.dim() >= 1
+            else int(
+                getattr(getattr(self.target_head, "config", None), "vocab_size", 0)
+            )
+        )
+        draft_vocab_size = int(
+            getattr(
+                getattr(draft_model, "config", None),
+                "draft_vocab_size",
+                int(draft_model.t2d.sum().item()),
+            )
+        )
+        validate_compact_teacher_enabled(
+            is_online=False,
+            is_vlm=False,
+            draft_vocab_size=draft_vocab_size,
+            vocab_size=vocab_size,
+            t2d=draft_model.t2d,
+            target_head_weight=target_head_weight,
+            chunk_size=self.compact_teacher_chunk_size,
+        )
+        validate_vocab_mapping_consistency(draft_model.t2d, draft_model.d2t)
 
     def trainable_module(self) -> nn.Module:
         return self.eagle3_model
@@ -174,9 +236,34 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         device = self._device()
         target_repr = batch.metadata.get("target_repr")
 
-        input_ids, target, loss_mask = self._prepare_target(
-            target_repr, t["input_ids"], t["target"], t["loss_mask"], device
-        )
+        compact_kwargs: Dict[str, Any] = {}
+        if self.compact_teacher:
+            if target_repr != "hidden_state":
+                raise ValueError(
+                    "compact teacher is offline-only and requires "
+                    "target_repr='hidden_state'"
+                )
+            # Preserve TargetHead.preprocess's shift exactly, but do not call
+            # TargetHead.forward: OnlineEagle3Model streams the frozen head in
+            # vocabulary chunks from these kwargs instead.
+            input_ids, target_hidden, loss_mask = self.target_head.preprocess(
+                t["input_ids"], t["target"], t["loss_mask"]
+            )
+            input_ids = input_ids.to(device)
+            target_hidden = target_hidden.to(device)
+            loss_mask = loss_mask.to(device)
+            from specforge.core.compact_teacher import build_offline_teacher_inputs
+
+            target, compact_kwargs = build_offline_teacher_inputs(
+                compact=True,
+                target_model=self.target_head,
+                target_hidden=target_hidden,
+                chunk_size_arg=self.compact_teacher_chunk_size,
+            )
+        else:
+            input_ids, target, loss_mask = self._prepare_target(
+                target_repr, t["input_ids"], t["target"], t["loss_mask"], device
+            )
         position_ids = t.get("position_ids")
         (
             plosses,
@@ -193,6 +280,7 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             target=target,
             hidden_states=t["hidden_state"].to(device),
             position_ids=position_ids.to(device) if position_ids is not None else None,
+            **compact_kwargs,
         )
         weights = [self.ploss_decay**i for i in range(len(plosses))]
         loss = sum(weights[i] * plosses[i] for i in range(len(plosses)))

@@ -27,7 +27,13 @@ training:
   save_interval: 2000
   log_interval: 50
   deployment_mode: local_colocated
+  dist_timeout: 30
   seed: 42
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-qwen3-8b-domino
+  wandb_name: qwen3-8b-domino_sharegpt
 
 run_id: qwen3-8b-domino-online
 output_dir: ./outputs/qwen3-8b-domino-online

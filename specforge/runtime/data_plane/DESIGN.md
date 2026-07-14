@@ -12,7 +12,8 @@ See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the complete topology.
 - `FeatureDataLoader` resolves refs through a store, validates and collates the
   result, and yields the only tensor-carrying runtime contract, `TrainBatch`.
 - Offline refs are fixed and re-iterable. Online refs are consume-once and are
-  never replayed for resume or a second consumer epoch.
+  never replayed as a second consumer epoch; resume rebuilds or reconciles only
+  the untrained suffix.
 
 ## Topology map
 
@@ -152,18 +153,22 @@ For every ref it performs `store.get -> clone if needed -> store.release`, then
 applies the injected per-sample transform and collator. The loader contains no
 model-specific loss logic and no topology branch.
 
-Queue acknowledgement has two layers in online disaggregation. The loader
-acks the private inbox after materializing each micro-batch, which drives
-producer backpressure. At the optimizer boundary, `DPAckController` gathers all
-rank sample ids and rank 0 records one durable ledger transaction.
+Queue acknowledgement has two layers in online disaggregation. Materialization
+only releases the feature read lease. At the optimizer boundary,
+`DPAckController` gathers every rank's sample ids, rank 0 records one durable
+ledger transaction and removes those features, then each private inbox advances
+its exact acknowledged prefix. This ordering keeps producer backpressure and
+restart accounting aligned with durable optimizer progress.
 
 ## Attempt lifecycle
 
-Online control and tensor objects belong to one fresh attempt. The public
-launcher requires fresh channel and SQLite paths; rank 0 recreates ephemeral
-inboxes. Online resume and a second pass over consumed refs are unsupported.
-Producer/consumer failures are propagated explicitly, and the producer cleans
-published Mooncake objects when the attempt finishes.
+An online producer always claims a fresh attempt and cannot resume. A fresh
+consumer also rejects a non-empty ledger. A consumer restart is supported only
+when its SQLite ledger, original channel/inboxes, Mooncake objects, and matching
+checkpoint remain available: rank 0 skips the optimizer-durable prefix and
+requeues the unacknowledged tail. A second pass over consumed refs remains
+unsupported. Producer/consumer failures are propagated explicitly, and the
+producer cleans published Mooncake objects when the attempt finishes.
 
 Offline manifests and feature objects are intentionally stable instead. They
 remain available for repeated epochs and checkpoint resume.

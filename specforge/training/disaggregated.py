@@ -146,6 +146,7 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
+        max_resident_bytes=cfg.runtime.feature_store_max_resident_bytes,
     )
 
 
@@ -220,12 +221,12 @@ def _build_offline(
     optimizer_factory: Callable,
     logger: Callable,
 ):
-    from specforge.training.assembly import TrainingRun
+    from specforge.training.assembly import (
+        TrainingRun,
+        _dataloader_num_workers,
+        _profiling_options,
+    )
 
-    if cfg.training.strategy != "eagle3":
-        raise NotImplementedError(
-            "disaggregated offline ingestion currently supports EAGLE3 features only"
-        )
     manifest = _env("DISAGG_MANIFEST")
     done = manifest + ".done"
 
@@ -243,6 +244,7 @@ def _build_offline(
                 refs = ingest_offline_features(
                     store,
                     cfg.data.hidden_states_path,
+                    strategy=cfg.training.strategy,
                     run_id=cfg.run_id,
                     ttt_length=cfg.training.ttt_length,
                     max_len=cfg.data.max_length,
@@ -262,8 +264,11 @@ def _build_offline(
     from specforge.runtime.data_plane.disagg_ingest import read_ref_manifest
 
     bundle = build_model_bundle(cfg, load_target_engine=False)
+    accumulation_steps = cfg.training.accumulation_steps
+    if cfg.training.attention_backend == "usp":
+        accumulation_steps *= cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
     trainer = build_disagg_offline_runtime(
-        strategy="eagle3",
+        strategy=cfg.training.strategy,
         feature_store=_offline_store(cfg, retain_on_release=True),
         refs=read_ref_manifest(manifest),
         draft_model=bundle.model,
@@ -271,18 +276,28 @@ def _build_offline(
         optimizer_factory=optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
+        ttt_length=cfg.training.ttt_length,
         max_len=cfg.data.max_length,
         batch_size=cfg.training.batch_size,
-        accumulation_steps=cfg.training.accumulation_steps,
+        accumulation_steps=accumulation_steps,
         num_epochs=cfg.training.num_epochs,
         max_steps=cfg.training.max_steps,
         total_steps=cfg.training.total_steps,
         save_interval=cfg.training.save_interval,
+        eval_interval=cfg.training.eval_interval,
+        eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
         logger=logger,
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
         resume_from=cfg.training.resume_from,
         max_checkpoints=cfg.training.max_checkpoints,
+        tp_size=cfg.training.tp_size,
+        sp_ulysses_size=cfg.training.sp_ulysses_size,
+        sp_ring_size=cfg.training.sp_ring_size,
+        use_usp_preprocess=(cfg.training.attention_backend == "usp"),
+        seed=cfg.training.seed,
+        dataloader_num_workers=_dataloader_num_workers(cfg),
+        profiling_options=_profiling_options(cfg),
     )
 
     def mark_consumed(_step: int) -> None:
@@ -300,9 +315,9 @@ def _build_offline(
 
 
 def _producer_capture_metadata(cfg: Config):
-    import json
-
     from transformers import AutoConfig
+
+    from specforge.training.model_loading import draft_config_dict
 
     target_cfg = AutoConfig.from_pretrained(
         cfg.model.target_model_path,
@@ -310,11 +325,7 @@ def _producer_capture_metadata(cfg: Config):
         trust_remote_code=cfg.model.trust_remote_code,
     )
     target_cfg = getattr(target_cfg, "text_config", target_cfg)
-    draft_path = cfg.model.draft_model_config
-    if os.path.isdir(draft_path):
-        draft_path = os.path.join(draft_path, "config.json")
-    with open(draft_path, encoding="utf-8") as stream:
-        draft_cfg = json.load(stream)
+    draft_cfg = draft_config_dict(cfg)
 
     if cfg.training.strategy in ("eagle3", "peagle"):
         from specforge.training.assembly import resolve_eagle_capture_layers
@@ -342,7 +353,11 @@ def _build_online(
     optimizer_factory: Callable,
     logger: Callable,
 ):
-    from specforge.training.assembly import TrainingRun
+    from specforge.training.assembly import (
+        TrainingRun,
+        _dataloader_num_workers,
+        _profiling_options,
+    )
 
     strategy = cfg.training.strategy
     if strategy == "peagle":
@@ -350,7 +365,10 @@ def _build_online(
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
         _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
-    store = _mooncake_store(cfg)
+    # The producer owns capture and explicit attempt cleanup. The consumer must
+    # retain materialized features until DPAckController commits the optimizer
+    # boundary and explicitly aborts the acknowledged ids.
+    store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
     channel = StreamingRefChannel(channel_path)
@@ -382,6 +400,22 @@ def _build_online(
         ]
         target_repr = "hidden_state" if strategy in ("eagle3", "dspark") else None
         peer_wait_timeout_s = float(os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800"))
+        high_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
+        in_flight_high_watermark = int(
+            high_watermark_override or cfg.runtime.in_flight_high_watermark
+        )
+        low_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
+        # Preserve the legacy one-watermark environment override: when only the
+        # old high value is supplied, resume at that same threshold.
+        in_flight_low_watermark = (
+            int(low_watermark_override)
+            if low_watermark_override is not None
+            else (
+                None
+                if high_watermark_override is not None
+                else cfg.runtime.in_flight_low_watermark
+            )
+        )
         _workers, drive = build_disagg_online_producer(
             strategy=strategy,
             prompts=prompts,
@@ -396,8 +430,18 @@ def _build_online(
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
-            in_flight_high_watermark=int(
-                os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK", "256")
+            lease=cfg.runtime.producer_lease,
+            in_flight_high_watermark=in_flight_high_watermark,
+            in_flight_low_watermark=in_flight_low_watermark,
+            resident_high_watermark_bytes=(
+                int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
+                if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
+                else cfg.runtime.resident_high_watermark_bytes
+            ),
+            resident_low_watermark_bytes=(
+                int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
+                if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
+                else cfg.runtime.resident_low_watermark_bytes
             ),
             peer_wait_timeout_s=peer_wait_timeout_s,
         )
@@ -484,7 +528,13 @@ def _build_online(
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
         max_checkpoints=cfg.training.max_checkpoints,
+        tp_size=cfg.training.tp_size,
+        sp_ulysses_size=cfg.training.sp_ulysses_size,
+        sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
+        resume_from=cfg.training.resume_from,
+        dataloader_num_workers=_dataloader_num_workers(cfg),
+        profiling_options=_profiling_options(cfg),
     )
 
     return TrainingRun(trainer=trainer)
