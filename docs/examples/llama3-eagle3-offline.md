@@ -20,71 +20,48 @@ torchrun --standalone --nproc_per_node 8 \
   scripts/prepare_hidden_states.py \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
-  --output-path ./cache/hidden_states/sharegpt-llama3-8b \
+  --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
   --chat-template llama3 \
   --max-length 4096 \
   --tp-size 1 \
   --batch-size 32
 ```
 
-The output directory contains the feature checkpoints consumed by the unified
-trainer. Offline EAGLE3 with a compact draft vocabulary also needs a matching
-`t2d`/`d2t` mapping generated from the same tokenized training corpus.
+The output directory now matches the hidden-state path in the checked-in
+recipe and contains the feature checkpoints consumed by the unified trainer.
 
-## 3. Create the run config
+## 3. Use the checked-in run config
 
-Create `llama3-eagle3-offline.yaml`:
+The canonical recipe is
+[`examples/configs/llama3.1-8b-eagle3-offline.yaml`](../../examples/configs/llama3.1-8b-eagle3-offline.yaml).
+It records the same target, feature directory, draft architecture, and trainer
+settings used by this walkthrough; edit the checked-in recipe or use dotted
+overrides instead of copying its YAML into another document.
 
-```yaml
-model:
-  target_model_path: meta-llama/Llama-3.1-8B-Instruct
-  draft_model_config: configs/llama3-8B-eagle3.json
-  embedding_key: model.embed_tokens.weight
-  vocab_mapping_path: ./cache/vocab_mapping/llama3-8b-eagle3.pt
-  torch_dtype: bfloat16
-
-data:
-  hidden_states_path: ./cache/hidden_states/sharegpt-llama3-8b
-  max_length: 4096
-  chat_template: llama3
-  cache_dir: ./cache
-
-training:
-  strategy: eagle3
-  deployment_mode: local_colocated
-  num_epochs: 10
-  batch_size: 1
-  learning_rate: 1.0e-4
-  max_grad_norm: 0.5
-  ttt_length: 7
-  attention_backend: flex_attention
-  save_interval: 1000
-  log_interval: 50
-
-run_id: llama3-8b-eagle3-offline
-output_dir: ./outputs/llama3-8b-eagle3-offline
-```
-
-The checked-in [Qwen offline
-config](../../examples/configs/qwen3-8b-eagle3-offline.yaml) is another complete
-reference.
+The recipe carries a conventional `model.vocab_mapping_path` for deployments
+that prepare and share a mapping artifact. For a local offline run, leaving
+that field empty makes SpecForge count effective tokens in the exact feature
+corpus, derive `t2d`/`d2t` deterministically, and cache the reusable mapping
+under `data.cache_dir/vocab_mapping`. Equal target and draft vocabularies need
+no mapping.
 
 ## 4. Train
 
 ```bash
-specforge train --config ./llama3-eagle3-offline.yaml
+specforge train \
+  --config examples/configs/llama3.1-8b-eagle3-offline.yaml \
+  model.vocab_mapping_path=
 ```
 
-The same entry supports offline data parallelism:
-
-```bash
-torchrun --standalone --nproc_per_node=4 "$(command -v specforge)" \
-  train --config ./llama3-eagle3-offline.yaml
-```
+Omit the final override when the mapping file named by the recipe already
+exists. The same recipe supports offline data parallelism through the typed
+`deployment.trainer` topology and unified self-launcher.
 
 For long sequences, EAGLE3 offline can instead use USP by setting
 `training.attention_backend=usp` and choosing
 `training.sp_ulysses_size`/`training.sp_ring_size`. Offline feature training
 also supports DFlash and Domino when the feature checkpoints and draft config
 use that strategy's contract. `training.compact_teacher: true` enables the
-exact lower-memory teacher projection for offline text EAGLE3.
+exact lower-memory teacher projection for offline text EAGLE3. See
+[Parallel topologies](../basic_usage/training.md#parallel-topologies) for the
+multi-process launch contract.

@@ -24,7 +24,6 @@ training:
   loss_decay_gamma: 7.0
   save_interval: 1000
   log_interval: 50
-  deployment_mode: local_colocated
   dist_timeout: 30
   seed: 42
 
@@ -35,3 +34,9 @@ tracking:
 
 run_id: qwen3-8b-dflash-online
 output_dir: ./outputs/qwen3-8b-dflash-online
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

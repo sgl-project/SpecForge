@@ -14,18 +14,17 @@ and derive the draft architecture from the target; see the
 for layer/block overrides and the distinction between weights-only
 `model.draft_checkpoint_path` and full `training.resume_from`.
 
-For multi-process colocated runs, launch the same entry with the topology
-encoded in `training.tp_size` and the required world size:
+Every recipe records its audited process count under `deployment.trainer`.
+Multi-process configs self-launch through torch distributed:
 
 ```bash
-torchrun --standalone --nproc_per_node 4 "$(command -v specforge)" \
-    train --config examples/configs/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
 The filename is the index: `*-online.yaml` performs target capture while
 training, `*-offline.yaml` consumes precomputed features, `*-disaggregated.yaml`
-is launched once per producer/consumer role through the wrappers in
-`examples/disagg/`, and `*-npu.yaml` retains the HF + SDPA Ascend recipes.
+supervises both roles on one trainer node or selects a split role with
+`--role`, and `*-npu.yaml` retains the HF + SDPA Ascend recipes.
 Qwen2.5-VL has both 7B and 32B online recipes and uses the same EAGLE3 trainer.
 
 Before running a recipe, update model/data paths and create any referenced
@@ -74,12 +73,11 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-torchrun --standalone --nproc_per_node=4 "$(command -v specforge)" \
-  train --config examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/qwen3.5-4b-dflash-online-npu.yaml
 ```
 
-`torchrun` provides rank/world/rendezvous variables and the runtime selects
-HCCL when `torch_npu` is active. For AMD GPUs, install
+The unified launcher provides rank/world/rendezvous variables and the runtime
+selects HCCL when `torch_npu` is active. For AMD GPUs, install
 `requirements-rocm.txt`; HF + SDPA is the portable ROCm starting point.
 
 Colocated online/offline and disaggregated offline resume are supported.

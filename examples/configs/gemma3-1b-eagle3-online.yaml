@@ -20,8 +20,13 @@ training:
   attention_backend: "sdpa"
   save_interval: 1000
   log_interval: 10
-  deployment_mode: "local_colocated"
   dist_timeout: 20
   seed: 0
 run_id: "gemma3-1b-eagle3-online"
 output_dir: "./outputs/gemma3-1b-eagle3-online"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

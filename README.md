@@ -33,10 +33,11 @@ Every method uses the same typed training entry point:
 specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
 ```
 
-Colocated and offline configs scale with `torchrun` through the supported target
-TP/DP, trainer DP, and EAGLE3 offline USP topologies. Online-disaggregated
-consumers support trainer DP. Configuration selects the method, data source, and
-runtime topology; there are no method-specific Python training entry points.
+The typed `deployment.trainer` topology self-launches supported target TP/DP,
+trainer DP, and EAGLE3 offline USP process groups. A single-node disaggregated
+config also supervises its SpecForge producer and consumer; Mooncake and SGLang
+remain externally managed services. There are no method-specific Python
+training entry points.
 
 | Method | Description | Example config | Optimization |
 | --- | --- | --- | --- |

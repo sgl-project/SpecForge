@@ -26,7 +26,6 @@ training:
   norm_before_residual: false
   save_interval: 50000
   log_interval: 50
-  deployment_mode: local_colocated
   dist_timeout: 120
   seed: 0
 
@@ -35,3 +34,9 @@ tracking:
 
 run_id: qwen3-8b-peagle-online
 output_dir: ./outputs/qwen3-8b-peagle-online
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

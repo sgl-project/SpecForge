@@ -56,5 +56,5 @@ SpecForge. The checked-in
 and
 [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml)
 recipes use HF target capture with SDPA. The unified launcher detects the NPU
-device and selects HCCL; see the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu)
-for the complete `torchrun` environment and command.
+device, self-launches the process count recorded in YAML, and selects HCCL; see
+the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu).

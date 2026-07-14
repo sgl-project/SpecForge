@@ -193,6 +193,90 @@ class RuntimeConfig(StrictConfigModel):
         return self
 
 
+class TrainerDeploymentConfig(StrictConfigModel):
+    """Process topology used by the unified CLI launcher."""
+
+    nnodes: int = Field(default=1, gt=0)
+    nproc_per_node: int = Field(default=1, gt=0)
+    #: Node-local identity. Shared multi-node configs normally provide this
+    #: through ``specforge train --node-rank`` instead.
+    node_rank: Optional[int] = Field(default=None, ge=0)
+    master_addr: Optional[str] = None
+    master_port: int = Field(default=29500, gt=0, le=65535)
+
+    @model_validator(mode="after")
+    def _validate_topology(self):
+        if self.node_rank is not None and self.node_rank >= self.nnodes:
+            raise ValueError(
+                "deployment.trainer.node_rank must be smaller than "
+                "deployment.trainer.nnodes"
+            )
+        if self.nnodes > 1 and not self.master_addr:
+            raise ValueError(
+                "deployment.trainer.master_addr is required when nnodes > 1"
+            )
+        return self
+
+
+class DisaggregatedDeploymentConfig(StrictConfigModel):
+    """Shared, non-secret topology for producer/consumer launch planning."""
+
+    #: Attempt-scoped shared directory. The launcher derives refs, manifest,
+    #: SQLite, and per-rank inbox paths beneath it.
+    control_dir: str
+    backend: Literal["shared_dir", "mooncake"]
+    store_root: Optional[str] = None
+    store_id: Optional[str] = None
+    server_urls: List[str] = Field(default_factory=list)
+    mooncake_metadata_server: Optional[str] = None
+    mooncake_master_server_addr: Optional[str] = None
+    mooncake_local_hostname: Optional[str] = None
+    mooncake_protocol: Optional[str] = None
+    mooncake_rdma_devices: Optional[str] = None
+    #: Offline Mooncake producers own ingested feature objects until the
+    #: consumer acknowledges them, so they require a positive segment. Online
+    #: capture remains server-owned and the launcher forces client segments to
+    #: zero for both SpecForge roles.
+    producer_segment_size: Optional[int] = Field(default=None, gt=0)
+    client_buffer_size: int = Field(default=256 << 20, gt=0)
+    idle_timeout_s: Optional[float] = Field(default=None, gt=0)
+    peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
+    producer_hold_s: Optional[float] = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_store(self):
+        if not self.control_dir:
+            raise ValueError("deployment.disaggregated.control_dir must not be empty")
+        if self.backend == "shared_dir" and not self.store_root:
+            raise ValueError(
+                "deployment.disaggregated.store_root is required for shared_dir"
+            )
+        return self
+
+
+class DeploymentConfig(StrictConfigModel):
+    """User-facing launch topology for ``specforge train``."""
+
+    #: ``None`` preserves legacy configs whose deployment fields still live
+    #: under ``training``. New recipes always set this explicitly.
+    mode: Optional[Literal["local_colocated", "disaggregated"]] = None
+    trainer: TrainerDeploymentConfig = Field(default_factory=TrainerDeploymentConfig)
+    disaggregated: Optional[DisaggregatedDeploymentConfig] = None
+
+    @model_validator(mode="after")
+    def _validate_mode(self):
+        if self.mode == "disaggregated" and self.disaggregated is None:
+            raise ValueError(
+                "deployment.disaggregated is required when "
+                "deployment.mode=disaggregated"
+            )
+        if self.mode != "disaggregated" and self.disaggregated is not None:
+            raise ValueError(
+                "deployment.disaggregated requires deployment.mode=disaggregated"
+            )
+        return self
+
+
 class TrainingConfig(StrictConfigModel):
     strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
@@ -254,7 +338,7 @@ class TrainingConfig(StrictConfigModel):
     #: ``all`` is a colocated run. Disaggregated online runs launch producer
     #: and consumer as separate ``specforge train`` processes with the same
     #: config and different roles.
-    role: Literal["all", "producer", "consumer"] = "all"
+    role: Literal["auto", "all", "producer", "consumer"] = "all"
     server_urls: List[str] = Field(default_factory=list)
     metadata_db_path: Optional[str] = None
     seed: int = 42
@@ -292,13 +376,13 @@ class TrainingConfig(StrictConfigModel):
             )
         if self.role != "all" and self.deployment_mode != "disaggregated":
             raise ValueError(
-                "training.role=producer/consumer requires "
+                "training.role=auto/producer/consumer requires "
                 "training.deployment_mode=disaggregated"
             )
         if self.deployment_mode == "disaggregated" and self.role == "all":
             raise ValueError(
                 "training.deployment_mode=disaggregated requires "
-                "training.role=producer or consumer"
+                "training.role=auto, producer, or consumer"
             )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
@@ -325,8 +409,48 @@ class Config(StrictConfigModel):
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
     profiling: ProfilingConfig = Field(default_factory=ProfilingConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    deployment: DeploymentConfig = Field(default_factory=DeploymentConfig)
     run_id: str = "specforge-run"
     output_dir: str = "./output"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_deployment_surface(cls, values):
+        """Project the new launch surface onto the retained assembly fields."""
+        if not isinstance(values, dict) or "deployment" not in values:
+            return values
+        raw = dict(values)
+        deployment = dict(raw.get("deployment") or {})
+        if not isinstance(deployment, dict):
+            return values
+        mode = deployment.get("mode")
+        if mode is None:
+            return values
+        training = dict(raw.get("training") or {})
+        legacy_mode = training.get("deployment_mode")
+        if legacy_mode is not None and legacy_mode != mode:
+            raise ValueError("deployment.mode conflicts with training.deployment_mode")
+        training["deployment_mode"] = mode
+        training.setdefault("role", "auto" if mode == "disaggregated" else "all")
+        disaggregated = dict(deployment.get("disaggregated") or {})
+        if disaggregated:
+            has_new_urls = "server_urls" in disaggregated
+            has_legacy_urls = "server_urls" in training
+            new_urls = disaggregated.get("server_urls")
+            legacy_urls = training.get("server_urls")
+            if has_new_urls and has_legacy_urls and new_urls != legacy_urls:
+                raise ValueError(
+                    "deployment.disaggregated.server_urls conflicts with "
+                    "training.server_urls"
+                )
+            if has_new_urls:
+                training["server_urls"] = new_urls
+            elif has_legacy_urls:
+                disaggregated["server_urls"] = legacy_urls
+                deployment["disaggregated"] = disaggregated
+                raw["deployment"] = deployment
+        raw["training"] = training
+        return raw
 
     @model_validator(mode="after")
     def _validate_capability_matrix(self):
@@ -471,6 +595,24 @@ class Config(StrictConfigModel):
                 "disaggregated online capture uses an SGLang server and requires "
                 "model.target_backend=sglang"
             )
+        if self.model.target_backend == "sglang":
+            ep_size = self.model.sglang_ep_size
+            tp_size = self.training.tp_size
+            if ep_size > tp_size or tp_size % ep_size:
+                raise ValueError(
+                    "model.sglang_ep_size must be no larger than and evenly "
+                    "divide training.tp_size"
+                )
+        if (
+            mode == "online"
+            and deployment == "disaggregated"
+            and self.deployment.disaggregated is not None
+            and self.deployment.disaggregated.backend != "mooncake"
+        ):
+            raise ValueError(
+                "online disaggregated training requires "
+                "deployment.disaggregated.backend=mooncake"
+            )
         if (
             mode == "online"
             and deployment == "disaggregated"
@@ -486,7 +628,7 @@ class Config(StrictConfigModel):
         if self.training.metadata_db_path is not None and not (
             mode == "online"
             and deployment == "disaggregated"
-            and self.training.role == "consumer"
+            and self.training.role in ("auto", "consumer")
         ):
             raise ValueError(
                 "training.metadata_db_path belongs to the online consumer only"
@@ -596,6 +738,7 @@ class Config(StrictConfigModel):
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
     """Apply dotted ``section.field=value`` overrides, re-validating the result."""
     raw = config.model_dump()
+    overridden_paths = set()
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
@@ -608,7 +751,31 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
             node = node[key]
         if keys[-1] not in node:
             raise ValueError(f"override path {path!r} does not exist")
-        node[keys[-1]] = value  # pydantic coerces the string on re-validation
+        current = node[keys[-1]]
+        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
+            import yaml
+
+            try:
+                value = yaml.safe_load(value)
+            except yaml.YAMLError as exc:
+                raise ValueError(
+                    f"override {path!r} contains an invalid structured value"
+                ) from exc
+        node[keys[-1]] = value  # pydantic coerces scalars on re-validation
+        overridden_paths.add(path)
+
+    if "deployment.mode" in overridden_paths:
+        raw["training"]["deployment_mode"] = raw["deployment"]["mode"]
+    elif "training.deployment_mode" in overridden_paths:
+        raw["deployment"]["mode"] = raw["training"]["deployment_mode"]
+
+    new_urls_path = "deployment.disaggregated.server_urls"
+    legacy_urls_path = "training.server_urls"
+    disaggregated = raw["deployment"].get("disaggregated")
+    if new_urls_path in overridden_paths:
+        raw["training"]["server_urls"] = disaggregated["server_urls"]
+    elif legacy_urls_path in overridden_paths and disaggregated is not None:
+        disaggregated["server_urls"] = raw["training"]["server_urls"]
     return Config.model_validate(raw)
 
 
@@ -625,6 +792,9 @@ __all__ = [
     "TrackingConfig",
     "ProfilingConfig",
     "RuntimeConfig",
+    "TrainerDeploymentConfig",
+    "DisaggregatedDeploymentConfig",
+    "DeploymentConfig",
     "TrainingConfig",
     "Config",
     "load_config",

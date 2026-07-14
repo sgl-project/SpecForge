@@ -215,20 +215,21 @@ fi
             capture[layer_index + 1 : layer_index + 6], ["1", "9", "17", "25", "33"]
         )
 
-        producer = command_line(result.stdout, "run_online.sh producer", " > ")
-        consumer = command_line(result.stdout, "run_online.sh consumer", " 2>&1 | tee ")
+        producer = command_line(result.stdout, "run_online.sh --role producer", " > ")
+        consumer = command_line(
+            result.stdout, "run_online.sh --role consumer", " 2>&1 | tee "
+        )
         for command in (producer, consumer):
             self.assertIn("training.num_epochs=20", command)
             self.assertIn("training.max_steps=10", command)
             self.assertIn("training.batch_size=1", command)
             self.assertIn("training.accumulation_steps=1", command)
             self.assertIn("tracking.report_to=none", command)
+            self.assertIn("deployment.trainer.nproc_per_node=2", command)
             self.assertIn(
                 f"data.train_data_path={work_dir / 'single_sample.jsonl'}", command
             )
-        self.assertEqual(
-            consumer[consumer.index("NPROC_PER_NODE=2")], "NPROC_PER_NODE=2"
-        )
+        self.assertNotIn("NPROC_PER_NODE=2", consumer)
 
         check = command_line(result.stdout, "check_overfit_metrics.py")
         self.assertEqual(check[check.index("--expected-step") + 1], "10")

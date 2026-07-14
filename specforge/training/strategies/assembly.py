@@ -27,7 +27,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional
 
 if TYPE_CHECKING:
-    import torch
     from transformers import PretrainedConfig
 
     from specforge.config import Config

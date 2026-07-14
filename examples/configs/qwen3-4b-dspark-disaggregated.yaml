@@ -10,8 +10,6 @@ data:
   build_dataset_num_proc: 32
 training:
   strategy: dspark
-  deployment_mode: disaggregated
-  role: producer
   num_epochs: 6
   max_steps: 10000
   batch_size: 1
@@ -24,3 +22,17 @@ training:
   seed: 42
 run_id: qwen3-4b-dspark-disaggregated
 output_dir: outputs/qwen3-4b-dspark-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: outputs/qwen3-4b-dspark-disaggregated/control
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

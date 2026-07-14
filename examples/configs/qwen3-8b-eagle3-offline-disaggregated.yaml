@@ -7,8 +7,6 @@ data:
   max_length: 4096
 training:
   strategy: eagle3
-  deployment_mode: disaggregated
-  role: producer
   num_epochs: 10
   batch_size: 1
   learning_rate: 0.0001
@@ -18,3 +16,13 @@ training:
   seed: 0
 run_id: qwen3-8b-eagle3-offline-disaggregated
 output_dir: outputs/qwen3-8b-eagle3-offline-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: outputs/qwen3-8b-eagle3-offline-disaggregated/control
+    backend: shared_dir
+    store_root: outputs/qwen3-8b-eagle3-offline-disaggregated/features

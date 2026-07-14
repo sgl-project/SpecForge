@@ -23,7 +23,6 @@ training:
   loss_decay_gamma: 7
   save_interval: 10000
   log_interval: 50
-  deployment_mode: "local_colocated"
   dist_timeout: 30
   seed: 42
 tracking:
@@ -32,3 +31,9 @@ tracking:
   wandb_name: "lfm2.5-1.2b-instruct-dflash-perfectblend-8layers"
 run_id: "lfm2.5-1.2b-instruct-dflash-online"
 output_dir: "./outputs/lfm2.5-1.2b-instruct-dflash-online"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

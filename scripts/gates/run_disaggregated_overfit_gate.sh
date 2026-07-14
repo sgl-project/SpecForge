@@ -236,10 +236,11 @@ COMMON_OVERRIDES=(
     training.eval_interval=0
     "training.save_interval=$MAX_STEPS"
     training.log_interval=1
-    training.deployment_mode=disaggregated
     training.tp_size=1
     training.sp_ulysses_size=1
     training.sp_ring_size=1
+    "deployment.trainer.nproc_per_node=$NPROC_PER_NODE"
+    "deployment.disaggregated.control_dir=$WORK_DIR"
     tracking.report_to=none
     "runtime.in_flight_high_watermark=$IN_FLIGHT_HIGH_WATERMARK"
     "runtime.in_flight_low_watermark=$IN_FLIGHT_LOW_WATERMARK"
@@ -291,7 +292,6 @@ if ! gate_dry_run; then
             "$PYTHON" "$CAPTURE_HOST" "$CAPTURE_PORT" CAPTURE_PORT
     fi
     mkdir -p "$PRODUCER_OUTPUT_DIR" "$CONSUMER_OUTPUT_DIR" "$DISAGG_INBOX_DIR"
-    : >"$DISAGG_REF_CHANNEL"
 fi
 
 gate_run "${SELECT_ARGS[@]}"
@@ -319,16 +319,14 @@ gate_wait_http "$CAPTURE_PID" capture-server \
 
 gate_start_service producer "$PRODUCER_LOG" \
     env CUDA_VISIBLE_DEVICES= \
-    "$ONLINE_LAUNCHER" producer \
+    "$ONLINE_LAUNCHER" --role producer \
     "${COMMON_OVERRIDES[@]}" \
     "output_dir=$PRODUCER_OUTPUT_DIR"
 PRODUCER_PID=$GATE_LAST_PID
 
 gate_run_with_tee "$TRAIN_LOG" \
     env "CUDA_VISIBLE_DEVICES=$CONSUMER_GPUS" \
-    "NPROC_PER_NODE=$NPROC_PER_NODE" NNODES=1 \
-    "DISAGG_DB=$DISAGG_DB" "DISAGG_INBOX_DIR=$DISAGG_INBOX_DIR" \
-    "$ONLINE_LAUNCHER" consumer \
+    "$ONLINE_LAUNCHER" --role consumer \
     "${COMMON_OVERRIDES[@]}" \
     "output_dir=$CONSUMER_OUTPUT_DIR"
 gate_wait_pid "$PRODUCER_PID" producer "$PRODUCER_LOG"

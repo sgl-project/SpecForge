@@ -268,9 +268,9 @@ torchrun --nproc_per_node=8 \
 ```
 
 This `torchrun` command parallelizes feature preparation. The subsequent
-offline run still uses the one `specforge train` entry and may be launched with
-`torchrun` for data parallelism or EAGLE3 USP; its world size and topology are
-independent of the feature-preparation job.
+offline run still uses the one `specforge train` entry and self-launches the
+data-parallel or EAGLE3 USP topology recorded under `deployment.trainer`; its
+world size is independent of the feature-preparation job.
 
 Once the `jsonl` file is ready, use it in an online run config or generate
 hidden states for an offline config. See the [Training](training.md) guide for

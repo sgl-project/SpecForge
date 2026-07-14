@@ -90,6 +90,29 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "not supported for VLM"):
             Config.model_validate(invalid)
 
+    def test_sglang_expert_parallelism_must_fit_target_tensor_parallelism(self):
+        payload = {
+            **MINIMAL,
+            "model": {
+                **MINIMAL["model"],
+                "target_backend": "sglang",
+                "sglang_ep_size": 2,
+            },
+            "training": {"tp_size": 4},
+        }
+        config = Config.model_validate(payload)
+        self.assertEqual(config.model.sglang_ep_size, 2)
+
+        invalid = copy.deepcopy(payload)
+        invalid["model"]["sglang_ep_size"] = 3
+        with self.assertRaisesRegex(ValidationError, "evenly divide"):
+            Config.model_validate(invalid)
+
+        invalid = copy.deepcopy(payload)
+        invalid["model"]["sglang_ep_size"] = 8
+        with self.assertRaisesRegex(ValidationError, "no larger"):
+            Config.model_validate(invalid)
+
     def test_online_eagle3_preserves_multi_sample_batches(self):
         payload = {
             **MINIMAL,

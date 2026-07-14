@@ -1,4 +1,4 @@
-"""Dependency-light contract tests for the disaggregated shell launchers."""
+"""Dependency-light contracts for the thin disaggregated examples."""
 
 from __future__ import annotations
 
@@ -12,457 +12,114 @@ ROOT = Path(__file__).resolve().parents[2]
 ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
 
-_DISAGG_ENV_PREFIXES = ("DISAGG_", "MOONCAKE_")
-_TORCHRUN_ENV_KEYS = {
-    "MASTER_ADDR",
-    "MASTER_PORT",
-    "NNODES",
-    "NODE_RANK",
-    "NPROC_PER_NODE",
-}
 
-
-class TestDisaggregatedLaunchers(unittest.TestCase):
+class DisaggregatedWrapperTest(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(prefix="disagg_launchers_")
+        self._tmp = tempfile.TemporaryDirectory(prefix="disagg_wrapper_")
         self.root = Path(self._tmp.name)
         self.bin_dir = self.root / "bin"
-        self.capture_dir = self.root / "capture"
         self.bin_dir.mkdir()
-        self.capture_dir.mkdir()
+        self.capture = self.root / "args.txt"
         self.config = self.root / "run config.yaml"
-        self.config.write_text("run_id: launcher-contract\n", encoding="utf-8")
-        for program in ("specforge", "torchrun"):
-            executable = self.bin_dir / program
-            executable.write_text(
-                "#!/usr/bin/env bash\n"
-                "set -euo pipefail\n"
-                'printf "%s\\n" "$@" > "${CAPTURE_DIR}/'
-                f'{program}.args"\n',
-                encoding="utf-8",
-            )
-            executable.chmod(0o755)
+        self.config.write_text("run_id: wrapper-test\n", encoding="utf-8")
+        executable = self.bin_dir / "specforge"
+        executable.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'printf "%s\\n" "$@" > "$CAPTURE_PATH"\n',
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _base_env(self):
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith(_DISAGG_ENV_PREFIXES)
-            and key not in _TORCHRUN_ENV_KEYS
-            and key not in {"CONFIG", "CAPTURE_DIR"}
-        }
-        env.update(
-            {
-                "PATH": f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}",
-                "CAPTURE_DIR": str(self.capture_dir),
-                "CONFIG": str(self.config),
-            }
-        )
+    def _env(self, *, include_config=True):
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["CAPTURE_PATH"] = str(self.capture)
+        if include_config:
+            env["CONFIG"] = str(self.config)
+        else:
+            env.pop("CONFIG", None)
         return env
 
-    def _online_env(self):
-        env = self._base_env()
-        env.update(
-            {
-                "DISAGG_REF_CHANNEL": str(self.root / "attempt.refs.jsonl"),
-                "MOONCAKE_METADATA_SERVER": "http://metadata:8080/metadata",
-                "MOONCAKE_MASTER_SERVER_ADDR": "master:50051",
-                "MOONCAKE_LOCAL_HOSTNAME": "worker.example",
-            }
-        )
-        return env
-
-    def _offline_env(self):
-        env = self._base_env()
-        env.update(
-            {
-                "DISAGG_MANIFEST": str(self.root / "attempt.manifest.json"),
-                "DISAGG_STORE_ROOT": str(self.root / "features"),
-            }
-        )
-        return env
-
-    def _run(self, script: Path, role: str | None, env, *overrides: str):
-        command = [str(script)]
-        if role is not None:
-            command.append(role)
-        command.extend(overrides)
+    def _run(self, wrapper, *args, include_config=True):
         return subprocess.run(
-            command,
+            [str(wrapper), *args],
             cwd=ROOT,
-            env=env,
+            env=self._env(include_config=include_config),
             text=True,
             capture_output=True,
             check=False,
         )
 
-    def _captured(self, program: str):
-        path = self.capture_dir / f"{program}.args"
-        return path.read_text(encoding="utf-8").splitlines()
-
-    def test_launchers_are_executable(self):
-        self.assertTrue(os.access(ONLINE, os.X_OK))
-        self.assertTrue(os.access(OFFLINE, os.X_OK))
-        for launcher in (ONLINE, OFFLINE):
-            result = subprocess.run(
-                ["bash", "-n", str(launcher)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((ONLINE.parent / "run_role.sh").exists())
-
-    def test_launchers_reject_missing_config_and_invalid_role(self):
-        for launcher in (ONLINE, OFFLINE):
-            with self.subTest(launcher=launcher.name, case="missing role"):
-                result = self._run(launcher, None, self._base_env())
-                self.assertEqual(result.returncode, 2)
-            with self.subTest(launcher=launcher.name, case="invalid role"):
-                result = self._run(launcher, "all", self._base_env())
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("producer or consumer", result.stderr)
-            with self.subTest(launcher=launcher.name, case="missing config"):
-                env = self._base_env()
-                del env["CONFIG"]
-                result = self._run(launcher, "producer", env)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("CONFIG", result.stderr)
-        self.assertEqual(list(self.capture_dir.iterdir()), [])
-
-    def test_online_producer_dispatches_to_the_single_training_cli(self):
-        env = self._online_env()
-        result = self._run(
-            ONLINE,
-            "producer",
-            env,
-            "training.batch_size=2",
-            "training.role=consumer",
-            "run_id=attempt with spaces",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("specforge"),
-            [
-                "train",
-                "--config",
-                str(self.config),
-                "training.batch_size=2",
-                "training.role=consumer",
-                "run_id=attempt with spaces",
-                "training.role=producer",
-            ],
-        )
-
-    def test_online_consumer_dispatches_dp_through_torchrun(self):
-        env = self._online_env()
-        env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
-        env["NPROC_PER_NODE"] = "4"
-        result = self._run(ONLINE, "consumer", env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("torchrun"),
-            [
-                "--standalone",
-                "--nproc_per_node",
-                "4",
-                str(self.bin_dir / "specforge"),
-                "train",
-                "--config",
-                str(self.config),
-                f"training.metadata_db_path={env['DISAGG_DB']}",
-                "training.role=consumer",
-            ],
-        )
-
-    def test_online_consumer_dispatches_multinode_through_torchrun(self):
-        env = self._online_env()
-        database = self.root / "consumer.sqlite"
-        # A nonzero node may join after global rank 0 created the shared DB.
-        database.touch()
-        env.update(
-            {
-                "DISAGG_DB": str(database),
-                "NNODES": "2",
-                "NODE_RANK": "1",
-                "MASTER_ADDR": "trainer-0.example",
-                "MASTER_PORT": "29400",
-                "NPROC_PER_NODE": "4",
-            }
-        )
-        result = self._run(ONLINE, "consumer", env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("torchrun"),
-            [
-                "--nnodes",
-                "2",
-                "--node_rank",
-                "1",
-                "--master_addr",
-                "trainer-0.example",
-                "--master_port",
-                "29400",
-                "--nproc_per_node",
-                "4",
-                str(self.bin_dir / "specforge"),
-                "train",
-                "--config",
-                str(self.config),
-                f"training.metadata_db_path={env['DISAGG_DB']}",
-                "training.role=consumer",
-            ],
-        )
-
-    def test_consumers_validate_multinode_rendezvous(self):
-        for launcher, base_env in (
-            (ONLINE, self._online_env()),
-            (OFFLINE, self._offline_env()),
-        ):
-            with self.subTest(launcher=launcher.name, case="missing node rank"):
-                env = dict(base_env)
-                env["NNODES"] = "2"
-                if launcher == ONLINE:
-                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
-                result = self._run(launcher, "consumer", env)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("NODE_RANK", result.stderr)
-
-            with self.subTest(launcher=launcher.name, case="missing master"):
-                env = dict(base_env)
-                env.update({"NNODES": "2", "NODE_RANK": "0"})
-                if launcher == ONLINE:
-                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
-                result = self._run(launcher, "consumer", env)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("MASTER_ADDR", result.stderr)
-
-            with self.subTest(launcher=launcher.name, case="rank out of range"):
-                env = dict(base_env)
-                env.update({"NNODES": "2", "NODE_RANK": "2"})
-                if launcher == ONLINE:
-                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
-                result = self._run(launcher, "consumer", env)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("smaller than NNODES", result.stderr)
-
-            with self.subTest(launcher=launcher.name, case="invalid master port"):
-                env = dict(base_env)
-                env.update(
-                    {
-                        "NNODES": "2",
-                        "NODE_RANK": "0",
-                        "MASTER_ADDR": "trainer-0.example",
-                        "MASTER_PORT": "70000",
-                    }
+    def test_wrappers_are_executable_and_syntax_valid(self):
+        for wrapper in (ONLINE, OFFLINE):
+            with self.subTest(wrapper=wrapper.name):
+                self.assertTrue(os.access(wrapper, os.X_OK))
+                result = subprocess.run(
+                    ["bash", "-n", str(wrapper)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
                 )
-                if launcher == ONLINE:
-                    env["DISAGG_DB"] = str(self.root / "consumer.sqlite")
-                result = self._run(launcher, "consumer", env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_wrappers_only_delegate_to_the_unified_cli(self):
+        for wrapper in (ONLINE, OFFLINE):
+            with self.subTest(wrapper=wrapper.name):
+                result = self._run(
+                    wrapper,
+                    "--role",
+                    "consumer",
+                    "--plan",
+                    "training.batch_size=2",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.capture.read_text(encoding="utf-8").splitlines(),
+                    [
+                        "train",
+                        "--config",
+                        str(self.config),
+                        "--role",
+                        "consumer",
+                        "--plan",
+                        "training.batch_size=2",
+                    ],
+                )
+
+    def test_wrappers_validate_only_the_config_boundary(self):
+        for wrapper in (ONLINE, OFFLINE):
+            with self.subTest(wrapper=wrapper.name):
+                result = self._run(wrapper, include_config=False)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn("MASTER_PORT", result.stderr)
+                self.assertIn("set CONFIG", result.stderr)
 
-    def test_online_rejects_missing_transport_and_stale_database(self):
-        missing = self._online_env()
-        del missing["DISAGG_REF_CHANNEL"]
-        result = self._run(ONLINE, "producer", missing)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("DISAGG_REF_CHANNEL", result.stderr)
-
-        stale = self._online_env()
-        database = self.root / "stale.sqlite"
-        database.touch()
-        stale["DISAGG_DB"] = str(database)
-        result = self._run(ONLINE, "consumer", stale)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("fresh attempt path", result.stderr)
-
-    def test_online_consumer_resume_reuses_only_an_existing_database(self):
-        env = self._online_env()
-        database = self.root / "retained.sqlite"
-        database.touch()
-        env["DISAGG_DB"] = str(database)
-        checkpoint = self.root / "run0-latest"
-
-        result = self._run(
-            ONLINE,
-            "consumer",
-            env,
-            f"training.resume_from={checkpoint}",
+    def test_topology_and_transport_logic_are_not_duplicated_in_shell(self):
+        forbidden = (
+            "torchrun",
+            "NPROC_PER_NODE",
+            "NNODES",
+            "NODE_RANK",
+            "DISAGG_DB",
+            "DISAGG_REF_CHANNEL",
+            "DISAGG_MANIFEST",
+            "MOONCAKE_",
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"training.resume_from={checkpoint}", self._captured("torchrun"))
+        for wrapper in (ONLINE, OFFLINE):
+            source = wrapper.read_text(encoding="utf-8")
+            for token in forbidden:
+                with self.subTest(wrapper=wrapper.name, token=token):
+                    self.assertNotIn(token, source)
 
-        missing = self._online_env()
-        missing["DISAGG_DB"] = str(self.root / "missing.sqlite")
-        result = self._run(
-            ONLINE,
-            "consumer",
-            missing,
-            f"training.resume_from={checkpoint}",
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("retained DISAGG_DB", result.stderr)
-
-    def test_online_consumer_requires_an_explicit_database_for_dp(self):
-        env = self._online_env()
-        env["NPROC_PER_NODE"] = "4"
-        result = self._run(ONLINE, "consumer", env)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("DISAGG_DB", result.stderr)
-
-    def test_online_consumer_inbox_requires_an_explicit_database(self):
-        env = self._online_env()
-        env["DISAGG_INBOX_DIR"] = str(self.root / "inbox")
-        result = self._run(ONLINE, "consumer", env)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("DISAGG_DB", result.stderr)
-
-    def test_online_single_rank_consumer_requires_database(self):
-        env = self._online_env()
-        result = self._run(ONLINE, "consumer", env)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("DISAGG_DB", result.stderr)
-
-    def test_online_database_env_overrides_the_config_path(self):
-        env = self._online_env()
-        env["DISAGG_DB"] = str(self.root / "fresh.sqlite")
-        result = self._run(
-            ONLINE,
-            "consumer",
-            env,
-            "training.metadata_db_path=/shared/stale.sqlite",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("torchrun")[-3:],
-            [
-                "training.metadata_db_path=/shared/stale.sqlite",
-                f"training.metadata_db_path={env['DISAGG_DB']}",
-                "training.role=consumer",
-            ],
-        )
-
-    def test_offline_producer_is_direct_and_consumer_dispatches_dp_through_torchrun(
-        self,
-    ):
-        result = self._run(OFFLINE, "producer", self._offline_env())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("specforge"),
-            ["train", "--config", str(self.config), "training.role=producer"],
-        )
-
-        result = self._run(OFFLINE, "consumer", self._offline_env())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("torchrun"),
-            [
-                "--standalone",
-                "--nproc_per_node",
-                "1",
-                str(self.bin_dir / "specforge"),
-                "train",
-                "--config",
-                str(self.config),
-                "training.role=consumer",
-            ],
-        )
-
-        multi_rank = self._offline_env()
-        multi_rank["NPROC_PER_NODE"] = "2"
-        result = self._run(OFFLINE, "consumer", multi_rank)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self._captured("torchrun")[1:3], ["--nproc_per_node", "2"])
-
-    def test_offline_consumer_dispatches_multinode_through_torchrun(self):
-        env = self._offline_env()
-        env.update(
-            {
-                "NNODES": "3",
-                "NODE_RANK": "2",
-                "MASTER_ADDR": "trainer-0.example",
-                "MASTER_PORT": "29500",
-                "NPROC_PER_NODE": "8",
-            }
-        )
-        result = self._run(OFFLINE, "consumer", env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self._captured("torchrun"),
-            [
-                "--nnodes",
-                "3",
-                "--node_rank",
-                "2",
-                "--master_addr",
-                "trainer-0.example",
-                "--master_port",
-                "29500",
-                "--nproc_per_node",
-                "8",
-                str(self.bin_dir / "specforge"),
-                "train",
-                "--config",
-                str(self.config),
-                "training.role=consumer",
-            ],
-        )
-
-    def test_offline_consumer_rejects_invalid_dp_width(self):
-        for nproc in ("0", "-1", "not-a-number"):
-            with self.subTest(nproc=nproc):
-                env = self._offline_env()
-                env["NPROC_PER_NODE"] = nproc
-                result = self._run(OFFLINE, "consumer", env)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("positive integer", result.stderr)
-
-    def test_offline_mooncake_validates_its_transport_contract(self):
-        env = self._offline_env()
-        env["DISAGG_BACKEND"] = "mooncake"
-        result = self._run(OFFLINE, "producer", env)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("MOONCAKE_METADATA_SERVER", result.stderr)
-
-        env.update(
-            {
-                "MOONCAKE_METADATA_SERVER": "http://metadata:8080/metadata",
-                "MOONCAKE_MASTER_SERVER_ADDR": "master:50051",
-                "MOONCAKE_LOCAL_HOSTNAME": "producer.example",
-            }
-        )
-        result = self._run(OFFLINE, "producer", env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_offline_rejects_missing_or_unknown_backend_contract(self):
-        missing_store = self._offline_env()
-        del missing_store["DISAGG_STORE_ROOT"]
-        result = self._run(OFFLINE, "producer", missing_store)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("DISAGG_STORE_ROOT", result.stderr)
-
-        unknown = self._offline_env()
-        unknown["DISAGG_BACKEND"] = "object_store"
-        result = self._run(OFFLINE, "producer", unknown)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("shared_dir or mooncake", result.stderr)
-
-    def test_docs_reference_only_the_mode_specific_launchers(self):
-        markdown_paths = [
-            ROOT / "README.md",
-            *(ROOT / "docs").rglob("*.md"),
-            *(ROOT / "examples").rglob("*.md"),
-        ]
-        markdown = "\n".join(
-            path.read_text(encoding="utf-8") for path in markdown_paths
-        )
-        self.assertIn("run_online.sh", markdown)
-        self.assertIn("run_offline.sh", markdown)
-        self.assertNotIn("run_role.sh", markdown)
+    def test_help_describes_auto_and_explicit_roles(self):
+        for wrapper in (ONLINE, OFFLINE):
+            result = self._run(wrapper, "--help")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--role", result.stdout)
+            self.assertIn("producer and consumer", result.stdout)
 
 
 if __name__ == "__main__":

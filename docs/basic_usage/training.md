@@ -18,19 +18,17 @@ there is no compatibility dispatch to the previous trainers.
 
 ## Launch a run
 
-Use the command directly for one process:
+Use the command directly for every checked-in topology:
 
 ```bash
 specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
 ```
 
-Use `torchrun` for colocated target parallel capture, target data parallelism,
-offline data parallelism, or EAGLE3 offline USP. The same YAML and the same
-`specforge train` entry are used at every world size:
+`deployment.trainer.nproc_per_node` records the audited local process count.
+When it is greater than one, the CLI starts torch distributed itself:
 
 ```bash
-torchrun --standalone --nproc_per_node 4 "$(command -v specforge)" \
-  train --config examples/configs/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
 `training.tp_size` defines each frozen-target capture group. SGLang targets and
@@ -63,8 +61,8 @@ misspelled or retired option from being silently ignored.
 
 ## Run config
 
-A run config has six typed sections (`model`, `data`, `training`, `tracking`,
-`profiling`, and `runtime`) plus `run_id` and `output_dir`:
+A run config has seven typed sections (`model`, `data`, `training`, `tracking`,
+`profiling`, `runtime`, and `deployment`) plus `run_id` and `output_dir`:
 
 ```yaml
 model:
@@ -81,11 +79,16 @@ data:
 
 training:
   strategy: eagle3
-  deployment_mode: local_colocated
   num_epochs: 10
   batch_size: 1
   learning_rate: 1.0e-4
   save_interval: 1000
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
 
 run_id: qwen3-8b-eagle3-online
 output_dir: ./outputs/qwen3-8b-eagle3-online
@@ -361,25 +364,22 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-torchrun --standalone --nproc_per_node=4 "$(command -v specforge)" \
-  train --config examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/qwen3.5-4b-dflash-online-npu.yaml
 ```
 
-`torchrun` supplies rank, world-size, and rendezvous variables. The runtime
-selects the active device dynamically and uses HCCL when `torch_npu` is active.
+The unified launcher supplies rank, world-size, and rendezvous variables. The
+runtime selects the active device dynamically and uses HCCL when `torch_npu`
+is active.
 
 ## Disaggregated roles
 
-A disaggregated run starts the same typed config once per role. The repository
-provides one topology-specific wrapper for online server capture and one for
-offline feature ingestion: `examples/disagg/run_online.sh` and
-`examples/disagg/run_offline.sh`.
-
-These scripts validate the environment and dispatch to the same
-`specforge train` entry point; they are not additional trainers. See the
-[disaggregated training guide](disaggregated_training.md) for the patched
-SGLang command, complete environment contract, fresh-attempt rules, and both
-launch procedures.
+A single-node disaggregated config supervises producer and consumer with one
+command. Split deployments use the same config with `--role producer` or
+`--role consumer`; multi-node consumers add only `--node-rank` on each host.
+The optional `examples/disagg/run_online.sh` and `run_offline.sh` files are thin
+delegates, not topology wrappers. See the
+[disaggregated training guide](disaggregated_training.md) for external
+Mooncake/SGLang prerequisites, freshness rules, and both launch forms.
 
 ## Checkpoints and resume
 
@@ -401,8 +401,8 @@ specforge train \
 ```
 
 For a disaggregated offline resume, reuse the same manifest, feature store, and
-run id, then pass the override to `run_offline.sh consumer`; the producer never
-accepts a resume checkpoint.
+run id, then invoke `specforge train -c run.yaml --role consumer` with the
+checkpoint override; the producer never accepts a resume checkpoint.
 
 Online disaggregated resume is intentionally consumer-only. Reuse the retained
 SQLite metadata DB, original channel/inboxes, Mooncake objects, and matching

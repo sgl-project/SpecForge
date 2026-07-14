@@ -6,7 +6,7 @@ model:
   torch_dtype: "bfloat16"
   mask_token_id: 2
   sglang_mem_fraction_static: 0.75
-  sglang_ep_size: 8
+  sglang_ep_size: 1
 data:
   train_data_path: "./cache/dataset/sharegpt_train.jsonl"
   max_length: 3072
@@ -25,7 +25,6 @@ training:
   loss_decay_gamma: 7
   save_interval: 1000
   log_interval: 50
-  deployment_mode: "local_colocated"
   dist_timeout: 30
   seed: 42
 tracking:
@@ -35,3 +34,9 @@ tracking:
   wandb_offline: true
 run_id: "longcat-flash-dflash-online"
 output_dir: "./outputs/longcat-flash-dflash-online"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

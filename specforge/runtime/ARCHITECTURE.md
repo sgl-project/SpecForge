@@ -19,7 +19,7 @@ the reference source and feature-store backend change.
 | Mode | Producer side | Consumer reference source | Feature store | Iteration contract |
 | --- | --- | --- | --- | --- |
 | Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
-| Disaggregated offline | `run_offline.sh producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
+| Disaggregated offline | `run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
 | Colocated online | `RolloutWorker` captures on demand | `LocalRolloutStream` | Private `LocalFeatureStore` | Consume once; deterministic resume rebuilds the untrained prompt suffix; no second pass over produced refs |
 | Disaggregated online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
 

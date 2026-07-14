@@ -47,7 +47,7 @@ EXPECTED_TRACKING = {
     "qwen3-8b-dflash-disaggregated.yaml": {
         "report_to": "none",
         "wandb_project": "qwen3-8b-dflash-disagg",
-        "wandb_name": "qwen3-8b-dflash-1srv-dp7",
+        "wandb_name": "qwen3-8b-dflash-disagg-dp4",
     },
     "qwen3-8b-dflash-online.yaml": {
         "report_to": "wandb",
@@ -57,7 +57,7 @@ EXPECTED_TRACKING = {
     "qwen3-8b-domino-disaggregated.yaml": {
         "report_to": "none",
         "wandb_project": "qwen3-8b-domino-disagg",
-        "wandb_name": "qwen3-8b-domino-1srv-dp7",
+        "wandb_name": "qwen3-8b-domino-disagg-dp4",
     },
     "qwen3-8b-domino-online.yaml": {
         "report_to": "wandb",

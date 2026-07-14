@@ -21,7 +21,6 @@ training:
   tp_size: 4
   save_interval: 5000
   log_interval: 50
-  deployment_mode: "local_colocated"
   dist_timeout: 60
   seed: 0
 tracking:
@@ -30,3 +29,9 @@ tracking:
   wandb_name: "qwen3-coder-30b-eagle3-tp4-opc-regen"
 run_id: "qwen3-coder-30b-a3b-eagle3-online"
 output_dir: "./outputs/qwen3-coder-30b-a3b-eagle3-online"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4

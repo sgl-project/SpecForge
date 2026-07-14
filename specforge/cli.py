@@ -13,9 +13,9 @@ validated :class:`~specforge.config.Config`, assembles the models, and runs
 training through the DataFlow launch builders — the same wiring the
 programmatic path uses, behind one typed config.
 
-Trainer-bearing roles may run under multi-rank ``torchrun``; the validated
-config defines target TP and draft DP/USP groups:
-    torchrun --standalone --nproc_per_node 8 $(which specforge) train --config run.yaml
+``deployment.trainer`` defines the process topology. The CLI self-launches
+multi-rank workers and recognizes an existing torchrun worker environment
+without nesting another launcher.
 
 Model/data assembly lives in :mod:`specforge.training.assembly`; this module is
 deliberately limited to command parsing and distributed process lifecycle.
@@ -94,11 +94,46 @@ def _train(cfg: Config) -> int:
         destroy_distributed()
 
 
+def _config_for_role(cfg: Config, role: str) -> Config:
+    """Resolve a launch role without changing the persisted run config.
+
+    A shared disaggregated config may contain trainer-only state used by the
+    consumer child.  The capture-only producer must ignore that state when the
+    launcher derives its role from the shared config.
+    """
+    raw = cfg.model_dump()
+    raw["training"]["role"] = role
+    if role == "producer":
+        raw["training"]["metadata_db_path"] = None
+        raw["profiling"]["enabled"] = False
+    return Config.model_validate(raw)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="specforge")
     sub = parser.add_subparsers(dest="command", required=True)
     train = sub.add_parser("train", help="train a draft model from a typed config")
-    train.add_argument("--config", required=True, help="YAML or JSON run config")
+    train.add_argument("-c", "--config", required=True, help="YAML or JSON run config")
+    train.add_argument(
+        "--role",
+        choices=("auto", "all", "producer", "consumer", "both"),
+        default="auto",
+        help=(
+            "launch selection (default: local all; single-node disaggregated "
+            "producer+consumer)"
+        ),
+    )
+    train.add_argument(
+        "--node-rank",
+        type=int,
+        default=None,
+        help="node-local rank for an explicit multi-node trainer launch",
+    )
+    train.add_argument(
+        "--plan",
+        action="store_true",
+        help="print the resolved process plan without starting workers",
+    )
     train.add_argument(
         "overrides",
         nargs="*",
@@ -122,7 +157,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "train":
         cfg = load_config(args.config, args.overrides)
-        _train(cfg)
+        from specforge.launch_plan import build_launch_plan, run_commands
+
+        plan = build_launch_plan(
+            cfg,
+            config_path=args.config,
+            overrides=args.overrides,
+            requested_role=args.role,
+            node_rank=args.node_rank,
+        )
+        if args.plan:
+            print(plan.render())
+            return 0
+        if plan.kind == "worker":
+            os.environ.update(plan.worker_env)
+            _train(_config_for_role(cfg, plan.role))
+            return 0
+        return run_commands(plan)
     elif args.to == "hf":
         from specforge.export.to_hf import export_to_hf
 

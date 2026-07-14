@@ -26,10 +26,15 @@ training:
   lambda_base_decay_ratio: 1
   save_interval: 3000
   log_interval: 50
-  deployment_mode: "local_colocated"
   dist_timeout: 30
   seed: 42
 tracking:
   report_to: "tensorboard"
 run_id: "qwen3.5-4b-domino-npu-online"
 output_dir: "./outputs/qwen3.5-4b-domino-npu-online"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

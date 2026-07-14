@@ -21,8 +21,13 @@ training:
   tp_size: 8
   save_interval: 1000
   log_interval: 50
-  deployment_mode: "local_colocated"
   dist_timeout: 20
   seed: 0
 run_id: "qwen3-coder-480b-a35b-eagle3-offline"
 output_dir: "./outputs/qwen3-coder-480b-a35b-eagle3-offline"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

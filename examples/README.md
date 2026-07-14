@@ -1,7 +1,8 @@
 # SpecForge Training Examples
 
 All training methods use the same typed entry point. Pick a run config, update
-its model and data paths, and launch it directly or through `torchrun`:
+its model and data paths, and launch it directly; multi-process topology is
+already recorded in the YAML:
 
 ```bash
 specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
@@ -40,10 +41,10 @@ features. VLM supports colocated online capture with a batch size of one; the
 32B recipe uses target TP. Each raw VLM record currently carries one image.
 
 The same CLI owns target TP + target-DP, offline DP, and EAGLE3 offline USP.
-Online disaggregated consumers use every trainer rank for DP. Use the dedicated
+Online disaggregated consumers use every trainer rank for DP. The optional
 [`run_online.sh`](./disagg/run_online.sh) and
-[`run_offline.sh`](./disagg/run_offline.sh) topology wrappers; they only encode
-deployment topology and still dispatch to `specforge train`. The complete
+[`run_offline.sh`](./disagg/run_offline.sh) scripts are thin delegates to
+`specforge train`; launch topology remains in YAML. The complete
 environment contract is in the [disaggregated training
 guide](../docs/basic_usage/disaggregated_training.md).
 
