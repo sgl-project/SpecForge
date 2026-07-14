@@ -422,10 +422,7 @@ class TrainerController:
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     self.logger(result.metrics, self.global_step)
-                if (
-                    self.save_interval
-                    and self.global_step % self.save_interval == 0
-                ):
+                if self.save_interval and self.global_step % self.save_interval == 0:
                     self.save_checkpoint(self.global_step)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step

@@ -3,10 +3,7 @@
 
 import unittest
 
-from specforge.runtime.control_plane import (
-    DataFlowController,
-    NoOpMetadataStore,
-)
+from specforge.runtime.control_plane import DataFlowController, NoOpMetadataStore
 from specforge.runtime.control_plane.metadata_store import MetadataStore
 
 

@@ -175,7 +175,7 @@ def build_hf_target(workdir, hidden=H, layers=8, vocab=V, aux_layer_ids=(1, 3, 4
 def build_eagle3(workdir, ttt=3):
     """Build (eagle3_model, target_head) sharing one set of weights, on cuda."""
     from specforge.core.eagle3 import OnlineEagle3Model
-    from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
     from specforge.modeling.target.target_head import TargetHead
 
     cfg = write_draft_config(os.path.join(workdir, "draft.json"))

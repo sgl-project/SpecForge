@@ -29,9 +29,7 @@ class TestMooncakeArchitecture(unittest.TestCase):
             node.name for node in store_class.body if isinstance(node, ast.FunctionDef)
         }
         self.assertTrue(
-            {"_key", "_store_put", "_get_pickle", "_get_zero_copy"}.isdisjoint(
-                methods
-            )
+            {"_key", "_store_put", "_get_pickle", "_get_zero_copy"}.isdisjoint(methods)
         )
 
         init = next(
@@ -39,9 +37,7 @@ class TestMooncakeArchitecture(unittest.TestCase):
             for node in store_class.body
             if isinstance(node, ast.FunctionDef) and node.name == "__init__"
         )
-        parameters = {
-            arg.arg for arg in init.args.args + init.args.kwonlyargs
-        }
+        parameters = {arg.arg for arg in init.args.args + init.args.kwonlyargs}
         self.assertNotIn("zero_copy", parameters)
         self.assertFalse(
             any(
@@ -77,8 +73,7 @@ class TestMooncakeArchitecture(unittest.TestCase):
         validator = next(
             node
             for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_require_store_api"
+            if isinstance(node, ast.FunctionDef) and node.name == "_require_store_api"
         )
         required_assignment = next(
             node

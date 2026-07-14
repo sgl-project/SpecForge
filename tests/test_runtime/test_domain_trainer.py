@@ -152,9 +152,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        _, cap, dfc_calls, _ = self._build(
-            {"queue": object()}, durable_ack=True
-        )
+        _, cap, dfc_calls, _ = self._build({"queue": object()}, durable_ack=True)
         ack = cap["ctrl_kw"]["ack_fn"]
         ack(["s1"], 7)
         self.assertIn(("ack", "trainer-0", ["s1"], 7, True), dfc_calls)

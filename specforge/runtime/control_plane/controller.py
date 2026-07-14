@@ -28,11 +28,7 @@ import uuid
 from collections import OrderedDict, deque
 from typing import Any, Deque, Dict, List, Optional
 
-from specforge.runtime.contracts import (
-    PromptTask,
-    SampleRef,
-    assert_no_tensors,
-)
+from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
@@ -223,5 +219,6 @@ class DataFlowController:
             "durable_acked": acked,
         }
         return status
+
 
 __all__ = ["DataFlowController"]

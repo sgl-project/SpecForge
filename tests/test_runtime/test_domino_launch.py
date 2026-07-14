@@ -52,8 +52,8 @@ class TestDominoOnlineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge.launch import build_online_runtime
         from specforge.inference.target_engine import get_target_engine
+        from specforge.launch import build_online_runtime
         from specforge.optimizer import BF16Optimizer
 
         HIDDEN, V, SEQ, ACC, MAX_OPT_STEPS, N = 64, fx.V, 16, 2, 2, 8

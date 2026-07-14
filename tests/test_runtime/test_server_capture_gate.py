@@ -319,7 +319,7 @@ class TestServerCaptureGate(unittest.TestCase):
 
     def _train_step(self, fetched, head):
         from specforge.core.eagle3 import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig

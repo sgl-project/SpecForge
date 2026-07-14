@@ -71,7 +71,7 @@ class PhaseBLossReproducibilityTest(unittest.TestCase):
     def _run_losses(self, port):
         from specforge.core.eagle3 import OnlineEagle3Model
         from specforge.launch import build_online_runtime
-        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from tests.test_runtime import _fixtures as fx
 

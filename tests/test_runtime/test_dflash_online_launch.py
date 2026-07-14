@@ -25,8 +25,8 @@ class TestDFlashOnlineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        from specforge.launch import build_online_runtime
         from specforge.inference.target_engine import get_target_engine
+        from specforge.launch import build_online_runtime
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import assert_no_tensors
 

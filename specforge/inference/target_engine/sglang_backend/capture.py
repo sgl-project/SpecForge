@@ -42,10 +42,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 # prepare_mlp_sync_batch_raw is a module-level function, not a Scheduler method.
 # sglang 0.5.14 moved it from managers.scheduler_dp_attn_mixin to
@@ -383,7 +380,6 @@ class SGLangCaptureBackend:
 
     def extend_eagle3(self, *args, **kwargs):
         return self.extend(*args, **kwargs)
-
 
     # --- DFlash extend ------------------------------------------------------
 

@@ -33,9 +33,7 @@ def _toplevel_sglang_imports(path):
     for node in tree.body:
         if isinstance(node, ast.Import):
             hits.extend(
-                name.name
-                for name in node.names
-                if name.name.split(".")[0] == "sglang"
+                name.name for name in node.names if name.name.split(".")[0] == "sglang"
             )
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0 and node.module:

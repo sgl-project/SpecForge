@@ -440,9 +440,7 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertEqual([], globbed, f"legacy entry pattern reintroduced: {globbed}")
 
         duplicate_tests = [
-            path
-            for path in REMOVED_DUPLICATE_PATH_TESTS
-            if (REPO_ROOT / path).exists()
+            path for path in REMOVED_DUPLICATE_PATH_TESTS if (REPO_ROOT / path).exists()
         ]
         self.assertEqual(
             [],
@@ -485,7 +483,9 @@ class TestPackageArchitecture(unittest.TestCase):
                     if name in LEGACY_API_NAMES:
                         relative_path = path.relative_to(REPO_ROOT)
                         violations.append(f"{relative_path}:{node.lineno}: {name}")
-        self.assertEqual([], violations, "legacy API references:\n" + "\n".join(violations))
+        self.assertEqual(
+            [], violations, "legacy API references:\n" + "\n".join(violations)
+        )
 
     def test_launch_exports_only_canonical_topology_builders(self):
         self.assertEqual(
@@ -502,8 +502,7 @@ class TestPackageArchitecture(unittest.TestCase):
         for name in ("build_online_runtime", "build_disagg_online_consumer"):
             parameters = {
                 arg.arg
-                for arg in functions[name].args.args
-                + functions[name].args.kwonlyargs
+                for arg in functions[name].args.args + functions[name].args.kwonlyargs
             }
             self.assertTrue(
                 {"resume", "resume_from", "num_epochs"}.isdisjoint(parameters),
@@ -522,9 +521,7 @@ class TestPackageArchitecture(unittest.TestCase):
             + functions["build_offline_runtime"].args.kwonlyargs
         }
         self.assertTrue(
-            {"deployment_mode", "metadata_db_path"}.isdisjoint(
-                offline_parameters
-            )
+            {"deployment_mode", "metadata_db_path"}.isdisjoint(offline_parameters)
         )
 
         producer_parameters = {
@@ -538,9 +535,7 @@ class TestPackageArchitecture(unittest.TestCase):
 
         consumer = functions["build_disagg_online_consumer"]
         called = [
-            node.func.id
-            if isinstance(node.func, ast.Name)
-            else node.func.attr
+            node.func.id if isinstance(node.func, ast.Name) else node.func.attr
             for node in ast.walk(consumer)
             if isinstance(node, ast.Call)
             and isinstance(node.func, (ast.Name, ast.Attribute))
@@ -582,9 +577,7 @@ class TestPackageArchitecture(unittest.TestCase):
             controller_keywords = {
                 keyword.arg: keyword.value for keyword in controller_call.keywords
             }
-            self.assertIs(
-                controller_keywords["enable_sample_queue"].value, False, name
-            )
+            self.assertIs(controller_keywords["enable_sample_queue"].value, False, name)
 
     def test_aggregate_packages_stay_doc_only(self):
         for relative_path in DOC_ONLY_PACKAGE_INITIALIZERS:
@@ -608,8 +601,7 @@ class TestPackageArchitecture(unittest.TestCase):
         for name in CANONICAL_LAUNCH_EXPORTS:
             parameters = {
                 arg.arg
-                for arg in functions[name].args.args
-                + functions[name].args.kwonlyargs
+                for arg in functions[name].args.args + functions[name].args.kwonlyargs
             }
             self.assertNotIn("eagle3_model", parameters, name)
             if name in DRAFT_MODEL_BUILDERS:
@@ -624,8 +616,7 @@ class TestPackageArchitecture(unittest.TestCase):
         for name in CANONICAL_LAUNCH_EXPORTS:
             parameters = {
                 arg.arg
-                for arg in functions[name].args.args
-                + functions[name].args.kwonlyargs
+                for arg in functions[name].args.args + functions[name].args.kwonlyargs
             }
             self.assertNotIn("eval_interval", parameters, name)
 
@@ -665,7 +656,9 @@ class TestPackageArchitecture(unittest.TestCase):
                         direct_imports.append(
                             f"{path.relative_to(REPO_ROOT)}:{line_number}: {module}"
                         )
-        self.assertEqual([], direct_imports, "CLI bypass imports:\n" + "\n".join(direct_imports))
+        self.assertEqual(
+            [], direct_imports, "CLI bypass imports:\n" + "\n".join(direct_imports)
+        )
 
         allowed = {
             Path("examples/disagg/run_online.sh"),
@@ -678,7 +671,9 @@ class TestPackageArchitecture(unittest.TestCase):
                 relative = path.relative_to(REPO_ROOT)
                 if train_command.search(path.read_text()) and relative not in allowed:
                     bypasses.append(str(relative))
-        self.assertEqual([], bypasses, f"non-canonical shell training entries: {bypasses}")
+        self.assertEqual(
+            [], bypasses, f"non-canonical shell training entries: {bypasses}"
+        )
 
 
 if __name__ == "__main__":

@@ -180,12 +180,8 @@ class TestRefDistributor(unittest.TestCase):
         for i in range(8):
             self.producer.publish(_ref(f"s{i}"))
         _pump_until_quiet(dist)
-        self.assertEqual(
-            _inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"]
-        )
-        self.assertEqual(
-            _inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"]
-        )
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"])
 
     def test_distributor_death_poisons_inboxes(self):
         clock = {"t": 0.0}

@@ -84,4 +84,5 @@ class SampleRefQueue:
         with self._lock:
             return len(self._leased)
 
+
 __all__ = ["SampleRefQueue"]

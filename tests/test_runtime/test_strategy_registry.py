@@ -65,9 +65,7 @@ class TestStrategyRegistry(unittest.TestCase):
         for name in ("dflash", "domino"):
             with self.subTest(strategy=name):
                 spec = resolve_strategy(name)
-                self.assertIs(
-                    spec.feature_schema, DFLASH_FEATURE_SCHEMA
-                )
+                self.assertIs(spec.feature_schema, DFLASH_FEATURE_SCHEMA)
                 self.assertIsNone(spec.make_offline_reader)
                 self.assertIsNone(spec.make_offline_transform)
                 self.assertIsNone(spec.make_offline_collate)

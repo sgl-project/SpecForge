@@ -382,9 +382,7 @@ def _build_online(
             for url in _server_urls(cfg)
         ]
         target_repr = "hidden_state" if strategy in ("eagle3", "dspark") else None
-        peer_wait_timeout_s = float(
-            os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800")
-        )
+        peer_wait_timeout_s = float(os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800"))
         _workers, drive = build_disagg_online_producer(
             strategy=strategy,
             prompts=prompts,

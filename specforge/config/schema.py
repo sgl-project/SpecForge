@@ -135,9 +135,7 @@ class TrainingConfig(StrictConfigModel):
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
     #: Colocated process or split producer/consumer deployment.
-    deployment_mode: Literal["local_colocated", "disaggregated"] = (
-        "local_colocated"
-    )
+    deployment_mode: Literal["local_colocated", "disaggregated"] = "local_colocated"
     #: ``all`` is a colocated run. Disaggregated online runs launch producer
     #: and consumer as separate ``specforge train`` processes with the same
     #: config and different roles.
