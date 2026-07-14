@@ -31,7 +31,7 @@ class TestOnlineLaunch(unittest.TestCase):
 
         from specforge.core.eagle3 import OnlineEagle3Model
         from specforge.launch import build_online_runtime
-        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import assert_no_tensors
 
@@ -74,23 +74,21 @@ class TestOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, run_interleaved = (
-            build_online_runtime(
-                strategy="eagle3",
-                target_model=target,
-                prompts=prompts,
-                draft_model=eagle3_model,
-                optimizer_factory=optimizer_factory,
-                run_id="online-launch",
-                output_dir=os.path.join(workdir, "out"),
-                target_hidden_size=H,
-                target_vocab_size=V,
-                target_repr="logits",
-                aux_hidden_state_layer_ids=tuple(aux_ids),
-                batch_size=1,
-                accumulation_steps=ACC,
-                max_steps=MAX_OPT_STEPS,
-            )
+        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
+            strategy="eagle3",
+            target_model=target,
+            prompts=prompts,
+            draft_model=eagle3_model,
+            optimizer_factory=optimizer_factory,
+            run_id="online-launch",
+            output_dir=os.path.join(workdir, "out"),
+            target_hidden_size=H,
+            target_vocab_size=V,
+            target_repr="logits",
+            aux_hidden_state_layer_ids=tuple(aux_ids),
+            batch_size=1,
+            accumulation_steps=ACC,
+            max_steps=MAX_OPT_STEPS,
         )
 
         # Build does not eagerly materialize the prompt pool.

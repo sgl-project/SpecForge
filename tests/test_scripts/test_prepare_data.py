@@ -47,11 +47,14 @@ class TestPrepareData(unittest.TestCase):
         sentinel_dataset = object()
         for suffix in (".json", ".jsonl"):
             data_path = Path(f"custom{suffix}")
-            with self.subTest(suffix=suffix), patch.object(
-                prepare_data,
-                "_load_hf_dataset",
-                return_value=sentinel_dataset,
-            ) as load_dataset:
+            with (
+                self.subTest(suffix=suffix),
+                patch.object(
+                    prepare_data,
+                    "_load_hf_dataset",
+                    return_value=sentinel_dataset,
+                ) as load_dataset,
+            ):
                 dataset = prepare_data.load_dataset_from_path(data_path)
 
                 self.assertIs(sentinel_dataset, dataset)

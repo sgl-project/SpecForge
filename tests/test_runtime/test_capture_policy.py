@@ -83,9 +83,7 @@ class PolicyRegistryTest(unittest.TestCase):
             def __init__(self):
                 self.kwargs = None
 
-            def extend_eagle3(
-                self, input_ids, attention_mask, loss_mask, **kwargs
-            ):
+            def extend_eagle3(self, input_ids, attention_mask, loss_mask, **kwargs):
                 self.kwargs = kwargs
                 return (
                     [[input_ids, attention_mask, loss_mask]],

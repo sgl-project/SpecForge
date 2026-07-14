@@ -63,9 +63,12 @@ class TargetEngineABCTest(unittest.TestCase):
             ("sglang", SGLangTargetEngine),
             ("custom", CustomTargetEngine),
         ):
-            with self.subTest(backend=backend), mock.patch.object(
-                engine_cls, "from_pretrained", return_value=backend
-            ) as load:
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(
+                    engine_cls, "from_pretrained", return_value=backend
+                ) as load,
+            ):
                 self.assertEqual(
                     get_target_engine("some/path", strategy="dflash", backend=backend),
                     backend,

@@ -245,6 +245,7 @@ def _assemble_rollout_workers(
         adapters = [feature_source] * num_rollout_workers
     else:
         from specforge.inference.adapters.policy import PolicyFeatureAdapter
+
         if spec.feature_schema is None:
             raise NotImplementedError(
                 f"{spec.name} online capture requires a server feature source; "
@@ -1013,7 +1014,10 @@ def build_disagg_online_consumer(
     import torch.distributed as dist
 
     from specforge.runtime.control_plane.dp_ack import DPAckController
-    from specforge.runtime.data_plane.ref_distributor import InboxChannel, RefDistributor
+    from specforge.runtime.data_plane.ref_distributor import (
+        InboxChannel,
+        RefDistributor,
+    )
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
     spec = resolve_strategy(strategy)
@@ -1065,9 +1069,7 @@ def build_disagg_online_consumer(
         try:
             store = _resolve_metadata_store(metadata_store, metadata_db_path)
             if store is None or isinstance(store, NoOpMetadataStore):
-                raise ValueError(
-                    "online consumer requires a retaining metadata ledger"
-                )
+                raise ValueError("online consumer requires a retaining metadata ledger")
             committed = store.committed_count()
             if committed > 0:
                 raise ValueError(
@@ -1086,9 +1088,7 @@ def build_disagg_online_consumer(
                 refs_per_rank_step=batch_size * accumulation_steps,
                 idle_timeout_s=idle_timeout_s,
             )
-            channel.publish_consumer_quantum(
-                dp_size * batch_size * accumulation_steps
-            )
+            channel.publish_consumer_quantum(dp_size * batch_size * accumulation_steps)
         except BaseException as exc:
             setup_exc = exc
 

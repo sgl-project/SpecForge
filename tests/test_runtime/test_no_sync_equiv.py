@@ -29,7 +29,7 @@ def _worker(rank, world_size, workdir, results_dir):
     from specforge.core.eagle3 import OnlineEagle3Model
     from specforge.data.preprocessing import OfflineEagle3Dataset
     from specforge.data.utils import DataCollatorWithPadding
-    from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
     from specforge.modeling.target.target_head import TargetHead
     from specforge.optimizer import BF16Optimizer
     from specforge.runtime.contracts import TrainBatch

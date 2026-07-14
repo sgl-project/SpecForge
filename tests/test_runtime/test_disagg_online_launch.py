@@ -39,7 +39,7 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
             build_disagg_online_consumer,
             build_disagg_online_producer,
         )
-        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
         from specforge.runtime.data_plane.streaming_ref_channel import (
@@ -133,6 +133,7 @@ class TestDisaggOnlineLaunch(unittest.TestCase):
         # Consume-once release occurs while materializing each ref, before the
         # final yielded batch can return to the inbox-ack generator.
         self.assertEqual(backend._d, {})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

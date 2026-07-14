@@ -102,7 +102,7 @@ def _device():
 
 def _load_draft(cfg: Config):
     """Construct the configured draft model without any legacy trainer code."""
-    from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     strategy = cfg.training.strategy
     draft_config = AutoDraftModelConfig.from_file(

@@ -131,7 +131,7 @@ class TestPEagleGpuSmoke(unittest.TestCase):
         self.addCleanup(torch.cuda.empty_cache)
 
         from specforge.core.peagle import OnlinePEagleModel
-        from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.draft import PEagleDraftModel, resolve_draft
         from specforge.optimizer import BF16Optimizer
 

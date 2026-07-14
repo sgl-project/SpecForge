@@ -15,7 +15,10 @@ from typing import Optional
 import torch
 
 from .base import KNOWN_BACKENDS, TargetEngine
-from .target_capture_policy import TARGET_CAPTURE_POLICIES, resolve_target_capture_policy
+from .target_capture_policy import (
+    TARGET_CAPTURE_POLICIES,
+    resolve_target_capture_policy,
+)
 
 
 def available_target_engines():

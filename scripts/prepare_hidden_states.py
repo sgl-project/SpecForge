@@ -384,9 +384,7 @@ class HiddenStatesGenerator:
         def check_single_file(idx):
             if os.path.exists(self._get_file_path(output_path, idx)):
                 return True
-            uncompressed_ckpt = self._get_file_path(
-                output_path, idx, extension=".ckpt"
-            )
+            uncompressed_ckpt = self._get_file_path(output_path, idx, extension=".ckpt")
             compressed_ckpt = self._get_file_path(
                 output_path, idx, extension=".ckpt.gz"
             )

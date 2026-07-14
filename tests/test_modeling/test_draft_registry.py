@@ -12,7 +12,7 @@ import unittest
 
 from transformers import LlamaConfig, Qwen3Config
 
-from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlashDraftModel,

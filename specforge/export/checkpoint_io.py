@@ -83,7 +83,7 @@ def materialize_draft(
     the only tolerated missing keys are the embeddings (excluded from draft
     checkpoints by design — serving loads them from the target).
     """
-    from specforge.modeling.auto import AutoDraftModelConfig, AutoDraftModel
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)

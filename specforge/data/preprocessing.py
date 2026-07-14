@@ -24,7 +24,6 @@ import gzip
 import io
 import json
 import os
-import re
 import warnings
 from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
@@ -44,8 +43,6 @@ Conversation = List[Dict[str, str]]
 # ==============================
 # This file is for preprocessing the data
 # ==============================
-
-
 
 
 # Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
@@ -108,8 +105,6 @@ def preprocess_conversations(
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
     return results
-
-
 
 
 def build_eagle3_dataset(
