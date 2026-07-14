@@ -82,11 +82,18 @@ selected topology supports them.
 
 Large target models may use a tensor-parallel custom implementation under
 `specforge/modeling/target/custom_backend`. `training.tp_size` defines each
-target-TP group; a larger world size creates target-DP groups that receive
-disjoint prompt or offline-reference shards. Colocated text EAGLE3 with SGLang
-can additionally set `model.shard_target_output: true` to return only each
-target-TP rank's local batch partition. Custom/HF targets and VLM capture the
-full target batch and partition it locally.
+target capture group. SGLang targets, sharded custom targets, and text EAGLE3's
+supported HF TP path use that group to shard model weights. DFlash and Domino
+with `model.target_backend: hf` do not: every rank loads a complete target
+replica, and `tp_size` only coordinates the shared capture batch and rank-local
+batch partition. A larger world size creates target-DP groups that receive
+disjoint prompt or offline-reference shards.
+
+Colocated text EAGLE3 with SGLang can additionally set
+`model.shard_target_output: true` to return only each target-TP rank's local
+batch partition. Other target paths, including VLM, capture the full target
+batch and partition outputs locally. This output partitioning is independent
+of whether the target model's weights are tensor-sharded.
 
 Follow the existing Transformers `PreTrainedModel` implementations and use
 SpecForge's parallel linear layers where the target model is sharded:

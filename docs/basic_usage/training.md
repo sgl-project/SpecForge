@@ -24,7 +24,7 @@ Use the command directly for one process:
 specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
 ```
 
-Use `torchrun` for colocated target tensor parallelism, target data parallelism,
+Use `torchrun` for colocated target parallel capture, target data parallelism,
 offline data parallelism, or EAGLE3 offline USP. The same YAML and the same
 `specforge train` entry are used at every world size:
 
@@ -33,11 +33,16 @@ torchrun --standalone --nproc_per_node 4 "$(command -v specforge)" \
   train --config examples/configs/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
-`training.tp_size` defines each frozen-target TP group. When the world size is
-larger than `tp_size`, the resulting target-DP groups receive disjoint prompt
-shards with deterministic padding so every trainer rank performs the same
-number of steps. Offline runs shard fixed feature references in the same way.
-See [Parallel topologies](#parallel-topologies) for USP and accelerator notes.
+`training.tp_size` defines each frozen-target capture group. SGLang targets and
+the supported sharded target backends use that group for weight tensor
+parallelism. DFlash and Domino with `model.target_backend: hf` instead load a
+complete target replica on every rank; for them, `tp_size` controls the shared
+capture batch and local batch partition, not model-weight sharding. When the
+world size is larger than `tp_size`, the resulting target-DP groups receive
+disjoint prompt shards with deterministic padding so every trainer rank
+performs the same number of steps. Offline runs shard fixed feature references
+in the same way. See [Parallel topologies](#parallel-topologies) for USP and
+accelerator notes.
 
 Paths in a config are resolved from the current working directory. The example
 configs assume that the command is run from the repository root.
@@ -183,8 +188,8 @@ combinations:
 | Strategy | Colocated online | Local/dataflow offline | Disaggregated online | Disaggregated offline |
 | --- | --- | --- | --- | --- |
 | EAGLE3 | Yes, target TP + target-DP | Yes, DP + USP | Yes, consumer DP | Yes, consumer DP |
-| DFlash | Yes, target TP + target-DP | Yes, DP | Yes, consumer DP | Yes, consumer DP |
-| Domino | Yes, target TP + target-DP | Yes, DP | Yes, consumer DP | Yes, consumer DP |
+| DFlash | Yes; SGLang target TP + target-DP, or HF replicas + batch partition | Yes, DP | Yes, consumer DP | Yes, consumer DP |
+| Domino | Yes; SGLang target TP + target-DP, or HF replicas + batch partition | Yes, DP | Yes, consumer DP | Yes, consumer DP |
 | DSpark | No | No | Yes, consumer DP | No |
 | P-EAGLE | Yes, batch size 1 | No | No | No |
 
@@ -222,12 +227,18 @@ itself stop an online stream.
 
 The launcher creates every process group from the typed run config:
 
-- `training.tp_size` is the frozen-target tensor-parallel size. Target-TP peers
-  capture the same global batch; when `world_size > tp_size`, each target-DP
-  group receives a disjoint prompt shard. For colocated text EAGLE3 with
-  SGLang, `model.shard_target_output: true` can return each TP rank's local
-  batch partition directly. Other backends, and VLM, capture the full target
-  batch and partition it locally.
+- `training.tp_size` defines the frozen-target capture group. SGLang targets,
+  sharded custom targets, and text EAGLE3's supported HF TP path use it for
+  model-weight tensor parallelism. DFlash and Domino HF targets do not: every
+  rank loads a complete target replica, while the group still captures a
+  `tp_size * training.batch_size` batch and keeps one local partition per rank.
+  Batch partitioning is therefore not evidence of weight sharding.
+- Peers in a target capture group process the same global batch; when
+  `world_size > tp_size`, each target-DP group receives a disjoint prompt
+  shard. For colocated text EAGLE3 with SGLang,
+  `model.shard_target_output: true` can return each TP rank's local batch
+  partition directly. Other backends, and VLM, capture the full target batch
+  before partitioning outputs locally.
 - Offline references use the same target-TP/target-DP partition. Each TP group
   sees the same samples, while different DP groups see disjoint samples.
 - EAGLE3 offline can set `training.attention_backend: usp` and choose

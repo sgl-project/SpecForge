@@ -38,10 +38,15 @@ through the environment; they are intentionally not embedded in portable YAML.
 | Strategy | Colocated online | Offline features | Disaggregated online | Disaggregated offline |
 | --- | --- | --- | --- | --- |
 | EAGLE3 | target TP + target-DP | DP + USP | consumer DP | consumer DP |
-| DFlash | target TP + target-DP | DP | consumer DP | consumer DP |
-| Domino | target TP + target-DP | DP | consumer DP | consumer DP |
+| DFlash | SGLang target TP + target-DP; HF replicas + batch partition | DP | consumer DP | consumer DP |
+| Domino | SGLang target TP + target-DP; HF replicas + batch partition | DP | consumer DP | consumer DP |
 | DSpark | No | No | consumer DP | No |
 | P-EAGLE | batch size 1 | No | No | No |
+
+Target TP in the DFlash and Domino rows is SGLang-only. With
+`model.target_backend: hf`, every rank loads a complete target replica;
+`training.tp_size` coordinates the shared capture batch and each rank's local
+batch partition but does not shard target weights.
 
 Qwen2.5-VL 7B and 32B remain supported through colocated online EAGLE3. The
 32B recipe sets `training.tp_size: 4`; VLM captures the full target batch and
