@@ -95,6 +95,7 @@ class ModelLoadingSchemaTest(unittest.TestCase):
             "dflash",
             draft_checkpoint_path="org/dflash-draft",
         )
+        payload["model"]["target_backend"] = "sglang"
         payload["data"] = {"train_data_path": "/train.jsonl"}
         payload["training"] = {
             "strategy": "dflash",
