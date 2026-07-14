@@ -303,6 +303,11 @@ class StreamingRefQueue:
 
     """
 
+    # A loader that stops after prefetching must put its never-yielded refs back
+    # without advancing the durable consumed counter. The retaining disagg
+    # feature store keeps those refs materializable across that retry.
+    loader_close_retryable = True
+
     def __init__(
         self,
         channel: StreamingRefChannel,
@@ -330,8 +335,34 @@ class StreamingRefQueue:
         self._last_wait_log = 0.0
 
     def get(self, n: int, timeout_s: float = 0.0) -> List[SampleRef]:
+        del timeout_s  # the durable stream blocks until closed, failed, or timed out
+        return self._get(n)
+
+    def get_interruptible(
+        self,
+        n: int,
+        *,
+        stop_event: threading.Event,
+    ) -> List[SampleRef]:
+        """Blocking ``get`` variant that a loader-owned worker can stop.
+
+        Normal :meth:`get` retains its closed-and-drained blocking contract.
+        This variant checks the loader event between channel polls; refs already
+        buffered locally remain unconsumed and therefore recoverable when the
+        loader stops.
+        """
+        return self._get(n, stop_event=stop_event)
+
+    def _get(
+        self,
+        n: int,
+        *,
+        stop_event: Optional[threading.Event] = None,
+    ) -> List[SampleRef]:
         last_progress = self._clock()
         while len(self._buf) < n:
+            if stop_event is not None and stop_event.is_set():
+                return []
             new = self.channel.poll()
             if new:
                 last_progress = self._clock()
@@ -369,7 +400,12 @@ class StreamingRefQueue:
                     flush=True,
                 )
                 self._last_wait_log = now
-            self._sleep(self.poll_s)
+            if stop_event is None:
+                self._sleep(self.poll_s)
+            else:
+                stop_event.wait(self.poll_s)
+        if stop_event is not None and stop_event.is_set():
+            return []
         take = min(n, len(self._buf))
         out, self._buf = self._buf[:take], self._buf[take:]
         with self._inflight_lock:

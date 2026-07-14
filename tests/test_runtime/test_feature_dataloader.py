@@ -4,9 +4,11 @@
 import os
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from functools import partial
+from unittest import mock
 
 import torch
 
@@ -34,6 +36,82 @@ class _CountingStore(LocalFeatureStore):
     def get(self, sample_ref, *, device="cpu", names=None):
         self.gets += 1
         return super().get(sample_ref, device=device, names=names)
+
+
+class _DurableQueue(SampleRefQueue):
+    """Queue fake whose close cleanup must never advance its ack counter."""
+
+    loader_close_retryable = True
+
+    def __init__(self):
+        super().__init__()
+        self.consumed = 0
+        self.failures = []
+
+    def get_interruptible(self, n, *, stop_event):
+        while not stop_event.is_set():
+            refs = super().get(n, timeout_s=0.01)
+            if refs:
+                return refs
+        return []
+
+    def ack_durable(self, refs):
+        super().ack(refs)
+        self.consumed += len(refs)
+
+    def fail(self, refs, reason, retryable):
+        self.failures.append(([ref.sample_id for ref in refs], reason, retryable))
+        super().fail(refs, reason=reason, retryable=retryable)
+
+
+class _CloneFailure:
+    def numel(self):
+        return 1
+
+    def element_size(self):
+        return 4
+
+    def clone(self):
+        raise RuntimeError("clone failed")
+
+
+class _LeaseTrackingStore:
+    def __init__(self):
+        self.active_leases = 0
+        self.releases = 0
+
+    def get(self, _ref, *, device="cpu"):
+        del device
+        self.active_leases += 1
+        return {"x": _CloneFailure()}, object()
+
+    def release(self, _handle, *, reason):
+        del reason
+        self.active_leases -= 1
+        self.releases += 1
+
+
+class _BlockingStore:
+    """Wrap a real store while holding get() until the test releases it."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.entered = threading.Event()
+        self.resume = threading.Event()
+
+    def get(self, ref, *, device="cpu"):
+        self.entered.set()
+        self.resume.wait()
+        return self.inner.get(ref, device=device)
+
+    def release(self, handle, *, reason):
+        self.inner.release(handle, reason=reason)
+
+    def gc(self):
+        return self.inner.gc()
+
+    def health(self):
+        return self.inner.health()
 
 
 class TestFeatureDataLoader(unittest.TestCase):
@@ -276,10 +354,144 @@ class TestFeatureDataLoader(unittest.TestCase):
 
         self.assertEqual(
             batches,
-            [[ref.sample_id for ref in refs[index : index + 2]] for index in range(0, 8, 2)],
+            [
+                [ref.sample_id for ref in refs[index : index + 2]]
+                for index in range(0, 8, 2)
+            ],
         )
         self.assertEqual(len(worker_names), 8)
         self.assertTrue(all(name.startswith("feature-loader") for name in worker_names))
+
+    def test_materialize_releases_handle_when_clone_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=1)
+            ref = OfflineManifestReader(d, run_id="run").read()[0]
+            store = _LeaseTrackingStore()
+            loader = FeatureDataLoader(store, refs=[ref])
+
+            with self.assertRaisesRegex(RuntimeError, "clone failed"):
+                loader._materialize(ref)
+
+        self.assertEqual(store.active_leases, 0)
+        self.assertEqual(store.releases, 1)
+
+    def test_prefetch_materialization_exception_leaves_no_lease_or_thread(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=1)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            queue = SampleRefQueue()
+            queue.put(refs)
+            store = LocalFeatureStore("st")
+
+            def fail_transform(_raw):
+                raise RuntimeError("transform failed")
+
+            loader = FeatureDataLoader(
+                store,
+                queue,
+                batch_size=1,
+                per_sample_transform=fail_transform,
+                num_workers=1,
+            )
+            with self.assertRaisesRegex(RuntimeError, "transform failed"):
+                list(loader)
+            loader.close()
+            loader.close()
+
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(store.health()["active_leases"], 0)
+        self.assertIsNone(loader._prefetch_state)
+
+    def test_prefetch_close_requeues_only_never_yielded_durable_refs(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=4)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            by_id = {ref.sample_id: ref for ref in refs}
+            queue = _DurableQueue()
+            queue.put(refs)
+            store = LocalFeatureStore("st")
+            loader = FeatureDataLoader(
+                store,
+                queue,
+                batch_size=1,
+                collate_fn=_simple_collate,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
+                ack=False,
+                num_workers=2,
+            )
+
+            iterator = iter(loader)
+            yielded = next(iterator)
+            deadline = time.monotonic() + 2.0
+            while queue.in_flight() < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(queue.in_flight(), 3)
+            queue.ack_durable([by_id[yielded.sample_ids[0]]])
+            state = loader._prefetch_state
+            loader.close()
+            loader.close()  # idempotent
+            iterator.close()
+
+        self.assertEqual(queue.consumed, 1)
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(queue.depth(), 3)
+        self.assertTrue(queue.failures)
+        self.assertTrue(all(retryable for _, _, retryable in queue.failures))
+        failed_ids = {sid for ids, _, _ in queue.failures for sid in ids}
+        self.assertNotIn(yielded.sample_ids[0], failed_ids)
+        self.assertEqual(store.health()["active_leases"], 0)
+        self.assertFalse(state.thread.is_alive())
+        self.assertIsNone(loader._prefetch_state)
+
+    def test_prefetch_close_is_bounded_if_store_get_stalls(self):
+        import specforge.runtime.data_plane.feature_dataloader as loader_module
+
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=1)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            queue = _DurableQueue()
+            queue.put(refs)
+            store = _BlockingStore(LocalFeatureStore("st"))
+            loader = FeatureDataLoader(
+                store,
+                queue,
+                batch_size=1,
+                collate_fn=_simple_collate,
+                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
+                ack=False,
+                num_workers=1,
+            )
+            iterator = iter(loader)
+            consumer_errors = []
+
+            def consume_one():
+                try:
+                    next(iterator)
+                except BaseException as exc:
+                    consumer_errors.append(exc)
+
+            consumer = threading.Thread(target=consume_one, daemon=True)
+            consumer.start()
+            self.assertTrue(store.entered.wait(timeout=1.0))
+            state = loader._prefetch_state
+            with mock.patch.object(loader_module, "_PREFETCH_JOIN_TIMEOUT_S", 0.05):
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "did not stop"):
+                    loader.close()
+                self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(state.outstanding_ids(), [refs[0].sample_id])
+
+            store.resume.set()
+            state.thread.join(timeout=1.0)
+            loader.close()
+            consumer.join(timeout=1.0)
+            iterator.close()
+
+        self.assertFalse(state.thread.is_alive())
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(queue.depth(), 1)
+        self.assertEqual(store.health()["active_leases"], 0)
+        self.assertIsNone(loader._prefetch_state)
 
     def test_requires_exactly_one_source(self):
         store = LocalFeatureStore("st")
