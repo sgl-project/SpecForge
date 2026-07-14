@@ -26,6 +26,7 @@ does not load Transformers, datasets, or a target backend.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
@@ -700,6 +701,17 @@ def _ensure_vocab_mapping(
     cfg: Config, bundle: ModelBundle, prompts: List[dict]
 ) -> None:
     """Generate the online EAGLE-family map from its prepared prompt plan."""
+    # Avoid walking (and validating) the prompt payload when no mapping can be
+    # needed.  This is common for equal-vocabulary targets and keeps assembly
+    # independent of the online prompt schema for non-mapping runs.
+    if cfg.training.strategy not in ("eagle3", "peagle"):
+        return
+    if (
+        cfg.model.vocab_mapping_path
+        or bundle.draft_vocab_size == bundle.target_vocab_size
+    ):
+        return
+
     counts: Counter = Counter()
     for task in prompts:
         payload = task["payload"]

@@ -207,7 +207,7 @@ class TrainerCore:
         # the generic trainer their algorithm-specific names. Move CPU schedule
         # scalars (for example Domino's lambda_base) onto the loss device before
         # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
-        reserved_metric_keys = set(structured_metric_keys) | {"accuracy"}
+        reserved_metric_keys = set(structured_metric_keys) | {"accuracy", "loss"}
         for key, value in out.metrics.items():
             if key in reserved_metric_keys:
                 continue

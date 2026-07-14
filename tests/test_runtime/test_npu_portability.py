@@ -21,19 +21,28 @@ class _Mesh:
 
 
 class NPUDistributedTest(unittest.TestCase):
+    _GLOBAL_NAMES = (
+        "_DEVICE_MESH",
+        "_TP_DEVICE_MESH",
+        "_TP_GROUP",
+        "_DP_DEVICE_MESH",
+        "_DP_GROUP",
+        "_DRAFT_DP_GROUP",
+        "_DRAFT_SP_GROUP",
+        "_SP_ULYSSES_GROUP",
+        "_SP_RING_GROUP",
+    )
+
+    def setUp(self):
+        # This suite can run after a CUDA runtime gate in the same interpreter.
+        # Preserve its live groups while the NPU initializer is mocked.
+        self._saved_globals = {
+            name: getattr(sf_dist, name) for name in self._GLOBAL_NAMES
+        }
+
     def tearDown(self):
-        for name in (
-            "_DEVICE_MESH",
-            "_TP_DEVICE_MESH",
-            "_TP_GROUP",
-            "_DP_DEVICE_MESH",
-            "_DP_GROUP",
-            "_DRAFT_DP_GROUP",
-            "_DRAFT_SP_GROUP",
-            "_SP_ULYSSES_GROUP",
-            "_SP_RING_GROUP",
-        ):
-            setattr(sf_dist, name, None)
+        for name, value in self._saved_globals.items():
+            setattr(sf_dist, name, value)
 
     def test_backend_mapping_is_device_specific(self):
         self.assertEqual(sf_dist._distributed_backend("cuda"), "nccl")
@@ -98,6 +107,25 @@ class NPUDistributedTest(unittest.TestCase):
             [call.kwargs["device_type"] for call in from_group.call_args_list],
             ["npu", "npu"],
         )
+
+
+class DistributedTeardownTest(unittest.TestCase):
+    def test_destroy_clears_every_cached_group_and_mesh(self):
+        names = NPUDistributedTest._GLOBAL_NAMES
+        saved = {name: getattr(sf_dist, name) for name in names}
+        try:
+            for name in names:
+                setattr(sf_dist, name, object())
+            with (
+                mock.patch.object(sf_dist.dist, "is_initialized", return_value=True),
+                mock.patch.object(sf_dist.dist, "destroy_process_group"),
+            ):
+                sf_dist.destroy_distributed()
+            for name in names:
+                self.assertIsNone(getattr(sf_dist, name), name)
+        finally:
+            for name, value in saved.items():
+                setattr(sf_dist, name, value)
 
 
 class NPURNGTest(unittest.TestCase):
