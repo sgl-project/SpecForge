@@ -29,6 +29,11 @@ def _load_preprocessing_stack():
     data_package.__path__ = []
     sys.modules[data_package_name] = data_package
 
+    distributed_module = types.ModuleType(f"{package_name}.distributed")
+    distributed_module.get_draft_sp_group = lambda: None
+    distributed_module.get_sp_ring_group = lambda: None
+    sys.modules[f"{package_name}.distributed"] = distributed_module
+
     for module_name in ("template", "parse", "preprocessing"):
         full_name = f"{data_package_name}.{module_name}"
         module_path = repo_root / "specforge" / "data" / f"{module_name}.py"
