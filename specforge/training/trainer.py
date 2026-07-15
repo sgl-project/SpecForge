@@ -84,6 +84,26 @@ class Trainer:
         )
 
         dataset_size = len(ref_source["refs"]) if "refs" in ref_source else None
+        configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
+        effective_total_steps = None
+        if total_steps is not None or max_steps is not None or dataset_size is not None:
+            from specforge.training.schedule import resolve_total_steps
+
+            effective_total_steps = resolve_total_steps(
+                total_steps=total_steps,
+                max_steps=max_steps,
+                num_samples=dataset_size,
+                batch_size=batch_size,
+                accumulation_steps=accumulation_steps,
+                num_epochs=num_epochs,
+            )
+        elif configure_schedule is not None:
+            raise ValueError(
+                "a configured optimizer on a streaming source requires total_steps "
+                "or max_steps"
+            )
+        if configure_schedule is not None:
+            configure_schedule(effective_total_steps)
         # Resume: draft weights load BEFORE the FSDP wrap so the optimizer's fp32
         # masters (cloned at build) start from them; this rank's own optimizer/RNG
         # shard (``state['backend']``) loads after the wrap builds the optimizer.
@@ -170,7 +190,7 @@ class Trainer:
             output_dir=output_dir,
             num_epochs=num_epochs,
             max_steps=max_steps,
-            total_steps=total_steps,
+            total_steps=effective_total_steps,
             save_interval=save_interval,
             eval_interval=eval_interval,
             log_interval=log_interval,
