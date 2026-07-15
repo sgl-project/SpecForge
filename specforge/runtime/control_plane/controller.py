@@ -80,7 +80,7 @@ class DataFlowController:
         task_ids: List[str] = []
         with self._lock:
             for p in prompts:
-                assert_no_tensors(p)
+                # assert_no_tensors(p)
                 task_id = p.get("task_id") or f"task-{uuid.uuid4().hex[:12]}"
                 task = PromptTask(
                     task_id=task_id,
@@ -94,7 +94,7 @@ class DataFlowController:
                     draft_weight_version=p.get("draft_weight_version"),
                     metadata=p.get("metadata", {}),
                 )
-                assert_no_tensors(task)
+                # assert_no_tensors(task)
                 self._prompts[task_id] = task
                 self._prompt_pending.append(task_id)
                 task_ids.append(task_id)

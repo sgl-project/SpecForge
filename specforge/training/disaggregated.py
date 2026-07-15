@@ -415,6 +415,7 @@ def _build_online(
     from specforge.training.assembly import (
         TrainingRun,
         _dataloader_num_workers,
+        _load_input_tools,
         _profiling_options,
     )
 
