@@ -17,7 +17,11 @@ the handle immediately, so prefetch can never race a release.
 from __future__ import annotations
 
 import os
+import queue as queue_module
+import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import torch
@@ -28,6 +32,55 @@ from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
 PerSampleTransform = Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
 CollateFn = Callable[[List[Dict[str, torch.Tensor]]], Dict[str, Any]]
+
+_PREFETCH_POLL_S = 0.1
+_PREFETCH_JOIN_TIMEOUT_S = float(
+    os.environ.get("SPECFORGE_LOADER_JOIN_TIMEOUT_S", "5.0")
+)
+
+
+@dataclass
+class _OutstandingRef:
+    ref: SampleRef
+    materialized: bool = False
+
+
+class _QueuePrefetchState:
+    """One online iterator's worker, buffer, and not-yet-yielded leases."""
+
+    def __init__(self, depth: int) -> None:
+        self.buffer: queue_module.Queue[Any] = queue_module.Queue(maxsize=depth)
+        self.stop = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.outstanding: "OrderedDict[str, _OutstandingRef]" = OrderedDict()
+        self.outstanding_lock = threading.Lock()
+        self.shutdown_lock = threading.Lock()
+        self.shutdown_complete = False
+
+    def track(self, refs: List[SampleRef]) -> None:
+        with self.outstanding_lock:
+            for ref in refs:
+                self.outstanding[ref.sample_id] = _OutstandingRef(ref)
+
+    def mark_materialized(self, refs: List[SampleRef]) -> None:
+        with self.outstanding_lock:
+            for ref in refs:
+                entry = self.outstanding.get(ref.sample_id)
+                if entry is not None:
+                    entry.materialized = True
+
+    def mark_yielded_or_failed(self, refs: List[SampleRef]) -> None:
+        with self.outstanding_lock:
+            for ref in refs:
+                self.outstanding.pop(ref.sample_id, None)
+
+    def outstanding_entries(self) -> List[_OutstandingRef]:
+        with self.outstanding_lock:
+            return list(self.outstanding.values())
+
+    def outstanding_ids(self) -> List[str]:
+        with self.outstanding_lock:
+            return list(self.outstanding)
 
 
 def _default_collate(features: List[Dict[str, torch.Tensor]]) -> Dict[str, Any]:
@@ -52,6 +105,7 @@ class FeatureDataLoader:
         strategy: str = "eagle3",
         ack: bool = True,
         gc_interval_s: Optional[float] = 15.0,
+        num_workers: int = 0,
     ) -> None:
         if (queue is None) == (refs is None):
             raise ValueError(
@@ -72,6 +126,9 @@ class FeatureDataLoader:
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack
+        if num_workers < 0:
+            raise ValueError("num_workers must be >= 0")
+        self.num_workers = int(num_workers)
         self._seek_batches = 0
         # Remote stores defer a physical free while the get() read-lease is live
         # (Mooncake remove -> -706): release() parks it and gc() must retry.
@@ -79,6 +136,9 @@ class FeatureDataLoader:
         # after max_release_attempts, so rapid retries would leak the object.
         self.gc_interval_s = gc_interval_s if hasattr(store, "gc") else None
         self._last_gc = time.monotonic()
+        self._lifecycle_lock = threading.Lock()
+        self._prefetch_state: Optional[_QueuePrefetchState] = None
+        self._queue_closed = False
 
     def _maybe_gc(self) -> None:
         if self.gc_interval_s is None:
@@ -152,17 +212,23 @@ class FeatureDataLoader:
         _prof = self._prof_loader
         _t = time.monotonic()
         tensors, handle = self.store.get(ref, device=self.device)
-        if _prof:
-            s = self._lp()
-            s["get"] += time.monotonic() - _t
-            s["bytes"] += sum(t.numel() * t.element_size() for t in tensors.values())
-            _t = time.monotonic()
-        if self.clone_on_fetch:
-            tensors = {k: v.clone() for k, v in tensors.items()}
-        if _prof:
-            self._lp()["clone"] += time.monotonic() - _t
-            _t = time.monotonic()
-        self.store.release(handle, reason="loaded")
+        try:
+            if _prof:
+                s = self._lp()
+                s["get"] += time.monotonic() - _t
+                s["bytes"] += sum(
+                    t.numel() * t.element_size() for t in tensors.values()
+                )
+                _t = time.monotonic()
+            if self.clone_on_fetch:
+                tensors = {k: v.clone() for k, v in tensors.items()}
+            if _prof:
+                self._lp()["clone"] += time.monotonic() - _t
+                _t = time.monotonic()
+        finally:
+            # ``get`` has already registered a read lease. Clone/device or
+            # tensor validation failures must not strand that handle.
+            self.store.release(handle, reason="loaded")
         if _prof:
             self._lp()["rel"] += time.monotonic() - _t
             _t = time.monotonic()
@@ -194,6 +260,29 @@ class FeatureDataLoader:
             },
         )
 
+    def _settle_incomplete_queue_batch(self, refs: List[SampleRef]) -> None:
+        """Terminally discard and clean a short ``drop_last`` queue batch."""
+        reason = (
+            "online stream ended with an incomplete batch: "
+            f"received {len(refs)} refs but batch_size={self.batch_size}"
+        )
+        self.queue.fail(refs, reason=reason, retryable=False)
+        cleanup_errors = []
+        for ref in refs:
+            try:
+                # A fresh Mooncake consumer has no put-side bookkeeping for a
+                # never-materialized server ref. Seed it before aborting so the
+                # remote keys are actually removed; local/file stores need no
+                # adoption hook.
+                adopt = getattr(self.store, "adopt", None)
+                if callable(adopt):
+                    adopt(ref)
+                self.store.abort(ref.sample_id, reason=reason)
+            except Exception as exc:  # settle the full tail, then fail loudly
+                cleanup_errors.append(f"{ref.sample_id}: {exc}")
+        if cleanup_errors:
+            raise RuntimeError(f"{reason}; cleanup errors={cleanup_errors}")
+
     def __iter__(self) -> Iterator[TrainBatch]:
         if self._refs is not None:
             yield from self._iter_refs()
@@ -203,24 +292,54 @@ class FeatureDataLoader:
     def _iter_refs(self) -> Iterator[TrainBatch]:
         # Acking (the durable marker) is the trainer's job here, not the loader's.
         skip, self._seek_batches = self._seek_batches, 0
+        chunks = []
         for start in range(skip * self.batch_size, len(self._refs), self.batch_size):
             chunk = self._refs[start : start + self.batch_size]
             if self.drop_last and len(chunk) < self.batch_size:
                 break
+            chunks.append(chunk)
+        if self.num_workers > 0:
+            yield from self._iter_refs_prefetch(chunks)
+            return
+        for chunk in chunks:
             yield self._make_batch(chunk)
+
+    def _iter_refs_prefetch(
+        self, chunks: List[List[SampleRef]]
+    ) -> Iterator[TrainBatch]:
+        """Materialize fixed offline batches concurrently while preserving order."""
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        chunk_iter = iter(chunks)
+        pending = deque()
+        with ThreadPoolExecutor(
+            max_workers=self.num_workers,
+            thread_name_prefix="feature-loader",
+        ) as executor:
+            for _ in range(self.num_workers):
+                try:
+                    chunk = next(chunk_iter)
+                except StopIteration:
+                    break
+                pending.append(executor.submit(self._make_batch, chunk))
+            while pending:
+                yield pending.popleft().result()
+                try:
+                    chunk = next(chunk_iter)
+                except StopIteration:
+                    continue
+                pending.append(executor.submit(self._make_batch, chunk))
 
     def seek(self, num_batches: int) -> None:
         """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
 
-        Raises on a queue stream (no position to restore — online resume
-        reconciles via the control plane) and when the skip exceeds the available
-        batches (a silently empty epoch is banned).
+        Raises on a queue stream (which has no resumable position) and when the
+        skip exceeds the available batches (a silently empty epoch is banned).
         """
         if self._refs is None:
             raise ValueError(
-                "seek() applies to refs mode only; a queue stream is consume-once "
-                "(online resume goes through the control plane's skip_ids "
-                "reconciliation, not a loader seek)"
+                "seek() applies to refs mode only; a queue stream is consume-once"
             )
         skip = max(0, int(num_batches))
         if self.drop_last:
@@ -237,11 +356,14 @@ class FeatureDataLoader:
         self._seek_batches = skip
 
     def _iter_queue(self) -> Iterator[TrainBatch]:
+        with self._lifecycle_lock:
+            if self._queue_closed:
+                return
         # LOADER_PREFETCH=N (>0) materializes up to N batches ahead on a
         # background thread so the training step never pays fetch latency
         # inline. Ack still happens on the consuming thread AFTER the trainer
         # has taken the batch (same in-flight semantics as the sync path).
-        depth = int(os.environ.get("LOADER_PREFETCH", "0"))
+        depth = self.num_workers or int(os.environ.get("LOADER_PREFETCH", "0"))
         if depth > 0:
             yield from self._iter_queue_prefetch(depth)
             return
@@ -255,8 +377,7 @@ class FeatureDataLoader:
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
-                # fail-retryable so the incomplete trailing batch is not lost
-                self.queue.fail(refs, reason="drop_last", retryable=True)
+                self._settle_incomplete_queue_batch(refs)
                 return
             try:
                 batch = self._make_batch(refs)
@@ -285,23 +406,45 @@ class FeatureDataLoader:
                 self.queue.ack(refs)
 
     def _iter_queue_prefetch(self, depth: int) -> Iterator[TrainBatch]:
-        import queue as _queue
-        import threading
-
         _prof = self._prof_loader
-        buf: "_queue.Queue" = _queue.Queue(maxsize=depth)
-        _EOS = object()
+        state = _QueuePrefetchState(depth)
+        eos = object()
+
+        def put_interruptibly(item: Any) -> bool:
+            while not state.stop.is_set():
+                try:
+                    state.buffer.put(item, timeout=_PREFETCH_POLL_S)
+                    return True
+                except queue_module.Full:
+                    continue
+            return False
+
+        def get_refs_interruptibly() -> List[SampleRef]:
+            get_interruptible = getattr(self.queue, "get_interruptible", None)
+            if callable(get_interruptible):
+                return get_interruptible(
+                    self.batch_size,
+                    stop_event=state.stop,
+                )
+            return self.queue.get(self.batch_size, timeout_s=_PREFETCH_POLL_S)
 
         def _worker() -> None:
             try:
-                while True:
-                    refs = self.queue.get(self.batch_size, timeout_s=0.0)
+                while not state.stop.is_set():
+                    refs = get_refs_interruptibly()
                     if not refs:
-                        buf.put(_EOS)
+                        if not state.stop.is_set():
+                            put_interruptibly(eos)
+                        return
+                    state.track(refs)
+                    if state.stop.is_set():
                         return
                     if self.drop_last and len(refs) < self.batch_size:
-                        self.queue.fail(refs, reason="drop_last", retryable=True)
-                        buf.put(_EOS)
+                        try:
+                            self._settle_incomplete_queue_batch(refs)
+                        finally:
+                            state.mark_yielded_or_failed(refs)
+                        put_interruptibly(eos)
                         return
                     try:
                         batch = self._make_batch(refs)
@@ -309,51 +452,146 @@ class FeatureDataLoader:
                         self.queue.fail(
                             refs, reason=f"materialize:{exc}", retryable=False
                         )
-                        buf.put(exc)
+                        state.mark_yielded_or_failed(refs)
+                        put_interruptibly(exc)
                         return
-                    buf.put((batch, refs))
+                    state.mark_materialized(refs)
+                    if not put_interruptibly((batch, refs)):
+                        return
             except BaseException as exc:  # loud failure, never a silent hang
-                buf.put(exc)
+                put_interruptibly(exc)
 
-        threading.Thread(target=_worker, name="loader-prefetch", daemon=True).start()
-        while True:
-            _t = time.monotonic()
-            item = buf.get()
-            if _prof:
-                s = self._lp()
-                s["wait"] += time.monotonic() - _t
-            if item is _EOS:
+        worker = threading.Thread(
+            target=_worker,
+            name="loader-prefetch",
+            # A broken backend must not make interpreter shutdown impossible.
+            # close() still joins and reports a bounded, loud lifecycle error.
+            daemon=True,
+        )
+        state.thread = worker
+        with self._lifecycle_lock:
+            if self._queue_closed:
                 return
-            if isinstance(item, BaseException):
-                raise item
-            batch, refs = item
-            if _prof:
-                s = self._lp()
-                s["b"] += 1
-                if s["b"] >= _prof:
-                    win = time.monotonic() - s["t0"]
-                    rank = os.environ.get("RANK", "?")
-                    print(
-                        f"[loader r{rank}] b={s['b']} win_s={win:.2f} "
-                        f"wait_ms={1000*s['wait']/s['b']:.1f} "
-                        f"get_ms={1000*s['get']/s['b']:.1f} "
-                        f"clone_ms={1000*s['clone']/s['b']:.1f} "
-                        f"rel_ms={1000*s['rel']/s['b']:.1f} "
-                        f"gc_ms={1000*s['gc']/s['b']:.1f} "
-                        f"MB={s['bytes']/s['b']/1e6:.1f} (avg/batch, prefetch)",
-                        flush=True,
+            if self._prefetch_state is not None:
+                raise RuntimeError("FeatureDataLoader already has an active iterator")
+            self._prefetch_state = state
+            worker.start()
+
+        try:
+            while not state.stop.is_set():
+                _t = time.monotonic()
+                try:
+                    item = state.buffer.get(timeout=_PREFETCH_POLL_S)
+                except queue_module.Empty:
+                    continue
+                if _prof:
+                    s = self._lp()
+                    s["wait"] += time.monotonic() - _t
+                if item is eos:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                batch, refs = item
+                # From this point the trainer owns the refs. In deferred-ack
+                # mode its optimizer-boundary transaction decides their
+                # outcome; loader shutdown must touch only batches that were
+                # materialized ahead but never yielded.
+                state.mark_yielded_or_failed(refs)
+                if _prof:
+                    s = self._lp()
+                    s["b"] += 1
+                    if s["b"] >= _prof:
+                        win = time.monotonic() - s["t0"]
+                        rank = os.environ.get("RANK", "?")
+                        print(
+                            f"[loader r{rank}] b={s['b']} win_s={win:.2f} "
+                            f"wait_ms={1000*s['wait']/s['b']:.1f} "
+                            f"get_ms={1000*s['get']/s['b']:.1f} "
+                            f"clone_ms={1000*s['clone']/s['b']:.1f} "
+                            f"rel_ms={1000*s['rel']/s['b']:.1f} "
+                            f"gc_ms={1000*s['gc']/s['b']:.1f} "
+                            f"MB={s['bytes']/s['b']/1e6:.1f} "
+                            "(avg/batch, prefetch)",
+                            flush=True,
+                        )
+                        self._lp_state = None
+                yield batch
+                if self.ack:
+                    self.queue.ack(refs)
+        finally:
+            self._shutdown_prefetch(state)
+
+    def _shutdown_prefetch(self, state: _QueuePrefetchState) -> None:
+        """Stop one worker and return every not-yet-yielded lease explicitly."""
+        with state.shutdown_lock:
+            if state.shutdown_complete:
+                return
+            state.stop.set()
+            worker = state.thread
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(timeout=_PREFETCH_JOIN_TIMEOUT_S)
+                if worker.is_alive():
+                    outstanding_ids = state.outstanding_ids()
+                    raise RuntimeError(
+                        "FeatureDataLoader prefetch worker did not stop within "
+                        f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
+                        f"is still blocked, outstanding_refs={outstanding_ids}"
                     )
-                    self._lp_state = None
-            yield batch
-            if self.ack:
-                self.queue.ack(refs)
+
+            outstanding = state.outstanding_entries()
+            retryable: List[SampleRef] = []
+            terminal: List[SampleRef] = []
+            durable_retry = bool(getattr(self.queue, "loader_close_retryable", False))
+            retain_on_release = bool(getattr(self.store, "retain_on_release", False))
+            for entry in outstanding:
+                can_rematerialize = (
+                    durable_retry
+                    or not entry.materialized
+                    or retain_on_release
+                    or entry.ref.feature_store_uri.startswith("file://")
+                )
+                (retryable if can_rematerialize else terminal).append(entry.ref)
+
+            if retryable:
+                self.queue.fail(
+                    retryable,
+                    reason="loader_prefetch_closed_before_yield",
+                    retryable=True,
+                )
+                state.mark_yielded_or_failed(retryable)
+            if terminal:
+                self.queue.fail(
+                    terminal,
+                    reason=(
+                        "loader_prefetch_closed_after_materialization_from_"
+                        "a_consume_once_store"
+                    ),
+                    retryable=False,
+                )
+                state.mark_yielded_or_failed(terminal)
+            state.shutdown_complete = True
+
+        with self._lifecycle_lock:
+            if self._prefetch_state is state:
+                self._prefetch_state = None
 
     def set_epoch(self, epoch: int) -> None:
         # hook for per-epoch shuffling of the offline ref set (no-op for now)
         self._epoch = epoch
 
     def close(self) -> None:
-        pass
+        """Stop online prefetch and settle every batch it never yielded.
+
+        Fixed offline refs have no loader-owned background lifecycle and remain
+        re-iterable after ``close``. Queue sources are consume-once, so closing
+        them prevents a later iterator from starting a second worker.
+        """
+        with self._lifecycle_lock:
+            if self._refs is None:
+                self._queue_closed = True
+            state = self._prefetch_state
+        if state is not None:
+            self._shutdown_prefetch(state)
 
 
 __all__ = ["FeatureDataLoader", "PerSampleTransform", "CollateFn"]

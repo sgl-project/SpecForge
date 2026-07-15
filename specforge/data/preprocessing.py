@@ -764,6 +764,79 @@ def generate_vocab_mapping_file(
     return vocab_mapping_path
 
 
+def process_offline_eagle3_sample(
+    raw: Dict[str, torch.Tensor], max_len: int
+) -> Dict[str, torch.Tensor]:
+    """Normalize one prepared EAGLE3 feature sample for the canonical loader.
+
+    Hidden-state preparation stores the target final state under
+    hidden_state and auxiliary layers under aux_hidden_state. Training consumes
+    those tensors as target and hidden_state respectively.
+    """
+    hidden_state = raw["aux_hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    target = raw["hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
+    if loss_mask.numel() > 0:
+        loss_mask[0, -1] = 0
+
+    return {
+        "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),
+        "loss_mask": loss_mask,
+        "target": target,
+        "hidden_state": hidden_state,
+        "input_ids": input_ids,
+    }
+
+
+def process_offline_dflash_sample(
+    raw: Dict[str, torch.Tensor], max_len: int
+) -> Dict[str, torch.Tensor]:
+    """Normalize one prepared DFlash-family feature sample.
+
+    DFlash and Domino consume the same capture contract: token ids, a loss
+    mask, and the concatenated target-layer states.  Unlike EAGLE3, there is no
+    auxiliary/final-state swap and no target distribution.  Offline feature
+    files may store ``hidden_states`` as either ``[seq, width]`` or
+    ``[1, seq, width]``; the canonical loader always receives a leading batch
+    dimension.
+    """
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
+    hidden_states = raw["hidden_states"]
+    if hidden_states.dim() == 3:
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                "offline DFlash hidden_states must have shape [seq, width] or "
+                f"[1, seq, width], got {tuple(hidden_states.shape)}"
+            )
+        hidden_states = hidden_states.squeeze(0)
+    if hidden_states.dim() != 2:
+        raise ValueError(
+            "offline DFlash hidden_states must have shape [seq, width] or "
+            f"[1, seq, width], got {tuple(hidden_states.shape)}"
+        )
+    hidden_states = hidden_states[:max_len].unsqueeze(0)
+
+    sequence_lengths = {
+        input_ids.shape[1],
+        loss_mask.shape[1],
+        hidden_states.shape[1],
+    }
+    if len(sequence_lengths) != 1:
+        raise ValueError(
+            "offline DFlash features have mismatched sequence lengths after "
+            f"truncation: input_ids={input_ids.shape[1]}, "
+            f"loss_mask={loss_mask.shape[1]}, "
+            f"hidden_states={hidden_states.shape[1]}"
+        )
+    return {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_states": hidden_states,
+    }
+
+
 def process_token_dict_to_mappings(
     token_dict: Counter,
     draft_vocab_size: int,

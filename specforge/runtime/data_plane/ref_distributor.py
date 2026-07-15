@@ -11,24 +11,23 @@
 One distributor per run (it lives on trainer DP rank 0). It is the ONLY reader
 of the producer's ref channel and the only holder of consume book-keeping:
 
-    source channel -> commit (ONE ledger, dedup) -> aligned round-robin -> per-rank inbox
+    source channel -> commit (ONE ledger, dedup) -> optimizer-step windows -> per-rank inbox
 
 Each rank reads a private inbox (a plain consume-once :class:`StreamingRefQueue`)
 and holds no channel offset, no partition math, no ledger — the design goal is a
-single book-keeping authority, not N. Refs are dispatched in windows of exactly
-``dp_size`` (one ref per rank per window) so every rank sees the SAME count:
-the lockstep invariant FSDP collectives require. Anything less than a full
-window at end-of-stream is dropped (logged; it stays committed-unacked in the
-ledger, so a restart re-trains it).
+single book-keeping authority, not N. Refs are dispatched only in complete
+``dp_size * refs_per_rank_step`` windows. Each rank receives exactly
+``refs_per_rank_step = batch_size * accumulation_steps`` refs, so the stream
+cannot end on a partial batch or an unreduced FSDP accumulation step. An
+unaligned end-of-stream cleans and settles the undispatched tail, then closes
+every rank inbox normally after the aligned prefix.
 
 The consumed counter on the source channel (the producer's backpressure signal)
-mirrors what the ranks actually consumed: each rank's loader acks its OWN inbox
-per micro-batch, and the distributor forwards the sum of the inbox sidecars to
-the source counter. Per-micro-batch granularity means the producer watermark
-never has to cover a whole ``dp_size * batch * accumulation`` optimizer window.
-Dispatch itself does NOT count — in-flight must keep covering everything not
-yet trained. On restart the counter is seeded from the sidecar (released refs
-were already counted by the prior run, so skips add nothing).
+mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
+the gathered SQLite ack/marker succeeds, and the distributor forwards the sum
+of the inbox sidecars to the source counter. The consumer publishes the global
+dispatch quantum before capture begins, and the producer rejects a watermark
+smaller than that first window. Dispatch itself does not count as consumption.
 
 If the distributor dies it drops a ``.failed`` sentinel (with the traceback)
 into every inbox; :class:`InboxChannel` readers raise on it at the next poll —
@@ -75,7 +74,11 @@ class InboxChannel(StreamingRefChannel):
                 raise RuntimeError(f"ref-distributor died:\n{f.read()}")
         return super().is_closed()
 
-    _is_closed = is_closed
+    def failure(self) -> Optional[str]:
+        failure = super().failure()
+        if failure is None:
+            return None
+        return f"ref-distributor died:\n{failure}"
 
 
 class RefDistributor:
@@ -88,7 +91,10 @@ class RefDistributor:
         inbox_dir: str,
         dp_size: int,
         *,
+        feature_store,
+        refs_per_rank_step: int,
         skip_ids: Optional[Iterable[str]] = None,
+        requeued_ids: Optional[Iterable[str]] = None,
         worker_id: str = "ref-distributor",
         poll_s: float = 0.05,
         idle_timeout_s: Optional[float] = None,
@@ -97,18 +103,26 @@ class RefDistributor:
     ) -> None:
         if dp_size < 1:
             raise ValueError(f"dp_size must be >= 1, got {dp_size}")
+        if refs_per_rank_step < 1:
+            raise ValueError(
+                f"refs_per_rank_step must be >= 1, got {refs_per_rank_step}"
+            )
         self.source = source
         self.controller = controller
         self.dp_size = dp_size
+        self.feature_store = feature_store
+        self.refs_per_rank_step = refs_per_rank_step
+        self.dispatch_quantum = dp_size * refs_per_rank_step
         self.worker_id = worker_id
         self.poll_s = poll_s
         self.idle_timeout_s = idle_timeout_s
         self._clock = clock
         self._sleep = sleep
-        self._skip = set(skip_ids) if skip_ids else None
+        self._skip = set(skip_ids or ())
+        self._requeued = set(requeued_ids or ())
         # Inboxes are EPHEMERAL (the ledger is the durable state): recreate them
         # fresh so a restarted run cannot replay a previous attempt's dispatch.
-        # The launcher barriers ranks AFTER construction, before readers open.
+        # Rank 0 broadcasts setup success before any rank opens a reader.
         os.makedirs(inbox_dir, exist_ok=True)
         for rank in range(dp_size):
             base = self.inbox_path(inbox_dir, rank)
@@ -121,17 +135,25 @@ class RefDistributor:
             StreamingRefChannel(self.inbox_path(inbox_dir, rank))
             for rank in range(dp_size)
         ]
-        # A restarted consumer must not rewind the producer's counter. The seed
-        # already covers everything the prior run counted (incl. released refs,
-        # which the skip filter therefore does NOT count again).
-        self.source.seed_consumed()
+        # Continue the producer-visible counter instead of rewinding it after a
+        # consumer restart. A crash can occur after SQLite commit/feature abort
+        # but before the rank-local inbox ack; repair that narrow window from
+        # the durable released prefix before the producer applies backpressure.
+        consumed = self.source.seed_consumed()
+        if len(self._skip) > consumed:
+            self.source.mark_consumed(len(self._skip) - consumed)
         self._inbox_consumed = 0  # last forwarded sum of the inbox sidecars
-        self._window: List[SampleRef] = []  # leased, awaiting a full dp_size window
+        self._window: List[SampleRef] = []
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.finished = False
         self.error: Optional[BaseException] = None
-        self.stats = {"dispatched": 0, "skipped": 0, "duplicates": 0, "dropped": 0}
+        self.stats = {
+            "dispatched": 0,
+            "skipped": 0,
+            "duplicates": 0,
+            "dropped": 0,
+        }
         # PROFILE_DISTRIB=<secs> -> periodic [dist] line: polled/dispatched
         # rates, per-ref commit + count cost, inbox-publish cost, rank lag.
         self._prof_s = float(os.environ.get("PROFILE_DISTRIB", "0"))
@@ -149,12 +171,7 @@ class RefDistributor:
         return os.path.join(inbox_dir, f"inbox-rank{dp_rank}.jsonl")
 
     def _forward_consumed(self) -> bool:
-        """Mirror the ranks' inbox acks onto the source counter (backpressure).
-
-        Per-micro-batch granularity: the producer's watermark only ever has to
-        cover the dispatch pipeline, not a whole optimizer window — a watermark
-        smaller than ``dp_size * batch * accumulation`` must not deadlock.
-        """
+        """Mirror optimizer-durable inbox acks onto source backpressure."""
         consumed = sum(inbox.consumed_remote() for inbox in self._inboxes)
         delta = consumed - self._inbox_consumed
         if delta <= 0:
@@ -171,6 +188,9 @@ class RefDistributor:
         """
         if self.finished:
             return False
+        source_failure = self.source.failure()
+        if source_failure is not None:
+            raise RuntimeError(f"source producer failed: {source_failure}")
         progress = False
 
         raw = self.source.poll()
@@ -178,13 +198,9 @@ class RefDistributor:
             progress = True
             self._pd["polled"] += len(raw)
             for ref in raw:
-                if self._skip and ref.sample_id in self._skip:
-                    # released in a prior run: already counted by that run's
-                    # acks (covered by the seed), so just don't re-dispatch.
+                if ref.sample_id in self._skip:
                     self._skip.discard(ref.sample_id)
                     self.stats["skipped"] += 1
-                    if not self._skip:
-                        self._skip = None
                     continue
                 _t = time.monotonic()
                 before = self.controller.store.committed_count()
@@ -194,25 +210,33 @@ class RefDistributor:
                 self._pd["commit"] += time.monotonic() - _t
                 _t = time.monotonic()
                 if self.controller.store.committed_count() == before:
-                    # duplicate publication (e.g. producer restart); a
-                    # reconcile-requeued ref also lands here and trains later.
+                    # Duplicate publication within an attempt is idempotent.
                     self.stats["duplicates"] += 1
+                    if ref.sample_id in self._requeued:
+                        # Reconciliation already put this unacked sample into
+                        # the transient queue. Its inbox ack will settle the
+                        # original publication exactly once.
+                        self._requeued.discard(ref.sample_id)
+                    else:
+                        # A same-attempt duplicate never reaches an inbox, so
+                        # settle that extra publication immediately.
+                        self.source.mark_consumed(1)
                 self._pd["cnt"] += time.monotonic() - _t
 
-        # Dispatch every full window: one ref per rank, round-robin — per-rank
-        # counts stay exactly equal, which is what keeps DP ranks in lockstep.
+        # Dispatch complete optimizer-step windows. Round-robin assignment gives
+        # every rank batch_size * accumulation_steps refs in the same order.
         queue = self.controller.sample_queue
         while True:
-            need = self.dp_size - len(self._window)
+            need = self.dispatch_quantum - len(self._window)
             if need:
                 self._window.extend(queue.get(need, timeout_s=0.0))
-            if len(self._window) < self.dp_size:
+            if len(self._window) < self.dispatch_quantum:
                 break
             _t = time.monotonic()
-            for rank, ref in enumerate(self._window):
-                self._inboxes[rank].publish(ref)
+            for index, ref in enumerate(self._window):
+                self._inboxes[index % self.dp_size].publish(ref)
             self._pd["inboxpub"] += time.monotonic() - _t
-            self.stats["dispatched"] += self.dp_size
+            self.stats["dispatched"] += self.dispatch_quantum
             self._window = []
             progress = True
 
@@ -252,21 +276,31 @@ class RefDistributor:
 
     def _finish(self) -> None:
         if self._window:
-            # Less than one aligned window left at end-of-stream: dropped for
-            # THIS run (lockstep needs equal counts). They stay committed-
-            # unacked in the ledger; only a resume=True restart re-queues them.
             self.stats["dropped"] = len(self._window)
-            logger.warning(
-                "ref-distributor: dropping %d end-of-stream refs (< dp_size=%d "
-                "window); committed-unacked in the ledger, re-queued only on a "
-                "resume=True restart",
-                len(self._window),
-                self.dp_size,
+            reason = (
+                f"end-of-stream has {len(self._window)} refs after the last full "
+                f"optimizer window (required global quantum={self.dispatch_quantum}: "
+                f"dp_size={self.dp_size} * refs_per_rank_step="
+                f"{self.refs_per_rank_step})"
             )
             self.controller.sample_queue.fail(
-                self._window, reason="eos-partial-window", retryable=False
+                self._window, reason=reason, retryable=False
             )
+            cleanup_errors = []
+            for ref in self._window:
+                try:
+                    adopt = getattr(self.feature_store, "adopt", None)
+                    if callable(adopt):
+                        adopt(ref)
+                    self.feature_store.abort(ref.sample_id, reason=reason)
+                except Exception as exc:  # best effort before the loud failure
+                    cleanup_errors.append(f"{ref.sample_id}: {exc}")
+            self.source.mark_consumed(len(self._window))
             self._window = []
+            if cleanup_errors:
+                reason += f"; cleanup errors={cleanup_errors}"
+                raise RuntimeError(reason)
+            logger.warning("ref-distributor: %s; tail settled without dispatch", reason)
         for inbox in self._inboxes:
             inbox.close()
         self.finished = True
@@ -303,8 +337,7 @@ class RefDistributor:
         text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         for inbox in self._inboxes:
             try:
-                with open(inbox.path + _FAILED_SUFFIX, "w") as f:
-                    f.write(text)
+                inbox.fail(text)
             except OSError:  # best effort; ranks still have idle_timeout_s
                 logger.exception("ref-distributor: could not poison %s", inbox.path)
 
