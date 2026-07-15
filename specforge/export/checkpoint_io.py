@@ -83,28 +83,24 @@ def materialize_draft(
     the only tolerated missing keys are the embeddings (excluded from draft
     checkpoints by design — serving loads them from the target).
     """
-    from specforge.modeling.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
-    model = AutoEagle3DraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
+    model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
     if unexpected:
         raise ValueError(
             f"checkpoint carries weights the {type(model).__name__} architecture "
             f"does not have: {sorted(unexpected)}"
         )
-    tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
-    non_embed_missing = [
-        k for k in missing if "embed" not in k.lower() and k not in tolerated
-    ]
+    non_embed_missing = [key for key in missing if "embed" not in key.lower()]
     if non_embed_missing:
         raise ValueError(
             f"checkpoint is missing non-embedding draft weights: "
             f"{sorted(non_embed_missing)}"
         )
     if vocab_mapping_path:
-        # tolerated above precisely so a legacy checkpoint that predates the
-        # t2d/d2t buffers can be exported by supplying the mapping here.
+        # Explicitly refresh the serving vocabulary mapping when requested.
         model.load_vocab_mapping(vocab_mapping_path)
     return model
 
