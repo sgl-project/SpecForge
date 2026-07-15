@@ -14,18 +14,21 @@ import unittest
 
 import torch
 
+from specforge.runtime.control_plane.controller import DataFlowController
+from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
-from specforge.runtime.data_plane.feature_store import LocalFeatureStore
+from specforge.runtime.data_plane.feature_store import (
+    LocalFeatureStore,
+    drain_feature_store_removals,
+)
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
 
 class _FakeMooncakeStore:
     """In-memory stand-in for MooncakeDistributedStore (API subset).
 
-    Supports BOTH the zero-copy raw-buffer API (``put_from``/``get_into`` +
-    ``register_buffer``, simulated with ctypes against the real buffer pointers)
-    and the legacy byte API (``put``/``get``), so the contract is exercised on
-    either transport without a running master.
+    The raw-buffer API (``put_from``/``get_into`` + ``register_buffer``) is
+    simulated with ctypes against the real buffer pointers.
     """
 
     def __init__(self) -> None:
@@ -39,16 +42,7 @@ class _FakeMooncakeStore:
     def is_exist(self, key):
         return 1 if key in self._d else 0
 
-    def put(self, key, value, config=None):
-        self.last_config = config
-        self._d[key] = bytes(value)
-        self.put_calls += 1
-        return 0
-
-    def get(self, key):
-        return self._d.get(key, b"")
-
-    # -- zero-copy raw-buffer API (ctypes-simulated) -----------------------
+    # -- raw-buffer API (ctypes-simulated) ---------------------------------
     def register_buffer(self, ptr, size):
         return 0
 
@@ -78,18 +72,11 @@ class _FakeMooncakeStore:
         self._d.pop(key, None)
         return 0
 
-    def get_size(self, key):
-        return len(self._d.get(key, b""))
-
 
 def _phys_resident(fake, sid="s0", store_id="run0"):
-    """Transport-agnostic: do the sample's bytes physically exist in the fake?
-
-    pickle: one key ``run0/s0``; zero-copy: ``run0/s0/g{gen}/{name}`` keys.
-    """
-    exact = f"{store_id}/{sid}"
-    prefix = exact + "/"
-    return any(k == exact or k.startswith(prefix) for k in fake._d)
+    """Do any per-tensor objects for the sample remain in the fake?"""
+    prefix = f"{store_id}/{sid}/"
+    return any(k.startswith(prefix) for k in fake._d)
 
 
 class _FakeClock:
@@ -253,6 +240,140 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(res["force_freed"], 1)
         self.assertEqual(fs.health()["release_pending"], 0)
 
+    def test_lifecycle_drain_retries_with_injected_sleep(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        fake.fail_remove = True
+        fs.abort("s0")
+        self.assertEqual(fs.health()["release_pending"], 1)
+
+        sleeps = []
+
+        def release_remote_lease(interval):
+            sleeps.append(interval)
+            fake.fail_remove = False
+
+        report = drain_feature_store_removals(
+            fs,
+            max_attempts=2,
+            retry_interval_s=0.125,
+            sleep=release_remote_lease,
+        )
+        self.assertEqual(sleeps, [0.125])
+        self.assertEqual(report["attempts"], 2)
+        self.assertEqual(report["release_pending"], 0)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertEqual(fs.health()["force_freed_total"], 1)
+        self.assertFalse(_phys_resident(fake))
+
+    def test_lifecycle_drain_does_not_renew_read_lease_between_retries(self):
+        clock = _FakeClock()
+        lease_ttl = 1.0
+
+        class LeaseFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.lease_until = {}
+                self.exists_calls = 0
+
+            def is_exist(self, key):
+                self.exists_calls += 1
+                self.lease_until[key] = clock() + lease_ttl
+                return super().is_exist(key)
+
+            def remove(self, key):
+                self.remove_calls += 1
+                if clock() < self.lease_until.get(key, 0.0):
+                    return -706
+                self._d.pop(key, None)
+                return 0
+
+        fake = LeaseFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+        fs.release(handle)
+        self.assertEqual(fs.health()["release_pending"], 1)
+        # get() and release-time failure each probe once. Drain retries must not
+        # probe again, or each probe would move lease_until forward forever.
+        expected_probes = 2 * len(ref.feature_keys)
+        self.assertEqual(fake.exists_calls, expected_probes)
+
+        report = drain_feature_store_removals(
+            fs,
+            max_attempts=6,
+            retry_interval_s=0.25,
+            sleep=clock.advance,
+        )
+
+        self.assertEqual(report["attempts"], 5)
+        self.assertEqual(fake.exists_calls, expected_probes)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertEqual(fs.health()["force_freed_total"], 1)
+        self.assertFalse(_phys_resident(fake))
+
+    def test_lifecycle_drain_is_bounded_and_never_hides_remote_leak(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0", max_release_attempts=1)
+        fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        fake.fail_remove = True
+        fs.abort("s0")
+
+        # Steady-state gc exhausts its window but must retain the key metadata;
+        # otherwise finalization would falsely report a clean shutdown.
+        fs.gc()
+        fs.gc()
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertEqual(fs.health()["resident_samples"], 1)
+
+        with self.assertRaisesRegex(RuntimeError, "could not drain 1 pending"):
+            drain_feature_store_removals(
+                fs,
+                max_attempts=2,
+                retry_interval_s=0.0,
+                sleep=lambda _interval: self.fail("zero interval must not sleep"),
+            )
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertEqual(fs.health()["force_freed_total"], 0)
+        self.assertTrue(_phys_resident(fake))
+
+    def test_restart_authority_adopts_acked_remote_ref_before_removing(self):
+        fake = _FakeMooncakeStore()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = producer.put(_tensors(), sample_id="remote-rank-1", metadata=_meta())
+        ledger = InMemoryMetadataStore()
+        original = DataFlowController("run0", metadata_store=ledger)
+        original.commit_samples("distributor", [ref])
+        original.ack_train_refs(
+            "trainer", [ref.sample_id], global_step=4, optimizer_durable=True
+        )
+
+        # This new authority has never put/get/adopted the remote rank's sample.
+        # Reconciliation must recover its key metadata from the committed ref;
+        # abort(sample_id) alone would otherwise be a false-success no-op.
+        restarted_store = MooncakeFeatureStore(store=fake, store_id="run0")
+        self.assertEqual(restarted_store.health()["resident_samples"], 0)
+        fake.fail_remove = True
+        restarted = DataFlowController("run0", metadata_store=ledger)
+        report = restarted.reconcile_on_restart(restarted_store)
+
+        self.assertEqual(report["released"], ["remote-rank-1"])
+        self.assertEqual(report["requeued"], [])
+        self.assertTrue(_phys_resident(fake, sid="remote-rank-1"))
+        self.assertEqual(restarted_store.health()["release_pending"], 1)
+
+        # The online-resume builder invokes this lifecycle gate immediately
+        # after reconciliation; emulate the lease expiring between attempts.
+        drain_feature_store_removals(
+            restarted_store,
+            max_attempts=2,
+            retry_interval_s=0.01,
+            sleep=lambda _interval: setattr(fake, "fail_remove", False),
+        )
+        self.assertFalse(_phys_resident(fake, sid="remote-rank-1"))
+        self.assertEqual(restarted_store.health()["resident_samples"], 0)
+
     def test_equivalence_with_local_feature_store(self):
         src = _tensors()
         local = LocalFeatureStore("run0")
@@ -286,52 +407,21 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             fs.get(ref)  # logically aborted -> KeyError (no use-after-free)
 
-    def test_reput_with_failed_remove_warns_and_supersedes(self):
-        # Pickle path: re-put when the pre-remove of the prior hard-pinned blob
-        # fails must still publish the new generation (overwriting the single key)
-        # and warn loudly that a pinned blob may be orphaned. The stale ref is then
-        # refused by the generation guard (the overwrite replaced the blob).
-        # (Zero-copy uses distinct per-generation keys, so a failed remove leaves
-        # the stale generation readable -- covered separately below.)
-        fake = _FakeMooncakeStore()
-        fs = MooncakeFeatureStore(store=fake, store_id="run0", zero_copy=False)
-        ref1 = fs.put(_tensors(), sample_id="s0", metadata=_meta())
-        fake.fail_remove = True
-        with self.assertLogs(
-            "specforge.runtime.data_plane.mooncake_store", level="WARNING"
-        ) as cm:
-            ref2 = fs.put(_tensors(), sample_id="s0", metadata=_meta())
-        self.assertTrue(
-            any("orphan" in line.lower() for line in cm.output),
-            f"expected an orphan warning, got {cm.output}",
-        )
-        out, _ = fs.get(ref2)  # the new generation is resident + served
-        self.assertIn("hidden_state", out)
-        with self.assertRaises(KeyError):
-            fs.get(ref1)  # the superseded ref is refused (generation guard)
 
+class TestMooncakeFeatureStoreWireContract(unittest.TestCase):
+    """The only wire format is one raw Mooncake object per tensor."""
 
-class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
-    """Zero-copy transport specifics (the default): per-tensor keys, no pickle."""
-
-    def test_zero_copy_is_the_default(self):
-        fs = _store()
-        self.assertTrue(fs._zero_copy)
-
-    def test_falls_back_to_pickle_without_raw_api(self):
-        # a backend that lacks put_from/get_into must transparently use the blob
-        # path (and still round-trip).
-        class _ByteOnly(_FakeMooncakeStore):
+    def test_backend_without_raw_api_fails_fast(self):
+        class _ObjectOnly(_FakeMooncakeStore):
             put_from = None
             get_into = None
 
-        fs = MooncakeFeatureStore(store=_ByteOnly(), store_id="run0")
-        self.assertFalse(fs._zero_copy)
-        src = _tensors()
-        ref = fs.put(src, sample_id="s0", metadata=_meta())
-        out, _ = fs.get(ref)
-        for k in src:
-            self.assertTrue(torch.equal(out[k], src[k]))
+        with self.assertRaises(RuntimeError) as raised:
+            MooncakeFeatureStore(store=_ObjectOnly(), store_id="run0")
+        message = str(raised.exception)
+        self.assertIn("put_from/get_into", message)
+        self.assertIn("Upgrade", message)
+        self.assertIn("serialized put/get transport is not supported", message)
 
     def test_one_object_per_tensor_with_generation_in_key(self):
         fake = _FakeMooncakeStore()
@@ -341,18 +431,17 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
             set(fake._d),
             {"run0/s0/g1/hidden_state", "run0/s0/g1/target", "run0/s0/g1/input_ids"},
         )
-        # no pickle blob was written under the bare sample key
+        # No serialized aggregate object is written under the bare sample key.
         self.assertNotIn("run0/s0", fake._d)
 
-    def test_no_pickle_on_the_wire(self):
-        # the stored bytes are the raw tensor buffer, not a torch.save pickle
-        # (which would begin with the PK zip magic or the pickle protocol byte).
+    def test_wire_bytes_are_exactly_the_raw_tensor(self):
+        # The stored bytes are exactly the raw tensor buffer, not an archive.
         fake = _FakeMooncakeStore()
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
-        blob = fake._d["run0/s0/g1/hidden_state"]
-        self.assertEqual(len(blob), 4 * 8 * 4)  # 4x8 float32, exactly the raw bytes
-        self.assertFalse(blob[:2] == b"PK")  # not a torch.save zip archive
+        wire_bytes = fake._d["run0/s0/g1/hidden_state"]
+        self.assertEqual(len(wire_bytes), 4 * 8 * 4)
+        self.assertFalse(wire_bytes[:2] == b"PK")
 
     def test_reput_success_supersedes_old_generation(self):
         fake = _FakeMooncakeStore()
@@ -369,7 +458,7 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
         # (a truncated / partially-written object the backend still reports
         # present) must raise -- never return a tensor whose uninitialized tail is
         # silent garbage. get_into returns the byte count, so a short count != nb
-        # is the signal. Simulate by truncating the stored blob.
+        # is the signal. Simulate by truncating the stored object.
         fake = _FakeMooncakeStore()
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
@@ -411,8 +500,8 @@ class TestMooncakeFeatureStoreCrossProcess(unittest.TestCase):
         self.assertEqual(producer.health()["resident_samples"], 1)
 
     def test_cross_process_stale_generation_rejected(self):
-        # producer re-puts (gen bumps on the shared blob); the consumer's original
-        # ref is stale and must be refused via the on-disk generation guard, even
+        # Producer re-puts (gen bumps in the key); the consumer's original ref is
+        # stale and must be refused via the missing generation objects, even
         # though the consumer's in-process index never saw either put.
         fake, producer, consumer = _shared_pair(retain_on_release=True)
         ref1 = producer.put(_tensors(), sample_id="s0", metadata=_meta())
@@ -422,7 +511,7 @@ class TestMooncakeFeatureStoreCrossProcess(unittest.TestCase):
 
     def test_cross_process_abort_blocks_consumer_get(self):
         # With a normal (immediate) remove, producer.abort physically deletes the
-        # blob, so a separate consumer's get() raises (B5 holds cross-process via
+        # objects, so a separate consumer's get() raises (B5 holds cross-process via
         # physical removal, not the per-process tombstone).
         fake, producer, consumer = _shared_pair(retain_on_release=True)
         ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
@@ -432,8 +521,8 @@ class TestMooncakeFeatureStoreCrossProcess(unittest.TestCase):
             consumer.get(ref)
 
     def test_cross_process_consume_once_free_by_consumer(self):
-        # Consume-once consumer (retain_on_release=False) frees the shared blob on
-        # release; the producer can then no longer resolve the ref.
+        # Consume-once consumer frees the shared tensor objects on release; the
+        # producer can then no longer resolve the ref.
         fake, producer, consumer = _shared_pair()  # consumer frees on release
         ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
         _, handle = consumer.get(ref)
