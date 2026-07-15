@@ -1,4 +1,4 @@
-"""Convert supported training datasets to SpecForge conversation JSONL.
+"""Convert supported text training datasets to SpecForge conversation JSONL.
 
 All presets produce rows with a stable id and a conversations list. Heavy
 dataset dependencies stay behind loader functions so row conversion helpers and
@@ -11,7 +11,6 @@ import argparse
 import hashlib
 import json
 import random
-import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -26,8 +25,6 @@ SUPPORTED_DATASETS = (
     "perfectblend-llama4-scout-instruct",
     "perfectblend-llama4-maverick-instruct",
     "magpie-qwen2.5-pro-1m-v0.1",
-    "sharegpt4v",
-    "allava4v",
     "opc",
     "gsm8k",
     "hendrycks_math",
@@ -39,6 +36,7 @@ SUPPORTED_DATASETS = (
     "camel",
     "nebius-llama31-8b-infinity-instruct",
 )
+UNSUPPORTED_VLM_DATASETS = frozenset({"sharegpt4v", "allava4v"})
 DEFAULT_OUTPUT_DIRECTORY = Path(__file__).resolve().parent.parent / "cache" / "dataset"
 SUPPORTED_DATA_PATH_SUFFIXES = {".json", ".jsonl"}
 OPC_SUBSETS = (
@@ -323,71 +321,6 @@ def process_camel_row(
     )
 
 
-def get_cache_dir(dataset_name: str) -> Path:
-    if dataset_name == "sharegpt4v":
-        raise ValueError("Downloading 'sharegpt4v' is not supported.")
-    if dataset_name != "allava4v":
-        raise ValueError(
-            f"Dataset {dataset_name!r} is not a supported VLM download preset."
-        )
-
-    from datasets import config
-
-    return Path(config.HF_DATASETS_CACHE) / "FreedomIntelligence" / "ALLaVA"
-
-
-def download_vlm_dataset(dataset_name: str) -> None:
-    """Download the external ALLaVA image archive when it is not cached."""
-    cache_dir = get_cache_dir(dataset_name)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    first_archive = cache_dir / "allava_laion" / "image_chunks" / "images_0.zip"
-    if first_archive.exists():
-        print("##### allava4v dataset already exists.")
-        return
-
-    script_path = (
-        Path(__file__).resolve().parent.parent / "datasets" / "download_laion.sh"
-    )
-    result = subprocess.run(
-        ["bash", str(script_path)],
-        cwd=cache_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Download image dataset failed: {result.stderr}")
-    print("##### allava4v dataset download complete.")
-
-
-def process_sharegpt4v_row(
-    row: Mapping[str, Any], dataset_name: str | None = None
-) -> ProcessedRow:
-    if dataset_name is None:
-        raise ValueError("VLM row processing requires a dataset name")
-    image_path = get_cache_dir(dataset_name) / row["image"]
-    if not image_path.exists():
-        print(f"Image path {image_path} does not exist, skipping this sample.")
-        return None, 0
-
-    conversations = []
-    skipped_count = 0
-    for message in row["conversations"]:
-        role = ROLE_MAPPING.get(message["from"])
-        if role is None:
-            skipped_count += 1
-            continue
-        content = message["value"]
-        if role == "user":
-            content = content.replace("<image>\n", "")
-        conversations.append({"role": role, "content": content})
-    return {
-        "id": str(row["id"]),
-        "image": str(image_path),
-        "conversations": conversations,
-    }, skipped_count
-
-
 def _identity_row(
     row: Mapping[str, Any], dataset_name: str | None = None
 ) -> ProcessedRow:
@@ -425,6 +358,11 @@ def load_dataset_preset(
     opc_subset: str = OPC_SUBSETS[0],
 ) -> tuple[Any, RowProcessor | None]:
     """Load one named preset and return its row processor."""
+    if dataset_name in UNSUPPORTED_VLM_DATASETS:
+        raise ValueError(
+            f"Dataset preset {dataset_name!r} is not supported; VLM data "
+            "preparation and training are not supported"
+        )
     if dataset_name == "ultrachat":
         return (
             _load_hf_dataset(
@@ -471,17 +409,6 @@ def load_dataset_preset(
     if dataset_name == "magpie-qwen2.5-pro-1m-v0.1":
         dataset = _train_split("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")
         return dataset.rename_column("uuid", "id"), process_sharegpt_row
-    if dataset_name == "sharegpt4v":
-        raise ValueError(
-            "ShareGPT4V image downloading is not supported; use allava4v instead."
-        )
-    if dataset_name == "allava4v":
-        dataset = _load_hf_dataset(
-            "FreedomIntelligence/ALLaVA-4V",
-            name="allava_laion",
-        )["instruct"]
-        download_vlm_dataset(dataset_name)
-        return dataset, process_sharegpt4v_row
     if dataset_name == "nebius-llama31-8b-infinity-instruct":
         dataset = _load_hf_dataset(
             "nebius/Llama-3.1-8B-Instruct-Infinity-Instruct-0625",

@@ -6,8 +6,6 @@ import types
 import unittest
 from unittest.mock import patch
 
-import torch
-
 from specforge.data.prompt_builder import prepare_prompt_tasks
 
 
@@ -32,46 +30,6 @@ def _write_jsonl(path, records):
 
 
 class TestPreparePromptTasks(unittest.TestCase):
-    def test_raw_vlm_tasks_keep_only_json_safe_media_metadata(self):
-        record = {
-            "image": "image.jpg",
-            "conversations": [
-                {"role": "user", "content": "what is shown?"},
-                {"role": "assistant", "content": "a test image"},
-            ],
-        }
-        prepared = {
-            "input_ids": torch.tensor([[10, 11, 12]]),
-            "loss_mask": torch.tensor([[0, 1, 1]]),
-            "attention_mask": torch.ones(1, 3, dtype=torch.long),
-            "pixel_values": torch.ones(4, 8),
-            "image_grid_thw": torch.tensor([[1, 2, 2]]),
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = os.path.join(tmp_dir, "vlm.jsonl")
-            _write_jsonl(path, [record])
-            with patch(
-                "specforge.data.vlm.prepare_qwen_vl_record",
-                return_value=prepared,
-            ):
-                prompts = prepare_prompt_tasks(
-                    path,
-                    tokenizer=object(),
-                    chat_template="qwen2-vl",
-                    max_length=32,
-                    is_preformatted=False,
-                    train_only_last_turn=False,
-                    cache_dir=None,
-                    cache_key=None,
-                    num_proc=1,
-                    input_modality="qwen2_5_vl",
-                    processor=object(),
-                )
-
-        self.assertEqual(prompts[0]["payload"]["input_ids"], [10, 11, 12])
-        self.assertEqual(prompts[0]["payload"]["media"], record)
-        self.assertNotIn("pixel_values", prompts[0]["payload"])
-
     def test_json_array_is_accepted(self):
         records = [
             {"input_ids": [1, 2], "loss_mask": [0, 1]},
@@ -172,7 +130,7 @@ class TestPreparePromptTasks(unittest.TestCase):
                 prompts = prepare_prompt_tasks(
                     path,
                     tokenizer="tokenizer",
-                    chat_template="qwen",
+                    chat_template="text-template",
                     max_length=128,
                     is_preformatted=False,
                     train_only_last_turn=True,
@@ -201,7 +159,7 @@ class TestPreparePromptTasks(unittest.TestCase):
         self.assertEqual(len(build_calls), 1)
         self.assertEqual(len(build_calls[0]["dataset"]), 1)
         self.assertEqual(build_calls[0]["tokenizer"], "tokenizer")
-        self.assertEqual(build_calls[0]["chat_template"], "qwen")
+        self.assertEqual(build_calls[0]["chat_template"], "text-template")
         self.assertEqual(build_calls[0]["minimum_valid_tokens"], 2)
         self.assertTrue(build_calls[0]["train_only_last_turn"])
 

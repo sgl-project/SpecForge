@@ -1,8 +1,8 @@
 # coding=utf-8
-"""Four-rank TP2 x SP2/USP parity for the unified Trainer lifecycle.
+"""Four-rank DP2 x SP2/USP parity for the unified Trainer lifecycle.
 
 The distributed leg uses the current offline builder and no-argument
-``Trainer.fit()`` with real TP2, Ulysses-SP2 and world-sized FSDP groups.  Its
+``Trainer.fit()`` with trainer TP1, Ulysses-SP2 and world-sized FSDP groups. Its
 logged boundary loss is compared with the same initial model and samples on the
 canonical full-sequence flex-attention reference.  This replaces the deleted
 legacy-script differential while retaining the scale-out numerical gate.
@@ -37,7 +37,7 @@ def _has_standard_flash_attention() -> bool:
 
 
 def _build_model(workdir: str, attention_backend: str):
-    from specforge.core.eagle3 import OnlineEagle3Model
+    from specforge.algorithms.eagle3.model import OnlineEagle3Model
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
@@ -59,7 +59,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     fx.init_rank_distributed(
         rank,
         world_size,
-        tp_size=2,
+        tp_size=1,
         sp_ulysses_size=2,
         sp_ring_size=1,
         port=str(port),
@@ -67,12 +67,12 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     try:
         import torch.distributed as dist
 
+        from specforge.algorithms.builtin import builtin_algorithm_registry
         from specforge.distributed import get_draft_sp_group, get_tp_group
         from specforge.launch import _shard_offline_refs, build_offline_runtime
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
-        from specforge.training.strategies.registry import resolve_strategy
 
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
@@ -85,8 +85,9 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
         )
 
-        spec = resolve_strategy("eagle3")
-        source_refs = spec.make_offline_reader(
+        algorithm = builtin_algorithm_registry().resolve("eagle3")
+        provider = algorithm.providers.offline_for("text")
+        source_refs = provider.build_reader(
             os.path.join(workdir, "features"),
             run_id="usp-reference",
             ttt_length=3,
@@ -107,19 +108,22 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             LocalFeatureStore(f"usp-reference-{rank}"),
             refs=[rank_refs[-1]],
             batch_size=1,
-            collate_fn=spec.make_offline_collate(),
-            per_sample_transform=spec.make_offline_transform(
+            collate_fn=provider.build_collator(),
+            per_sample_transform=provider.build_normalizer(
                 512,
                 ttt_length=3,
                 use_usp_preprocess=False,
             ),
-            strategy=spec.name,
+            strategy=algorithm.name,
         )
         reference_batch = next(iter(reference_loader))
         reference_model.train()
         with torch.no_grad():
             expected_loss = (
-                spec.make_strategy(reference_model, target_head=target_head)
+                algorithm.providers.step.build(
+                    reference_model,
+                    target_head=target_head,
+                )
                 .forward_loss(reference_batch)
                 .loss.detach()
             )
@@ -137,7 +141,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
 
         logged = []
         trainer = build_offline_runtime(
-            strategy="eagle3",
+            algorithm=algorithm,
             hidden_states_path=os.path.join(workdir, "features"),
             draft_model=usp_model,
             target_head=target_head,
@@ -152,7 +156,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             accumulation_steps=2,
             num_epochs=1,
             max_steps=1,
-            tp_size=2,
+            tp_size=1,
             sp_ulysses_size=2,
             sp_ring_size=1,
             use_usp_preprocess=True,
@@ -190,7 +194,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     "requires four CUDA devices and the standard flash-attn USP interfaces",
 )
 class TestEquiv4Rank(unittest.TestCase):
-    def test_tp2_sp2_trainer_loss_matches_full_sequence_reference(self):
+    def test_dp2_sp2_trainer_loss_matches_full_sequence_reference(self):
         import torch.multiprocessing as mp
 
         from tests.utils import get_available_port
@@ -215,9 +219,9 @@ class TestEquiv4Rank(unittest.TestCase):
                 self.assertEqual(result["rank"], rank)
                 self.assertEqual(result["step"], 1)
                 self.assertEqual(result["world_size"], WORLD_SIZE)
-                self.assertEqual(result["tp_size"], 2)
+                self.assertEqual(result["tp_size"], 1)
                 self.assertEqual(result["sp_size"], 2)
-                self.assertEqual(result["tp_group_size"], 2)
+                self.assertEqual(result["tp_group_size"], 1)
                 self.assertEqual(result["draft_sp_group_size"], 2)
                 self.assertTrue(
                     math.isclose(

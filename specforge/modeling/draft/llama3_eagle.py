@@ -381,8 +381,8 @@ class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
         self.scaling_factor = scaling_factor
 
     def forward(self, x, position_ids):
-        # In contrast to other models, Qwen2_5_VL has different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
+        # Generic three-axis rotary inputs carry independent position IDs for
+        # each axis, so expand the inverse frequencies to match that layout.
         inv_freq_expanded = (
             self.inv_freq[None, None, :, None]
             .float()

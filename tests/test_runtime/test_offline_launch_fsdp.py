@@ -1,7 +1,7 @@
 # coding=utf-8
 """Launcher path: FSDP is in the forward path + global_step is optimizer steps.
 
-Exercises ``build_offline_runtime(strategy="eagle3")`` end to end with
+Exercises ``build_offline_runtime(algorithm=eagle3_registration)`` end to end with
 accumulation_steps=2, which the equivalence tests (wrap=False) do not cover:
 - the strategy must run forward through the FSDP-wrapped module (Issue 1);
 - fit's global_step counts OPTIMIZER steps, micro_step counts micro-batches (Issue 2).
@@ -15,7 +15,10 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
+
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
 
 @unittest.skipUnless(CUDA, "launcher FSDP path requires CUDA")
@@ -46,7 +49,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
             )
 
         trainer = build_offline_runtime(
-            strategy="eagle3",
+            algorithm=ALGORITHM,
             hidden_states_path=feat_dir,
             draft_model=eagle3_model,
             target_head=target_head,

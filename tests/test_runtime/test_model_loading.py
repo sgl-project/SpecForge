@@ -11,6 +11,7 @@ from unittest import mock
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.training.model_loading import (
     load_draft_config_source,
@@ -32,13 +33,34 @@ def _run_config(strategy: str, **model_overrides) -> Config:
         if strategy == "peagle"
         else {"hidden_states_path": "/features"}
     )
-    return Config.model_validate(
-        {
-            "model": model,
-            "data": data,
-            "training": {"strategy": strategy},
+    payload = {
+        "model": model,
+        "data": data,
+        "training": {"strategy": strategy},
+    }
+    if strategy == "peagle":
+        model["target_backend"] = "sglang"
+        payload["training"].update(
+            {
+                "attention_backend": "flex_attention",
+                "batch_size": 1,
+                "max_steps": 1,
+            }
+        )
+        payload["deployment"] = {
+            "mode": "disaggregated",
+            "disaggregated": {
+                "control_dir": "/control",
+                "backend": "mooncake",
+                "server_urls": ["http://capture:30000"],
+            },
         }
-    )
+    return Config.model_validate(payload)
+
+
+def _draft_config_provider(strategy: str):
+    registration = builtin_algorithm_registry().resolve(strategy)
+    return registration.providers.model.draft_config
 
 
 def _target_config(*, layers: int = 12):
@@ -126,7 +148,10 @@ assert not torch.cuda.is_initialized()
                     "transformers.AutoConfig.from_pretrained",
                     return_value=_target_config(),
                 ):
-                    resolved = resolve_draft_config(cfg)
+                    resolved = resolve_draft_config(
+                        cfg,
+                        provider=_draft_config_provider(strategy),
+                    )
                 self.assertEqual(resolved.architectures, [architecture])
                 self.assertEqual(resolved.num_hidden_layers, layers)
                 if block_size is not None:
@@ -149,7 +174,10 @@ assert not torch.cuda.is_initialized()
                 draft_num_hidden_layers=2,
                 draft_block_size=8,
             )
-            resolved = resolve_draft_config(cfg)
+            resolved = resolve_draft_config(
+                cfg,
+                provider=_draft_config_provider("dflash"),
+            )
         self.assertEqual(resolved.num_hidden_layers, 2)
         self.assertEqual(resolved.block_size, 8)
         self.assertEqual(len(resolved.dflash_config["target_layer_ids"]), 2)
@@ -188,7 +216,10 @@ assert not torch.cuda.is_initialized()
         with mock.patch(
             "transformers.AutoConfig.from_pretrained", return_value=remote
         ) as load:
-            resolved = resolve_draft_config(cfg)
+            resolved = resolve_draft_config(
+                cfg,
+                provider=_draft_config_provider("eagle3"),
+            )
         self.assertEqual(resolved.architectures, ["LlamaForCausalLMEagle3"])
         load.assert_called_once()
         self.assertEqual(load.call_args.args[0], "org/base-draft")
@@ -260,6 +291,7 @@ class WarmStartTest(unittest.TestCase):
                 path,
                 draft_config=object(),
                 strategy="eagle3",
+                allow_missing_embedding=True,
             )
         self.assertFalse(report.loaded_embedding)
         self.assertIn("embed_tokens.weight", report.missing_keys)

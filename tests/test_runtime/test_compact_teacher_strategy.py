@@ -6,6 +6,7 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.core.compact_teacher import (
     compute_target_from_hidden,
     compute_target_p_padded_from_hidden,
@@ -14,8 +15,9 @@ from specforge.core.compact_teacher import (
 from specforge.core.eagle3_adapters import SdpaLikeAdapter
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import Eagle3TrainStrategy
-from specforge.training.strategies.registry import resolve_strategy
 from specforge.utils import padding
+
+EAGLE3 = builtin_algorithm_registry().resolve("eagle3")
 
 
 def _mapping(vocab=8, draft_vocab=3):
@@ -321,8 +323,8 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "offline-only"):
             strategy.forward_loss(_batch(target_repr="logits"))
 
-    def test_registry_forwards_compact_strategy_kwargs(self):
-        strategy = resolve_strategy("eagle3").make_strategy(
+    def test_step_provider_forwards_compact_strategy_kwargs(self):
+        strategy = EAGLE3.providers.step.build(
             _Eagle3(),
             target_head=_TargetHead(),
             compact_teacher=True,

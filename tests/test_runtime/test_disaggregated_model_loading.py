@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from specforge.application import resolve_run
 from specforge.config import Config
 from specforge.training.capture_contract import (
     ServerCaptureContract,
@@ -24,10 +25,16 @@ def _config(*, strategy="dflash", **model_overrides):
             "data": {"train_data_path": "train.jsonl"},
             "training": {
                 "strategy": strategy,
-                "deployment_mode": "disaggregated",
                 "role": "producer",
-                "server_urls": ["http://capture"],
                 "total_steps": 2,
+            },
+            "deployment": {
+                "mode": "disaggregated",
+                "disaggregated": {
+                    "control_dir": "outputs/test/control",
+                    "backend": "mooncake",
+                    "server_urls": ["http://capture"],
+                },
             },
         }
     )
@@ -49,6 +56,7 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
         target_config = SimpleNamespace(hidden_size=64, vocab_size=128)
 
         for cfg in configs:
+            resolved = resolve_run(cfg)
             with (
                 self.subTest(model=cfg.model.model_dump()),
                 mock.patch(
@@ -60,16 +68,22 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
                     return_value=draft_payload,
                 ) as resolve,
             ):
-                contract = resolve_server_capture_contract(cfg)
+                contract = resolve_server_capture_contract(
+                    resolved.config,
+                    algorithm=resolved.algorithm,
+                )
 
             self.assertEqual(
                 contract,
                 ServerCaptureContract("dflash", (3, 7), 64, 128, 32),
             )
-            resolve.assert_called_once_with(cfg)
+            resolve.assert_called_once_with(
+                resolved.config,
+                provider=resolved.algorithm.providers.model.draft_config,
+            )
 
     def test_producer_metadata_delegates_to_the_shared_server_contract(self):
-        cfg = _config()
+        resolved = resolve_run(_config())
         contract = ServerCaptureContract(
             method="dflash",
             aux_layer_ids=(3, 7),
@@ -81,12 +95,20 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
             "specforge.training.capture_contract.resolve_server_capture_contract",
             return_value=contract,
         ) as resolve:
-            metadata = _producer_capture_metadata(cfg)
+            metadata = _producer_capture_metadata(
+                resolved.config,
+                resolved.algorithm,
+            )
         self.assertEqual(metadata, ([3, 7], 64, 128, 32))
-        resolve.assert_called_once_with(cfg)
+        resolve.assert_called_once_with(
+            resolved.config,
+            algorithm=resolved.algorithm,
+        )
 
     def test_domino_uses_the_dflash_server_capture_method(self):
-        cfg = _config(strategy="domino", draft_model_config="domino-draft")
+        resolved = resolve_run(
+            _config(strategy="domino", draft_model_config="domino-draft")
+        )
         draft_payload = {
             "architectures": ["DominoDraftModel"],
             "vocab_size": 128,
@@ -105,7 +127,10 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
                 return_value=draft_payload,
             ),
         ):
-            contract = resolve_server_capture_contract(cfg)
+            contract = resolve_server_capture_contract(
+                resolved.config,
+                algorithm=resolved.algorithm,
+            )
 
         self.assertEqual(contract.method, "dflash")
         self.assertEqual(contract.aux_layer_ids, (3, 7))

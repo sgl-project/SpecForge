@@ -40,6 +40,20 @@ AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
 
+def _capture_schema(algorithm: str):
+    from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.inference.adapters.server_capture import ServerCaptureSchema
+
+    registration = builtin_algorithm_registry().resolve(algorithm)
+    layout = registration.providers.server_streaming_for("text").layout
+    return ServerCaptureSchema(
+        aux_feature=layout.aux_feature,
+        last_hidden_feature=layout.last_hidden_feature,
+        passthrough=layout.passthrough,
+        attention_mask_feature=layout.attention_mask_feature,
+    )
+
+
 def _patched_sglang() -> bool:
     return importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
 
@@ -266,7 +280,11 @@ class TestServerCaptureGate(unittest.TestCase):
         rows = [[5, 6, 7, 8, 9, 10], [11, 12, 13, 14]]
         store = self._store("gate-eagle3")
         adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}", store, run_id="gate0", strategy="eagle3"
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate0",
+            algorithm="eagle3",
+            schema=_capture_schema("eagle3"),
         )
         contract = CaptureConfig.from_strategy(
             required_features={
@@ -318,7 +336,7 @@ class TestServerCaptureGate(unittest.TestCase):
         self._train_step(fetched, head)
 
     def _train_step(self, fetched, head):
-        from specforge.core.eagle3 import OnlineEagle3Model
+        from specforge.algorithms.eagle3.model import OnlineEagle3Model
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
@@ -375,7 +393,11 @@ class TestServerCaptureGate(unittest.TestCase):
         rows = [[3, 1, 4, 1, 5]]
         store = self._store("gate-dflash")
         adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}", store, run_id="gate1", strategy="dflash"
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate1",
+            algorithm="dflash",
+            schema=_capture_schema("dflash"),
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},

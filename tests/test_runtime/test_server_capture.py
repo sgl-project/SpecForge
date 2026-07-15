@@ -21,10 +21,11 @@ from typing import Any, Dict, List
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
+    ServerCaptureSchema,
     SGLangServerCaptureAdapter,
-    resolve_server_capture_schema,
 )
 from specforge.inference.capture import (
     CaptureConfig,
@@ -237,7 +238,39 @@ def _dspark_contract() -> CaptureConfig:
     )
 
 
-def _mk(strategy="eagle3", server=None, backend=None):
+def _capture_schema(algorithm: str) -> ServerCaptureSchema:
+    registration = builtin_algorithm_registry().resolve(algorithm)
+    layout = registration.providers.server_streaming_for("text").layout
+    return ServerCaptureSchema(
+        aux_feature=layout.aux_feature,
+        last_hidden_feature=layout.last_hidden_feature,
+        passthrough=layout.passthrough,
+        attention_mask_feature=layout.attention_mask_feature,
+    )
+
+
+class _GenericRequestInputAdapter:
+    def __init__(self, request_inputs):
+        self.request_inputs = request_inputs
+        self.seen_tasks = None
+
+    def load_input_tools(self, config):
+        return config
+
+    def prepare_prompts(self, config, input_tools, *, draft_config):
+        return []
+
+    def build_request_inputs(self, tasks):
+        self.seen_tasks = list(tasks)
+        return self.request_inputs
+
+
+def _mk(
+    algorithm="eagle3",
+    server=None,
+    backend=None,
+    request_input_adapter=None,
+):
     backend = backend or _FakeMooncakeStore()
     server = server or _StubCaptureServer(backend)
     store = MooncakeFeatureStore(store=backend, store_id="run0")
@@ -245,13 +278,93 @@ def _mk(strategy="eagle3", server=None, backend=None):
         "http://server:30000",
         store,
         run_id="run0",
-        strategy=strategy,
+        algorithm=algorithm,
+        schema=_capture_schema(algorithm),
+        request_input_adapter=request_input_adapter,
         post_fn=server,
     )
     return backend, server, store, adapter
 
 
 class TestServerCaptureAdapter(unittest.TestCase):
+    def test_generic_adapter_inputs_merge_with_runtime_owned_request_fields(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+        posted = []
+
+        def recording_server(url, json_body, timeout):
+            posted.append(json_body)
+            return server(url, json_body, timeout)
+
+        tasks = [_task(0, 4), _task(1, 6)]
+        model_inputs = {
+            "input_ids": [task.payload["input_ids"] for task in tasks],
+            "multi_modal_data": {
+                "image": ["image-0", "image-1"],
+            },
+        }
+        input_adapter = _GenericRequestInputAdapter(model_inputs)
+        _, _, _, capture_adapter = _mk(
+            server=recording_server,
+            backend=backend,
+            request_input_adapter=input_adapter,
+        )
+
+        refs = capture_adapter.produce_refs(tasks, capture=_eagle3_contract())
+
+        self.assertTrue(all(isinstance(ref, SampleRef) for ref in refs))
+        self.assertEqual(tasks, input_adapter.seen_tasks)
+        self.assertEqual(1, len(posted))
+        request = posted[0]
+        self.assertEqual(model_inputs["input_ids"], request["input_ids"])
+        self.assertEqual(
+            model_inputs["multi_modal_data"],
+            request["multi_modal_data"],
+        )
+        self.assertEqual(
+            {"temperature": 0.0, "max_new_tokens": 1},
+            request["sampling_params"],
+        )
+        self.assertEqual(2, len(request["spec_capture"]))
+
+    def test_generic_adapter_cannot_override_runtime_owned_request_fields(self):
+        task = _task(0, 4)
+        for reserved_field in ("sampling_params", "spec_capture"):
+            with self.subTest(field=reserved_field):
+                input_adapter = _GenericRequestInputAdapter(
+                    {
+                        "input_ids": [task.payload["input_ids"]],
+                        reserved_field: "plugin-owned",
+                    }
+                )
+                _, _, _, capture_adapter = _mk(request_input_adapter=input_adapter)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"runtime-owned request fields: \\['{reserved_field}'\\]",
+                ):
+                    capture_adapter.produce_refs(
+                        [task],
+                        capture=_eagle3_contract(),
+                    )
+
+    def test_generic_adapter_must_return_nonempty_model_input_mapping(self):
+        task = _task(0, 4)
+        cases = (
+            ([], TypeError, "must return a mapping"),
+            ({}, ValueError, "returned no model inputs"),
+        )
+        for request_inputs, exception_type, message in cases:
+            with self.subTest(request_inputs=request_inputs):
+                _, _, _, capture_adapter = _mk(
+                    request_input_adapter=_GenericRequestInputAdapter(request_inputs)
+                )
+                with self.assertRaisesRegex(exception_type, message):
+                    capture_adapter.produce_refs(
+                        [task],
+                        capture=_eagle3_contract(),
+                    )
+
     def test_eagle3_refs_and_zero_copy_roundtrip(self):
         backend, server, store, adapter = _mk()
         tasks = [_task(0, 6), _task(1, 9)]
@@ -285,7 +398,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertFalse(any(backend._d))
 
     def test_dflash_schema_names_and_no_target(self):
-        backend, server, store, adapter = _mk(strategy="dflash")
+        backend, server, store, adapter = _mk(algorithm="dflash")
         refs = adapter.produce_refs([_task(0, 5)], capture=_dflash_contract())
         (ref,) = refs
         self.assertIsInstance(ref, SampleRef)
@@ -301,7 +414,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertEqual(out["input_ids"].tolist(), [list(range(1, 6))])
 
     def test_dspark_schema_includes_target_last_hidden(self):
-        backend, server, store, adapter = _mk(strategy="dspark")
+        backend, server, store, adapter = _mk(algorithm="dspark")
         refs = adapter.produce_refs([_task(0, 5)], capture=_dspark_contract())
         (ref,) = refs
         self.assertIsInstance(ref, SampleRef)
@@ -342,7 +455,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
             return [[row] for row in rows]
 
         _, _, _, adapter = _mk(
-            strategy="dflash", server=wrapped_server, backend=backend
+            algorithm="dflash", server=wrapped_server, backend=backend
         )
         refs = adapter.produce_refs(
             [_task(0, 5), _task(1, 6)], capture=_dflash_contract()
@@ -447,9 +560,17 @@ class TestServerCaptureAdapter(unittest.TestCase):
                 recorded_aux_layer_ids=(1, 2, 3),
             )
 
-    def test_unknown_strategy_raises(self):
-        with self.assertRaises(KeyError):
-            resolve_server_capture_schema("nonexistent")
+    def test_transport_requires_an_injected_capture_schema(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        with self.assertRaisesRegex(TypeError, "injected ServerCaptureSchema"):
+            SGLangServerCaptureAdapter(
+                "http://server:30000",
+                store,
+                run_id="run0",
+                algorithm="eagle3",
+                schema=object(),
+            )
 
 
 class TestLoaderGcPump(unittest.TestCase):
@@ -526,7 +647,8 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
             "http://server:30000",
             store,
             run_id="run0",
-            strategy="dflash",
+            algorithm="dflash",
+            schema=_capture_schema("dflash"),
             post_fn=server,
         )
         prompts = [
@@ -543,7 +665,7 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
         )
         channel.publish_consumer_quantum(1)
         _workers, drive = build_disagg_online_producer(
-            strategy="dflash",
+            algorithm=builtin_algorithm_registry().resolve("dflash"),
             feature_source=adapter,
             prompts=prompts,
             feature_store=store,

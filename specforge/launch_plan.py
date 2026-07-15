@@ -14,12 +14,15 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config
+
+if TYPE_CHECKING:
+    from specforge.algorithms.registry import AlgorithmRegistration
 
 LaunchRole = Literal["auto", "all", "producer", "consumer", "both"]
 PlanKind = Literal["worker", "command", "supervisor", "managed_supervisor"]
@@ -182,7 +185,7 @@ def _distributed_state(env: Mapping[str, str]) -> bool:
 def _resolve_role(
     cfg: Config, requested: LaunchRole, *, distributed: bool
 ) -> Literal["all", "producer", "consumer", "both"]:
-    disaggregated = cfg.training.deployment_mode == "disaggregated"
+    disaggregated = cfg.deployment.mode == "disaggregated"
     if requested == "auto":
         legacy_role = cfg.training.role
         if disaggregated and legacy_role in ("producer", "consumer"):
@@ -344,7 +347,11 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
     return values
 
 
-def _managed_local_services(cfg: Config) -> tuple[ServiceSpec, ...]:
+def _managed_local_services(
+    cfg: Config,
+    *,
+    algorithm: "AlgorithmRegistration",
+) -> tuple[ServiceSpec, ...]:
     from specforge.training.capture_contract import resolve_server_capture_contract
 
     deployment = cfg.deployment.disaggregated
@@ -382,7 +389,7 @@ def _managed_local_services(cfg: Config) -> tuple[ServiceSpec, ...]:
         phase=0,
     )
 
-    contract = resolve_server_capture_contract(cfg)
+    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
     capture_services = []
     for index, server in enumerate(managed.capture_servers):
         argv = [
@@ -535,15 +542,15 @@ def _validate_consumer_database(
 ) -> None:
     if (
         cfg.mode != "online"
-        or cfg.training.deployment_mode != "disaggregated"
+        or cfg.deployment.mode != "disaggregated"
         or role not in ("consumer", "both")
     ):
         return
-    database = (
-        cfg.training.metadata_db_path
-        or launch_env.get("DISAGG_DB")
-        or base_env.get("DISAGG_DB")
-    )
+    database = launch_env.get("DISAGG_DB") or base_env.get("DISAGG_DB")
+    deployment = cfg.deployment.disaggregated
+    if not database and deployment is not None:
+        state_dir = deployment.consumer_state_dir or deployment.control_dir
+        database = str(Path(state_dir) / "consumer.sqlite")
     if not database:
         raise ValueError("online disaggregated consumer requires a metadata database")
     state_owner = int(base_env["RANK"]) == 0 if distributed else node_rank in (None, 0)
@@ -574,14 +581,14 @@ def _validate_capture_urls(
 ) -> None:
     if (
         cfg.mode != "online"
-        or cfg.training.deployment_mode != "disaggregated"
+        or cfg.deployment.mode != "disaggregated"
         or role not in ("producer", "both")
     ):
         return
     deployment = cfg.deployment.disaggregated
     if deployment is not None and deployment.managed_local is not None:
         return
-    if cfg.training.server_urls:
+    if deployment is not None and deployment.server_urls:
         return
     if base_env.get("DISAGG_SERVER_URLS") or base_env.get("DISAGG_SERVER_URL"):
         return
@@ -594,6 +601,7 @@ def _validate_capture_urls(
 def build_launch_plan(
     cfg: Config,
     *,
+    algorithm: Optional["AlgorithmRegistration"] = None,
     config_path: str,
     overrides: Sequence[str] = (),
     requested_role: LaunchRole = "auto",
@@ -603,10 +611,24 @@ def build_launch_plan(
     torchrun_prefix: Optional[Sequence[str]] = None,
 ) -> LaunchPlan:
     """Resolve one validated config into a side-effect-free process plan."""
+    if cfg.mode == "online":
+        if cfg.deployment.mode != "disaggregated":
+            raise ValueError(
+                "online launch planning requires disaggregated producer/consumer "
+                "mode; colocated online training is no longer supported"
+            )
+        if cfg.model.target_backend != "sglang":
+            raise ValueError(
+                "online launch planning requires an external SGLang capture server"
+            )
     base_env = os.environ if env is None else env
     distributed = _distributed_state(base_env)
     deployment = cfg.deployment.disaggregated
     managed_local = deployment.managed_local if deployment is not None else None
+    if managed_local is not None and algorithm is None:
+        raise ValueError(
+            "managed_local launch planning requires a resolved algorithm registration"
+        )
     managed_child = base_env.get(_MANAGED_CHILD_ENV) == "1"
     if managed_local is not None:
         if managed_child:
@@ -648,7 +670,7 @@ def build_launch_plan(
     )
     producer_env: dict[str, str] = {}
     consumer_env: dict[str, str] = {}
-    if cfg.training.deployment_mode == "disaggregated":
+    if cfg.deployment.mode == "disaggregated":
         role_base_env = base_env
         managed_environment: dict[str, str] = {}
         if managed_local is not None:
@@ -745,7 +767,7 @@ def build_launch_plan(
             "managed_supervisor",
             "both",
             commands=(producer, consumer),
-            services=_managed_local_services(cfg),
+            services=_managed_local_services(cfg, algorithm=algorithm),
             managed_root=deployment.control_dir,
             managed_ports=(
                 managed_local.mooncake.rpc_port,

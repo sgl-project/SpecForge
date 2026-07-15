@@ -1,8 +1,9 @@
-"""Generate offline EAGLE3 features with the canonical target engine.
+"""Generate offline EAGLE3 features with a dedicated local SGLang capture.
 
-The script uses the same policy-driven SGLang capture path as ``specforge
-train``. Precomputing target features removes the target model's memory and
-latency cost from the later offline training run.
+The local target exists only for this preprocessing command. Online training
+consumes features from an external server and never loads a target model in the
+trainer process. Precomputing target features removes the target model's memory
+and latency cost from the later offline training run.
 
 Usage:
 torchrun --nproc_per_node=8 \
@@ -52,7 +53,10 @@ from specforge.distributed import (
     init_distributed,
     is_tp_rank_0,
 )
-from specforge.inference.target_engine import TargetEngine, get_target_engine
+from specforge.offline_capture import (
+    OfflineEagle3SGLangCapture,
+    load_offline_eagle3_capture,
+)
 from specforge.utils import (
     load_tokenizer,
     print_args_with_dots,
@@ -85,7 +89,7 @@ def parse_args():
         "--capture-layers",
         type=str,
         default=None,
-        help="Comma-separated target layer ids (defaults to the EAGLE3 policy)",
+        help="Three comma-separated layer ids (default: 1, middle-1, final-4)",
     )
 
     data_group = parser.add_argument_group("data")
@@ -107,12 +111,6 @@ def parse_args():
     others_group = parser.add_argument_group("others")
     others_group.add_argument("--cache-dir", type=str, default="./cache")
     others_group.add_argument("--output-path", type=str, default=None)
-    others_group.add_argument(
-        "--model-download-dir",
-        type=str,
-        default=None,
-        help="The directory to download the target model to",
-    )
     others_group.add_argument(
         "--dist-timeout",
         type=int,
@@ -156,7 +154,7 @@ def parse_args():
     sglang_group.add_argument(
         "--sglang-attention-backend",
         default="flashinfer",
-        help="Attention backend used by the in-process SGLang target engine",
+        help="Attention backend used by the offline SGLang capture",
     )
     sglang_group.add_argument("--sglang-mem-fraction-static", type=float, default=0.4)
     sglang_group.add_argument("--sglang-context-length", type=int, default=None)
@@ -185,25 +183,42 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
     }
 
 
+def _resolve_capture_layers(
+    model_config: AutoConfig, value: Optional[str]
+) -> List[int]:
+    if value is None:
+        num_layers = model_config.num_hidden_layers
+        layers = [1, num_layers // 2 - 1, num_layers - 4]
+    else:
+        try:
+            layers = [int(layer.strip()) for layer in value.split(",")]
+        except (AttributeError, ValueError) as exc:
+            raise ValueError(
+                "--capture-layers must be three comma-separated integers"
+            ) from exc
+    if len(layers) != 3 or len(set(layers)) != 3 or any(layer < 0 for layer in layers):
+        raise ValueError(
+            "offline EAGLE3 capture requires three distinct non-negative layers"
+        )
+    return layers
+
+
 def build_target_model(
     args: argparse.Namespace, model_config: AutoConfig
-) -> TargetEngine:
-    """Build the same policy-driven target engine used by ``specforge train``."""
-    target_model = get_target_engine(
+) -> OfflineEagle3SGLangCapture:
+    """Build the local target used only by this preprocessing command."""
+    capture_layers = _resolve_capture_layers(model_config, args.capture_layers)
+    target_model = load_offline_eagle3_capture(
         args.target_model_path,
-        strategy="eagle3",
-        backend="sglang",
         torch_dtype=(
             model_config.dtype
             if hasattr(model_config, "dtype")
             else model_config.torch_dtype
         ),
-        device="cuda",
-        cache_dir=args.model_download_dir,
         trust_remote_code=args.trust_remote_code,
         **_sglang_kwargs(args),
     )
-    target_model.set_capture_layers(args.capture_layers)
+    target_model.set_capture_layers(capture_layers)
     return target_model
 
 
@@ -501,8 +516,6 @@ class HiddenStatesGenerator:
             }
             captured = self.model.capture(
                 **filtered_batch_gpu,
-                return_last_hidden_states=True,
-                return_logits=False,
             )
             aux_hidden_states_list = captured.hidden_states
             last_hidden_states_list = captured.last_hidden_states
@@ -581,8 +594,6 @@ class HiddenStatesGenerator:
 
 def main():
     args = parse_args()
-    if args.capture_layers is not None:
-        args.capture_layers = [int(x) for x in args.capture_layers.split(",")]
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)

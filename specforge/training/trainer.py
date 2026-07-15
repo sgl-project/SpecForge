@@ -9,7 +9,7 @@
 """Domain ``Trainer``: the caller-facing training object.
 
 Composes (ref source + FeatureStore) -> FeatureDataLoader (the data path) and
-model + spec.make_strategy -> FSDPTrainingBackend -> TrainerCore ->
+model + an injected step factory -> FSDPTrainingBackend -> TrainerCore ->
 TrainerController (the trainer seam) behind one object with a ``.fit()``.
 Online / offline / disaggregated is invisible here: it is fully absorbed by the
 ref source + store the Trainer is handed — the loader IS the stream.
@@ -20,13 +20,17 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import nullcontext
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
+from specforge.algorithms.common.providers import (
+    OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+    StepRuntimeConfig,
+    checkpoint_key_fingerprint,
+)
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
-from specforge.training.strategies.registry import StrategySpec
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,8 @@ class Trainer:
     def __init__(
         self,
         *,
-        spec: StrategySpec,
+        algorithm_name: str,
+        make_step_strategy: Callable,
         controller,  # runtime.control_plane.DataFlowController (metadata only)
         store: FeatureStore,
         ref_source: dict,  # {"refs": [...]} (offline) | {"queue": q} (online)
@@ -56,7 +61,7 @@ class Trainer:
         logger,
         log_interval: int,
         collate_fn,
-        strategy_kwargs: Optional[dict] = None,
+        strategy_kwargs: Optional[Mapping[str, object]] = None,
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
@@ -108,7 +113,7 @@ class Trainer:
             collate_fn=collate_fn,
             per_sample_transform=per_sample_transform,
             drop_last=True,
-            strategy=spec.name,
+            strategy=algorithm_name,
             ack=not defer_queue_ack,
             num_workers=dataloader_num_workers,
         )
@@ -139,6 +144,38 @@ class Trainer:
                 f"dataset_size={dataset_size} does not match the "
                 f"{inferred_dataset_size} supplied refs"
             )
+        if isinstance(strategy_kwargs, StepRuntimeConfig):
+            algorithm_checkpoint_extra = dict(strategy_kwargs.resume_contract)
+            allowed_missing_checkpoint_keys = set(
+                strategy_kwargs.allowed_missing_checkpoint_keys
+            )
+            resolved_strategy_kwargs = dict(strategy_kwargs)
+        else:
+            algorithm_checkpoint_extra = {}
+            allowed_missing_checkpoint_keys = set()
+            resolved_strategy_kwargs = dict(strategy_kwargs or {})
+
+        if allowed_missing_checkpoint_keys:
+            draft_state_keys = set(model.draft_model.state_dict())
+            unknown_allowed_missing = allowed_missing_checkpoint_keys - draft_state_keys
+            if unknown_allowed_missing:
+                raise ValueError(
+                    "algorithm checkpoint policy allows unknown draft keys: "
+                    f"{sorted(unknown_allowed_missing)}"
+                )
+            recorded_fingerprint = algorithm_checkpoint_extra[
+                OMITTED_STATE_FINGERPRINT_CONTRACT_KEY
+            ]
+            live_fingerprint = checkpoint_key_fingerprint(
+                model.draft_model,
+                allowed_missing_checkpoint_keys,
+            )
+            if recorded_fingerprint != live_fingerprint:
+                raise ValueError(
+                    f"{OMITTED_STATE_FINGERPRINT_CONTRACT_KEY!r} does not match "
+                    "the live draft model and complete allowed-missing-key policy"
+                )
+
         standard_checkpoint_extra = {
             "dataset_size": dataset_size,
             "batch_size": batch_size,
@@ -148,7 +185,19 @@ class Trainer:
             "sp_ulysses_size": sp_ulysses_size,
             "sp_ring_size": sp_ring_size,
         }
-        custom_checkpoint_extra = dict(checkpoint_extra or {})
+        explicit_checkpoint_extra = dict(checkpoint_extra or {})
+        duplicate_algorithm_keys = (
+            algorithm_checkpoint_extra.keys() & explicit_checkpoint_extra.keys()
+        )
+        if duplicate_algorithm_keys:
+            raise ValueError(
+                "checkpoint_extra cannot override algorithm-owned fields: "
+                f"{sorted(duplicate_algorithm_keys)}"
+            )
+        custom_checkpoint_extra = {
+            **algorithm_checkpoint_extra,
+            **explicit_checkpoint_extra,
+        }
         reserved = standard_checkpoint_extra.keys() & custom_checkpoint_extra.keys()
         if reserved:
             raise ValueError(
@@ -187,10 +236,10 @@ class Trainer:
                 else CheckpointManager.read_resume_state(resume_from)
             )
             saved_strategy = state.get("strategy")
-            if saved_strategy != spec.name:
+            if saved_strategy != algorithm_name:
                 raise ValueError(
                     f"checkpoint {resume_from} was written by strategy "
-                    f"{saved_strategy!r}; this run trains {spec.name!r}"
+                    f"{saved_strategy!r}; this run trains {algorithm_name!r}"
                 )
             import torch.distributed as dist
 
@@ -201,17 +250,13 @@ class Trainer:
             }
             for key, current in resume_contract.items():
                 persisted = state.get(key)
-                if (
-                    spec.name == "peagle"
-                    and key.startswith("peagle_")
-                    and persisted is None
-                ):
+                if key in custom_checkpoint_extra and key not in state:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
-                        f"P-EAGLE resume semantic {key}; start a fresh run "
+                        f"algorithm resume semantic {key}; start a fresh run "
                         "rather than guessing the prior objective"
                     )
-                if persisted is not None and persisted != current:
+                if key in state and persisted != current:
                     raise ValueError(
                         f"checkpoint {resume_from} was written with "
                         f"{key}={persisted} but this run has {key}={current}; "
@@ -220,12 +265,19 @@ class Trainer:
             saved_weights = state["draft_state_dict"]
             load_result = model.draft_model.load_state_dict(saved_weights, strict=False)
             loaded = len(saved_weights) - len(load_result.unexpected_keys)
-            # strict=False must not degrade into loading nothing silently.
-            if load_result.unexpected_keys or loaded == 0:
+            missing_keys = set(load_result.missing_keys)
+            disallowed_missing = missing_keys - allowed_missing_checkpoint_keys
+            # strict=False exists solely for provider-declared omissions such as
+            # EAGLE3's frozen target-copied embedding. Every other mismatch is
+            # checkpoint corruption or a different model contract.
+            if load_result.unexpected_keys or disallowed_missing or loaded == 0:
                 raise ValueError(
                     f"checkpoint {resume_from} draft weights do not match this "
                     f"model: {loaded}/{len(saved_weights)} keys loaded, "
-                    f"unexpected={sorted(load_result.unexpected_keys)}"
+                    f"unexpected={sorted(load_result.unexpected_keys)}, "
+                    f"missing={sorted(disallowed_missing)}, "
+                    "provider_allowed_missing="
+                    f"{sorted(allowed_missing_checkpoint_keys)}"
                 )
             # Mid-epoch position persists in SAMPLES (batch-size independent);
             # Offline refs are rebuilt for the saved epoch before seek; a local
@@ -296,8 +348,10 @@ class Trainer:
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
         if resume is not None:
             backend.load_state_dict(resume["backend"])
-        strategy = spec.make_strategy(
-            wrapped, target_head=target_head, **(strategy_kwargs or {})
+        strategy = make_step_strategy(
+            wrapped,
+            target_head=target_head,
+            **resolved_strategy_kwargs,
         )
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
         ack_fn = None
@@ -346,7 +400,8 @@ class Trainer:
             controller_obj.last_checkpoint_step = resume["global_step"]
 
         # Runtime pieces remain inspectable behind the single Trainer lifecycle.
-        self.spec = spec
+        self.algorithm_name = algorithm_name
+        self.make_step_strategy = make_step_strategy
         self.run_id = run_id
         self.output_dir = output_dir
         self.batch_size = batch_size

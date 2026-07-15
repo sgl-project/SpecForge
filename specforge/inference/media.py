@@ -1,8 +1,8 @@
 # coding=utf-8
-"""Typed, inference-local multimodal inputs.
+"""Legacy multimodal input types retained for import compatibility.
 
-Media tensors are created inside rollout and consumed by a target engine. They
-never enter PromptTask, the control plane, or FeatureStore.
+The current runtime does not support VLM training or media rollout inputs.
+These types are not wired into the canonical training path.
 """
 
 from __future__ import annotations

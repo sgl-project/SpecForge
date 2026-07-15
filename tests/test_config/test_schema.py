@@ -6,9 +6,13 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 
 from pydantic import ValidationError
 
+from specforge.algorithms import AlgorithmRegistration, AlgorithmRegistry
+from specforge.algorithms.builtin import builtin_algorithm_registry
+from specforge.application import resolve_run
 from specforge.config import Config, apply_overrides, load_config
 
 MINIMAL = {
@@ -19,6 +23,44 @@ MINIMAL = {
     },
     "data": {"hidden_states_path": "/features"},
 }
+
+ONLINE_DEPLOYMENT = {
+    "mode": "disaggregated",
+    "disaggregated": {
+        "control_dir": "/control",
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+    },
+}
+
+
+def _online_payload(strategy: str = "eagle3") -> dict:
+    payload = copy.deepcopy(MINIMAL)
+    payload["model"]["target_backend"] = "sglang"
+    payload["data"] = {"train_data_path": "/train.jsonl"}
+    payload["training"] = {"strategy": strategy, "max_steps": 1}
+    payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
+    return payload
+
+
+def _managed_local_payload(*, ep_size: int) -> dict:
+    payload = _online_payload()
+    payload["model"]["sglang_ep_size"] = ep_size
+    payload["deployment"]["disaggregated"] = {
+        "control_dir": "/control",
+        "backend": "mooncake",
+        "managed_local": {
+            "trainer_cuda_visible_devices": ["4"],
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0", "1", "2", "3"],
+                    "tp_size": 4,
+                }
+            ],
+        },
+    }
+    return payload
 
 
 def _write(payload: dict, suffix: str) -> str:
@@ -34,99 +76,64 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
-    def test_qwen_vl_uses_online_eagle3_without_a_second_entry(self):
-        payload = {
-            **MINIMAL,
-            "model": {
-                **MINIMAL["model"],
-                "input_modality": "qwen2_5_vl",
-                "target_backend": "hf",
-            },
-            "data": {
-                "train_data_path": "/vlm.jsonl",
-                "chat_template": "qwen2-vl",
-                "min_pixels": 50176,
-                "max_pixels": 802816,
-            },
-        }
+    def test_removed_vlm_pixel_knobs_are_rejected(self):
+        for field in ("min_pixels", "max_pixels"):
+            payload = copy.deepcopy(MINIMAL)
+            payload["data"][field] = 1
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                Config.model_validate(payload)
+
+    def test_input_modality_is_extensible_and_resolved_by_providers(self):
+        payload = _online_payload()
+        payload["model"]["input_modality"] = "vendor_vlm"
+        payload["data"].update(
+            {
+                "chat_template": "vendor-template",
+            }
+        )
         cfg = Config.model_validate(payload)
-        self.assertEqual(cfg.model.input_modality, "qwen2_5_vl")
+        self.assertEqual(cfg.model.input_modality, "vendor_vlm")
         self.assertEqual(cfg.mode, "online")
+        with self.assertRaisesRegex(
+            ValueError,
+            "no streaming feature contract and provider for modality 'vendor_vlm'",
+        ):
+            resolve_run(cfg)
 
-        legacy_compatible = copy.deepcopy(payload)
-        legacy_compatible["model"]["target_backend"] = "custom"
-        legacy_compatible["training"] = {"batch_size": 2}
-        cfg = Config.model_validate(legacy_compatible)
-        self.assertEqual(cfg.model.target_backend, "custom")
-        self.assertEqual(cfg.training.batch_size, 2)
+        for modality in ("", "two words", " trailing"):
+            invalid = copy.deepcopy(payload)
+            invalid["model"]["input_modality"] = modality
+            with self.subTest(modality=modality), self.assertRaises(ValidationError):
+                Config.model_validate(invalid)
 
-        invalid = copy.deepcopy(payload)
-        invalid["data"] = {"hidden_states_path": "/features"}
-        with self.assertRaisesRegex(ValidationError, "online target capture"):
-            Config.model_validate(invalid)
-
-        invalid = copy.deepcopy(payload)
-        invalid["training"] = {"strategy": "dflash"}
-        with self.assertRaisesRegex(ValidationError, "does not support input_modality"):
-            Config.model_validate(invalid)
-
-    def test_target_output_sharding_is_a_colocated_text_sglang_option(self):
-        payload = {
-            **MINIMAL,
-            "model": {
-                **MINIMAL["model"],
-                "target_backend": "sglang",
-                "shard_target_output": True,
-            },
-            "data": {"train_data_path": "/train.jsonl"},
-        }
+    def test_target_output_sharding_is_unavailable_with_server_capture(self):
+        payload = _online_payload()
+        payload["model"]["shard_target_output"] = True
         cfg = Config.model_validate(payload)
         self.assertTrue(cfg.model.shard_target_output)
-
-        invalid = copy.deepcopy(payload)
-        invalid["model"]["target_backend"] = "hf"
-        with self.assertRaisesRegex(ValidationError, "target_backend=sglang"):
-            Config.model_validate(invalid)
-
-        invalid = copy.deepcopy(payload)
-        invalid["model"]["input_modality"] = "qwen2_5_vl"
-        invalid["data"] = {
-            "train_data_path": "/vlm.jsonl",
-            "chat_template": "qwen2-vl",
-        }
-        with self.assertRaisesRegex(ValidationError, "not supported for VLM"):
-            Config.model_validate(invalid)
+        with self.assertRaisesRegex(
+            ValueError, "unavailable with external server capture"
+        ):
+            resolve_run(cfg)
 
     def test_sglang_expert_parallelism_must_fit_target_tensor_parallelism(self):
-        payload = {
-            **MINIMAL,
-            "model": {
-                **MINIMAL["model"],
-                "target_backend": "sglang",
-                "sglang_ep_size": 2,
-            },
-            "training": {"tp_size": 4},
-        }
+        payload = _managed_local_payload(ep_size=2)
         config = Config.model_validate(payload)
         self.assertEqual(config.model.sglang_ep_size, 2)
 
-        invalid = copy.deepcopy(payload)
-        invalid["model"]["sglang_ep_size"] = 3
+        invalid = _managed_local_payload(ep_size=3)
         with self.assertRaisesRegex(ValidationError, "evenly divide"):
             Config.model_validate(invalid)
 
-        invalid = copy.deepcopy(payload)
-        invalid["model"]["sglang_ep_size"] = 8
+        invalid = _managed_local_payload(ep_size=8)
         with self.assertRaisesRegex(ValidationError, "no larger"):
             Config.model_validate(invalid)
 
     def test_online_eagle3_preserves_multi_sample_batches(self):
-        payload = {
-            **MINIMAL,
-            "data": {"train_data_path": "/train.jsonl"},
-            "training": {"strategy": "eagle3", "batch_size": 4},
-        }
+        payload = _online_payload()
+        payload["training"]["batch_size"] = 4
         cfg = Config.model_validate(payload)
+        resolve_run(cfg)
         self.assertEqual(cfg.training.batch_size, 4)
 
     def test_from_file_yaml_and_json(self):
@@ -148,16 +155,16 @@ class ConfigSchemaTest(unittest.TestCase):
                     "data": {"hidden_states_path": "/a", "prompts_path": "/b"},
                 }
             )
-        online = Config.model_validate(
-            {**MINIMAL, "data": {"prompts_path": "/prompts.jsonl"}}
-        )
+        online_payload = _online_payload()
+        online_payload["data"] = {"prompts_path": "/prompts.jsonl"}
+        online = Config.model_validate(online_payload)
         self.assertEqual(online.mode, "online")
-        raw = Config.model_validate(
-            {**MINIMAL, "data": {"train_data_path": "/conversations.jsonl"}}
-        )
+        raw_payload = _online_payload()
+        raw_payload["data"] = {"train_data_path": "/conversations.jsonl"}
+        raw = Config.model_validate(raw_payload)
         self.assertEqual(raw.mode, "online")
 
-    def test_eval_source_and_interval_form_one_mode_matched_pair(self):
+    def test_offline_eval_source_and_interval_form_one_pair(self):
         offline = Config.model_validate(
             {
                 **MINIMAL,
@@ -170,18 +177,6 @@ class ConfigSchemaTest(unittest.TestCase):
         )
         self.assertEqual(offline.data.eval_hidden_states_path, "/eval-features")
         self.assertEqual(offline.training.eval_interval, 10)
-
-        online = Config.model_validate(
-            {
-                **MINIMAL,
-                "data": {
-                    "train_data_path": "/train.jsonl",
-                    "eval_data_path": "/eval.jsonl",
-                },
-                "training": {"eval_interval": 5},
-            }
-        )
-        self.assertEqual(online.data.eval_data_path, "/eval.jsonl")
 
         for data, training in (
             (
@@ -199,64 +194,41 @@ class ConfigSchemaTest(unittest.TestCase):
                         {**MINIMAL, "data": data, "training": training}
                     )
 
-        with self.assertRaisesRegex(ValidationError, "at most one"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "data": {
-                        "hidden_states_path": "/train",
-                        "eval_data_path": "/eval.jsonl",
-                        "eval_hidden_states_path": "/eval-features",
-                    },
-                    "training": {"eval_interval": 2},
-                }
-            )
+    def test_online_evaluation_is_explicitly_unsupported(self):
+        offline_payload = {
+            **MINIMAL,
+            "data": {
+                "hidden_states_path": "/train-features",
+                "eval_data_path": "/eval.jsonl",
+            },
+            "training": {"eval_interval": 2},
+        }
+        online_payload = _online_payload()
+        online_payload["data"]["eval_data_path"] = "/eval.jsonl"
+        online_payload["training"]["eval_interval"] = 2
 
-    def test_eval_mode_must_match_training_and_online_disagg_is_rejected(self):
-        with self.assertRaisesRegex(ValidationError, "online training data source"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "data": {
-                        "hidden_states_path": "/train-features",
-                        "eval_data_path": "/eval.jsonl",
-                    },
-                    "training": {"eval_interval": 2},
-                }
-            )
+        for mode, payload in (
+            ("offline", offline_payload),
+            ("online", online_payload),
+        ):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    ValidationError, "data.eval_data_path is unsupported"
+                ):
+                    Config.model_validate(payload)
+
+    def test_offline_eval_source_requires_offline_training(self):
+        mismatched_online = _online_payload()
+        mismatched_online["data"]["eval_hidden_states_path"] = "/eval-features"
+        mismatched_online["training"]["eval_interval"] = 2
         with self.assertRaisesRegex(ValidationError, "offline training data source"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "data": {
-                        "train_data_path": "/train.jsonl",
-                        "eval_hidden_states_path": "/eval-features",
-                    },
-                    "training": {"eval_interval": 2},
-                }
-            )
-        with self.assertRaisesRegex(ValidationError, "online disaggregated evaluation"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "data": {
-                        "train_data_path": "/train.jsonl",
-                        "eval_data_path": "/eval.jsonl",
-                    },
-                    "training": {
-                        "strategy": "dflash",
-                        "deployment_mode": "disaggregated",
-                        "role": "consumer",
-                        "total_steps": 10,
-                        "eval_interval": 2,
-                    },
-                }
-            )
+            Config.model_validate(mismatched_online)
 
     def test_local_offline_eagle3_can_derive_vocab_mapping(self):
         missing = copy.deepcopy(MINIMAL)
         missing["model"].pop("vocab_mapping_path")
         config = Config.model_validate(missing)
+        resolve_run(config)
         self.assertEqual(config.mode, "offline")
         self.assertEqual(config.model.vocab_mapping_path, "")
         self.assertEqual(Config.model_validate(MINIMAL).mode, "offline")
@@ -264,12 +236,16 @@ class ConfigSchemaTest(unittest.TestCase):
     def test_disaggregated_eagle3_requires_shared_vocab_mapping(self):
         missing = copy.deepcopy(MINIMAL)
         missing["model"].pop("vocab_mapping_path")
-        missing["training"] = {
-            "deployment_mode": "disaggregated",
-            "role": "consumer",
+        missing["deployment"] = {
+            "mode": "disaggregated",
+            "disaggregated": {
+                "control_dir": "/control",
+                "backend": "shared_dir",
+                "store_root": "/features",
+            },
         }
-        with self.assertRaisesRegex(ValidationError, "vocab_mapping_path"):
-            Config.model_validate(missing)
+        with self.assertRaisesRegex(ValueError, "vocab_mapping_path"):
+            resolve_run(Config.model_validate(missing))
 
     def test_resume_allows_trainers_and_rejects_producer(self):
         local = Config.model_validate(
@@ -280,43 +256,26 @@ class ConfigSchemaTest(unittest.TestCase):
         )
         self.assertEqual(local.training.resume_from, "/checkpoints/run-latest")
 
-        local_online = Config.model_validate(
+        consumer_payload = _online_payload("dflash")
+        consumer_payload["training"].update(
             {
-                **MINIMAL,
-                "data": {"train_data_path": "/data.jsonl"},
-                "training": {"resume_from": "/checkpoints/run-latest"},
+                "role": "consumer",
+                "total_steps": 10,
+                "resume_from": "/checkpoints/run-latest",
             }
         )
-        self.assertEqual(local_online.mode, "online")
-        self.assertEqual(local_online.training.resume_from, "/checkpoints/run-latest")
-
-        disagg_consumer = Config.model_validate(
-            {
-                **MINIMAL,
-                "data": {"train_data_path": "/data.jsonl"},
-                "training": {
-                    "strategy": "dflash",
-                    "deployment_mode": "disaggregated",
-                    "role": "consumer",
-                    "total_steps": 10,
-                    "resume_from": "/checkpoints/run-latest",
-                },
-            }
-        )
+        disagg_consumer = Config.model_validate(consumer_payload)
+        resolve_run(disagg_consumer)
         self.assertEqual(
             disagg_consumer.training.resume_from, "/checkpoints/run-latest"
         )
+
+        producer_payload = _online_payload("dflash")
+        producer_payload["training"].update(
+            {"role": "producer", "resume_from": "/checkpoints/run-latest"}
+        )
         with self.assertRaisesRegex(ValidationError, "trainer role"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "training": {
-                        "deployment_mode": "disaggregated",
-                        "role": "producer",
-                        "resume_from": "/checkpoints/run-latest",
-                    },
-                }
-            )
+            Config.model_validate(producer_payload)
 
     def test_unknown_backend_rejected(self):
         bad = {**MINIMAL, "model": {**MINIMAL["model"], "target_backend": "vllm"}}
@@ -328,7 +287,10 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(
                 {
                     **MINIMAL,
-                    "data": {"train_data_path": "/data.jsonl", "is_vlm": True},
+                    "data": {
+                        "train_data_path": "/data.jsonl",
+                        "unexpected_data_field": True,
+                    },
                 }
             )
         with self.assertRaises(ValidationError):
@@ -348,6 +310,7 @@ class ConfigSchemaTest(unittest.TestCase):
         offline_dflash = Config.model_validate(
             {**MINIMAL, "training": {"strategy": "dflash"}}
         )
+        resolve_run(offline_dflash)
         self.assertEqual(offline_dflash.mode, "offline")
         with self.assertRaises(ValidationError):
             Config.model_validate(
@@ -356,149 +319,119 @@ class ConfigSchemaTest(unittest.TestCase):
                     "training": {"deployment_mode": "dataflow_colocated"},
                 }
             )
-        dspark = Config.model_validate(
-            {
-                **MINIMAL,
-                "data": {"train_data_path": "/data.jsonl"},
-                "training": {
-                    "strategy": "dspark",
-                    "deployment_mode": "disaggregated",
-                    "role": "producer",
-                    "total_steps": 10,
-                },
-            }
-        )
+        dspark_payload = _online_payload("dspark")
+        dspark_payload["training"].update({"role": "producer", "total_steps": 10})
+        dspark = Config.model_validate(dspark_payload)
+        resolve_run(dspark)
         self.assertEqual(dspark.training.strategy, "dspark")
-        with self.assertRaisesRegex(ValidationError, "target_backend=sglang"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "model": {**MINIMAL["model"], "target_backend": "hf"},
-                    "data": {"train_data_path": "/data.jsonl"},
-                    "training": {
-                        "strategy": "dflash",
-                        "deployment_mode": "disaggregated",
-                        "role": "producer",
-                        "total_steps": 10,
-                    },
-                }
-            )
+        invalid_backend = _online_payload("dflash")
+        invalid_backend["model"]["target_backend"] = "hf"
+        with self.assertRaisesRegex(ValidationError, "external SGLang"):
+            Config.model_validate(invalid_backend)
+
+        unknown = copy.deepcopy(MINIMAL)
+        unknown["training"] = {"strategy": "unknown_algorithm"}
+        cfg = Config.model_validate(unknown)
+        with self.assertRaisesRegex(ValueError, "unknown algorithm"):
+            resolve_run(cfg)
 
     def test_registered_strategy_needs_no_schema_edit(self):
-        from specforge.training.strategies import registry as strategy_registry
-        from specforge.training.strategies.assembly import (
-            DraftConfigSpec,
-            StrategyAssemblySpec,
-            StrategyModelParts,
+        name = "config_registry_test"
+        builtin = builtin_algorithm_registry()
+        base = builtin.resolve("eagle3")
+        registration = AlgorithmRegistration(
+            spec=replace(base.spec, name=name),
+            providers=replace(base.providers, algorithm_name=name),
         )
-        from specforge.training.strategies.registry import (
-            StrategySpec,
-            register_strategy,
-        )
-
-        name = "_config_registry_test"
-        register_strategy(
-            StrategySpec(
-                name=name,
-                required_features=frozenset({"input_ids"}),
-                make_strategy=lambda wrapped, *, target_head=None: None,
-                assembly=StrategyAssemblySpec(
-                    draft_config=DraftConfigSpec(architecture="UnusedDraft"),
-                    make_draft_model=lambda cfg, draft_config: None,
-                    make_model=(
-                        lambda cfg, draft, draft_config, target_config, tokenizer: (
-                            StrategyModelParts(model=None)
-                        )
-                    ),
-                ),
-                supported_modes=frozenset({"offline"}),
-                supported_attention_backends=frozenset({"flex_attention"}),
-            )
-        )
-        self.addCleanup(strategy_registry._REGISTRY.pop, name, None)
+        registry = AlgorithmRegistry((registration,))
 
         payload = copy.deepcopy(MINIMAL)
         payload["training"] = {"strategy": name}
         cfg = Config.model_validate(payload)
         self.assertEqual(cfg.training.strategy, name)
+        self.assertIs(resolve_run(cfg, registry).algorithm, registration)
+        self.assertNotIn(name, builtin.names)
 
     def test_strategy_specific_capture_and_attention_are_validated(self):
-        online = {**MINIMAL, "data": {"train_data_path": "/data.jsonl"}}
-        with self.assertRaisesRegex(ValidationError, "exactly three"):
-            Config.model_validate(
-                {
-                    **online,
-                    "model": {
-                        **online["model"],
-                        "aux_hidden_state_layer_ids": [1, 2],
-                    },
-                }
+        online = _online_payload()
+        with self.assertRaisesRegex(ValueError, "exactly three"):
+            resolve_run(
+                Config.model_validate(
+                    {
+                        **online,
+                        "model": {
+                            **online["model"],
+                            "aux_hidden_state_layer_ids": [1, 2],
+                        },
+                    }
+                )
             )
 
-        with self.assertRaisesRegex(ValidationError, "would be ignored"):
-            Config.model_validate(
-                {
-                    **online,
-                    "model": {
-                        **online["model"],
-                        "aux_hidden_state_layer_ids": [1, 2, 3],
-                    },
-                    "training": {"strategy": "dflash"},
-                }
+        with self.assertRaisesRegex(ValueError, "would be ignored"):
+            resolve_run(
+                Config.model_validate(
+                    {
+                        **online,
+                        "model": {
+                            **online["model"],
+                            "aux_hidden_state_layer_ids": [1, 2, 3],
+                        },
+                        "training": {
+                            **online["training"],
+                            "strategy": "dflash",
+                        },
+                    }
+                )
             )
-        with self.assertRaisesRegex(
-            ValidationError, "does not support attention_backend"
-        ):
-            Config.model_validate(
-                {
-                    **online,
-                    "training": {
-                        "strategy": "peagle",
-                        "attention_backend": "sdpa",
-                    },
-                }
+        with self.assertRaisesRegex(ValueError, "does not support attention_backend"):
+            resolve_run(
+                Config.model_validate(
+                    {
+                        **online,
+                        "training": {
+                            **online["training"],
+                            "strategy": "peagle",
+                            "attention_backend": "sdpa",
+                        },
+                    }
+                )
             )
-        with self.assertRaisesRegex(
-            ValidationError, "does not support attention_backend"
-        ):
-            Config.model_validate(
-                {**online, "training": {"attention_backend": "eager"}}
+        with self.assertRaisesRegex(ValueError, "does not support attention_backend"):
+            resolve_run(
+                Config.model_validate(
+                    {
+                        **online,
+                        "training": {
+                            **online["training"],
+                            "attention_backend": "eager",
+                        },
+                    }
+                )
             )
-        with self.assertRaisesRegex(
-            ValidationError, "does not support attention_backend"
-        ):
-            Config.model_validate(
-                {
-                    **online,
-                    "training": {
-                        "strategy": "dflash",
-                        "attention_backend": "fa",
-                    },
-                }
+        with self.assertRaisesRegex(ValueError, "does not support attention_backend"):
+            resolve_run(
+                Config.model_validate(
+                    {
+                        **online,
+                        "training": {
+                            **online["training"],
+                            "strategy": "dflash",
+                            "attention_backend": "fa",
+                        },
+                    }
+                )
             )
 
-    def test_online_producer_cannot_claim_the_consumer_ledger(self):
-        payload = {
-            **MINIMAL,
-            "model": {**MINIMAL["model"], "target_backend": "sglang"},
-            "data": {"train_data_path": "/data.jsonl"},
-            "training": {
-                "deployment_mode": "disaggregated",
-                "role": "producer",
-                "max_steps": 1,
-                "metadata_db_path": "/shared/consumer.sqlite",
-            },
-        }
-        with self.assertRaisesRegex(ValidationError, "consumer only"):
-            Config.model_validate(payload)
-
-    def test_offline_run_cannot_configure_an_online_consumer_ledger(self):
-        payload = {
-            **MINIMAL,
-            "training": {"metadata_db_path": "/shared/consumer.sqlite"},
-        }
-        with self.assertRaisesRegex(ValidationError, "consumer only"):
-            Config.model_validate(payload)
+    def test_legacy_deployment_fields_are_not_domain_model_fields(self):
+        for field, value in (
+            ("deployment_mode", "disaggregated"),
+            ("server_urls", ["http://127.0.0.1:30000"]),
+            ("metadata_db_path", "/shared/consumer.sqlite"),
+        ):
+            payload = copy.deepcopy(MINIMAL)
+            payload["training"] = {field: value}
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                Config.model_validate(payload)
 
     def test_invalid_core_bounds_fail_during_config_validation(self):
         cases = (
@@ -575,31 +508,30 @@ class ConfigSchemaTest(unittest.TestCase):
                 Config.model_validate({**MINIMAL, "runtime": runtime})
 
     def test_capture_only_producer_rejects_training_profiler(self):
+        payload = _online_payload("dflash")
+        payload["training"].update({"role": "producer", "max_steps": 1})
+        payload["profiling"] = {"enabled": True}
         with self.assertRaisesRegex(ValidationError, "trainer roles"):
+            Config.model_validate(payload)
+
+    def test_offline_dp_and_usp_topologies_are_validated(self):
+        with self.assertRaisesRegex(
+            ValidationError, "do not implement trainer tensor parallelism"
+        ):
             Config.model_validate(
                 {
                     **MINIMAL,
-                    "data": {"train_data_path": "/data.jsonl"},
-                    "training": {
-                        "deployment_mode": "disaggregated",
-                        "role": "producer",
-                        "max_steps": 1,
-                    },
-                    "profiling": {"enabled": True},
+                    "training": {"tp_size": 2},
                 }
             )
 
-    def test_local_tp_and_offline_usp_topologies_are_validated(self):
-        tp = Config.model_validate(
+        dp = Config.model_validate(
             {
                 **MINIMAL,
-                "data": {"prompts_path": "/prompts.jsonl"},
-                "training": {"tp_size": 2},
+                "training": {"tp_size": 1},
             }
         )
-        tp.validate_world_size(4)
-        with self.assertRaisesRegex(ValueError, "divisible"):
-            tp.validate_world_size(3)
+        dp.validate_world_size(4)
 
         usp = Config.model_validate(
             {
@@ -612,17 +544,14 @@ class ConfigSchemaTest(unittest.TestCase):
             }
         )
         usp.validate_world_size(2)
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            usp.validate_world_size(3)
+        online_usp = _online_payload()
+        online_usp["training"].update(
+            {"attention_backend": "usp", "sp_ulysses_size": 2}
+        )
         with self.assertRaisesRegex(ValidationError, "offline features"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "data": {"prompts_path": "/prompts.jsonl"},
-                    "training": {
-                        "attention_backend": "usp",
-                        "sp_ulysses_size": 2,
-                    },
-                }
-            )
+            Config.model_validate(online_usp)
         with self.assertRaisesRegex(ValidationError, "attention_backend=usp"):
             Config.model_validate(
                 {

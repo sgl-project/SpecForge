@@ -9,7 +9,8 @@
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
 FSDP-only for now. ``ParallelConfig`` carries the process groups created by the
-single distributed lifecycle: frozen-target TP plus draft DP/USP topology.
+single distributed lifecycle: trainer TP (fixed at one by public builders) plus
+draft DP/USP topology.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import torch.nn as nn
 
 @dataclass
 class ParallelConfig:
-    """Snapshot of the target-TP and draft-DP/SP layout.
+    """Snapshot of the trainer-TP and draft-DP/SP layout.
 
     Process-group handles are created once by :func:`init_distributed` and
     carried into the trainer.  Re-deriving groups here can change collective

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from transformers import LlamaConfig
 
-from specforge.core.peagle import (
+from specforge.algorithms.peagle.model import (
     OnlinePEagleModel,
     compute_peagle_metrics,
     create_peagle_mask_mod,
@@ -96,7 +96,10 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         def fake_loss(logits, target_p, position_mask):
             return torch.tensor(0.0, device=logits.device)
 
-        with patch("specforge.core.peagle.LogSoftmaxLoss.apply", side_effect=fake_loss):
+        with patch(
+            "specforge.algorithms.peagle.model.LogSoftmaxLoss.apply",
+            side_effect=fake_loss,
+        ):
             _loss, metrics = compute_peagle_metrics(
                 logits=logits,
                 targets=targets,

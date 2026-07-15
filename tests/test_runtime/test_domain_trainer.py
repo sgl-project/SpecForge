@@ -107,12 +107,16 @@ class DomainTrainerWiringTest(unittest.TestCase):
             def ack_train_refs(self, tid, ids, *, global_step, optimizer_durable):
                 dfc_calls.append(("ack", tid, ids, global_step, optimizer_durable))
 
-        spec = SimpleNamespace(
+        algorithm = SimpleNamespace(
             name="eagle3",
-            make_strategy=lambda wrapped, *, target_head: (
-                "STRAT",
-                wrapped,
-                target_head,
+            providers=SimpleNamespace(
+                step=SimpleNamespace(
+                    build=lambda wrapped, *, target_head: (
+                        "STRAT",
+                        wrapped,
+                        target_head,
+                    )
+                )
             ),
         )
         model = SimpleNamespace(draft_model="DRAFT")
@@ -127,7 +131,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
             TrainerController=FakeController,
         ):
             trainer = tr.Trainer(
-                spec=spec,
+                algorithm_name=algorithm.name,
+                make_step_strategy=algorithm.providers.step.build,
                 controller=dfc,
                 store="STORE",
                 ref_source=ref_source,

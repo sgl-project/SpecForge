@@ -10,8 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.runtime.data_plane.disagg_ingest import ingest_offline_features
 from specforge.training.disaggregated import _build_offline
+
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
 
 class _RecordingStore:
@@ -34,6 +37,7 @@ class OfflineMooncakeCleanupTest(unittest.TestCase):
     def _config(self):
         return SimpleNamespace(
             run_id="offline-cleanup",
+            model=SimpleNamespace(input_modality="text"),
             training=SimpleNamespace(
                 role="producer",
                 strategy="eagle3",
@@ -80,6 +84,7 @@ class OfflineMooncakeCleanupTest(unittest.TestCase):
         ):
             run = _build_offline(
                 self._config(),
+                algorithm=ALGORITHM,
                 build_model_bundle=lambda *_args, **_kwargs: None,
                 optimizer_factory=lambda *_args, **_kwargs: None,
                 logger=lambda *_args, **_kwargs: None,
@@ -221,9 +226,6 @@ class OfflineIngestTrackingTest(unittest.TestCase):
             feature_keys=("input_ids",),
             target_repr="hidden_state",
         )
-        spec = SimpleNamespace(
-            make_offline_reader=lambda *_args, **_kwargs: reader,
-        )
         tracked = []
 
         class FailingStore:
@@ -235,10 +237,6 @@ class OfflineIngestTrackingTest(unittest.TestCase):
 
         raw = {"input_ids": SimpleNamespace(numel=lambda: 4)}
         with (
-            patch(
-                "specforge.training.strategies.registry.resolve_strategy",
-                return_value=spec,
-            ),
             patch(
                 "specforge.runtime.data_plane.disagg_ingest.list_feature_files",
                 return_value=["feature-0", "feature-1"],
@@ -252,6 +250,8 @@ class OfflineIngestTrackingTest(unittest.TestCase):
             ingest_offline_features(
                 FailingStore(),
                 "/features",
+                algorithm_name="eagle3",
+                build_reader=lambda *_args, **_kwargs: reader,
                 run_id="partial",
                 on_ref=tracked.append,
             )

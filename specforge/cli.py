@@ -63,16 +63,17 @@ def _validate_world_size(cfg: Config, world_size: int) -> None:
     cfg.validate_world_size(world_size)
 
 
-def _train(cfg: Config) -> int:
+def _train(resolved) -> int:
     from accelerate.utils import set_seed
 
+    cfg = resolved.config
     set_seed(cfg.training.seed)
     if cfg.training.role == "producer":
         # A server-capture/offline-ingest producer owns no trainer process
         # group and must not initialize CUDA merely to publish feature refs.
-        from specforge.training.assembly import build_training_run
+        from specforge.application import build_application_run
 
-        return build_training_run(cfg).run()
+        return build_application_run(resolved).run()
 
     from specforge.distributed import destroy_distributed, init_distributed
 
@@ -88,9 +89,9 @@ def _train(cfg: Config) -> int:
         import torch.distributed as dist
 
         _validate_world_size(cfg, dist.get_world_size())
-        from specforge.training.assembly import build_training_run
+        from specforge.application import build_application_run
 
-        return build_training_run(cfg).run()
+        return build_application_run(resolved).run()
     finally:
         destroy_distributed()
 
@@ -111,7 +112,6 @@ def _config_for_role(cfg: Config, role: str) -> Config:
         # validate or own that stack again.
         disaggregated["managed_local"] = None
     if role == "producer":
-        raw["training"]["metadata_db_path"] = None
         raw["profiling"]["enabled"] = False
     return Config.model_validate(raw)
 
@@ -126,7 +126,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         choices=("auto", "all", "producer", "consumer", "both"),
         default="auto",
         help=(
-            "launch selection (default: local all; single-node disaggregated "
+            "launch selection (default: offline local all or online/disaggregated "
             "producer+consumer)"
         ),
     )
@@ -164,10 +164,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "train":
         cfg = load_config(args.config, args.overrides)
+        from specforge.application import bind_run, resolve_run
         from specforge.launch_plan import build_launch_plan, run_commands
 
+        resolved = resolve_run(cfg)
         plan = build_launch_plan(
-            cfg,
+            resolved.config,
+            algorithm=resolved.algorithm,
             config_path=args.config,
             overrides=args.overrides,
             requested_role=args.role,
@@ -178,7 +181,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         if plan.kind == "worker":
             os.environ.update(plan.worker_env)
-            _train(_config_for_role(cfg, plan.role))
+            role_config = _config_for_role(resolved.config, plan.role)
+            _train(bind_run(role_config, resolved.algorithm))
             return 0
         return run_commands(plan)
     elif args.to == "hf":

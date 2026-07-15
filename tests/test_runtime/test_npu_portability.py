@@ -185,38 +185,6 @@ class NPURNGTest(unittest.TestCase):
         accelerator.set_rng_state.assert_called_once_with(cuda_state, 1)
 
 
-class NPUTargetAssemblyTest(unittest.TestCase):
-    def test_hf_target_uses_the_bound_local_device(self):
-        from specforge.training.assembly import _build_target_engine
-        from specforge.training.strategies.registry import resolve_strategy
-
-        target = mock.Mock()
-        cfg = SimpleNamespace(
-            model=SimpleNamespace(
-                target_model_path="target",
-                target_backend="hf",
-                input_modality="text",
-                trust_remote_code=True,
-                torch_dtype="bfloat16",
-                cache_dir=None,
-            ),
-            training=SimpleNamespace(strategy="dflash"),
-            data=SimpleNamespace(max_length=1024),
-        )
-        with (
-            mock.patch(
-                "specforge.inference.target_engine.get_target_engine",
-                return_value=target,
-            ) as get_engine,
-            mock.patch("specforge.training.assembly._device", return_value="npu:3"),
-        ):
-            result = _build_target_engine(cfg, [1, 2], resolve_strategy("dflash"))
-
-        self.assertIs(result, target)
-        self.assertEqual(get_engine.call_args.kwargs["device"], "npu:3")
-        target.set_capture_layers.assert_called_once_with([1, 2])
-
-
 class NPUEvaluatorTest(unittest.TestCase):
     def test_hccl_collectives_use_the_bound_npu(self):
         from specforge.eval import Evaluator

@@ -18,6 +18,7 @@ from specforge.config.schema import (
     TrainingConfig,
     apply_overrides,
     load_config,
+    migrate_legacy_config,
 )
 
 __all__ = [
@@ -37,4 +38,5 @@ __all__ = [
     "TrainerDeploymentConfig",
     "load_config",
     "apply_overrides",
+    "migrate_legacy_config",
 ]

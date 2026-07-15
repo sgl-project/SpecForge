@@ -21,7 +21,6 @@ class TestPrepareData(unittest.TestCase):
             {
                 "ultrachat",
                 "sharegpt",
-                "allava4v",
                 "opc",
                 "gsm8k",
                 "hendrycks_math",
@@ -29,6 +28,17 @@ class TestPrepareData(unittest.TestCase):
                 "camel",
             }.issubset(dataset_action.choices)
         )
+        self.assertTrue(
+            prepare_data.UNSUPPORTED_VLM_DATASETS.isdisjoint(dataset_action.choices)
+        )
+
+    def test_vlm_presets_are_explicitly_unsupported(self):
+        for dataset_name in prepare_data.UNSUPPORTED_VLM_DATASETS:
+            with (
+                self.subTest(dataset=dataset_name),
+                self.assertRaisesRegex(ValueError, "VLM.*not supported"),
+            ):
+                prepare_data.load_dataset_preset(dataset_name)
 
     def test_parser_restores_eval_split_and_opc_subset(self):
         args = prepare_data.parse_args(
