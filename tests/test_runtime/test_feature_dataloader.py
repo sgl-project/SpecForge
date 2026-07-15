@@ -17,6 +17,10 @@ from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
+from specforge.runtime.data_plane.streaming_ref_channel import (
+    StreamingRefChannel,
+    StreamingRefQueue,
+)
 
 _OFFLINE_EAGLE3_TRANSFORM = partial(process_offline_eagle3_sample, max_len=2048)
 
@@ -36,6 +40,21 @@ class _CountingStore(LocalFeatureStore):
     def get(self, sample_ref, *, device="cpu", names=None):
         self.gets += 1
         return super().get(sample_ref, device=device, names=names)
+
+
+class _AdoptingLocalStore(LocalFeatureStore):
+    """Local cleanup behavior plus Mooncake-style adopt observability."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cleanup_events = []
+
+    def adopt(self, ref):
+        self.cleanup_events.append(("adopt", ref.sample_id))
+
+    def abort(self, sample_id, *, reason="aborted"):
+        self.cleanup_events.append(("abort", sample_id))
+        super().abort(sample_id, reason=reason)
 
 
 class _DurableQueue(SampleRefQueue):
@@ -171,23 +190,90 @@ class TestFeatureDataLoader(unittest.TestCase):
             batches = list(loader)
             self.assertEqual(len(batches), 1)  # 3 samples, drop the trailing 1
 
-    def test_queue_partial_batch_fails_terminally(self):
+    def test_queue_partial_batch_drops_terminally_without_failing_run(self):
         with tempfile.TemporaryDirectory() as d:
-            self._write_offline_files(d, n=3)
-            q = SampleRefQueue()
-            q.put(OfflineManifestReader(d, run_id="run").read())
+            store = _AdoptingLocalStore("st")
+            refs = [
+                store.put(
+                    {"x": torch.tensor([[float(index)]])},
+                    sample_id=f"s{index}",
+                    metadata={"run_id": "run", "target_repr": "hidden_state"},
+                )
+                for index in range(3)
+            ]
+            producer = StreamingRefChannel(os.path.join(d, "refs.jsonl"))
+            producer.publish_many(refs)
+            producer.close()
+            q = StreamingRefQueue(StreamingRefChannel(producer.path))
             loader = FeatureDataLoader(
-                LocalFeatureStore("st"),
+                store,
                 q,
                 batch_size=2,
-                collate_fn=_simple_collate,
-                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
                 drop_last=True,
             )
-            with self.assertRaisesRegex(RuntimeError, "incomplete batch"):
+            batches = list(loader)
+            self.assertEqual(len(batches), 1)
+            self.assertEqual(producer.consumed_remote(), 3)
+            self.assertEqual(store.health()["resident_samples"], 0)
+            self.assertEqual(
+                store.cleanup_events,
+                [("adopt", "s2"), ("abort", "s2")],
+            )
+
+    def test_prefetch_queue_partial_batch_drops_and_closes_cleanly(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = LocalFeatureStore("st")
+            refs = [
+                store.put(
+                    {"x": torch.tensor([[float(index)]])},
+                    sample_id=f"s{index}",
+                    metadata={"run_id": "run", "target_repr": "hidden_state"},
+                )
+                for index in range(3)
+            ]
+            q = _DurableQueue()
+            q.put(refs)
+            loader = FeatureDataLoader(
+                store,
+                q,
+                batch_size=2,
+                drop_last=True,
+                num_workers=1,
+            )
+
+            batches = list(loader)
+            loader.close()
+
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(q.depth(), 0)
+        self.assertEqual(q.in_flight(), 0)
+        self.assertEqual(len(q.failures), 1)
+        self.assertFalse(q.failures[0][2])
+        self.assertEqual(store.health()["resident_samples"], 0)
+        self.assertIsNone(loader._prefetch_state)
+
+    def test_queue_partial_batch_cleanup_failure_stays_loud(self):
+        store = _AdoptingLocalStore("st")
+        ref = store.put(
+            {"x": torch.tensor([[1.0]])},
+            sample_id="s0",
+            metadata={"run_id": "run", "target_repr": "hidden_state"},
+        )
+        q = SampleRefQueue()
+        q.put([ref])
+        loader = FeatureDataLoader(store, q, batch_size=2, drop_last=True)
+
+        with mock.patch.object(
+            store,
+            "abort",
+            side_effect=RuntimeError("injected abort failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cleanup errors"):
                 list(loader)
-            self.assertEqual(q.depth(), 0)
-            self.assertEqual(q.in_flight(), 0)
+
+        self.assertEqual(q.depth(), 0)
+        self.assertEqual(q.in_flight(), 0)
+        self.assertEqual(store.cleanup_events, [("adopt", "s0")])
 
     def test_mixed_target_repr_fails_and_releases_refs(self):
         with tempfile.TemporaryDirectory() as d:

@@ -67,9 +67,9 @@ state is written by rank 0 while every rank writes its own optimizer/RNG state.
 
 Natural end-of-stream is accepted only at an optimizer boundary. If the final
 backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
-gradients or reporting a checkpoint as successful. Queue-mode loaders likewise
-fail a short terminal batch; fixed offline refs keep normal `drop_last`
-semantics.
+gradients or reporting a checkpoint as successful. Queue-mode loaders
+terminally settle and clean a short `drop_last` batch without emitting it;
+fixed offline refs keep normal `drop_last` semantics.
 
 ## Endpoints
 

@@ -19,7 +19,8 @@ single book-keeping authority, not N. Refs are dispatched only in complete
 ``dp_size * refs_per_rank_step`` windows. Each rank receives exactly
 ``refs_per_rank_step = batch_size * accumulation_steps`` refs, so the stream
 cannot end on a partial batch or an unreduced FSDP accumulation step. An
-unaligned end-of-stream fails the attempt after cleaning the undispatched refs.
+unaligned end-of-stream cleans and settles the undispatched tail, then closes
+every rank inbox normally after the aligned prefix.
 
 The consumed counter on the source channel (the producer's backpressure signal)
 mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
@@ -288,6 +289,9 @@ class RefDistributor:
             cleanup_errors = []
             for ref in self._window:
                 try:
+                    adopt = getattr(self.feature_store, "adopt", None)
+                    if callable(adopt):
+                        adopt(ref)
                     self.feature_store.abort(ref.sample_id, reason=reason)
                 except Exception as exc:  # best effort before the loud failure
                     cleanup_errors.append(f"{ref.sample_id}: {exc}")
@@ -295,7 +299,8 @@ class RefDistributor:
             self._window = []
             if cleanup_errors:
                 reason += f"; cleanup errors={cleanup_errors}"
-            raise RuntimeError(reason)
+                raise RuntimeError(reason)
+            logger.warning("ref-distributor: %s; tail settled without dispatch", reason)
         for inbox in self._inboxes:
             inbox.close()
         self.finished = True

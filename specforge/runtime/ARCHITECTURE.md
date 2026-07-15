@@ -108,10 +108,17 @@ watermark is smaller than `quantum`. The canonical CLI reads
 
 `RefDistributor` releases refs only in complete `quantum` windows, giving every
 rank exactly `batch_size * accumulation_steps` refs per optimizer step. If EOF
-leaves a partial window, the attempt fails loudly: those refs are marked
-terminal, their feature-store objects are aborted best-effort, the source
-counter is settled, and failure sentinels poison every inbox. A partial global
-optimizer step is never reported as successful completion.
+leaves a partial window, those refs are marked terminal, adopted for lifecycle
+tracking when required, their feature-store objects are aborted, and the source
+counter is settled. Every inbox then closes normally after the aligned prefix;
+an actual cleanup failure still poisons the inboxes. A partial global optimizer
+step is never dispatched.
+
+The terminal tail remains committed-but-unacknowledged in the attempt's
+metadata ledger even though its feature objects are removed. A successfully
+completed attempt with such a tail must therefore start any later run with a
+fresh ledger; resume of that completed ledger is unsupported until the control
+plane records an explicit terminal-drop state.
 
 Every online producer requires fresh source-channel, store-id, and run-id
 artifacts. A fresh consumer requires a fresh SQLite ledger and rank 0 recreates

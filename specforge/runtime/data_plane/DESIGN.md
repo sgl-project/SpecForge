@@ -121,9 +121,15 @@ channel. The producer's in-flight high watermark must be at least that value;
 `DISAGG_IN_FLIGHT_HIGH_WATERMARK` defaults to `256` in the canonical CLI.
 
 If source EOF arrives with fewer than one full quantum staged, the distributor
-fails those refs non-retryably, aborts their feature-store objects best-effort,
-settles the source counter, and poisons all inboxes with a failure sentinel.
-Ranks never train or silently drop a partial global optimizer window.
+fails those refs non-retryably, adopts and aborts their feature-store objects,
+settles the source counter, and closes every inbox after the aligned prefix.
+Cleanup errors remain loud and poison all inboxes. Ranks never train a partial
+global optimizer window.
+
+Those terminal tail ids remain committed-but-unacknowledged in the attempt's
+metadata ledger after their feature objects are removed. Do not reuse a
+successfully completed ledger containing such a tail for resume; a later
+control-plane terminal-drop state is required before that can be supported.
 
 ## `FeatureDataLoader`
 

@@ -46,9 +46,19 @@ def _inbox_ids(inbox_dir, rank):
 class _AbortStore:
     def __init__(self):
         self.aborted = []
+        self.adopted = []
+
+    def adopt(self, ref):
+        self.adopted.append(ref.sample_id)
 
     def abort(self, sample_id, reason):
         self.aborted.append((sample_id, reason))
+
+
+class _FailingAbortStore(_AbortStore):
+    def abort(self, sample_id, reason):
+        super().abort(sample_id, reason)
+        raise RuntimeError("injected abort failure")
 
 
 class TestRefDistributor(unittest.TestCase):
@@ -73,7 +83,7 @@ class TestRefDistributor(unittest.TestCase):
             **kwargs,
         )
 
-    def test_round_robin_equal_counts_and_unaligned_tail_fails(self):
+    def test_round_robin_equal_counts_and_unaligned_tail_closes_cleanly(self):
         dist = self._distributor(dp_size=2)
         for i in range(7):
             self.producer.publish(_ref(f"s{i}"))
@@ -84,13 +94,13 @@ class TestRefDistributor(unittest.TestCase):
         self.assertFalse(dist.finished)
         self.producer.close()
         dist._run_guarded()
-        self.assertIsInstance(dist.error, RuntimeError)
+        self.assertIsNone(dist.error)
+        self.assertTrue(dist.finished)
         self.assertEqual(dist.stats["dropped"], 1)
         self.assertEqual([item[0] for item in self.feature_store.aborted], ["s6"])
         for rank in range(2):
             reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
-            with self.assertRaisesRegex(RuntimeError, "optimizer window"):
-                reader.is_closed()
+            self.assertTrue(reader.is_closed())
 
     def test_inbox_readers_get_disjoint_shards_via_queue(self):
         dist = self._distributor(dp_size=2)
@@ -295,13 +305,17 @@ class TestRefDistributor(unittest.TestCase):
             self.producer.publish(_ref(f"s{i}"))
         self.producer.close()
         dist._run_guarded()
-        self.assertIsInstance(dist.error, RuntimeError)
+        self.assertIsNone(dist.error)
+        self.assertTrue(dist.finished)
         self.assertEqual(dist.stats["dropped"], 1)
         # the dropped ref's lease is released, not leaked
         self.assertEqual(controller.sample_queue.in_flight(), 2)  # dispatched only
         self.assertEqual(controller.sample_queue.depth(), 0)
         self.assertEqual([item[0] for item in self.feature_store.aborted], ["s2"])
         self.assertEqual(self.producer.consumed_remote(), 1)
+        for rank in range(2):
+            reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            self.assertTrue(reader.is_closed())
 
     def test_dispatches_only_complete_optimizer_step_windows(self):
         dist = self._distributor(dp_size=2, refs_per_rank_step=4)
@@ -310,6 +324,42 @@ class TestRefDistributor(unittest.TestCase):
         _pump_until_quiet(dist)
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"])
         self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"])
+
+    def test_partial_optimizer_quantum_settles_tail_after_aligned_prefix(self):
+        dist = self._distributor(dp_size=2, refs_per_rank_step=4)
+        for i in range(10):
+            self.producer.publish(_ref(f"s{i}"))
+        self.producer.close()
+
+        dist._run_guarded()
+
+        self.assertIsNone(dist.error)
+        self.assertTrue(dist.finished)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"])
+        self.assertEqual(dist.stats["dropped"], 2)
+        self.assertEqual(self.feature_store.adopted, ["s8", "s9"])
+        self.assertEqual(
+            [sample_id for sample_id, _ in self.feature_store.aborted],
+            ["s8", "s9"],
+        )
+        self.assertEqual(self.producer.consumed_remote(), 2)
+
+    def test_partial_window_cleanup_failure_stays_loud(self):
+        self.feature_store = _FailingAbortStore()
+        dist = self._distributor(dp_size=2)
+        self.producer.publish(_ref("s0"))
+        self.producer.close()
+
+        dist._run_guarded()
+
+        self.assertIsInstance(dist.error, RuntimeError)
+        self.assertIn("cleanup errors", str(dist.error))
+        self.assertEqual(self.feature_store.adopted, ["s0"])
+        for rank in range(2):
+            reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            with self.assertRaisesRegex(RuntimeError, "injected abort failure"):
+                reader.is_closed()
 
     def test_distributor_death_poisons_inboxes(self):
         clock = {"t": 0.0}

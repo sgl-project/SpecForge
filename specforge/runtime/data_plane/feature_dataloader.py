@@ -260,6 +260,29 @@ class FeatureDataLoader:
             },
         )
 
+    def _settle_incomplete_queue_batch(self, refs: List[SampleRef]) -> None:
+        """Terminally discard and clean a short ``drop_last`` queue batch."""
+        reason = (
+            "online stream ended with an incomplete batch: "
+            f"received {len(refs)} refs but batch_size={self.batch_size}"
+        )
+        self.queue.fail(refs, reason=reason, retryable=False)
+        cleanup_errors = []
+        for ref in refs:
+            try:
+                # A fresh Mooncake consumer has no put-side bookkeeping for a
+                # never-materialized server ref. Seed it before aborting so the
+                # remote keys are actually removed; local/file stores need no
+                # adoption hook.
+                adopt = getattr(self.store, "adopt", None)
+                if callable(adopt):
+                    adopt(ref)
+                self.store.abort(ref.sample_id, reason=reason)
+            except Exception as exc:  # settle the full tail, then fail loudly
+                cleanup_errors.append(f"{ref.sample_id}: {exc}")
+        if cleanup_errors:
+            raise RuntimeError(f"{reason}; cleanup errors={cleanup_errors}")
+
     def __iter__(self) -> Iterator[TrainBatch]:
         if self._refs is not None:
             yield from self._iter_refs()
@@ -354,12 +377,8 @@ class FeatureDataLoader:
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
-                reason = (
-                    "online stream ended with an incomplete batch: "
-                    f"received {len(refs)} refs but batch_size={self.batch_size}"
-                )
-                self.queue.fail(refs, reason=reason, retryable=False)
-                raise RuntimeError(reason)
+                self._settle_incomplete_queue_batch(refs)
+                return
             try:
                 batch = self._make_batch(refs)
             except Exception as exc:
@@ -421,14 +440,11 @@ class FeatureDataLoader:
                     if state.stop.is_set():
                         return
                     if self.drop_last and len(refs) < self.batch_size:
-                        reason = (
-                            "online stream ended with an incomplete batch: "
-                            f"received {len(refs)} refs but "
-                            f"batch_size={self.batch_size}"
-                        )
-                        self.queue.fail(refs, reason=reason, retryable=False)
-                        state.mark_yielded_or_failed(refs)
-                        put_interruptibly(RuntimeError(reason))
+                        try:
+                            self._settle_incomplete_queue_batch(refs)
+                        finally:
+                            state.mark_yielded_or_failed(refs)
+                        put_interruptibly(eos)
                         return
                     try:
                         batch = self._make_batch(refs)
