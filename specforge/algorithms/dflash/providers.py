@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from functools import partial
 
-from specforge.algorithms.common.defaults import empty_options, empty_resume_contract
+from specforge.algorithms.common.defaults import (
+    empty_options,
+    no_missing_checkpoint_keys,
+)
 from specforge.algorithms.common.dflash_family_data import (
     NORMALIZER_ID,
     build_collator,
@@ -40,6 +43,24 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     from specforge.training.strategies.base import DFlashTrainStrategy
 
     return DFlashTrainStrategy(wrapped_model)
+
+
+def resume_contract(_config, draft_model, training_model):
+    """Persist resolved DFlash architecture, sampling, and loss semantics."""
+
+    return {
+        "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
+        "dflash_target_layer_ids": tuple(
+            int(layer_id) for layer_id in draft_model.target_layer_ids
+        ),
+        "dflash_block_size": int(training_model.block_size),
+        "dflash_mask_token_id": int(training_model.mask_token_id),
+        "dflash_attention_backend": str(training_model.attention_backend),
+        "dflash_num_anchors": int(training_model.num_anchors),
+        "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
+        "dflash_loss_type": str(training_model.loss_type),
+        "dflash_dpace_alpha": float(training_model.dpace_alpha),
+    }
 
 
 def build_draft(config, draft_config):
@@ -129,7 +150,8 @@ def algorithm_providers() -> AlgorithmProviders:
         step=StepProvider(
             build=build_step,
             options=empty_options,
-            resume_contract=empty_resume_contract,
+            resume_contract=resume_contract,
+            allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
             uses_external_target_head=False,
         ),
         model=ModelProvider(

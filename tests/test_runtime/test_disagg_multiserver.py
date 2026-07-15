@@ -101,6 +101,41 @@ def _published_sample_ids(path):
     return [r.sample_id for r in _published_refs(path)]
 
 
+class _FailingPublishChannel(StreamingRefChannel):
+    def __init__(self, path, *, fail_after):
+        super().__init__(path)
+        self.fail_after = fail_after
+
+    def publish(self, ref):
+        if self.published >= self.fail_after:
+            raise OSError(
+                f"injected publish failure after {self.published} durable ref(s)"
+            )
+        super().publish(ref)
+
+
+class _FsyncFailingPublishChannel(StreamingRefChannel):
+    def publish(self, ref):
+        with patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.os.fsync",
+            side_effect=OSError("injected fsync failure"),
+        ):
+            super().publish(ref)
+
+
+class _TrackingMooncakeFeatureStore(MooncakeFeatureStore):
+    def __init__(self, *args, abort_failures=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.abort_calls = []
+        self.abort_failures = set(abort_failures)
+
+    def abort(self, sample_id, *, reason="aborted"):
+        self.abort_calls.append((sample_id, reason))
+        if sample_id in self.abort_failures:
+            raise RuntimeError(f"injected abort failure for {sample_id}")
+        return super().abort(sample_id, reason=reason)
+
+
 class TestMultiServerProducer(unittest.TestCase):
     def _workdir(self):
         return tempfile.mkdtemp(prefix="disagg_multisrv_")
@@ -262,6 +297,114 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertFalse(channel.is_closed())
         self.assertIn("MemoryError", channel.failure())
         self.assertEqual(backend._d, {})
+
+    def test_publish_failure_before_first_ref_aborts_the_whole_captured_batch(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = _TrackingMooncakeFeatureStore(store=backend, store_id="run0")
+        channel = _FailingPublishChannel(
+            os.path.join(self._workdir(), "refs.jsonl"), fail_after=0
+        )
+        _workers, drive = _build(
+            [_adapter(store, stub)], _prompts(3), store, channel, lease=3
+        )
+
+        with self.assertRaisesRegex(OSError, "after 0 durable ref"):
+            drive()
+
+        self.assertEqual(channel.published, 0)
+        self.assertEqual(_published_sample_ids(channel.path), [])
+        self.assertEqual(
+            store.abort_calls,
+            [
+                ("run0:p0", "producer-ref-publication-failed"),
+                ("run0:p1", "producer-ref-publication-failed"),
+                ("run0:p2", "producer-ref-publication-failed"),
+            ],
+        )
+        self.assertEqual(backend._d, {})
+        self.assertIn("OSError", channel.failure())
+
+    def test_partial_publish_aborts_only_the_non_durable_suffix(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = _TrackingMooncakeFeatureStore(store=backend, store_id="run0")
+        channel = _FailingPublishChannel(
+            os.path.join(self._workdir(), "refs.jsonl"), fail_after=1
+        )
+        _workers, drive = _build(
+            [_adapter(store, stub)], _prompts(3), store, channel, lease=3
+        )
+
+        with self.assertRaisesRegex(OSError, "after 1 durable ref"):
+            drive()
+
+        self.assertEqual(_published_sample_ids(channel.path), ["run0:p0"])
+        self.assertEqual(
+            store.abort_calls,
+            [
+                ("run0:p1", "producer-ref-publication-failed"),
+                ("run0:p2", "producer-ref-publication-failed"),
+            ],
+        )
+        self.assertEqual(store.health()["resident_samples"], 1)
+        self.assertTrue(backend._d)
+        self.assertTrue(all("/run0:p0/" in key for key in backend._d))
+
+    def test_fsync_failure_preserves_the_possibly_visible_ref(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = _TrackingMooncakeFeatureStore(store=backend, store_id="run0")
+        channel = _FsyncFailingPublishChannel(
+            os.path.join(self._workdir(), "refs.jsonl")
+        )
+        _workers, drive = _build(
+            [_adapter(store, stub)], _prompts(3), store, channel, lease=3
+        )
+
+        with self.assertRaisesRegex(OSError, "injected fsync failure"):
+            drive()
+
+        self.assertEqual(_published_sample_ids(channel.path), ["run0:p0"])
+        self.assertEqual(
+            store.abort_calls,
+            [
+                ("run0:p1", "producer-ref-publication-failed"),
+                ("run0:p2", "producer-ref-publication-failed"),
+            ],
+        )
+        self.assertEqual(store.health()["resident_samples"], 1)
+        self.assertTrue(all("/run0:p0/" in key for key in backend._d))
+
+    def test_publish_cleanup_failure_keeps_the_primary_error_as_the_cause(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = _TrackingMooncakeFeatureStore(
+            store=backend,
+            store_id="run0",
+            abort_failures={"run0:p1"},
+        )
+        channel = _FailingPublishChannel(
+            os.path.join(self._workdir(), "refs.jsonl"), fail_after=0
+        )
+        _workers, drive = _build(
+            [_adapter(store, stub)], _prompts(2), store, channel, lease=2
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "reference publication failed.*cleanup.*run0:p1",
+        ) as raised:
+            drive()
+
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertEqual(
+            [sample_id for sample_id, _reason in store.abort_calls],
+            ["run0:p0", "run0:p1"],
+        )
+        self.assertIn("injected publish failure", str(raised.exception))
+        self.assertIn("injected abort failure", str(raised.exception))
+        self.assertIn("cleanup", channel.failure())
 
     def test_prompt_epochs_republish_with_unique_sample_ids(self):
         backend = _FakeMooncakeStore()

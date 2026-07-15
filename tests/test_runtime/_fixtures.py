@@ -67,7 +67,7 @@ def init_rank_distributed(
 
     Defaults preserve the world-sized FSDP/DP layout used by the two-rank
     runtime tests. The explicit TP/SP arguments let the numerical parity gate
-    exercise production TP2 x SP2 groups without a second test initializer.
+    exercise production trainer-TP1 x SP2 groups without a second initializer.
     """
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)

@@ -325,15 +325,15 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 self.assertEqual(topology.nproc_per_node, expected_nproc)
                 config.validate_world_size(topology.nnodes * expected_nproc)
 
-    def test_disaggregated_recipes_keep_single_rank_model_parallelism(self):
+    def test_every_recipe_keeps_trainer_tp_at_one(self):
         recipes = _recipes()
         for filename, path in recipes.items():
             with self.subTest(config=filename):
                 config = Config.from_file(str(path))
+                self.assertEqual(config.training.tp_size, 1)
                 if config.deployment.mode != "disaggregated":
                     continue
                 self.assertEqual(config.training.role, "auto")
-                self.assertEqual(config.training.tp_size, 1)
                 self.assertEqual(config.training.sp_ulysses_size, 1)
                 self.assertEqual(config.training.sp_ring_size, 1)
 

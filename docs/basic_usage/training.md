@@ -205,10 +205,10 @@ The unified runtime supports text training in these combinations:
 Unsupported combinations fail explicitly during config validation or run
 assembly. In particular:
 
-- Qwen2.5-VL is temporarily unsupported. Restoring it requires an
-  algorithm-owned SGLang capture provider and a versioned streaming schema for
-  media tensors and M-RoPE metadata. The explicit `model.input_modality` field
-  is retained for that extension;
+- VLM training, including Qwen2.5-VL, is not supported. The unified runtime
+  currently accepts text inputs only;
+- online evaluation is not supported. Evaluation requires precomputed offline
+  features through `data.eval_hidden_states_path`;
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, `fa`, or offline `usp`; P-EAGLE requires
   `flex_attention`; DFlash, Domino, and DSpark accept `eager`, `sdpa`, or
@@ -238,16 +238,15 @@ The launcher creates every process group from the typed run config:
 - Online target TP/EP belongs to each external SGLang capture server, not the
   trainer. Online consumers keep `training.tp_size` and both SP sizes at 1;
   every trainer rank receives a disjoint feature stream.
-- Offline references use the same target-TP/target-DP partition. Each TP group
-  sees the same samples, while different DP groups see disjoint samples.
+- Offline consumers also keep `training.tp_size` at 1. Without USP, every
+  trainer rank receives a disjoint reference shard and participates as data
+  parallelism.
 - EAGLE3 offline can set `training.attention_backend: usp` and choose
   `training.sp_ulysses_size` and `training.sp_ring_size`. Their product must be
-  greater than one, and USP currently uses `training.batch_size: 1`.
-- An online disaggregated consumer reserves every trainer rank for DP. Keep
-  `training.tp_size`, `sp_ulysses_size`, and `sp_ring_size` at one and configure
-  target TP on the external SGLang server.
+  greater than one, USP currently uses `training.batch_size: 1`, and SP peers
+  share one sequence while draft-DP groups receive disjoint references.
 
-The world size must be divisible by both `training.tp_size` and
+The world size must be divisible by
 `training.sp_ulysses_size * training.sp_ring_size`. Use a shared `output_dir`
 for multi-rank checkpoints.
 
@@ -274,22 +273,22 @@ An active partial window is finalized when training stops or fails.
 
 ## Evaluation and best checkpoints
 
-Evaluation is configured through the same YAML:
+Offline evaluation is configured through the same YAML:
 
 ```yaml
 data:
-  train_data_path: ./cache/dataset/train.jsonl
-  eval_data_path: ./cache/dataset/eval.jsonl
+  hidden_states_path: ./cache/hidden_states/train
+  eval_hidden_states_path: ./cache/hidden_states/eval
 
 training:
   eval_interval: 100
 ```
 
-Use `data.eval_hidden_states_path` with a local or disaggregated offline run.
-The evaluation source and `training.eval_interval` must be set together. Online
-evaluation is not yet implemented for the server-only capture path. Offline
-evaluation uses the same feature reader and collator as training and retains
-the final partial batch. Metrics are emitted under `eval/*`.
+The evaluation source and `training.eval_interval` must be set together.
+Online evaluation is not supported; setting `data.eval_data_path` fails config
+validation. Offline evaluation uses the same feature reader and collator as
+training and retains the final partial batch. Metrics are emitted under
+`eval/*`.
 
 The default selection metric is `eval/simulated_acc_len`. An improvement writes
 a complete checkpoint and points `<run_id>-best` at it, even when

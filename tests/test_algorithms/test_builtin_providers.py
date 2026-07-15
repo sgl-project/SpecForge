@@ -9,10 +9,14 @@ from types import SimpleNamespace
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import (
+    MODEL_PROVENANCE_CONTRACT_KEY,
+    OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+    STEP_OPTIONS_CONTRACT_KEY,
     AlgorithmProviders,
     DraftConfigProvider,
     ServerCaptureLayout,
     ServerStreamingProvider,
+    StepRuntimeConfig,
 )
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 
@@ -131,6 +135,179 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 contract.modality for contract in registration.spec.feature_contracts
             }
             self.assertEqual({"text"}, modalities, registration.name)
+
+    def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
+        training = SimpleNamespace(
+            attention_backend="flex_attention",
+            compact_teacher=True,
+            compact_teacher_chunk_size=1024,
+            lambda_base_start=0.75,
+            lambda_base_decay_ratio=0.25,
+        )
+        config = SimpleNamespace(training=training)
+        draft = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=2),
+            layers=[object(), object()],
+            norm_before_residual=True,
+            target_layer_ids=[3, 7],
+            pure_draft_prefix_len=2,
+        )
+        dflash_family = SimpleNamespace(
+            block_size=16,
+            mask_token_id=0,
+            attention_backend="flex_attention",
+            num_anchors=64,
+            loss_decay_gamma=2.0,
+            loss_type="dpace",
+            dpace_alpha=0.4,
+            shift_label=True,
+            dspark_ce_loss_alpha=0.1,
+            dspark_l1_loss_alpha=0.8,
+            dspark_confidence_head_alpha=0.2,
+        )
+        models = {
+            "eagle3": SimpleNamespace(
+                length=7,
+                attention_backend="flex_attention",
+                lk_loss_type="lambda",
+                kl_scale=0.9,
+                kl_decay=0.8,
+            ),
+            "peagle": SimpleNamespace(
+                num_depths=5,
+                down_sample_ratio=0.7,
+                down_sample_ratio_min=0.3,
+                mask_token_id=31,
+            ),
+            "dflash": dflash_family,
+            "domino": dflash_family,
+            "dspark": dflash_family,
+        }
+        expected_keys = {
+            "eagle3": {
+                "eagle3_ttt_length",
+                "eagle3_lk_loss_type",
+                "eagle3_kl_scale",
+                "eagle3_kl_decay",
+                "eagle3_compact_teacher",
+            },
+            "peagle": {
+                "peagle_num_draft_layers",
+                "peagle_num_depths",
+                "peagle_down_sample_ratio",
+                "peagle_mask_token_id",
+            },
+            "dflash": {
+                "dflash_block_size",
+                "dflash_num_anchors",
+                "dflash_loss_type",
+                "dflash_dpace_alpha",
+            },
+            "domino": {
+                "domino_block_size",
+                "domino_shift_label",
+                "domino_pure_draft_prefix_len",
+                "domino_lambda_base_start",
+                "domino_lambda_base_decay_ratio",
+            },
+            "dspark": {
+                "dspark_block_size",
+                "dspark_ce_loss_alpha",
+                "dspark_l1_loss_alpha",
+                "dspark_confidence_head_alpha",
+            },
+        }
+
+        for name in BUILTINS:
+            with self.subTest(algorithm=name):
+                step = self.registry.resolve(name).providers.step
+                contract = step.resume_contract(config, draft, models[name])
+                self.assertTrue(expected_keys[name] <= contract.keys())
+                self.assertTrue(all(key.startswith(f"{name}_") for key in contract))
+
+    def test_step_runtime_config_binds_options_contract_and_missing_key_policy(self):
+        step = self.registry.resolve("eagle3").providers.step
+        draft = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=1),
+            named_parameters=lambda: (),
+            state_dict=lambda: {},
+        )
+        config = SimpleNamespace(
+            training=SimpleNamespace(
+                attention_backend="flex_attention",
+                compact_teacher=False,
+                compact_teacher_chunk_size=None,
+            )
+        )
+        model = SimpleNamespace(
+            length=7,
+            attention_backend="flex_attention",
+            lk_loss_type=None,
+            kl_scale=1.0,
+            kl_decay=1.0,
+        )
+
+        model_provenance = {"target_model": ("reference", "model-id")}
+        runtime = step.bind_runtime(
+            config,
+            draft,
+            model,
+            model_provenance=model_provenance,
+        )
+
+        self.assertIsInstance(runtime, StepRuntimeConfig)
+        self.assertEqual(dict(runtime), step.options(config))
+        self.assertEqual(
+            {
+                key: value
+                for key, value in runtime.resume_contract.items()
+                if key not in {STEP_OPTIONS_CONTRACT_KEY, MODEL_PROVENANCE_CONTRACT_KEY}
+            },
+            step.resume_contract(config, draft, model),
+        )
+        self.assertEqual(
+            runtime.resume_contract[STEP_OPTIONS_CONTRACT_KEY],
+            (
+                ("compact_teacher", False),
+                ("compact_teacher_chunk_size", None),
+            ),
+        )
+        self.assertEqual(
+            runtime.resume_contract[MODEL_PROVENANCE_CONTRACT_KEY],
+            (("target_model", ("reference", "model-id")),),
+        )
+        self.assertEqual(runtime.allowed_missing_checkpoint_keys, frozenset())
+
+    def test_missing_checkpoint_policy_requires_a_runtime_fingerprint(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+        ):
+            StepRuntimeConfig(
+                options={},
+                resume_contract={},
+                allowed_missing_checkpoint_keys={"embed_tokens.weight"},
+            )
+
+    def test_step_options_are_canonical_resume_metadata(self):
+        runtime = StepRuntimeConfig(
+            options={"objective_scale": 0.5},
+            resume_contract={},
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        self.assertEqual(
+            runtime.resume_contract[STEP_OPTIONS_CONTRACT_KEY],
+            (("objective_scale", 0.5),),
+        )
+
+        with self.assertRaisesRegex(ValueError, STEP_OPTIONS_CONTRACT_KEY):
+            StepRuntimeConfig(
+                options={"objective_scale": 0.5},
+                resume_contract={
+                    STEP_OPTIONS_CONTRACT_KEY: (("objective_scale", 1.0),),
+                },
+                allowed_missing_checkpoint_keys=frozenset(),
+            )
 
     def test_streaming_provider_constructs_a_generic_input_adapter(self):
         config = object()

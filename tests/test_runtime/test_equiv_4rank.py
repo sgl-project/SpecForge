@@ -1,8 +1,8 @@
 # coding=utf-8
-"""Four-rank TP2 x SP2/USP parity for the unified Trainer lifecycle.
+"""Four-rank DP2 x SP2/USP parity for the unified Trainer lifecycle.
 
 The distributed leg uses the current offline builder and no-argument
-``Trainer.fit()`` with real TP2, Ulysses-SP2 and world-sized FSDP groups.  Its
+``Trainer.fit()`` with trainer TP1, Ulysses-SP2 and world-sized FSDP groups. Its
 logged boundary loss is compared with the same initial model and samples on the
 canonical full-sequence flex-attention reference.  This replaces the deleted
 legacy-script differential while retaining the scale-out numerical gate.
@@ -59,7 +59,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     fx.init_rank_distributed(
         rank,
         world_size,
-        tp_size=2,
+        tp_size=1,
         sp_ulysses_size=2,
         sp_ring_size=1,
         port=str(port),
@@ -156,7 +156,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             accumulation_steps=2,
             num_epochs=1,
             max_steps=1,
-            tp_size=2,
+            tp_size=1,
             sp_ulysses_size=2,
             sp_ring_size=1,
             use_usp_preprocess=True,
@@ -194,7 +194,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     "requires four CUDA devices and the standard flash-attn USP interfaces",
 )
 class TestEquiv4Rank(unittest.TestCase):
-    def test_tp2_sp2_trainer_loss_matches_full_sequence_reference(self):
+    def test_dp2_sp2_trainer_loss_matches_full_sequence_reference(self):
         import torch.multiprocessing as mp
 
         from tests.utils import get_available_port
@@ -219,9 +219,9 @@ class TestEquiv4Rank(unittest.TestCase):
                 self.assertEqual(result["rank"], rank)
                 self.assertEqual(result["step"], 1)
                 self.assertEqual(result["world_size"], WORLD_SIZE)
-                self.assertEqual(result["tp_size"], 2)
+                self.assertEqual(result["tp_size"], 1)
                 self.assertEqual(result["sp_size"], 2)
-                self.assertEqual(result["tp_group_size"], 2)
+                self.assertEqual(result["tp_group_size"], 1)
                 self.assertEqual(result["draft_sp_group_size"], 2)
                 self.assertTrue(
                     math.isclose(

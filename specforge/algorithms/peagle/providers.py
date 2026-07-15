@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from specforge.algorithms.common.defaults import (
     empty_options,
+    no_missing_checkpoint_keys,
     one_loss_token,
     online_needs_input_tools,
 )
@@ -39,7 +40,9 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(config, draft_model, training_model):
     from specforge.algorithms.model_providers import peagle_resume_contract
 
-    return peagle_resume_contract(config, draft_model, training_model)
+    contract = peagle_resume_contract(config, draft_model, training_model)
+    contract["peagle_attention_backend"] = config.training.attention_backend
+    return contract
 
 
 def build_draft(config, draft_config):
@@ -106,6 +109,7 @@ def algorithm_providers() -> AlgorithmProviders:
             build=build_step,
             options=empty_options,
             resume_contract=resume_contract,
+            allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
             # Server capture stores the target's last hidden state.  The
             # consumer therefore injects a frozen target head before cutover.
             uses_external_target_head=True,

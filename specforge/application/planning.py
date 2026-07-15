@@ -121,11 +121,17 @@ def _validate_algorithm_capabilities(
         )
 
 
-def _validate_server_only_topology(
+def _validate_training_topology(
     cfg: Config,
     mode: FeatureMode,
 ) -> None:
     deployment_mode = cfg.deployment.mode
+    if mode is FeatureMode.OFFLINE and cfg.training.tp_size != 1:
+        raise ValueError(
+            "offline feature consumers do not implement trainer tensor "
+            "parallelism; keep training.tp_size=1 so every non-SP rank "
+            "receives its own data shard"
+        )
     if mode is FeatureMode.STREAMING:
         if deployment_mode != "disaggregated":
             raise ValueError(
@@ -195,7 +201,7 @@ def validate_resolved_run(
     _validate_feature_provider(cfg, algorithm, mode)
     _validate_draft_options(cfg, algorithm)
     _validate_algorithm_capabilities(cfg, algorithm, mode)
-    _validate_server_only_topology(cfg, mode)
+    _validate_training_topology(cfg, mode)
     _validate_vocab_mapping(cfg, algorithm, mode)
 
 

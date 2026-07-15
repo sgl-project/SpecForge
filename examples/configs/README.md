@@ -25,8 +25,7 @@ The filename is the index: `*-online.yaml` performs SGLang server capture while
 training, `*-offline.yaml` consumes precomputed features, and
 `*-disaggregated.yaml` highlights a producer/consumer topology. Every online
 recipe is disaggregated even when its historical filename only says `online`.
-The VLM recipes are intentionally absent until a server-side multimodal capture
-provider is available.
+VLM training is not supported, so the catalog contains text-only recipes.
 
 The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
@@ -130,7 +129,7 @@ should make their training strategy and topology explicit.
 | `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
 | `model.target_backend` | `sglang` | Use `sglang` for every online run. HF/custom online target loading is unsupported; offline feature consumers do not instantiate a target inference backend. |
-| `model.input_modality` | `text` | The provider modality. `qwen2_5_vl` is reserved but currently rejected until its server streaming provider is implemented. |
+| `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the server-only online path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
@@ -149,7 +148,7 @@ should make their training strategy and topology explicit.
 | `model.sglang_enable_torch_compile` | `false` | Enable the SGLang torch-compile path. |
 | `model.sglang_enable_dp_attention` | `false` | Enable SGLang DP attention where supported. Managed-local capture currently rejects it. |
 | `model.sglang_enable_dp_lm_head` | `false` | Enable SGLang DP LM head where supported. Managed-local capture currently rejects it. |
-| `model.sglang_ep_size` | `1` | SGLang expert-parallel size; it must divide and not exceed `training.tp_size`. |
+| `model.sglang_ep_size` | `1` | SGLang expert-parallel size; it must divide and not exceed every managed capture server's `tp_size`. |
 | `model.sglang_max_running_requests` | `null` | Positive SGLang request-concurrency limit. |
 | `model.sglang_max_total_tokens` | `null` | Positive SGLang token-pool limit. |
 
@@ -162,7 +161,7 @@ Exactly one of the first three fields must be non-empty:
 | `data.train_data_path` | `""` | Raw conversation/preformatted JSON or JSONL sent to the online capture producer. |
 | `data.prompts_path` | `""` | Pre-tokenized online JSONL with `input_ids` and `loss_mask`. |
 | `data.hidden_states_path` | `""` | Directory of precomputed offline feature `.ckpt` files. Selecting it makes the run offline. |
-| `data.eval_data_path` | `""` | Online evaluation data; configure it together with a positive `training.eval_interval`. |
+| `data.eval_data_path` | `""` | Reserved migration field. Online evaluation is unsupported; leave it empty. |
 | `data.eval_hidden_states_path` | `""` | Offline evaluation features; configure them together with a positive `training.eval_interval`. |
 | `data.max_length` | `2048` | Maximum token length used by preparation, capture, and training. |
 | `data.chat_template` | `llama3` | Template name used to format conversations and locate assistant loss spans. |
@@ -174,10 +173,9 @@ Exactly one of the first three fields must be non-empty:
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
 
-Evaluation data and `training.eval_interval` must be configured together.
-Online evaluation uses `eval_data_path`; offline evaluation uses
-`eval_hidden_states_path`. Online disaggregated evaluation is not currently
-supported.
+Offline evaluation uses `eval_hidden_states_path`; configure it together with
+`training.eval_interval`. Online evaluation is unsupported, and setting
+`eval_data_path` fails config validation.
 
 ### `training`: optimization, strategy, and parallelism
 
@@ -195,7 +193,7 @@ Common fields:
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
-| `training.tp_size` | `1` | Frozen-target capture TP group. Online disaggregated consumers must keep it at 1 and configure target TP on capture servers. |
+| `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
 | `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
 | `training.dist_timeout` | `10` | Positive distributed-operation timeout in minutes. |
@@ -235,8 +233,8 @@ New recipes must not write the loader-only migration fields
 | `deployment.trainer.master_addr` | `null` | Rendezvous address; required when `nnodes > 1`. |
 | `deployment.trainer.master_port` | `29500` | Rendezvous port. |
 
-The trainer world size is `nnodes * nproc_per_node`. It must be divisible by
-both `training.tp_size` and
+The trainer world size is `nnodes * nproc_per_node`. `training.tp_size` must
+remain 1, and the world size must be divisible by
 `training.sp_ulysses_size * training.sp_ring_size`.
 
 For `deployment.mode: disaggregated`, also write:
@@ -368,6 +366,9 @@ unless tuning throughput or memory pressure.
 
 ### Cross-section checks
 
+- Offline feature consumers require `training.tp_size: 1`. Non-USP ranks each
+  consume a disjoint data shard; USP peers share a sequence within their SP
+  group while draft-DP groups remain disjoint.
 - Online disaggregated runs require `model.target_backend: sglang`,
   `backend: mooncake`, and either `training.max_steps` or
   `training.total_steps`. Every trainer rank is data parallel, so
@@ -378,11 +379,11 @@ unless tuning throughput or memory pressure.
   `sp_ulysses_size * sp_ring_size > 1`. Non-USP runs keep both SP sizes at 1.
 - P-EAGLE reuses the EAGLE3 server feature schema, uses `flex_attention`, and
   requires batch size 1. DSpark is also server-only online.
-- Qwen2.5-VL is temporarily unsupported. The modality field remains in the
-  schema so a future algorithm-owned server provider can restore it without a
-  config migration.
+- VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
+  text inputs only.
 - `training.compact_teacher` is offline text EAGLE3 only.
-- `data.eval_*` and `training.eval_interval` must be configured together.
+- Online evaluation is not supported. Offline `data.eval_hidden_states_path`
+  and `training.eval_interval` must be configured together.
 
 Validate the complete schema and inspect the resolved processes without
 starting a run:

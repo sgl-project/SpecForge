@@ -9,6 +9,7 @@ from specforge.algorithms.common.providers import (
     ServerInputAdapter,
     ServerStreamingProvider,
     StepProvider,
+    StepRuntimeConfig,
     TargetDerivedDraftDefaults,
     make_registration,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "ServerInputAdapter",
     "ServerStreamingProvider",
     "StepProvider",
+    "StepRuntimeConfig",
     "TargetDerivedDraftDefaults",
     "make_registration",
 ]

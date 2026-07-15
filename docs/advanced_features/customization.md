@@ -49,11 +49,9 @@ data:
   max_length: 4096
 ```
 
-The server capture runtime currently accepts text input. The explicit
-`model.input_modality` field remains part of the contract, but
-`qwen2_5_vl` is rejected until an algorithm-owned provider defines how media
-and M-RoPE tensors are serialized through the streaming data plane. Attention
-backends are a closed, strategy-specific set:
+The server capture runtime accepts text input only. VLM training, including
+`qwen2_5_vl`, is not supported. Attention backends are a closed,
+strategy-specific set:
 
 | Strategy | Accepted `training.attention_backend` values |
 | --- | --- |

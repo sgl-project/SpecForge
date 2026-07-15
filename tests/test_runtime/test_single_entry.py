@@ -262,7 +262,11 @@ class TestCliLifecycle(unittest.TestCase):
             {
                 "model": {"target_model_path": "t", "draft_model_config": "d"},
                 "data": {"hidden_states_path": "/features"},
-                "training": {"tp_size": 2},
+                "training": {
+                    "attention_backend": "usp",
+                    "batch_size": 1,
+                    "sp_ulysses_size": 2,
+                },
             }
         )
         _validate_world_size(local, 2)

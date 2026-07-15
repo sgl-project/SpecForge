@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from specforge.algorithms.common.defaults import empty_options, empty_resume_contract
+from specforge.algorithms.common.defaults import (
+    empty_options,
+    no_missing_checkpoint_keys,
+)
 from specforge.algorithms.common.dflash_family_data import build_dspark_collator
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
@@ -30,6 +33,27 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     from specforge.training.strategies.base import DSparkTrainStrategy
 
     return DSparkTrainStrategy(wrapped_model)
+
+
+def resume_contract(_config, draft_model, training_model):
+    """Persist resolved DSpark model, sampling, and objective semantics."""
+
+    return {
+        "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
+        "dspark_target_layer_ids": tuple(
+            int(layer_id) for layer_id in draft_model.target_layer_ids
+        ),
+        "dspark_block_size": int(training_model.block_size),
+        "dspark_mask_token_id": int(training_model.mask_token_id),
+        "dspark_attention_backend": str(training_model.attention_backend),
+        "dspark_num_anchors": int(training_model.num_anchors),
+        "dspark_loss_decay_gamma": training_model.loss_decay_gamma,
+        "dspark_ce_loss_alpha": float(training_model.dspark_ce_loss_alpha),
+        "dspark_l1_loss_alpha": float(training_model.dspark_l1_loss_alpha),
+        "dspark_confidence_head_alpha": float(
+            training_model.dspark_confidence_head_alpha
+        ),
+    }
 
 
 def build_draft(config, draft_config):
@@ -101,7 +125,8 @@ def algorithm_providers() -> AlgorithmProviders:
         step=StepProvider(
             build=build_step,
             options=empty_options,
-            resume_contract=empty_resume_contract,
+            resume_contract=resume_contract,
+            allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
             uses_external_target_head=False,
         ),
         model=ModelProvider(

@@ -11,6 +11,10 @@ def empty_resume_contract(_config, _draft_model, _training_model):
     return {}
 
 
+def no_missing_checkpoint_keys(_config, _draft_model, _training_model):
+    return frozenset()
+
+
 def one_loss_token(_config, _draft_config=None):
     return 1
 
@@ -22,6 +26,7 @@ def online_needs_input_tools(config, _draft_model):
 __all__ = [
     "empty_options",
     "empty_resume_contract",
+    "no_missing_checkpoint_keys",
     "one_loss_token",
     "online_needs_input_tools",
 ]

@@ -164,7 +164,7 @@ class ConfigSchemaTest(unittest.TestCase):
         raw = Config.model_validate(raw_payload)
         self.assertEqual(raw.mode, "online")
 
-    def test_eval_source_and_interval_form_one_mode_matched_pair(self):
+    def test_offline_eval_source_and_interval_form_one_pair(self):
         offline = Config.model_validate(
             {
                 **MINIMAL,
@@ -177,12 +177,6 @@ class ConfigSchemaTest(unittest.TestCase):
         )
         self.assertEqual(offline.data.eval_hidden_states_path, "/eval-features")
         self.assertEqual(offline.training.eval_interval, 10)
-
-        online = _online_payload()
-        online["data"]["eval_data_path"] = "/eval.jsonl"
-        online["training"]["eval_interval"] = 5
-        with self.assertRaisesRegex(ValidationError, "server-only capture path"):
-            Config.model_validate(online)
 
         for data, training in (
             (
@@ -200,43 +194,35 @@ class ConfigSchemaTest(unittest.TestCase):
                         {**MINIMAL, "data": data, "training": training}
                     )
 
-        with self.assertRaisesRegex(ValidationError, "at most one"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "data": {
-                        "hidden_states_path": "/train",
-                        "eval_data_path": "/eval.jsonl",
-                        "eval_hidden_states_path": "/eval-features",
-                    },
-                    "training": {"eval_interval": 2},
-                }
-            )
+    def test_online_evaluation_is_explicitly_unsupported(self):
+        offline_payload = {
+            **MINIMAL,
+            "data": {
+                "hidden_states_path": "/train-features",
+                "eval_data_path": "/eval.jsonl",
+            },
+            "training": {"eval_interval": 2},
+        }
+        online_payload = _online_payload()
+        online_payload["data"]["eval_data_path"] = "/eval.jsonl"
+        online_payload["training"]["eval_interval"] = 2
 
-    def test_eval_mode_must_match_training_and_online_disagg_is_rejected(self):
-        with self.assertRaisesRegex(ValidationError, "online training data source"):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "data": {
-                        "hidden_states_path": "/train-features",
-                        "eval_data_path": "/eval.jsonl",
-                    },
-                    "training": {"eval_interval": 2},
-                }
-            )
+        for mode, payload in (
+            ("offline", offline_payload),
+            ("online", online_payload),
+        ):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    ValidationError, "data.eval_data_path is unsupported"
+                ):
+                    Config.model_validate(payload)
+
+    def test_offline_eval_source_requires_offline_training(self):
         mismatched_online = _online_payload()
         mismatched_online["data"]["eval_hidden_states_path"] = "/eval-features"
         mismatched_online["training"]["eval_interval"] = 2
         with self.assertRaisesRegex(ValidationError, "offline training data source"):
             Config.model_validate(mismatched_online)
-        online = _online_payload("dflash")
-        online["data"]["eval_data_path"] = "/eval.jsonl"
-        online["training"].update(
-            {"role": "consumer", "total_steps": 10, "eval_interval": 2}
-        )
-        with self.assertRaisesRegex(ValidationError, "server-only capture path"):
-            Config.model_validate(online)
 
     def test_local_offline_eagle3_can_derive_vocab_mapping(self):
         missing = copy.deepcopy(MINIMAL)
@@ -528,16 +514,24 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "trainer roles"):
             Config.model_validate(payload)
 
-    def test_local_tp_and_offline_usp_topologies_are_validated(self):
-        tp = Config.model_validate(
+    def test_offline_dp_and_usp_topologies_are_validated(self):
+        with self.assertRaisesRegex(
+            ValidationError, "do not implement trainer tensor parallelism"
+        ):
+            Config.model_validate(
+                {
+                    **MINIMAL,
+                    "training": {"tp_size": 2},
+                }
+            )
+
+        dp = Config.model_validate(
             {
                 **MINIMAL,
-                "training": {"tp_size": 2},
+                "training": {"tp_size": 1},
             }
         )
-        tp.validate_world_size(4)
-        with self.assertRaisesRegex(ValueError, "divisible"):
-            tp.validate_world_size(3)
+        dp.validate_world_size(4)
 
         usp = Config.model_validate(
             {
@@ -550,6 +544,8 @@ class ConfigSchemaTest(unittest.TestCase):
             }
         )
         usp.validate_world_size(2)
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            usp.validate_world_size(3)
         online_usp = _online_payload()
         online_usp["training"].update(
             {"attention_backend": "usp", "sp_ulysses_size": 2}

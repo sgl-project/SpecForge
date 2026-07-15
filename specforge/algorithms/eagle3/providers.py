@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from specforge.algorithms.common.defaults import (
-    empty_resume_contract,
+    no_missing_checkpoint_keys,
     one_loss_token,
     online_needs_input_tools,
 )
@@ -55,6 +55,38 @@ def step_options(config):
     from specforge.algorithms.model_providers import eagle3_strategy_kwargs
 
     return eagle3_strategy_kwargs(config)
+
+
+def resume_contract(config, draft_model, training_model):
+    """Persist every resolved EAGLE3 model/objective setting used by a step."""
+
+    return {
+        "eagle3_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
+        "eagle3_ttt_length": int(training_model.length),
+        "eagle3_attention_backend": str(training_model.attention_backend),
+        "eagle3_lk_loss_type": training_model.lk_loss_type,
+        "eagle3_kl_scale": float(training_model.kl_scale),
+        "eagle3_kl_decay": float(training_model.kl_decay),
+        "eagle3_compact_teacher": bool(config.training.compact_teacher),
+        "eagle3_compact_teacher_chunk_size": (
+            config.training.compact_teacher_chunk_size
+        ),
+    }
+
+
+def allowed_missing_checkpoint_keys(_config, draft_model, _training_model):
+    """Allow only the frozen target-copied embedding omitted by EAGLE3 saves."""
+
+    embedding_parameters = [
+        parameter
+        for name, parameter in draft_model.named_parameters()
+        if "embed" in name.lower()
+    ]
+    if not embedding_parameters or any(
+        parameter.requires_grad for parameter in embedding_parameters
+    ):
+        return no_missing_checkpoint_keys(_config, draft_model, _training_model)
+    return frozenset(key for key in draft_model.state_dict() if "embed" in key.lower())
 
 
 def build_draft(config, draft_config):
@@ -139,7 +171,8 @@ def algorithm_providers() -> AlgorithmProviders:
         step=StepProvider(
             build=build_step,
             options=step_options,
-            resume_contract=empty_resume_contract,
+            resume_contract=resume_contract,
+            allowed_missing_checkpoint_keys=allowed_missing_checkpoint_keys,
             uses_external_target_head=True,
         ),
         model=ModelProvider(

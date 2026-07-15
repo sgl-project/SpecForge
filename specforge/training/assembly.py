@@ -30,7 +30,7 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -50,7 +50,7 @@ class ModelBundle:
     target_vocab_size: int = 0
     draft_vocab_size: int = 0
     capture_layers: Optional[List[int]] = None
-    strategy_kwargs: Dict[str, Any] = field(default_factory=dict)
+    strategy_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -157,15 +157,77 @@ def _load_input_tools(
     return _load_text_tokenizer(cfg)
 
 
-def _strategy_resume_contract(
-    cfg: Config,
-    bundle: ModelBundle,
-    algorithm: AlgorithmRegistration,
-) -> Dict[str, Any]:
-    """Return resolved strategy semantics that a checkpoint must preserve."""
-    return algorithm.providers.step.resume_contract(
-        cfg, bundle.draft_model, bundle.model
+def _model_source_identity(path: Optional[str]):
+    """Return a stable source id with content identity for local artifacts."""
+
+    def file_identity(file_path: str, name: str):
+        size = os.path.getsize(file_path)
+        hasher = hashlib.sha256()
+        # Local paths have no immutable repository revision. Stream every
+        # tracked artifact so replacing a same-size model shard cannot silently
+        # change reconstructed frozen state across resume. Memory stays bounded
+        # even for very large checkpoints.
+        with open(file_path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(16 * 1024 * 1024), b""):
+                hasher.update(chunk)
+        return (name, size, hasher.hexdigest())
+
+    if not path:
+        return None
+    expanded = os.path.abspath(os.path.expanduser(path))
+    if not os.path.exists(expanded):
+        return ("reference", path)
+    if os.path.isfile(expanded):
+        return ("file", expanded, file_identity(expanded, ""))
+
+    tracked_suffixes = (
+        ".bin",
+        ".json",
+        ".pt",
+        ".pth",
+        ".safetensors",
     )
+    files = []
+    for entry in os.scandir(expanded):
+        if not entry.is_file(follow_symlinks=True) or not entry.name.endswith(
+            tracked_suffixes
+        ):
+            continue
+        files.append(file_identity(entry.path, entry.name))
+    return ("directory", expanded, tuple(sorted(files)))
+
+
+def _model_resume_provenance(
+    cfg: Config,
+    draft_config,
+    target_config,
+    *,
+    capture_layers: Optional[List[int]],
+):
+    """Identify every reconstructed frozen model input used after resume."""
+
+    draft_source = cfg.model.draft_model_config or getattr(
+        draft_config,
+        "_name_or_path",
+        None,
+    )
+    return {
+        "target_model": _model_source_identity(cfg.model.target_model_path),
+        "target_revision": getattr(target_config, "_commit_hash", None),
+        "draft_config": _model_source_identity(draft_source),
+        "draft_revision": getattr(draft_config, "_commit_hash", None),
+        "vocab_mapping": _model_source_identity(cfg.model.vocab_mapping_path or None),
+        "embedding_key": cfg.model.embedding_key,
+        "lm_head_key": cfg.model.lm_head_key,
+        "load_target_embedding": cfg.model.load_target_embedding,
+        "capture_layers": (
+            tuple(int(layer_id) for layer_id in capture_layers)
+            if capture_layers is not None
+            else None
+        ),
+        "input_modality": cfg.model.input_modality,
+        "torch_dtype": cfg.model.torch_dtype,
+    }
 
 
 def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:
@@ -212,7 +274,19 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
         capture_layers=parts.capture_layers,
-        strategy_kwargs=algorithm.providers.step.options(cfg),
+        # This mapping also carries the provider-bound checkpoint policy. It is
+        # forwarded unchanged through every trainer-bearing topology.
+        strategy_kwargs=algorithm.providers.step.bind_runtime(
+            cfg,
+            draft_model,
+            parts.model,
+            model_provenance=_model_resume_provenance(
+                cfg,
+                draft_config,
+                target_config,
+                capture_layers=parts.capture_layers,
+            ),
+        ),
     )
 
 

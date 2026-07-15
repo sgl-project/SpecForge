@@ -5,7 +5,12 @@ import unittest
 from unittest import mock
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
-from specforge.launch import _offline_io, _shard_offline_refs
+from specforge.launch import (
+    _offline_io,
+    _shard_offline_refs,
+    build_disagg_offline_runtime,
+    build_offline_runtime,
+)
 
 
 class ParallelTopologyTest(unittest.TestCase):
@@ -65,8 +70,8 @@ class ParallelTopologyTest(unittest.TestCase):
                     dp_size=2,
                 )
                 self.assertEqual(actual, expected)
-                # Repeating a DP rank models the TP peers (or, for the USP
-                # group selection, the SP peers) that must share one order.
+                # Repeating a draft-DP rank models the SP peers that must share
+                # one order for USP sequence sharding.
                 self.assertEqual(
                     actual,
                     _shard_offline_refs(
@@ -85,6 +90,62 @@ class ParallelTopologyTest(unittest.TestCase):
         # Each rank receives three padded refs, but batch_size=2 drops the last
         # ref in each epoch. The two tails cannot form a cross-epoch batch.
         self.assertEqual(sum(map(len, usable_epochs)), 4)
+
+    def test_offline_data_parallel_ranks_receive_disjoint_refs(self):
+        # Validated offline configs keep tp_size=1, so the non-USP DP group is
+        # the complete trainer world and every rank owns a distinct ref shard.
+        refs = list(range(12))
+        rank_shards = [
+            _shard_offline_refs(
+                refs,
+                use_usp_preprocess=False,
+                shuffle=False,
+                dp_rank=rank,
+                dp_size=4,
+            )
+            for rank in range(4)
+        ]
+
+        self.assertEqual(
+            rank_shards,
+            [
+                [0, 4, 8],
+                [1, 5, 9],
+                [2, 6, 10],
+                [3, 7, 11],
+            ],
+        )
+        self.assertEqual(sorted(ref for shard in rank_shards for ref in shard), refs)
+
+    def test_public_offline_builders_reject_trainer_tensor_parallelism(self):
+        with self.assertRaisesRegex(
+            ValueError, "do not implement trainer tensor parallelism"
+        ):
+            build_offline_runtime(
+                algorithm=object(),
+                hidden_states_path="/unused",
+                draft_model=object(),
+                target_head=None,
+                optimizer_factory=object(),
+                run_id="run",
+                output_dir="/unused",
+                tp_size=2,
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "do not implement trainer tensor parallelism"
+        ):
+            build_disagg_offline_runtime(
+                algorithm=object(),
+                feature_store=object(),
+                refs=[],
+                draft_model=object(),
+                target_head=None,
+                optimizer_factory=object(),
+                run_id="run",
+                output_dir="/unused",
+                tp_size=2,
+            )
 
     def test_offline_io_resolves_the_builtin_provider_for_text(self):
         algorithm = builtin_algorithm_registry().resolve("eagle3")

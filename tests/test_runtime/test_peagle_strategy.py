@@ -168,9 +168,12 @@ class TestPEagleStrategy(unittest.TestCase):
         self.assertTrue(model.draft_model.embed_tokens.weight.requires_grad)
 
     def test_resume_contract_records_resolved_model_and_objective_semantics(self):
-        from specforge.training.assembly import ModelBundle, _strategy_resume_contract
-
-        cfg = SimpleNamespace(training=SimpleNamespace(strategy="peagle"))
+        cfg = SimpleNamespace(
+            training=SimpleNamespace(
+                strategy="peagle",
+                attention_backend="flex_attention",
+            )
+        )
         draft_model = SimpleNamespace(
             layers=[object(), object()],
             norm_before_residual=True,
@@ -182,18 +185,10 @@ class TestPEagleStrategy(unittest.TestCase):
             mask_token_id=0,
         )
 
-        contract = _strategy_resume_contract(
-            cfg,
-            ModelBundle(
-                model=model,
-                draft_model=draft_model,
-                draft_config=SimpleNamespace(),
-            ),
-            PEAGLE,
-        )
+        runtime = PEAGLE.providers.step.bind_runtime(cfg, draft_model, model)
 
         self.assertEqual(
-            contract,
+            dict(runtime.resume_contract),
             {
                 "peagle_num_draft_layers": 2,
                 "peagle_norm_before_residual": True,
@@ -201,6 +196,8 @@ class TestPEagleStrategy(unittest.TestCase):
                 "peagle_down_sample_ratio": 0.7,
                 "peagle_down_sample_ratio_min": 0.3,
                 "peagle_mask_token_id": 0,
+                "peagle_attention_backend": "flex_attention",
+                "specforge_step_options": (),
             },
         )
 

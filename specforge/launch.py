@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef
@@ -58,7 +58,7 @@ def _assemble_trainer(
     logger,
     log_interval: int,
     collate_fn,
-    strategy_kwargs: Optional[dict] = None,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
     per_sample_transform=None,
     durable_ack: bool = True,
     resume_from: Optional[str] = None,
@@ -80,7 +80,35 @@ def _assemble_trainer(
     assembly (FSDP wrap, optimizer-after-wrap, per-step strategy, loader, acks)
     shared by every trainer-bearing builder.
     """
+    from specforge.algorithms.common.providers import (
+        MODEL_PROVENANCE_CONTRACT_KEY,
+        StepRuntimeConfig,
+    )
     from specforge.training import Trainer
+
+    if not isinstance(strategy_kwargs, StepRuntimeConfig):
+        if resume_from is not None:
+            raise ValueError(
+                "direct builder resume requires a provider-bound "
+                "StepRuntimeConfig so algorithm options and reconstructed "
+                "frozen state can be validated"
+            )
+        strategy_kwargs = StepRuntimeConfig(
+            options=strategy_kwargs or {},
+            # A plain direct-builder run may train from scratch, but its
+            # checkpoint intentionally cannot be resumed without a provider-
+            # bound runtime contract on the subsequent call.
+            resume_contract={},
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+    elif (
+        resume_from is not None
+        and MODEL_PROVENANCE_CONTRACT_KEY not in strategy_kwargs.resume_contract
+    ):
+        raise ValueError(
+            "direct builder resume requires provider-bound model provenance in "
+            f"the {MODEL_PROVENANCE_CONTRACT_KEY!r} resume contract"
+        )
 
     trainer = Trainer(
         algorithm_name=algorithm.name,
@@ -155,9 +183,9 @@ def _shard_offline_refs(
     """Match ``DistributedSampler`` over metadata-only refs for one epoch.
 
     Draft sequence-parallel peers must see the same sample, while independent
-    draft-DP replicas see disjoint samples.  Without USP, target-TP peers see
-    the same sample and target-DP replicas are sharded.  Padding to an even
-    number of refs keeps every FSDP rank on the same number of collectives. The
+    draft-DP replicas see disjoint samples. Without USP, trainer TP is fixed at
+    one and every rank is a distinct DP replica. Padding to an even number of
+    refs keeps every FSDP rank on the same number of collectives. The
     caller rebuilds this plan with ``seed + epoch`` before applying a resume
     seek, exactly like the legacy ``DistributedSampler.set_epoch`` lifecycle.
     """
@@ -343,6 +371,36 @@ def _normalize_prompt_epochs(prompt_epochs: int) -> int:
     return prompt_epochs
 
 
+def _publish_refs_with_cleanup(
+    *, channel, feature_store, refs: List[SampleRef]
+) -> None:
+    """Publish one captured batch and abort only its untouched suffix on error."""
+
+    transaction = channel.begin_publish(refs)
+    try:
+        transaction.commit()
+    except BaseException as publish_exc:
+        cleanup_errors = []
+        for ref in transaction.unpublished_refs:
+            try:
+                feature_store.abort(
+                    ref.sample_id,
+                    reason="producer-ref-publication-failed",
+                )
+            except Exception as cleanup_exc:
+                cleanup_errors.append(
+                    f"{ref.sample_id}: {type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+        if cleanup_errors:
+            raise RuntimeError(
+                "reference publication failed "
+                f"({type(publish_exc).__name__}: {publish_exc}) and cleanup of "
+                "unpublished server-captured refs also failed: "
+                f"{cleanup_errors}"
+            ) from publish_exc
+        raise
+
+
 def _epoch_online_prompts(prompts, epoch: int, prompt_epochs: int):
     """Build one epoch's prompt tasks without expanding the full run upfront."""
     if prompt_epochs == 1:
@@ -431,6 +489,15 @@ def _assemble_server_rollout_workers(
 # ---------------------------------------------------------------------------
 
 
+def _validate_offline_trainer_tp(tp_size: int) -> None:
+    if tp_size != 1:
+        raise ValueError(
+            "offline feature consumers do not implement trainer tensor "
+            "parallelism; keep tp_size=1 so every non-SP rank receives its "
+            "own data shard"
+        )
+
+
 def build_offline_runtime(
     *,
     algorithm: AlgorithmRegistration,
@@ -461,7 +528,7 @@ def build_offline_runtime(
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
-    strategy_kwargs: Optional[dict] = None,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
 ):
@@ -471,6 +538,7 @@ def build_offline_runtime(
     trainable module as ``.draft_model``. Colocated offline refs are fixed and
     re-iterable, so this path does not allocate a training ledger or ref queue.
     """
+    _validate_offline_trainer_tp(tp_size)
     provider = algorithm.providers.offline_for(modality)
     collate_fn, per_sample_transform = _offline_io(
         algorithm,
@@ -586,7 +654,7 @@ def build_disagg_offline_runtime(
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
-    strategy_kwargs: Optional[dict] = None,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
 ):
@@ -596,6 +664,7 @@ def build_disagg_offline_runtime(
     ``disagg://`` refs its producer published. Same trainer assembly as the
     colocated offline path, so results match within determinism tolerance.
     """
+    _validate_offline_trainer_tp(tp_size)
     collate_fn, per_sample_transform = _offline_io(
         algorithm,
         modality,
@@ -1076,7 +1145,11 @@ def build_disagg_online_producer(
                             if cleanup_errors:
                                 message += f"; cleanup errors={cleanup_errors}"
                             raise MemoryError(message)
-                        channel.publish_many(refs)
+                        _publish_refs_with_cleanup(
+                            channel=channel,
+                            feature_store=feature_store,
+                            refs=refs,
+                        )
                         published_sizes.extend(ref_sizes)
                         state["resident_bytes"] = projected_bytes
                         state["produced"] += len(refs)
@@ -1254,7 +1327,7 @@ def build_disagg_online_consumer(
     metadata_db_path: Optional[str] = None,
     logger=None,
     log_interval: int = 50,
-    strategy_kwargs: Optional[dict] = None,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
     max_checkpoints: int = 0,
     tp_size: int = 1,
     sp_ulysses_size: int = 1,

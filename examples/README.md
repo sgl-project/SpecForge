@@ -40,13 +40,13 @@ disaggregated EAGLE3 requires one explicit shared `model.vocab_mapping_path`.
 
 Online training always uses an external or managed SGLang capture server and
 the disaggregated producer/consumer data plane. Colocated online target loading
-and the HF/custom online backends are intentionally unsupported. Qwen2.5-VL is
-temporarily disabled until a server capture provider defines its media and
-M-RoPE streaming feature schema; `model.input_modality` remains explicit so
-that provider can be added without changing the run-config shape.
+and the HF/custom online backends are intentionally unsupported. Online capture
+is text-only: VLM training, including Qwen2.5-VL, is not supported. Online
+evaluation is also not supported.
 
-The same CLI owns target TP + target-DP, offline DP, and EAGLE3 offline USP.
-Online disaggregated consumers use every trainer rank for DP. The optional
+The same CLI owns offline DP, EAGLE3 offline USP, and managed capture-server
+topology. Trainer `tp_size` remains 1; target TP belongs to SGLang capture
+servers, and non-USP trainer ranks consume disjoint data. The optional
 [`run_online.sh`](./disagg/run_online.sh) and
 [`run_offline.sh`](./disagg/run_offline.sh) scripts are thin single-node
 delegates to `specforge train`. The

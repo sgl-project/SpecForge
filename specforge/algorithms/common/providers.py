@@ -13,7 +13,9 @@ backend, start a server, or construct a transport.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import (
     Any,
     Callable,
@@ -30,6 +32,12 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 Factory = Callable[..., Any]
+
+STEP_OPTIONS_CONTRACT_KEY = "specforge_step_options"
+MODEL_PROVENANCE_CONTRACT_KEY = "specforge_model_provenance"
+OMITTED_STATE_FINGERPRINT_CONTRACT_KEY = (
+    "specforge_omitted_checkpoint_state_fingerprint"
+)
 
 
 @runtime_checkable
@@ -74,6 +82,43 @@ def _factories_are_callable(values: Iterable[tuple[str, object]]) -> None:
     for field_name, value in values:
         if not callable(value):
             raise TypeError(f"{field_name} must be callable")
+
+
+def checkpoint_key_fingerprint(model: Any, keys: Iterable[str]) -> str:
+    """Hash selected state tensors with bounded host memory.
+
+    Providers may intentionally omit reconstructable frozen tensors from a
+    checkpoint. Their values still affect the model, so resume records this
+    fingerprint and rejects a reconstruction from different weights.
+    """
+
+    import torch
+
+    state = model.state_dict()
+    hasher = hashlib.sha256()
+    for key in sorted(keys):
+        if key not in state:
+            raise ValueError(
+                f"cannot fingerprint missing checkpoint-policy key {key!r}"
+            )
+        tensor = state[key]
+        if not torch.is_tensor(tensor):
+            raise TypeError(
+                f"checkpoint-policy key {key!r} is not a tensor: "
+                f"{type(tensor).__name__}"
+            )
+        hasher.update(key.encode("utf-8"))
+        hasher.update(str(tensor.dtype).encode("ascii"))
+        hasher.update(repr(tuple(tensor.shape)).encode("ascii"))
+        flat = tensor.detach().contiguous().view(-1)
+        chunk_elements = max(1, (16 * 1024 * 1024) // flat.element_size())
+        for start in range(0, flat.numel(), chunk_elements):
+            chunk = flat[start : start + chunk_elements].to(
+                device="cpu",
+                copy=True,
+            )
+            hasher.update(memoryview(chunk.view(torch.uint8).numpy()))
+    return hasher.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -134,12 +179,98 @@ class DraftConfigProvider:
 
 
 @dataclass(frozen=True)
+class StepRuntimeConfig(Mapping[str, Any]):
+    """Resolved step options and checkpoint policy for one training run.
+
+    The mapping interface exposes only strategy constructor options, so the
+    existing runtime builders can forward this object through their
+    ``strategy_kwargs`` seam. ``Trainer`` additionally reads the immutable
+    checkpoint metadata carried alongside those options.
+    """
+
+    options: Mapping[str, Any]
+    resume_contract: Mapping[str, Any]
+    allowed_missing_checkpoint_keys: FrozenSet[str]
+
+    def __post_init__(self) -> None:
+        options = dict(self.options)
+        invalid_option_keys = sorted(
+            repr(key) for key in options if not isinstance(key, str) or not key.strip()
+        )
+        if invalid_option_keys:
+            raise ValueError(
+                "step option keys must be non-empty strings, got "
+                f"{invalid_option_keys}"
+            )
+        resume_contract = dict(self.resume_contract)
+        invalid_contract_keys = sorted(
+            repr(key)
+            for key in resume_contract
+            if not isinstance(key, str) or not key.strip()
+        )
+        if invalid_contract_keys:
+            raise ValueError(
+                "resume_contract keys must be non-empty strings, got "
+                f"{invalid_contract_keys}"
+            )
+        expected_options_contract = tuple(
+            (key, options[key]) for key in sorted(options)
+        )
+        recorded_options_contract = resume_contract.setdefault(
+            STEP_OPTIONS_CONTRACT_KEY,
+            expected_options_contract,
+        )
+        if recorded_options_contract != expected_options_contract:
+            raise ValueError(
+                f"{STEP_OPTIONS_CONTRACT_KEY!r} must exactly match the resolved "
+                f"step options: expected {expected_options_contract!r}, got "
+                f"{recorded_options_contract!r}"
+            )
+        allowed_missing = frozenset(self.allowed_missing_checkpoint_keys)
+        invalid_missing_keys = sorted(
+            repr(key)
+            for key in allowed_missing
+            if not isinstance(key, str) or not key.strip()
+        )
+        if invalid_missing_keys:
+            raise ValueError(
+                "allowed missing checkpoint keys must be non-empty strings, got "
+                f"{invalid_missing_keys}"
+            )
+        if (
+            allowed_missing
+            and OMITTED_STATE_FINGERPRINT_CONTRACT_KEY not in resume_contract
+        ):
+            raise ValueError(
+                "allowed missing checkpoint keys require the runtime-owned "
+                f"{OMITTED_STATE_FINGERPRINT_CONTRACT_KEY!r} resume contract"
+            )
+        object.__setattr__(self, "options", MappingProxyType(options))
+        object.__setattr__(
+            self,
+            "resume_contract",
+            MappingProxyType(resume_contract),
+        )
+        object.__setattr__(self, "allowed_missing_checkpoint_keys", allowed_missing)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.options[key]
+
+    def __iter__(self):
+        return iter(self.options)
+
+    def __len__(self) -> int:
+        return len(self.options)
+
+
+@dataclass(frozen=True)
 class StepProvider:
     """Factories and persistence hooks for one algorithm's training step."""
 
     build: Factory
     options: Factory
     resume_contract: Factory
+    allowed_missing_checkpoint_keys: Factory
     uses_external_target_head: bool
 
     def __post_init__(self) -> None:
@@ -148,10 +279,70 @@ class StepProvider:
                 ("build", self.build),
                 ("options", self.options),
                 ("resume_contract", self.resume_contract),
+                (
+                    "allowed_missing_checkpoint_keys",
+                    self.allowed_missing_checkpoint_keys,
+                ),
             )
         )
         if not isinstance(self.uses_external_target_head, bool):
             raise TypeError("uses_external_target_head must be a bool")
+
+    def bind_runtime(
+        self,
+        config: Any,
+        draft_model: Any,
+        training_model: Any,
+        *,
+        model_provenance: Mapping[str, Any] | None = None,
+    ) -> StepRuntimeConfig:
+        """Resolve algorithm checkpoint semantics against the live model."""
+
+        options = self.options(config)
+        if not isinstance(options, Mapping):
+            raise TypeError(
+                "step options must return a mapping, got " f"{type(options).__name__}"
+            )
+        provider_contract = self.resume_contract(config, draft_model, training_model)
+        if not isinstance(provider_contract, Mapping):
+            raise TypeError(
+                "step resume_contract must return a mapping, got "
+                f"{type(provider_contract).__name__}"
+            )
+        resume_contract = dict(provider_contract)
+        reserved = {
+            STEP_OPTIONS_CONTRACT_KEY,
+            MODEL_PROVENANCE_CONTRACT_KEY,
+            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+        } & resume_contract.keys()
+        if reserved:
+            raise ValueError(
+                "provider resume_contract uses runtime-owned fields: "
+                f"{sorted(reserved)}"
+            )
+        resume_contract[STEP_OPTIONS_CONTRACT_KEY] = tuple(
+            (key, options[key]) for key in sorted(options)
+        )
+        if model_provenance is not None:
+            resume_contract[MODEL_PROVENANCE_CONTRACT_KEY] = tuple(
+                (key, model_provenance[key]) for key in sorted(model_provenance)
+            )
+        allowed_missing = frozenset(
+            self.allowed_missing_checkpoint_keys(
+                config,
+                draft_model,
+                training_model,
+            )
+        )
+        if allowed_missing:
+            resume_contract[OMITTED_STATE_FINGERPRINT_CONTRACT_KEY] = (
+                checkpoint_key_fingerprint(draft_model, allowed_missing)
+            )
+        return StepRuntimeConfig(
+            options=options,
+            resume_contract=resume_contract,
+            allowed_missing_checkpoint_keys=allowed_missing,
+        )
 
 
 @dataclass(frozen=True)
@@ -253,9 +444,9 @@ class ServerCaptureLayout:
 class ServerStreamingProvider:
     """Algorithm adapter for externally captured streaming features.
 
-    ``build_input_adapter`` is deliberately modality-neutral.  Text providers
-    can leave it unset; a future VLM registration can inject media/request
-    preparation without changing this interface or the transport runtime.
+    ``build_input_adapter`` is deliberately modality-neutral. Text providers
+    can leave it unset; the current runtime does not support VLM registration
+    or media requests.
     """
 
     modality: str
@@ -453,12 +644,17 @@ def make_registration(
 __all__ = [
     "AlgorithmProviders",
     "DraftConfigProvider",
+    "MODEL_PROVENANCE_CONTRACT_KEY",
     "ModelProvider",
+    "OMITTED_STATE_FINGERPRINT_CONTRACT_KEY",
     "OfflineDataProvider",
+    "STEP_OPTIONS_CONTRACT_KEY",
     "ServerCaptureLayout",
     "ServerInputAdapter",
     "ServerStreamingProvider",
     "StepProvider",
+    "StepRuntimeConfig",
     "TargetDerivedDraftDefaults",
+    "checkpoint_key_fingerprint",
     "make_registration",
 ]

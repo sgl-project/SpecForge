@@ -57,7 +57,7 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             ):
                 Config.model_validate(_online_payload(backend=backend))
 
-    def test_vlm_waits_for_a_server_streaming_provider(self):
+    def test_vlm_is_explicitly_unsupported(self):
         config = Config.model_validate(_online_payload(modality="qwen2_5_vl"))
         self.assertEqual(config.model.input_modality, "qwen2_5_vl")
         with self.assertRaisesRegex(

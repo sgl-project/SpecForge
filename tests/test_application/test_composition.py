@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
+from specforge.algorithms.contracts import FeatureMode
 from specforge.application import resolve_run
+from specforge.application.planning import _validate_training_topology
 from specforge.config import Config, TrainingConfig
 
 
@@ -84,6 +89,16 @@ class ApplicationCompositionTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "no offline feature contract"):
                     resolve_run(config)
 
+    def test_application_planning_defends_offline_data_parallelism(self):
+        config = Config.model_validate(_payload(mode="offline"))
+        invalid_training = config.training.model_copy(update={"tp_size": 2})
+        invalid_config = config.model_copy(update={"training": invalid_training})
+
+        with self.assertRaisesRegex(
+            ValueError, "do not implement trainer tensor parallelism"
+        ):
+            _validate_training_topology(invalid_config, FeatureMode.OFFLINE)
+
     def test_peagle_remains_server_streaming_capable(self):
         resolved = resolve_run(Config.model_validate(_payload("peagle")))
 
@@ -112,6 +127,36 @@ class ApplicationCompositionTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "require model.vocab_mapping_path"):
             resolve_run(Config.model_validate(payload))
+
+    def test_local_model_identity_hashes_large_same_size_artifacts(self):
+        from specforge.training.assembly import _model_source_identity
+
+        with TemporaryDirectory(prefix="model-identity-") as directory:
+            shard = Path(directory) / "model-00001-of-00001.safetensors"
+            with shard.open("wb") as stream:
+                stream.seek(64 * 1024 * 1024)
+                stream.write(b"a")
+            original = _model_source_identity(directory)
+
+            with shard.open("r+b") as stream:
+                stream.seek(-1, 2)
+                stream.write(b"b")
+            changed = _model_source_identity(directory)
+
+        self.assertNotEqual(original, changed)
+
+    def test_model_resume_provenance_records_resolved_capture_layers(self):
+        from specforge.training.assembly import _model_resume_provenance
+
+        config = Config.model_validate(_payload())
+        provenance = _model_resume_provenance(
+            config,
+            SimpleNamespace(_name_or_path="draft.json", _commit_hash="draft-rev"),
+            SimpleNamespace(_commit_hash="target-rev"),
+            capture_layers=[1, 7, 15],
+        )
+
+        self.assertEqual(provenance["capture_layers"], (1, 7, 15))
 
 
 if __name__ == "__main__":

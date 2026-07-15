@@ -52,9 +52,8 @@ class ModelConfig(StrictConfigModel):
     #: transports complete feature records and does not shard target outputs in
     #: the trainer.
     shard_target_output: bool = False
-    #: Input family consumed by the capture provider. Keeping modality explicit
-    #: lets future server providers add VLM schemas without changing the public
-    #: run-config shape.
+    #: Input family consumed by the capture provider. Built-in algorithms support
+    #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
     embedding_key: str = "model.embed_tokens.weight"
@@ -104,7 +103,7 @@ class DataConfig(StrictConfigModel):
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
     hidden_states_path: str = ""
-    #: online evaluation — raw or pre-tokenized records prepared like training.
+    #: Reserved migration field. Online evaluation is unsupported; keep empty.
     eval_data_path: str = ""
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
     eval_hidden_states_path: str = ""
@@ -460,8 +459,8 @@ class TrainingConfig(StrictConfigModel):
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
     )
-    #: Frozen target tensor parallelism and draft sequence-parallel topology.
-    #: All groups are created by the one CLI process lifecycle.
+    #: Trainer tensor parallelism. The unified runtime currently requires one;
+    #: target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
@@ -656,10 +655,6 @@ class Config(StrictConfigModel):
                 "training.role=auto, producer, or consumer"
             )
 
-        eval_sources = [
-            bool(self.data.eval_data_path),
-            bool(self.data.eval_hidden_states_path),
-        ]
         if (
             self.model.draft_checkpoint_path is not None
             and self.training.resume_from is not None
@@ -673,31 +668,22 @@ class Config(StrictConfigModel):
                 "profiling.enabled applies to trainer roles, not a capture-only "
                 "producer"
             )
-        if sum(eval_sources) > 1:
+        if self.data.eval_data_path:
             raise ValueError(
-                "set at most one of data.eval_data_path (online eval) or "
-                "data.eval_hidden_states_path (offline eval)"
+                "data.eval_data_path is unsupported; online evaluation is not "
+                "supported by the server-only capture path"
             )
-        has_eval_source = any(eval_sources)
+        has_eval_source = bool(self.data.eval_hidden_states_path)
         has_eval_interval = self.training.eval_interval > 0
         if has_eval_source != has_eval_interval:
             raise ValueError(
                 "an eval data source and training.eval_interval must be "
                 "configured together"
             )
-        if self.data.eval_data_path and mode != "online":
-            raise ValueError(
-                "data.eval_data_path requires an online training data source"
-            )
         if self.data.eval_hidden_states_path and mode != "offline":
             raise ValueError(
                 "data.eval_hidden_states_path requires an offline training data "
                 "source"
-            )
-        if has_eval_source and mode == "online":
-            raise ValueError(
-                "online evaluation is not yet supported by the server-only "
-                "capture path"
             )
         if (
             not self.training.compact_teacher
@@ -813,6 +799,12 @@ class Config(StrictConfigModel):
         if self.training.attention_backend == "usp":
             if mode != "offline":
                 raise ValueError("USP attention currently requires offline features")
+        if mode == "offline" and self.training.tp_size != 1:
+            raise ValueError(
+                "offline feature consumers do not implement trainer tensor "
+                "parallelism; keep training.tp_size=1 so every non-SP rank "
+                "receives its own data shard"
+            )
         if (
             mode == "online"
             and deployment == "disaggregated"
