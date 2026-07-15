@@ -4,7 +4,7 @@ Every draft model JSON under `configs/` has at least one typed YAML recipe in
 this directory. Run any recipe through the one public training entry:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-online.yaml
+specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
 `model.draft_model_config` may name a local JSON file, a local model directory,
@@ -21,11 +21,11 @@ Multi-process configs self-launch through torch distributed:
 specforge train -c examples/configs/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
-The filename is the index: `*-online.yaml` performs target capture while
-training, `*-offline.yaml` consumes precomputed features, `*-disaggregated.yaml`
-supervises both roles on one trainer node or selects a split role with
-`--role`, and `*-npu.yaml` retains the HF + SDPA Ascend recipes.
-Qwen2.5-VL has both 7B and 32B online recipes and uses the same EAGLE3 trainer.
+The filename is the index: `*-online.yaml` performs SGLang server capture while
+training, `*-offline.yaml` consumes precomputed features, and
+`*-disaggregated.yaml` highlights a producer/consumer topology. Every online
+recipe is disaggregated even when its historical filename only says `online`.
+VLM training is not supported, so the catalog contains text-only recipes.
 
 The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
@@ -55,13 +55,14 @@ errors; YAML files and dotted CLI overrides go through the same validation.
 New checked-in recipes should explicitly set `training.strategy`,
 `deployment.mode`, `deployment.trainer.nnodes`,
 `deployment.trainer.nproc_per_node`, `run_id`, and `output_dir`, even when the
-schema has the same default. A minimal colocated online recipe looks like:
+schema has the same default. A minimal server-only online recipe looks like:
 
 ```yaml
 model:
   target_model_path: Qwen/Qwen3-8B
   draft_model_config: configs/qwen3-8b-eagle3.json
   target_backend: sglang
+  vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
 
 data:
   train_data_path: dataset/sharegpt_train.jsonl
@@ -70,17 +71,26 @@ data:
 
 training:
   strategy: eagle3
+  max_steps: 10000
   batch_size: 1
   learning_rate: 0.0001
 
+run_id: qwen3-8b-eagle3-disaggregated
+output_dir: outputs/qwen3-8b-eagle3-disaggregated
+
 deployment:
-  mode: local_colocated
+  mode: disaggregated
   trainer:
     nnodes: 1
     nproc_per_node: 1
-
-run_id: qwen3-8b-eagle3-online
-output_dir: ./outputs/qwen3-8b-eagle3-online
+  disaggregated:
+    control_dir: outputs/qwen3-8b-eagle3-disaggregated/control
+    consumer_state_dir: outputs/qwen3-8b-eagle3-disaggregated/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
 ```
 
 Paths are resolved from the current working directory. The checked-in recipes
@@ -90,9 +100,8 @@ assume the command runs from the repository root.
 
 | Workflow | Canonical starting point |
 | --- | --- |
-| Colocated online | `qwen3-8b-eagle3-online.yaml` |
 | Colocated offline | `qwen3-8b-eagle3-offline.yaml` |
-| External-service disaggregated online | `qwen3-8b-dflash-disaggregated.yaml` |
+| External-service online | `qwen3-8b-eagle3-disaggregated.yaml` |
 | Managed-local disaggregated online | `qwen3-8b-domino-multiserver-disaggregated.yaml` |
 | Disaggregated offline | `qwen3-8b-eagle3-offline-disaggregated.yaml` |
 
@@ -119,9 +128,9 @@ should make their training strategy and topology explicit.
 | `model.draft_checkpoint_path` | `null` | Weights-only warm start for a new run. Do not combine it with `training.resume_from`. |
 | `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
-| `model.target_backend` | `sglang` | `sglang`, `hf`, or `custom`. Online disaggregated capture requires `sglang`. |
-| `model.input_modality` | `text` | `text` or `qwen2_5_vl`. Qwen2.5-VL currently means colocated online EAGLE3 with raw records. |
-| `model.shard_target_output` | `false` | Return the local target-TP batch partition directly. Supported only by colocated online text EAGLE3 with SGLang. |
+| `model.target_backend` | `sglang` | Use `sglang` for every online run. HF/custom online target loading is unsupported; offline feature consumers do not instantiate a target inference backend. |
+| `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
+| `model.shard_target_output` | `false` | Retained for config migration; leave it false on the server-only online path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
@@ -139,7 +148,7 @@ should make their training strategy and topology explicit.
 | `model.sglang_enable_torch_compile` | `false` | Enable the SGLang torch-compile path. |
 | `model.sglang_enable_dp_attention` | `false` | Enable SGLang DP attention where supported. Managed-local capture currently rejects it. |
 | `model.sglang_enable_dp_lm_head` | `false` | Enable SGLang DP LM head where supported. Managed-local capture currently rejects it. |
-| `model.sglang_ep_size` | `1` | SGLang expert-parallel size; it must divide and not exceed `training.tp_size`. |
+| `model.sglang_ep_size` | `1` | SGLang expert-parallel size; it must divide and not exceed every managed capture server's `tp_size`. |
 | `model.sglang_max_running_requests` | `null` | Positive SGLang request-concurrency limit. |
 | `model.sglang_max_total_tokens` | `null` | Positive SGLang token-pool limit. |
 
@@ -149,10 +158,10 @@ Exactly one of the first three fields must be non-empty:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `data.train_data_path` | `""` | Raw conversation/preformatted JSON or JSONL for online capture. Required for VLM so media can be materialized during rollout. |
+| `data.train_data_path` | `""` | Raw conversation/preformatted JSON or JSONL sent to the online capture producer. |
 | `data.prompts_path` | `""` | Pre-tokenized online JSONL with `input_ids` and `loss_mask`. |
 | `data.hidden_states_path` | `""` | Directory of precomputed offline feature `.ckpt` files. Selecting it makes the run offline. |
-| `data.eval_data_path` | `""` | Online evaluation data; configure it together with a positive `training.eval_interval`. |
+| `data.eval_data_path` | `""` | Reserved migration field. Online evaluation is unsupported; leave it empty. |
 | `data.eval_hidden_states_path` | `""` | Offline evaluation features; configure them together with a positive `training.eval_interval`. |
 | `data.max_length` | `2048` | Maximum token length used by preparation, capture, and training. |
 | `data.chat_template` | `llama3` | Template name used to format conversations and locate assistant loss spans. |
@@ -163,13 +172,10 @@ Exactly one of the first three fields must be non-empty:
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
-| `data.min_pixels` | `50176` | Qwen2.5-VL minimum image area. |
-| `data.max_pixels` | `802816` | Qwen2.5-VL maximum image area; it must be at least `min_pixels`. |
 
-Evaluation data and `training.eval_interval` must be configured together.
-Online evaluation uses `eval_data_path`; offline evaluation uses
-`eval_hidden_states_path`. Online disaggregated evaluation is not currently
-supported.
+Offline evaluation uses `eval_hidden_states_path`; configure it together with
+`training.eval_interval`. Online evaluation is unsupported, and setting
+`eval_data_path` fails config validation.
 
 ### `training`: optimization, strategy, and parallelism
 
@@ -187,7 +193,7 @@ Common fields:
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
-| `training.tp_size` | `1` | Frozen-target capture TP group. Online disaggregated consumers must keep it at 1 and configure target TP on capture servers. |
+| `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
 | `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
 | `training.dist_timeout` | `10` | Positive distributed-operation timeout in minutes. |
@@ -198,6 +204,7 @@ Common fields:
 | `training.resume_from` | `null` | Full-run checkpoint/run root: draft, optimizer/scheduler, counters, data position, and RNG. Mutually exclusive with `model.draft_checkpoint_path`. |
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
+| `training.role` | `all` | Use `all` for local offline training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 
 Strategy-specific fields should be written only when tuning that objective:
@@ -209,15 +216,15 @@ Strategy-specific fields should be written only when tuning that objective:
 | DSpark | `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), `training.dspark_confidence_head_alpha` (`1.0`) |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 
-New recipes must not write the retained migration fields
-`training.deployment_mode`, `training.role`, `training.server_urls`, or
+New recipes must not write the loader-only migration fields
+`training.deployment_mode`, `training.server_urls`, or
 `training.metadata_db_path`; use the typed `deployment.*` surface below.
 
 ### `deployment`: process and service topology
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `deployment.mode` | legacy-compatible `null` | Set `local_colocated` or `disaggregated` explicitly in every new recipe. |
+| `deployment.mode` | `local_colocated` | Set `local_colocated` or `disaggregated` explicitly in every new recipe. |
 | `deployment.trainer` | default object | Trainer process topology described by the fields below. |
 | `deployment.disaggregated` | `null` | Required object only when `deployment.mode: disaggregated`. |
 | `deployment.trainer.nnodes` | `1` | Number of trainer nodes. |
@@ -226,8 +233,8 @@ New recipes must not write the retained migration fields
 | `deployment.trainer.master_addr` | `null` | Rendezvous address; required when `nnodes > 1`. |
 | `deployment.trainer.master_port` | `29500` | Rendezvous port. |
 
-The trainer world size is `nnodes * nproc_per_node`. It must be divisible by
-both `training.tp_size` and
+The trainer world size is `nnodes * nproc_per_node`. `training.tp_size` must
+remain 1, and the world size must be divisible by
 `training.sp_ulysses_size * training.sp_ring_size`.
 
 For `deployment.mode: disaggregated`, also write:
@@ -359,6 +366,9 @@ unless tuning throughput or memory pressure.
 
 ### Cross-section checks
 
+- Offline feature consumers require `training.tp_size: 1`. Non-USP ranks each
+  consume a disjoint data shard; USP peers share a sequence within their SP
+  group while draft-DP groups remain disjoint.
 - Online disaggregated runs require `model.target_backend: sglang`,
   `backend: mooncake`, and either `training.max_steps` or
   `training.total_steps`. Every trainer rank is data parallel, so
@@ -367,12 +377,13 @@ unless tuning throughput or memory pressure.
   server.
 - USP is offline EAGLE3 only, requires `training.batch_size: 1`, and requires
   `sp_ulysses_size * sp_ring_size > 1`. Non-USP runs keep both SP sizes at 1.
-- P-EAGLE is colocated online only, uses `flex_attention`, and requires batch
-  size 1. DSpark is disaggregated online only.
-- Qwen2.5-VL is colocated online EAGLE3, uses raw `data.train_data_path`, and
-  does not support USP or sharded target output.
+- P-EAGLE reuses the EAGLE3 server feature schema, uses `flex_attention`, and
+  requires batch size 1. DSpark is also server-only online.
+- VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
+  text inputs only.
 - `training.compact_teacher` is offline text EAGLE3 only.
-- `data.eval_*` and `training.eval_interval` must be configured together.
+- Online evaluation is not supported. Offline `data.eval_hidden_states_path`
+  and `training.eval_interval` must be configured together.
 
 Validate the complete schema and inspect the resolved processes without
 starting a run:
@@ -395,38 +406,29 @@ For deeper lifecycle and recovery semantics, see the
 
 ## Capability matrix
 
-| Strategy | Colocated online | Offline features | Disaggregated online | Disaggregated offline |
-| --- | --- | --- | --- | --- |
-| EAGLE3 | target TP + target-DP | DP + USP | consumer DP | consumer DP |
-| DFlash | SGLang target TP + target-DP; HF replicas + batch partition | DP | consumer DP | consumer DP |
-| Domino | SGLang target TP + target-DP; HF replicas + batch partition | DP | consumer DP | consumer DP |
-| DSpark | No | No | consumer DP | No |
-| P-EAGLE | batch size 1 | No | No | No |
-
-Target TP in the DFlash and Domino rows is SGLang-only. With
-`model.target_backend: hf`, every rank loads a complete target replica;
-`training.tp_size` coordinates the shared capture batch and each rank's local
-batch partition but does not shard target weights.
-
-Qwen2.5-VL 7B and 32B remain supported through colocated online EAGLE3. The
-32B recipe sets `training.tp_size: 4`; VLM captures the full target batch and
-partitions it locally rather than using `model.shard_target_output`.
+| Strategy | SGLang server online | Local offline | Disaggregated offline |
+| --- | --- | --- | --- |
+| EAGLE3 | consumer DP | DP + USP | consumer DP |
+| DFlash | consumer DP | DP | consumer DP |
+| Domino | consumer DP | DP | consumer DP |
+| DSpark | consumer DP | No | No |
+| P-EAGLE | consumer DP, batch size 1 | No | No |
 
 `qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the
 shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective
 selection inside the unified trainer, not another training entry.
 
-Evaluation is enabled by pairing `training.eval_interval` with
-`data.eval_data_path` for colocated online training or
-`data.eval_hidden_states_path` for offline training. Best checkpoints are
+Evaluation is currently offline-only and pairs `training.eval_interval` with
+`data.eval_hidden_states_path`. Best checkpoints are
 linked as `<run_id>-best`. Offline text EAGLE3 may enable
 `training.compact_teacher`; `tracking.report_to` selects `none`, W&B,
 TensorBoard, SwanLab, or MLflow.
 
 ## Ascend NPU launch
 
-Install a vendor-matched PyTorch and `torch_npu` first. The `*-npu.yaml`
-recipes use HF target capture and SDPA. For example:
+Install vendor-matched PyTorch, `torch_npu`, Mooncake, and an NPU-compatible
+SGLang capture server first. The `*-npu.yaml` consumers use SDPA while target
+capture remains outside the trainer. For example:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
@@ -441,7 +443,7 @@ The unified launcher provides rank/world/rendezvous variables and the runtime
 selects HCCL when `torch_npu` is active. For AMD GPUs, install
 `requirements-rocm.txt`; HF + SDPA is the portable ROCm starting point.
 
-Colocated online/offline and disaggregated offline resume are supported.
+Local offline and disaggregated offline resume are supported.
 Disaggregated online recovery resumes only the consumer against retained
 control/data-plane state; capture producers always start a fresh attempt.
 
@@ -467,8 +469,7 @@ Migration notes:
 - The former Qwen3-235B shell accidentally launched Qwen3-Next-80B; the two now
   have separate recipes.
 - Qwen3-Next online EAGLE3 retains its batch size of two. P-EAGLE requires
-  batch size one; the current VLM recipes keep batch size one as a conservative
-  default, while the unified VLM collator also supports larger padded batches.
+  batch size one.
 - The old Qwen3.5-35B offline shell had its training command commented out. The
   YAML records that intended offline trainer configuration after feature
   preparation.

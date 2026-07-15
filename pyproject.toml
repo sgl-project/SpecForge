@@ -13,7 +13,6 @@ urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
 dependencies = [
     "torch==2.11.0",
     "transformers==5.8.1",
-    "qwen-vl-utils==0.0.11",
     "datasets",
     "tqdm",
     "accelerate",

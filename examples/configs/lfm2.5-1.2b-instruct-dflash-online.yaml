@@ -13,6 +13,7 @@ data:
 training:
   strategy: "dflash"
   num_epochs: 6
+  max_steps: 10000
   batch_size: 2
   accumulation_steps: 2
   learning_rate: 0.0006
@@ -33,7 +34,16 @@ run_id: "lfm2.5-1.2b-instruct-dflash-online"
 output_dir: "./outputs/lfm2.5-1.2b-instruct-dflash-online"
 
 deployment:
-  mode: local_colocated
+  mode: disaggregated
   trainer:
     nnodes: 1
     nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/lfm2.5-1.2b-instruct-dflash-online/control
+    consumer_state_dir: outputs/lfm2.5-1.2b-instruct-dflash-online/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

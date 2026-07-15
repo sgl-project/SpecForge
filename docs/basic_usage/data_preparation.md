@@ -6,14 +6,16 @@ Data is an important aspect of speculative decoding as the quality of the datase
 
 ## ☁️ Canonical Dataset Presets
 
-`scripts/prepare_data.py --dataset NAME` exposes the same 21 conversion presets
+`scripts/prepare_data.py --dataset NAME` exposes the same 19 text presets
 used by the checked-in recipes:
 
 | Family | Presets |
 | --- | --- |
 | General chat | `ultrachat`, `sharegpt`, `eaglechat`, `perfectblend`, `perfectblend-llama3.1-8b-instruct`, `perfectblend-llama3.3-70b-instruct`, `perfectblend-llama4-scout-instruct`, `perfectblend-llama4-maverick-instruct`, `magpie-qwen2.5-pro-1m-v0.1`, `nebius-llama31-8b-infinity-instruct` |
-| Vision-language | `allava4v`; `sharegpt4v` is recognized but fails with an explicit instruction to use `allava4v` because its image downloader is not supported |
 | Reasoning, math, and code | `opc`, `gsm8k`, `hendrycks_math`, `math_qa`, `codealpaca-20k`, `opencodeinstruct`, `magicoder-evol-instruct`, `sciq`, `camel` |
+
+VLM data preparation and training, including ALLaVA and ShareGPT4V, are not
+supported.
 
 Every successful preset writes the same stable `id` + `conversations` JSONL
 contract. Use `--split-eval` to create a deterministic 95/5 train/eval split;
@@ -245,12 +247,12 @@ to create the text. SpecForge uses it to identify assistant spans and build the
 loss mask.
 
 ```bash
-# After copying an online example YAML, set these data fields:
+# After copying a disaggregated online example YAML, set these data fields:
 # data:
 #   train_data_path: ./your_preformatted_dataset.jsonl
 #   is_preformatted: true
 #   chat_template: llama3
-specforge train --config ./my-eagle3-online.yaml
+specforge train --config ./my-eagle3-disaggregated.yaml
 ```
 
 For offline training, you can also use `--is-preformatted` when generating hidden states:

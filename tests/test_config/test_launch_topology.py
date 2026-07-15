@@ -31,8 +31,6 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen2.5-0.5b-eagle3-online.yaml": 1,
     "qwen2.5-7b-eagle3-offline.yaml": 1,
     "qwen2.5-7b-eagle3-offline-disaggregated.yaml": 1,
-    "qwen2.5-vl-32b-eagle3-online.yaml": 4,
-    "qwen2.5-vl-7b-eagle3-online.yaml": 1,
     "qwen3-235b-a22b-eagle3-online.yaml": 8,
     "qwen3-30b-a3b-eagle3-online.yaml": 4,
     "qwen3-32b-eagle3-online.yaml": 4,
@@ -50,8 +48,8 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-8b-dta-online.yaml": 8,
     "qwen3-8b-eagle3-offline-disaggregated.yaml": 1,
     "qwen3-8b-eagle3-offline.yaml": 1,
-    "qwen3-8b-eagle3-online.yaml": 1,
-    "qwen3-8b-peagle-online.yaml": 1,
+    "qwen3-8b-eagle3-disaggregated.yaml": 1,
+    "qwen3-8b-peagle-disaggregated.yaml": 1,
     "qwen3-coder-30b-a3b-eagle3-online.yaml": 4,
     "qwen3-coder-480b-a35b-eagle3-offline.yaml": 8,
     "qwen3-coder-480b-a35b-eagle3-online.yaml": 8,
@@ -188,6 +186,20 @@ EXPECTED_DISAGGREGATED = {
         "backend": "shared_dir",
         "store_root": ("outputs/qwen3-8b-eagle3-offline-disaggregated/features"),
     },
+    "qwen3-8b-eagle3-disaggregated.yaml": {
+        "control_dir": "outputs/qwen3-8b-eagle3-disaggregated/control",
+        "consumer_state_dir": ("outputs/qwen3-8b-eagle3-disaggregated/consumer-state"),
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+    },
+    "qwen3-8b-peagle-disaggregated.yaml": {
+        "control_dir": "outputs/qwen3-8b-peagle-disaggregated/control",
+        "consumer_state_dir": ("outputs/qwen3-8b-peagle-disaggregated/consumer-state"),
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+    },
     "qwen3.6-27b-dflash-disaggregated.yaml": {
         "control_dir": "outputs/qwen3.6-27b-dflash-disaggregated/control",
         "backend": "mooncake",
@@ -254,20 +266,27 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 57)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 55)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
             with self.subTest(config=filename):
                 payload = yaml.safe_load(recipes[filename].read_text())
                 training = payload["training"]
-                self.assertNotIn("deployment_mode", training)
+                for legacy_field in (
+                    "deployment_mode",
+                    "server_urls",
+                    "metadata_db_path",
+                ):
+                    self.assertNotIn(legacy_field, training)
                 self.assertNotIn("role", training)
 
                 deployment = payload["deployment"]
+                data = payload["data"]
+                online = bool(data.get("train_data_path") or data.get("prompts_path"))
                 expected_mode = (
                     "disaggregated"
-                    if filename in EXPECTED_DISAGGREGATED
+                    if online or filename in EXPECTED_DISAGGREGATED
                     else "local_colocated"
                 )
                 self.assertEqual(deployment["mode"], expected_mode)
@@ -277,11 +296,22 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 )
 
                 expected_keys = {"mode", "trainer"}
-                if filename in EXPECTED_DISAGGREGATED:
+                if expected_mode == "disaggregated":
                     expected_keys.add("disaggregated")
+                if filename in EXPECTED_DISAGGREGATED:
                     self.assertEqual(
                         deployment["disaggregated"],
                         EXPECTED_DISAGGREGATED[filename],
+                    )
+                elif online:
+                    services = deployment["disaggregated"]
+                    self.assertEqual(services["backend"], "mooncake")
+                    self.assertTrue(services.get("server_urls"))
+                    self.assertTrue(services.get("consumer_state_dir"))
+                    self.assertEqual(payload["model"]["target_backend"], "sglang")
+                    self.assertTrue(
+                        payload["training"].get("max_steps")
+                        or payload["training"].get("total_steps")
                     )
                 self.assertEqual(set(deployment), expected_keys)
 
@@ -295,13 +325,15 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 self.assertEqual(topology.nproc_per_node, expected_nproc)
                 config.validate_world_size(topology.nnodes * expected_nproc)
 
-    def test_disaggregated_recipes_keep_single_rank_model_parallelism(self):
+    def test_every_recipe_keeps_trainer_tp_at_one(self):
         recipes = _recipes()
-        for filename in EXPECTED_DISAGGREGATED:
+        for filename, path in recipes.items():
             with self.subTest(config=filename):
-                config = Config.from_file(str(recipes[filename]))
-                self.assertEqual(config.training.role, "auto")
+                config = Config.from_file(str(path))
                 self.assertEqual(config.training.tp_size, 1)
+                if config.deployment.mode != "disaggregated":
+                    continue
+                self.assertEqual(config.training.role, "auto")
                 self.assertEqual(config.training.sp_ulysses_size, 1)
                 self.assertEqual(config.training.sp_ring_size, 1)
 

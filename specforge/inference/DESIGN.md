@@ -1,53 +1,54 @@
-# Inference Plane Design (`specforge.inference`)
+# Inference plane design (`specforge.inference`)
 
-This is the design note for the **inference**, scoped to this plane.
-The cross-plane picture (whole-system map, endpoint reference, autonomy) lives in
-[`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md); the shared records
-every plane exchanges are in
-[`../runtime/contracts.py`](../runtime/contracts.py).
+The inference plane is an external-server transport boundary. Online training
+does not load or execute a target model in a trainer or producer process.
 
 ## Responsibility
 
-The rollout/inference plane turns leased PromptTasks into per-sample feature tensors and commits only their typed SampleRef metadata to the controller — it never hands a tensor to the controller. It owns the clean boundary to the target engine (a `TargetEngine` via its generic `capture()`; the sglang-version glue lives behind `SGLangCaptureBackend`), the only place target→draft projection/pruning happens, and the loud pre-write validation (`verify_capture` against a typed `CaptureConfig`) that converts layer/name/width/target-dim mismatches into immediate, localized errors at the extraction boundary instead of downstream trainer bugs.
+`SGLangServerCaptureAdapter` sends model inputs and capture metadata to a
+patched SGLang server. The server performs prefill and writes captured tensors
+directly to Mooncake. Its response contains only sample ids and feature
+key/shape/dtype metadata. The adapter validates those feature specifications,
+adopts the server-written objects into the producer store, and returns
+`SampleRef`s for `RolloutWorker` to commit.
 
-## Internal mechanics
+Algorithm registrations own the requested capture layout, target
+representation, collator, and optional modality-specific `ServerInputAdapter`.
+The transport owns sampling and capture metadata. This keeps target execution,
+algorithm policy, and deployment wiring separate.
 
 ```mermaid
-flowchart TD
-  classDef compute fill:#e6f6ea,stroke:#3bb061,color:#0b4a22;
-  classDef control fill:#e8f0fe,stroke:#3b6fd6,color:#0b2e6b;
-  classDef data fill:#fdeede,stroke:#d6893b,color:#6b3a0b;
-
-  A[lease_prompt_tasks] --> B[generate_features per batch]
-  B --> C[PolicyFeatureAdapter group by len single forward]
-  C --> D[TargetEngine.capture]
-  D --> E[_project_target logits or pruned_logits]
-  E --> F[verify_capture vs CaptureConfig]
-  F -->|mismatch| G[fail_prompt_tasks non retryable]
-  F -->|ok| H[FeatureStore put]
-  H -->|put error| I[abort then fail retryable]
-  H -->|ok| J[append SampleRef]
-  J --> K[commit_samples metadata only]
-
-  class A,K control;
-  class B,C,D,E,F,J compute;
-  class H,I data;
-  class G control;
+flowchart LR
+  P["PromptTask lease"] --> I["ServerInputAdapter inputs"]
+  I --> A["SGLangServerCaptureAdapter"]
+  A --> S["patched SGLang /generate"]
+  S --> M["Mooncake tensor writes"]
+  S --> V["feature metadata response"]
+  V --> C["verify_capture_specs"]
+  C --> R["adopt SampleRef"]
+  R --> W["RolloutWorker commit"]
 ```
 
-The rollout plane turns leased `PromptTask`s into per-sample feature tensors and commits only their typed `SampleRef` metadata — it never hands a tensor to the controller. `RolloutWorker.run_once` is the core loop: lease up to `max_tasks`, call `feature_source.generate_features(tasks, capture=...)` once for the whole batch, enforce a strict `len(feats)==len(tasks)` contract, then per sample pop the out-of-band `__aux_layer_ids__`, run `verify_capture`, and on success `FeatureStore.put` (tensors go straight to the data plane). Every leased task ends in exactly one terminal controller action — `commit_samples` on success or `fail_prompt_tasks` on generate failure / wrong count / contract mismatch / put failure — with `sample_id = f"{run_id}:{task.task_id}"` deterministic and a put exception triggering `abort`. `CaptureConfig` is a frozen, strategy-derived contract carrying `feature_names`, `aux_hidden_state_layer_ids`, `target_repr`, and the derived `expected_aux_width` / `expected_target_dim()`. `verify_capture` is the loud pre-`put` validator: it checks name presence, aux-layer-id equality, aux last-dim width, and target last-dim, gating `pruned_logits` on a non-None `vocab_map_version`, raising `CaptureMismatchError` at the boundary. `PolicyFeatureAdapter` is the one runtime adapter: each strategy's `FeatureSchema` selects the emitted tensors while the adapter remains backend- and algorithm-neutral. It is also the only place target-to-draft projection happens (`_project_target`: passthrough for `logits`, `t2d` indexing for `pruned_logits`). Equal-length tasks share one padding-free `TargetEngine.capture` forward, which returns a typed `TargetCaptureBatch`; the adapter slices its rows back into task order.
+`RolloutWorker` treats this adapter as a `RefSource`: it leases tasks, calls
+`produce_refs`, and commits only metadata. Per-task server failures remain
+retryable without failing successful tasks from the same batch. Tensors never
+pass through the controller or the producer process.
+
+## Offline capture
+
+The separate `specforge.offline_capture` package is used only by
+`scripts/prepare_hidden_states.py`. It contains the version-pinned local SGLang
+internals needed to generate precomputed EAGLE3 features. It is not imported by
+online application or training assembly.
 
 ## Endpoints
 
-### What this plane calls into
-
 | From | Endpoint | Plane |
 |---|---|---|
-| `RolloutWorker` | `DataFlowController.register_rollout_worker` | control |
 | `RolloutWorker` | `DataFlowController.lease_prompt_tasks` | control |
-| `RolloutWorker` | `PolicyFeatureAdapter.generate_features` | compute |
-| `PolicyFeatureAdapter` | `TargetEngine.capture` (→ `SGLangCaptureBackend`) | compute |
-| `RolloutWorker` | `FeatureStore.put` | data |
-| `RolloutWorker` | `FeatureStore.abort` | data |
+| `RolloutWorker` | `SGLangServerCaptureAdapter.produce_refs` | inference |
+| `SGLangServerCaptureAdapter` | patched SGLang `/generate` | external compute |
+| patched SGLang | Mooncake feature keys | data |
+| `SGLangServerCaptureAdapter` | `MooncakeFeatureStore.adopt` | data |
 | `RolloutWorker` | `DataFlowController.commit_samples` | control |
-| `RolloutWorker` | `DataFlowController.fail_prompt_tasks` | control |
+| producer | `StreamingRefChannel.publish` | data |

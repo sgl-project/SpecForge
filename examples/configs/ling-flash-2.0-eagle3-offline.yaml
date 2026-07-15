@@ -19,7 +19,7 @@ training:
   max_grad_norm: 0.5
   ttt_length: 7
   attention_backend: "flex_attention"
-  tp_size: 8
+  tp_size: 1
   save_interval: 1000
   log_interval: 50
   dist_timeout: 20

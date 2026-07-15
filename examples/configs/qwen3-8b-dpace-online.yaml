@@ -15,6 +15,7 @@ data:
 training:
   strategy: dflash
   num_epochs: 6
+  max_steps: 10000
   batch_size: 4
   learning_rate: 6.0e-4
   warmup_ratio: 0.04
@@ -37,7 +38,16 @@ run_id: qwen3-8b-dpace-online
 output_dir: ./outputs/qwen3-8b-dpace-online
 
 deployment:
-  mode: local_colocated
+  mode: disaggregated
   trainer:
     nnodes: 1
     nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/qwen3-8b-dpace-online/control
+    consumer_state_dir: outputs/qwen3-8b-dpace-online/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp
