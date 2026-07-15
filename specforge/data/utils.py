@@ -35,8 +35,14 @@ class DataCollatorWithPadding:
     """
 
     def __init__(self):
-        self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
-        self.ulysses_degree = torch.distributed.get_world_size(get_sp_ulysses_group())
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
+            self.ulysses_degree = torch.distributed.get_world_size(
+                get_sp_ulysses_group()
+            )
+        else:
+            self.sp_degree = 1
+            self.ulysses_degree = 1
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -74,6 +80,22 @@ class DataCollatorWithPadding:
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
+    def padding_mrope(self, position_ids: torch.Tensor, length: int) -> torch.Tensor:
+        """Pad Qwen M-RoPE ids while preserving their ``[3, B, L]`` layout."""
+        if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+            raise ValueError(
+                "M-RoPE position_ids must have shape [3, B, L], got "
+                f"{tuple(position_ids.shape)}"
+            )
+        padding = torch.zeros(
+            position_ids.shape[0],
+            position_ids.shape[1],
+            length - position_ids.shape[2],
+            dtype=position_ids.dtype,
+            device=position_ids.device,
+        )
+        return torch.cat((position_ids, padding), dim=2)
+
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Collate a batch of features.
@@ -108,16 +130,33 @@ class DataCollatorWithPadding:
                 for item in features
             ]
         )
-        batch_loss_mask = torch.cat(
-            [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
-        )
-        if "position_ids" in features[0]:
-            batch_position_ids = torch.cat(
+        if features[0]["loss_mask"].ndim == 3:
+            batch_loss_mask = torch.cat(
+                [self.paddingtensor(item["loss_mask"], max_length) for item in features]
+            )
+        else:
+            batch_loss_mask = torch.cat(
                 [
-                    self.paddingtensor2D(item["position_ids"], position_max_len)
+                    self.paddingtensor2D(item["loss_mask"], max_length)
                     for item in features
                 ]
             )
+        if "position_ids" in features[0]:
+            if features[0]["position_ids"].ndim == 3:
+                batch_position_ids = torch.cat(
+                    [
+                        self.padding_mrope(item["position_ids"], max_length)
+                        for item in features
+                    ],
+                    dim=1,
+                )
+            else:
+                batch_position_ids = torch.cat(
+                    [
+                        self.paddingtensor2D(item["position_ids"], position_max_len)
+                        for item in features
+                    ]
+                )
         else:
             batch_position_ids = None
         batch = {
