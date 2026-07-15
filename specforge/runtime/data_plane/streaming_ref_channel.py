@@ -41,8 +41,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass
-from typing import Iterator, List, Optional, Sequence
+from typing import Iterator, List, Optional
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
@@ -53,49 +52,6 @@ _FAILED_SUFFIX = ".failed"
 _CONSUMER_DONE_SUFFIX = ".consumer_done"
 _CONSUMER_FAILED_SUFFIX = ".consumer_failed"
 _CONSUMER_QUANTUM_SUFFIX = ".consumer_quantum"
-
-
-@dataclass
-class RefPublishTransaction:
-    """Track the ownership-transferred prefix of one publication batch.
-
-    JSONL append is not atomic across a batch. A complete line can also become
-    visible before its fsync reports failure. The channel increments its
-    publication counter once the full line has been accepted; the transaction
-    observes that progress even when ``publish`` raises. Cleanup can therefore
-    preserve every possibly visible ref and abort only the untouched suffix.
-    """
-
-    channel: "StreamingRefChannel"
-    refs: tuple[SampleRef, ...]
-    published_count: int = 0
-
-    @property
-    def published_refs(self) -> tuple[SampleRef, ...]:
-        return self.refs[: self.published_count]
-
-    @property
-    def unpublished_refs(self) -> tuple[SampleRef, ...]:
-        return self.refs[self.published_count :]
-
-    def commit(self) -> None:
-        """Publish the remaining suffix, retaining progress if one append fails."""
-
-        for ref in self.unpublished_refs:
-            before = self.channel.published
-            try:
-                self.channel.publish(ref)
-            except BaseException as publish_exc:
-                transferred = self.channel.published - before
-                if transferred not in (0, 1):
-                    raise RuntimeError(
-                        "reference channel reported invalid publication progress: "
-                        f"{before} -> {self.channel.published}"
-                    ) from publish_exc
-                self.published_count += transferred
-                raise
-            else:
-                self.published_count += 1
 
 
 class StreamingRefChannel:
@@ -121,33 +77,16 @@ class StreamingRefChannel:
     def publish(self, ref: SampleRef) -> None:
         """Append one tensor-free ref. Durable (fsync) so a remote reader sees it."""
         assert_no_tensors([ref])
-        payload = (json.dumps(ref_to_dict(ref), separators=(",", ":")) + "\n").encode(
-            "utf-8"
-        )
-        fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-        try:
-            offset = 0
-            while offset < len(payload):
-                written = os.write(fd, payload[offset:])
-                if written <= 0:
-                    raise OSError("reference channel append made no progress")
-                offset += written
-            # Ownership transfers only after the complete newline-terminated
-            # record has reached the kernel. fsync may still report a durability
-            # failure after the record is visible, so progress must be observable
-            # to the surrounding transaction before that call.
-            self._published += 1
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-    def begin_publish(self, refs: Sequence[SampleRef]) -> RefPublishTransaction:
-        """Create an observable batch publication boundary without writing yet."""
-
-        return RefPublishTransaction(self, tuple(refs))
+        line = json.dumps(ref_to_dict(ref), separators=(",", ":")) + "\n"
+        with open(self.path, "a") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        self._published += 1
 
     def publish_many(self, refs: List[SampleRef]) -> None:
-        self.begin_publish(refs).commit()
+        for r in refs:
+            self.publish(r)
 
     def close(self) -> None:
         """Drop the EOF sentinel so the reader's stream() terminates when drained."""
@@ -514,4 +453,4 @@ class StreamingRefQueue:
             return [ref.sample_id for ref in self._inflight]
 
 
-__all__ = ["RefPublishTransaction", "StreamingRefChannel", "StreamingRefQueue"]
+__all__ = ["StreamingRefChannel", "StreamingRefQueue"]
