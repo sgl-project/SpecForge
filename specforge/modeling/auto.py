@@ -110,6 +110,12 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         return model
 
 
+# Stack-only compatibility alias: new algorithm providers use the topology-free
+# name while the still-public legacy CLI imports AutoEagle3DraftModel.  P12
+# replaces this file with the exact server-only target blob.
+AutoDraftModel = AutoEagle3DraftModel
+
+
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {

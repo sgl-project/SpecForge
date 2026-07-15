@@ -1,9 +1,8 @@
 # coding=utf-8
 """E gate: draft-architecture registry drives the auto loaders.
 
-Adding a draft architecture = a class + @register_draft; both auto loaders
-(config-from-file and model-from-config) resolve it from the registry with the
-legacy hardcoded mappings kept only as fallback.
+Adding a draft architecture means adding a class with ``@register_draft``; both
+auto loaders resolve it from that registry.
 """
 
 import json
@@ -13,7 +12,7 @@ import unittest
 
 from transformers import LlamaConfig, Qwen3Config
 
-from specforge.modeling.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlashDraftModel,
@@ -67,11 +66,6 @@ TINY_DSPARK = {
     },
 }
 
-TINY_LEGACY_DSPARK = {
-    **TINY_DSPARK,
-    "architectures": ["DFlashDraftModel"],
-}
-
 TINY_DOMINO = {
     **TINY_DFLASH,
     "architectures": ["DominoDraftModel"],
@@ -83,11 +77,6 @@ TINY_DOMINO = {
         "pure_draft_prefix_len": 0,
         "shift_label": False,
     },
-}
-
-TINY_LEGACY_DOMINO = {
-    **TINY_DOMINO,
-    "architectures": ["DFlashDraftModel"],
 }
 
 
@@ -158,38 +147,18 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         path = _write(TINY_DSPARK)
         self.addCleanup(os.unlink, path)
         config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
+        model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DSparkDraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
         self.assertEqual(model.projector_type, "dspark")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
 
-    def test_from_config_maps_legacy_dspark_projector_to_explicit_draft(self):
-        path = _write(TINY_LEGACY_DSPARK)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
-        self.assertIsInstance(model, DSparkDraftModel)
-        self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.projector_type, "dspark")
-        self.assertIsNotNone(model.markov_head)
-
-    def test_from_config_maps_legacy_domino_projector_to_explicit_draft(self):
-        path = _write(TINY_LEGACY_DOMINO)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
-        self.assertIsInstance(model, DominoDraftModel)
-        self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.projector_type, "domino")
-        self.assertIsNotNone(model.prefix_gru)
-
     def test_from_config_builds_domino_as_explicit_draft(self):
         path = _write(TINY_DOMINO)
         self.addCleanup(os.unlink, path)
         config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
+        model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DominoDraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
         self.assertEqual(model.projector_type, "domino")
@@ -200,7 +169,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         path = _write(TINY_DOMINO)
         self.addCleanup(os.unlink, path)
         config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
+        model = AutoDraftModel.from_config(config)
         keys = set(model.state_dict())
         self.assertTrue(any(key.startswith("prefix_gru.") for key in keys))
         self.assertTrue(any(key.startswith("embed_proj.") for key in keys))
@@ -210,7 +179,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         path = _write(TINY_DSPARK)
         self.addCleanup(os.unlink, path)
         config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
+        model = AutoDraftModel.from_config(config)
         keys = set(model.state_dict())
         self.assertTrue(any(key.startswith("markov_head.") for key in keys))
         self.assertTrue(any(key.startswith("confidence_head.") for key in keys))
@@ -227,7 +196,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         path = _write(TINY_EAGLE3)
         self.addCleanup(os.unlink, path)
         config = AutoDraftModelConfig.from_file(path)
-        model = AutoEagle3DraftModel.from_config(config)
+        model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, LlamaForCausalLMEagle3)
 
 
