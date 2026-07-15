@@ -99,6 +99,7 @@ class SGLangBackendArgs:
     sglang_ep_size: int = 1
     sglang_max_running_requests: int = None  # assign based on batch size
     sglang_max_total_tokens: int = None  # assign based on batch size and seq length
+    sglang_quantization: str = None
 
     @staticmethod
     def add_args(parser: argparse.ArgumentParser) -> None:
@@ -153,6 +154,13 @@ class SGLangBackendArgs:
             default=1,
             help="The ep size of the SGLang backend",
         )
+        parser.add_argument(
+            "--sglang-quantization",
+            type=str,
+            default=None,
+            help="The quantization method for the SGLang backend (e.g., w8a8_int8). "
+            "If not set, no quantization is applied.",
+        )
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "SGLangBackendArgs":
@@ -174,6 +182,7 @@ class SGLangBackendArgs:
                 if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
                 else None
             ),
+            sglang_quantization=getattr(args, "sglang_quantization", None),
         )
 
     def to_kwargs(self) -> Dict[str, Any]:
@@ -191,6 +200,7 @@ class SGLangBackendArgs:
             # (`disable_piecewise_cuda_graph=True`) because the EAGLE3 logits
             # processor's output cannot go through the piecewise CUDA graph path.
             ep_size=self.sglang_ep_size,
+            quantization=self.sglang_quantization,
             max_running_requests=self.sglang_max_running_requests,
             max_total_tokens=self.sglang_max_total_tokens,
         )
