@@ -281,6 +281,32 @@ class TestReadResumeState(unittest.TestCase):
             self.assertNotIn("optimizer_state_dict", st)
             self.assertNotIn("rng_state", st)
 
+        root_state = CheckpointManager.read_resume_state(out)
+        self.assertEqual(root_state["global_step"], 3)
+
+    def test_run_root_without_symlinks_uses_latest_complete_step(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_root_")
+        mgr = _mgr(out)
+        mgr.save(_state(2, world_size=1), 2, rank_state={"optimizer": {}})
+        mgr.save(_state(7, world_size=1), 7, rank_state={"optimizer": {}})
+        os.remove(os.path.join(out, "run-latest"))
+
+        state = CheckpointManager.read_resume_state(out)
+        self.assertEqual(state["global_step"], 7)
+
+    def test_ambiguous_multi_run_root_is_rejected(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_ambiguous_")
+        _mgr(out, "alpha").save(
+            _state(2, world_size=1), 2, rank_state={"optimizer": {}}
+        )
+        _mgr(out, "beta").save(_state(3, world_size=1), 3, rank_state={"optimizer": {}})
+        with self.assertRaisesRegex(ValueError, "multiple complete.*latest"):
+            CheckpointManager.read_resume_state(out)
+
     def test_require_full_state_raises_without_rank_file(self):
         from specforge.training.checkpoint import CheckpointManager
 

@@ -8,9 +8,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-FSDP-only for now. ``ParallelConfig`` carries the parallel handles created by
-``init_distributed`` rather than re-deriving them; distributed imports stay
-lazy so the module is importable without a GPU.
+FSDP-only for now. ``ParallelConfig`` carries the process groups created by the
+single distributed lifecycle: frozen-target TP plus draft DP/USP topology.
 """
 
 from __future__ import annotations
@@ -29,7 +28,12 @@ import torch.nn as nn
 
 @dataclass
 class ParallelConfig:
-    """Handles describing the active parallel layout. Carried, not re-derived."""
+    """Snapshot of the target-TP and draft-DP/SP layout.
+
+    Process-group handles are created once by :func:`init_distributed` and
+    carried into the trainer.  Re-deriving groups here can change collective
+    ordering and deadlock a multi-rank run.
+    """
 
     world_size: int = 1
     tp_size: int = 1
@@ -37,8 +41,6 @@ class ParallelConfig:
     sp_ring_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
     param_dtype: torch.dtype = torch.bfloat16
-    # opaque process-group / device-mesh handles snapshotted from
-    # init_distributed, never re-derived (None in single-process).
     fsdp_process_group: Any = None
     dp_group: Any = None
     draft_dp_group: Any = None
@@ -64,8 +66,7 @@ class ParallelConfig:
         sharding_strategy: str = "SHARD_GRAD_OP",
         param_dtype: torch.dtype = torch.bfloat16,
     ) -> "ParallelConfig":
-        """Snapshot all parallel handles (DP/TP/SP groups, device meshes) from
-        ``init_distributed``; a missing getter is logged, never silently skipped."""
+        """Carry every group built by :func:`specforge.distributed.init_distributed`."""
         # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
         # runs DDP-style (full params replicated, one grad all-reduce, no param
         # all-gather). Default unchanged when the env var is unset.
@@ -98,7 +99,7 @@ class ParallelConfig:
                     continue
                 try:
                     handles[name] = fn()
-                except Exception as exc:  # group not built for this config
+                except Exception as exc:
                     logging.getLogger(__name__).warning(
                         "ParallelConfig.from_distributed: %s() unavailable: %s",
                         getter,
@@ -106,7 +107,7 @@ class ParallelConfig:
                     )
         except Exception as exc:
             logging.getLogger(__name__).warning(
-                "ParallelConfig.from_distributed: specforge.distributed import failed: %s",
+                "ParallelConfig.from_distributed: distributed handles unavailable: %s",
                 exc,
             )
         return cls(
@@ -141,7 +142,7 @@ class TrainingBackend(abc.ABC):
 
 
 class FSDPTrainingBackend(TrainingBackend):
-    """FSDP1 backend mirroring the legacy SpecForge training math: FSDP with
+    """FSDP1 backend for the canonical SpecForge training math: FSDP with
     ``use_orig_params=True`` / bf16 mixed precision over the configured process
     group, optimizer targeting the inner trainable submodule."""
 
@@ -158,6 +159,7 @@ class FSDPTrainingBackend(TrainingBackend):
         self.module: Optional[nn.Module] = None
         self.optimizer = None
         self._wrapped = False
+        self.auto_wrap_block_classes = set()
 
     def prepare_model(
         self,
@@ -172,13 +174,16 @@ class FSDPTrainingBackend(TrainingBackend):
             self.module = model
             self._wrapped = False
         else:
+            import functools
+
+            from torch.distributed.fsdp import BackwardPrefetch
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+            from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
             pc = self.parallel_config
             sharding = getattr(ShardingStrategy, pc.sharding_strategy)
-            model = FSDP(
-                model,
+            fsdp_kwargs = dict(
                 use_orig_params=True,
                 mixed_precision=MixedPrecision(
                     param_dtype=pc.param_dtype, buffer_dtype=torch.float32
@@ -186,8 +191,34 @@ class FSDPTrainingBackend(TrainingBackend):
                 sharding_strategy=sharding,
                 process_group=pc.fsdp_process_group,
             )
+            # DFlash-family models expose their transformer block class through
+            # ``_no_split_modules``.  Preserve the legacy per-block FSDP policy:
+            # it overlaps all-gather/reduce-scatter with decoder compute and is
+            # required for the memory envelope of the larger recipes.  EAGLE
+            # models do not advertise block classes and retain a single root
+            # FSDP unit.
+            block_names = set(
+                getattr(optimizer_target, "_no_split_modules", None) or ()
+            )
+            block_classes = {
+                type(module)
+                for module in model.modules()
+                if type(module).__name__ in block_names
+            }
+            if block_classes:
+                fsdp_kwargs.update(
+                    auto_wrap_policy=functools.partial(
+                        transformer_auto_wrap_policy,
+                        transformer_layer_cls=block_classes,
+                    ),
+                    forward_prefetch=True,
+                    backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                    limit_all_gathers=True,
+                )
+            model = FSDP(model, **fsdp_kwargs)
             self.module = model
             self._wrapped = True
+            self.auto_wrap_block_classes = block_classes
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
             self.optimizer = self._optimizer_factory(target)
@@ -283,35 +314,41 @@ class FSDPTrainingBackend(TrainingBackend):
 
     @staticmethod
     def _rng_state() -> dict:
-        # single bound-device CUDA state keeps the checkpoint independent of
-        # how many devices happen to be visible at save time.
+        # Persist only the bound accelerator's RNG state so a checkpoint is
+        # independent of how many CUDA/NPU devices are visible at load time.
+        from specforge.utils import get_device_type
+
+        device_type = get_device_type()
+        accelerator_state = None
+        module = getattr(torch, device_type, None)
+        if (
+            device_type in ("cuda", "npu")
+            and module is not None
+            and module.is_available()
+        ):
+            accelerator_state = module.get_rng_state(module.current_device())
         return {
             "torch": torch.get_rng_state(),
-            "cuda": (
-                torch.cuda.get_rng_state(torch.cuda.current_device())
-                if torch.cuda.is_available()
-                else None
-            ),
+            "device_type": device_type,
+            # Named keys keep old CUDA checkpoints readable and make NPU state
+            # inspectable without understanding a new opaque payload.
+            "cuda": accelerator_state if device_type == "cuda" else None,
+            "npu": accelerator_state if device_type == "npu" else None,
         }
 
     @staticmethod
     def _set_rng_state(rng: dict) -> None:
-        cpu_state = rng.get("torch", rng.get("cpu"))  # "cpu" = legacy key
-        if cpu_state is not None:
-            torch.set_rng_state(cpu_state)
-        cuda_state = rng.get("cuda")
-        if cuda_state is None or not torch.cuda.is_available():
+        torch.set_rng_state(rng["torch"])
+        # ``device_type``/``npu`` are new. Falling back to the legacy ``cuda``
+        # key preserves every checkpoint written before NPU support.
+        device_type = rng.get("device_type")
+        if device_type is None:
+            device_type = "cuda" if rng.get("cuda") is not None else None
+        state = rng.get(device_type) if device_type is not None else None
+        module = getattr(torch, device_type, None) if device_type is not None else None
+        if state is None or module is None or not module.is_available():
             return
-        device = torch.cuda.current_device()
-        if isinstance(cuda_state, list):  # legacy get_rng_state_all format
-            if device >= len(cuda_state):
-                raise ValueError(
-                    f"legacy RNG checkpoint holds {len(cuda_state)} CUDA states "
-                    f"but this rank's bound device index is {device}; it was "
-                    "saved with fewer visible devices and cannot be restored here"
-                )
-            cuda_state = cuda_state[device]
-        torch.cuda.set_rng_state(cuda_state, device)
+        module.set_rng_state(state, module.current_device())
 
 
 __all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend"]
