@@ -107,7 +107,7 @@ class TestDominoOfflineLaunch(unittest.TestCase):
 
 @unittest.skipUnless(CUDA, "Domino online launcher path requires CUDA")
 class TestDominoOnlineLaunch(unittest.TestCase):
-    def test_online_rollout_then_fsdp_train(self):
+    def test_online_rollout_is_interleaved_with_fsdp_train(self):
         torch.manual_seed(0)
         from tests.test_runtime import _fixtures as fx
 
@@ -162,7 +162,7 @@ class TestDominoOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, drive_rollout = build_online_runtime(
+        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
             strategy="domino",
             target_model=target,
             prompts=prompts,
@@ -177,15 +177,15 @@ class TestDominoOnlineLaunch(unittest.TestCase):
             max_steps=MAX_OPT_STEPS,
         )
 
-        produced = drive_rollout()
-        self.assertEqual(produced, N)
-        self.assertEqual(controller.sample_queue.depth(), N)
+        self.assertEqual(controller.sample_queue.depth(), 0)
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
 
-        step = trainer.fit(loader)
+        step = run_interleaved()
         self.assertEqual(step, MAX_OPT_STEPS)
+        self.assertEqual(loader.queue.produced_count, ACC * MAX_OPT_STEPS)
+        self.assertLessEqual(loader.queue.peak_resident_samples, 1)
         self.assertTrue(
             all(torch.isfinite(p).all() for p in module.parameters()),
             "draft params became non-finite — loss was NaN/inf?",

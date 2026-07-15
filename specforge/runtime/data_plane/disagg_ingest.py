@@ -36,8 +36,7 @@ def ingest_offline_features(
     store: FeatureStore,
     hidden_states_path: str,
     *,
-    algorithm_name: str,
-    build_reader: Callable,
+    strategy: str = "eagle3",
     run_id: str = "disagg",
     ttt_length: int = 7,
     max_len: int = 2048,
@@ -46,14 +45,23 @@ def ingest_offline_features(
 ) -> List[SampleRef]:
     """Load offline ``.ckpt`` features and ``put()`` them into ``store``.
 
-    The application injects the algorithm-owned reader; this transport layer
-    does not import or resolve training algorithms. Tensors are copied
-    verbatim, and ``on_ref`` runs immediately after every successful ``put()``
-    so a lifecycle owner can retain refs needed to clean up a partial attempt.
+    The strategy registry owns the raw feature contract. EAGLE3 stores its
+    final/auxiliary target states, while DFlash and Domino store their shared
+    ``hidden_states`` capture.  Tensors are copied verbatim; the consumer uses
+    the same strategy transform as a colocated run, so both topologies receive
+    byte-identical normalized batches. ``on_ref`` runs immediately after every
+    successful ``put()`` so a lifecycle owner can retain the refs needed to
+    clean up a partially ingested attempt.
     """
-    if not callable(build_reader):
-        raise TypeError("build_reader must be an injected callable")
-    reader = build_reader(
+    from specforge.training.strategies.registry import resolve_strategy
+
+    spec = resolve_strategy(strategy)
+    if spec.make_offline_reader is None:
+        raise NotImplementedError(
+            f"offline ingestion for strategy {strategy!r} is not wired; its "
+            "StrategySpec needs make_offline_reader"
+        )
+    reader = spec.make_offline_reader(
         hidden_states_path,
         run_id=run_id,
         ttt_length=ttt_length,
@@ -76,8 +84,8 @@ def ingest_offline_features(
             sample_id=f"{run_id}:{index:08d}",
             metadata={
                 "run_id": run_id,
-                "strategy": algorithm_name,
-                "format": f"offline_{algorithm_name}",
+                "strategy": strategy,
+                "format": f"offline_{strategy}",
                 "target_repr": reader.target_repr,
                 "ttt_length": ttt_length,
                 "max_len": max_len,

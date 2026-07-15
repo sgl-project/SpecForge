@@ -364,6 +364,11 @@ class FeatureDataLoader:
         # inline. Ack still happens on the consuming thread AFTER the trainer
         # has taken the batch (same in-flight semantics as the sync path).
         depth = self.num_workers or int(os.environ.get("LOADER_PREFETCH", "0"))
+        if not getattr(self.queue, "loader_prefetch_safe", True):
+            # A pull-through local rollout runs target inference inside get().
+            # Keep that CUDA work on the training thread so early-stop and
+            # producer failures share one deterministic lifecycle.
+            depth = 0
         if depth > 0:
             yield from self._iter_queue_prefetch(depth)
             return
