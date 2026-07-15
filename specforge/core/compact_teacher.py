@@ -2,12 +2,11 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 """Compact (draft-vocabulary) teacher distribution for EAGLE-3 training.
 
-Reproduces the teacher quantities of
-``specforge.algorithms.eagle3.model._compute_target_p`` from the target's last hidden
-states and ``lm_head`` weight without materializing the full ``[B, S, vocab_size]``
-fp32 logits: the draft-vocab logits come from a ``t2d``-sliced head, and the
-full-vocab ``logsumexp``/``argmax`` from a streaming reduction over vocabulary
-chunks.
+Reproduces the teacher quantities of ``specforge.core.eagle3._compute_target_p`` from
+the target's last hidden states and ``lm_head`` weight without materializing the full
+``[B, S, vocab_size]`` fp32 logits: the draft-vocab logits come from a ``t2d``-sliced
+head, and the full-vocab ``logsumexp``/``argmax`` from a streaming reduction over
+vocabulary chunks.
 
 Scope: offline training only. The teacher uses the full (unsharded, rank-replicated)
 target ``lm_head`` weight, so the computation is a pure function of
@@ -234,6 +233,7 @@ def validate_vocab_mapping_consistency(t2d: torch.Tensor, d2t: torch.Tensor) -> 
 def validate_compact_teacher_enabled(
     *,
     is_online: bool,
+    is_vlm: bool,
     draft_vocab_size: int,
     vocab_size: int,
     t2d: torch.Tensor,
@@ -249,6 +249,10 @@ def validate_compact_teacher_enabled(
         raise ValueError(
             "compact teacher supports offline training only; disable --compact-teacher "
             "or train offline."
+        )
+    if is_vlm:
+        raise ValueError(
+            "compact teacher does not support VLM training yet; disable --compact-teacher."
         )
     if target_head_weight is None:
         raise ValueError(

@@ -1,7 +1,7 @@
 # coding=utf-8
 """M4 gate: extraction correctness vs an independent HF reference (fp tolerance).
 
-The SGLangAdapter's extracted aux hidden states (at the recorded layer IDs) must
+The policy adapter's extracted aux hidden states (at the recorded layer IDs) must
 equal an independent HF ``output_hidden_states=True`` forward at those layers,
 and the target logits must match a direct forward — within a documented bf16
 tolerance. This is the only M4 numerical gate at fp tolerance (different engine),
@@ -28,7 +28,10 @@ class TestExtractionVsHFReference(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29564")
 
-        from specforge.inference.adapters.eagle3 import SGLangAdapter
+        from specforge.inference.adapters.policy import (
+            EAGLE3_FEATURE_SCHEMA,
+            PolicyFeatureAdapter,
+        )
         from specforge.inference.capture import CaptureConfig, verify_capture
         from specforge.runtime.contracts import PromptTask
 
@@ -38,7 +41,9 @@ class TestExtractionVsHFReference(unittest.TestCase):
             workdir, hidden=H, layers=8, vocab=V
         )
 
-        adapter = SGLangAdapter(target, device="cuda")
+        adapter = PolicyFeatureAdapter(
+            target, schema=EAGLE3_FEATURE_SCHEMA, device="cuda"
+        )
         capture = CaptureConfig.from_strategy(
             required_features={
                 "input_ids",

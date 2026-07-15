@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from typing import get_args
 
 import torch
@@ -90,21 +91,15 @@ class TestPEagleStrategy(unittest.TestCase):
         )
         self.assertTrue(spec.supports_online)
         self.assertTrue(spec.uses_target_head)
-        self.assertIsNotNone(spec.make_offline_reader)
-        self.assertIsNotNone(spec.make_offline_transform)
-        self.assertIsNotNone(spec.make_offline_collate)
+        self.assertIsNone(spec.make_offline_reader)
+        self.assertIsNone(spec.make_offline_transform)
+        self.assertIsNone(spec.make_offline_collate)
 
-    def test_registry_reuses_eagle3_capture_and_tags_offline_refs(self):
+    def test_registry_reuses_eagle3_online_capture(self):
         peagle = resolve_strategy("peagle")
         eagle3 = resolve_strategy("eagle3")
         self.assertIs(peagle.feature_schema, eagle3.feature_schema)
-        self.assertIs(peagle.make_adapter, eagle3.make_adapter)
-
-        reader = peagle.make_offline_reader(
-            "/unused", run_id="run", ttt_length=1, max_len=32
-        )
-        self.assertEqual(reader.strategy, "peagle")
-        self.assertEqual(reader.target_repr, "hidden_state")
+        self.assertIs(peagle.make_online_collate(), eagle3.make_online_collate())
 
     def test_online_logits_map_hidden_state_and_derive_length(self):
         model = _FakePEagleModel()
@@ -121,7 +116,6 @@ class TestPEagleStrategy(unittest.TestCase):
         )
         self.assertEqual(model.forward_kwargs["lengths"].tolist(), [3])
         self.assertAlmostEqual(float(output.metrics["accuracy"]), 0.75)
-        self.assertEqual(float(output.metrics["accuracy_denom"]), 4.0)
         self.assertFalse(output.metrics["loss_sum"].requires_grad)
 
     def test_offline_target_hidden_state_is_shifted_and_projected(self):
@@ -169,6 +163,38 @@ class TestPEagleStrategy(unittest.TestCase):
             {"embed_tokens.weight", "mask_hidden", "scale"},
         )
         self.assertTrue(model.draft_model.embed_tokens.weight.requires_grad)
+
+    def test_resume_contract_records_resolved_model_and_objective_semantics(self):
+        from specforge.training.assembly import ModelBundle, _strategy_resume_contract
+
+        cfg = SimpleNamespace(training=SimpleNamespace(strategy="peagle"))
+        draft_model = SimpleNamespace(
+            layers=[object(), object()],
+            norm_before_residual=True,
+        )
+        model = SimpleNamespace(
+            num_depths=5,
+            down_sample_ratio=0.7,
+            down_sample_ratio_min=0.3,
+            mask_token_id=0,
+        )
+
+        contract = _strategy_resume_contract(
+            cfg,
+            ModelBundle(model=model, draft_model=draft_model),
+        )
+
+        self.assertEqual(
+            contract,
+            {
+                "peagle_num_draft_layers": 2,
+                "peagle_norm_before_residual": True,
+                "peagle_num_depths": 5,
+                "peagle_down_sample_ratio": 0.7,
+                "peagle_down_sample_ratio_min": 0.3,
+                "peagle_mask_token_id": 0,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -18,7 +18,6 @@ from transformers import (
     modeling_utils,
 )
 
-from .draft.llama3_eagle import LlamaForCausalLMEagle3
 from .draft.registry import DRAFT_REGISTRY, available_drafts
 from .target.custom_backend import (
     GptOssForCausalLM,
@@ -31,34 +30,22 @@ from .target.custom_backend import (
 )
 
 
-class AutoEagle3DraftModel(AutoModelForCausalLMBase):
-    # legacy config-type dispatch, kept as the fallback for configs that carry
-    # no ``architectures``; new drafts register via @register_draft instead.
-    _model_mapping = {
-        LlamaConfig: LlamaForCausalLMEagle3,
-    }
-
+class AutoDraftModel(AutoModelForCausalLMBase):
     @classmethod
     def _model_cls_from_config(cls, config: PretrainedConfig):
         archs = getattr(config, "architectures", None) or []
-        if len(archs) == 1 and archs[0] in DRAFT_REGISTRY:
-            model_cls = DRAFT_REGISTRY[archs[0]]
-            if archs[0] == "DFlashDraftModel":
-                dflash_config = getattr(config, "dflash_config", {}) or {}
-                projector_type = dflash_config.get("projector_type", None)
-                if projector_type == "domino":
-                    model_cls = DRAFT_REGISTRY["DominoDraftModel"]
-                elif projector_type == "dspark":
-                    model_cls = DRAFT_REGISTRY["DSparkDraftModel"]
-            return model_cls
-        return cls._model_mapping[type(config)]
+        if len(archs) != 1 or archs[0] not in DRAFT_REGISTRY:
+            raise ValueError(
+                "draft config must name exactly one registered architecture; "
+                f"got {archs!r}, available: {available_drafts()}"
+            )
+        return DRAFT_REGISTRY[archs[0]]
 
     @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
         This class method takes a configuration object and creates its model,
-        resolving the class from DRAFT_REGISTRY via ``config.architectures``
-        first, then falling back to the legacy config-type mapping.
+        resolving the class from DRAFT_REGISTRY via ``config.architectures``.
 
         Args:
             config (PretrainedConfig): A configuration object.
@@ -95,25 +82,14 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
             if config is None:
                 config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
             model_cls = cls._model_cls_from_config(config)
-            if model_cls is not cls._model_mapping.get(type(config)):
-                kwargs = {**kwargs, "config": config}
-                model = model_cls.from_pretrained(
-                    pretrained_model_name_or_path, *model_args, **kwargs
-                )
-            else:
-                model = super().from_pretrained(
-                    pretrained_model_name_or_path, *model_args, **kwargs
-                )
+            kwargs = {**kwargs, "config": config}
+            model = model_cls.from_pretrained(
+                pretrained_model_name_or_path, *model_args, **kwargs
+            )
         finally:
             modeling_utils.logger.warning = original_warn
 
         return model
-
-
-# Stack-only compatibility alias: new algorithm providers use the topology-free
-# name while the still-public legacy CLI imports AutoEagle3DraftModel.  P12
-# replaces this file with the exact server-only target blob.
-AutoDraftModel = AutoEagle3DraftModel
 
 
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
@@ -163,11 +139,6 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
 
 
 class AutoDraftModelConfig:
-
-    _config_mapping = {
-        "LlamaForCausalLMEagle3": LlamaConfig,
-    }
-
     @classmethod
     def from_file(cls, config_path: str):
         """
@@ -198,15 +169,12 @@ class AutoDraftModelConfig:
 
         architecture = architectures[0]
 
-        if architecture in DRAFT_REGISTRY:
-            config_cls = DRAFT_REGISTRY[architecture].config_class
-        elif architecture in cls._config_mapping:
-            config_cls = cls._config_mapping[architecture]
-        else:
+        if architecture not in DRAFT_REGISTRY:
             raise ValueError(
                 f"Architecture {architecture} not registered; "
                 f"available: {available_drafts()}"
             )
+        config_cls = DRAFT_REGISTRY[architecture].config_class
 
         # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
         if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:

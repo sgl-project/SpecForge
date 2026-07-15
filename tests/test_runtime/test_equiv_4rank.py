@@ -1,220 +1,235 @@
 # coding=utf-8
-"""M6 gate: the trainer split is equivalent under tp>1 & sp>1 (>=4 ranks).
+"""Four-rank TP2 x SP2/USP parity for the unified Trainer lifecycle.
 
-Spawns a 4-process group with TP=2 x SP(ulysses)=2 and, on every rank, runs ONE
-offline EAGLE3 step through both the legacy path (``run_forward`` +
-``run_backward_and_update``) and the new path (``Eagle3TrainStrategy`` +
-``TrainerCore`` + ``FSDPTrainingBackend`` carrying the real 4-rank
-``ParallelConfig``). Both consume the *identical* USP-sharded data for that rank,
-so any divergence is the new path failing to preserve the math under real TP+SP —
-the "scale-out claim met, not FSDP-only" gate.
-
-GPU-only; needs >=4 visible GPUs AND flash-attn **v2** (the Ulysses/USP attention
-path resolves flash-attn v2 varlen kernels in ``llama3_eagle`` — there is no SP
-fallback). The cached ``sglang:dev`` image used for the other gates ships
-flash-attn **v4**, whose API differs, so SpecForge's USP path is non-functional
-there and this test skips. Run on a training image with flash-attn v2. Validated
-up to the USP-engages point on 8xH200; full numerical assertion needs v2.
+The distributed leg uses the current offline builder and no-argument
+``Trainer.fit()`` with real TP2, Ulysses-SP2 and world-sized FSDP groups.  Its
+logged boundary loss is compared with the same initial model and samples on the
+canonical full-sequence flex-attention reference.  This replaces the deleted
+legacy-script differential while retaining the scale-out numerical gate.
 """
 
 import json
+import math
 import os
 import tempfile
-import types
 import unittest
 
 import torch
 
+from tests.test_runtime import _fixtures as fx
+
 CUDA = torch.cuda.is_available()
 NGPU = torch.cuda.device_count() if CUDA else 0
-WORLD = 4
+WORLD_SIZE = 4
 
 
-def _has_usp_flash_attn() -> bool:
-    # Authoritative check: the USP attention path resolves flash-attn *v2* varlen
-    # kernels in llama3_eagle. Probe that exact symbol — it is None when flash-attn
-    # is absent OR when an API-incompatible major version is installed (e.g. the
-    # cached sglang:dev image ships flash-attn v4, whose API differs, so SpecForge's
-    # USP path is non-functional there). A bare `import flash_attn` is NOT enough.
+def _has_standard_flash_attention() -> bool:
+    """Probe the exact standard interfaces used by the USP implementation."""
     try:
-        from specforge.modeling.draft.llama3_eagle import _std_flash_unpad_input
-
-        return _std_flash_unpad_input is not None
+        from flash_attn import flash_attn_varlen_func  # noqa: F401
+        from flash_attn.bert_padding import pad_input, unpad_input  # noqa: F401
+        from flash_attn.flash_attn_interface import (  # noqa: F401
+            _flash_attn_varlen_backward,
+        )
     except Exception:
         return False
+    return True
 
 
-def _worker(rank, world_size, workdir, results_dir):
-    """One rank: build old+new with identical weights, one step, record result."""
-    from tests.test_runtime import _fixtures as fx
+def _build_model(workdir: str, attention_backend: str):
+    from specforge.core.eagle3 import OnlineEagle3Model
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
+    draft_config = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
+    draft_model = AutoDraftModel.from_config(
+        draft_config,
+        attention_backend=attention_backend,
+        torch_dtype=torch.bfloat16,
+    ).cuda()
+    draft_model.load_vocab_mapping(os.path.join(workdir, "vm.pt"))
+    draft_model.freeze_embedding()
+    return OnlineEagle3Model(
+        draft_model=draft_model,
+        length=3,
+        attention_backend=attention_backend,
+    ).cuda()
+
+
+def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     fx.init_rank_distributed(
-        rank, world_size, tp_size=2, sp_ulysses_size=2, sp_ring_size=1, port="29573"
+        rank,
+        world_size,
+        tp_size=2,
+        sp_ulysses_size=2,
+        sp_ring_size=1,
+        port=str(port),
     )
+    try:
+        import torch.distributed as dist
 
-    from scripts.train_eagle3 import run_backward_and_update, run_forward
-    from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
-    from specforge.data.preprocessing import OfflineEagle3Dataset
-    from specforge.data.utils import DataCollatorWithPadding
-    from specforge.modeling.target import TargetHead
-    from specforge.optimizer import BF16Optimizer
-    from specforge.runtime.contracts import TrainBatch
-    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-    from specforge.training.controller import TrainerCore
-    from specforge.training.strategies.base import Eagle3TrainStrategy
+        from specforge.distributed import get_draft_sp_group, get_tp_group
+        from specforge.launch import _shard_offline_refs, build_offline_runtime
+        from specforge.modeling.target.target_head import TargetHead
+        from specforge.optimizer import BF16Optimizer
+        from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
+        from specforge.training.strategies.registry import resolve_strategy
 
-    torch.manual_seed(0)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
-    TTT, BS = 3, 2
-    cfg = os.path.join(workdir, "draft.json")
-    target_dir = os.path.join(workdir, "target")
-    vocab_path = os.path.join(workdir, "vm.pt")
-    feat_dir = os.path.join(workdir, "features")
-    draft_config = AutoDraftModelConfig.from_file(cfg)
-
-    def build_model():
-        # attention_backend="usp" so the forward actually exercises Ulysses SP
-        # (UspAdapter + SeqAllToAll cross-rank attention), matching production
-        # when sp>1; flex_attention would silently run per-rank-local attention
-        # and the use_usp_preprocess-sharded data would shape-mismatch.
-        dm = AutoEagle3DraftModel.from_config(
-            draft_config, attention_backend="usp", torch_dtype=torch.bfloat16
-        ).cuda()
-        dm.load_vocab_mapping(vocab_path)
-        dm.freeze_embedding()
-        return OnlineEagle3Model(
-            draft_model=dm, length=TTT, attention_backend="usp"
-        ).cuda()
-
-    model_a = build_model()
-    model_b = build_model()
-    model_b.draft_model.load_state_dict(model_a.draft_model.state_dict())  # identical
-    head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
-
-    # USP-sharded offline data: this rank gets its SP slice (the real sp>1 path).
-    files = sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir))
-    ds = OfflineEagle3Dataset(
-        files, max_len=512, ttt_length=TTT, use_usp_preprocess=True
-    )
-    data = DataCollatorWithPadding()([ds[j] for j in range(BS)])
-
-    args = types.SimpleNamespace(
-        is_vlm=False,
-        target_model_backend="hf",
-        shard_target_output=False,
-        draft_accumulation_steps=1,
-        # Keep the legacy full-logits teacher path used by this equivalence gate.
-        compact_teacher=False,
-        compact_teacher_chunk_size=None,
-    )
-
-    # --- legacy path ---
-    opt_a = BF16Optimizer(
-        model_a.draft_model,
-        lr=1e-4,
-        max_grad_norm=0.5,
-        warmup_ratio=0.0,
-        total_steps=10,
-    )
-    # Both models are deliberately unwrapped in this equivalence gate, so their
-    # replicated parameters use rank-local norm clipping on both paths.
-    opt_a.configure_grad_norm_reduction(enabled=False)
-    plosses_a, _, _, _, _, _, _ = run_forward(
-        args, model_a, data, head, is_online=False
-    )
-    loss_old = sum(0.8**i * plosses_a[i] for i in range(len(plosses_a))).item()
-    gn_old = run_backward_and_update(args, plosses_a, opt_a, global_step=1)
-
-    # --- new path under the real 4-rank ParallelConfig ---
-    opt_b = BF16Optimizer(
-        model_b.draft_model,
-        lr=1e-4,
-        max_grad_norm=0.5,
-        warmup_ratio=0.0,
-        total_steps=10,
-    )
-    pc = ParallelConfig.from_distributed(tp_size=2, sp_ulysses_size=2, sp_ring_size=1)
-    backend = FSDPTrainingBackend(pc)
-    backend.prepare_model(model_b, wrap=False, optimizer_target=model_b.draft_model)
-    backend.set_optimizer(opt_b)
-    strategy = Eagle3TrainStrategy(model_b, target_head=head)
-    core = TrainerCore(strategy, backend, accumulation_steps=1)
-    batch = TrainBatch(
-        sample_ids=["a", "b"],
-        strategy="eagle3",
-        tensors=dict(data),
-        metadata={"target_repr": "hidden_state", "ttt_length": TTT},
-    )
-    rep = core.train_step(batch)
-
-    with open(os.path.join(results_dir, f"rank{rank}.json"), "w") as f:
-        json.dump(
-            {
-                "rank": rank,
-                "world": pc.world_size,
-                "tp": pc.tp_size,
-                "sp": pc.sp_size,
-                "loss_old": loss_old,
-                "loss_new": rep.loss,
-                "gn_old": float(gn_old.item()),
-                "gn_new": rep.grad_norm,
-            },
-            f,
+        reference_model = _build_model(workdir, "flex_attention")
+        usp_model = _build_model(workdir, "usp")
+        usp_model.load_state_dict(reference_model.state_dict())
+        target_head = TargetHead.from_pretrained(
+            os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
         )
+
+        spec = resolve_strategy("eagle3")
+        source_refs = spec.make_offline_reader(
+            os.path.join(workdir, "features"),
+            run_id="usp-reference",
+            ttt_length=3,
+            max_len=512,
+        ).read()
+        rank_refs = _shard_offline_refs(
+            source_refs,
+            use_usp_preprocess=True,
+            seed=0,
+            epoch=0,
+        )
+        if len(rank_refs) != 2:
+            raise AssertionError(
+                f"rank {rank} expected two accumulation refs, got {len(rank_refs)}"
+            )
+
+        reference_loader = FeatureDataLoader(
+            LocalFeatureStore(f"usp-reference-{rank}"),
+            refs=[rank_refs[-1]],
+            batch_size=1,
+            collate_fn=spec.make_offline_collate(),
+            per_sample_transform=spec.make_offline_transform(
+                512,
+                ttt_length=3,
+                use_usp_preprocess=False,
+            ),
+            strategy=spec.name,
+        )
+        reference_batch = next(iter(reference_loader))
+        reference_model.train()
+        with torch.no_grad():
+            expected_loss = (
+                spec.make_strategy(reference_model, target_head=target_head)
+                .forward_loss(reference_batch)
+                .loss.detach()
+            )
+        dist.all_reduce(expected_loss, op=dist.ReduceOp.SUM)
+        expected_loss /= world_size
+
+        def optimizer_factory(module):
+            return BF16Optimizer(
+                module,
+                lr=1e-4,
+                max_grad_norm=0.5,
+                warmup_ratio=0.0,
+                total_steps=1,
+            )
+
+        logged = []
+        trainer = build_offline_runtime(
+            strategy="eagle3",
+            hidden_states_path=os.path.join(workdir, "features"),
+            draft_model=usp_model,
+            target_head=target_head,
+            optimizer_factory=optimizer_factory,
+            run_id="usp-parity",
+            output_dir=os.path.join(workdir, "output"),
+            ttt_length=3,
+            max_len=512,
+            batch_size=1,
+            # Production assembly multiplies one logical accumulation unit by
+            # SP size; two refs per draft-DP shard form one optimizer boundary.
+            accumulation_steps=2,
+            num_epochs=1,
+            max_steps=1,
+            tp_size=2,
+            sp_ulysses_size=2,
+            sp_ring_size=1,
+            use_usp_preprocess=True,
+            seed=0,
+            logger=lambda metrics, step: logged.append((step, dict(metrics))),
+            log_interval=1,
+        )
+        step = trainer.fit()
+        if len(logged) != 1:
+            raise AssertionError(f"rank {rank} expected one logged step, got {logged}")
+
+        topology = trainer.backend.parallel_config
+        result = {
+            "rank": rank,
+            "step": step,
+            "world_size": topology.world_size,
+            "tp_size": topology.tp_size,
+            "sp_size": topology.sp_size,
+            "tp_group_size": dist.get_world_size(get_tp_group()),
+            "draft_sp_group_size": dist.get_world_size(get_draft_sp_group()),
+            "reference_loss": float(expected_loss.item()),
+            "usp_loss": float(logged[0][1]["loss"]),
+            "grad_norm": float(logged[0][1]["grad_norm"]),
+        }
+        with open(os.path.join(workdir, "results", f"rank{rank}.json"), "w") as out:
+            json.dump(result, out)
+    finally:
+        from specforge.distributed import destroy_distributed
+
+        destroy_distributed()
 
 
 @unittest.skipUnless(
-    CUDA and NGPU >= WORLD and _has_usp_flash_attn(),
-    f"requires >={WORLD} GPUs and flash-attn v2 (USP/Ulysses attention path)",
+    CUDA and NGPU >= WORLD_SIZE and _has_standard_flash_attention(),
+    "requires four CUDA devices and the standard flash-attn USP interfaces",
 )
 class TestEquiv4Rank(unittest.TestCase):
-    def test_equiv_tp2_sp2(self):
+    def test_tp2_sp2_trainer_loss_matches_full_sequence_reference(self):
         import torch.multiprocessing as mp
 
-        workdir = tempfile.mkdtemp(prefix="equiv_4rank_")
-        from tests.test_runtime import _fixtures as fx
+        from tests.utils import get_available_port
 
-        # build shared fixtures once (deterministic, seed-fixed)
-        fx.write_draft_config(os.path.join(workdir, "draft.json"))
-        fx.write_target_head_dir(os.path.join(workdir, "target"))
-        fx.write_vocab_mapping(os.path.join(workdir, "vm.pt"))
-        fx.write_offline_files(os.path.join(workdir, "features"), n=8, seq=64)
+        with tempfile.TemporaryDirectory(prefix="equiv_4rank_") as work:
+            fx.write_draft_config(os.path.join(work, "draft.json"))
+            fx.write_target_head_dir(os.path.join(work, "target"))
+            fx.write_vocab_mapping(os.path.join(work, "vm.pt"))
+            fx.write_offline_files(os.path.join(work, "features"), n=4, seq=64, seed=23)
+            os.makedirs(os.path.join(work, "results"))
 
-        results_dir = os.path.join(workdir, "results")
-        os.makedirs(results_dir, exist_ok=True)
-
-        mp.spawn(_worker, args=(WORLD, workdir, results_dir), nprocs=WORLD, join=True)
-
-        results = []
-        for r in range(WORLD):
-            with open(os.path.join(results_dir, f"rank{r}.json")) as f:
-                results.append(json.load(f))
-        self.assertEqual(len(results), WORLD)
-
-        # TrainerCore reports the world-averaged loss, matching production
-        # logging, while the legacy helper leaves each rank's loss local.
-        loss_old_global = sum(res["loss_old"] for res in results) / WORLD
-        for res in results:
-            self.assertEqual(res["world"], WORLD)
-            self.assertEqual(res["tp"], 2)
-            self.assertEqual(res["sp"], 2)
-            self.assertAlmostEqual(
-                loss_old_global,
-                res["loss_new"],
-                places=3,
-                msg=(
-                    f"rank {res['rank']} loss: "
-                    f"old_global={loss_old_global} new={res['loss_new']}"
-                ),
+            mp.spawn(
+                _worker,
+                nprocs=WORLD_SIZE,
+                args=(WORLD_SIZE, get_available_port(), work),
+                join=True,
             )
-            # Unwrapped paths use the same rank-local clipping semantics.
-            self.assertAlmostEqual(
-                res["gn_old"],
-                res["gn_new"],
-                places=2,
-                msg=f"rank {res['rank']} grad_norm: old={res['gn_old']} new={res['gn_new']}",
-            )
+
+            for rank in range(WORLD_SIZE):
+                with open(os.path.join(work, "results", f"rank{rank}.json")) as src:
+                    result = json.load(src)
+                self.assertEqual(result["rank"], rank)
+                self.assertEqual(result["step"], 1)
+                self.assertEqual(result["world_size"], WORLD_SIZE)
+                self.assertEqual(result["tp_size"], 2)
+                self.assertEqual(result["sp_size"], 2)
+                self.assertEqual(result["tp_group_size"], 2)
+                self.assertEqual(result["draft_sp_group_size"], 2)
+                self.assertTrue(
+                    math.isclose(
+                        result["reference_loss"],
+                        result["usp_loss"],
+                        rel_tol=2e-2,
+                        abs_tol=2e-2,
+                    ),
+                    f"rank {rank} full/USP loss mismatch: {result}",
+                )
+                self.assertTrue(math.isfinite(result["grad_norm"]))
+                self.assertGreater(result["grad_norm"], 0.0)
 
 
 if __name__ == "__main__":

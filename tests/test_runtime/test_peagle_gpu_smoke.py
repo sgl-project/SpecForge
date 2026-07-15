@@ -130,11 +130,8 @@ class TestPEagleGpuSmoke(unittest.TestCase):
         torch.cuda.set_device(0)
         self.addCleanup(torch.cuda.empty_cache)
 
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlinePEagleModel,
-        )
+        from specforge.core.peagle import OnlinePEagleModel
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.draft import PEagleDraftModel, resolve_draft
         from specforge.optimizer import BF16Optimizer
 
@@ -145,7 +142,7 @@ class TestPEagleGpuSmoke(unittest.TestCase):
 
             _seed(1234)
             config = AutoDraftModelConfig.from_file(config_path)
-            draft_model = AutoEagle3DraftModel.from_config(
+            draft_model = AutoDraftModel.from_config(
                 config,
                 torch_dtype=torch.bfloat16,
             ).cuda()
@@ -269,7 +266,7 @@ class TestPEagleGpuSmoke(unittest.TestCase):
 
             checkpoint_dir = os.path.join(workdir, "checkpoint")
             draft_model.save_pretrained(checkpoint_dir)
-            reloaded = AutoEagle3DraftModel.from_pretrained(
+            reloaded = AutoDraftModel.from_pretrained(
                 checkpoint_dir,
                 dtype=torch.bfloat16,
             ).cuda()

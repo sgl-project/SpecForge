@@ -1,65 +1,118 @@
-# 💡 Customize Your Own Training
+# Customize a training run
 
-## 🔧 Customize Training Args
+Customization starts from a typed YAML config. Pick the closest checked-in
+file under
+[`examples/configs`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs),
+change model and data paths, and keep the same training entry point:
 
 ```bash
-torchrun \
-    --standalone \
-    --nproc_per_node 8 \
-    ./scripts/train_eagle3.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config ./configs/llama3-8B-eagle3.json \
-    --train-data-path ./cache/dataset/sharegpt.jsonl \
-    --output-dir ./outputs/llama3-8b-eagle3 \
-    --num-epochs 10 \
-    --batch-size 1 \
-    --learning-rate 1e-4 \
-    --max-length 2048 \
-    --chat-template llama3 \
-    --cache-dir ./cache
+specforge train --config ./my-run.yaml
 ```
 
-If you wish to understand what each argument does, you can run `python scripts/train_eagle3.py --help` to see the full list of arguments. Particularly, we will discuss some important arguments below.
-- `--chat-template`: This should be the chat template to use for the model, so please make sure you set it to the correct value.
-- `--cache-dir`: This directory contains the dataset cache including the `input_ids`, `loss_mask`, `attention_mask` and `vocab_mapping`. These caches can make your data loading much faster once a cache is generated. The cache file has a name which is obtained by hashing the dataset path to avoid cache collision.
+For one-off changes, use dotted overrides rather than adding another launcher:
 
-## 💬 Customize Chat Template
+```bash
+specforge train \
+  --config examples/configs/qwen3-8b-eagle3-online.yaml \
+  model.target_model_path=/models/my-target \
+  data.train_data_path=/datasets/my-training-data.jsonl \
+  training.learning_rate=5e-5
+```
 
-You can register a new chat template for your model by adding a new entry to the `TEMPLATE_REGISTRY` in the `specforge.data.template.py` file.
+The config is strict: unknown fields, invalid strategy/topology combinations,
+and unsupported attention backends are errors. See
+[`specforge/config/schema.py`](../../specforge/config/schema.py) and the
+[training guide](../basic_usage/training.md) for the accepted fields.
+
+## Chat templates
+
+Register a text chat template in `TEMPLATE_REGISTRY` in
+`specforge/data/template.py`, then reference its name with
+`data.chat_template`:
 
 ```python
 TEMPLATE_REGISTRY.register(
     name="your-template-name",
     template=ChatTemplate(
-        assistant_header="xxx",
-        user_header="xxx",
-        system_prompt="xxx",
-        end_of_turn_token="xxx",
+        assistant_header="...",
+        user_header="...",
+        system_prompt="...",
+        end_of_turn_token="...",
     ),
 )
 ```
 
-## 🪅 Customize Model
+```yaml
+data:
+  train_data_path: /datasets/my-training-data.jsonl
+  chat_template: your-template-name
+  max_length: 4096
+```
 
-### Customize Target Model
+The unified runtime accepts text input and Qwen2.5-VL input through
+`model.input_modality: qwen2_5_vl`. Multimodal tensors stay inside rollout;
+the control plane retains JSON-safe image/conversation metadata and the
+feature store retains only M-RoPE position IDs. Other multimodal model config
+fields are rejected. Attention backends are a closed, strategy-specific set:
 
-If you wish to train Eagle3 for other models, you need to modify the `--target-model-path` value. We support loading these models directly from HuggingFace.
+| Strategy | Accepted `training.attention_backend` values |
+| --- | --- |
+| EAGLE3 | `sdpa`, `flex_attention`, `fa`, offline `usp` |
+| P-EAGLE | `flex_attention` |
+| DFlash, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
 
-However, if your model is too large and requires tensor parallelism, you can implement its tensor parallel version on your own in the `specforge.modeling.target` directory. The CausalLM model should inherit the `DistributedTargetModel` class in the `specforge.modeling.target.base.py` file and apply `ColumnParallelLinear` and `RowParallelLinear` to its submodules.
+## Target models
+
+For a Hugging Face-compatible target, normally only these model fields need to
+change:
+
+```yaml
+model:
+  target_model_path: organization/model-name
+  target_backend: sglang
+  trust_remote_code: false
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+```
+
+`model.target_backend` is also strategy- and topology-specific. Online
+disaggregation requires `sglang`. A `custom` backend is accepted only for
+EAGLE3 and P-EAGLE; DFlash-family strategies use `sglang` or `hf` where the
+selected topology supports them. For compatibility with the earlier VLM entry,
+`custom` plus `input_modality: qwen2_5_vl` is an observable alias for the
+effective `hf` target backend and emits a warning at assembly time.
+
+Large target models may use a tensor-parallel custom implementation under
+`specforge/modeling/target/custom_backend`. `training.tp_size` defines each
+target capture group. SGLang targets, sharded custom targets, and text EAGLE3's
+supported HF TP path use that group to shard model weights. DFlash and Domino
+with `model.target_backend: hf` do not: every rank loads a complete target
+replica, and `tp_size` only coordinates the shared capture batch and rank-local
+batch partition. A larger world size creates target-DP groups that receive
+disjoint prompt or offline-reference shards.
+
+Colocated text EAGLE3 with SGLang can additionally set
+`model.shard_target_output: true` to return only each target-TP rank's local
+batch partition. Other target paths, including VLM, capture the full target
+batch and partition outputs locally. This output partitioning is independent
+of whether the target model's weights are tensor-sharded.
+
+Follow the existing Transformers `PreTrainedModel` implementations and use
+SpecForge's parallel linear layers where the target model is sharded:
 
 ```python
-from .base import DistributedTargetModel
 from specforge.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 
-class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin, DistributedTargetModel):
+class MyModelForCausalLM(MyModelPreTrainedModel, GenerationMixin):
     ...
 
-    def load_weights(self, state_dict: Dict[str, torch.Tensor]):
+    def load_weights(self, state_dict):
         ...
 ```
 
-Afterwards, you need to register this model to the `AutoEagle3TargetModel` class in the `specforge.modeling.auto.py` file.
+Register the target config class in `AutoDistributedTargetModel` in
+`specforge/modeling/auto.py`, then select `model.target_backend: custom`:
 
 ```diff
 class AutoDistributedTargetModel(AutoModelForCausalLMBase):
@@ -69,50 +122,57 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
     }
 ```
 
-When `tp_size` is greater than 1, the script will automatically load the distributed version of the model for tensor parallelism.
+The target backend implements target inference only. Run orchestration remains
+in the `specforge train` assembly path.
 
-### Customize Draft Model
+EAGLE3 offline sequence parallelism is selected with
+`training.attention_backend: usp` plus `training.sp_ulysses_size` and
+`training.sp_ring_size`. Evaluation, compact-teacher projection, and experiment
+tracking are also config features rather than custom launchers; see the
+[training guide](../basic_usage/training.md) for their validated combinations.
 
-If you want to change the draft model configuration, you can write your own configuration file and pass its path to the `--draft-model-config` argument. Or, if you do not provide the `--draft-model-config` argument, the script will automatically generate the draft model configuration based on the target model configuration. If you wish to serve your customized draft model with SGLang, make sure you implement the draft model in SGLang as well and the architecture name must match. To implement your own draft model, you can create a new class and inherit it from the `Eagle3DraftModel` class in the `specforge.modeling.draft.base.py` file.
+## Draft architectures
 
+Draft classes register through `@register_draft`. The key defaults to the
+class name and must match the single entry in the draft JSON's
+`architectures` list:
 
 ```python
-from .base import Eagle3DraftModel
 from transformers import PretrainedConfig
 
-
-class MyModelConfig(PretrainedConfig):
-    model_type = "mymodel"
-
-    def __init__(self, **kwargs):
-        ...
+from specforge.modeling.draft.base import Eagle3DraftModel
+from specforge.modeling.draft.registry import register_draft
 
 
-class MyModelEagle3(Eagle3DraftModel):
+class MyDraftConfig(PretrainedConfig):
+    model_type = "my-draft"
 
-    config_class = MyModelConfig
 
-    def __init__(self, config, quant_config=None) -> None:
+@register_draft
+class MyEagle3Draft(Eagle3DraftModel):
+    config_class = MyDraftConfig
+
+    def __init__(self, config, **kwargs):
+        super().__init__(config)
         ...
 ```
 
-You can then register these models to the `AutoEagle3TargetModel` and `AutoDraftModelConfig` classes in the `specforge.modeling.auto.py` file for the automatic model loading.
+Import the module from `specforge/modeling/draft/__init__.py` so registration
+runs before config resolution. A minimal draft config then contains:
 
-```diff
-class AutoEagle3DraftModel(AutoModelForCausalLMBase):
-    # the model mapping is currently hardcoded, we should support lazy model mapping via registry
-    _model_mapping = {
-        LlamaConfig: [LlamaForCausalLMEagle3],
-+       MyModelConfig: MyModelEagle3,
-    }
-
-
-class AutoDraftModelConfig:
-
-    _config_mapping = {
-        "LlamaForCausalLMEagle3": LlamaConfig,
-+       "MyModelEagle3": MyModelConfig,
-    }
+```json
+{
+  "architectures": ["MyEagle3Draft"],
+  "model_type": "my-draft",
+  "vocab_size": 128256,
+  "draft_vocab_size": 32000
+}
 ```
 
-In this way, as long as your `config.json` specifies the correct architecture name, the script will automatically load the correct draft model for you.
+Point `model.draft_model_config` at that JSON. `AutoDraftModelConfig` and the
+model assembler resolve both the config and model class from the registry; do
+not add a method-specific training launcher.
+
+An architecture alone does not define a new loss. A genuinely new training
+algorithm also needs a `DraftTrainStrategy` and `StrategySpec` registration in
+`specforge/training/strategies`, plus a corresponding validated strategy value.

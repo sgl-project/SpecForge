@@ -38,14 +38,6 @@ class SGLangTargetEngine(TargetEngine):
         """The underlying sglang ModelRunner."""
         return self._backend.model_runner
 
-    @property
-    def hf_config(self):
-        return self._backend.hf_config
-
-    @property
-    def is_vlm(self) -> bool:
-        return self._backend.is_vlm
-
     @classmethod
     def from_pretrained(
         cls,
@@ -76,6 +68,10 @@ class SGLangTargetEngine(TargetEngine):
         return self.policy.sglang_capture(
             self._backend, input_ids, attention_mask, loss_mask, **kwargs
         )
+
+    def get_rope_index(self, **kwargs):
+        """Return M-RoPE indices for a multimodal target batch."""
+        return self._backend.get_rope_index(**kwargs)
 
     def set_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
         self.capture_layers = layer_ids

@@ -57,6 +57,16 @@ class HFTargetEngine(TargetEngine):
             **kwargs,
         )
 
+    def get_rope_index(self, **kwargs):
+        """Return M-RoPE indices from a Hugging Face VLM."""
+        for candidate in (self.model, getattr(self.model, "model", None)):
+            method = getattr(candidate, "get_rope_index", None)
+            if method is not None:
+                return method(**kwargs)
+        raise AttributeError(
+            f"{type(self.model).__name__} does not expose get_rope_index"
+        )
+
     def set_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
         # config is only needed to derive defaults; explicit ids must not
         # require the wrapped module to expose one (test doubles don't).

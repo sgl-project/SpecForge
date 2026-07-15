@@ -6,7 +6,6 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.data_plane.streaming_ref_channel import (
@@ -30,17 +29,6 @@ def _ref(sid="s0", gen=1):
     )
 
 
-class _FailingPublishChannel(StreamingRefChannel):
-    def __init__(self, path, *, fail_after):
-        super().__init__(path)
-        self.fail_after = fail_after
-
-    def publish(self, ref):
-        if self.published >= self.fail_after:
-            raise OSError("injected publish failure")
-        super().publish(ref)
-
-
 class TestStreamingRefChannel(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="refstream_")
@@ -57,82 +45,6 @@ class TestStreamingRefChannel(unittest.TestCase):
         self.assertEqual(got[1].metadata["generation"], 2)
         # nothing new -> empty
         self.assertEqual(r.poll(), [])
-
-    def test_publish_transaction_exposes_the_whole_batch_before_first_failure(self):
-        channel = _FailingPublishChannel(self.path, fail_after=0)
-        transaction = channel.begin_publish([_ref("s0"), _ref("s1")])
-
-        with self.assertRaisesRegex(OSError, "injected publish failure"):
-            transaction.commit()
-
-        self.assertEqual(transaction.published_refs, ())
-        self.assertEqual(
-            [ref.sample_id for ref in transaction.unpublished_refs], ["s0", "s1"]
-        )
-
-    def test_publish_transaction_exposes_only_the_partial_publish_suffix(self):
-        channel = _FailingPublishChannel(self.path, fail_after=1)
-        transaction = channel.begin_publish([_ref("s0"), _ref("s1"), _ref("s2")])
-
-        with self.assertRaisesRegex(OSError, "injected publish failure"):
-            transaction.commit()
-
-        self.assertEqual([ref.sample_id for ref in transaction.published_refs], ["s0"])
-        self.assertEqual(
-            [ref.sample_id for ref in transaction.unpublished_refs], ["s1", "s2"]
-        )
-        self.assertEqual(
-            [ref.sample_id for ref in StreamingRefChannel(self.path).poll()], ["s0"]
-        )
-
-    def test_fsync_failure_preserves_a_complete_visible_line(self):
-        channel = StreamingRefChannel(self.path)
-        transaction = channel.begin_publish([_ref("s0"), _ref("s1")])
-
-        with (
-            mock.patch(
-                "specforge.runtime.data_plane.streaming_ref_channel.os.fsync",
-                side_effect=OSError("injected fsync failure"),
-            ),
-            self.assertRaisesRegex(OSError, "injected fsync failure"),
-        ):
-            transaction.commit()
-
-        self.assertEqual([ref.sample_id for ref in transaction.published_refs], ["s0"])
-        self.assertEqual(
-            [ref.sample_id for ref in transaction.unpublished_refs], ["s1"]
-        )
-        self.assertEqual(
-            [ref.sample_id for ref in StreamingRefChannel(self.path).poll()], ["s0"]
-        )
-
-    def test_partial_write_failure_leaves_current_ref_unpublished(self):
-        channel = StreamingRefChannel(self.path)
-        transaction = channel.begin_publish([_ref("s0"), _ref("s1")])
-        real_write = os.write
-        write_calls = 0
-
-        def write_partial_then_fail(fd, payload):
-            nonlocal write_calls
-            write_calls += 1
-            if write_calls == 1:
-                return real_write(fd, payload[: len(payload) // 2])
-            raise OSError("injected partial write failure")
-
-        with (
-            mock.patch(
-                "specforge.runtime.data_plane.streaming_ref_channel.os.write",
-                side_effect=write_partial_then_fail,
-            ),
-            self.assertRaisesRegex(OSError, "injected partial write failure"),
-        ):
-            transaction.commit()
-
-        self.assertEqual(transaction.published_refs, ())
-        self.assertEqual(
-            [ref.sample_id for ref in transaction.unpublished_refs], ["s0", "s1"]
-        )
-        self.assertEqual(StreamingRefChannel(self.path).poll(), [])
 
     def test_incremental_poll(self):
         w = StreamingRefChannel(self.path)

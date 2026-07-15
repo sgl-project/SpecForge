@@ -32,81 +32,68 @@ def execute_shell_command(
     enable_hf_mirror: bool = False,
     sglang_use_modelscope: bool = False,
 ):
-    """
-    Execute a shell command and return its process handle.
-    """
+    """Execute a shell command and return its process handle."""
     command = command.replace("\\\n", " ").replace("\\", " ")
-    parts = command.split()
     env = os.environ.copy()
 
     if disable_proxy:
-        env.pop("http_proxy", None)
-        env.pop("https_proxy", None)
-        env.pop("no_proxy", None)
-        env.pop("HTTP_PROXY", None)
-        env.pop("HTTPS_PROXY", None)
-        env.pop("NO_PROXY", None)
+        for name in (
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+        ):
+            env.pop(name, None)
 
     if enable_hf_mirror:
         env["HF_ENDPOINT"] = "https://hf-mirror.com"
     if sglang_use_modelscope:
         env["SGLANG_USE_MODELSCOPE"] = "true"
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
+    return subprocess.Popen(
+        command.split(), text=True, stderr=subprocess.STDOUT, env=env
+    )
 
 
 def wait_for_server(
-    base_url: str, timeout: int = None, disable_proxy: bool = False
+    base_url: str, timeout: int | None = None, disable_proxy: bool = False
 ) -> None:
-    """Wait for the server to be ready by polling the /v1/models endpoint.
-
-    Args:
-        base_url: The base URL of the server
-        timeout: Maximum time to wait in seconds. None means wait forever.
-    """
-    start_time = time.perf_counter()
-
+    """Wait until a server's OpenAI-compatible models endpoint is ready."""
+    started = time.perf_counter()
+    proxy_names = (
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    )
+    saved_proxies = {}
     if disable_proxy:
-        http_proxy = os.environ.pop("http_proxy", None)
-        https_proxy = os.environ.pop("https_proxy", None)
-        no_proxy = os.environ.pop("no_proxy", None)
-        http_proxy_capitalized = os.environ.pop("HTTP_PROXY", None)
-        https_proxy_capitalized = os.environ.pop("HTTPS_PROXY", None)
-        no_proxy_capitalized = os.environ.pop("NO_PROXY", None)
+        saved_proxies = {
+            name: os.environ.pop(name) for name in proxy_names if name in os.environ
+        }
 
-    while True:
-        try:
-            response = requests.get(
-                f"{base_url}/v1/models",
-                headers={"Authorization": "Bearer None"},
-            )
-            if response.status_code == 200:
-                time.sleep(5)
-                print_highlight(
-                    """\n
-                    NOTE: Typically, the server runs in a separate terminal.
-                    In this notebook, we run the server and notebook code together, so their outputs are combined.
-                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
-                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
-                    """
+    try:
+        while True:
+            try:
+                response = requests.get(
+                    f"{base_url}/v1/models",
+                    headers={"Authorization": "Bearer None"},
+                    timeout=5,
                 )
-                break
+                if response.status_code == 200:
+                    time.sleep(5)
+                    print_highlight(
+                        "Server is ready; server and test output may be interleaved."
+                    )
+                    return
+            except requests.exceptions.RequestException:
+                pass
 
-            if timeout and time.perf_counter() - start_time > timeout:
+            if timeout is not None and time.perf_counter() - started > timeout:
                 raise TimeoutError("Server did not become ready within timeout period")
-        except requests.exceptions.RequestException:
             time.sleep(1)
-
-    if disable_proxy:
-        if http_proxy:
-            os.environ["http_proxy"] = http_proxy
-        if https_proxy:
-            os.environ["https_proxy"] = https_proxy
-        if no_proxy:
-            os.environ["no_proxy"] = no_proxy
-        if http_proxy_capitalized:
-            os.environ["HTTP_PROXY"] = http_proxy_capitalized
-        if https_proxy_capitalized:
-            os.environ["HTTPS_PROXY"] = https_proxy_capitalized
-        if no_proxy_capitalized:
-            os.environ["NO_PROXY"] = no_proxy_capitalized
+    finally:
+        os.environ.update(saved_proxies)

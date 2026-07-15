@@ -21,9 +21,10 @@ once per strategy, instead of being hardcoded into every ``build_*`` function:
   * ``make_online_collate``  — the online/streamed collate,
   * ``feature_schema``       — the store-ready dict shape the shared
                                ``PolicyFeatureAdapter`` emits online,
-  * ``make_adapter``         — escape hatch for a bespoke online capture adapter
-                               (None => PolicyFeatureAdapter over feature_schema),
-  * ``supports_online``      — whether an online capture path exists yet.
+  * ``assembly``             — method-owned draft/model/capture/prompt hooks,
+  * ``online_capture``       — explicit shared-policy, server-only, or unsupported
+                               capture semantics,
+  * capability fields       — the modes/backends/modalities accepted by config.
 
 Registering a new model (dflash, domino, ...) is a ``StrategySpec`` entry next
 to its model code — NOT a new family of ``build_*_runtime`` functions. This is
@@ -33,22 +34,46 @@ through here. Builders go from ``topologies x models`` to
 ``topologies + one spec per model``.
 
 Import-light: this module references only the (light) strategy classes; the
-model/dataset-heavy imports (``OfflineEagle3Dataset``, ``DataCollatorWithPadding``,
-``OfflineManifestReader``) stay lazy inside the factory callables so importing
-the registry never drags in a GPU/model environment.
+model/dataset-heavy imports (``process_offline_eagle3_sample``,
+``DataCollatorWithPadding``, ``OfflineManifestReader``) stay lazy inside the
+factory callables so importing the registry never drags in a GPU/model
+environment.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional
 
 import torch
 
 from specforge.inference.adapters.policy import (
     DFLASH_FEATURE_SCHEMA,
     EAGLE3_FEATURE_SCHEMA,
+    EAGLE3_VLM_FEATURE_SCHEMA,
     FeatureSchema,
+)
+from specforge.training.strategies.assembly import (
+    DraftConfigSpec,
+    OnlineCaptureMode,
+    StrategyAssemblySpec,
+    apply_dflash_overrides,
+    build_dflash_model,
+    build_domino_model,
+    build_dspark_model,
+    build_eagle3_draft,
+    build_eagle3_model,
+    build_peagle_draft,
+    build_peagle_model,
+    build_registered_draft,
+    dflash_min_loss_tokens,
+    dflash_needs_input_tools,
+    domino_strategy_kwargs,
+    eagle3_strategy_kwargs,
+    peagle_resume_contract,
+    populate_dflash_generated_config,
+    resolve_dflash_capture_layers,
+    resolve_eagle_capture_layers,
 )
 from specforge.training.strategies.base import (
     DraftTrainStrategy,
@@ -84,6 +109,7 @@ class StrategySpec:
     # (wrapped_model, *, target_head) -> DraftTrainStrategy. Strategies that own
     # their head (e.g. DFlash) accept and ignore target_head.
     make_strategy: Callable[..., DraftTrainStrategy]
+    assembly: StrategyAssemblySpec
     uses_target_head: bool = True
     # Offline data path.
     make_offline_reader: Optional[Callable[..., Any]] = None
@@ -92,12 +118,33 @@ class StrategySpec:
     # Online data path.
     make_online_collate: Optional[Callable[[], Callable]] = None
     # The store-ready dict shape the shared PolicyFeatureAdapter emits online.
-    # None with supports_online=True falls back to the EAGLE3 schema.
     feature_schema: Optional[FeatureSchema] = None
-    # Escape hatch: (target_model, *, device, t2d) -> bespoke capture adapter.
-    # None => PolicyFeatureAdapter over feature_schema.
-    make_adapter: Optional[Callable[..., Any]] = None
-    supports_online: bool = False
+    modality_feature_schemas: Optional[Mapping[str, FeatureSchema]] = None
+    # POLICY selects the shared PolicyFeatureAdapter. SERVER_ONLY requires a
+    # caller-provided server capture source. A bespoke colocated-adapter hook is
+    # intentionally not part of the contract until a strategy needs one.
+    online_capture: OnlineCaptureMode = OnlineCaptureMode.UNSUPPORTED
+    supported_modes: FrozenSet[str] = frozenset({"online"})
+    supported_deployments: FrozenSet[str] = frozenset({"local_colocated"})
+    supported_attention_backends: FrozenSet[str] = frozenset(
+        {"eager", "sdpa", "flex_attention", "fa", "usp"}
+    )
+    supported_target_backends: FrozenSet[str] = frozenset({"sglang", "hf"})
+    supported_modalities: FrozenSet[str] = frozenset({"text"})
+    required_batch_size: Optional[int] = None
+    allows_aux_layer_override: bool = False
+    supports_compact_teacher: bool = False
+    requires_disaggregated_vocab_mapping: bool = False
+    supports_sharded_target_output: bool = False
+
+    @property
+    def supports_online(self) -> bool:
+        return self.online_capture is not OnlineCaptureMode.UNSUPPORTED
+
+    def feature_schema_for(self, modality: str) -> Optional[FeatureSchema]:
+        if self.modality_feature_schemas and modality in self.modality_feature_schemas:
+            return self.modality_feature_schemas[modality]
+        return self.feature_schema
 
 
 _REGISTRY: Dict[str, StrategySpec] = {}
@@ -139,10 +186,37 @@ def _eagle3_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
     )
 
 
-def _eagle3_offline_transform(max_len):
-    from specforge.data.preprocessing import OfflineEagle3Dataset
+def _eagle3_offline_transform(
+    max_len,
+    *,
+    ttt_length=1,
+    use_usp_preprocess=False,
+):
+    from functools import partial
 
-    return lambda raw: OfflineEagle3Dataset.process_data(raw, max_len)
+    if not use_usp_preprocess:
+        from specforge.data.preprocessing import process_offline_eagle3_sample
+
+        return partial(process_offline_eagle3_sample, max_len=max_len)
+
+    import torch.distributed as dist
+
+    from specforge.data.preprocessing import OfflineEagle3Dataset
+    from specforge.distributed import get_draft_sp_group, get_sp_ring_group
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("USP preprocessing requires initialized process groups")
+    sp_group = get_draft_sp_group()
+    ring_group = get_sp_ring_group()
+    return partial(
+        OfflineEagle3Dataset.process_data_usp,
+        max_len=max_len,
+        ttt_length=ttt_length,
+        sp_rank=dist.get_rank(sp_group),
+        sp_size=dist.get_world_size(sp_group),
+        ring_rank=dist.get_rank(ring_group),
+        sp_ring_size=dist.get_world_size(ring_group),
+    )
 
 
 def _eagle3_offline_collate():
@@ -151,18 +225,33 @@ def _eagle3_offline_collate():
     return DataCollatorWithPadding()
 
 
-def _make_eagle3_adapter(target_model, *, device="cuda", t2d=None):
-    from specforge.inference.adapters.eagle3 import SGLangAdapter
-
-    return SGLangAdapter(target_model, device=device, t2d=t2d)
+def _make_eagle3_strategy(wrapped, *, target_head=None, **kwargs):
+    return Eagle3TrainStrategy(wrapped, target_head=target_head, **kwargs)
 
 
 register_strategy(
     StrategySpec(
         name="eagle3",
         required_features=frozenset(Eagle3TrainStrategy.required_features),
-        make_strategy=lambda wrapped, *, target_head=None: Eagle3TrainStrategy(
-            wrapped, target_head=target_head
+        make_strategy=_make_eagle3_strategy,
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="LlamaForCausalLMEagle3",
+                auto_model_type="llama",
+                auto_num_hidden_layers=1,
+                auto_draft_vocab_size=32000,
+                supports_num_hidden_layers_override=True,
+                required_num_hidden_layers=1,
+            ),
+            make_draft_model=build_eagle3_draft,
+            make_model=build_eagle3_model,
+            make_strategy_kwargs=eagle3_strategy_kwargs,
+            resolve_capture_layers=resolve_eagle_capture_layers,
+            vocab_mapping_modes=frozenset({"online", "offline"}),
+            default_dataloader_num_workers=4,
+            allow_missing_warm_start_embedding=True,
+            colocated_target_repr="logits",
+            server_target_repr="hidden_state",
         ),
         uses_target_head=True,
         make_offline_reader=_eagle3_offline_reader,
@@ -170,29 +259,23 @@ register_strategy(
         make_offline_collate=_eagle3_offline_collate,
         make_online_collate=lambda: concat_collate,
         feature_schema=EAGLE3_FEATURE_SCHEMA,
-        make_adapter=_make_eagle3_adapter,
-        supports_online=True,
+        modality_feature_schemas={"qwen2_5_vl": EAGLE3_VLM_FEATURE_SCHEMA},
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_modes=frozenset({"online", "offline"}),
+        supported_deployments=frozenset({"local_colocated", "disaggregated"}),
+        supported_attention_backends=frozenset({"sdpa", "flex_attention", "fa", "usp"}),
+        supported_target_backends=frozenset({"sglang", "hf", "custom"}),
+        supported_modalities=frozenset({"text", "qwen2_5_vl"}),
+        allows_aux_layer_override=True,
+        supports_compact_teacher=True,
+        requires_disaggregated_vocab_mapping=True,
+        supports_sharded_target_output=True,
     )
 )
 
 
 # --- P-EAGLE ----------------------------------------------------------------
-# P-EAGLE consumes the same target features as EAGLE3. The only schema-level
-# difference is the strategy tag on offline refs; the per-step strategy maps
-# hidden_state -> OnlinePEagleModel's hidden_states argument and runs COD loss.
-
-
-def _peagle_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
-    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
-
-    return OfflineManifestReader(
-        hidden_states_path,
-        run_id=run_id,
-        strategy="peagle",
-        ttt_length=ttt_length,
-        max_len=max_len,
-        target_repr="hidden_state",
-    )
+# P-EAGLE consumes the EAGLE3 online capture schema and runs the COD objective.
 
 
 register_strategy(
@@ -202,14 +285,32 @@ register_strategy(
         make_strategy=lambda wrapped, *, target_head=None: PEagleTrainStrategy(
             wrapped, target_head=target_head
         ),
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="PEagleDraftModel",
+                auto_model_type="llama",
+                auto_num_hidden_layers=4,
+                auto_draft_vocab_size=32000,
+                supports_num_hidden_layers_override=True,
+            ),
+            make_draft_model=build_peagle_draft,
+            make_model=build_peagle_model,
+            resume_contract=peagle_resume_contract,
+            resolve_capture_layers=resolve_eagle_capture_layers,
+            vocab_mapping_modes=frozenset({"online"}),
+            default_dataloader_num_workers=4,
+            allow_missing_warm_start_embedding=True,
+            capture_engine_strategy="eagle3",
+            colocated_target_repr="logits",
+        ),
         uses_target_head=True,
-        make_offline_reader=_peagle_offline_reader,
-        make_offline_transform=_eagle3_offline_transform,
-        make_offline_collate=_eagle3_offline_collate,
         make_online_collate=lambda: concat_collate,
         feature_schema=EAGLE3_FEATURE_SCHEMA,
-        make_adapter=_make_eagle3_adapter,
-        supports_online=True,
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_attention_backends=frozenset({"flex_attention"}),
+        supported_target_backends=frozenset({"sglang", "hf", "custom"}),
+        required_batch_size=1,
+        allows_aux_layer_override=True,
     )
 )
 
@@ -217,11 +318,9 @@ register_strategy(
 # --- DFlash -----------------------------------------------------------------
 # DFlash uses its own feature schema ('hidden_states' = the concatenated target
 # capture layers, NO eagle3 aux/target swap, NO target distribution / vocab map).
-# Offline: the reader reuses OfflineManifestReader with dflash feature_keys; the
-# transform slices to max_len (no swap); the collate pads + emits {input_ids,
-# hidden_states, loss_mask}. Online: DFlashAdapter emits the same schema from
-# the DFlash-family target engine. The DFlashTrainStrategy already drops into
-# the unchanged TrainerCore/Backend/Loader.
+# Offline and online use that same contract, so both paths share one transform
+# and collate implementation.  The shared PolicyFeatureAdapter emits the schema
+# from the policy-driven target engine for online runs.
 
 from specforge.training.strategies.base import DFlashTrainStrategy
 
@@ -229,9 +328,6 @@ from specforge.training.strategies.base import DFlashTrainStrategy
 def _dflash_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
     from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 
-    # OfflineManifestReader is schema-agnostic; only its EAGLE3 defaults
-    # (feature_keys/strategy/target_repr) must be overridden. DFlash has no target
-    # distribution, so target_repr=None (only stored in ref metadata).
     return OfflineManifestReader(
         hidden_states_path,
         run_id=run_id,
@@ -243,37 +339,20 @@ def _dflash_offline_reader(hidden_states_path, *, run_id, ttt_length, max_len):
     )
 
 
-def _dflash_process_data(raw, max_len):
-    """Offline DFlash per-sample normalization.
+def _dflash_offline_transform(max_len, **_topology):
+    from functools import partial
 
-    Slices to ``max_len`` and restores a leading batch dim. NO eagle3-style
-    aux->input / hidden->target swap and NO last-position loss zeroing (the online
-    DFlash path does neither), so offline matches online training.
-    """
-    input_ids = raw["input_ids"][:max_len]
-    loss_mask = raw["loss_mask"][:max_len]
-    hidden_states = raw["hidden_states"]
-    if hidden_states.dim() == 3:  # stored as [1, seq, W]; drop the saved batch dim
-        hidden_states = hidden_states.squeeze(0)
-    hidden_states = hidden_states[:max_len]
-    return {
-        "input_ids": input_ids[None, :],
-        "loss_mask": loss_mask[None, :],
-        "hidden_states": hidden_states[None, :, :],
-    }
+    from specforge.data.preprocessing import process_offline_dflash_sample
+
+    return partial(process_offline_dflash_sample, max_len=max_len)
 
 
-def _dflash_offline_transform(max_len):
-    return lambda raw: _dflash_process_data(raw, max_len)
-
-
-def _dflash_offline_collate():
+def _dflash_collate():
     """Right-pad ragged samples to the batch max length and concat along batch.
 
     DataCollatorWithPadding is eagle3-specific (hardwires attention_mask + the
     hidden_state/target keys), so DFlash uses this minimal collate. loss_mask is
-    zero-padded, so padded positions contribute no loss. (Single-rank; no SP
-    sharding multiple — sequence-parallel offline DFlash is a follow-up.)
+    zero-padded, so padded positions contribute no loss.
     """
 
     def collate(feats):
@@ -304,25 +383,39 @@ def _dflash_offline_collate():
     return collate
 
 
-def _make_dflash_adapter(target_model, *, device="cuda", t2d=None):
-    from specforge.inference.adapters.dflash import DFlashAdapter
-
-    return DFlashAdapter(target_model, device=device, t2d=t2d)
-
-
 register_strategy(
     StrategySpec(
         name="dflash",
         required_features=frozenset(DFlashTrainStrategy.required_features),
         make_strategy=lambda wrapped, *, target_head=None: DFlashTrainStrategy(wrapped),
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="DFlashDraftModel",
+                expected_auto_map_model="dflash.DFlashDraftModel",
+                auto_model_type="qwen3",
+                auto_num_hidden_layers=1,
+                populate_generated=populate_dflash_generated_config,
+                apply_overrides=apply_dflash_overrides,
+                supports_num_hidden_layers_override=True,
+                supports_block_size_override=True,
+            ),
+            make_draft_model=build_registered_draft,
+            make_model=build_dflash_model,
+            min_loss_tokens=dflash_min_loss_tokens,
+            needs_input_tools=dflash_needs_input_tools,
+            resolve_capture_layers=resolve_dflash_capture_layers,
+            default_dataloader_num_workers=8,
+        ),
         uses_target_head=False,
         make_offline_reader=_dflash_offline_reader,
         make_offline_transform=_dflash_offline_transform,
-        make_offline_collate=_dflash_offline_collate,
-        make_online_collate=_dflash_offline_collate,
+        make_offline_collate=_dflash_collate,
+        make_online_collate=_dflash_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,
-        make_adapter=_make_dflash_adapter,
-        supports_online=True,
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_modes=frozenset({"online", "offline"}),
+        supported_deployments=frozenset({"local_colocated", "disaggregated"}),
+        supported_attention_backends=frozenset({"eager", "sdpa", "flex_attention"}),
     )
 )
 
@@ -368,32 +461,38 @@ def _dspark_online_collate():
     return collate
 
 
-def _dspark_server_capture_only_adapter(*args, **kwargs):
-    raise NotImplementedError(
-        "DSpark online training is wired only for the disaggregated "
-        "server-capture path through `specforge train` with "
-        "training.deployment_mode=disaggregated."
-    )
-
-
 register_strategy(
     StrategySpec(
         name="dspark",
         required_features=frozenset(DSparkTrainStrategy.required_features),
         make_strategy=lambda wrapped, *, target_head=None: DSparkTrainStrategy(wrapped),
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="DSparkDraftModel",
+                expected_auto_map_model="dspark.DSparkDraftModel",
+            ),
+            make_draft_model=build_registered_draft,
+            make_model=build_dspark_model,
+            min_loss_tokens=dflash_min_loss_tokens,
+            needs_input_tools=dflash_needs_input_tools,
+            resolve_capture_layers=resolve_dflash_capture_layers,
+            default_dataloader_num_workers=8,
+            server_target_repr="hidden_state",
+        ),
         uses_target_head=False,
         make_online_collate=_dspark_online_collate,
-        make_adapter=_dspark_server_capture_only_adapter,
-        supports_online=True,
+        online_capture=OnlineCaptureMode.SERVER_ONLY,
+        supported_deployments=frozenset({"disaggregated"}),
+        supported_attention_backends=frozenset({"eager", "sdpa", "flex_attention"}),
     )
 )
 
 
 # --- Domino -----------------------------------------------------------------
-# Domino uses a DFlash-family draft model and reuses the DFlash feature schema,
-# offline transform/collate, and capture path (same DFLASH_FEATURE_SCHEMA ->
-# hidden_states). The loss blends a base loss with a step-decayed weight, so
-# DominoTrainStrategy reads the StepContext (forward_loss(batch, ctx)).
+# Domino uses a DFlash-family draft model and reuses the DFlash offline/online
+# feature schema, transform and collate. The loss blends a base loss with a
+# step-decayed weight, so DominoTrainStrategy reads the StepContext
+# (forward_loss(batch, ctx)).
 
 from specforge.training.strategies.base import DominoTrainStrategy
 
@@ -425,20 +524,36 @@ register_strategy(
         name="domino",
         required_features=frozenset(DominoTrainStrategy.required_features),
         make_strategy=_make_domino_strategy,
+        assembly=StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(
+                architecture="DominoDraftModel",
+                expected_auto_map_model="domino.DominoDraftModel",
+            ),
+            make_draft_model=build_registered_draft,
+            make_model=build_domino_model,
+            make_strategy_kwargs=domino_strategy_kwargs,
+            min_loss_tokens=dflash_min_loss_tokens,
+            needs_input_tools=dflash_needs_input_tools,
+            resolve_capture_layers=resolve_dflash_capture_layers,
+            default_dataloader_num_workers=8,
+        ),
         uses_target_head=False,
         make_offline_reader=_domino_offline_reader,
-        make_offline_transform=_dflash_offline_transform,  # same schema as DFlash
-        make_offline_collate=_dflash_offline_collate,
-        make_online_collate=_dflash_offline_collate,
+        make_offline_transform=_dflash_offline_transform,
+        make_offline_collate=_dflash_collate,
+        make_online_collate=_dflash_collate,
         feature_schema=DFLASH_FEATURE_SCHEMA,  # same capture path as DFlash
-        make_adapter=_make_dflash_adapter,
-        supports_online=True,
+        online_capture=OnlineCaptureMode.POLICY,
+        supported_modes=frozenset({"online", "offline"}),
+        supported_deployments=frozenset({"local_colocated", "disaggregated"}),
+        supported_attention_backends=frozenset({"eager", "sdpa", "flex_attention"}),
     )
 )
 
 
 __all__ = [
     "StrategySpec",
+    "OnlineCaptureMode",
     "concat_collate",
     "register_strategy",
     "resolve_strategy",

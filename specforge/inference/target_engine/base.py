@@ -8,27 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TargetEngine: the backend-agnostic target-model abstraction (Phase B).
 
-This is the de-EAGLE3'd boundary extracted from the former ``Eagle3TargetModel``
-ABC. A ``TargetEngine`` wraps a *frozen* target model and exposes ONE generic
-extraction entry point, :meth:`capture`, plus a real ``backend`` tag. The
-inference/transport split (sglang in-process / hf / custom / sglang_server) is a
-*backend* axis **under** each algorithm engine, and — crucially — the
-sglang-version-specific glue lives behind a replaceable capture backend
-(``sglang_backend``), NOT in the algorithm engine, so a sglang bump touches one
-place instead of every ``*TargetModel`` subclass.
-
-Two sibling algorithm engines subclass this ABC:
-
-* :class:`Eagle3TargetEngine` (``eagle3_target_model``) — EAGLE3 TTT capture
-  (aux hidden states + logits), keeps the EAGLE3-specific
-  ``set_aux_hidden_states_layers`` / ``generate_eagle3_data``.
-* :class:`DFlashTargetEngine` (``dflash_target_model``) — DFlash block capture
-  (concatenated layer hidden states, no target distribution).
-
-The runtime inference adapters (``SGLangAdapter`` / ``DFlashAdapter``) wrap a
-``TargetEngine`` and remain the ``FeatureSource`` seam to the ``RolloutWorker`` —
-they are unchanged by this extraction; they call the generic engine and read the
-now-real ``.backend`` tag in ``health()``.
+``TargetEngine`` wraps a frozen target model and exposes one generic
+:meth:`capture` entry point. Algorithm-specific extraction is supplied by a
+``TargetCapturePolicy``; backend-specific loading is supplied by the generic HF,
+SGLang, and custom engine classes.
 """
 
 from __future__ import annotations
@@ -38,21 +21,16 @@ from typing import Any, List, Optional
 
 import torch
 
-# Known transport/backend tags. ``sglang_server`` (a live frozen-target SGLang
-# server, cross-node) is introduced by the sglang-capture-backend PR; its capture
-# depth is gated by the O1.3 spike. The tag set is advisory (informational, used
-# by adapter health + provenance), not an enum the ABC enforces.
-KNOWN_BACKENDS = ("sglang", "hf", "custom", "sglang_server")
+# The live disaggregated capture server is a FeatureSource transport, not a
+# second TargetEngine backend.
+KNOWN_BACKENDS = ("sglang", "hf", "custom")
 
 
 class TargetEngine(ABC):
     """Backend-agnostic frozen-target engine.
 
-    Subclasses are organised on two axes: the *algorithm* (EAGLE3 / DFlash —
-    the intermediate ABCs :class:`Eagle3TargetEngine` / :class:`DFlashTargetEngine`)
-    and the *backend/transport* (sglang / hf / custom / sglang_server — the
-    concrete leaf classes). Only the leaf classes are instantiable; each sets a
-    real :attr:`backend` tag.
+    Concrete subclasses implement a backend (SGLang, Hugging Face, or custom);
+    their capture policy supplies the strategy-specific extraction.
     """
 
     #: Transport tag; concrete leaf engines override this class attribute
@@ -82,21 +60,16 @@ class TargetEngine(ABC):
     ) -> Any:
         """Run the frozen target forward and extract training features.
 
-        The generic extraction entry point that replaces the EAGLE3-named
-        ``generate_eagle3_data``. Returns a per-algorithm output dataclass
-        (``Eagle3TargetOutput`` / ``DFlashTargetOutput``). Algorithm engines keep
-        their original ``generate_*_data`` method as the concrete implementation
-        and as a back-compat alias; ``capture`` simply dispatches to it, so the
-        extraction is byte-identical to the pre-refactor path.
+        Returns a typed ``TargetCaptureBatch`` supplied by the active capture
+        policy.
         """
 
     def set_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
         """Select which target layers' hidden states to capture.
 
-        The generic hook. EAGLE3 maps this onto its 3 aux layers
-        (``set_aux_hidden_states_layers``); DFlash captures an arbitrary list.
-        Engines that do not capture intermediate layers may leave this
-        unimplemented.
+        The active capture policy validates this list. EAGLE3 requires three
+        auxiliary layers, while DFlash accepts an arbitrary list. Engines that
+        do not capture intermediate layers may leave this unimplemented.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement set_capture_layers"

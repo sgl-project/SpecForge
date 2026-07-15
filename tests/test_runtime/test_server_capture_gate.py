@@ -318,11 +318,8 @@ class TestServerCaptureGate(unittest.TestCase):
         self._train_step(fetched, head)
 
     def _train_step(self, fetched, head):
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
-        )
+        from specforge.core.eagle3 import OnlineEagle3Model
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -335,7 +332,7 @@ class TestServerCaptureGate(unittest.TestCase):
         draft_cfg = AutoDraftModelConfig.from_file(
             fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
         )
-        dm = AutoEagle3DraftModel.from_config(
+        dm = AutoDraftModel.from_config(
             draft_cfg, attention_backend="sdpa", torch_dtype=torch.bfloat16
         ).cuda()
         dm.load_vocab_mapping(

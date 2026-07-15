@@ -1,11 +1,11 @@
 # coding=utf-8
-"""Launcher path (Domino): build_{offline,online}_runtime(strategy="domino").
+"""Domino strategy schedule and canonical online launcher.
 
 Domino is the third algorithm on the composable launch. Beyond a StrategySpec it
 needs exactly one shared-contract extension: its loss blends a base loss with a
 step-decayed weight, so DominoTrainStrategy reads the StepContext threaded through
-forward_loss. These tests prove (1) the lambda schedule logic (CPU), and (2) that
-domino trains end-to-end offline and online through the same runtime spine (GPU).
+forward_loss. These tests prove the lambda schedule logic on CPU and that Domino
+trains end to end through the typed online runtime on GPU.
 """
 
 import os
@@ -42,10 +42,9 @@ class TestDominoLambdaSchedule(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(CUDA, "Domino launcher FSDP path requires CUDA")
+@unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
 class TestDominoOfflineLaunch(unittest.TestCase):
-    def test_offline_domino_trains_through_fsdp(self):
-        torch.manual_seed(0)
+    def test_domino_trains_from_precomputed_dflash_features(self):
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29571")
@@ -55,54 +54,52 @@ class TestDominoOfflineLaunch(unittest.TestCase):
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
 
-        HIDDEN, SEQ, N, MAX_OPT_STEPS = 64, 32, 4, 2
-        workdir = tempfile.mkdtemp(prefix="domino_launch_")
-        # domino reuses the DFlash offline feature schema {input_ids, hidden_states, loss_mask}
-        feat_dir = fx.write_offline_files_dflash(
-            os.path.join(workdir, "features"), n=N, seq=SEQ, hidden=HIDDEN
+        hidden, sequence_length = 64, 32
+        workdir = tempfile.mkdtemp(prefix="domino_offline_")
+        feature_dir = fx.write_offline_files_dflash(
+            os.path.join(workdir, "features"),
+            n=4,
+            seq=sequence_length,
+            hidden=hidden,
         )
-        domino_model, width, _td, _layers = fx.build_domino(
+        model, width, _target_dir, _layers = fx.build_domino(
             workdir,
-            hidden=HIDDEN,
+            hidden=hidden,
             block_size=4,
             num_anchors=8,
             attention_backend="sdpa",
         )
-        self.assertEqual(width, HIDDEN)
+        self.assertEqual(width, hidden)
 
-        def optimizer_factory(draft_module):
+        def optimizer_factory(module):
             return BF16Optimizer(
-                draft_module,
+                module,
                 lr=1e-3,
                 max_grad_norm=0.5,
                 warmup_ratio=0.0,
-                total_steps=10,
+                total_steps=2,
             )
 
-        trainer, loader = build_offline_runtime(
+        trainer = build_offline_runtime(
             strategy="domino",
-            hidden_states_path=feat_dir,
-            eagle3_model=domino_model,
+            hidden_states_path=feature_dir,
+            draft_model=model,
             target_head=None,
             optimizer_factory=optimizer_factory,
             run_id="domino-offline",
             output_dir=os.path.join(workdir, "out"),
-            max_len=SEQ,
+            max_len=sequence_length,
             batch_size=1,
-            num_epochs=3,
-            max_steps=MAX_OPT_STEPS,
+            num_epochs=1,
+            max_steps=2,
+            total_steps=2,
+            strategy_kwargs={"lambda_start": 1.0, "decay_ratio": 0.5},
         )
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
-
-        step = trainer.fit(loader)
-
-        self.assertEqual(step, MAX_OPT_STEPS)
-        self.assertTrue(
-            all(torch.isfinite(p).all() for p in module.parameters()),
-            "draft params became non-finite — loss was NaN/inf?",
-        )
+        self.assertEqual(trainer.fit(), 2)
+        self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 
 
 @unittest.skipUnless(CUDA, "Domino online launcher path requires CUDA")
@@ -115,8 +112,8 @@ class TestDominoOnlineLaunch(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+        from specforge.inference.target_engine import get_target_engine
         from specforge.launch import build_online_runtime
-        from specforge.modeling.target import get_target_engine
         from specforge.optimizer import BF16Optimizer
 
         HIDDEN, V, SEQ, ACC, MAX_OPT_STEPS, N = 64, fx.V, 16, 2, 2, 8
@@ -162,30 +159,29 @@ class TestDominoOnlineLaunch(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader, workers, controller, run_interleaved = build_online_runtime(
+        trainer = build_online_runtime(
             strategy="domino",
             target_model=target,
             prompts=prompts,
-            eagle3_model=domino_model,
+            draft_model=domino_model,
             optimizer_factory=optimizer_factory,
             run_id="domino-online",
             output_dir=os.path.join(workdir, "out"),
             target_hidden_size=HIDDEN,
             batch_size=1,
             accumulation_steps=ACC,
-            num_epochs=1,
             max_steps=MAX_OPT_STEPS,
         )
 
-        self.assertEqual(controller.sample_queue.depth(), 0)
+        self.assertEqual(trainer.dataflow_controller.sample_queue.depth(), 0)
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
 
-        step = run_interleaved()
+        step = trainer.fit()
         self.assertEqual(step, MAX_OPT_STEPS)
-        self.assertEqual(loader.queue.produced_count, ACC * MAX_OPT_STEPS)
-        self.assertLessEqual(loader.queue.peak_resident_samples, 1)
+        self.assertEqual(trainer.rollout_stream.produced_count, ACC * MAX_OPT_STEPS)
+        self.assertLessEqual(trainer.rollout_stream.peak_resident_samples, 1)
         self.assertTrue(
             all(torch.isfinite(p).all() for p in module.parameters()),
             "draft params became non-finite — loss was NaN/inf?",

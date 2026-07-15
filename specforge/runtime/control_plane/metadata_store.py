@@ -6,15 +6,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""MetadataStore: the durability seam for recovery-critical control-plane state.
+"""MetadataStore: the durable ledger for one disaggregated training attempt.
 
-The controller's *recovery-critical* state — committed sample dedup and the
-at-least-once durable ack transaction (``{acked sample_ids, global_step,
-optimizer-durable marker}``) — lives behind this interface rather than in inline
-dicts. The current implementation ships ``InMemoryMetadataStore``; a SQLite
-(dev) or Redis/DB (prod) backend is then a *new subclass*, not a
-method-by-method rewrite of the controller. The single durable transaction
-(``record_train_ack``) is the unit a restart reconciles release state from.
+Committed-sample dedup and trainer acknowledgements live behind this interface
+rather than in controller-local dictionaries. Online attempts use the SQLite
+implementation as their single cross-process ledger; colocated runs use the
+lightweight in-memory or no-op implementations.
 
 Dependency-light (stdlib only) so it stays importable without torch.
 """
@@ -22,13 +19,13 @@ Dependency-light (stdlib only) so it stays importable without torch.
 from __future__ import annotations
 
 import abc
-import dataclasses
 import json
 import sqlite3
 import threading
 from typing import Any, Dict, List, Optional, Set
 
-from specforge.runtime.contracts import FeatureSpec, SampleRef
+from specforge.runtime.contracts import SampleRef
+from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
 
 
 class MetadataStore(abc.ABC):
@@ -47,8 +44,7 @@ class MetadataStore(abc.ABC):
     def committed_count(self) -> int: ...
 
     @abc.abstractmethod
-    def all_committed_ids(self) -> List[str]:
-        """Every committed sample_id. Restart reconciliation iterates this."""
+    def all_committed_ids(self) -> List[str]: ...
 
     # -- durable ack transaction -------------------------------------------
     @abc.abstractmethod
@@ -59,11 +55,7 @@ class MetadataStore(abc.ABC):
         global_step: Optional[int],
         optimizer_durable: bool,
     ) -> None:
-        """Commit {acked sample_ids, global_step, optimizer-durable marker} atomically.
-
-        Release state is *derived* from this on restart — it is the single
-        transaction recovery reconciles against; never split it.
-        """
+        """Commit the ack ids and optimizer-step marker atomically."""
 
     @abc.abstractmethod
     def durable_marker(self) -> Dict[str, Any]:
@@ -102,7 +94,7 @@ class InMemoryMetadataStore(MetadataStore):
 
     def all_committed_ids(self) -> List[str]:
         with self._lock:
-            return list(self._committed.keys())
+            return list(self._committed)
 
     def record_train_ack(
         self,
@@ -131,9 +123,8 @@ class NoOpMetadataStore(MetadataStore):
     """MetadataStore implementation for ``local_colocated`` runs.
 
     It retains no committed refs or ack marker. ``commit_sample`` always reports
-    a fresh ref so the existing controller path still enqueues it; status and
-    recovery surfaces stay empty. Use a retaining store for cross-process or
-    restart-reconcilable runs.
+    a fresh ref so the controller still enqueues it. Use a retaining store for
+    cross-process runs.
     """
 
     def commit_sample(self, ref: SampleRef) -> bool:
@@ -164,61 +155,8 @@ class NoOpMetadataStore(MetadataStore):
         return {"acked": set(), "global_step": None, "optimizer_durable": False}
 
 
-# ---------------------------------------------------------------------------
-# SampleRef <-> JSON (the only metadata-store payload that needs persisting)
-# ---------------------------------------------------------------------------
-def sample_ref_to_json(ref: SampleRef) -> str:
-    # asdict() recurses into the nested FeatureSpec dataclasses + dicts; tuples
-    # (FeatureSpec.shape) degrade to lists, which from_json restores.
-    return json.dumps(dataclasses.asdict(ref))
-
-
-def sample_ref_from_json(blob: str) -> SampleRef:
-    d = json.loads(blob)
-    specs = {
-        name: FeatureSpec(
-            name=s["name"],
-            shape=tuple(s["shape"]),
-            dtype=s["dtype"],
-            device_hint=s.get("device_hint"),
-            required=s.get("required", True),
-            target_repr=s.get("target_repr"),
-            target_meta=s.get("target_meta", {}),
-        )
-        for name, s in d.get("feature_specs", {}).items()
-    }
-    return SampleRef(
-        sample_id=d["sample_id"],
-        run_id=d["run_id"],
-        source_task_id=d.get("source_task_id"),
-        feature_store_uri=d["feature_store_uri"],
-        feature_keys=d.get("feature_keys", {}),
-        feature_specs=specs,
-        strategy=d["strategy"],
-        schema_version=d.get("schema_version", 1),
-        target_model_version=d.get("target_model_version", "unknown"),
-        draft_weight_version=d.get("draft_weight_version"),
-        tokenizer_version=d.get("tokenizer_version", "unknown"),
-        num_tokens=d.get("num_tokens", 0),
-        estimated_bytes=d.get("estimated_bytes", 0),
-        metadata=d.get("metadata", {}),
-    )
-
-
 class SQLiteMetadataStore(MetadataStore):
-    """Durable metadata store: committed refs + the single ack transaction.
-
-    This is the recovery floor B4 requires: after a crash a fresh controller
-    reopens the same DB file and reconstructs *exactly* the durable state — the
-    committed refs and the ``{acked sample_ids, global_step, optimizer_durable}``
-    marker — so it matches today's checkpoint+seek resume rather than regressing
-    it. Release state is *derived* from this marker, never stored separately, so
-    it can never disagree with the optimizer step (the bug B4 names).
-
-    Same in-process API as ``InMemoryMetadataStore``; the controller does not
-    know which backend it holds. SQLite is the dev/single-host durable tier;
-    Redis/DB is a later subclass behind the same interface.
-    """
+    """SQLite ledger shared by the ranks of one online consumer attempt."""
 
     def __init__(self, path: str) -> None:
         # check_same_thread=False + a guard lock: one connection, serialized.
@@ -246,7 +184,7 @@ class SQLiteMetadataStore(MetadataStore):
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO committed (sample_id, ref_json) VALUES (?, ?)",
-                (ref.sample_id, sample_ref_to_json(ref)),
+                (ref.sample_id, json.dumps(ref_to_dict(ref))),
             )
             self._conn.commit()
             return cur.rowcount == 1  # 0 == duplicate (idempotent, at-least-once)
@@ -263,7 +201,7 @@ class SQLiteMetadataStore(MetadataStore):
             row = self._conn.execute(
                 "SELECT ref_json FROM committed WHERE sample_id = ?", (sample_id,)
             ).fetchone()
-        return sample_ref_from_json(row[0]) if row else None
+        return ref_from_dict(json.loads(row[0])) if row else None
 
     def committed_count(self) -> int:
         with self._lock:
@@ -271,11 +209,12 @@ class SQLiteMetadataStore(MetadataStore):
 
     def all_committed_ids(self) -> List[str]:
         with self._lock:
-            # rowid order == commit (insertion) order, matching InMemory's dict.
-            rows = self._conn.execute(
-                "SELECT sample_id FROM committed ORDER BY rowid"
-            ).fetchall()
-        return [r[0] for r in rows]
+            return [
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT sample_id FROM committed ORDER BY rowid"
+                ).fetchall()
+            ]
 
     def record_train_ack(
         self,
@@ -284,8 +223,7 @@ class SQLiteMetadataStore(MetadataStore):
         global_step: Optional[int],
         optimizer_durable: bool,
     ) -> None:
-        # ONE transaction commits {acked ids, global_step, optimizer marker}
-        # together — never split, so a restart reconciles against a single fact.
+        # ONE transaction commits ack ids and the optimizer marker together.
         with self._lock:
             self._conn.executemany(
                 "INSERT OR IGNORE INTO acked (sample_id) VALUES (?)",
@@ -327,6 +265,4 @@ __all__ = [
     "InMemoryMetadataStore",
     "NoOpMetadataStore",
     "SQLiteMetadataStore",
-    "sample_ref_to_json",
-    "sample_ref_from_json",
 ]

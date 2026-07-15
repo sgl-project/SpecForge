@@ -5,16 +5,16 @@ The multi-server topology: ``build_disagg_online_producer(feature_source=[...])`
 builds one RolloutWorker per SGLangServerCaptureAdapter (1 server : 1 adapter :
 1 worker), all leasing DISJOINT prompts from the one controller and publishing
 into the one channel, concurrently. Each stub ``post_fn`` stands in for one
-patched SGLang server writing into the SHARED fake Mooncake backend — exactly
-the shape of ``examples/disagg/run_qwen3.6_27b_dflash_disagg_multiserver.sh``.
+patched SGLang server writing into the shared fake Mooncake backend — the same
+topology configured through ``specforge train`` producer and consumer roles.
 
 Covers the failure matrix the single-server path never hits:
 - disjoint + complete production across two live servers;
 - one dead server: its leases fail retryable, the survivor re-leases and
   finishes the pool (no truncation, no hang);
-- all servers dead: loud RuntimeError, channel still closed;
-- a poisoned prompt (server rejects it every time): terminal after
-  ``max_prompt_attempts`` instead of spinning the drained-detection loop.
+- all servers dead: loud RuntimeError and a failure sentinel;
+- a poisoned prompt (server rejects it every time): terminal failure after
+  ``max_prompt_attempts`` instead of a partial-success EOF.
 """
 
 import os
@@ -60,6 +60,7 @@ def _adapter(store, post_fn, url="http://server:30000"):
 
 
 def _build(adapters, prompts, store, channel, **kw):
+    channel.publish_consumer_quantum(kw.pop("consumer_quantum", 1))
     return build_disagg_online_producer(
         strategy="dflash",
         feature_source=adapters,
@@ -102,6 +103,9 @@ class TestMultiServerProducer(unittest.TestCase):
         produced = drive()
         self.assertEqual(produced, N)
         self.assertTrue(channel.is_closed())
+        # A disaggregated producer publishes refs directly to the channel. It
+        # must not retain a second local training queue/ledger.
+        self.assertIsNone(workers[0].controller.sample_queue)
 
         ids = _published_sample_ids(channel.path)
         self.assertEqual(len(ids), N)
@@ -122,6 +126,25 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertEqual(by_server.get("http://server0:30000"), seen0)
         self.assertEqual(by_server.get("http://server1:30001"), seen1)
 
+    def test_watermark_must_cover_one_consumer_optimizer_window(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(4),
+            store,
+            channel,
+            consumer_quantum=4,
+            in_flight_high_watermark=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "optimizer-step quantum 4"):
+            drive()
+        self.assertEqual(channel.published, 0)
+        self.assertIn("high watermark", channel.failure())
+
     def test_producer_profiling_handles_first_round_without_backpressure(self):
         backend = _FakeMooncakeStore()
         stub = _StubCaptureServer(backend)
@@ -136,6 +159,92 @@ class TestMultiServerProducer(unittest.TestCase):
 
         self.assertEqual(produced, 2)
         self.assertTrue(channel.is_closed())
+
+    def test_byte_watermark_resumes_after_durable_consumer_ack(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            lease=1,
+            resident_high_watermark_bytes=1,
+            resident_low_watermark_bytes=0,
+        )
+
+        outcome = {}
+
+        def run_producer():
+            try:
+                outcome["produced"] = drive()
+            except BaseException as exc:  # expose a thread failure to the test
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run_producer, daemon=True)
+        thread.start()
+        reader = StreamingRefChannel(channel.path)
+        consumed = 0
+        observed_pauses = []
+        deadline = time.monotonic() + 10
+        while consumed < 3 and time.monotonic() < deadline:
+            refs = reader.poll()
+            if refs:
+                pause_deadline = time.monotonic() + 2
+                while time.monotonic() < pause_deadline:
+                    snapshot = drive.flow_control.snapshot(
+                        in_flight_refs=channel.in_flight_remote(),
+                        resident_bytes=sum(ref.estimated_bytes for ref in refs),
+                    )
+                    if snapshot["paused"]:
+                        break
+                    time.sleep(0.001)
+                observed_pause = snapshot["paused"]
+                # RefDistributor forwards this source-channel acknowledgement
+                # only after the inbox ack follows the durable optimizer marker.
+                reader.mark_consumed(len(refs))
+                consumed += len(refs)
+                observed_pauses.append(observed_pause)
+            else:
+                time.sleep(0.001)
+        thread.join(5)
+
+        self.assertFalse(thread.is_alive(), "producer stayed byte-throttled")
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome.get("produced"), 3)
+        self.assertEqual(consumed, 3)
+        self.assertEqual(observed_pauses, [True, True, True])
+        self.assertTrue(channel.is_closed())
+        snapshot = drive.flow_control.snapshot(
+            in_flight_refs=channel.in_flight_remote(), resident_bytes=0
+        )
+        self.assertGreaterEqual(snapshot["pause_transitions"], 1)
+        self.assertGreaterEqual(snapshot["resume_transitions"], 1)
+
+    def test_hard_byte_cap_aborts_unpublished_capture_and_fails_channel(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(1),
+            store,
+            channel,
+            lease=1,
+            feature_store_max_resident_bytes=1,
+        )
+
+        with self.assertRaisesRegex(MemoryError, "hard cap exceeded"):
+            drive()
+
+        self.assertEqual(channel.published, 0)
+        self.assertEqual(_published_refs(channel.path), [])
+        self.assertFalse(channel.is_closed())
+        self.assertIn("MemoryError", channel.failure())
+        self.assertEqual(backend._d, {})
 
     def test_prompt_epochs_republish_with_unique_sample_ids(self):
         backend = _FakeMooncakeStore()
@@ -218,8 +327,8 @@ class TestMultiServerProducer(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             drive(max_rounds=10_000)
-        # EOF still reaches the consumer — a crashed producer must not hang it.
-        self.assertTrue(channel.is_closed())
+        self.assertFalse(channel.is_closed())
+        self.assertIn("RuntimeError", channel.failure())
 
     def test_poisoned_prompt_goes_terminal_not_infinite(self):
         # PR654 known rough edge: an all-failed round used to read as
@@ -239,11 +348,12 @@ class TestMultiServerProducer(unittest.TestCase):
             lease=2,
             max_prompt_attempts=3,
         )
-        produced = drive(max_rounds=10_000)
-        self.assertEqual(produced, N - 1)  # p0 terminal, everything else through
+        with self.assertRaisesRegex(RuntimeError, "terminally failed prompt"):
+            drive(max_rounds=10_000)
         ids = _published_sample_ids(channel.path)
         self.assertEqual(set(ids), {f"run0:p{i}" for i in range(1, N)})
-        self.assertTrue(channel.is_closed())
+        self.assertFalse(channel.is_closed())
+        self.assertIn("terminally failed prompt", channel.failure())
 
     def test_source_count_worker_count_conflict_raises(self):
         backend = _FakeMooncakeStore()

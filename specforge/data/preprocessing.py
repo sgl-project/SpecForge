@@ -31,10 +31,9 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
-
-from datasets import Dataset as HFDataset
 
 from ..distributed import get_draft_sp_group, get_sp_ring_group
 

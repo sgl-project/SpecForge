@@ -16,7 +16,7 @@ from specforge.modeling.target.custom_backend.qwen3 import (
 from tests.utils import get_available_port
 
 
-def test_qwen3_tp(rank, world_size, temp_dir, port):
+def _run_qwen3_tp_worker(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -94,7 +94,11 @@ class TestQwen3TP(unittest.TestCase):
     def test_qwen3_tp(self):
         # Set to 2 as only 2 GPU avaialble in CI
         port = get_available_port()
-        mp.spawn(test_qwen3_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(
+            _run_qwen3_tp_worker,
+            nprocs=2,
+            args=(2, self.temp_dir.name, port),
+        )
 
 
 if __name__ == "__main__":

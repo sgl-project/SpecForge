@@ -91,6 +91,17 @@ def _dp_mean(x: Any) -> Any:
     return x / world
 
 
+def _synchronize_device() -> None:
+    """Synchronize the active accelerator for opt-in timing diagnostics."""
+    from specforge.utils import get_device_type
+
+    device_type = get_device_type()
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    elif device_type == "npu" and hasattr(torch, "npu"):
+        torch.npu.synchronize()
+
+
 class TrainerCore:
     """One step: forward/loss (strategy) -> backward (backend) -> optimizer boundary."""
 
@@ -106,6 +117,11 @@ class TrainerCore:
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
 
+    @property
+    def accumulation_remainder(self) -> int:
+        """Micro-batches whose gradients have not reached an optimizer step."""
+        return self._micro % self.accumulation_steps
+
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
@@ -115,7 +131,7 @@ class TrainerCore:
         if _P:
             import time as _t
 
-            torch.cuda.synchronize()
+            _synchronize_device()
             _a0 = _t.perf_counter()
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
         loss = out.loss / self.accumulation_steps
@@ -124,15 +140,15 @@ class TrainerCore:
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
         if _P:
-            torch.cuda.synchronize()
+            _synchronize_device()
             _a1 = _t.perf_counter()
         self.backend.backward(loss, is_boundary=stepped)
         if _P:
-            torch.cuda.synchronize()
+            _synchronize_device()
             _a2 = _t.perf_counter()
         grad_norm = self.backend.step() if stepped else None
         if _P:
-            torch.cuda.synchronize()
+            _synchronize_device()
             _a3 = _t.perf_counter()
             acc = getattr(self, "_prof2", None)
             if acc is None:
@@ -173,15 +189,12 @@ class TrainerCore:
                 self._prof2 = None
         return self._result(out, grad_norm, stepped)
 
-    # Deliberately no eval_step: evaluation runs ``Evaluator.run`` on raw
-    # ``forward_loss`` outputs — ``_result`` scalarizes away the per-position
-    # count tensors that correct acc-len aggregation needs.
-
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
         # DP-average loss AND accuracy across ranks before logging, matching stock
         # DFlash reports a data-parallel mean for loss and accuracy.
         metrics: Dict[str, Any] = {"loss": _scalar(_dp_mean(out.loss))}
-        for key in ("acces", "acceptance_rates", "plosses"):
+        structured_metric_keys = ("acces", "acceptance_rates", "plosses")
+        for key in structured_metric_keys:
             if key in out.metrics:
                 metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
                     out.metrics[key]
@@ -190,6 +203,23 @@ class TrainerCore:
             # DP-average the accuracy across ranks.
             # so the logged curve is smooth, not a single rank's noisy local batch.
             metrics["acc"] = _scalar(_dp_mean(out.metrics["accuracy"]))
+        # Strategies may expose additional scalar diagnostics without teaching
+        # the generic trainer their algorithm-specific names. Move CPU schedule
+        # scalars (for example Domino's lambda_base) onto the loss device before
+        # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
+        reserved_metric_keys = set(structured_metric_keys) | {"accuracy", "loss"}
+        for key, value in out.metrics.items():
+            if key in reserved_metric_keys:
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                scalar = value.detach().reshape(()).to(out.loss.device)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                scalar = out.loss.detach().new_tensor(float(value))
+            else:
+                continue
+            metrics[key] = _scalar(_dp_mean(scalar))
         gn = _scalar(grad_norm) if grad_norm is not None else None
         if gn is not None:
             metrics["grad_norm"] = gn
@@ -206,7 +236,9 @@ class TrainerController:
 
     ``save_checkpoint`` persists resumable draft state and returns a
     :class:`Checkpoint`; ``specforge export`` materializes that state into the
-    serving or Hugging Face model format.
+    serving or Hugging Face model format.  Evaluation is configured once at
+    construction time, so the public training lifecycle remains one no-argument
+    :meth:`Trainer.fit` call.
     """
 
     def __init__(
@@ -217,6 +249,9 @@ class TrainerController:
         output_dir: str = "./output",
         save_interval: int = 0,
         eval_interval: int = 0,
+        eval_data_factory: Optional[
+            Callable[[], Optional[Iterable[TrainBatch]]]
+        ] = None,
         log_interval: int = 50,
         max_steps: Optional[int] = None,
         total_steps: Optional[int] = None,
@@ -227,8 +262,10 @@ class TrainerController:
         start_epoch: int = 0,
         start_batch: int = 0,
         start_samples: int = 0,
+        data_prepositioned: bool = False,
         checkpoint_manager: Optional[Any] = None,
         checkpoint_extra: Optional[Dict[str, Any]] = None,
+        profiling_options=None,
     ) -> None:
         if (start_batch == 0) != (start_samples == 0):
             raise ValueError(
@@ -241,6 +278,7 @@ class TrainerController:
         self.output_dir = output_dir
         self.save_interval = save_interval
         self.eval_interval = eval_interval
+        self.eval_data_factory = eval_data_factory
         self.log_interval = log_interval
         # Injected manager (rotation, best metric) or the lazy default layout.
         self._checkpoint_mgr = checkpoint_manager
@@ -269,12 +307,32 @@ class TrainerController:
         # — makes fit() skip that prefix instead of re-training it.
         self._epoch_batch = start_batch
         self._epoch_samples = start_samples
+        # A resumed online queue is rebuilt from the deterministic prompt plan
+        # with its trained prefix already removed. Suppress the generic iterable
+        # seek exactly once; consuming ``start_batch`` again would skip fresh data.
+        self._data_prepositioned = bool(data_prepositioned)
         self.last_metrics: Dict[str, Any] = {}
         self.last_checkpoint_step: Optional[int] = None
+        from specforge.training.profiling import ProfilingOptions, StepProfiler
 
-    def fit(
-        self, data: Iterable[TrainBatch], eval_data: Optional[Iterable] = None
-    ) -> int:
+        options = profiling_options or ProfilingOptions()
+        env_steps = int(os.environ.get("PROFILE_TORCH", "0"))
+        trace_path = None
+        if env_steps > 0 and not options.enabled:
+            options = ProfilingOptions(
+                enabled=True,
+                start_step=int(os.environ.get("PROFILE_TORCH_WARMUP", "40")),
+                num_steps=env_steps,
+                record_shapes=True,
+            )
+            trace_path = os.environ.get("PROFILE_TORCH_TRACE") or None
+        self._step_profiler = StepProfiler(
+            options,
+            output_dir=output_dir,
+            trace_path=trace_path,
+        )
+
+    def fit(self, data: Iterable[TrainBatch]) -> int:
         if self.max_steps is not None and self.global_step >= self.max_steps:
             logger.info(
                 "fit: global_step=%d already at max_steps=%d; nothing to train",
@@ -284,22 +342,16 @@ class TrainerController:
             return self.global_step
         module = self.core.strategy.trainable_module()
         module.train()
-        # Rank0-broadcast once: a rank-local eval_data view must not let ranks
-        # enter or skip the evaluator's collectives alone.
-        eval_enabled = self._rank0_decision(eval_data is not None)
+        # Rank0-broadcast once: rank-local assembly must not let ranks enter or
+        # skip the evaluator's collectives independently.
+        eval_enabled = self._rank0_decision(
+            self.eval_interval > 0 and self.eval_data_factory is not None
+        )
         pending_ack: List[str] = []
         import time as _time
 
         _PROFILE = int(os.environ.get("PROFILE_STEPS", "0"))
         _prof = {"data": 0.0, "step": 0.0, "n": 0}
-        _TPROF = int(
-            os.environ.get("PROFILE_TORCH", "0")
-        )  # active optimizer steps to profile; 0=off
-        _tprof_warmup = int(os.environ.get("PROFILE_TORCH_WARMUP", "40"))
-        _tprof_rank0 = (
-            not torch.distributed.is_initialized()
-        ) or torch.distributed.get_rank() == 0
-        _tprof = {"p": None, "done": False}
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -307,7 +359,9 @@ class TrainerController:
             stream: Iterable[TrainBatch] = data
             skip = self._epoch_batch
             if skip:
-                if hasattr(data, "seek"):
+                if self._data_prepositioned:
+                    self._data_prepositioned = False
+                elif hasattr(data, "seek"):
                     data.seek(skip)
                 else:
                     it = iter(data)
@@ -322,20 +376,21 @@ class TrainerController:
             _it = iter(stream)
             while True:
                 if _PROFILE:
-                    torch.cuda.synchronize()
+                    _synchronize_device()
                     _pt0 = _time.perf_counter()
                 try:
                     batch = next(_it)
                 except StopIteration:
                     break
                 if _PROFILE:
-                    torch.cuda.synchronize()
+                    _synchronize_device()
                     _pt1 = _time.perf_counter()
                 self._epoch_batch += 1
                 self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
+                self._step_profiler.before_micro_step(self.global_step)
                 result = self.core.train_step(
                     batch,
                     ctx=StepContext(
@@ -344,7 +399,7 @@ class TrainerController:
                 )
                 self.last_metrics = result.metrics
                 if _PROFILE:
-                    torch.cuda.synchronize()
+                    _synchronize_device()
                     _pt2 = _time.perf_counter()
                     _prof["data"] += _pt1 - _pt0
                     _prof["step"] += _pt2 - _pt1
@@ -368,88 +423,34 @@ class TrainerController:
                 if not result.optimizer_stepped:
                     continue
                 self.global_step += 1
-                if _TPROF and _tprof_rank0 and not _tprof["done"]:
-                    if self.global_step == _tprof_warmup and _tprof["p"] is None:
-                        import torch.profiler as _tp
-
-                        _tprof["p"] = _tp.profile(
-                            activities=[
-                                _tp.ProfilerActivity.CPU,
-                                _tp.ProfilerActivity.CUDA,
-                            ],
-                            record_shapes=True,
-                        )
-                        _tprof["p"].start()
-                        print(f"[tprof] started @ step {self.global_step}", flush=True)
-                    elif (
-                        _tprof["p"] is not None
-                        and self.global_step >= _tprof_warmup + _TPROF
-                    ):
-                        _p = _tprof["p"]
-                        _p.stop()
-                        _ka = _p.key_averages()
-                        print(
-                            "[tprof] ===== top ops by self_cuda_time =====\n"
-                            + _ka.table(sort_by="self_cuda_time_total", row_limit=35),
-                            flush=True,
-                        )
-                        try:
-                            _ncalls = sum(int(e.count) for e in _ka)
-                            _cuda_ms = (
-                                sum(
-                                    float(getattr(e, "self_cuda_time_total", 0.0))
-                                    for e in _ka
-                                )
-                                / 1000.0
-                            )
-                            print(
-                                f"[tprof] window={_TPROF} steps  "
-                                f"total_op_calls={_ncalls}  "
-                                f"sum_self_cuda={_cuda_ms:.1f}ms",
-                                flush=True,
-                            )
-                        except Exception as _e:
-                            print(f"[tprof] summary err: {_e}", flush=True)
-                        try:
-                            _p.export_chrome_trace(
-                                os.environ.get(
-                                    "PROFILE_TORCH_TRACE",
-                                    "/workspace/SpecForge-domino/tprof_trace.json",
-                                )
-                            )
-                            print("[tprof] chrome trace exported", flush=True)
-                        except Exception as _e:
-                            print(f"[tprof] trace err: {_e}", flush=True)
-                        _tprof["p"] = None
-                        _tprof["done"] = True
+                self._step_profiler.after_optimizer_step(self.global_step)
                 if self.ack_fn is not None:
                     # durable ack transaction at the optimizer-step boundary
                     self.ack_fn(pending_ack, self.global_step)
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
-                    self.logger(result.metrics, self.global_step)
+                    log_metrics = dict(result.metrics)
+                    optimizer = getattr(self.core.backend, "optimizer", None)
+                    get_learning_rate = getattr(optimizer, "get_learning_rate", None)
+                    if callable(get_learning_rate):
+                        log_metrics["lr"] = float(get_learning_rate())
+                    self.logger(log_metrics, self.global_step)
                 eval_metrics: Optional[Dict[str, Any]] = None
-                if (
-                    self.eval_interval
-                    and eval_enabled
-                    and self.global_step % self.eval_interval == 0
-                ):
-                    eval_metrics = self.evaluate(eval_data)
+                if eval_enabled and self.global_step % self.eval_interval == 0:
+                    eval_metrics = self.evaluate_configured()
                     module.train()
                     if eval_metrics:
                         if self.logger:
                             self.logger(eval_metrics, self.global_step)
                         self.last_metrics = {**self.last_metrics, **eval_metrics}
-                # is_better is a collective (rank0 verdict broadcast inside the
-                # manager); its guard is rank-identical because eval_metrics is
-                # DP-reduced. Empty ({}) eval metrics skip best entirely.
+                # ``is_better`` is collective (rank0 verdict broadcast inside
+                # the manager); its guard is rank-identical because eval metrics
+                # are DP-reduced. Empty eval metrics skip best tracking.
                 interval_hit = bool(
                     self.save_interval and self.global_step % self.save_interval == 0
                 )
                 is_best = bool(
-                    self.save_interval
-                    and eval_metrics
-                    and self._checkpoint_manager().is_better(eval_metrics)
+                    eval_metrics and self._checkpoint_manager().is_better(eval_metrics)
                 )
                 if interval_hit or is_best:
                     self.save_checkpoint(self.global_step)
@@ -466,36 +467,73 @@ class TrainerController:
             # work, not epoch ``N`` at batch zero (which would replay that
             # entire epoch on resume).
             self.epoch = epoch + 1
+        remainder = self.core.accumulation_remainder
+        if remainder:
+            raise RuntimeError(
+                "training stream ended with incomplete gradient accumulation: "
+                f"received {remainder} of {self.core.accumulation_steps} "
+                "micro-batches after the last optimizer step; no partial "
+                "optimizer step or durable acknowledgement was committed"
+            )
         return self.global_step
+
+    def close_profiler(self) -> None:
+        """Finalize a partial profiling window on every training exit path."""
+        try:
+            self._step_profiler.close(self.global_step)
+        except Exception:
+            logger.exception("failed to finalize the training profiler")
+
+    def evaluate_configured(self) -> Dict[str, Any]:
+        """Build one fresh eval pass and close any managed capture stream.
+
+        Fixed offline loaders may simply be returned on every call. Online eval
+        factories can return an iterable context manager so each interval gets
+        a fresh rollout stream without exposing an extra argument on ``fit``.
+        """
+        if self.eval_data_factory is None:
+            return self.evaluate(None)
+        data = self.eval_data_factory()
+        if data is None or not hasattr(data, "__enter__"):
+            return self.evaluate(data)
+        with data as entered:
+            return self.evaluate(data if entered is None else entered)
 
     @torch.no_grad()
     def evaluate(self, data: Optional[Iterable[TrainBatch]]) -> Dict[str, Any]:
-        """Full-pass eval via :class:`Evaluator`: rank-identical ``eval/*``
-        metrics, ``{}`` when zero batches were processed globally. ``data=None``
-        (empty local shard) still joins the evaluator's collectives."""
+        """Full-pass eval via :class:`Evaluator`.
+
+        Returns rank-identical ``eval/*`` metrics, or ``{}`` when zero batches
+        were processed globally. ``data=None`` (an empty local shard) still
+        joins the evaluator's collectives.
+        """
         from specforge.eval import Evaluator
 
         module = self.core.strategy.trainable_module()
+        was_training = module.training
         module.eval()
-        # Same StepContext as the train path so schedule-dependent losses
-        # (Domino's lambda_base) evaluate at the live step, not at step 0.
+        # Use the train path's live context so schedule-dependent losses (for
+        # example Domino's lambda_base) are not evaluated as if at step zero.
         ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
-        return Evaluator().run(
-            lambda batch: self.core.strategy.forward_loss(batch, ctx), data
-        )
+        try:
+            return Evaluator().run(
+                lambda batch: self.core.strategy.forward_loss(batch, ctx), data
+            )
+        finally:
+            module.train(was_training)
 
     @staticmethod
     def _rank0_decision(flag: bool) -> bool:
-        """Broadcast rank0's verdict so a collective-bearing branch is entered by
-        every rank or by none."""
+        """Broadcast rank0's verdict for a collective-bearing branch."""
         if (
-            not torch.distributed.is_initialized()
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
             or torch.distributed.get_world_size() == 1
         ):
             return bool(flag)
-        verdict = [bool(flag)]
-        torch.distributed.broadcast_object_list(verdict, src=0)
-        return bool(verdict[0])
+        box = [bool(flag)] if torch.distributed.get_rank() == 0 else [False]
+        torch.distributed.broadcast_object_list(box, src=0)
+        return bool(box[0])
 
     def _checkpoint_manager(self):
         # Lazily built in its S-home so the runtime seam does not import the domain

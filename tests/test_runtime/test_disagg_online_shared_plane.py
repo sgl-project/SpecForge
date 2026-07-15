@@ -1,213 +1,168 @@
 # coding=utf-8
-"""O1.1: shared, durable, cross-process control plane for online disaggregation.
+"""Shared-plane consumer resume through the canonical disaggregated builder."""
 
-The online producer and consumer run in *separate processes*. Before O1.1 each
-built its own in-process ``InMemoryMetadataStore``, so commit / dedup / ack were
-not shared and a restart could not reconcile: the producer held the committed
-set, the consumer held the ack marker, in two different process-local stores.
-These CPU tests prove a shared ``SQLiteMetadataStore`` makes commit/dedup/ack
-cross-process, and that the streaming consumer skips already-trained samples on
-restart instead of re-reading the append-only channel from offset zero.
-
-No GPU / torch needed: this exercises the control plane + streaming queue
-directly (the FSDP training half is the GPU launcher test).
-"""
+from __future__ import annotations
 
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
-from specforge.runtime.contracts import SampleRef
+import torch
+
+from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
-from specforge.runtime.data_plane.streaming_ref_channel import (
-    StreamingRefChannel,
-    StreamingRefQueue,
-)
+from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+from specforge.training.checkpoint import STATE_FILE
 
 
-def _ref(i: int, run_id: str = "run0") -> SampleRef:
-    """A minimal tensor-free SampleRef (the control plane carries metadata only)."""
-    sid = f"{run_id}:s{i}"
+def _ref(sample_id: str) -> SampleRef:
     return SampleRef(
-        sample_id=sid,
-        run_id=run_id,
-        source_task_id=f"task-{i}",
-        feature_store_uri=f"mem://{run_id}",
-        feature_keys={"hidden_state": f"{sid}/hidden_state"},
-        feature_specs={},
+        sample_id=sample_id,
+        run_id="run0",
+        source_task_id=f"task-{sample_id}",
+        feature_store_uri=f"mooncake://run0/{sample_id}",
+        feature_keys={"hidden_state": f"{sample_id}/hidden_state"},
+        feature_specs={
+            "hidden_state": FeatureSpec(
+                name="hidden_state", shape=(2, 4), dtype="float32"
+            )
+        },
         strategy="eagle3",
-        metadata={"target_repr": "logits", "num_tokens": 4},
+        metadata={"target_repr": "hidden_state"},
     )
 
 
-class _RecordingStore:
-    """Minimal FeatureStore stub: records abort() (the reconcile-time free)."""
+class _RetainingFeatureStore:
+    retain_on_release = True
 
     def __init__(self) -> None:
         self.aborted = []
 
-    def abort(self, sample_id: str, reason: str = "") -> None:
-        self.aborted.append(sample_id)
+    def abort(self, sample_id, *, reason="aborted") -> None:
+        self.aborted.append((sample_id, reason))
 
 
-def _db() -> str:
-    return os.path.join(tempfile.mkdtemp(prefix="o11_"), "meta.db")
+class _FakeDistributor:
+    latest = None
+
+    def __init__(self, *_args, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.started = False
+        self.stopped = False
+        type(self).latest = self
+
+    @staticmethod
+    def inbox_path(inbox_dir: str, dp_rank: int) -> str:
+        return os.path.join(inbox_dir, f"inbox-rank{dp_rank}.jsonl")
+
+    def start(self):
+        self.started = True
+        return self
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
-class TestSharedControlPlane(unittest.TestCase):
-    def test_commit_and_dedup_cross_process(self):
-        db = _db()
-        # two controllers over ONE db file == two processes sharing the store
-        producer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        consumer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
+class TestSharedPlaneConsumerResume(unittest.TestCase):
+    def setUp(self):
+        self.work = tempfile.mkdtemp(prefix="shared_plane_resume_")
+        self.db = os.path.join(self.work, "metadata.sqlite")
+        self.channel = StreamingRefChannel(os.path.join(self.work, "refs.jsonl"))
+        self.features = _RetainingFeatureStore()
 
-        refs = [_ref(i) for i in range(4)]
-        producer.commit_samples("rollout-0", refs)
+    def _checkpoint(self, step: int) -> str:
+        path = os.path.join(self.work, f"run0-step{step}")
+        os.makedirs(path, exist_ok=True)
+        torch.save({"global_step": step}, os.path.join(path, STATE_FILE))
+        return path
 
-        # consumer (separate store instance, same file) sees the producer's commits
-        for r in refs:
-            self.assertTrue(consumer.store.is_committed(r.sample_id))
-            got = consumer.store.get_committed(r.sample_id)
-            self.assertIsNotNone(got)
-            self.assertEqual(got.sample_id, r.sample_id)
-        self.assertEqual(consumer.store.committed_count(), 4)
+    def _seed_ledger(self, *, acked=(), step=None) -> None:
+        store = SQLiteMetadataStore(self.db)
+        controller = DataFlowController("run0", metadata_store=store)
+        controller.commit_samples("producer", [_ref("s0"), _ref("s1")])
+        if acked:
+            store.record_train_ack(
+                list(acked), global_step=step, optimizer_durable=True
+            )
+        store.close()
 
-        # at-least-once dedup: re-committing the same refs adds no duplicate rows
-        producer.commit_samples("rollout-0", refs)
-        self.assertEqual(consumer.store.committed_count(), 4)
+    def _build(self, *, resume_from=None):
+        from specforge.launch import build_disagg_online_consumer
 
-    def test_durable_ack_visible_across_process(self):
-        db = _db()
-        producer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        consumer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        refs = [_ref(i) for i in range(3)]
-        producer.commit_samples("rollout-0", refs)
+        captured = {}
 
-        tid = consumer.register_trainer({"role": "trainer"})
-        consumer.ack_train_refs(
-            tid,
-            [refs[0].sample_id, refs[1].sample_id],
-            global_step=5,
-            optimizer_durable=True,
-        )
+        def assemble(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace()
 
-        # a fresh controller reopened on the same file sees the durable marker
-        reopened = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        marker = reopened.store.durable_marker()
-        self.assertEqual(marker["acked"], {refs[0].sample_id, refs[1].sample_id})
-        self.assertEqual(marker["global_step"], 5)
-        self.assertTrue(marker["optimizer_durable"])
+        if resume_from is not None and self.channel.consumer_quantum() is None:
+            self.channel.publish_consumer_quantum(1)
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=False),
+            mock.patch(
+                "specforge.runtime.data_plane.ref_distributor.RefDistributor",
+                _FakeDistributor,
+            ),
+            mock.patch("specforge.launch._assemble_trainer", side_effect=assemble),
+        ):
+            trainer = build_disagg_online_consumer(
+                feature_store=self.features,
+                channel=self.channel,
+                draft_model=object(),
+                optimizer_factory=object(),
+                run_id="run0",
+                output_dir=os.path.join(self.work, "output"),
+                collate_fn=lambda features: {},
+                metadata_db_path=self.db,
+                inbox_dir=os.path.join(self.work, "inboxes"),
+                resume_from=resume_from,
+            )
+        return trainer, captured, _FakeDistributor.latest
 
-    def test_reconcile_on_restart_releases_acked_requeues_unacked(self):
-        db = _db()
-        producer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        consumer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        refs = [_ref(i) for i in range(5)]
-        producer.commit_samples("rollout-0", refs)
-        tid = consumer.register_trainer({"role": "trainer"})
-        acked = [refs[0].sample_id, refs[1].sample_id, refs[2].sample_id]
-        consumer.ack_train_refs(tid, acked, global_step=3, optimizer_durable=True)
+    def test_crash_before_ack_requeues_every_committed_ref(self):
+        self._seed_ledger()
+        checkpoint = self._checkpoint(0)
 
-        # crash + restart: a fresh controller over the same db reconciles
-        restarted = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        fs = _RecordingStore()
-        result = restarted.reconcile_on_restart(fs)
+        trainer, captured, distributor = self._build(resume_from=checkpoint)
 
-        self.assertEqual(set(result["released"]), set(acked))
-        self.assertEqual(
-            set(result["requeued"]), {refs[3].sample_id, refs[4].sample_id}
-        )
-        # released samples were idempotently freed from the feature store
-        self.assertEqual(set(fs.aborted), set(acked))
-        # the unacked tail is requeued for re-training (no data loss)
-        self.assertEqual(restarted.sample_queue.depth(), 2)
+        self.assertTrue(trainer.ref_distributor.started)
+        self.assertEqual(distributor.kwargs["skip_ids"], set())
+        self.assertEqual(distributor.kwargs["requeued_ids"], {"s0", "s1"})
+        self.assertEqual(self.features.aborted, [])
+        self.assertEqual(captured["resume_from"], checkpoint)
+        self.assertTrue(captured["ref_source"]["prepositioned"])
+        self.assertTrue(captured["ref_source"]["defer_ack_until_durable"])
 
-    def test_reconcile_without_optimizer_durable_requeues_all(self):
-        # acked but the optimizer step never durably committed -> replay all (no
-        # sample counted as trained), per the B4 release rule.
-        db = _db()
-        producer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        consumer = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        refs = [_ref(i) for i in range(3)]
-        producer.commit_samples("rollout-0", refs)
-        tid = consumer.register_trainer({"role": "trainer"})
-        consumer.ack_train_refs(
-            tid,
-            [r.sample_id for r in refs],
-            global_step=None,
-            optimizer_durable=False,
-        )
+    def test_crash_after_ack_skips_durable_ref_and_requeues_tail(self):
+        self._seed_ledger(acked=("s0",), step=1)
+        checkpoint = self._checkpoint(1)
 
-        restarted = DataFlowController("run0", metadata_store=SQLiteMetadataStore(db))
-        result = restarted.reconcile_on_restart(_RecordingStore())
-        self.assertEqual(result["released"], [])
-        self.assertEqual(set(result["requeued"]), {r.sample_id for r in refs})
+        _trainer, _captured, distributor = self._build(resume_from=checkpoint)
 
+        self.assertEqual(distributor.kwargs["skip_ids"], {"s0"})
+        self.assertEqual(distributor.kwargs["requeued_ids"], {"s1"})
+        self.assertEqual([item[0] for item in self.features.aborted], ["s0"])
 
-class TestStreamingQueueRestartSkip(unittest.TestCase):
-    def _chan_path(self) -> str:
-        return os.path.join(tempfile.mkdtemp(prefix="o11_chan_"), "refs.jsonl")
+    def test_marker_ahead_of_checkpoint_is_rejected(self):
+        self._seed_ledger(acked=("s0",), step=2)
+        checkpoint = self._checkpoint(1)
 
-    def test_skip_ids_drops_trained_refs_on_reread(self):
-        path = self._chan_path()
-        # producer published s0..s4 then closed (the durable channel survives)
-        wchan = StreamingRefChannel(path)
-        refs = [_ref(i) for i in range(5)]
-        wchan.publish_many(refs)
-        wchan.close()
+        with self.assertRaisesRegex(RuntimeError, "ahead of.*checkpoint"):
+            self._build(resume_from=checkpoint)
 
-        # restart: s0,s1,s2 were durably trained -> skip them on re-read
-        trained = {refs[0].sample_id, refs[1].sample_id, refs[2].sample_id}
-        rchan = StreamingRefChannel(path)
-        queue = StreamingRefQueue(rchan, poll_s=0.0, skip_ids=trained)
+    def test_fresh_attempt_rejects_nonempty_ledger(self):
+        self._seed_ledger()
+        with self.assertRaisesRegex(ValueError, "fresh online attempt cannot reuse"):
+            self._build()
 
-        got = queue.get(2)  # only the untrained tail survives the skip filter
-        self.assertEqual(
-            [r.sample_id for r in got], [refs[3].sample_id, refs[4].sample_id]
-        )
-        queue.ack(got)
-
-        # backpressure stays exact: 3 skipped + 2 acked == 5 consumed, 0 in flight
-        self.assertEqual(wchan.consumed_remote(), 5)
-        self.assertEqual(wchan.in_flight_remote(), 0)
-
-    def test_skip_all_terminates_on_close(self):
-        # every published ref was already trained: the queue must drain to empty
-        # (loop end) once the channel is closed, not spin.
-        path = self._chan_path()
-        wchan = StreamingRefChannel(path)
-        refs = [_ref(i) for i in range(3)]
-        wchan.publish_many(refs)
-        wchan.close()
-
-        queue = StreamingRefQueue(
-            StreamingRefChannel(path),
-            poll_s=0.0,
-            skip_ids={r.sample_id for r in refs},
-        )
-        self.assertEqual(queue.get(1), [])
-        self.assertEqual(wchan.consumed_remote(), 3)  # all counted consumed
-
-    def test_no_skip_ids_is_unchanged(self):
-        # regression: skip_ids=None preserves the pre-O1.1 full-stream behavior
-        path = self._chan_path()
-        wchan = StreamingRefChannel(path)
-        refs = [_ref(i) for i in range(3)]
-        wchan.publish_many(refs)
-        wchan.close()
-
-        queue = StreamingRefQueue(StreamingRefChannel(path), poll_s=0.0)
-        got = []
-        while True:
-            batch = queue.get(1)
-            if not batch:
-                break
-            got.extend(batch)
-            queue.ack(batch)
-        self.assertEqual([r.sample_id for r in got], [r.sample_id for r in refs])
-        self.assertEqual(wchan.consumed_remote(), 3)
+    def test_consumer_requires_release_retention(self):
+        self.features.retain_on_release = False
+        with self.assertRaisesRegex(ValueError, "retain_on_release=True"):
+            self._build()
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

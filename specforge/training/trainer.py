@@ -17,13 +17,18 @@ ref source + store the Trainer is handed — the loader IS the stream.
 
 from __future__ import annotations
 
-from typing import Optional
+import logging
+import sys
+from contextlib import nullcontext
+from typing import Callable, Optional
 
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
-from specforge.training.strategies.registry import StrategySpec, resolve_strategy
+from specforge.training.strategies.registry import StrategySpec
+
+logger = logging.getLogger(__name__)
 
 
 class Trainer:
@@ -46,10 +51,8 @@ class Trainer:
         num_epochs: int,
         max_steps: Optional[int],
         save_interval: int,
-        eval_interval: int,
-        tp_size: int,
-        sp_ulysses_size: int,
-        sp_ring_size: int,
+        eval_interval: int = 0,
+        eval_data_factory: Optional[Callable[[], object]] = None,
         logger,
         log_interval: int,
         collate_fn,
@@ -58,20 +61,45 @@ class Trainer:
         per_sample_transform=None,
         durable_ack: bool = True,
         resume_from: Optional[str] = None,
+        resume_state: Optional[dict] = None,
+        dataset_size: Optional[int] = None,
+        checkpoint_extra: Optional[dict] = None,
         max_checkpoints: int = 0,
+        tp_size: int = 1,
+        sp_ulysses_size: int = 1,
+        sp_ring_size: int = 1,
+        dataloader_num_workers: int = 0,
+        profiling_options=None,
+        fit_context=None,
+        on_fit_success: Optional[Callable[[int], None]] = None,
+        on_fit_failure: Optional[Callable[[BaseException], None]] = None,
+        on_fit_finally: Optional[Callable[[], None]] = None,
     ):
-        # durable_ack off (local_colocated): no durable ack transaction — the
-        # loader releases each feature as it consumes it — so the offline enqueue
-        # is skipped too (nothing acks or reads that queue).
-        if "refs" in ref_source:
-            if durable_ack:
-                controller.enqueue_offline_refs(ref_source["refs"])
-            else:
-                from specforge.runtime.contracts import assert_no_tensors
+        ref_source = dict(ref_source)
+        data_prepositioned = bool(ref_source.pop("prepositioned", False))
+        defer_queue_ack = bool(ref_source.pop("defer_ack_until_durable", False))
+        if data_prepositioned and "queue" not in ref_source:
+            raise ValueError("prepositioned data is valid only for a queue source")
+        if defer_queue_ack and "queue" not in ref_source:
+            raise ValueError("deferred queue ack is valid only for a queue source")
+        if defer_queue_ack and not durable_ack:
+            raise ValueError("deferred queue ack requires durable_ack=True")
 
-                # metadata-only contract still holds for refs entering the trainer
-                for ref in ref_source["refs"]:
-                    assert_no_tensors(ref)
+        # Fixed offline refs never enter an online staging queue. The loader
+        # releases each feature as it consumes it and can re-iterate the same
+        # refs on later epochs.
+        if "refs" in ref_source:
+            from specforge.runtime.contracts import assert_no_tensors
+
+            for ref in ref_source["refs"]:
+                assert_no_tensors(ref)
+        refs_for_epoch = ref_source.pop("refs_for_epoch", None)
+        if refs_for_epoch is not None and (
+            "refs" not in ref_source or not callable(refs_for_epoch)
+        ):
+            raise ValueError(
+                "refs_for_epoch must be callable and accompany a refs source"
+            )
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
         loader = FeatureDataLoader(
             store,
@@ -81,9 +109,53 @@ class Trainer:
             per_sample_transform=per_sample_transform,
             drop_last=True,
             strategy=spec.name,
+            ack=not defer_queue_ack,
+            num_workers=dataloader_num_workers,
         )
+        if refs_for_epoch is not None:
+            expected_refs = len(ref_source["refs"])
 
-        dataset_size = len(ref_source["refs"]) if "refs" in ref_source else None
+            def set_epoch(epoch):
+                planned = list(refs_for_epoch(epoch))
+                if len(planned) != expected_refs:
+                    raise ValueError(
+                        f"epoch {epoch} ref plan has {len(planned)} refs; "
+                        f"expected {expected_refs}"
+                    )
+                loader._refs = planned
+                loader._seek_batches = 0
+
+            loader.set_epoch = set_epoch
+
+        inferred_dataset_size = (
+            len(ref_source["refs"]) if "refs" in ref_source else None
+        )
+        if dataset_size is None:
+            dataset_size = inferred_dataset_size
+        elif (
+            inferred_dataset_size is not None and dataset_size != inferred_dataset_size
+        ):
+            raise ValueError(
+                f"dataset_size={dataset_size} does not match the "
+                f"{inferred_dataset_size} supplied refs"
+            )
+        standard_checkpoint_extra = {
+            "dataset_size": dataset_size,
+            "batch_size": batch_size,
+            "accumulation_steps": accumulation_steps,
+            "num_epochs": num_epochs,
+            "tp_size": tp_size,
+            "sp_ulysses_size": sp_ulysses_size,
+            "sp_ring_size": sp_ring_size,
+        }
+        custom_checkpoint_extra = dict(checkpoint_extra or {})
+        reserved = standard_checkpoint_extra.keys() & custom_checkpoint_extra.keys()
+        if reserved:
+            raise ValueError(
+                "checkpoint_extra cannot override trainer-owned fields: "
+                f"{sorted(reserved)}"
+            )
+        persisted_contract = {**standard_checkpoint_extra, **custom_checkpoint_extra}
         configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
         effective_total_steps = None
         if total_steps is not None or max_steps is not None or dataset_size is not None:
@@ -109,18 +181,36 @@ class Trainer:
         # shard (``state['backend']``) loads after the wrap builds the optimizer.
         resume = None
         if resume_from:
-            state = CheckpointManager.read_resume_state(resume_from)
+            state = (
+                resume_state
+                if resume_state is not None
+                else CheckpointManager.read_resume_state(resume_from)
+            )
             saved_strategy = state.get("strategy")
             if saved_strategy != spec.name:
                 raise ValueError(
                     f"checkpoint {resume_from} was written by strategy "
                     f"{saved_strategy!r}; this run trains {spec.name!r}"
                 )
-            for key, current in (
-                ("dataset_size", dataset_size),
-                ("accumulation_steps", accumulation_steps),
-            ):
+            import torch.distributed as dist
+
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            resume_contract = {
+                "world_size": world_size,
+                **persisted_contract,
+            }
+            for key, current in resume_contract.items():
                 persisted = state.get(key)
+                if (
+                    spec.name == "peagle"
+                    and key.startswith("peagle_")
+                    and persisted is None
+                ):
+                    raise ValueError(
+                        f"checkpoint {resume_from} does not record required "
+                        f"P-EAGLE resume semantic {key}; start a fresh run "
+                        "rather than guessing the prior objective"
+                    )
                 if persisted is not None and persisted != current:
                     raise ValueError(
                         f"checkpoint {resume_from} was written with "
@@ -138,12 +228,32 @@ class Trainer:
                     f"unexpected={sorted(load_result.unexpected_keys)}"
                 )
             # Mid-epoch position persists in SAMPLES (batch-size independent);
-            # only an offline (refs) stream can be repositioned, and a batch-size
-            # drift that does not divide the count fails fast (a silent mis-seek
-            # would skip or re-train data).
+            # Offline refs are rebuilt for the saved epoch before seek; a local
+            # online queue arrives prepositioned from its deterministic prompt
+            # plan. A batch-size drift that does not divide the count fails fast.
             start_batch = start_samples = 0
-            if "refs" in ref_source:
-                samples = state.get("epoch_samples", 0)
+            samples = int(state.get("epoch_samples", 0))
+            if samples < 0:
+                raise ValueError(
+                    f"checkpoint {resume_from} has negative epoch_samples={samples}"
+                )
+            if dataset_size is not None and samples > dataset_size:
+                raise ValueError(
+                    f"checkpoint {resume_from} stopped after {samples} samples, "
+                    f"past this run's dataset_size={dataset_size}"
+                )
+            saved_epoch = int(state.get("epoch", 0))
+            if not 0 <= saved_epoch <= num_epochs:
+                raise ValueError(
+                    f"checkpoint {resume_from} has epoch={saved_epoch}, outside "
+                    f"this run's [0, {num_epochs}] epoch range"
+                )
+            if saved_epoch == num_epochs and samples:
+                raise ValueError(
+                    f"checkpoint {resume_from} is complete at epoch={saved_epoch} "
+                    f"but still records epoch_samples={samples}"
+                )
+            if "refs" in ref_source or data_prepositioned:
                 if samples % batch_size:
                     raise ValueError(
                         f"checkpoint {resume_from} stopped mid-epoch after "
@@ -152,10 +262,22 @@ class Trainer:
                         f"batch size the checkpoint was written with"
                     )
                 start_batch, start_samples = samples // batch_size, samples
+                persisted_batch = state.get("epoch_batch")
+                if persisted_batch is not None and int(persisted_batch) != start_batch:
+                    raise ValueError(
+                        f"checkpoint {resume_from} has epoch_batch="
+                        f"{persisted_batch} but epoch_samples={samples} implies "
+                        f"{start_batch} batches at batch_size={batch_size}"
+                    )
+            elif samples:
+                raise ValueError(
+                    f"checkpoint {resume_from} has a streamed mid-epoch position, "
+                    "but the queue was not rebuilt as prepositioned"
+                )
             resume = {
                 "backend": state["backend"],
                 "global_step": state["global_step"],
-                "epoch": state.get("epoch", 0),
+                "epoch": saved_epoch,
                 "epoch_batch": start_batch,
                 "epoch_samples": start_samples,
             }
@@ -163,7 +285,9 @@ class Trainer:
             del state, saved_weights
 
         parallel = ParallelConfig.from_distributed(
-            tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
+            tp_size=tp_size,
+            sp_ulysses_size=sp_ulysses_size,
+            sp_ring_size=sp_ring_size,
         )
         backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
@@ -183,6 +307,13 @@ class Trainer:
                 controller.ack_train_refs(
                     trainer_id, ids, global_step=step, optimizer_durable=True
                 )
+                if defer_queue_ack:
+                    ack_ids = getattr(ref_source["queue"], "ack_ids", None)
+                    if not callable(ack_ids):
+                        raise TypeError(
+                            "deferred queue ack requires queue.ack_ids(sample_ids)"
+                        )
+                    ack_ids(ids)
 
         controller_obj = TrainerController(
             core,
@@ -193,49 +324,151 @@ class Trainer:
             total_steps=effective_total_steps,
             save_interval=save_interval,
             eval_interval=eval_interval,
+            eval_data_factory=eval_data_factory,
             log_interval=log_interval,
             logger=logger,
             ack_fn=ack_fn,
             checkpoint_manager=CheckpointManager(
                 output_dir, run_id, max_checkpoints=max_checkpoints
             ),
-            checkpoint_extra={
-                "dataset_size": dataset_size,
-                "accumulation_steps": accumulation_steps,
-            },
+            checkpoint_extra=persisted_contract,
             start_step=resume["global_step"] if resume else 0,
             start_epoch=resume["epoch"] if resume else 0,
             start_batch=resume["epoch_batch"] if resume else 0,
             start_samples=resume["epoch_samples"] if resume else 0,
+            data_prepositioned=data_prepositioned,
+            profiling_options=profiling_options,
         )
+        if resume is not None:
+            # The loaded checkpoint already represents this durable step. If a
+            # completed run or max_steps cap makes fit() a no-op, do not rewrite
+            # it as a new checkpoint with altered epoch counters.
+            controller_obj.last_checkpoint_step = resume["global_step"]
 
-        # Runtime pieces exposed for direct callers (and for
-        # launch._assemble_trainer's (controller, loader) tuple).
+        # Runtime pieces remain inspectable behind the single Trainer lifecycle.
         self.spec = spec
+        self.run_id = run_id
+        self.output_dir = output_dir
+        self.batch_size = batch_size
+        self.max_steps = max_steps
+        self.max_checkpoints = max_checkpoints
         self.dataflow_controller = controller
         self.trainer_id = trainer_id
         self.backend = backend
         self.core = core
-        #: the runtime TrainerController (has fit / evaluate / save_checkpoint)
-        self.controller = controller_obj
-        #: the FeatureDataLoader -> TrainBatch iterator (the canonical "stream")
-        self.loader = loader
+        self._controller = controller_obj
+        self._loader = loader
+        self._fit_context = fit_context
+        self._logger = logger
+        self._on_fit_success = on_fit_success
+        self._on_fit_failure = on_fit_failure
+        self._on_fit_finally = on_fit_finally
 
-    @classmethod
-    def from_strategy_name(cls, strategy: str, **kwargs) -> "Trainer":
-        """Resolve the :class:`StrategySpec` by name, then assemble."""
-        return cls(spec=resolve_strategy(strategy), **kwargs)
+    @property
+    def global_step(self) -> int:
+        return self._controller.global_step
 
-    def fit(self, eval_data=None) -> int:
-        """Run the training loop over the loader; returns the final global step."""
-        return self.controller.fit(self.loader, eval_data=eval_data)
+    @property
+    def micro_step(self) -> int:
+        return self._controller.micro_step
+
+    @property
+    def last_checkpoint_step(self) -> Optional[int]:
+        return self._controller.last_checkpoint_step
+
+    def fit(self) -> int:
+        """Run training and configured evaluation through one lifecycle."""
+        loader_close_attempted = False
+
+        def close_loader() -> None:
+            nonlocal loader_close_attempted
+            loader_close_attempted = True
+            close = getattr(self._loader, "close", None)
+            if callable(close):
+                close()
+
+        try:
+            context = (
+                self._fit_context if self._fit_context is not None else nullcontext()
+            )
+            with context:
+                step = self._controller.fit(self._loader)
+            if step > 0 and self.last_checkpoint_step != step:
+                self.save_checkpoint()
+            # A distributed consumer is not successful until prefetch has
+            # stopped and every never-yielded lease has an explicit outcome.
+            # Run this before on_fit_success publishes consumer_done.
+            close_loader()
+            if self._on_fit_success is not None:
+                self._on_fit_success(step)
+            return step
+        except BaseException as exc:
+            if self._on_fit_failure is not None:
+                self._on_fit_failure(exc)
+            raise
+        finally:
+            primary_exception = sys.exception()
+            cleanup_errors: list[tuple[str, BaseException]] = []
+
+            def capture_cleanup(label: str, action) -> None:
+                try:
+                    action()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append((label, cleanup_error))
+
+            if not loader_close_attempted:
+                capture_cleanup("FeatureDataLoader.close", close_loader)
+            capture_cleanup(
+                "TrainerController.close_profiler",
+                self._controller.close_profiler,
+            )
+            if self._on_fit_finally is not None:
+                capture_cleanup("on_fit_finally", self._on_fit_finally)
+            close_logger = getattr(self._logger, "close", None)
+            if callable(close_logger):
+                capture_cleanup("logger.close", close_logger)
+
+            if cleanup_errors and primary_exception is not None:
+                for label, cleanup_error in cleanup_errors:
+                    note = (
+                        f"{label} also failed during cleanup: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    primary_exception.add_note(note)
+                    logger.error(
+                        "%s",
+                        note,
+                        exc_info=(
+                            type(cleanup_error),
+                            cleanup_error,
+                            cleanup_error.__traceback__,
+                        ),
+                    )
+            elif cleanup_errors:
+                label, cleanup_error = cleanup_errors[0]
+                for other_label, other_error in cleanup_errors[1:]:
+                    cleanup_error.add_note(
+                        f"{other_label} also failed during cleanup: "
+                        f"{type(other_error).__name__}: {other_error}"
+                    )
+                cleanup_error.add_note(f"cleanup owner: {label}")
+                raise cleanup_error
+
+    def save_checkpoint(self):
+        """Persist the current optimizer step through the one trainer surface."""
+        return self._controller.save_checkpoint(self.global_step)
 
     def evaluate(self, data=None):
-        return self.controller.evaluate(self.loader if data is None else data)
+        """Run one eval pass, defaulting to the configured eval source.
 
-    def save_checkpoint(self, step: Optional[int] = None):
-        step = self.controller.global_step if step is None else step
-        return self.controller.save_checkpoint(step)
+        The training loader remains the compatibility fallback when a caller
+        assembled ``Trainer`` directly without a separate eval source.
+        """
+        if data is not None:
+            return self._controller.evaluate(data)
+        if self._controller.eval_data_factory is not None:
+            return self._controller.evaluate_configured()
+        return self._controller.evaluate(self._loader)
 
 
 __all__ = ["Trainer"]

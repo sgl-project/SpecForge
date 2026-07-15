@@ -15,7 +15,7 @@ from specforge.modeling.target.custom_backend.gpt_oss import (
 from tests.utils import get_available_port
 
 
-def test_gpt_oss_tp(rank, world_size, temp_dir, port):
+def _run_gpt_oss_tp_worker(rank, world_size, temp_dir, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -97,7 +97,11 @@ class TestGptOssTP(unittest.TestCase):
 
     def test_gpt_oss_tp(self):
         port = get_available_port()
-        mp.spawn(test_gpt_oss_tp, nprocs=2, args=(2, self.temp_dir.name, port))
+        mp.spawn(
+            _run_gpt_oss_tp_worker,
+            nprocs=2,
+            args=(2, self.temp_dir.name, port),
+        )
 
 
 if __name__ == "__main__":

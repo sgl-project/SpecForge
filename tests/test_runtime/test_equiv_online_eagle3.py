@@ -1,13 +1,9 @@
 # coding=utf-8
-"""M2 gate: online EAGLE3 through PromptTask -> SampleRef -> TrainBatch matches.
+"""Online EAGLE3 capture-to-loss parity through the canonical runtime.
 
-Old path = legacy online ``run_forward`` (target.generate_eagle3_data -> eagle3
-model). New path = PromptTask -> SGLangAdapter (via RolloutWorker) -> FeatureStore
--> FeatureDataLoader -> TrainBatch -> Eagle3TrainStrategy. Single rank, batch
-size 1 (so old and new run the identical per-sample target forward): the weighted
-loss must match near-exactly, and the controller never carries a tensor.
-
-GPU-only. Run on the H200 box via rcli.
+The reference uses the policy-driven target capture and registered strategy
+directly.  The compared path sends the same prompt through the current rollout
+stream, feature store, builder and public ``Trainer.fit()`` lifecycle.
 """
 
 import os
@@ -16,113 +12,128 @@ import unittest
 
 import torch
 
+from tests.test_runtime import _fixtures as fx
+
 CUDA = torch.cuda.is_available()
 
 
-@unittest.skipUnless(CUDA, "online EAGLE3 equivalence requires CUDA")
+def _optimizer_factory(module):
+    from specforge.optimizer import BF16Optimizer
+
+    return BF16Optimizer(
+        module,
+        lr=1e-3,
+        max_grad_norm=0.5,
+        warmup_ratio=0.0,
+        total_steps=1,
+    )
+
+
+@unittest.skipUnless(CUDA, "online EAGLE3 parity requires CUDA")
 class TestEquivOnlineEagle3(unittest.TestCase):
-    def test_equiv_online_eagle3(self):
-        torch.manual_seed(0)
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        from tests.test_runtime import _fixtures as fx
-
+    def test_policy_capture_matches_rollout_stream_and_trainer_fit(self):
         fx.build_single_rank_distributed(port="29565")
-
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
+        from specforge.inference.adapters.policy import (
+            EAGLE3_FEATURE_SCHEMA,
+            PolicyFeatureAdapter,
         )
-        from specforge.inference.adapters.eagle3 import SGLangAdapter
         from specforge.inference.capture import CaptureConfig
-        from specforge.inference.rollout_worker import RolloutWorker
-        from specforge.runtime.contracts import assert_no_tensors
-        from specforge.runtime.control_plane import DataFlowController
-        from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
-        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from specforge.launch import build_online_runtime
+        from specforge.runtime.contracts import PromptTask, TrainBatch
+        from specforge.training.strategies.registry import resolve_strategy
 
-        H, V, SEQ, TTT = fx.H, fx.V, 12, 3
-        workdir = tempfile.mkdtemp(prefix="equiv_online_")
-        target, _dir, aux_ids = fx.build_hf_target(workdir, hidden=H, layers=8, vocab=V)
-        cfg = fx.write_draft_config(os.path.join(workdir, "draft.json"))
-        vocab_path = fx.write_vocab_mapping(os.path.join(workdir, "vm.pt"))
-        draft = AutoEagle3DraftModel.from_config(
-            AutoDraftModelConfig.from_file(cfg),
-            attention_backend="flex_attention",
-            torch_dtype=torch.bfloat16,
-        ).cuda()
-        draft.load_vocab_mapping(vocab_path)
-        draft.freeze_embedding()
-        eagle3_model = OnlineEagle3Model(
-            draft, length=TTT, attention_backend="flex_attention"
-        ).cuda()
-        eagle3_model.eval()
+        previous_deterministic = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="equiv_online_") as work:
+                torch.manual_seed(0)
+                target, _target_dir, aux_layer_ids = fx.build_hf_target(
+                    work, hidden=fx.H, layers=8, vocab=fx.V
+                )
+                model, _target_head = fx.build_eagle3(work, ttt=3)
+                model.eval()
 
-        torch.manual_seed(11)
-        ids = torch.randint(0, V, (SEQ,)).tolist()
+                generator = torch.Generator().manual_seed(11)
+                input_ids = torch.randint(0, fx.V, (12,), generator=generator).tolist()
+                loss_mask = [1] * len(input_ids)
+                task = PromptTask(
+                    task_id="prompt-0",
+                    run_id="online-reference",
+                    source_id="synthetic",
+                    payload={"input_ids": input_ids, "loss_mask": loss_mask},
+                    max_length=len(input_ids),
+                )
+                capture = CaptureConfig.from_strategy(
+                    required_features=EAGLE3_FEATURE_SCHEMA.names,
+                    aux_hidden_state_layer_ids=tuple(aux_layer_ids),
+                    target_repr="logits",
+                    target_hidden_size=fx.H,
+                    target_vocab_size=fx.V,
+                    draft_vocab_size=fx.D,
+                )
+                adapter = PolicyFeatureAdapter(
+                    target, schema=EAGLE3_FEATURE_SCHEMA, device="cuda"
+                )
+                features = adapter.generate_features([task], capture=capture)
+                # RolloutWorker verifies and removes this out-of-band capture
+                # record before FeatureStore.put; mirror that exact boundary.
+                for feature in features:
+                    self.assertEqual(
+                        feature.pop("__aux_layer_ids__"), tuple(aux_layer_ids)
+                    )
+                spec = resolve_strategy("eagle3")
+                tensors = spec.make_online_collate()(features)
+                direct_batch = TrainBatch(
+                    sample_ids=[task.task_id],
+                    strategy=spec.name,
+                    tensors=tensors,
+                    metadata={"target_repr": "logits", "ttt_length": 3},
+                )
+                with torch.no_grad():
+                    expected = float(
+                        spec.make_strategy(model, target_head=None)
+                        .forward_loss(direct_batch)
+                        .loss.item()
+                    )
 
-        # --- old online path (batch size 1, tp=1 so no TP sharding) ---
-        @torch.no_grad()
-        def old_loss():
-            input_ids = torch.tensor([ids], device="cuda")
-            attn = torch.ones_like(input_ids)
-            loss_mask = torch.ones_like(input_ids)
-            d = target.generate_eagle3_data(input_ids, attn, loss_mask)
-            plosses, _, _, _, _, _, _ = eagle3_model(
-                input_ids=d.input_ids,
-                attention_mask=d.attention_mask,
-                loss_mask=d.loss_mask,
-                target=d.target,
-                hidden_states=d.hidden_states,
+                logged = []
+                trainer = build_online_runtime(
+                    strategy="eagle3",
+                    target_model=target,
+                    prompts=[
+                        {
+                            "task_id": task.task_id,
+                            "payload": {
+                                "input_ids": input_ids,
+                                "loss_mask": loss_mask,
+                            },
+                        }
+                    ],
+                    draft_model=model,
+                    optimizer_factory=_optimizer_factory,
+                    run_id="online-canonical",
+                    output_dir=os.path.join(work, "output"),
+                    target_hidden_size=fx.H,
+                    target_vocab_size=fx.V,
+                    draft_vocab_size=fx.D,
+                    target_repr="logits",
+                    aux_hidden_state_layer_ids=aux_layer_ids,
+                    device="cuda",
+                    batch_size=1,
+                    max_steps=1,
+                    dataset_size=1,
+                    logger=lambda metrics, step: logged.append((step, metrics["loss"])),
+                    log_interval=1,
+                )
+
+                self.assertEqual(trainer.fit(), 1)
+                self.assertEqual([step for step, _ in logged], [1])
+                self.assertAlmostEqual(expected, logged[0][1], places=3)
+        finally:
+            torch.use_deterministic_algorithms(
+                previous_deterministic, warn_only=previous_warn_only
             )
-            return sum(0.8**i * plosses[i] for i in range(len(plosses))).item()
-
-        # --- new dataflow path ---
-        @torch.no_grad()
-        def new_loss():
-            ctrl = DataFlowController("online")
-            ctrl.ingest_prompts(
-                [{"payload": {"input_ids": ids, "loss_mask": [1] * SEQ}}]
-            )
-            store = LocalFeatureStore("online")
-            adapter = SGLangAdapter(target, device="cuda")
-            capture = CaptureConfig.from_strategy(
-                required_features=Eagle3TrainStrategy.required_features,
-                aux_hidden_state_layer_ids=tuple(aux_ids),
-                target_repr="logits",
-                target_hidden_size=H,
-                target_vocab_size=V,
-            )
-            worker = RolloutWorker(ctrl, store, adapter, capture, run_id="online")
-            worker.start()
-            refs = worker.run_once(max_tasks=4)
-            assert len(refs) == 1
-            # controller holds only metadata
-            assert_no_tensors(ctrl.status())
-            for r in refs:
-                assert_no_tensors(r)
-
-            def cat_collate(feats):
-                return {k: torch.cat([f[k] for f in feats], dim=0) for k in feats[0]}
-
-            loader = FeatureDataLoader(
-                store,
-                ctrl.sample_queue,
-                batch_size=1,
-                collate_fn=cat_collate,
-            )
-            strategy = Eagle3TrainStrategy(eagle3_model, target_head=None)
-            losses = []
-            for batch in loader:
-                self.assertEqual(batch.metadata["target_repr"], "logits")
-                losses.append(strategy.forward_loss(batch).loss.item())
-            return losses[0]
-
-        old = old_loss()
-        new = new_loss()
-        self.assertAlmostEqual(
-            old, new, places=3, msg=f"online loss: old={old} new={new}"
-        )
 
 
 if __name__ == "__main__":

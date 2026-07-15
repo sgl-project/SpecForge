@@ -26,11 +26,9 @@ target logits; DFlash reads ``output_hidden_states`` and selects layers with no
 target distribution. The SGLang side shares :class:`SGLangCaptureBackend` and
 differs only in build flags, the extend call, and output shaping.
 
-The target-capture bodies here are the single implementation behind the
-``{HF,SGLang,Custom}Eagle3TargetEngine`` / ``{HF,SGLang}DFlashTargetEngine``
-methods; those classes delegate to these policies, so the extraction stays
-byte-identical (enforced by ``test_phase_b_gate`` and the backend-parity
-tests).
+The target-capture bodies here are the single implementation used by the
+generic HF, SGLang, and custom engines. Backend-parity tests enforce that each
+engine returns the same typed capture contract.
 """
 
 from __future__ import annotations
@@ -64,7 +62,7 @@ class TargetCaptureBatch:
 @dataclass
 class Eagle3TargetOutput(TargetCaptureBatch):
     hidden_states: torch.Tensor
-    target: torch.Tensor
+    target: Optional[torch.Tensor]
     loss_mask: torch.Tensor
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
@@ -155,6 +153,12 @@ def _get_transformer_layers(model: nn.Module):
     """
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
+    elif (
+        hasattr(model, "model")
+        and hasattr(model.model, "language_model")
+        and hasattr(model.model.language_model, "layers")
+    ):
+        return model.model.language_model.layers
     elif hasattr(model, "layers"):
         return model.layers
     elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
@@ -199,6 +203,7 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
         torch_dtype,
         device,
         cache_dir,
+        input_modality: str = "text",
         **kwargs,
     ):
         from specforge.distributed import get_tp_device_mesh, get_tp_group
@@ -216,7 +221,13 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
                 "device_map": device,
             }
 
-        return AutoModelForCausalLM.from_pretrained(
+        model_class = AutoModelForCausalLM
+        if input_modality == "qwen2_5_vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration
+
+            model_class = Qwen2_5_VLForConditionalGeneration
+
+        return model_class.from_pretrained(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             cache_dir=cache_dir,
@@ -232,6 +243,7 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
         input_ids,
         attention_mask,
         loss_mask,
+        media_inputs=None,
         **kwargs,
     ) -> Eagle3TargetOutput:
         """Capture only the required layers via forward hooks (memory-light)."""
@@ -261,13 +273,31 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
                 )
 
         try:
+            media_kwargs = {}
+            if media_inputs is not None:
+                media_kwargs = {
+                    "pixel_values": media_inputs.pixel_values,
+                    "image_grid_thw": torch.cat(
+                        list(media_inputs.image_grid_thw), dim=0
+                    ),
+                }
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "output_hidden_states": False,
+                "output_attentions": False,
+                "use_cache": False,
+                **media_kwargs,
+            }
+            # ``output_router_logits`` is a causal-LM/MoE knob.  Qwen2.5-VL's
+            # multimodal wrapper accepts arbitrary Transformers kwargs and
+            # forwards them into the text stack, where this unrelated option is
+            # not part of the VLM contract.  Keep the text behavior without
+            # relying on permissive ``**kwargs`` in the VLM implementation.
+            if media_inputs is None:
+                forward_kwargs["output_router_logits"] = False
             outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=False,
-                output_attentions=False,
-                output_router_logits=False,
-                use_cache=False,
+                **forward_kwargs,
             )
             target = outputs.logits
         finally:
@@ -308,25 +338,23 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
         input_ids,
         attention_mask,
         loss_mask,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        is_vlm: bool = False,
+        media_inputs=None,
         shard_returns: bool = False,
-        **kwargs,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = True,
     ) -> Eagle3TargetOutput:
-        if kwargs:
-            logger.debug(f"unused kwargs {list(kwargs.keys())}")
-
-        if is_vlm:
+        if media_inputs is not None:
+            if shard_returns:
+                raise ValueError("VLM capture does not support shard_returns")
             data_cache, logits_list, aux_hidden_states_list, last_hidden_states_list = (
                 backend.extend_eagle3_vlm(
                     input_ids,
                     attention_mask,
                     loss_mask,
-                    return_last_hidden_states=False,
-                    return_logits=True,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
+                    return_last_hidden_states=return_last_hidden_states,
+                    return_logits=return_logits,
+                    pixel_values=media_inputs.pixel_values,
+                    image_grid_thw=list(media_inputs.image_grid_thw),
                 )
             )
         else:
@@ -335,8 +363,8 @@ class Eagle3CapturePolicy(TargetCapturePolicy):
                     input_ids,
                     attention_mask,
                     loss_mask,
-                    return_last_hidden_states=False,
-                    return_logits=True,
+                    return_last_hidden_states=return_last_hidden_states,
+                    return_logits=return_logits,
                     shard_returns=shard_returns,
                 )
             )
@@ -518,8 +546,6 @@ class DFlashCapturePolicy(TargetCapturePolicy):
 
 
 TARGET_CAPTURE_POLICIES: Dict[str, TargetCapturePolicy] = {}
-# Back-compat name retained for existing imports/tests.
-CAPTURE_POLICIES = TARGET_CAPTURE_POLICIES
 
 
 def register_target_capture_policy(name: str, policy: TargetCapturePolicy) -> None:
@@ -542,43 +568,20 @@ def resolve_target_capture_policy(name: str) -> TargetCapturePolicy:
         ) from None
 
 
-def register_capture_policy(name: str, policy: TargetCapturePolicy) -> None:
-    """Back-compat alias for :func:`register_target_capture_policy`."""
-    register_target_capture_policy(name, policy)
-
-
-def resolve_capture_policy(name: str) -> TargetCapturePolicy:
-    """Back-compat alias for :func:`resolve_target_capture_policy`."""
-    return resolve_target_capture_policy(name)
-
-
 register_target_capture_policy("eagle3", Eagle3CapturePolicy())
 register_target_capture_policy("dflash", DFlashCapturePolicy())
 # Domino trains on the same captured features as DFlash (same capture path).
 register_target_capture_policy("domino", TARGET_CAPTURE_POLICIES["dflash"])
 
-
-# Back-compat aliases for the original shorter names. New code should prefer
-# TargetCaptureSpec/TargetCapturePolicy to avoid confusion with
-# inference.capture.CaptureConfig.
-CaptureSpec = TargetCaptureSpec
-CapturePolicy = TargetCapturePolicy
-
-
 __all__ = [
     "TargetCaptureBatch",
     "TargetCaptureSpec",
     "TargetCapturePolicy",
-    "CaptureSpec",
-    "CapturePolicy",
     "Eagle3CapturePolicy",
     "DFlashCapturePolicy",
     "Eagle3TargetOutput",
     "DFlashTargetOutput",
     "TARGET_CAPTURE_POLICIES",
-    "CAPTURE_POLICIES",
     "register_target_capture_policy",
     "resolve_target_capture_policy",
-    "register_capture_policy",
-    "resolve_capture_policy",
 ]

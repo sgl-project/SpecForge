@@ -1,0 +1,33 @@
+model:
+  target_model_path: "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+  draft_model_config: "configs/llama4-scout-17B-16E-eagle3.json"
+  target_backend: "sglang"
+  embedding_key: "language_model.model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "./cache/dataset/sharegpt.jsonl"
+  max_length: 4096
+  chat_template: "llama4"
+  build_dataset_num_proc: 64
+  cache_dir: "./cache"
+training:
+  strategy: "eagle3"
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  tp_size: 8
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 20
+  seed: 0
+run_id: "llama4-scout-17b-16e-eagle3-online"
+output_dir: "./outputs/llama4-scout-17b-16e-eagle3-online"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

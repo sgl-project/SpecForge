@@ -401,7 +401,7 @@ class OnlineDFlashModel(nn.Module):
             accuracy_denom = binary_eval_mask.sum()
             accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
 
-        return loss, accuracy, {"accuracy_denom": accuracy_denom}
+        return loss, accuracy, {"accuracy_denom": accuracy_denom.detach()}
 
 
 class OnlineDominoModel(OnlineDFlashModel):
@@ -696,7 +696,7 @@ class OnlineDominoModel(OnlineDFlashModel):
                 base_loss=base_loss,
                 lambda_base=lambda_base,
             )
-            metrics["accuracy_denom"] = accuracy_denom
+            metrics["accuracy_denom"] = accuracy_denom.detach()
 
         return loss, accuracy, metrics
 
@@ -1007,5 +1007,5 @@ class OnlineDSparkModel(OnlineDFlashModel):
             correct = (pred_ids == flat_targets) & binary_eval_mask
             accuracy_denom = binary_eval_mask.to(torch.float32).sum()
             accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
-        metrics["accuracy_denom"] = accuracy_denom
+            metrics["accuracy_denom"] = accuracy_denom.detach()
         return loss, accuracy, metrics

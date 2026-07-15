@@ -16,15 +16,40 @@ from unittest import mock
 
 
 class DomainTrainerWiringTest(unittest.TestCase):
-    def _build(self, ref_source):
+    def _build(
+        self,
+        ref_source,
+        *,
+        durable_ack=False,
+        fit_step=42,
+        checkpointed_step=None,
+        fit_context=None,
+        fit_error=None,
+        loader_close_error=None,
+        save_error=None,
+        events=None,
+        on_fit_success=None,
+        on_fit_failure=None,
+        on_fit_finally=None,
+        tp_size=1,
+        sp_ulysses_size=1,
+        sp_ring_size=1,
+    ):
         import specforge.training.trainer as tr
 
         cap = {}
+        events = [] if events is None else events
 
         class FakeLoader:
             def __init__(self, store, **kw):
                 cap["loader_store"] = store
                 cap["loader_kw"] = kw
+                cap["loader"] = self
+
+            def close(self):
+                cap["loader_closes"] = cap.get("loader_closes", 0) + 1
+                if loader_close_error is not None:
+                    raise loader_close_error
 
         class FakeParallel:
             @classmethod
@@ -50,17 +75,31 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap["ctrl_core"] = core
                 cap["ctrl_kw"] = kw
                 self.global_step = 0
+                self.micro_step = 0
+                self.last_checkpoint_step = checkpointed_step
 
-            def fit(self, loader, eval_data=None):
-                cap["fit"] = (loader, eval_data)
-                return 42
+            def fit(self, loader):
+                cap["fit"] = loader
+                events.append("fit")
+                if fit_error is not None:
+                    raise fit_error
+                self.global_step = fit_step
+                return fit_step
+
+            def save_checkpoint(self, step):
+                events.append("save")
+                if save_error is not None:
+                    raise save_error
+                cap.setdefault("saves", []).append(step)
+                self.last_checkpoint_step = step
+                return SimpleNamespace(global_step=step)
+
+            def close_profiler(self):
+                cap["profiler_closes"] = cap.get("profiler_closes", 0) + 1
 
         dfc_calls = []
 
         class FakeDataflowController:
-            def enqueue_offline_refs(self, refs):
-                dfc_calls.append(("enqueue", refs))
-
             def register_trainer(self, meta):
                 dfc_calls.append(("register", meta))
                 return "trainer-0"
@@ -103,13 +142,17 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 max_steps=None,
                 total_steps=None,
                 save_interval=0,
-                eval_interval=0,
-                tp_size=1,
-                sp_ulysses_size=1,
-                sp_ring_size=1,
                 logger=None,
                 log_interval=50,
                 collate_fn="COLLATE",
+                durable_ack=durable_ack,
+                fit_context=fit_context,
+                on_fit_success=on_fit_success,
+                on_fit_failure=on_fit_failure,
+                on_fit_finally=on_fit_finally,
+                tp_size=tp_size,
+                sp_ulysses_size=sp_ulysses_size,
+                sp_ring_size=sp_ring_size,
             )
         return trainer, cap, dfc_calls, model
 
@@ -118,10 +161,10 @@ class DomainTrainerWiringTest(unittest.TestCase):
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        trainer, cap, dfc_calls, model = self._build({"refs": [1, 2]})
+        refs = list(range(6))
+        trainer, cap, dfc_calls, model = self._build({"refs": refs})
 
-        # offline refs enqueued; trainer registered
-        self.assertIn(("enqueue", [1, 2]), dfc_calls)
+        # Fixed offline refs bypass online queue/ledger state; trainer registered.
         self.assertIn(("register", {"role": "trainer", "run_id": "run"}), dfc_calls)
 
         # loader built over the store with the spec's name + drop_last + ref_source
@@ -129,22 +172,31 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(cap["loader_kw"]["batch_size"], 2)
         self.assertEqual(cap["loader_kw"]["strategy"], "eagle3")
         self.assertIs(cap["loader_kw"]["drop_last"], True)
-        self.assertEqual(cap["loader_kw"]["refs"], [1, 2])
+        self.assertEqual(cap["loader_kw"]["refs"], refs)
 
         # optimizer built over the inner draft AFTER FSDP wrap
         self.assertEqual(cap["prepare_model"], (model, "DRAFT"))
         self.assertEqual(cap["core"][0], ("STRAT", "WRAPPED", "HEAD"))
         self.assertEqual(cap["core"][2], 3)  # accumulation_steps threaded
 
-        # ack_fn wired to the DataFlowController with optimizer_durable=True
-        ack = cap["ctrl_kw"]["ack_fn"]
-        ack(["s1"], 7)
-        self.assertIn(("ack", "trainer-0", ["s1"], 7, True), dfc_calls)
+        self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
+        self.assertEqual(
+            cap["parallel_kw"],
+            {"tp_size": 1, "sp_ulysses_size": 1, "sp_ring_size": 1},
+        )
 
         # run identity rides the shared checkpoint payload, validated on resume
         self.assertEqual(
             cap["ctrl_kw"]["checkpoint_extra"],
-            {"dataset_size": 2, "accumulation_steps": 3},
+            {
+                "dataset_size": 6,
+                "batch_size": 2,
+                "accumulation_steps": 3,
+                "num_epochs": 1,
+                "tp_size": 1,
+                "sp_ulysses_size": 1,
+                "sp_ring_size": 1,
+            },
         )
 
     def test_fit_delegates_to_controller_over_loader(self):
@@ -152,19 +204,188 @@ class DomainTrainerWiringTest(unittest.TestCase):
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        trainer, cap, _, _ = self._build({"refs": []})
-        out = trainer.fit(eval_data="EVAL")
+        trainer, cap, _, _ = self._build({"refs": list(range(6))})
+        out = trainer.fit()
         self.assertEqual(out, 42)
-        self.assertEqual(cap["fit"], (trainer.loader, "EVAL"))
+        self.assertIs(cap["fit"], cap["loader"])
+        self.assertEqual(cap["saves"], [42])
+        self.assertEqual(cap["loader_closes"], 1)
 
-    def test_online_ref_source_not_enqueued(self):
+        # Re-entering at an already durable step does not write it twice.
+        self.assertEqual(trainer.fit(), 42)
+        self.assertEqual(cap["saves"], [42])
+        self.assertEqual(cap["loader_closes"], 2)
+
+    def test_offline_loader_rebuilds_the_ref_plan_on_set_epoch(self):
         try:
             import torch  # noqa: F401
         except Exception:
             self.skipTest("torch unavailable")
-        _, _, dfc_calls, _ = self._build({"queue": object()})
-        # a streamed (online) ref source is committed elsewhere — not enqueued here
-        self.assertNotIn("enqueue", [c[0] for c in dfc_calls])
+        calls = []
+
+        def refs_for_epoch(epoch):
+            calls.append(epoch)
+            return [f"e{epoch}-{index}" for index in range(6)]
+
+        _, cap, _, _ = self._build(
+            {
+                "refs": refs_for_epoch(0),
+                "refs_for_epoch": refs_for_epoch,
+            }
+        )
+        cap["loader"].set_epoch(3)
+        self.assertEqual(calls, [0, 3])
+        self.assertEqual(
+            cap["loader"]._refs,
+            ["e3-0", "e3-1", "e3-2", "e3-3", "e3-4", "e3-5"],
+        )
+        self.assertEqual(cap["loader"]._seek_batches, 0)
+
+    def test_fit_exits_topology_context_before_final_checkpoint(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+
+        class FitContext:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, *_exc):
+                events.append("exit")
+
+        trainer, _, _, _ = self._build(
+            {"refs": list(range(6))},
+            fit_context=FitContext(),
+            events=events,
+        )
+        self.assertEqual(trainer.fit(), 42)
+        self.assertEqual(events, ["enter", "fit", "exit", "save"])
+
+    def test_fit_owns_terminal_success_and_cleanup_after_checkpoint(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        trainer, _, _, _ = self._build(
+            {"refs": list(range(6))},
+            events=events,
+            on_fit_success=lambda step: events.append(f"success:{step}"),
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+        self.assertEqual(trainer.fit(), 42)
+        self.assertEqual(events, ["fit", "save", "success:42", "finally"])
+
+    def test_fit_owns_terminal_failure_and_cleanup(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        error = RuntimeError("fit failed")
+        trainer, cap, _, _ = self._build(
+            {"refs": list(range(6))},
+            fit_error=error,
+            events=events,
+            on_fit_success=lambda step: events.append(f"success:{step}"),
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            trainer.fit()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(events, ["fit", "failure:fit failed", "finally"])
+        self.assertEqual(cap["loader_closes"], 1)
+
+    def test_loader_cleanup_failure_does_not_mask_primary_fit_error(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        primary = RuntimeError("optimizer failed first")
+        cleanup = RuntimeError("prefetch worker stayed blocked")
+        trainer, cap, _, _ = self._build(
+            {"refs": list(range(6))},
+            fit_error=primary,
+            loader_close_error=cleanup,
+            events=events,
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+
+        with (
+            self.assertLogs("specforge.training.trainer", level="ERROR") as logs,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            trainer.fit()
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(cap["loader_closes"], 1)
+        self.assertEqual(events, ["fit", "failure:optimizer failed first", "finally"])
+        self.assertTrue(
+            any("prefetch worker stayed blocked" in note for note in primary.__notes__)
+        )
+        self.assertIn("prefetch worker stayed blocked", "\n".join(logs.output))
+
+    def test_loader_close_failure_signals_failure_before_final_cleanup(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        events = []
+        cleanup = RuntimeError("prefetch close failed")
+        trainer, cap, _, _ = self._build(
+            {"refs": list(range(6))},
+            loader_close_error=cleanup,
+            events=events,
+            on_fit_success=lambda step: events.append(f"success:{step}"),
+            on_fit_failure=lambda exc: events.append(f"failure:{exc}"),
+            on_fit_finally=lambda: events.append("finally"),
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            trainer.fit()
+
+        self.assertIs(raised.exception, cleanup)
+        self.assertEqual(cap["loader_closes"], 1)
+        self.assertEqual(
+            events,
+            ["fit", "save", "failure:prefetch close failed", "finally"],
+        )
+
+    def test_zero_step_skips_final_checkpoint(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        trainer, cap, _, _ = self._build({"refs": list(range(6))}, fit_step=0)
+        self.assertEqual(trainer.fit(), 0)
+        self.assertNotIn("saves", cap)
+
+    def test_final_checkpoint_failure_propagates(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        error = RuntimeError("checkpoint failed")
+        trainer, _, _, _ = self._build({"refs": list(range(6))}, save_error=error)
+        with self.assertRaises(RuntimeError) as raised:
+            trainer.fit()
+        self.assertIs(raised.exception, error)
+
+    def test_streaming_durable_ack_routes_through_controller(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+        _, cap, dfc_calls, _ = self._build({"queue": object()}, durable_ack=True)
+        ack = cap["ctrl_kw"]["ack_fn"]
+        ack(["s1"], 7)
+        self.assertIn(("ack", "trainer-0", ["s1"], 7, True), dfc_calls)
 
 
 if __name__ == "__main__":

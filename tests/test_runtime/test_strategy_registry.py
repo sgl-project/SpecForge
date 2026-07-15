@@ -4,28 +4,40 @@
 These lock the composition contract introduced by the launch refactor:
   * the registry resolves eagle3 to a spec whose required_features match the
     strategy class, with its offline + online data paths wired;
-  * launch builders take a `strategy=` parameter (default "eagle3") and the old
-    eagle3-named builders are exact aliases of the strategy-neutral ones;
+  * launch builders take a ``strategy=`` parameter and do not expose
+    strategy-specific entry points;
   * a strategy whose data path is not wired raises an actionable
     NotImplementedError rather than silently assembling eagle3-shaped features.
 
 No GPU / model environment required.
 """
 
+import ast
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
-from specforge import launch
+import specforge.launch as launch
+from specforge.inference.adapters.policy import (
+    DFLASH_FEATURE_SCHEMA,
+    EAGLE3_FEATURE_SCHEMA,
+)
 from specforge.training.strategies.base import (
     DFlashTrainStrategy,
     DSparkTrainStrategy,
     Eagle3TrainStrategy,
 )
 from specforge.training.strategies.registry import (
+    OnlineCaptureMode,
     available_strategies,
     resolve_strategy,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUILTIN_STRATEGIES = ("eagle3", "peagle", "dflash", "domino", "dspark")
 
 
 class TestStrategyRegistry(unittest.TestCase):
@@ -35,17 +47,57 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIn("domino", available_strategies())
         self.assertIn("dspark", available_strategies())
 
-    def test_dflash_fully_wired(self):
+    def test_online_capture_mode_is_explicit(self):
+        for name in ("eagle3", "peagle", "dflash", "domino"):
+            with self.subTest(strategy=name):
+                self.assertIs(
+                    resolve_strategy(name).online_capture,
+                    OnlineCaptureMode.POLICY,
+                )
+        self.assertIs(
+            resolve_strategy("dspark").online_capture,
+            OnlineCaptureMode.SERVER_ONLY,
+        )
+
+    def test_strategy_spec_is_the_draft_architecture_source(self):
+        import specforge.modeling.draft  # noqa: F401
+        from specforge.modeling.draft.registry import resolve_draft
+
+        for name in BUILTIN_STRATEGIES:
+            with self.subTest(strategy=name):
+                spec = resolve_strategy(name)
+                model_type = resolve_draft(spec.assembly.draft_config.architecture)
+                self.assertEqual(
+                    model_type.__name__, spec.assembly.draft_config.architecture
+                )
+
+    def test_generic_assembly_modules_have_no_builtin_strategy_dispatch(self):
+        generic_modules = (
+            "specforge/training/assembly.py",
+            "specforge/training/model_loading.py",
+            "specforge/training/disaggregated.py",
+        )
+        for relative_path in generic_modules:
+            tree = ast.parse((REPO_ROOT / relative_path).read_text())
+            string_literals = {
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            for strategy in BUILTIN_STRATEGIES:
+                with self.subTest(module=relative_path, strategy=strategy):
+                    self.assertNotIn(strategy, string_literals)
+
+    def test_dflash_offline_and_online_are_fully_wired(self):
         spec = resolve_strategy("dflash")
         self.assertEqual(
             spec.required_features, frozenset(DFlashTrainStrategy.required_features)
         )
-        # offline (reader/transform/collate) + online (feature schema) both wired
         self.assertIsNotNone(spec.make_offline_reader)
         self.assertIsNotNone(spec.make_offline_transform)
         self.assertIsNotNone(spec.make_offline_collate)
         self.assertIsNotNone(spec.feature_schema)
-        self.assertIsNotNone(spec.make_adapter)
+        self.assertIs(spec.feature_schema, DFLASH_FEATURE_SCHEMA)
         self.assertIsNone(spec.feature_schema.target_feature)  # no target distribution
         self.assertTrue(spec.supports_online)
         # DFlash owns its own (frozen) head -> builders pass target_head=None
@@ -58,19 +110,17 @@ class TestStrategyRegistry(unittest.TestCase):
             spec.make_strategy(_M(), target_head=None), DFlashTrainStrategy
         )
 
-    def test_dflash_family_online_uses_dflash_adapter(self):
+    def test_dflash_family_uses_one_feature_contract_offline_and_online(self):
         for name in ("dflash", "domino"):
             with self.subTest(strategy=name):
-                adapter = resolve_strategy(name).make_adapter(
-                    object(), device="cpu", t2d=None
-                )
-                self.assertEqual(type(adapter).__name__, "DFlashAdapter")
+                spec = resolve_strategy(name)
+                self.assertIs(spec.feature_schema, DFLASH_FEATURE_SCHEMA)
+                self.assertIsNotNone(spec.make_offline_reader)
+                self.assertIsNotNone(spec.make_offline_transform)
+                self.assertIsNotNone(spec.make_offline_collate)
 
-    def test_eagle3_online_uses_eagle3_adapter(self):
-        adapter = resolve_strategy("eagle3").make_adapter(
-            object(), device="cpu", t2d=None
-        )
-        self.assertEqual(type(adapter).__name__, "SGLangAdapter")
+    def test_eagle3_uses_eagle3_feature_schema(self):
+        self.assertIs(resolve_strategy("eagle3").feature_schema, EAGLE3_FEATURE_SCHEMA)
 
     def test_dspark_is_server_capture_online_only(self):
         spec = resolve_strategy("dspark")
@@ -81,8 +131,19 @@ class TestStrategyRegistry(unittest.TestCase):
         self.assertIsNone(spec.make_offline_reader)
         self.assertIsNone(spec.feature_schema)
         self.assertFalse(spec.uses_target_head)
-        with self.assertRaises(NotImplementedError):
-            spec.make_adapter(None)
+        with self.assertRaisesRegex(
+            NotImplementedError, "requires a server feature source"
+        ):
+            launch.build_online_runtime(
+                strategy="dspark",
+                target_model=None,
+                prompts=[],
+                draft_model=None,
+                optimizer_factory=None,
+                run_id="dspark-server-guard",
+                output_dir="unused",
+                target_hidden_size=8,
+            )
 
         class _M:
             draft_model = object()
@@ -119,6 +180,82 @@ class TestStrategyRegistry(unittest.TestCase):
                 self.assertEqual(batch["loss_mask"][0].tolist(), [1, 1, 1, 0, 0])
                 self.assertEqual(batch["input_ids"][0].tolist(), [1, 2, 3, 0, 0])
                 self.assertTrue(torch.all(batch["hidden_states"][0, 3:] == 0))
+
+    def test_dflash_and_domino_offline_transform_preserves_capture_contract(self):
+        raw = {
+            "input_ids": torch.tensor([1, 2, 3, 4]),
+            "loss_mask": torch.tensor([1, 1, 1, 1]),
+            "hidden_states": torch.arange(24).reshape(1, 4, 6),
+        }
+        for name in ("dflash", "domino"):
+            with self.subTest(strategy=name):
+                transformed = resolve_strategy(name).make_offline_transform(3)(raw)
+                self.assertEqual(
+                    set(transformed), {"input_ids", "loss_mask", "hidden_states"}
+                )
+                self.assertEqual(transformed["input_ids"].shape, (1, 3))
+                self.assertEqual(transformed["loss_mask"].tolist(), [[1, 1, 1]])
+                self.assertEqual(transformed["hidden_states"].shape, (1, 3, 6))
+                self.assertTrue(
+                    torch.equal(
+                        transformed["hidden_states"], raw["hidden_states"][:, :3]
+                    )
+                )
+
+    def test_dflash_family_offline_reader_stamps_strategy_specific_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            torch.save(
+                {
+                    "input_ids": torch.tensor([1, 2, 3]),
+                    "loss_mask": torch.ones(3, dtype=torch.long),
+                    "hidden_states": torch.ones(1, 3, 4),
+                },
+                os.path.join(directory, "0000.ckpt"),
+            )
+            for name in ("dflash", "domino"):
+                with self.subTest(strategy=name):
+                    reader = resolve_strategy(name).make_offline_reader(
+                        directory,
+                        run_id=f"{name}-run",
+                        ttt_length=7,
+                        max_len=16,
+                    )
+                    refs = reader.read()
+                    self.assertEqual(len(refs), 1)
+                    self.assertEqual(refs[0].strategy, name)
+                    self.assertEqual(
+                        set(refs[0].feature_keys),
+                        {"input_ids", "loss_mask", "hidden_states"},
+                    )
+                    self.assertEqual(refs[0].metadata["format"], f"offline_{name}")
+                    self.assertIsNone(refs[0].metadata["target_repr"])
+
+    def test_disaggregated_ingest_uses_domino_offline_contract(self):
+        from specforge.runtime.data_plane import LocalFeatureStore
+        from specforge.runtime.data_plane.disagg_ingest import ingest_offline_features
+
+        with tempfile.TemporaryDirectory() as directory:
+            tensors = {
+                "input_ids": torch.tensor([1, 2, 3]),
+                "loss_mask": torch.ones(3, dtype=torch.long),
+                "hidden_states": torch.ones(1, 3, 4),
+            }
+            torch.save(tensors, os.path.join(directory, "0000.ckpt"))
+            store = LocalFeatureStore("offline-domino")
+            refs = ingest_offline_features(
+                store,
+                directory,
+                strategy="domino",
+                run_id="domino-run",
+            )
+            self.assertEqual(len(refs), 1)
+            self.assertEqual(refs[0].strategy, "domino")
+            self.assertEqual(refs[0].metadata["format"], "offline_domino")
+            loaded, handle = store.get(refs[0])
+            self.addCleanup(store.release, handle)
+            self.assertEqual(set(loaded), set(tensors))
+            for key, value in tensors.items():
+                self.assertTrue(torch.equal(loaded[key], value))
 
     def test_dspark_online_collate_pads_target_last_hidden(self):
         short = {
@@ -161,19 +298,21 @@ class TestStrategyRegistry(unittest.TestCase):
         )
 
 
-class TestLaunchBackCompatAndGuards(unittest.TestCase):
-    def test_eagle3_named_builders_are_aliases_of_neutral_ones(self):
-        self.assertIs(launch.build_offline_eagle3_runtime, launch.build_offline_runtime)
-        self.assertIs(
-            launch.build_offline_eagle3_controller, launch.build_offline_runtime
+class TestLaunchGuards(unittest.TestCase):
+    @staticmethod
+    def _assembly_spec():
+        from specforge.training.strategies.assembly import (
+            DraftConfigSpec,
+            StrategyAssemblySpec,
+            StrategyModelParts,
         )
-        self.assertIs(
-            launch.build_disagg_eagle3_runtime, launch.build_disagg_offline_runtime
-        )
-        self.assertIs(launch.build_online_eagle3_runtime, launch.build_online_runtime)
-        self.assertIs(
-            launch.build_disagg_online_eagle3_runtime,
-            launch.build_disagg_online_runtime,
+
+        return StrategyAssemblySpec(
+            draft_config=DraftConfigSpec(architecture="UnusedDraft"),
+            make_draft_model=lambda cfg, draft_config: None,
+            make_model=lambda cfg, draft, draft_config, target_config, tokenizer: (
+                StrategyModelParts(model=None)
+            ),
         )
 
     def test_offline_builder_rejects_unwired_strategy(self):
@@ -191,6 +330,7 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
                 name="_unwired_offline_test",
                 required_features=frozenset({"x"}),
                 make_strategy=lambda wrapped, *, target_head=None: None,
+                assembly=self._assembly_spec(),
             )
         )
         self.addCleanup(_reg._REGISTRY.pop, "_unwired_offline_test", None)
@@ -198,7 +338,7 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
             launch.build_offline_runtime(
                 strategy="_unwired_offline_test",
                 hidden_states_path="unused",
-                eagle3_model=None,
+                draft_model=None,
                 target_head=None,
                 optimizer_factory=None,
                 run_id="r",
@@ -218,7 +358,7 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
                 name="_unwired_online_test",
                 required_features=frozenset({"x"}),
                 make_strategy=lambda wrapped, *, target_head=None: None,
-                supports_online=False,
+                assembly=self._assembly_spec(),
             )
         )
         self.addCleanup(_reg._REGISTRY.pop, "_unwired_online_test", None)
@@ -227,7 +367,7 @@ class TestLaunchBackCompatAndGuards(unittest.TestCase):
                 strategy="_unwired_online_test",
                 target_model=None,
                 prompts=[],
-                eagle3_model=None,
+                draft_model=None,
                 optimizer_factory=None,
                 run_id="r-online",
                 output_dir="o",
