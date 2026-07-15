@@ -314,41 +314,35 @@ class FSDPTrainingBackend(TrainingBackend):
 
     @staticmethod
     def _rng_state() -> dict:
-        # Persist only the bound accelerator's RNG state so a checkpoint is
-        # independent of how many CUDA/NPU devices are visible at load time.
-        from specforge.utils import get_device_type
-
-        device_type = get_device_type()
-        accelerator_state = None
-        module = getattr(torch, device_type, None)
-        if (
-            device_type in ("cuda", "npu")
-            and module is not None
-            and module.is_available()
-        ):
-            accelerator_state = module.get_rng_state(module.current_device())
+        # single bound-device CUDA state keeps the checkpoint independent of
+        # how many devices happen to be visible at save time.
         return {
             "torch": torch.get_rng_state(),
-            "device_type": device_type,
-            # Named keys keep old CUDA checkpoints readable and make NPU state
-            # inspectable without understanding a new opaque payload.
-            "cuda": accelerator_state if device_type == "cuda" else None,
-            "npu": accelerator_state if device_type == "npu" else None,
+            "cuda": (
+                torch.cuda.get_rng_state(torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else None
+            ),
         }
 
     @staticmethod
     def _set_rng_state(rng: dict) -> None:
-        torch.set_rng_state(rng["torch"])
-        # ``device_type``/``npu`` are new. Falling back to the legacy ``cuda``
-        # key preserves every checkpoint written before NPU support.
-        device_type = rng.get("device_type")
-        if device_type is None:
-            device_type = "cuda" if rng.get("cuda") is not None else None
-        state = rng.get(device_type) if device_type is not None else None
-        module = getattr(torch, device_type, None) if device_type is not None else None
-        if state is None or module is None or not module.is_available():
+        cpu_state = rng.get("torch", rng.get("cpu"))  # "cpu" = legacy key
+        if cpu_state is not None:
+            torch.set_rng_state(cpu_state)
+        cuda_state = rng.get("cuda")
+        if cuda_state is None or not torch.cuda.is_available():
             return
-        module.set_rng_state(state, module.current_device())
+        device = torch.cuda.current_device()
+        if isinstance(cuda_state, list):  # legacy get_rng_state_all format
+            if device >= len(cuda_state):
+                raise ValueError(
+                    f"legacy RNG checkpoint holds {len(cuda_state)} CUDA states "
+                    f"but this rank's bound device index is {device}; it was "
+                    "saved with fewer visible devices and cannot be restored here"
+                )
+            cuda_state = cuda_state[device]
+        torch.cuda.set_rng_state(cuda_state, device)
 
 
 __all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend"]

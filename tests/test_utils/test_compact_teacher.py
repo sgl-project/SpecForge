@@ -358,18 +358,6 @@ class TestCompactTeacherEnabledValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_compact_teacher_enabled(
                 is_online=True,
-                is_vlm=False,
-                draft_vocab_size=16,
-                vocab_size=64,
-                t2d=self._t2d(),
-                target_head_weight=self._weight(),
-            )
-
-    def test_rejects_vlm(self):
-        with self.assertRaises(ValueError):
-            validate_compact_teacher_enabled(
-                is_online=False,
-                is_vlm=True,
                 draft_vocab_size=16,
                 vocab_size=64,
                 t2d=self._t2d(),
@@ -380,7 +368,6 @@ class TestCompactTeacherEnabledValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_compact_teacher_enabled(
                 is_online=False,
-                is_vlm=False,
                 draft_vocab_size=16,
                 vocab_size=64,
                 t2d=self._t2d(),
@@ -392,7 +379,6 @@ class TestCompactTeacherEnabledValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_compact_teacher_enabled(
                 is_online=False,
-                is_vlm=False,
                 draft_vocab_size=32,
                 vocab_size=32,
                 t2d=t,
@@ -403,7 +389,6 @@ class TestCompactTeacherEnabledValidation(unittest.TestCase):
         with self.assertRaises(ValueError):  # wrong row count
             validate_compact_teacher_enabled(
                 is_online=False,
-                is_vlm=False,
                 draft_vocab_size=16,
                 vocab_size=64,
                 t2d=self._t2d(),
@@ -412,7 +397,6 @@ class TestCompactTeacherEnabledValidation(unittest.TestCase):
         with self.assertRaises(ValueError):  # not 2-D
             validate_compact_teacher_enabled(
                 is_online=False,
-                is_vlm=False,
                 draft_vocab_size=16,
                 vocab_size=64,
                 t2d=self._t2d(),
@@ -424,7 +408,6 @@ class TestCompactTeacherEnabledValidation(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_compact_teacher_enabled(
                     is_online=False,
-                    is_vlm=False,
                     draft_vocab_size=16,
                     vocab_size=64,
                     t2d=self._t2d(),
@@ -435,7 +418,6 @@ class TestCompactTeacherEnabledValidation(unittest.TestCase):
     def test_accepts_valid_offline(self):
         validate_compact_teacher_enabled(
             is_online=False,
-            is_vlm=False,
             draft_vocab_size=16,
             vocab_size=64,
             t2d=self._t2d(),

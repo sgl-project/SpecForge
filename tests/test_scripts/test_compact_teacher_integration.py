@@ -113,7 +113,7 @@ class TestValidateCompactTeacherArgs(unittest.TestCase):
     def _config(self, vocab=64, draft=16):
         t2d, d2t = _mapping(vocab, draft)
         return types.SimpleNamespace(
-            args=types.SimpleNamespace(is_vlm=False, compact_teacher_chunk_size=128),
+            args=types.SimpleNamespace(compact_teacher_chunk_size=128),
             target_model=_TargetHeadDouble(8, vocab),
             draft_model=types.SimpleNamespace(t2d=t2d, d2t=d2t),
             cfg=types.SimpleNamespace(vocab_size=vocab, draft_vocab_size=draft),
@@ -130,12 +130,6 @@ class TestValidateCompactTeacherArgs(unittest.TestCase):
     def test_rejects_online(self):
         with self.assertRaises(ValueError):
             self._validate(self._config(), is_online=True)
-
-    def test_rejects_vlm(self):
-        c = self._config()
-        c.args.is_vlm = True
-        with self.assertRaises(ValueError):
-            self._validate(c)
 
     def test_rejects_nonpositive_chunk(self):
         c = self._config()

@@ -315,6 +315,10 @@ class DataFlowController:
             if sid in acked and step_committed:
                 released.append(sid)
                 if feature_store is not None:
+                    ref = self.store.get_committed(sid)
+                    adopt = getattr(feature_store, "adopt", None)
+                    if ref is not None and callable(adopt):
+                        adopt(ref)
                     # idempotent free; safe if the sample was already freed
                     feature_store.abort(sid, reason="reconciled-released")
             else:

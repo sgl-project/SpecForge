@@ -331,7 +331,6 @@ def validate_compact_teacher_args(
     target_head_weight = getattr(getattr(target_model, "fc", None), "weight", None)
     validate_compact_teacher_enabled(
         is_online=is_online,
-        is_vlm=args.is_vlm,
         draft_vocab_size=draft_model_config.draft_vocab_size,
         vocab_size=draft_model_config.vocab_size,
         t2d=draft_model.t2d,

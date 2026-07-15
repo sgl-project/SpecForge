@@ -1000,12 +1000,16 @@ def build_disagg_online_producer(
                 channel.fail(f"{type(exc).__name__}: {exc}")
             except Exception:
                 logger.exception("failed to publish producer failure sentinel")
+            try:
+                channel.close()
+            except Exception:
+                logger.exception("failed to close channel after producer failure")
             raise
         producer_timing(
             f"drive_producer closing channel produced={produced} "
             f"elapsed={elapsed(drive_start)}"
         )
-        channel.close()  # successful EOF; a failure uses channel.fail()
+        channel.close()
         return produced
 
     return workers, drive_producer
