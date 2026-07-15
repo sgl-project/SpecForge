@@ -89,13 +89,14 @@ class ConfigSchemaTest(unittest.TestCase):
                     "training": {"attention_backend": "usp"},
                 }
             )
-        with self.assertRaises(ValidationError):
-            Config.model_validate(
-                {
-                    **MINIMAL,
-                    "training": {"tp_size": 1},
-                }
-            )
+        parallel = Config.model_validate(
+            {
+                **MINIMAL,
+                "training": {"tp_size": 2, "sp_ulysses_size": 2},
+            }
+        )
+        self.assertEqual(parallel.training.tp_size, 2)
+        self.assertEqual(parallel.training.sp_ulysses_size, 2)
         with self.assertRaises(ValidationError):
             Config.model_validate(
                 {

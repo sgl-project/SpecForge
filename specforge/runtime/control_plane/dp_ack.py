@@ -76,11 +76,13 @@ class DPAckController(DataFlowController):
         *,
         is_authority: bool = True,
         gather: Callable[[List[str]], List[str]] = gather_id_union,
+        feature_store=None,
         **kwargs,
     ) -> None:
         super().__init__(run_id, **kwargs)
         self.is_authority = is_authority
         self._gather = gather
+        self.feature_store = feature_store
 
     def ack_train_refs(
         self,
@@ -99,6 +101,15 @@ class DPAckController(DataFlowController):
             global_step=global_step,
             optimizer_durable=optimizer_durable,
         )
+        if optimizer_durable and self.feature_store is not None:
+            adopt = getattr(self.feature_store, "adopt", None)
+            for sample_id in union:
+                ref = self.store.get_committed(sample_id)
+                if ref is not None and callable(adopt):
+                    adopt(ref)
+                self.feature_store.abort(
+                    sample_id, reason="optimizer-boundary-durable-ack"
+                )
 
 
 __all__ = ["DPAckController", "gather_id_union"]

@@ -239,10 +239,11 @@ class TestMultiServerProducer(unittest.TestCase):
             lease=2,
             max_prompt_attempts=3,
         )
-        produced = drive(max_rounds=10_000)
-        self.assertEqual(produced, N - 1)  # p0 terminal, everything else through
+        with self.assertRaisesRegex(RuntimeError, "terminally failed prompt"):
+            drive(max_rounds=10_000)
         ids = _published_sample_ids(channel.path)
         self.assertEqual(set(ids), {f"run0:p{i}" for i in range(1, N)})
+        self.assertIn("terminally failed prompt", channel.failure())
         self.assertTrue(channel.is_closed())
 
     def test_source_count_worker_count_conflict_raises(self):

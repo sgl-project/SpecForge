@@ -1162,7 +1162,10 @@ def build_disagg_online_consumer(
                     "ledger is what dedups commits and reconciles restarts"
                 )
             controller = DPAckController(
-                run_id, is_authority=True, metadata_store=store
+                run_id,
+                is_authority=True,
+                feature_store=feature_store,
+                metadata_store=store,
             )
             skip_ids = _reconcile(controller, store) if resume else None
             if not resume and store.committed_count() > 0:

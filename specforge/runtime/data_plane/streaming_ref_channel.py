@@ -41,7 +41,8 @@ import json
 import os
 import threading
 import time
-from typing import Iterator, List, Optional
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Sequence, Set
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
@@ -52,6 +53,49 @@ _FAILED_SUFFIX = ".failed"
 _CONSUMER_DONE_SUFFIX = ".consumer_done"
 _CONSUMER_FAILED_SUFFIX = ".consumer_failed"
 _CONSUMER_QUANTUM_SUFFIX = ".consumer_quantum"
+
+
+@dataclass
+class RefPublishTransaction:
+    """Track the ownership-transferred prefix of one publication batch.
+
+    JSONL append is not atomic across a batch. A complete line can also become
+    visible before its fsync reports failure. The channel increments its
+    publication counter once the full line has been accepted; the transaction
+    observes that progress even when ``publish`` raises. Cleanup can therefore
+    preserve every possibly visible ref and abort only the untouched suffix.
+    """
+
+    channel: "StreamingRefChannel"
+    refs: tuple[SampleRef, ...]
+    published_count: int = 0
+
+    @property
+    def published_refs(self) -> tuple[SampleRef, ...]:
+        return self.refs[: self.published_count]
+
+    @property
+    def unpublished_refs(self) -> tuple[SampleRef, ...]:
+        return self.refs[self.published_count :]
+
+    def commit(self) -> None:
+        """Publish the remaining suffix, retaining progress if one append fails."""
+
+        for ref in self.unpublished_refs:
+            before = self.channel.published
+            try:
+                self.channel.publish(ref)
+            except BaseException as publish_exc:
+                transferred = self.channel.published - before
+                if transferred not in (0, 1):
+                    raise RuntimeError(
+                        "reference channel reported invalid publication progress: "
+                        f"{before} -> {self.channel.published}"
+                    ) from publish_exc
+                self.published_count += transferred
+                raise
+            else:
+                self.published_count += 1
 
 
 class StreamingRefChannel:
@@ -77,16 +121,33 @@ class StreamingRefChannel:
     def publish(self, ref: SampleRef) -> None:
         """Append one tensor-free ref. Durable (fsync) so a remote reader sees it."""
         assert_no_tensors([ref])
-        line = json.dumps(ref_to_dict(ref), separators=(",", ":")) + "\n"
-        with open(self.path, "a") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
-        self._published += 1
+        payload = (json.dumps(ref_to_dict(ref), separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("reference channel append made no progress")
+                offset += written
+            # Ownership transfers only after the complete newline-terminated
+            # record has reached the kernel. fsync may still report a durability
+            # failure after the record is visible, so progress must be observable
+            # to the surrounding transaction before that call.
+            self._published += 1
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def begin_publish(self, refs: Sequence[SampleRef]) -> RefPublishTransaction:
+        """Create an observable batch publication boundary without writing yet."""
+
+        return RefPublishTransaction(self, tuple(refs))
 
     def publish_many(self, refs: List[SampleRef]) -> None:
-        for r in refs:
-            self.publish(r)
+        self.begin_publish(refs).commit()
 
     def close(self) -> None:
         """Drop the EOF sentinel so the reader's stream() terminates when drained."""
@@ -301,6 +362,11 @@ class StreamingRefQueue:
     only the read lease. The durable optimizer-boundary controller owns the
     later physical feature deletion.
 
+    ``skip_ids`` contains refs already covered by the durable optimizer marker
+    when a consumer re-reads the append-only channel after restart. Those refs
+    are filtered before leasing and counted as consumed so producer
+    backpressure remains exact.
+
     """
 
     # A loader that stops after prefetching must put its never-yielded refs back
@@ -314,12 +380,14 @@ class StreamingRefQueue:
         *,
         poll_s: float = 0.1,
         idle_timeout_s: Optional[float] = None,
+        skip_ids: Optional[Set[str]] = None,
         clock=time.monotonic,
         sleep=time.sleep,
     ) -> None:
         self.channel = channel
         self.poll_s = poll_s
         self.idle_timeout_s = idle_timeout_s
+        self._skip_ids = set(skip_ids) if skip_ids else None
         self._clock = clock
         self._sleep = sleep
         self._buf: List[SampleRef] = []
@@ -333,6 +401,25 @@ class StreamingRefQueue:
             os.environ.get("SPECFORGE_STREAM_WAIT_LOG_INTERVAL", 30.0)
         )
         self._last_wait_log = 0.0
+
+    def _poll(self) -> tuple[List[SampleRef], int]:
+        """Return fresh refs and the raw count read from the durable channel."""
+        raw = self.channel.poll()
+        if not self._skip_ids or not raw:
+            return raw, len(raw)
+        fresh: List[SampleRef] = []
+        skipped = 0
+        for ref in raw:
+            if ref.sample_id in self._skip_ids:
+                self._skip_ids.discard(ref.sample_id)
+                skipped += 1
+            else:
+                fresh.append(ref)
+        if skipped:
+            self.channel.mark_consumed(skipped)
+            if not self._skip_ids:
+                self._skip_ids = None
+        return fresh, len(raw)
 
     def get(self, n: int, timeout_s: float = 0.0) -> List[SampleRef]:
         del timeout_s  # the durable stream blocks until closed, failed, or timed out
@@ -363,10 +450,11 @@ class StreamingRefQueue:
         while len(self._buf) < n:
             if stop_event is not None and stop_event.is_set():
                 return []
-            new = self.channel.poll()
-            if new:
+            new, raw_count = self._poll()
+            if raw_count:
                 last_progress = self._clock()
-                self._buf.extend(new)
+                if new:
+                    self._buf.extend(new)
                 continue
             failure = self.channel.failure()
             if failure is not None:
@@ -375,7 +463,7 @@ class StreamingRefQueue:
                     f"{failure}"
                 )
             if self.channel.is_closed():
-                drain = self.channel.poll()
+                drain, _ = self._poll()
                 self._buf.extend(drain)  # final drain
                 break
             if (
@@ -453,4 +541,4 @@ class StreamingRefQueue:
             return [ref.sample_id for ref in self._inflight]
 
 
-__all__ = ["StreamingRefChannel", "StreamingRefQueue"]
+__all__ = ["RefPublishTransaction", "StreamingRefChannel", "StreamingRefQueue"]

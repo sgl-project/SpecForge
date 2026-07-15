@@ -1,37 +1,11 @@
 """Generic position-ID contracts for the EAGLE3 training model."""
 
-import importlib.util
 import inspect
-import sys
-import types
 import unittest
-from pathlib import Path
 
 import torch
 
-_loss_module = types.ModuleType("specforge.core.loss")
-_loss_module.LogSoftmaxLoss = object
-_model_spec = importlib.util.spec_from_file_location(
-    "test_eagle3_position_model",
-    Path(__file__).resolve().parents[2]
-    / "specforge"
-    / "algorithms"
-    / "eagle3"
-    / "model.py",
-)
-assert _model_spec is not None and _model_spec.loader is not None
-_model_module = importlib.util.module_from_spec(_model_spec)
-_missing = object()
-_previous_loss_module = sys.modules.get("specforge.core.loss", _missing)
-sys.modules["specforge.core.loss"] = _loss_module
-try:
-    _model_spec.loader.exec_module(_model_module)
-finally:
-    if _previous_loss_module is _missing:
-        sys.modules.pop("specforge.core.loss", None)
-    else:
-        sys.modules["specforge.core.loss"] = _previous_loss_module
-OnlineEagle3Model = _model_module.OnlineEagle3Model
+from specforge.algorithms.eagle3.model import OnlineEagle3Model
 
 
 class Eagle3PositionIdsTest(unittest.TestCase):

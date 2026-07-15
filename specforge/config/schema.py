@@ -128,7 +128,11 @@ class TrainingConfig(StrictConfigModel):
     down_sample_ratio: float = 0.8
     down_sample_ratio_min: float = 0.2
     norm_before_residual: Optional[bool] = None
+    tp_size: int = Field(default=1, gt=0)
+    sp_ulysses_size: int = Field(default=1, gt=0)
+    sp_ring_size: int = Field(default=1, gt=0)
     save_interval: int = Field(default=0, ge=0)
+    eval_interval: int = Field(default=0, ge=0)
     log_interval: int = Field(default=50, gt=0)
     #: CheckpointManager rotation: keep the newest N checkpoints (0 = keep all).
     max_checkpoints: int = Field(default=0, ge=0)

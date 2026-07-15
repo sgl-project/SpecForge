@@ -86,7 +86,7 @@ class TestCliConfigBuild(unittest.TestCase):
         cfg = Config.model_validate(
             {
                 "model": {"target_model_path": "t", "draft_model_config": "d"},
-                "data": {"hidden_states_path": "/features"},
+                "data": {"prompts_path": "/prompts.jsonl"},
                 "training": {"strategy": "dflash"},
             }
         )

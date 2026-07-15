@@ -10,12 +10,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
+
+
+def dp_partition(sample_id: str, num_partitions: int) -> int:
+    """Return a stable consumer-side DP partition for ``sample_id``."""
+    if num_partitions <= 1:
+        return 0
+    digest = hashlib.sha1(sample_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % num_partitions
 
 
 class SampleRefQueue:
@@ -25,7 +34,10 @@ class SampleRefQueue:
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
 
-    def put(self, refs: List[SampleRef]) -> None:
+    def put(
+        self, refs: List[SampleRef], *, partition_key: Optional[str] = None
+    ) -> None:
+        del partition_key  # reserved producer-side routing seam
         with self._cv:
             for ref in refs:
                 assert_no_tensors(ref)  # structural no-tensor guard
@@ -39,13 +51,19 @@ class SampleRefQueue:
         self,
         max_refs: int,
         timeout_s: Optional[float] = None,
+        *,
+        partition_key: Optional[str] = None,
+        partition: Optional[Tuple[int, int]] = None,
     ) -> List[SampleRef]:
         """Lease pending refs, optionally waiting up to ``timeout_s``."""
+        del partition_key  # reserved producer-side routing seam
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         with self._cv:
             while True:
                 if self._pending:
-                    return self._lease_any_locked(max_refs)
+                    if partition is None:
+                        return self._lease_any_locked(max_refs)
+                    return self._lease_partition_locked(max_refs, partition)
                 if deadline is None:
                     return []
                 remaining = deadline - time.monotonic()
@@ -60,6 +78,21 @@ class SampleRefQueue:
             sid, ref = self._pending.popitem(last=False)
             self._leased[sid] = ref
             out.append(ref)
+        return out
+
+    def _lease_partition_locked(
+        self, max_refs: int, partition: Tuple[int, int]
+    ) -> List[SampleRef]:
+        """Lease only refs assigned to the requested current DP shard."""
+        index, num_partitions = partition
+        out: List[SampleRef] = []
+        for sample_id in list(self._pending):
+            if len(out) >= max_refs:
+                break
+            if dp_partition(sample_id, num_partitions) == index:
+                ref = self._pending.pop(sample_id)
+                self._leased[sample_id] = ref
+                out.append(ref)
         return out
 
     def ack(self, refs: List[SampleRef]) -> None:
@@ -85,4 +118,4 @@ class SampleRefQueue:
             return len(self._leased)
 
 
-__all__ = ["SampleRefQueue"]
+__all__ = ["SampleRefQueue", "dp_partition"]
