@@ -557,6 +557,34 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(len(_inbox_ids(self.inbox_dir, 0)), 8)
         self.assertEqual(len(_inbox_ids(self.inbox_dir, 1)), 8)
 
+    def test_eof_counters_reconcile_consumed_with_published(self):
+        # Every publication must eventually be counted consumed exactly once:
+        # window acks for dispatched refs, immediate settle for same-attempt
+        # duplicates, and the end-of-stream settle for the sub-window leftover.
+        dist = self._distributor(dp_size=2, refs_per_rank_step=2)  # window = 4
+        for i in range(4):
+            self.producer.publish(_ref(f"s{i}"))
+        _pump_until_quiet(dist)
+        for rank in range(2):
+            q = StreamingRefQueue(
+                StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            )
+            q.ack(q.get(2))
+        self.producer.publish(_ref("s0"))  # at-least-once duplicate
+        for i in range(4, 7):  # sub-window leftover
+            self.producer.publish(_ref(f"s{i}"))
+        self.producer.close()
+
+        dist._run_guarded()
+
+        self.assertIsNone(dist.error)
+        self.assertTrue(dist.finished)
+        self.assertEqual(dist.stats["dispatched"], 4)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(dist.stats["dropped"], 3)
+        self.assertEqual(self.producer.consumed_remote(), 8)
+        self.assertEqual(self.producer.in_flight_remote(), 0)
+
     def test_requeued_leftover_below_one_window_settles_on_resume(self):
         # Resume scenario: reconciliation requeued committed-unacked refs from
         # a prior attempt, the producer has nothing further, and the leftover

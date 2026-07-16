@@ -981,6 +981,18 @@ def build_disagg_online_producer(
                     f"global optimizer-step quantum {consumer_quantum}; set "
                     "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
                 )
+            resolved_low_watermark = flow_control.limits.resolved_low_watermark_refs
+            if resolved_low_watermark < consumer_quantum:
+                # The consumer dispatches only whole optimizer windows, so a
+                # paused producer must be resumable while the consumer still
+                # needs up to one full window: a low watermark below the
+                # quantum could leave both sides waiting on each other.
+                raise ValueError(
+                    "producer in-flight low watermark "
+                    f"{resolved_low_watermark} is smaller than the consumer's "
+                    f"global optimizer-step quantum {consumer_quantum}; set "
+                    "DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
+                )
             producer_timing(
                 f"consumer optimizer window ready quantum={consumer_quantum}"
             )

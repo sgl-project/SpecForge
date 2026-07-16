@@ -23,7 +23,10 @@ in whole windows, so a window that could not complete would strand refs that no
 resume can ever acknowledge. An end-of-stream therefore always lands on a
 window boundary; the sub-window leftover (fewer refs than one global window)
 is settled without dispatch — drop_last-style, matching the floor semantics of
-``resolve_online_total_steps`` — and the stream closes cleanly.
+``resolve_online_total_steps`` — and the stream closes cleanly. Note the
+cold-start consequence: ranks receive their first micro-batch only after the
+whole first window is captured, so rank-side idle timeouts must cover
+full-window capture latency, not a single round.
 
 The consumed counter on the source channel (the producer's backpressure signal)
 mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
