@@ -270,6 +270,60 @@ class TestTrainerCore(unittest.TestCase):
 
 
 class TestTrainerController(unittest.TestCase):
+    def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        progress = mock.Mock()
+        with (
+            tempfile.TemporaryDirectory() as d,
+            mock.patch(
+                "specforge.training.controller.sys.stderr.isatty", return_value=True
+            ),
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=False),
+            mock.patch("tqdm.tqdm", return_value=progress) as build_progress,
+        ):
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=3,
+                num_epochs=1,
+                start_step=1,
+            )
+            self.assertEqual(ctrl.fit([_batch(), _batch()]), 3)
+
+        self.assertEqual(build_progress.call_args.kwargs["total"], 3)
+        self.assertEqual(build_progress.call_args.kwargs["initial"], 1)
+        self.assertEqual(progress.update.call_args_list, [mock.call(1), mock.call(1)])
+        progress.close.assert_called_once_with()
+
+    def test_progress_bar_is_disabled_off_rank_zero(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        with (
+            tempfile.TemporaryDirectory() as d,
+            mock.patch(
+                "specforge.training.controller.sys.stderr.isatty", return_value=True
+            ),
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_rank", return_value=1),
+            mock.patch("tqdm.tqdm") as build_progress,
+        ):
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=1,
+                num_epochs=1,
+            )
+            self.assertIsNone(ctrl._make_progress_bar())
+
+        build_progress.assert_not_called()
+
     def test_fit_and_checkpoint(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
@@ -350,8 +404,12 @@ class TestTrainerController(unittest.TestCase):
         core = TrainerCore(strat, backend, accumulation_steps=2)
         with tempfile.TemporaryDirectory() as d:
             ctrl = TrainerController(core, run_id="r", output_dir=d)
-            with self.assertRaisesRegex(
-                RuntimeError, "incomplete gradient accumulation"
+            progress = mock.Mock()
+            with (
+                mock.patch.object(ctrl, "_make_progress_bar", return_value=progress),
+                self.assertRaisesRegex(
+                    RuntimeError, "incomplete gradient accumulation"
+                ),
             ):
                 ctrl.fit([_batch() for _ in range(3)])
 
@@ -359,6 +417,7 @@ class TestTrainerController(unittest.TestCase):
         self.assertEqual(backend.steps, 1)
         self.assertEqual(core.accumulation_remainder, 1)
         self.assertEqual(backend.boundaries, [False, True, False])
+        progress.close.assert_called_once_with()
 
 
 class TestBestTracking(unittest.TestCase):

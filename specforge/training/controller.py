@@ -19,6 +19,7 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -412,7 +413,37 @@ class TrainerController:
             output_dir=output_dir,
         )
 
+    def _make_progress_bar(self):
+        """Build a rank-0 optimizer-step bar for interactive terminals only."""
+        if not sys.stderr.isatty() or (
+            self.max_steps is not None and self.global_step >= self.max_steps
+        ):
+            return None
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return None
+        from tqdm import tqdm
+
+        total = self.max_steps if self.max_steps is not None else self.total_steps
+        return tqdm(
+            total=total,
+            initial=self.global_step,
+            desc="Training",
+            unit="step",
+            mininterval=1.0,
+            dynamic_ncols=True,
+        )
+
     def fit(self, data: Iterable[TrainBatch]) -> int:
+        progress = self._make_progress_bar()
+        try:
+            return self._fit(data, progress)
+        finally:
+            if progress is not None:
+                progress.close()
+
+    def _fit(self, data: Iterable[TrainBatch], progress: Optional[Any]) -> int:
         if self.max_steps is not None and self.global_step >= self.max_steps:
             logger.info(
                 "fit: global_step=%d already at max_steps=%d; nothing to train",
@@ -508,6 +539,8 @@ class TrainerController:
                     self._checkpoint_manager().update_best(
                         self.global_step, eval_metrics
                     )
+                if progress is not None:
+                    progress.update(1)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
             self._epoch_batch = 0
