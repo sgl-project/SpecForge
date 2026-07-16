@@ -15,11 +15,15 @@ of the producer's ref channel and the only holder of consume book-keeping:
 
 Each rank reads a private inbox (a plain consume-once :class:`StreamingRefQueue`)
 and holds no channel offset, no partition math, no ledger — the design goal is a
-single book-keeping authority, not N. Online consumers may release one complete
-DP micro-batch round at a time while retaining the larger optimizer-window
-boundary for durable acknowledgements. An end-of-stream after a partially
-released optimizer window fails loudly so those unacknowledged refs can be
-replayed from the last durable checkpoint.
+single book-keeping authority, not N. Refs are released one complete DP
+micro-batch round at a time, but an optimizer window is OPENED only once the
+whole window is already committed locally: a released round obligates every
+rank to a full accumulation window, and durable acknowledgements only advance
+in whole windows, so a window that could not complete would strand refs that no
+resume can ever acknowledge. An end-of-stream therefore always lands on a
+window boundary; the sub-window leftover (fewer refs than one global window)
+is settled without dispatch — drop_last-style, matching the floor semantics of
+``resolve_online_total_steps`` — and the stream closes cleanly.
 
 The consumed counter on the source channel (the producer's backpressure signal)
 mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
@@ -246,6 +250,16 @@ class RefDistributor:
         # durable acknowledgement still happens only after the full window.
         queue = self.controller.sample_queue
         while True:
+            if self._window_dispatched == 0:
+                # Open a new optimizer window only when the WHOLE window is
+                # already committed locally. Dispatching the first round
+                # obligates every rank to a full accumulation window, and acks
+                # advance only in whole windows — so a window opened without
+                # its full quantum secured could end mid-accumulation at
+                # end-of-stream, stranding refs no resume can ever settle.
+                # Once secured, the window completes within this same loop.
+                if len(self._window) + queue.depth() < self.dispatch_quantum:
+                    break
             need = self.dispatch_round_quantum - len(self._window)
             if need:
                 self._window.extend(queue.get(need, timeout_s=0.0))
@@ -266,25 +280,43 @@ class RefDistributor:
         if self._forward_consumed():
             progress = True
 
-        if source_drained and queue.depth() == 0:
+        if source_drained:
             self._finish()
         return progress
 
     def _finish(self) -> None:
-        partial_dispatched = self._window_dispatched
-        if self._window:
-            self.stats["dropped"] = len(self._window)
+        # The dispatch loop only opens an optimizer window once its whole
+        # quantum is committed locally and then completes it within the same
+        # loop, so end-of-stream always lands on a window boundary: every
+        # dispatched ref belongs to a completed window whose acks the ranks
+        # can durably deliver. Guard that invariant loudly — settling refs of
+        # a dispatched window here would corrupt the ack accounting.
+        if self._window_dispatched:
+            raise AssertionError(
+                "internal invariant violated: a dispatched optimizer window "
+                "must complete within the pump cycle that opened it "
+                f"(dispatched={self._window_dispatched}/{self.dispatch_quantum})"
+            )
+        leftover = list(self._window)
+        self._window = []
+        queue = self.controller.sample_queue
+        while True:
+            batch = queue.get(self.dispatch_quantum, timeout_s=0.0)
+            if not batch:
+                break
+            leftover.extend(batch)
+        if leftover:
+            self.stats["dropped"] = len(leftover)
             reason = (
-                f"end-of-stream has {len(self._window)} refs after the last full "
-                f"optimizer window (required global quantum={self.dispatch_quantum}: "
-                f"dp_size={self.dp_size} * refs_per_rank_step="
-                f"{self.refs_per_rank_step})"
+                f"end-of-stream leaves {len(leftover)} refs, fewer than one "
+                f"optimizer window (required global quantum="
+                f"{self.dispatch_quantum}: dp_size={self.dp_size} * "
+                f"refs_per_rank_step={self.refs_per_rank_step}); settled "
+                "without dispatch so every rank finishes on a completed window"
             )
-            self.controller.sample_queue.fail(
-                self._window, reason=reason, retryable=False
-            )
+            queue.fail(leftover, reason=reason, retryable=False)
             cleanup_errors = []
-            for ref in self._window:
+            for ref in leftover:
                 try:
                     adopt = getattr(self.feature_store, "adopt", None)
                     if callable(adopt):
@@ -292,19 +324,11 @@ class RefDistributor:
                     self.feature_store.abort(ref.sample_id, reason=reason)
                 except Exception as exc:  # best effort before the loud failure
                     cleanup_errors.append(f"{ref.sample_id}: {exc}")
-            self.source.mark_consumed(len(self._window))
-            self._window = []
+            self.source.mark_consumed(len(leftover))
             if cleanup_errors:
                 reason += f"; cleanup errors={cleanup_errors}"
                 raise RuntimeError(reason)
-            logger.warning("ref-distributor: %s; tail settled without dispatch", reason)
-        if partial_dispatched:
-            raise RuntimeError(
-                "end-of-stream after dispatching a partial optimizer window: "
-                f"dispatched={partial_dispatched}/{self.dispatch_quantum} refs. "
-                "The refs remain unacknowledged for replay from the last durable "
-                "optimizer checkpoint."
-            )
+            logger.warning("ref-distributor: %s", reason)
         for inbox in self._inboxes:
             inbox.close()
         self.finished = True
