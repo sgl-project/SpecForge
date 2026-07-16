@@ -1,16 +1,3 @@
-# coding=utf-8
-"""EDSD Training Wrapper.
-
-EDSD (Enhanced Draft Speculative Decoding) extends EAGLE3 with:
-1. Curriculum learning: entropy-based position masking drops confusing tokens
-   early in training, progressively including harder positions (learn from easy
-   to hard).
-2. Variable TTT length: the number of test-time-training unroll steps grows
-   with epoch, starting from the full length at epoch 0.
-3. EDFuse: a gated fusion module replacing concatenation for embedding-hidden
-   state fusion in the draft model (see specforge/modeling/draft/edsd.py).
-"""
-
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -27,7 +14,6 @@ from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspA
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
-
 
 # ---------------------------------------------------------------------------
 # Target distribution computation with curriculum learning mask
@@ -82,7 +68,7 @@ def _edsd_apply_curriculum_mask(
     entropy_flat = entropy.view(-1)
 
     drop_ratio = min(
-        max((total_epochs - epoch_idx) * drop_ratio_scale, 0.0), 0.4
+        max((total_epochs - epoch_idx - 1) * drop_ratio_scale, 0.0), 0.4
     )
     num_valid = valid_mask_flat.sum()
     k = int((drop_ratio * num_valid).item())
