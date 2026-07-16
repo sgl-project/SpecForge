@@ -59,9 +59,7 @@ class DisaggregatedTimeoutTest(unittest.TestCase):
         )
 
     def test_configured_timeouts_must_be_positive_numbers(self):
-        with patch.dict(
-            os.environ, {"DISAGG_PEER_WAIT_TIMEOUT": "12.5"}, clear=True
-        ):
+        with patch.dict(os.environ, {"DISAGG_PEER_WAIT_TIMEOUT": "12.5"}, clear=True):
             self.assertEqual(12.5, _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT"))
 
         for value in ("0", "-1", "not-a-number"):

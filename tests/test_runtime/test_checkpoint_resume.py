@@ -418,8 +418,6 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             )
 
     def test_legacy_checkpoint_recovers_horizon_from_scheduler_state(self):
-        from specforge.training.checkpoint import CheckpointManager
-
         workdir = tempfile.mkdtemp(prefix="trainer_resume_legacy_horizon_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
         source_dir = os.path.join(workdir, "source")

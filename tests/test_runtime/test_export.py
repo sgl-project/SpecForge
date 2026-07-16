@@ -21,9 +21,8 @@ CUDA = torch.cuda.is_available()
 
 class TestLegacyVocabMappingCompatibility(unittest.TestCase):
     def setUp(self):
-        from tests.test_runtime import _fixtures as fx
-
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from tests.test_runtime import _fixtures as fx
 
         self.tempdir = tempfile.TemporaryDirectory(prefix="legacy_export_")
         self.addCleanup(self.tempdir.cleanup)

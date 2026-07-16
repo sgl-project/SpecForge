@@ -11,11 +11,11 @@ from unittest import mock
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.application import bind_run
 from specforge.cli import (
-    _WorkerTermination,
     _bootstrap_single_process_env,
     _train,
     _validate_world_size,
     _worker_signal_unwind,
+    _WorkerTermination,
     main,
 )
 from specforge.config import Config

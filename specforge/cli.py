@@ -28,8 +28,7 @@ import os
 import signal
 import socket
 from contextlib import contextmanager
-from typing import Iterator
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from specforge.config import Config, load_config
 
