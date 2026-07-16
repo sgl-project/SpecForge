@@ -85,6 +85,18 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIsNone(config.training.max_steps)
         self.assertIsNone(config.training.total_steps)
 
+    def test_fsdp_sharding_is_typed(self):
+        payload = copy.deepcopy(MINIMAL)
+        payload["training"] = {"fsdp_sharding": "NO_SHARD"}
+        self.assertEqual(
+            Config.model_validate(payload).training.fsdp_sharding,
+            "NO_SHARD",
+        )
+
+        payload["training"]["fsdp_sharding"] = "INVALID"
+        with self.assertRaises(ValidationError):
+            Config.model_validate(payload)
+
     def test_removed_vlm_pixel_knobs_are_rejected(self):
         for field in ("min_pixels", "max_pixels"):
             payload = copy.deepcopy(MINIMAL)

@@ -264,6 +264,26 @@ class TestBestApi(unittest.TestCase):
 
 
 class TestReadResumeState(unittest.TestCase):
+    def test_replicated_optimizer_is_restored_from_shared_state(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_replicated_")
+        state = _state(
+            3,
+            world_size=1,
+            replicated_optimizer_state={"moment": torch.tensor([7.0])},
+        )
+        ckpt = _mgr(out).save(
+            state,
+            3,
+            rank_state={"optimizer": None, "rng": {"torch": torch.tensor([1])}},
+        )
+
+        loaded = CheckpointManager.read_resume_state(ckpt)
+
+        self.assertEqual(loaded["backend"]["optimizer"]["moment"].item(), 7.0)
+        self.assertEqual(loaded["backend"]["rng"]["torch"].item(), 1)
+
     def test_backend_passthrough_and_path_forms(self):
         from specforge.training.checkpoint import STATE_FILE, CheckpointManager
 

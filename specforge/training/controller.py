@@ -66,29 +66,31 @@ def _scalar(x: Any) -> float:
     return float(x)
 
 
-def _dp_mean(x: Any) -> Any:
-    """Average a scalar metric tensor across all ranks before it is logged.
+def _dp_mean_scalars(values: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Average scalar metrics across DP ranks with one collective.
 
     Uses the established DFlash metric convention (DP mean):
     without it the disagg consumer logs a single rank's local-batch accuracy
     (~1 rank x batch x anchors), which is ~sqrt(world) noisier and spikes because
     each rank's few round-robin refs can be all-easy or all-hard. Reducing across
     ranks recovers the ~world x larger effective sample the stock path logs.
-    No-op when torch.distributed is unavailable / single-rank / x is not a
-    tensor. Called every step on every rank, so the collective stays in lockstep.
+    The caller invokes this only at an optimizer boundary: intermediate
+    micro-step metrics are not logged, so synchronizing them only adds latency.
     """
     import torch.distributed as dist
 
-    if not isinstance(x, torch.Tensor):
-        return x
-    if not (dist.is_available() and dist.is_initialized()):
-        return x
+    if not values or not (dist.is_available() and dist.is_initialized()):
+        return values
     world = dist.get_world_size()
     if world <= 1:
-        return x
-    x = x.detach().clone()
-    dist.all_reduce(x)
-    return x / world
+        return values
+    names = list(values)
+    packed = torch.stack(
+        [values[name].detach().float().reshape(()) for name in names]
+    )
+    dist.all_reduce(packed)
+    packed /= world
+    return {name: packed[index] for index, name in enumerate(names)}
 
 
 _EAGLE3_STRUCTURED_METRIC_KEYS = frozenset(
@@ -276,13 +278,23 @@ class TrainerCore:
             process_group=process_group,
             ploss_decay=float(getattr(self.strategy, "ploss_decay", 1.0)),
         )
-        # Other strategies expose scalar loss/accuracy and retain the established
-        # data-parallel mean convention.
-        metrics: Dict[str, Any] = structured or {"loss": _scalar(_dp_mean(out.loss))}
+        # Structured EAGLE3 metrics are already globally reduced.  Remaining
+        # scalar diagnostics are DP-averaged in a single collective at optimizer
+        # boundaries; non-boundary results stay rank-local.
+        metrics: Dict[str, Any] = dict(structured or {})
+        scalar_metrics: Dict[str, torch.Tensor] = {}
+        if "loss" not in metrics:
+            scalar_metrics["loss"] = out.loss
         if "accuracy" in out.metrics:
-            # DP-average the accuracy across ranks.
-            # so the logged curve is smooth, not a single rank's noisy local batch.
-            metrics["acc"] = _scalar(_dp_mean(out.metrics["accuracy"]))
+            accuracy = out.metrics["accuracy"]
+            if isinstance(accuracy, torch.Tensor):
+                scalar_metrics["acc"] = accuracy.detach().float().mean().to(
+                    out.loss.device
+                )
+            elif isinstance(accuracy, (int, float)) and not isinstance(
+                accuracy, bool
+            ):
+                scalar_metrics["acc"] = out.loss.detach().new_tensor(float(accuracy))
         # Strategies may expose additional scalar diagnostics without teaching
         # the generic trainer their algorithm-specific names. Move CPU schedule
         # scalars (for example Domino's lambda_base) onto the loss device before
@@ -299,7 +311,10 @@ class TrainerCore:
                 scalar = out.loss.detach().new_tensor(float(value))
             else:
                 continue
-            metrics[key] = _scalar(_dp_mean(scalar))
+            scalar_metrics[key] = scalar
+        if stepped:
+            scalar_metrics = _dp_mean_scalars(scalar_metrics)
+        metrics.update({key: _scalar(value) for key, value in scalar_metrics.items()})
         gn = _scalar(grad_norm) if grad_norm is not None else None
         if gn is not None:
             metrics["grad_norm"] = gn
@@ -584,11 +599,14 @@ class TrainerController:
         return self._checkpoint_mgr
 
     def save_checkpoint(self, step: int) -> Checkpoint:
-        # Every rank participates: the FSDP FULL_STATE_DICT gather is a
-        # collective, and the optimizer/RNG parts are rank-local so every rank
-        # persists its own (the manager writes the shared payload on rank0 only).
+        # Every rank participates: FSDP model gathering is collective and every
+        # rank persists its RNG. Sharded optimizer state stays rank-local; the
+        # identical DDP optimizer is written once in the shared rank0 payload.
         full = self.core.backend.state_dict()
         mgr = self._checkpoint_manager()
+        replicated_optimizer = bool(
+            getattr(self.core.backend, "optimizer_state_is_replicated", False)
+        )
         shared = None
         if mgr.is_rank0():
             shared = {
@@ -608,10 +626,18 @@ class TrainerController:
                 ),
                 **self.checkpoint_extra,
             }
+            if replicated_optimizer:
+                # DDP ranks have identical parameters, gradients, optimizer
+                # moments, and scheduler state. Persist that large state once;
+                # rank files still preserve their distinct RNG streams.
+                shared["replicated_optimizer_state"] = full["optimizer"]
         ckpt_dir = mgr.save(
             shared,
             step,
-            rank_state={"optimizer": full["optimizer"], "rng": full["rng"]},
+            rank_state={
+                "optimizer": None if replicated_optimizer else full["optimizer"],
+                "rng": full["rng"],
+            },
         )
         self.last_checkpoint_step = step
         return Checkpoint(

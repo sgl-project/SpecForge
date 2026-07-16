@@ -115,6 +115,26 @@ class TestTrainerCore(unittest.TestCase):
         # boundary known BEFORE backward so the backend can no_sync micro-steps
         self.assertEqual(backend.boundaries, [False, True])
 
+    def test_metrics_reduce_once_at_accumulation_boundary(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=2)
+
+        def reduce_sum(tensor):
+            tensor.mul_(2)
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.all_reduce", side_effect=reduce_sum) as reduce,
+        ):
+            core.train_step(_batch())
+            self.assertEqual(reduce.call_count, 0)
+            core.train_step(_batch())
+
+        self.assertEqual(reduce.call_count, 1)
+        self.assertEqual(reduce.call_args.args[0].numel(), 2)
+
     def test_metrics_carry_no_mode(self):
         strat = FakeStrategy()
         core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)

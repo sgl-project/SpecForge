@@ -14,7 +14,11 @@ import torch.nn as nn
 
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
-from specforge.training.backend import ParallelConfig, TrainingBackend
+from specforge.training.backend import (
+    FSDPTrainingBackend,
+    ParallelConfig,
+    TrainingBackend,
+)
 from specforge.training.controller import TrainerController, TrainerCore
 from specforge.training.strategies.base import DFlashTrainStrategy
 
@@ -86,6 +90,21 @@ class TestParallelConfigHandles(unittest.TestCase):
         self.assertEqual(pc.world_size, 1)
         self.assertEqual(pc.tp_size, 2)
         self.assertEqual(pc.sp_size, 2)
+
+    def test_frozen_target_tables_are_ignored_by_fsdp(self):
+        class Composite(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 8, bias=False)
+                self.embed_tokens = nn.Embedding(8, 4)
+                self.draft = nn.Linear(4, 4, bias=False)
+                self.lm_head.requires_grad_(False)
+                self.embed_tokens.requires_grad_(False)
+
+        model = Composite()
+        ignored = FSDPTrainingBackend._frozen_target_modules(model)
+
+        self.assertEqual(ignored, (model.lm_head, model.embed_tokens))
 
 
 class _FakeBackend(TrainingBackend):

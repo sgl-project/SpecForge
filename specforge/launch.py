@@ -1472,6 +1472,7 @@ def build_disagg_online_consumer(
                 dp_size,
                 feature_store=feature_store,
                 refs_per_rank_step=batch_size * accumulation_steps,
+                refs_per_rank_batch=batch_size,
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,

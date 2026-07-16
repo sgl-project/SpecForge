@@ -160,7 +160,35 @@ class FSDPTrainingBackend(TrainingBackend):
         self.module: Optional[nn.Module] = None
         self.optimizer = None
         self._wrapped = False
+        self._wrapper_kind = "none"
         self.auto_wrap_block_classes = set()
+        self.ignored_frozen_modules = tuple()
+
+    @property
+    def optimizer_state_is_replicated(self) -> bool:
+        """Whether every rank owns the same complete optimizer state."""
+        return self._wrapper_kind == "ddp"
+
+    @staticmethod
+    def _frozen_target_modules(model: nn.Module) -> tuple[nn.Module, ...]:
+        """Return frozen target tables that should remain replicated.
+
+        DFlash-family wrappers carry the target embedding and LM head only for
+        inference inside the loss.  Sharding those frozen tables makes FSDP
+        all-gather them before every optimizer window without saving optimizer
+        memory, which is the wrong trade-off for the current trainer recipes.
+        """
+        modules = []
+        for name in ("lm_head", "embed_tokens"):
+            module = getattr(model, name, None)
+            if not isinstance(module, nn.Module):
+                continue
+            parameters = tuple(module.parameters())
+            if parameters and not any(
+                parameter.requires_grad for parameter in parameters
+            ):
+                modules.append(module)
+        return tuple(modules)
 
     def prepare_model(
         self,
@@ -169,29 +197,19 @@ class FSDPTrainingBackend(TrainingBackend):
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
     ) -> nn.Module:
-        """Register the trainable module, FSDP-wrapping it unless ``wrap=False``
-        (single-rank / equivalence runs where sharding would be a no-op)."""
+        """Register and wrap the trainable module unless ``wrap=False``.
+
+        Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
+        """
         if not wrap:
             self.module = model
             self._wrapped = False
+            self._wrapper_kind = "none"
         else:
             import functools
 
-            from torch.distributed.fsdp import BackwardPrefetch
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-            from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-
             pc = self.parallel_config
-            sharding = getattr(ShardingStrategy, pc.sharding_strategy)
-            fsdp_kwargs = dict(
-                use_orig_params=True,
-                mixed_precision=MixedPrecision(
-                    param_dtype=pc.param_dtype, buffer_dtype=torch.float32
-                ),
-                sharding_strategy=sharding,
-                process_group=pc.fsdp_process_group,
-            )
+            ignored_frozen_modules = self._frozen_target_modules(model)
             # DFlash-family models expose their transformer block class through
             # ``_no_split_modules``.  Preserve the legacy per-block FSDP policy:
             # it overlaps all-gather/reduce-scatter with decoder compute and is
@@ -206,20 +224,62 @@ class FSDPTrainingBackend(TrainingBackend):
                 for module in model.modules()
                 if type(module).__name__ in block_names
             }
-            if block_classes:
-                fsdp_kwargs.update(
-                    auto_wrap_policy=functools.partial(
-                        transformer_auto_wrap_policy,
-                        transformer_layer_cls=block_classes,
-                    ),
-                    forward_prefetch=True,
-                    backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-                    limit_all_gathers=True,
+            if pc.sharding_strategy == "NO_SHARD":
+                # PyTorch deprecated FSDP's NO_SHARD mode in favor of DDP.
+                # DDP gives this small draft model replicated-param execution
+                # without per-block parameter all-gathers.
+                from torch.nn.parallel import DistributedDataParallel as DDP
+
+                device_ids = None
+                output_device = None
+                model_device = next(model.parameters()).device
+                if model_device.type in ("cuda", "npu"):
+                    device_ids = [model_device.index]
+                    output_device = model_device.index
+                model = DDP(
+                    model,
+                    device_ids=device_ids,
+                    output_device=output_device,
+                    process_group=pc.fsdp_process_group,
+                    broadcast_buffers=False,
+                    gradient_as_bucket_view=True,
                 )
-            model = FSDP(model, **fsdp_kwargs)
+                self._wrapper_kind = "ddp"
+            else:
+                from torch.distributed.fsdp import BackwardPrefetch
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+                from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+                sharding = getattr(ShardingStrategy, pc.sharding_strategy)
+                fsdp_kwargs = dict(
+                    use_orig_params=True,
+                    mixed_precision=MixedPrecision(
+                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+                    ),
+                    sharding_strategy=sharding,
+                    process_group=pc.fsdp_process_group,
+                )
+                if ignored_frozen_modules:
+                    fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
+                if block_classes:
+                    fsdp_kwargs.update(
+                        auto_wrap_policy=functools.partial(
+                            transformer_auto_wrap_policy,
+                            transformer_layer_cls=block_classes,
+                        ),
+                        forward_prefetch=True,
+                        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                        limit_all_gathers=True,
+                    )
+                model = FSDP(model, **fsdp_kwargs)
+                self._wrapper_kind = "fsdp"
             self.module = model
             self._wrapped = True
-            self.auto_wrap_block_classes = block_classes
+            self.auto_wrap_block_classes = (
+                block_classes if self._wrapper_kind == "fsdp" else set()
+            )
+            self.ignored_frozen_modules = ignored_frozen_modules
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
             self.optimizer = self._optimizer_factory(target)
@@ -242,10 +302,11 @@ class FSDPTrainingBackend(TrainingBackend):
             )
 
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
-        """Backward one micro-step. FSDP reduce-scatters grads on every backward,
-        so non-boundary micro-steps run under ``no_sync()`` and the boundary
-        backward reduces the accumulated sum once — identical math, one
-        collective per optimizer step."""
+        """Backward one micro-step with one gradient collective per window.
+
+        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
+        the boundary backward reduces the accumulated sum once.
+        """
         if is_boundary or not self._wrapped:
             loss.backward()
         else:
@@ -263,9 +324,9 @@ class FSDPTrainingBackend(TrainingBackend):
     def state_dict(self) -> dict:
         """Full training state ``{"model", "optimizer", "rng"}`` for resume.
 
-        ``model`` is gathered rank0-only with CPU offload (``{}`` on other ranks
-        when wrapped); ``optimizer``/``rng`` are rank-local and must be persisted
-        per rank — restoring rank0's copy everywhere corrupts the other ranks.
+        ``model`` is gathered rank0-only (``{}`` on other ranks when wrapped).
+        FSDP optimizer state is rank-local; DDP optimizer state is replicated.
+        RNG state is always rank-local.
         """
         if self.module is None:
             raise RuntimeError("state_dict called before prepare_model")
@@ -288,7 +349,7 @@ class FSDPTrainingBackend(TrainingBackend):
 
     def _full_state_ctx(self, state_dict_config=None):
         """FULL_STATE_DICT context for a wrapped module; a no-op when unwrapped."""
-        if not self._wrapped:
+        if self._wrapper_kind != "fsdp":
             return contextlib.nullcontext()
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import StateDictType
@@ -298,7 +359,11 @@ class FSDPTrainingBackend(TrainingBackend):
         )
 
     def _module_state_dict(self) -> dict:
-        if not self._wrapped:
+        if self._wrapper_kind == "ddp":
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return {}
+            return self.module.module.state_dict()
+        if self._wrapper_kind != "fsdp":
             return self.module.state_dict()
         from torch.distributed.fsdp import FullStateDictConfig
 
@@ -310,6 +375,9 @@ class FSDPTrainingBackend(TrainingBackend):
 
     def _load_module_state_dict(self, model_state: dict) -> None:
         # every rank loads the full state dict read from the shared file.
+        if self._wrapper_kind == "ddp":
+            self.module.module.load_state_dict(model_state)
+            return
         with self._full_state_ctx():
             self.module.load_state_dict(model_state)
 

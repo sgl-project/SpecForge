@@ -15,12 +15,11 @@ of the producer's ref channel and the only holder of consume book-keeping:
 
 Each rank reads a private inbox (a plain consume-once :class:`StreamingRefQueue`)
 and holds no channel offset, no partition math, no ledger — the design goal is a
-single book-keeping authority, not N. Refs are dispatched only in complete
-``dp_size * refs_per_rank_step`` windows. Each rank receives exactly
-``refs_per_rank_step = batch_size * accumulation_steps`` refs, so the stream
-cannot end on a partial batch or an unreduced FSDP accumulation step. An
-unaligned end-of-stream cleans and settles the undispatched tail, then closes
-every rank inbox normally after the aligned prefix.
+single book-keeping authority, not N. Online consumers may release one complete
+DP micro-batch round at a time while retaining the larger optimizer-window
+boundary for durable acknowledgements. An end-of-stream after a partially
+released optimizer window fails loudly so those unacknowledged refs can be
+replayed from the last durable checkpoint.
 
 The consumed counter on the source channel (the producer's backpressure signal)
 mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
@@ -94,6 +93,7 @@ class RefDistributor:
         *,
         feature_store,
         refs_per_rank_step: int,
+        refs_per_rank_batch: Optional[int] = None,
         skip_ids: Optional[Iterable[str]] = None,
         requeued_ids: Optional[Iterable[str]] = None,
         worker_id: str = "ref-distributor",
@@ -108,12 +108,25 @@ class RefDistributor:
             raise ValueError(
                 f"refs_per_rank_step must be >= 1, got {refs_per_rank_step}"
             )
+        if refs_per_rank_batch is None:
+            refs_per_rank_batch = refs_per_rank_step
+        if refs_per_rank_batch < 1:
+            raise ValueError(
+                f"refs_per_rank_batch must be >= 1, got {refs_per_rank_batch}"
+            )
+        if refs_per_rank_step % refs_per_rank_batch:
+            raise ValueError(
+                "refs_per_rank_step must be divisible by refs_per_rank_batch: "
+                f"{refs_per_rank_step} % {refs_per_rank_batch} != 0"
+            )
         self.source = source
         self.controller = controller
         self.dp_size = dp_size
         self.feature_store = feature_store
         self.refs_per_rank_step = refs_per_rank_step
+        self.refs_per_rank_batch = refs_per_rank_batch
         self.dispatch_quantum = dp_size * refs_per_rank_step
+        self.dispatch_round_quantum = dp_size * refs_per_rank_batch
         self.worker_id = worker_id
         self.poll_s = poll_s
         self.idle_timeout_s = idle_timeout_s
@@ -145,6 +158,7 @@ class RefDistributor:
             self.source.mark_consumed(len(self._skip) - consumed)
         self._inbox_consumed = 0  # last forwarded sum of the inbox sidecars
         self._window: List[SampleRef] = []
+        self._window_dispatched = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.finished = False
@@ -219,22 +233,26 @@ class RefDistributor:
                     # settle that extra publication immediately.
                     self.source.mark_consumed(1)
 
-        # Dispatch complete optimizer-step windows. Round-robin assignment gives
-        # every rank batch_size * accumulation_steps refs in the same order.
+        # Release complete DP micro-batch rounds while tracking the surrounding
+        # optimizer window. Round-robin assignment keeps every rank in lockstep;
+        # durable acknowledgement still happens only after the full window.
         queue = self.controller.sample_queue
         while True:
-            need = self.dispatch_quantum - len(self._window)
+            need = self.dispatch_round_quantum - len(self._window)
             if need:
                 self._window.extend(queue.get(need, timeout_s=0.0))
-            if len(self._window) < self.dispatch_quantum:
+            if len(self._window) < self.dispatch_round_quantum:
                 break
             rank_batches: List[List[SampleRef]] = [[] for _ in range(self.dp_size)]
             for index, ref in enumerate(self._window):
                 rank_batches[index % self.dp_size].append(ref)
             for inbox, refs in zip(self._inboxes, rank_batches):
                 inbox.publish_batch(refs)
-            self.stats["dispatched"] += self.dispatch_quantum
+            self.stats["dispatched"] += self.dispatch_round_quantum
+            self._window_dispatched += self.dispatch_round_quantum
             self._window = []
+            if self._window_dispatched == self.dispatch_quantum:
+                self._window_dispatched = 0
             progress = True
 
         if self._forward_consumed():
@@ -245,6 +263,7 @@ class RefDistributor:
         return progress
 
     def _finish(self) -> None:
+        partial_dispatched = self._window_dispatched
         if self._window:
             self.stats["dropped"] = len(self._window)
             reason = (
@@ -271,6 +290,13 @@ class RefDistributor:
                 reason += f"; cleanup errors={cleanup_errors}"
                 raise RuntimeError(reason)
             logger.warning("ref-distributor: %s; tail settled without dispatch", reason)
+        if partial_dispatched:
+            raise RuntimeError(
+                "end-of-stream after dispatching a partial optimizer window: "
+                f"dispatched={partial_dispatched}/{self.dispatch_quantum} refs. "
+                "The refs remain unacknowledged for replay from the last durable "
+                "optimizer checkpoint."
+            )
         for inbox in self._inboxes:
             inbox.close()
         self.finished = True

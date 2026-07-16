@@ -9,9 +9,10 @@
 """On-disk checkpoint lifecycle: layout, rotation, best tracking, resume reads.
 
 A checkpoint is ``{run_id}-step{N}/`` under ``output_dir``: ``training_state.pt``
-(rank0 shared payload) plus ``training_state_rank{r}.pt`` per rank (optimizer/RNG
-are rank-local under FSDP). Run-scoped ``{run_id}-latest``/``{run_id}-best`` links
-and ``{run_id}.best_meta.json`` sit beside them; multi-rank runs need a shared fs.
+(rank0 shared payload) plus ``training_state_rank{r}.pt`` per rank. FSDP optimizer
+and all RNG state are rank-local; replicated DDP optimizer state is stored once
+in the shared payload. Run-scoped ``{run_id}-latest``/``{run_id}-best`` links and
+``{run_id}.best_meta.json`` sit beside them; multi-rank runs need a shared fs.
 """
 
 from __future__ import annotations
@@ -249,6 +250,13 @@ class CheckpointManager:
             state["backend"] = torch.load(
                 rank_path, map_location=map_location, weights_only=False
             )
+            if (
+                state["backend"].get("optimizer") is None
+                and "replicated_optimizer_state" in state
+            ):
+                state["backend"]["optimizer"] = state[
+                    "replicated_optimizer_state"
+                ]
             return state
         state["backend"] = {}
         if require_full_state and int(state.get("global_step") or 0) > 0:

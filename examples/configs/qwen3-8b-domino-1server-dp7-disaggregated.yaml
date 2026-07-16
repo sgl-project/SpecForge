@@ -17,6 +17,7 @@ training:
   num_epochs: 6
   batch_size: 2
   accumulation_steps: 8
+  fsdp_sharding: "NO_SHARD"
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1
@@ -29,6 +30,8 @@ training:
   log_interval: 10
   dist_timeout: 30
   seed: 42
+runtime:
+  producer_lease: 16
 tracking:
   report_to: "none"
   wandb_project: "qwen3-8b-domino-disagg"

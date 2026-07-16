@@ -442,6 +442,41 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"])
         self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"])
 
+    def test_streams_complete_dp_batch_rounds_before_optimizer_window_is_full(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=1,
+        )
+        for i in range(2):
+            self.producer.publish(_ref(f"s{i}"))
+
+        _pump_until_quiet(dist)
+
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1"])
+        self.assertEqual(dist.stats["dispatched"], 2)
+        self.assertEqual(dist._window_dispatched, 2)
+
+    def test_streamed_partial_optimizer_window_fails_loudly_at_eof(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=1,
+        )
+        for i in range(2):
+            self.producer.publish(_ref(f"s{i}"))
+        self.producer.close()
+
+        dist._run_guarded()
+
+        self.assertIsInstance(dist.error, RuntimeError)
+        self.assertIn("partial optimizer window", str(dist.error))
+        for rank in range(2):
+            reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            with self.assertRaisesRegex(RuntimeError, "partial optimizer window"):
+                reader.is_closed()
+
     def test_partial_optimizer_quantum_settles_tail_after_aligned_prefix(self):
         dist = self._distributor(dp_size=2, refs_per_rank_step=4)
         for i in range(10):
