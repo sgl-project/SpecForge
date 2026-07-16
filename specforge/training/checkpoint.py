@@ -254,9 +254,7 @@ class CheckpointManager:
                 state["backend"].get("optimizer") is None
                 and "replicated_optimizer_state" in state
             ):
-                state["backend"]["optimizer"] = state[
-                    "replicated_optimizer_state"
-                ]
+                state["backend"]["optimizer"] = state["replicated_optimizer_state"]
             return state
         state["backend"] = {}
         if require_full_state and int(state.get("global_step") or 0) > 0:

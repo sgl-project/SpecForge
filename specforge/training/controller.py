@@ -85,9 +85,7 @@ def _dp_mean_scalars(values: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
     if world <= 1:
         return values
     names = list(values)
-    packed = torch.stack(
-        [values[name].detach().float().reshape(()) for name in names]
-    )
+    packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
     dist.all_reduce(packed)
     packed /= world
     return {name: packed[index] for index, name in enumerate(names)}
@@ -288,12 +286,10 @@ class TrainerCore:
         if "accuracy" in out.metrics:
             accuracy = out.metrics["accuracy"]
             if isinstance(accuracy, torch.Tensor):
-                scalar_metrics["acc"] = accuracy.detach().float().mean().to(
-                    out.loss.device
+                scalar_metrics["acc"] = (
+                    accuracy.detach().float().mean().to(out.loss.device)
                 )
-            elif isinstance(accuracy, (int, float)) and not isinstance(
-                accuracy, bool
-            ):
+            elif isinstance(accuracy, (int, float)) and not isinstance(accuracy, bool):
                 scalar_metrics["acc"] = out.loss.detach().new_tensor(float(accuracy))
         # Strategies may expose additional scalar diagnostics without teaching
         # the generic trainer their algorithm-specific names. Move CPU schedule

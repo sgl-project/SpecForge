@@ -126,7 +126,9 @@ class TestTrainerCore(unittest.TestCase):
             mock.patch("torch.distributed.is_available", return_value=True),
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.get_world_size", return_value=2),
-            mock.patch("torch.distributed.all_reduce", side_effect=reduce_sum) as reduce,
+            mock.patch(
+                "torch.distributed.all_reduce", side_effect=reduce_sum
+            ) as reduce,
         ):
             core.train_step(_batch())
             self.assertEqual(reduce.call_count, 0)
