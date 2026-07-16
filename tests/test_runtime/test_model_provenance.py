@@ -122,7 +122,17 @@ class ModelProvenanceTest(unittest.TestCase):
             original_stat = shard.stat()
             original = provenance.model_source_identity(directory)
 
+            # Same size, later mtime. Set it explicitly: a back-to-back
+            # rewrite can land inside the filesystem's mtime-update tick and
+            # legitimately keep the same timestamp.
             shard.write_bytes(b"new-weights")
+            os.utime(
+                shard,
+                ns=(
+                    original_stat.st_atime_ns,
+                    original_stat.st_mtime_ns + 1_000_000_000,
+                ),
+            )
             self.assertNotEqual(original, provenance.model_source_identity(directory))
 
             shard.write_bytes(b"different-size")
