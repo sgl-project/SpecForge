@@ -555,12 +555,12 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss_mask=t["loss_mask"].to(device),
             lambda_base=lambda_base,
         )
-        metrics = {
-            "accuracy": accuracy.detach(),
-            "lambda_base": torch.tensor(float(lambda_base)),
-        }
-        if "accuracy_denom" in model_metrics:
-            metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        metrics = dict(model_metrics)
+        metrics["accuracy"] = accuracy.detach()
+        metrics.setdefault(
+            "lambda_base",
+            torch.tensor(float(lambda_base), device=loss.device),
+        )
         return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

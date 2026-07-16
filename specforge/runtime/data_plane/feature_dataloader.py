@@ -188,53 +188,16 @@ class FeatureDataLoader:
                         f"feature {name!r}: {spec} vs {expected}"
                     )
 
-    # PROFILE_LOADER=N -> every N batches print one [loader rK] line splitting
-    # queue-wait / store-get / clone / release / gc time per batch.
-    _prof_loader = int(os.environ.get("PROFILE_LOADER", "0"))
-
-    def _lp(self) -> dict:
-        s = getattr(self, "_lp_state", None)
-        if s is None:
-            s = {
-                "b": 0,
-                "wait": 0.0,
-                "get": 0.0,
-                "clone": 0.0,
-                "rel": 0.0,
-                "gc": 0.0,
-                "bytes": 0,
-                "t0": time.monotonic(),
-            }
-            self._lp_state = s
-        return s
-
     def _materialize(self, ref: SampleRef) -> Dict[str, torch.Tensor]:
-        _prof = self._prof_loader
-        _t = time.monotonic()
         tensors, handle = self.store.get(ref, device=self.device)
         try:
-            if _prof:
-                s = self._lp()
-                s["get"] += time.monotonic() - _t
-                s["bytes"] += sum(
-                    t.numel() * t.element_size() for t in tensors.values()
-                )
-                _t = time.monotonic()
             if self.clone_on_fetch:
                 tensors = {k: v.clone() for k, v in tensors.items()}
-            if _prof:
-                self._lp()["clone"] += time.monotonic() - _t
-                _t = time.monotonic()
         finally:
             # ``get`` has already registered a read lease. Clone/device or
             # tensor validation failures must not strand that handle.
             self.store.release(handle, reason="loaded")
-        if _prof:
-            self._lp()["rel"] += time.monotonic() - _t
-            _t = time.monotonic()
         self._maybe_gc()
-        if _prof:
-            self._lp()["gc"] += time.monotonic() - _t
         if self.per_sample_transform is not None:
             tensors = self.per_sample_transform(tensors)
         return tensors
@@ -367,13 +330,8 @@ class FeatureDataLoader:
         if depth > 0:
             yield from self._iter_queue_prefetch(depth)
             return
-        _prof = self._prof_loader
         while True:
-            _t = time.monotonic()
             refs = self.queue.get(self.batch_size, timeout_s=0.0)
-            if _prof:
-                s = self._lp()
-                s["wait"] += time.monotonic() - _t
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
@@ -384,29 +342,11 @@ class FeatureDataLoader:
             except Exception as exc:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
                 raise
-            if _prof:
-                s = self._lp()
-                s["b"] += 1
-                if s["b"] >= _prof:
-                    win = time.monotonic() - s["t0"]
-                    rank = os.environ.get("RANK", "?")
-                    print(
-                        f"[loader r{rank}] b={s['b']} win_s={win:.2f} "
-                        f"wait_ms={1000*s['wait']/s['b']:.1f} "
-                        f"get_ms={1000*s['get']/s['b']:.1f} "
-                        f"clone_ms={1000*s['clone']/s['b']:.1f} "
-                        f"rel_ms={1000*s['rel']/s['b']:.1f} "
-                        f"gc_ms={1000*s['gc']/s['b']:.1f} "
-                        f"MB={s['bytes']/s['b']/1e6:.1f} (avg/batch)",
-                        flush=True,
-                    )
-                    self._lp_state = None
             yield batch
             if self.ack:
                 self.queue.ack(refs)
 
     def _iter_queue_prefetch(self, depth: int) -> Iterator[TrainBatch]:
-        _prof = self._prof_loader
         state = _QueuePrefetchState(depth)
         eos = object()
 
@@ -479,14 +419,10 @@ class FeatureDataLoader:
 
         try:
             while not state.stop.is_set():
-                _t = time.monotonic()
                 try:
                     item = state.buffer.get(timeout=_PREFETCH_POLL_S)
                 except queue_module.Empty:
                     continue
-                if _prof:
-                    s = self._lp()
-                    s["wait"] += time.monotonic() - _t
                 if item is eos:
                     return
                 if isinstance(item, BaseException):
@@ -497,24 +433,6 @@ class FeatureDataLoader:
                 # outcome; loader shutdown must touch only batches that were
                 # materialized ahead but never yielded.
                 state.mark_yielded_or_failed(refs)
-                if _prof:
-                    s = self._lp()
-                    s["b"] += 1
-                    if s["b"] >= _prof:
-                        win = time.monotonic() - s["t0"]
-                        rank = os.environ.get("RANK", "?")
-                        print(
-                            f"[loader r{rank}] b={s['b']} win_s={win:.2f} "
-                            f"wait_ms={1000*s['wait']/s['b']:.1f} "
-                            f"get_ms={1000*s['get']/s['b']:.1f} "
-                            f"clone_ms={1000*s['clone']/s['b']:.1f} "
-                            f"rel_ms={1000*s['rel']/s['b']:.1f} "
-                            f"gc_ms={1000*s['gc']/s['b']:.1f} "
-                            f"MB={s['bytes']/s['b']/1e6:.1f} "
-                            "(avg/batch, prefetch)",
-                            flush=True,
-                        )
-                        self._lp_state = None
                 yield batch
                 if self.ack:
                     self.queue.ack(refs)

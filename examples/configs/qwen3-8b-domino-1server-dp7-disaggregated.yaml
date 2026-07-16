@@ -1,5 +1,5 @@
 model:
-  target_model_path: "/disk3/wjp/pretrained_models/Qwen3-8B"
+  target_model_path: "Qwen/Qwen3-8B"
   draft_model_config: "configs/qwen3-8b-domino.json"
   target_backend: "sglang"
   trust_remote_code: true
@@ -7,7 +7,7 @@ model:
   torch_dtype: "bfloat16"
   mask_token_id: 151669
 data:
-  train_data_path: "/disk3/wjp/datasets/perfectblend/qwen3-8b/sharegpt_train_regen_temperature0_no_think.jsonl"
+  train_data_path: "./cache/dataset/perfectblend_qwen3-8b_regen.jsonl"
   max_length: 3072
   chat_template: "qwen"
   build_dataset_num_proc: 32
@@ -15,8 +15,7 @@ data:
 training:
   strategy: "domino"
   num_epochs: 6
-  max_steps: 10000
-  batch_size: 1
+  batch_size: 2
   accumulation_steps: 8
   learning_rate: 0.0006
   warmup_ratio: 0.04
@@ -35,7 +34,7 @@ tracking:
   wandb_project: "qwen3-8b-domino-disagg"
   wandb_name: "qwen3-8b-domino-1srv-dp7"
 run_id: "qwen3-8b-domino-1server-dp7-disaggregated"
-output_dir: "./outputs/qwen3-8b-domino-1server-dp7-disaggregated-profile"
+output_dir: "./outputs/qwen3-8b-domino-1server-dp7-disaggregated"
 
 deployment:
   mode: disaggregated
@@ -43,7 +42,7 @@ deployment:
     nnodes: 1
     nproc_per_node: 7
   disaggregated:
-    control_dir: outputs/qwen3-8b-domino-1server-dp7-disaggregated-profile/control
+    control_dir: outputs/qwen3-8b-domino-1server-dp7-disaggregated/control
     backend: mooncake
     managed_local:
       trainer_cuda_visible_devices:
@@ -55,7 +54,7 @@ deployment:
         - "6"
         - "7"
       mooncake:
-        protocol: rdma
+        protocol: tcp
         global_segment_size_bytes: 34359738368
         local_buffer_size_bytes: 1073741824
       capture_servers:
@@ -63,4 +62,4 @@ deployment:
           cuda_visible_devices:
             - "0"
           tp_size: 1
-          mem_fraction_static: 0.8
+          mem_fraction_static: 0.5

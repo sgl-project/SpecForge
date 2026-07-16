@@ -368,7 +368,7 @@ new file mode 100644
 index 000000000..d317b2801
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,243 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -388,7 +388,7 @@ index 000000000..d317b2801
 +
 +Request schema::
 +
-+    {"store_id", "sample_id", "gen",           # key namespace / id / staleness
++    {"store_id", "sample_id", "gen", "replace", # key namespace / retry policy
 +     "features": {"aux": <name>, "last_hidden": <name>},   # artifact -> feature
 +     "passthrough": [{"name", "data", "shape", "dtype"}]}  # client tensors verbatim
 +
@@ -438,6 +438,9 @@ index 000000000..d317b2801
 +        self._store = None
 +        self._put_config = None
 +        self._lock = threading.Lock()
++        # Retried HTTP requests reuse deterministic keys.  Striped locks keep
++        # replacement atomic per key without retaining one lock per sample.
++        self._write_locks = [threading.Lock() for _ in range(256)]
 +
 +    # -- connection ---------------------------------------------------------
 +    def _connect(self):
@@ -484,21 +487,29 @@ index 000000000..d317b2801
 +    def _tkey(store_id: str, sample_id: str, gen: int, name: str) -> str:
 +        return f"{store_id}/{sample_id}/g{gen}/{name}"
 +
-+    def _put_tensor(self, key: str, t: torch.Tensor) -> None:
++    def _put_tensor(
++        self, key: str, t: torch.Tensor, *, replace: bool = False
++    ) -> None:
 +        store = self._connect()
 +        t = t.detach().to("cpu").contiguous()
 +        nbytes = t.element_size() * t.numel()
-+        try:
-+            store.register_buffer(t.data_ptr(), nbytes)
-+        except Exception:
-+            pass  # some builds auto-register
-+        try:
-+            rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
-+        finally:
++        lock = self._write_locks[hash(key) % len(self._write_locks)]
++        with lock:
++            if replace:
++                # Do not probe with is_exist(): Mooncake existence checks can
++                # acquire a read lease that prevents the following removal.
++                self._remove_quiet(key)
 +            try:
-+                store.unregister_buffer(t.data_ptr())
++                store.register_buffer(t.data_ptr(), nbytes)
 +            except Exception:
-+                pass
++                pass  # some builds auto-register
++            try:
++                rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
++            finally:
++                try:
++                    store.unregister_buffer(t.data_ptr())
++                except Exception:
++                    pass
 +        if rc is not None and int(rc) < 0:
 +            raise RuntimeError(f"spec-capture put_from failed (status {rc}) for {key}")
 +
@@ -525,6 +536,7 @@ index 000000000..d317b2801
 +        store_id = str(spec["store_id"])
 +        sample_id = str(spec["sample_id"])
 +        gen = int(spec.get("gen", 1))
++        replace = bool(spec.get("replace", False))
 +        features: Dict[str, str] = dict(spec.get("features") or {})
 +
 +        written: List[str] = []
@@ -532,7 +544,7 @@ index 000000000..d317b2801
 +
 +        def _write(name: str, t: torch.Tensor) -> None:
 +            key = self._tkey(store_id, sample_id, gen, name)
-+            self._put_tensor(key, t)
++            self._put_tensor(key, t, replace=replace)
 +            written.append(key)
 +            result_feats[name] = {
 +                "shape": list(t.shape),

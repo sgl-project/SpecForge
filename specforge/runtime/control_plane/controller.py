@@ -77,12 +77,16 @@ class DataFlowController:
 
     # -- prompt lifecycle (online) ----------------------------------------
     def ingest_prompts(self, prompts: List[Dict[str, Any]]) -> List[str]:
+        prepared: List[PromptTask] = []
         task_ids: List[str] = []
-        with self._lock:
-            for p in prompts:
-                # assert_no_tensors(p)
-                task_id = p.get("task_id") or f"task-{uuid.uuid4().hex[:12]}"
-                task = PromptTask(
+        for p in prompts:
+            # Every PromptTask field below is either taken from this validated
+            # input or built from tensor-free defaults/scalar conversions. One
+            # boundary check therefore avoids walking long token lists twice.
+            assert_no_tensors(p)
+            task_id = p.get("task_id") or f"task-{uuid.uuid4().hex[:12]}"
+            prepared.append(
+                PromptTask(
                     task_id=task_id,
                     run_id=self.run_id,
                     source_id=str(p.get("source_id", "prompt_source")),
@@ -94,10 +98,15 @@ class DataFlowController:
                     draft_weight_version=p.get("draft_weight_version"),
                     metadata=p.get("metadata", {}),
                 )
-                # assert_no_tensors(task)
-                self._prompts[task_id] = task
-                self._prompt_pending.append(task_id)
-                task_ids.append(task_id)
+            )
+            task_ids.append(task_id)
+
+        # Validation and object construction can be expensive for large prompt
+        # batches, so keep them outside the controller's global state lock.
+        with self._lock:
+            for task in prepared:
+                self._prompts[task.task_id] = task
+                self._prompt_pending.append(task.task_id)
         return task_ids
 
     def lease_prompt_tasks(self, worker_id: str, max_tasks: int) -> List[PromptTask]:
@@ -163,19 +172,33 @@ class DataFlowController:
                     self._prompt_failed[task_id] = reason
                     self._prompts.pop(task_id, None)
 
-    def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> None:
-        fresh: List[SampleRef] = []
+    def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> List[SampleRef]:
+        """Commit refs and return the subset newly accepted by the ledger.
+
+        The returned refs are the exact deduplication result from
+        :meth:`MetadataStore.commit_samples`. Callers that need freshness should
+        use this result instead of inferring it from a separate ledger query.
+        """
+
         for ref in refs:
             assert_no_tensors(ref)  # online no-tensor guard
-            if not self.store.commit_sample(ref):
-                continue  # idempotent on sample_id (at-least-once delivery)
-            if ref.source_task_id is not None:
-                with self._lock:
+
+        freshness = self.store.commit_samples(refs)
+        if len(freshness) != len(refs):
+            raise RuntimeError(
+                "metadata store returned an invalid commit result: "
+                f"expected {len(refs)} entries, got {len(freshness)}"
+            )
+        fresh = [ref for ref, is_fresh in zip(refs, freshness) if is_fresh]
+
+        with self._lock:
+            for ref in fresh:
+                if ref.source_task_id is not None:
                     self._prompt_leased.pop(ref.source_task_id, None)
                     self._prompts.pop(ref.source_task_id, None)
-            fresh.append(ref)
         if fresh and self.sample_queue is not None:
             self.sample_queue.put(fresh)
+        return fresh
 
     # -- offline ingest ----------------------------------------------------
     # -- train-side durable ack -------------------------------------------

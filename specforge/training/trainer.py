@@ -23,6 +23,7 @@ from contextlib import nullcontext
 from typing import Callable, Mapping, Optional
 
 from specforge.algorithms.common.providers import (
+    MODEL_PROVENANCE_CONTRACT_KEY,
     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
     StepRuntimeConfig,
     checkpoint_key_fingerprint,
@@ -33,6 +34,41 @@ from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
 logger = logging.getLogger(__name__)
+
+
+def _legacy_scheduler_total_steps(state: Mapping[str, object]) -> Optional[int]:
+    """Recover the BF16 optimizer horizon from a pre-contract checkpoint.
+
+    Older checkpoints did not copy the effective horizon into the shared
+    trainer contract, but their rank-local cosine scheduler persisted both the
+    warmup length and post-warmup ``T_max``.  Reading those two immutable
+    scheduler fields preserves resume compatibility without guessing from a
+    possibly changed ``max_steps`` value.
+    """
+    backend = state.get("backend")
+    if not isinstance(backend, Mapping):
+        return None
+    optimizer = backend.get("optimizer")
+    if not isinstance(optimizer, Mapping):
+        return None
+    scheduler = optimizer.get("scheduler_state_dict")
+    if not isinstance(scheduler, Mapping):
+        return None
+    after_scheduler = scheduler.get("after_scheduler_dict")
+    if not isinstance(after_scheduler, Mapping):
+        return None
+    warmup_steps = scheduler.get("warmup_epochs")
+    cosine_steps = after_scheduler.get("T_max")
+    if (
+        isinstance(warmup_steps, bool)
+        or not isinstance(warmup_steps, int)
+        or isinstance(cosine_steps, bool)
+        or not isinstance(cosine_steps, int)
+        or warmup_steps < 0
+        or cosine_steps < 1
+    ):
+        return None
+    return warmup_steps + cosine_steps
 
 
 class Trainer:
@@ -144,6 +180,16 @@ class Trainer:
                 f"dataset_size={dataset_size} does not match the "
                 f"{inferred_dataset_size} supplied refs"
             )
+        if dataset_size is not None:
+            from specforge.training.schedule import validate_fixed_accumulation_plan
+
+            validate_fixed_accumulation_plan(
+                num_samples=dataset_size,
+                batch_size=batch_size,
+                accumulation_steps=accumulation_steps,
+                num_epochs=num_epochs,
+                max_steps=max_steps,
+            )
         if isinstance(strategy_kwargs, StepRuntimeConfig):
             algorithm_checkpoint_extra = dict(strategy_kwargs.resume_contract)
             allowed_missing_checkpoint_keys = set(
@@ -176,11 +222,34 @@ class Trainer:
                     "the live draft model and complete allowed-missing-key policy"
                 )
 
+        effective_total_steps = None
+        if total_steps is not None or max_steps is not None or dataset_size is not None:
+            from specforge.training.schedule import resolve_total_steps
+
+            effective_total_steps = resolve_total_steps(
+                total_steps=total_steps,
+                max_steps=max_steps,
+                num_samples=dataset_size,
+                batch_size=batch_size,
+                accumulation_steps=accumulation_steps,
+                num_epochs=num_epochs,
+            )
+
+        configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
+        if effective_total_steps is None and configure_schedule is not None:
+            raise ValueError(
+                "a configured optimizer on a streaming source requires total_steps "
+                "or max_steps"
+            )
+        if configure_schedule is not None:
+            configure_schedule(effective_total_steps)
+
         standard_checkpoint_extra = {
             "dataset_size": dataset_size,
             "batch_size": batch_size,
             "accumulation_steps": accumulation_steps,
             "num_epochs": num_epochs,
+            "effective_total_steps": effective_total_steps,
             "tp_size": tp_size,
             "sp_ulysses_size": sp_ulysses_size,
             "sp_ring_size": sp_ring_size,
@@ -205,26 +274,6 @@ class Trainer:
                 f"{sorted(reserved)}"
             )
         persisted_contract = {**standard_checkpoint_extra, **custom_checkpoint_extra}
-        configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
-        effective_total_steps = None
-        if total_steps is not None or max_steps is not None or dataset_size is not None:
-            from specforge.training.schedule import resolve_total_steps
-
-            effective_total_steps = resolve_total_steps(
-                total_steps=total_steps,
-                max_steps=max_steps,
-                num_samples=dataset_size,
-                batch_size=batch_size,
-                accumulation_steps=accumulation_steps,
-                num_epochs=num_epochs,
-            )
-        elif configure_schedule is not None:
-            raise ValueError(
-                "a configured optimizer on a streaming source requires total_steps "
-                "or max_steps"
-            )
-        if configure_schedule is not None:
-            configure_schedule(effective_total_steps)
         # Resume: draft weights load BEFORE the FSDP wrap so the optimizer's fp32
         # masters (cloned at build) start from them; this rank's own optimizer/RNG
         # shard (``state['backend']``) loads after the wrap builds the optimizer.
@@ -250,13 +299,35 @@ class Trainer:
             }
             for key, current in resume_contract.items():
                 persisted = state.get(key)
+                persisted_available = key in state
+                comparison_current = current
+                if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
+                    from specforge.training.provenance import (
+                        model_provenance_for_resume_comparison,
+                    )
+
+                    comparison_current = model_provenance_for_resume_comparison(
+                        current,
+                        persisted,
+                        cache_root=output_dir,
+                    )
+                if key == "effective_total_steps" and key not in state:
+                    persisted = _legacy_scheduler_total_steps(state)
+                    persisted_available = persisted is not None
+                    if not persisted_available:
+                        raise ValueError(
+                            f"checkpoint {resume_from} does not record "
+                            "effective_total_steps and its saved scheduler does "
+                            "not expose a recoverable horizon; the restored "
+                            "optimizer schedule cannot be proven to match this run"
+                        )
                 if key in custom_checkpoint_extra and key not in state:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "
                         "rather than guessing the prior objective"
                     )
-                if key in state and persisted != current:
+                if persisted_available and persisted != comparison_current:
                     raise ValueError(
                         f"checkpoint {resume_from} was written with "
                         f"{key}={persisted} but this run has {key}={current}; "

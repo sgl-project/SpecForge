@@ -44,6 +44,53 @@ class TestDominoLambdaSchedule(unittest.TestCase):
             s._lambda_base(StepContext(global_step=3, total_steps=None)), 0.0
         )
 
+    def test_strategy_preserves_every_model_diagnostic(self):
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.strategies.base import DominoTrainStrategy, StepContext
+
+        class DiagnosticModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+                self.model_metrics = {
+                    "final_loss": torch.tensor(1.25),
+                    "base_loss": torch.tensor(2.5),
+                    "base_accuracy": torch.tensor(0.4),
+                    "accept_len": torch.tensor(3.0),
+                    "base_accept_len": torch.tensor(2.0),
+                    "accuracy_denom": torch.tensor(8.0),
+                    "lambda_base": torch.tensor(0.5),
+                }
+
+            def forward(self, **kwargs):
+                del kwargs
+                return self.weight.square(), torch.tensor(0.75), self.model_metrics
+
+        model = DiagnosticModel()
+        strategy = DominoTrainStrategy(model, lambda_start=1.0, decay_ratio=0.5)
+        batch = TrainBatch(
+            sample_ids=["sample-0"],
+            strategy="domino",
+            tensors={
+                "input_ids": torch.ones(1, 2, dtype=torch.long),
+                "hidden_states": torch.ones(1, 2, 2),
+                "loss_mask": torch.ones(1, 2),
+            },
+        )
+
+        output = strategy.forward_loss(
+            batch,
+            StepContext(global_step=1, total_steps=4),
+        )
+
+        self.assertEqual(
+            set(output.metrics),
+            {*model.model_metrics, "accuracy"},
+        )
+        for name, value in model.model_metrics.items():
+            self.assertIs(output.metrics[name], value)
+        self.assertEqual(float(output.metrics["accuracy"]), 0.75)
+
 
 @unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
 class TestDominoOfflineLaunch(unittest.TestCase):

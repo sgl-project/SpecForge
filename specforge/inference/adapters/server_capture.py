@@ -137,10 +137,19 @@ class SGLangServerCaptureAdapter:
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
     ) -> None:
-        if not hasattr(store, "adopt") or not hasattr(store, "store_id"):
+        required_store_api = (
+            "adopt",
+            "discard_external_attempts",
+            "store_id",
+            "track_external_attempt",
+        )
+        missing_store_api = [
+            name for name in required_store_api if not hasattr(store, name)
+        ]
+        if missing_store_api:
             raise TypeError(
                 "SGLangServerCaptureAdapter needs a MooncakeFeatureStore-like "
-                "store exposing .store_id and .adopt(ref)"
+                f"store; missing {missing_store_api}"
             )
         self.base_url = base_url.rstrip("/")
         self.store = store
@@ -203,7 +212,12 @@ class SGLangServerCaptureAdapter:
             if payload_key == "input_ids":
                 data = input_ids
             else:
-                data = list(task.payload.get(payload_key, [1] * length))
+                if payload_key not in task.payload:
+                    raise ValueError(
+                        f"task {task.task_id}: required capture payload "
+                        f"{payload_key!r} is missing"
+                    )
+                data = list(task.payload[payload_key])
             if len(data) != length:
                 raise ValueError(
                     f"task {task.task_id}: payload {payload_key!r} length "
@@ -229,9 +243,13 @@ class SGLangServerCaptureAdapter:
         return {
             "store_id": self.store.store_id,
             "sample_id": self._sample_id(task),
-            # retried tasks re-capture under a bumped generation so a stale
-            # ref from the failed attempt can never resolve (B5)
-            "gen": int(task.attempt) + 1,
+            # A task id is unique within a run, and retries happen only before
+            # its ref is committed.  Keep the generation stable so a response
+            # lost after the server write cannot strand gN when the retry writes
+            # gN+1.  The server patch replaces these deterministic keys on a
+            # retry (``replace``), bounding the attempt to one namespace.
+            "gen": 1,
+            "replace": int(task.attempt) > 0,
             "features": features,
             "passthrough": passthrough,
         }
@@ -298,35 +316,23 @@ class SGLangServerCaptureAdapter:
         transport-level error raises — the worker fails the whole lease batch
         retryable, mirroring ``generate_features`` semantics.
         """
-        import os as _os
-        import time as _time
-
-        # PROFILE_PRODUCER=N -> every N produce_refs calls print one
-        # [prod-http] line splitting body-build / HTTP round-trip / parse.
-        _prof = int(_os.environ.get("PROFILE_PRODUCER", "0"))
-        if _prof and not hasattr(self, "_hs"):
-            self._hs = {
-                "calls": 0,
-                "n": 0,
-                "tok": 0,
-                "build": 0.0,
-                "http": 0.0,
-                "parse": 0.0,
-            }
-        _t = _time.monotonic()
         body = self._request_inputs(tasks)
         body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 1}
-        body["spec_capture"] = [self._spec_capture_payload(t) for t in tasks]
-        if _prof:
-            self._hs["build"] += _time.monotonic() - _t
-            self._hs["tok"] += sum(len(t.payload["input_ids"]) for t in tasks)
-        _t = _time.monotonic()
+        capture_payloads = [self._spec_capture_payload(t) for t in tasks]
+        body["spec_capture"] = capture_payloads
+        for payload in capture_payloads:
+            feature_names = list(payload["features"].values())
+            feature_names.extend(
+                item["name"] for item in payload.get("passthrough", ())
+            )
+            self.store.track_external_attempt(
+                payload["sample_id"],
+                generation=int(payload["gen"]),
+                feature_names=feature_names,
+            )
         rows = self.post_fn(
             f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
         )
-        if _prof:
-            self._hs["http"] += _time.monotonic() - _t
-        _t = _time.monotonic()
         rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):
             raise RuntimeError(
@@ -334,6 +340,7 @@ class SGLangServerCaptureAdapter:
                 f"{len(tasks)} tasks"
             )
         out: List[Union[Any, ServerCaptureFailure]] = []
+        successful_refs = []
         for task, row in zip(tasks, rows):
             if not isinstance(row, dict):
                 raise RuntimeError(
@@ -370,6 +377,22 @@ class SGLangServerCaptureAdapter:
                     )
                 )
                 continue
+            expected_identity = {
+                "sample_id": self._sample_id(task),
+                "store_id": str(self.store.store_id),
+                "gen": 1,
+            }
+            actual_identity = {
+                "sample_id": str(result.get("sample_id")),
+                "store_id": str(result.get("store_id")),
+                "gen": int(result.get("gen", -1)),
+            }
+            if actual_identity != expected_identity:
+                raise RuntimeError(
+                    "spec-capture server returned the wrong object identity for "
+                    f"task {task.task_id}: {actual_identity} != "
+                    f"{expected_identity}"
+                )
             ref = self._ref_from_result(task, result, capture)
             # A capture shorter than the prompt is corrupt (classic cause: a
             # radix-cache prefix hit skips prefilling — and capturing — the
@@ -396,13 +419,23 @@ class SGLangServerCaptureAdapter:
                 )
                 continue
             try:
+                recorded_aux_layer_ids = result.get("aux_layer_ids")
+                if (
+                    capture.aux_hidden_state_layer_ids
+                    and recorded_aux_layer_ids is None
+                ):
+                    raise CaptureMismatchError(
+                        f"[{ref.sample_id}] capture omitted aux-layer ids; "
+                        "cannot verify requested layers "
+                        f"{capture.aux_hidden_state_layer_ids}"
+                    )
                 verify_capture_specs(
                     ref.feature_specs,
                     capture,
                     sample_id=ref.sample_id,
                     recorded_aux_layer_ids=(
-                        tuple(result["aux_layer_ids"])
-                        if result.get("aux_layer_ids") is not None
+                        tuple(recorded_aux_layer_ids)
+                        if recorded_aux_layer_ids is not None
                         else None
                     ),
                     aux_feature_name=self.schema.aux_feature or "hidden_state",
@@ -419,29 +452,15 @@ class SGLangServerCaptureAdapter:
                     )
                 )
                 continue
-            self.store.adopt(ref)
+            # Do not transfer a successful row out of provisional ownership
+            # until every row in the response has passed structural and
+            # identity validation.  A later malformed row raises for the whole
+            # lease batch; adopting this prefix now would make it invisible to
+            # terminal provisional cleanup even though no refs are returned.
+            successful_refs.append(ref)
             out.append(ref)
-        if _prof:
-            self._hs["parse"] += _time.monotonic() - _t
-            self._hs["calls"] += 1
-            self._hs["n"] += len(tasks)
-            if self._hs["calls"] >= _prof:
-                h = self._hs
-                print(
-                    f"[prod-http] calls={h['calls']} n={h['n']} tok={h['tok']} "
-                    f"build_ms={1000*h['build']/h['calls']:.1f} "
-                    f"http_ms={1000*h['http']/h['calls']:.1f} "
-                    f"parse_ms={1000*h['parse']/h['calls']:.1f} (avg/call)",
-                    flush=True,
-                )
-                self._hs = {
-                    "calls": 0,
-                    "n": 0,
-                    "tok": 0,
-                    "build": 0.0,
-                    "http": 0.0,
-                    "parse": 0.0,
-                }
+        for ref in successful_refs:
+            self.store.adopt(ref)
         return out
 
     def health(self) -> Dict[str, Any]:

@@ -62,6 +62,7 @@ def _config(*, mode="local_colocated", nproc=1, nnodes=1):
             "control_dir": "/shared/attempt-1",
             "backend": "mooncake",
             "server_urls": ["http://capture:30000"],
+            **({"consumer_state_dir": "/local/attempt-1"} if nnodes > 1 else {}),
         }
     return Config.model_validate(raw)
 
@@ -333,18 +334,12 @@ class LaunchPlanTest(unittest.TestCase):
                 "/local/attempt-state/inboxes",
             )
 
-    def test_consumer_state_dir_rejects_unsupported_topologies(self):
+    def test_consumer_state_dir_rejects_unsupported_modes_and_whitespace(self):
         cfg = _config(mode="disaggregated")
         invalid_cases = {
             "offline": (
                 lambda raw: raw.update(data={"hidden_states_path": "features"}),
                 "valid only for online disaggregated",
-            ),
-            "multi-node trainer": (
-                lambda raw: raw["deployment"]["trainer"].update(
-                    nnodes=2, master_addr="trainer-0"
-                ),
-                "requires deployment.trainer.nnodes=1",
             ),
             "surrounding whitespace": (
                 lambda raw: raw["deployment"]["disaggregated"].update(
@@ -362,6 +357,30 @@ class LaunchPlanTest(unittest.TestCase):
                 mutate(raw)
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
+
+    def test_multi_node_requires_node_local_consumer_state(self):
+        raw = _config(mode="disaggregated").model_dump()
+        raw["deployment"]["trainer"].update(nnodes=2, master_addr="trainer-0")
+
+        with self.assertRaisesRegex(
+            ValidationError, "multi-node online consumers require"
+        ):
+            Config.model_validate(raw)
+
+    def test_multi_node_keeps_wal_local_and_inboxes_shared(self):
+        plan = build_launch_plan(
+            _config(mode="disaggregated", nproc=2, nnodes=2),
+            config_path="run.yaml",
+            requested_role="consumer",
+            node_rank=0,
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            env=MOONCAKE_ENV,
+        )
+
+        command = plan.commands[0]
+        self.assertEqual("/local/attempt-1/consumer.sqlite", command.env["DISAGG_DB"])
+        self.assertEqual("/shared/attempt-1/inboxes", command.env["DISAGG_INBOX_DIR"])
 
     def test_disaggregated_roles_are_independently_selectable(self):
         producer = build_launch_plan(
@@ -535,6 +554,8 @@ class LaunchPlanTest(unittest.TestCase):
                 torch_dtype="float32",
                 cache_dir="/models/cache",
                 sglang_attention_backend="fa3",
+                sglang_mem_fraction_static=0.35,
+                sglang_ep_size=2,
                 sglang_enable_nccl_nvls=True,
                 sglang_enable_symm_mem=True,
                 sglang_enable_torch_compile=True,
@@ -593,6 +614,8 @@ class LaunchPlanTest(unittest.TestCase):
                 argv[argv.index("--attention-backend") + 1],
                 "fa3" if index == 0 else "triton",
             )
+            self.assertEqual(argv[argv.index("--mem-fraction-static") + 1], "0.35")
+            self.assertEqual(argv[argv.index("--ep-size") + 1], "2")
             for flag in (
                 "--enable-nccl-nvls",
                 "--enable-symm-mem",
@@ -809,6 +832,26 @@ class LaunchPlanTest(unittest.TestCase):
                 requested_role="consumer",
                 env=MOONCAKE_ENV,
             )
+
+    def test_multi_node_resume_checks_ledger_only_on_rank_zero_node(self):
+        raw = _config(mode="disaggregated", nproc=2, nnodes=2).model_dump()
+        raw["training"]["resume_from"] = "/shared/checkpoints/latest"
+        distributed = {
+            "RANK": "2",
+            "WORLD_SIZE": "4",
+            "LOCAL_RANK": "0",
+            "MASTER_ADDR": "trainer-0",
+            "MASTER_PORT": "29500",
+        }
+
+        plan = build_launch_plan(
+            Config.model_validate(raw),
+            config_path="run.yaml",
+            requested_role="consumer",
+            env={**distributed, **MOONCAKE_ENV},
+        )
+
+        self.assertEqual((plan.kind, plan.role), ("worker", "consumer"))
 
     def test_partial_distributed_environment_fails_before_launch(self):
         with self.assertRaisesRegex(ValueError, "environment is incomplete"):
@@ -1069,6 +1112,7 @@ class LaunchPlanTest(unittest.TestCase):
     def test_managed_supervisor_signal_cleans_roles_and_services(self):
         handlers = {}
         events = []
+        cleanup_handlers = []
 
         def set_signal(signum, handler):
             previous = handlers.get(signum, signal.SIG_DFL)
@@ -1086,10 +1130,15 @@ class LaunchPlanTest(unittest.TestCase):
                     handlers[signal.SIGTERM](signal.SIGTERM, None)
                 return super().poll()
 
+        class CleanupProcess(_FakeProcess):
+            def terminate(self):
+                cleanup_handlers.append(handlers[signal.SIGTERM])
+                super().terminate()
+
         mooncake = _FakeProcess([None], label="mooncake", events=events)
         capture = _FakeProcess([None], label="capture", events=events)
         producer = SignalProcess()
-        consumer = _FakeProcess([None])
+        consumer = CleanupProcess([None])
         processes = iter((mooncake, capture, producer, consumer))
         with tempfile.TemporaryDirectory() as parent:
             plan = _managed_plan(os.path.join(parent, "attempt"))
@@ -1111,6 +1160,7 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(status, 128 + signal.SIGTERM)
         self.assertTrue(producer.terminated)
         self.assertTrue(consumer.terminated)
+        self.assertEqual(cleanup_handlers, [signal.SIG_IGN])
         self.assertLess(
             events.index("terminate:capture"), events.index("terminate:mooncake")
         )
@@ -1140,6 +1190,47 @@ class LaunchPlanTest(unittest.TestCase):
                 )
         self.assertTrue(mooncake.terminated)
         self.assertTrue(capture.terminated)
+
+    def test_readiness_failure_cleans_descendants_of_exited_service_leader(self):
+        mooncake = _FakeProcess([None])
+        capture = _FakeProcess([7])
+        processes = iter((mooncake, capture))
+        signals = []
+
+        def ready(service, process, _started):
+            if service.command.label.startswith("capture"):
+                self.assertEqual(7, process.poll())
+                raise RuntimeError("capture exited during readiness")
+
+        def killpg(pgid, signum):
+            signals.append((pgid, signum))
+            if signum == 0:
+                raise ProcessLookupError
+
+        with tempfile.TemporaryDirectory() as parent:
+            original = _managed_plan(os.path.join(parent, "attempt"))
+            plan = LaunchPlan(
+                **{
+                    **original.__dict__,
+                    "shutdown_grace_s": 0,
+                }
+            )
+            with (
+                mock.patch("specforge.launch_plan.os.killpg", side_effect=killpg),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "capture exited during readiness",
+                ),
+            ):
+                run_commands(
+                    plan,
+                    popen=lambda *_args, **_kwargs: next(processes),
+                    managed_preflight=lambda _plan: None,
+                    readiness_waiter=ready,
+                )
+
+        self.assertIn((capture.pid, signal.SIGTERM), signals)
+        self.assertIn((mooncake.pid, signal.SIGTERM), signals)
 
     def test_managed_preflight_rejects_an_occupied_port_before_spawning(self):
         with tempfile.TemporaryDirectory() as parent:
@@ -1209,6 +1300,35 @@ class LaunchPlanTest(unittest.TestCase):
             status = run_commands(plan, popen=lambda *_args, **_kwargs: next(processes))
         self.assertEqual(status, 7)
         self.assertTrue(producer.terminated)
+
+    def test_supervisor_terminates_descendants_of_oom_killed_group_leader(self):
+        producer = _FakeProcess([None])
+        consumer = _FakeProcess([-signal.SIGKILL])
+        processes = iter((producer, consumer))
+        plan = LaunchPlan(
+            "supervisor",
+            "both",
+            commands=(
+                CommandSpec("producer", ("producer",)),
+                CommandSpec("consumer", ("consumer",)),
+            ),
+            shutdown_grace_s=0,
+        )
+        signals = []
+
+        def killpg(pgid, signum):
+            signals.append((pgid, signum))
+            if pgid == producer.pid:
+                raise ProcessLookupError
+            if signum == 0:
+                raise ProcessLookupError
+
+        with mock.patch("specforge.launch_plan.os.killpg", side_effect=killpg):
+            status = run_commands(plan, popen=lambda *_args, **_kwargs: next(processes))
+
+        self.assertEqual(status, 128 + signal.SIGKILL)
+        self.assertTrue(producer.terminated)
+        self.assertIn((consumer.pid, signal.SIGTERM), signals)
 
     def test_clean_producer_exit_does_not_cancel_a_running_consumer(self):
         producer = _FakeProcess([0])

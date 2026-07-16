@@ -15,10 +15,11 @@ What is pinned here:
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
   dflash (aux only) requests, named per strategy by the client schema.
 
-OPT-IN: needs a GPU, sglang patched with
+The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
+GPU, sglang patched with
 ``patches/sglang/v0.5.14/spec-capture.patch`` (see
 ``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
-a reachable/spawnable ``mooncake_master``. Enable with
+a reachable/spawnable ``mooncake_master``; opt in locally with
 ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
 """
 

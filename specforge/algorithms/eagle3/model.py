@@ -206,9 +206,14 @@ class OnlineEagle3Model(Eagle3Model):
         past_key_values_length: int,
         device: torch.device,
     ) -> Optional[torch.Tensor]:
+        # USP owns its position-ID layout: the offline collator keeps the
+        # all-to-all-expanded Ulysses dimension for the backend adapter to slice.
+        # It therefore must not be reshaped or validated against this rank's
+        # local hidden-state sequence length.
+        if self.attention_backend == "usp":
+            return position_ids
+
         if position_ids is None:
-            if self.attention_backend == "usp":
-                return None
             return (
                 torch.arange(
                     past_key_values_length,

@@ -7,10 +7,11 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch.func import functional_call
 
 from specforge.utils import get_device_type
 
-from .dflash import DFlashDraftModel
+from .dflash import DFlashDraftModel, sample
 from .registry import register_draft
 
 
@@ -52,10 +53,6 @@ class DominoDraftModel(DFlashDraftModel):
             nn.Linear(self.emb_dim, config.vocab_size, bias=False),
         )
 
-        # Ascend NPU DynamicGRU does not support bfloat16. Keep the fp16 copy
-        # outside module registration so FSDP does not see mixed parameter dtypes.
-        object.__setattr__(self, "_gru_fp16", None)
-
     @property
     def suffix_start(self) -> int:
         return (
@@ -64,33 +61,48 @@ class DominoDraftModel(DFlashDraftModel):
             else (1 + self.pure_draft_prefix_len)
         )
 
-    def _get_gru_fp16(self, device: torch.device) -> nn.GRU:
-        gru_fp16 = self._gru_fp16
-        if (
-            gru_fp16 is None
-            or next(gru_fp16.parameters()).device != device
-            or gru_fp16.hidden_size != self.prefix_gru.hidden_size
-        ):
-            gru_fp16 = nn.GRU(
-                input_size=self.prefix_gru.weight_ih_l0.shape[1],
-                hidden_size=self.prefix_gru.hidden_size,
-                num_layers=1,
-                batch_first=True,
-                bias=False,
-            )
-            gru_fp16.to(device=device, dtype=torch.float16)
-            gru_fp16.weight_ih_l0.requires_grad = False
-            gru_fp16.weight_hh_l0.requires_grad = False
-            object.__setattr__(self, "_gru_fp16", gru_fp16)
-        return gru_fp16
-
     def _run_gru(self, gru_inputs: torch.Tensor) -> torch.Tensor:
         if get_device_type() == "npu" and gru_inputs.dtype == torch.bfloat16:
-            gru_fp16 = self._get_gru_fp16(gru_inputs.device)
-            gru_fp16.weight_ih_l0.data.copy_(self.prefix_gru.weight_ih_l0.data.half())
-            gru_fp16.weight_hh_l0.data.copy_(self.prefix_gru.weight_hh_l0.data.half())
-            return gru_fp16(gru_inputs.half())[0].to(gru_inputs.dtype)
+            # Ascend DynamicGRU does not accept bf16. Functionally substitute
+            # fp16 views of the real parameters so autograd still reaches the
+            # registered bf16 weights and FSDP never sees a mixed-dtype module.
+            fp16_parameters = {
+                name: parameter.to(dtype=torch.float16)
+                for name, parameter in self.prefix_gru.named_parameters()
+            }
+            output, _ = functional_call(
+                self.prefix_gru,
+                fp16_parameters,
+                (gru_inputs.to(dtype=torch.float16),),
+                strict=True,
+            )
+            return output.to(dtype=gru_inputs.dtype)
         return self.prefix_gru(gru_inputs)[0]
+
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Sample a block while causally applying Domino's GRU correction."""
+        base_logits = target.lm_head(draft_hidden)
+        completed_ids = block_output_ids.clone()
+        base_logits4d = base_logits.unsqueeze(1)
+        hidden_states4d = draft_hidden.unsqueeze(1)
+
+        for token_position in range(1, completed_ids.shape[1]):
+            previous_embeddings = target.model.embed_tokens(completed_ids).unsqueeze(1)
+            final_logits = self.apply_logits_head(
+                base_logits4d,
+                prev_token_embeddings=previous_embeddings,
+                hidden_states=hidden_states4d,
+            )
+            head_position = token_position - 1 if self.shift_label else token_position
+            next_token_logits = final_logits[:, 0, head_position, :].unsqueeze(1)
+            completed_ids[:, token_position] = sample(next_token_logits).squeeze(1)
+
+        return completed_ids[:, 1:]
 
     def apply_logits_head(
         self,

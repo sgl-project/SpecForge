@@ -57,12 +57,19 @@ flag to keep synchronized. The consumer world size is
 
 The control directory is attempt-scoped. The launcher deterministically derives
 the online reference channel and lifecycle markers, or the offline manifest,
-beneath that root. Online consumers may put their SQLite/WAL and rank inboxes
-under a separate `consumer_state_dir`; that path should be node-local and is
-currently supported only when `deployment.trainer.nnodes: 1`. A fresh attempt
-requires fresh control and consumer-state directories. `store_id` defaults to
-`run_id` and can be set explicitly when the Mooncake deployment requires
-another namespace.
+beneath that root. Online consumers put the rank-0 SQLite/WAL under
+`consumer_state_dir`; that path should be node-local and is required for
+multi-node trainers. Rank inboxes stay under the shared `control_dir` when
+`deployment.trainer.nnodes > 1`, so remote ranks never need to access the
+SQLite filesystem. A fresh attempt requires fresh control and consumer-state
+directories. `store_id` defaults to `run_id` and can be set explicitly when the
+Mooncake deployment requires another namespace.
+
+Long producer/consumer waits are unbounded unless `idle_timeout_s`,
+`peer_wait_timeout_s`, or `producer_hold_s` is explicitly configured. This
+avoids terminating healthy training merely because it runs longer than a fixed
+wall-clock default. An explicitly configured timeout is terminal: expiration
+fails the attempt and runs its feature cleanup.
 
 The file loader translates the former `training.deployment_mode`,
 `training.server_urls`, and `training.metadata_db_path` fields at its migration
@@ -344,6 +351,11 @@ Rank 0 publishes a global dispatch quantum before capture:
 quantum = consumer_world_size * batch_size * accumulation_steps
 ```
 
+When both `training.total_steps` and `training.max_steps` are omitted, the
+producer publishes the schedule horizon derived from the prepared prompt count,
+`training.num_epochs`, and this quantum. The consumer validates that contract,
+uses it for optimizer and Domino loss schedules, and still trains until EOF.
+
 The producer waits for that handshake. Configure bounded capture under
 `runtime`:
 
@@ -358,8 +370,8 @@ runtime:
 ```
 
 High/low thresholds implement hysteresis. The optional hard resident cap rejects
-and cleans a new capture before publication. A partial quantum at EOF fails the
-attempt rather than training an incomplete optimizer step.
+and cleans a new capture before publication. A partial quantum at EOF is settled
+without dispatch rather than training an incomplete optimizer step.
 
 Consumer rank 0 is the only source-channel reader and SQLite writer. At an
 optimizer boundary, `DPAckController` commits sample ids and the durable marker,

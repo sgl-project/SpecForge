@@ -47,7 +47,6 @@ method-specific Python training entry points.
 | **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online](./examples/configs/qwen3-8b-domino-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-domino-disaggregated.yaml) | — |
 | **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Disaggregated](./examples/configs/qwen3-4b-dspark-disaggregated.yaml) | — |
 | **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online](./examples/configs/qwen3-8b-peagle-disaggregated.yaml) | — |
-| **[D^2SD](https://arxiv.org/abs/2606.04446)** | Dual Diffusion Draft Models | TODO | — |
 
 See the [training guide](./docs/basic_usage/training.md) for the supported
 method/topology matrix and the

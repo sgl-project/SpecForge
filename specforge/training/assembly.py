@@ -35,6 +35,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.training.provenance import (
+    model_resume_provenance as _model_resume_provenance,
+)
 
 
 @dataclass
@@ -155,79 +158,6 @@ def _load_input_tools(
     if input_adapter is not None:
         return input_adapter.load_input_tools(cfg)
     return _load_text_tokenizer(cfg)
-
-
-def _model_source_identity(path: Optional[str]):
-    """Return a stable source id with content identity for local artifacts."""
-
-    def file_identity(file_path: str, name: str):
-        size = os.path.getsize(file_path)
-        hasher = hashlib.sha256()
-        # Local paths have no immutable repository revision. Stream every
-        # tracked artifact so replacing a same-size model shard cannot silently
-        # change reconstructed frozen state across resume. Memory stays bounded
-        # even for very large checkpoints.
-        with open(file_path, "rb") as stream:
-            for chunk in iter(lambda: stream.read(16 * 1024 * 1024), b""):
-                hasher.update(chunk)
-        return (name, size, hasher.hexdigest())
-
-    if not path:
-        return None
-    expanded = os.path.abspath(os.path.expanduser(path))
-    if not os.path.exists(expanded):
-        return ("reference", path)
-    if os.path.isfile(expanded):
-        return ("file", expanded, file_identity(expanded, ""))
-
-    tracked_suffixes = (
-        ".bin",
-        ".json",
-        ".pt",
-        ".pth",
-        ".safetensors",
-    )
-    files = []
-    for entry in os.scandir(expanded):
-        if not entry.is_file(follow_symlinks=True) or not entry.name.endswith(
-            tracked_suffixes
-        ):
-            continue
-        files.append(file_identity(entry.path, entry.name))
-    return ("directory", expanded, tuple(sorted(files)))
-
-
-def _model_resume_provenance(
-    cfg: Config,
-    draft_config,
-    target_config,
-    *,
-    capture_layers: Optional[List[int]],
-):
-    """Identify every reconstructed frozen model input used after resume."""
-
-    draft_source = cfg.model.draft_model_config or getattr(
-        draft_config,
-        "_name_or_path",
-        None,
-    )
-    return {
-        "target_model": _model_source_identity(cfg.model.target_model_path),
-        "target_revision": getattr(target_config, "_commit_hash", None),
-        "draft_config": _model_source_identity(draft_source),
-        "draft_revision": getattr(draft_config, "_commit_hash", None),
-        "vocab_mapping": _model_source_identity(cfg.model.vocab_mapping_path or None),
-        "embedding_key": cfg.model.embedding_key,
-        "lm_head_key": cfg.model.lm_head_key,
-        "load_target_embedding": cfg.model.load_target_embedding,
-        "capture_layers": (
-            tuple(int(layer_id) for layer_id in capture_layers)
-            if capture_layers is not None
-            else None
-        ),
-        "input_modality": cfg.model.input_modality,
-        "torch_dtype": cfg.model.torch_dtype,
-    }
 
 
 def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:

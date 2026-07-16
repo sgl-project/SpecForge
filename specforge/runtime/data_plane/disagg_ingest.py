@@ -26,7 +26,7 @@ import json
 import os
 from typing import Callable, List, Optional
 
-from specforge.runtime.contracts import SCHEMA_VERSION, SampleRef
+from specforge.runtime.contracts import SCHEMA_VERSION, SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.feature_store import FeatureStore, load_feature_file
 from specforge.runtime.data_plane.offline_reader import list_feature_files
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
@@ -97,7 +97,7 @@ def write_ref_manifest(refs: List[SampleRef], path: str) -> None:
     Asserts the no-tensor invariant first (a manifest is control-plane state),
     then publishes with a single rename so a reader never sees a partial file.
     """
-    # assert_no_tensors(refs)
+    assert_no_tensors(refs)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "refs": [ref_to_dict(r) for r in refs],

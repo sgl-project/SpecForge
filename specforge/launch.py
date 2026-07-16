@@ -401,13 +401,23 @@ def _publish_refs_with_cleanup(
         raise
 
 
-def _epoch_online_prompts(prompts, epoch: int, prompt_epochs: int):
-    """Build one epoch's prompt tasks without expanding the full run upfront."""
+def _epoch_online_prompts(
+    prompts,
+    epoch: int,
+    prompt_epochs: int,
+    *,
+    seed: int = 0,
+):
+    """Build one deterministic, epoch-specific online prompt plan."""
+    import random
+
+    indexed_prompts = list(enumerate(prompts))
+    random.Random(int(seed) + int(epoch)).shuffle(indexed_prompts)
     if prompt_epochs == 1:
-        return prompts
+        return [prompt for _idx, prompt in indexed_prompts]
 
     out = []
-    for idx, prompt in enumerate(prompts):
+    for idx, prompt in indexed_prompts:
         item = dict(prompt)
         metadata = dict(prompt.get("metadata") or {})
         if "task_id" in prompt:
@@ -779,6 +789,7 @@ def build_disagg_online_producer(
     max_prompt_attempts: Optional[int] = 5,
     sleep=None,
     prompt_epochs: int = 1,
+    prompt_seed: int = 0,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -798,8 +809,9 @@ def build_disagg_online_producer(
     before it can publish its stop sentinel.
 
     ``prompt_epochs`` repeats the prompt stream on the producer side by minting
-    epoch-tagged task/sample ids. This keeps the consumer path consume-once while
-    preserving ``num_epochs`` semantics for online streams.
+    epoch-tagged task/sample ids. Each pass uses the deterministic
+    ``prompt_seed + epoch`` order, matching sampler-style epoch semantics while
+    keeping a reconstructed plan stable across restarts.
 
     Failure semantics: a worker whose source raises (dead/unreachable server)
     has already failed its leases retryable — the surviving workers re-lease
@@ -1020,27 +1032,11 @@ def build_disagg_online_producer(
                 return reconcile_consumed_locked()
 
         def run_worker(w) -> None:
-            import os as _os
-
-            # PROFILE_PRODUCER=N -> every N rounds print one [prod] line
-            # splitting the round into backpressure-park / run_once / publish.
-            _prof = int(_os.environ.get("PROFILE_PRODUCER", "0"))
-            _ps = {
-                "rounds": 0,
-                "refs": 0,
-                "bp": 0.0,
-                "once": 0.0,
-                "pub": 0.0,
-                "t0": time.monotonic(),
-                "infl": 0,
-                "infl_max": 0,
-            }
             failures = 0
             last_backpressure_log = 0.0
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
                     return
-                _t = time.monotonic()
                 _infl = channel.in_flight_remote()
                 _resident = resident_bytes()
                 # backpressure: in_flight = published - consumer-acked
@@ -1080,11 +1076,6 @@ def build_disagg_online_producer(
                     sleep(backpressure_poll_s)
                     _infl = channel.in_flight_remote()
                     _resident = resident_bytes()
-                if _prof:
-                    _ps["bp"] += time.monotonic() - _t
-                    _ps["infl"] = _infl
-                    _ps["infl_max"] = max(_ps["infl_max"], _infl)
-                _t = time.monotonic()
                 try:
                     run_once_start = time.perf_counter()
                     refs = w.run_once(max_tasks=worker_lease)
@@ -1112,10 +1103,7 @@ def build_disagg_online_producer(
                     sleep(backpressure_poll_s)
                     continue
                 failures = 0
-                if _prof:
-                    _ps["once"] += time.monotonic() - _t
                 if refs:
-                    _t = time.monotonic()
                     with publish_lock:
                         current_bytes = reconcile_consumed_locked()
                         ref_sizes = [
@@ -1185,7 +1173,12 @@ def build_disagg_online_producer(
                     sleep(backpressure_poll_s)
 
         def ingest_epoch(epoch: int) -> None:
-            epoch_prompts = _epoch_online_prompts(prompts, epoch, prompt_epochs)
+            epoch_prompts = _epoch_online_prompts(
+                prompts,
+                epoch,
+                prompt_epochs,
+                seed=prompt_seed,
+            )
             epoch_count = (
                 len(epoch_prompts) if hasattr(epoch_prompts, "__len__") else "unknown"
             )
@@ -1411,8 +1404,6 @@ def build_disagg_online_consumer(
 
     if inbox_dir is None:
         inbox_dir = channel.path + ".inboxes"
-    if idle_timeout_s is None:
-        idle_timeout_s = 1800.0
 
     distributor = None
     store = None

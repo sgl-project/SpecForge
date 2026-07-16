@@ -322,6 +322,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         del hidden_states, prev_token_ids
         return None
 
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Sample one speculative block from the draft-model hidden states.
+
+        DFlash predicts the whole suffix in one LM-head call. Draft families
+        with an auxiliary logits head can override this boundary without
+        duplicating the target-cache and acceptance logic in ``spec_generate``.
+        """
+        del block_output_ids
+        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        return sample(draft_logits)
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -400,20 +416,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start + block_size
-                    ],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                    is_causal=False,
-                )[:, -block_size + 1 :, :]
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[
+                    :, past_key_values_draft.get_seq_length() : start + block_size
+                ],
+                past_key_values=past_key_values_draft,
+                use_cache=True,
+                is_causal=False,
             )
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            block_output_ids[:, 1:] = self._sample_draft_tokens(
+                target,
+                draft_hidden,
+                block_output_ids,
+            )
 
             output = target(
                 block_output_ids,

@@ -25,10 +25,58 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import socket
+from contextlib import contextmanager
+from typing import Iterator
 from typing import List, Optional
 
 from specforge.config import Config, load_config
+
+
+class _WorkerTermination(BaseException):
+    """Translate a process signal into normal Python stack unwinding."""
+
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+@contextmanager
+def _worker_signal_unwind() -> Iterator[None]:
+    """Make worker termination run training and distributed cleanup blocks.
+
+    Managed supervisors terminate worker process groups with SIGTERM.  Python's
+    default SIGTERM action exits immediately, bypassing ``finally`` blocks.  The
+    first managed signal is therefore raised as a ``BaseException``; subsequent
+    signals are ignored while cleanup runs, after which the original handlers
+    are restored.  A supervising parent may still enforce its grace period with
+    SIGKILL if cleanup cannot finish.
+    """
+    managed_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        managed_signals.append(signal.SIGHUP)
+    previous_handlers = {}
+
+    def unwind(signum, _frame):
+        for installed in previous_handlers:
+            signal.signal(installed, signal.SIG_IGN)
+        raise _WorkerTermination(signum)
+
+    try:
+        for signum in managed_signals:
+            try:
+                previous_handlers[signum] = signal.signal(signum, unwind)
+            except ValueError:
+                # Embedded callers may execute the CLI from a non-main thread,
+                # where Python does not permit signal handler installation.
+                for installed, handler in previous_handlers.items():
+                    signal.signal(installed, handler)
+                previous_handlers.clear()
+                break
+        yield
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def _bootstrap_single_process_env() -> None:
@@ -182,7 +230,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if plan.kind == "worker":
             os.environ.update(plan.worker_env)
             role_config = _config_for_role(resolved.config, plan.role)
-            _train(bind_run(role_config, resolved.algorithm))
+            try:
+                with _worker_signal_unwind():
+                    _train(bind_run(role_config, resolved.algorithm))
+            except _WorkerTermination as received:
+                return 128 + received.signum
             return 0
         return run_commands(plan)
     elif args.to == "hf":

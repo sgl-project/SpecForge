@@ -3,8 +3,10 @@
 single-authority dispatch/book-keeping path (CPU only, no torch.distributed)."""
 
 import os
+import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
@@ -59,6 +61,29 @@ class _FailingAbortStore(_AbortStore):
     def abort(self, sample_id, reason):
         super().abort(sample_id, reason)
         raise RuntimeError("injected abort failure")
+
+
+class _CountForbiddenSQLiteMetadataStore(SQLiteMetadataStore):
+    def committed_count(self):
+        raise AssertionError("RefDistributor must use the commit freshness result")
+
+
+class _CloseAfterFirstEmptyPollChannel(StreamingRefChannel):
+    """Inject a final publication between a consumer poll and close check."""
+
+    def __init__(self, path, producer, final_ref):
+        super().__init__(path)
+        self._producer = producer
+        self._final_ref = final_ref
+        self._injected = False
+
+    def poll(self, max_n=None):
+        refs = super().poll(max_n)
+        if not self._injected and not refs:
+            self._injected = True
+            self._producer.publish(self._final_ref)
+            self._producer.close()
+        return refs
 
 
 class TestRefDistributor(unittest.TestCase):
@@ -143,6 +168,98 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(self.producer.in_flight_remote(), 0)
         self.producer.close()
         _pump_until_quiet(dist)
+
+    def test_dedup_uses_commit_result_without_counting_the_ledger(self):
+        store = _CountForbiddenSQLiteMetadataStore(
+            os.path.join(self.dir, "no-count.sqlite")
+        )
+        self.addCleanup(store.close)
+        controller = DataFlowController("run0", metadata_store=store)
+        dist = self._distributor(dp_size=1, controller=controller)
+        self.producer.publish(_ref("s0"))
+        self.producer.publish(_ref("s0"))
+        self.producer.close()
+
+        _pump_until_quiet(dist)
+
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0"])
+        self.assertEqual(dist.stats["duplicates"], 1)
+
+    def test_poll_batches_one_db_commit_and_one_inbox_fsync_per_rank_window(self):
+        store = SQLiteMetadataStore(os.path.join(self.dir, "batched.sqlite"))
+        self.addCleanup(store.close)
+        controller = DataFlowController("run0", metadata_store=store)
+        dist = self._distributor(
+            dp_size=2,
+            controller=controller,
+            refs_per_rank_step=2,
+        )
+        # Eight fresh refs form two global windows. The repeated s0 exercises
+        # same-poll ledger dedup without adding an inbox publication.
+        for sample_id in ["s0", "s0", *[f"s{i}" for i in range(1, 8)]]:
+            self.producer.publish(_ref(sample_id))
+
+        sql = []
+        store._conn.set_trace_callback(sql.append)
+        batch_calls = []
+        for rank, inbox in enumerate(dist._inboxes):
+            publish_batch = inbox.publish_batch
+
+            def record_batch(refs, *, rank=rank, publish_batch=publish_batch):
+                batch_calls.append((rank, [ref.sample_id for ref in refs]))
+                publish_batch(refs)
+
+            inbox.publish_batch = record_batch
+
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.os.fsync"
+        ) as fsync:
+            self.assertTrue(dist.pump())
+
+        commits = [statement for statement in sql if statement.strip() == "COMMIT"]
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(
+            batch_calls,
+            [
+                (0, ["s0", "s2"]),
+                (1, ["s1", "s3"]),
+                (0, ["s4", "s6"]),
+                (1, ["s5", "s7"]),
+            ],
+        )
+        self.assertEqual(fsync.call_count, 4)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"])
+
+    def test_sqlite_bulk_commit_rolls_back_the_whole_poll_on_insert_failure(self):
+        store = SQLiteMetadataStore(os.path.join(self.dir, "rollback.sqlite"))
+        self.addCleanup(store.close)
+        store._conn.execute(
+            "CREATE TRIGGER reject_s1 BEFORE INSERT ON committed "
+            "WHEN NEW.sample_id = 's1' BEGIN "
+            "SELECT RAISE(ABORT, 'injected insert failure'); END"
+        )
+        store._conn.commit()
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected insert failure"):
+            store.commit_samples([_ref("s0"), _ref("s1")])
+
+        self.assertEqual(store.all_committed_ids(), [])
+
+    def test_close_observed_after_empty_poll_gets_a_final_drain(self):
+        final_ref = _ref("last")
+        self.source = _CloseAfterFirstEmptyPollChannel(
+            self.src_path, self.producer, final_ref
+        )
+        dist = self._distributor(dp_size=1)
+
+        self.assertTrue(dist.pump())
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["last"])
+        self.assertFalse(dist.finished)
+
+        self.assertFalse(dist.pump())
+        self.assertTrue(dist.finished)
 
     def test_resume_skips_acked_and_dispatches_reconciled_unacked(self):
         ledger_path = os.path.join(self.dir, "resume.sqlite")

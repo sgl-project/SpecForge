@@ -309,10 +309,7 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                     self.assertTrue(services.get("server_urls"))
                     self.assertTrue(services.get("consumer_state_dir"))
                     self.assertEqual(payload["model"]["target_backend"], "sglang")
-                    self.assertTrue(
-                        payload["training"].get("max_steps")
-                        or payload["training"].get("total_steps")
-                    )
+                    self.assertGreater(payload["training"]["num_epochs"], 0)
                 self.assertEqual(set(deployment), expected_keys)
 
     def test_golden_topologies_validate_for_their_declared_world_size(self):

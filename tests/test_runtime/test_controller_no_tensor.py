@@ -45,10 +45,64 @@ class TestControllerCarriesNoTensor(unittest.TestCase):
         with self.assertRaises(TypeError):
             ctrl.ingest_prompts([{"payload": {"ids": torch.zeros(3)}}])
 
+    def test_prompt_batch_validation_is_atomic(self):
+        ctrl = DataFlowController("run1")
+
+        with self.assertRaises(TypeError):
+            ctrl.ingest_prompts(
+                [
+                    {"task_id": "good", "payload": {"ids": [1, 2, 3]}},
+                    {"task_id": "bad", "payload": {"ids": torch.zeros(3)}},
+                ]
+            )
+
+        status = ctrl.status()
+        self.assertEqual(status["prompts"], 0)
+        self.assertEqual(status["prompts_pending"], 0)
+
+    def test_sample_batch_validation_is_atomic(self):
+        ctrl = DataFlowController("run1")
+        bad = SampleRef(
+            sample_id="bad",
+            run_id="r",
+            source_task_id=None,
+            feature_store_uri="mem://x/bad",
+            feature_keys={},
+            feature_specs={},
+            strategy="eagle3",
+            metadata={"sneaky": torch.zeros(4)},
+        )
+
+        with self.assertRaises(TypeError):
+            ctrl.commit_samples("w0", [_ref(0), bad])
+
+        self.assertEqual(ctrl.status()["samples_committed"], 0)
+        self.assertEqual(ctrl.sample_queue.depth(), 0)
+
+    def test_prompt_batch_preserves_each_task_id(self):
+        ctrl = DataFlowController("run1")
+        expected = ["task-0", "task-1"]
+
+        task_ids = ctrl.ingest_prompts(
+            [
+                {"task_id": task_id, "payload": {"ids": [1, 2, 3]}}
+                for task_id in expected
+            ]
+        )
+        tasks = ctrl.lease_prompt_tasks("w0", 2)
+
+        self.assertEqual(task_ids, expected)
+        self.assertEqual([task.task_id for task in tasks], expected)
+
     def test_commit_samples_idempotent(self):
         ctrl = DataFlowController("run1")
-        ctrl.commit_samples("w0", [_ref(0)])
-        ctrl.commit_samples("w0", [_ref(0)])  # at-least-once: dedup on sample_id
+        ref = _ref(0)
+        self.assertEqual(ctrl.commit_samples("w0", [ref]), [ref])
+        # At-least-once delivery is deduplicated on sample_id.
+        self.assertEqual(
+            ctrl.commit_samples("w0", [ref]),
+            [],
+        )
         self.assertEqual(ctrl.status()["samples_committed"], 1)
         self.assertEqual(ctrl.sample_queue.depth(), 1)
 

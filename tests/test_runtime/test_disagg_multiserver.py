@@ -29,7 +29,7 @@ from specforge.inference.adapters.server_capture import (
     ServerCaptureSchema,
     SGLangServerCaptureAdapter,
 )
-from specforge.launch import build_disagg_online_producer
+from specforge.launch import _epoch_online_prompts, build_disagg_online_producer
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from tests.test_runtime.test_server_capture import (
@@ -197,21 +197,6 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertEqual(channel.published, 0)
         self.assertIn("high watermark", channel.failure())
 
-    def test_producer_profiling_handles_first_round_without_backpressure(self):
-        backend = _FakeMooncakeStore()
-        stub = _StubCaptureServer(backend)
-        store = MooncakeFeatureStore(store=backend, store_id="run0")
-        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
-        _workers, drive = _build(
-            [_adapter(store, stub)], _prompts(2), store, channel, lease=2
-        )
-
-        with patch.dict(os.environ, {"PROFILE_PRODUCER": "1"}):
-            produced = drive()
-
-        self.assertEqual(produced, 2)
-        self.assertTrue(channel.is_closed())
-
     def test_byte_watermark_resumes_after_durable_consumer_ack(self):
         backend = _FakeMooncakeStore()
         stub = _StubCaptureServer(backend)
@@ -306,7 +291,12 @@ class TestMultiServerProducer(unittest.TestCase):
             os.path.join(self._workdir(), "refs.jsonl"), fail_after=0
         )
         _workers, drive = _build(
-            [_adapter(store, stub)], _prompts(3), store, channel, lease=3
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            lease=3,
+            prompt_seed=5,
         )
 
         with self.assertRaisesRegex(OSError, "after 0 durable ref"):
@@ -333,7 +323,12 @@ class TestMultiServerProducer(unittest.TestCase):
             os.path.join(self._workdir(), "refs.jsonl"), fail_after=1
         )
         _workers, drive = _build(
-            [_adapter(store, stub)], _prompts(3), store, channel, lease=3
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            lease=3,
+            prompt_seed=5,
         )
 
         with self.assertRaisesRegex(OSError, "after 1 durable ref"):
@@ -359,7 +354,12 @@ class TestMultiServerProducer(unittest.TestCase):
             os.path.join(self._workdir(), "refs.jsonl")
         )
         _workers, drive = _build(
-            [_adapter(store, stub)], _prompts(3), store, channel, lease=3
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            lease=3,
+            prompt_seed=5,
         )
 
         with self.assertRaisesRegex(OSError, "injected fsync failure"):
@@ -388,7 +388,12 @@ class TestMultiServerProducer(unittest.TestCase):
             os.path.join(self._workdir(), "refs.jsonl"), fail_after=0
         )
         _workers, drive = _build(
-            [_adapter(store, stub)], _prompts(2), store, channel, lease=2
+            [_adapter(store, stub)],
+            _prompts(2),
+            store,
+            channel,
+            lease=2,
+            prompt_seed=5,
         )
 
         with self.assertRaisesRegex(
@@ -435,6 +440,34 @@ class TestMultiServerProducer(unittest.TestCase):
             },
         )
         self.assertTrue(channel.is_closed())
+
+    def test_prompt_epoch_order_is_seeded_and_reconstruction_stable(self):
+        prompts = _prompts(12)
+
+        single_epoch = _epoch_online_prompts(prompts, 0, 1, seed=42)
+        rebuilt_single_epoch = _epoch_online_prompts(prompts, 0, 1, seed=42)
+        other_seed = _epoch_online_prompts(prompts, 0, 1, seed=43)
+        epoch_zero = _epoch_online_prompts(prompts, 0, 3, seed=42)
+        epoch_one = _epoch_online_prompts(prompts, 1, 3, seed=42)
+        rebuilt_epoch_one = _epoch_online_prompts(prompts, 1, 3, seed=42)
+
+        self.assertEqual(single_epoch, rebuilt_single_epoch)
+        self.assertNotEqual(
+            [item["task_id"] for item in single_epoch],
+            [item["task_id"] for item in other_seed],
+        )
+        zero_order = [item["metadata"]["prompt_index"] for item in epoch_zero]
+        one_order = [item["metadata"]["prompt_index"] for item in epoch_one]
+        self.assertNotEqual(zero_order, one_order)
+        self.assertEqual(epoch_one, rebuilt_epoch_one)
+        self.assertEqual(
+            {item["task_id"] for item in epoch_one},
+            {f"epoch0001-prompt{idx:012d}" for idx in range(len(prompts))},
+        )
+        self.assertEqual(
+            [item["task_id"] for item in epoch_one[5:]],
+            [item["task_id"] for item in rebuilt_epoch_one[5:]],
+        )
 
     def test_one_dead_server_survivor_completes_pool(self):
         backend = _FakeMooncakeStore()

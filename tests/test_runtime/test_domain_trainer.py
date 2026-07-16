@@ -198,11 +198,23 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 "batch_size": 2,
                 "accumulation_steps": 3,
                 "num_epochs": 1,
+                "effective_total_steps": 1,
                 "tp_size": 1,
                 "sp_ulysses_size": 1,
                 "sp_ring_size": 1,
             },
         )
+
+    def test_fixed_refs_reject_partial_accumulation_during_assembly(self):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("torch unavailable")
+
+        with self.assertRaisesRegex(
+            ValueError, "ends with incomplete gradient accumulation"
+        ):
+            self._build({"refs": list(range(8))})
 
     def test_fit_delegates_to_controller_over_loader(self):
         try:

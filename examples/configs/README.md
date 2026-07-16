@@ -65,7 +65,7 @@ model:
   vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
 
 data:
-  train_data_path: dataset/sharegpt_train.jsonl
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
   max_length: 4096
   chat_template: qwen
 
@@ -141,7 +141,7 @@ should make their training strategy and topology explicit.
 | `model.cache_dir` | `null` | Model/tokenizer download cache. This is distinct from `data.cache_dir`. |
 | `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
-| `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`. |
+| `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
 | `model.sglang_context_length` | `null` | Positive explicit context limit. Managed capture requires at least `data.max_length + 7`; omitting it derives that value. |
 | `model.sglang_enable_nccl_nvls` | `false` | Pass the matching SGLang NCCL NVLS optimization flag. |
 | `model.sglang_enable_symm_mem` | `false` | Pass the matching SGLang symmetric-memory flag. |
@@ -185,8 +185,8 @@ Common fields:
 | --- | --- | --- |
 | `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
-| `training.max_steps` | `null` | Positive hard stop in optimizer steps. It also becomes the schedule horizon when `total_steps` is omitted. |
-| `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not by itself stop an online stream. Online disaggregated runs require this or `max_steps`. |
+| `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
+| `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
@@ -243,7 +243,7 @@ For `deployment.mode: disaggregated`, also write:
 | --- | --- | --- |
 | `deployment.disaggregated.control_dir` | required | Fresh attempt-scoped shared directory for refs/manifest and lifecycle markers. |
 | `deployment.disaggregated.backend` | required | `mooncake` or `shared_dir`. Online disaggregated runs require Mooncake. |
-| `deployment.disaggregated.consumer_state_dir` | `null` | Optional node-local online-consumer SQLite/WAL and inbox root. Currently restricted to one trainer node. |
+| `deployment.disaggregated.consumer_state_dir` | `null` | Node-local rank-0 SQLite/WAL root. Required for multi-node online consumers; their rank inboxes remain under shared `control_dir`. |
 | `deployment.disaggregated.store_root` | `null` | Shared feature directory; required when `backend: shared_dir`. |
 | `deployment.disaggregated.store_id` | `null` | Feature-store namespace; defaults to `run_id`. |
 | `deployment.disaggregated.server_urls` | `[]` | External patched SGLang capture endpoints. One rollout worker is created per entry. Do not set with `managed_local`. |
@@ -255,8 +255,8 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
 | `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. |
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
-| `deployment.disaggregated.peer_wait_timeout_s` | `null` | Positive producer/consumer peer-completion timeout. |
-| `deployment.disaggregated.producer_hold_s` | `null` | Positive offline producer retention window where required. |
+| `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
+| `deployment.disaggregated.producer_hold_s` | `null` | Optional positive offline producer retention timeout. Unset is unbounded; expiration fails the attempt. |
 | `deployment.disaggregated.managed_local` | `null` | Optional owned single-node Mooncake + capture-server stack described below. |
 
 The four path fields have different ownership:
@@ -265,7 +265,7 @@ The four path fields have different ownership:
 | --- | --- |
 | `output_dir` | Shared durable checkpoints and run outputs. |
 | `deployment.disaggregated.control_dir` | Shared, fresh attempt control state. |
-| `deployment.disaggregated.consumer_state_dir` | Optional node-local, fresh online-consumer ledger/inboxes. |
+| `deployment.disaggregated.consumer_state_dir` | Fresh node-local online-consumer ledger; required for multi-node runs. |
 | `deployment.disaggregated.store_root` | Shared offline feature payloads for `shared_dir`. |
 
 An external-service online run writes `server_urls` and Mooncake endpoints in
@@ -314,7 +314,7 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |
-| `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `0.85` | SGLang static-memory fraction in `(0, 1]`. |
+| `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
 
@@ -369,9 +369,11 @@ unless tuning throughput or memory pressure.
 - Offline feature consumers require `training.tp_size: 1`. Non-USP ranks each
   consume a disjoint data shard; USP peers share a sequence within their SP
   group while draft-DP groups remain disjoint.
-- Online disaggregated runs require `model.target_backend: sglang`,
-  `backend: mooncake`, and either `training.max_steps` or
-  `training.total_steps`. Every trainer rank is data parallel, so
+- Online disaggregated runs require `model.target_backend: sglang` and
+  `backend: mooncake`. When both step fields are omitted, the producer publishes
+  the finite prompt plan's optimizer horizon and the consumer trains to EOF;
+  `max_steps` remains an optional hard cap. Every trainer rank is data parallel,
+  so
   `training.tp_size`, `training.sp_ulysses_size`, and
   `training.sp_ring_size` must remain 1; configure target TP on each capture
   server.

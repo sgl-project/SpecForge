@@ -42,6 +42,7 @@ import os
 import threading
 import time
 import traceback
+from collections import Counter
 from typing import Iterable, List, Optional
 
 from specforge.runtime.contracts import SampleRef
@@ -154,17 +155,6 @@ class RefDistributor:
             "duplicates": 0,
             "dropped": 0,
         }
-        # PROFILE_DISTRIB=<secs> -> periodic [dist] line: polled/dispatched
-        # rates, per-ref commit + count cost, inbox-publish cost, rank lag.
-        self._prof_s = float(os.environ.get("PROFILE_DISTRIB", "0"))
-        self._pd = {
-            "polled": 0,
-            "disp0": 0,
-            "commit": 0.0,
-            "cnt": 0.0,
-            "inboxpub": 0.0,
-            "t0": time.monotonic(),
-        }
 
     @staticmethod
     def inbox_path(inbox_dir: str, dp_rank: int) -> str:
@@ -194,34 +184,40 @@ class RefDistributor:
         progress = False
 
         raw = self.source.poll()
+        source_drained = False
+        if not raw and self.source.is_closed():
+            # The producer can append its final ref and close after the first
+            # empty poll. Once close is observed no later publication is valid,
+            # so this post-close poll is the authoritative drained check.
+            raw = self.source.poll()
+            source_drained = not raw
         if raw:
             progress = True
-            self._pd["polled"] += len(raw)
+            candidates = []
             for ref in raw:
                 if ref.sample_id in self._skip:
                     self._skip.discard(ref.sample_id)
                     self.stats["skipped"] += 1
                     continue
-                _t = time.monotonic()
-                before = self.controller.store.committed_count()
-                self._pd["cnt"] += time.monotonic() - _t
-                _t = time.monotonic()
-                self.controller.commit_samples(self.worker_id, [ref])
-                self._pd["commit"] += time.monotonic() - _t
-                _t = time.monotonic()
-                if self.controller.store.committed_count() == before:
-                    # Duplicate publication within an attempt is idempotent.
-                    self.stats["duplicates"] += 1
-                    if ref.sample_id in self._requeued:
-                        # Reconciliation already put this unacked sample into
-                        # the transient queue. Its inbox ack will settle the
-                        # original publication exactly once.
-                        self._requeued.discard(ref.sample_id)
-                    else:
-                        # A same-attempt duplicate never reaches an inbox, so
-                        # settle that extra publication immediately.
-                        self.source.mark_consumed(1)
-                self._pd["cnt"] += time.monotonic() - _t
+                candidates.append(ref)
+
+            fresh = self.controller.commit_samples(self.worker_id, candidates)
+            fresh_ids = Counter(ref.sample_id for ref in fresh)
+            for ref in candidates:
+                if fresh_ids[ref.sample_id]:
+                    fresh_ids[ref.sample_id] -= 1
+                    continue
+                # Duplicate publication within an attempt is idempotent.
+                self.stats["duplicates"] += 1
+                if ref.sample_id in self._requeued:
+                    # Reconciliation already put this unacked sample into the
+                    # transient queue. Its inbox ack will settle the original
+                    # publication exactly once.
+                    self._requeued.discard(ref.sample_id)
+                else:
+                    # A same-attempt duplicate never reaches an inbox, so
+                    # settle that extra publication immediately.
+                    self.source.mark_consumed(1)
 
         # Dispatch complete optimizer-step windows. Round-robin assignment gives
         # every rank batch_size * accumulation_steps refs in the same order.
@@ -232,10 +228,11 @@ class RefDistributor:
                 self._window.extend(queue.get(need, timeout_s=0.0))
             if len(self._window) < self.dispatch_quantum:
                 break
-            _t = time.monotonic()
+            rank_batches: List[List[SampleRef]] = [[] for _ in range(self.dp_size)]
             for index, ref in enumerate(self._window):
-                self._inboxes[index % self.dp_size].publish(ref)
-            self._pd["inboxpub"] += time.monotonic() - _t
+                rank_batches[index % self.dp_size].append(ref)
+            for inbox, refs in zip(self._inboxes, rank_batches):
+                inbox.publish_batch(refs)
             self.stats["dispatched"] += self.dispatch_quantum
             self._window = []
             progress = True
@@ -243,34 +240,7 @@ class RefDistributor:
         if self._forward_consumed():
             progress = True
 
-        if self._prof_s:
-            now = time.monotonic()
-            win = now - self._pd["t0"]
-            if win >= self._prof_s:
-                pd = self._pd
-                n = max(1, pd["polled"])
-                disp = self.stats["dispatched"] - pd["disp0"]
-                lag = [
-                    inbox._published - inbox.consumed_remote()
-                    for inbox in self._inboxes
-                ]
-                print(
-                    f"[dist] win_s={win:.1f} polled={pd['polled']} disp={disp} "
-                    f"q={queue.depth()} dup={self.stats['duplicates']} "
-                    f"cnt_ms={1000*pd['cnt']/n:.2f} commit_ms={1000*pd['commit']/n:.2f} "
-                    f"inboxpub_ms={1000*pd['inboxpub']/n:.2f} lag={lag} (per-ref avg)",
-                    flush=True,
-                )
-                self._pd = {
-                    "polled": 0,
-                    "disp0": self.stats["dispatched"],
-                    "commit": 0.0,
-                    "cnt": 0.0,
-                    "inboxpub": 0.0,
-                    "t0": now,
-                }
-
-        if not raw and self.source.is_closed() and queue.depth() == 0:
+        if source_drained and queue.depth() == 0:
             self._finish()
         return progress
 

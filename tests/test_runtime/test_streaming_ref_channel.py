@@ -106,6 +106,51 @@ class TestStreamingRefChannel(unittest.TestCase):
             [ref.sample_id for ref in StreamingRefChannel(self.path).poll()], ["s0"]
         )
 
+    def test_batch_fsync_failure_preserves_all_complete_visible_lines(self):
+        channel = StreamingRefChannel(self.path)
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.os.fsync",
+                side_effect=OSError("injected fsync failure"),
+            ),
+            self.assertRaisesRegex(OSError, "injected fsync failure"),
+        ):
+            channel.publish_batch([_ref("s0"), _ref("s1")])
+
+        self.assertEqual(channel.published, 2)
+        self.assertEqual(
+            [ref.sample_id for ref in StreamingRefChannel(self.path).poll()],
+            ["s0", "s1"],
+        )
+
+    def test_batch_partial_write_failure_tracks_complete_prefix(self):
+        channel = StreamingRefChannel(self.path)
+        real_write = os.write
+        write_calls = 0
+
+        def write_one_record_then_fail(fd, payload):
+            nonlocal write_calls
+            write_calls += 1
+            if write_calls == 1:
+                first_record_end = payload.index(b"\n") + 1
+                return real_write(fd, payload[:first_record_end])
+            raise OSError("injected batch write failure")
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.os.write",
+                side_effect=write_one_record_then_fail,
+            ),
+            self.assertRaisesRegex(OSError, "injected batch write failure"),
+        ):
+            channel.publish_batch([_ref("s0"), _ref("s1")])
+
+        self.assertEqual(channel.published, 1)
+        self.assertEqual(
+            [ref.sample_id for ref in StreamingRefChannel(self.path).poll()], ["s0"]
+        )
+
     def test_partial_write_failure_leaves_current_ref_unpublished(self):
         channel = StreamingRefChannel(self.path)
         transaction = channel.begin_publish([_ref("s0"), _ref("s1")])

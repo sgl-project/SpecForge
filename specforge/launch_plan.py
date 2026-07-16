@@ -273,7 +273,17 @@ def _disaggregated_env(
             {
                 "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
                 "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
-                "DISAGG_INBOX_DIR": str(consumer_state_dir / "inboxes"),
+                # SQLite/WAL stays on rank 0's local filesystem.  Inboxes are
+                # ordinary append-only channels and must remain visible to
+                # ranks on every trainer node.
+                "DISAGG_INBOX_DIR": str(
+                    (
+                        control_dir
+                        if cfg.deployment.trainer.nnodes > 1
+                        else consumer_state_dir
+                    )
+                    / "inboxes"
+                ),
             }
         )
     else:
@@ -413,7 +423,13 @@ def _managed_local_services(
                 "--context-length",
                 str(capture_context_length),
                 "--mem-fraction-static",
-                str(server.mem_fraction_static),
+                str(
+                    server.mem_fraction_static
+                    if server.mem_fraction_static is not None
+                    else cfg.model.sglang_mem_fraction_static
+                ),
+                "--ep-size",
+                str(cfg.model.sglang_ep_size),
                 "--chunked-prefill-size",
                 "-1",
                 "--disable-radix-cache",
@@ -555,7 +571,7 @@ def _validate_consumer_database(
         raise ValueError("online disaggregated consumer requires a metadata database")
     state_owner = int(base_env["RANK"]) == 0 if distributed else node_rank in (None, 0)
     if cfg.training.resume_from:
-        if not os.path.exists(database):
+        if state_owner and not os.path.exists(database):
             raise ValueError(
                 "consumer resume requires the retained metadata database: "
                 f"{database}"
@@ -780,30 +796,67 @@ def build_launch_plan(
     return LaunchPlan("supervisor", "both", commands=(producer, consumer))
 
 
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (AttributeError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_process_group(process: subprocess.Popen, signum: int) -> bool:
+    try:
+        os.killpg(process.pid, signum)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
 def _terminate_processes(
-    processes: Sequence[subprocess.Popen], *, grace_s: float = 5.0
+    processes: Sequence[subprocess.Popen],
+    *,
+    grace_s: float = 5.0,
+    exited_group_leaders: Sequence[subprocess.Popen] = (),
 ) -> None:
+    """Terminate child sessions, including descendants of a dead group leader."""
+    tracked_groups: set[int] = set()
     for process in processes:
         if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except (AttributeError, ProcessLookupError):
+            if _signal_process_group(process, signal.SIGTERM):
+                tracked_groups.add(process.pid)
+            else:
                 process.terminate()
+    # A leader killed directly by the OOM killer can already have a terminal
+    # poll status while its children remain in the detached session. The PID is
+    # passed only from the poll that observed that failure, minimizing reuse risk.
+    for process in exited_group_leaders:
+        if _signal_process_group(process, signal.SIGTERM):
+            tracked_groups.add(process.pid)
     deadline = time.monotonic() + grace_s
-    while time.monotonic() < deadline and any(
-        process.poll() is None for process in processes
+    while time.monotonic() < deadline and (
+        any(process.poll() is None for process in processes)
+        or any(_process_group_exists(pgid) for pgid in tracked_groups)
     ):
         time.sleep(0.05)
+    killed_groups: set[int] = set()
     for process in processes:
         if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (AttributeError, ProcessLookupError):
+            if _signal_process_group(process, signal.SIGKILL):
+                killed_groups.add(process.pid)
+            else:
                 process.kill()
         try:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             pass
+    for pgid in tracked_groups - killed_groups:
+        if _process_group_exists(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (AttributeError, ProcessLookupError, PermissionError):
+                pass
 
 
 def _managed_preflight(plan: LaunchPlan) -> None:
@@ -936,7 +989,22 @@ def _stop_services(
     phases = sorted({service.phase for service, _ in started}, reverse=True)
     for phase in phases:
         processes = [process for service, process in started if service.phase == phase]
-        _terminate_processes(processes, grace_s=grace_s)
+        running = []
+        exited_group_leaders = []
+        for process in processes:
+            if process.poll() is None:
+                running.append(process)
+            else:
+                # Readiness can fail because the service leader already died
+                # while its capture/Mooncake descendants remain in the detached
+                # session. Preserve that just-observed PID as a group-cleanup
+                # target instead of silently skipping the entire process tree.
+                exited_group_leaders.append(process)
+        _terminate_processes(
+            running,
+            grace_s=grace_s,
+            exited_group_leaders=exited_group_leaders,
+        )
 
 
 def _normalized_status(status: int, *, unexpected_clean: bool = False) -> int:
@@ -973,6 +1041,12 @@ def run_commands(
     readiness_waiter = readiness_waiter or _wait_for_service
 
     def forward_signal(signum, _frame):
+        # The first signal starts orderly process-group teardown. Ignore later
+        # INT/TERM/HUP deliveries until the finally block restores the caller's
+        # handlers; otherwise a second Ctrl-C can interrupt cleanup and orphan
+        # detached capture-server grandchildren.
+        for installed in previous_handlers:
+            signal.signal(installed, signal.SIG_IGN)
         raise _ForwardedSignal(signum)
 
     try:
@@ -1016,6 +1090,7 @@ def run_commands(
                     _terminate_processes(
                         [processes[item] for item in remaining],
                         grace_s=plan.shutdown_grace_s,
+                        exited_group_leaders=(processes[index],),
                     )
                     remaining.clear()
                     break
@@ -1028,6 +1103,7 @@ def run_commands(
                     _terminate_processes(
                         [processes[item] for item in remaining],
                         grace_s=plan.shutdown_grace_s,
+                        exited_group_leaders=(process,),
                     )
                     remaining.clear()
                     break

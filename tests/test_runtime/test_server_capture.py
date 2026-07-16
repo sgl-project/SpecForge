@@ -95,7 +95,7 @@ class _StubCaptureServer:
         self.backend = backend
         self.hidden = hidden
         self.aux_width = aux_width
-        self.aux_layer_ids = list(aux_layer_ids)
+        self.aux_layer_ids = None if aux_layer_ids is None else list(aux_layer_ids)
         self.error_sample_ids = set(error_sample_ids)
         self.expected: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -365,6 +365,24 @@ class TestServerCaptureAdapter(unittest.TestCase):
                         capture=_eagle3_contract(),
                     )
 
+    def test_required_loss_mask_never_defaults_to_all_ones(self):
+        task = PromptTask(
+            task_id="t0",
+            run_id="run0",
+            source_id="unit",
+            payload={"input_ids": [1, 2, 3]},
+            max_length=3,
+        )
+        backend, server, _, adapter = _mk()
+
+        with self.assertRaisesRegex(
+            ValueError, "required capture payload 'loss_mask' is missing"
+        ):
+            adapter.produce_refs([task], capture=_eagle3_contract())
+
+        self.assertFalse(server.expected)
+        self.assertFalse(backend._d)
+
     def test_eagle3_refs_and_zero_copy_roundtrip(self):
         backend, server, store, adapter = _mk()
         tasks = [_task(0, 6), _task(1, 9)]
@@ -473,6 +491,18 @@ class TestServerCaptureAdapter(unittest.TestCase):
         # the mismatched sample's server-written keys were freed via abort
         self.assertFalse(any(backend._d), f"leaked keys: {list(backend._d)}")
 
+    def test_missing_aux_layer_ids_fails_loud_and_frees_keys(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend, aux_layer_ids=None)
+        _, _, _, adapter = _mk(server=server, backend=backend)
+
+        (result,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+
+        self.assertIsInstance(result, ServerCaptureFailure)
+        self.assertFalse(result.retryable)
+        self.assertIn("capture omitted aux-layer ids", result.reason)
+        self.assertFalse(any(backend._d), f"leaked keys: {list(backend._d)}")
+
     def test_per_task_server_error_becomes_failure_marker(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend, error_sample_ids={"run0:t0"})
@@ -517,19 +547,123 @@ class TestServerCaptureAdapter(unittest.TestCase):
         with self.assertRaises(KeyError):
             store.get(ref)
 
-    def test_retry_bumps_generation(self):
+    def test_retry_reuses_generation_after_a_lost_response(self):
         backend, server, store, adapter = _mk()
-        task = PromptTask(
+        initial = PromptTask(
             task_id="t0",
             run_id="run0",
             source_id="unit",
-            payload={"input_ids": [1, 2, 3]},
+            payload={"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1]},
             max_length=3,
-            attempt=2,
         )
-        (ref,) = adapter.produce_refs([task], capture=_eagle3_contract())
-        self.assertEqual(ref.metadata["generation"], 3)
-        self.assertTrue(any("/g3/" in k for k in backend._d))
+        original_post = adapter.post_fn
+        requests = []
+
+        def lose_first_response(url, json_body, timeout):
+            requests.append(json_body["spec_capture"][0])
+            response = original_post(url, json_body, timeout)
+            if len(requests) == 1:
+                raise ConnectionError("response lost after server write")
+            return response
+
+        adapter.post_fn = lose_first_response
+        with self.assertRaisesRegex(ConnectionError, "response lost"):
+            adapter.produce_refs([initial], capture=_eagle3_contract())
+        self.assertTrue(backend._d)
+        self.assertTrue(all("/g1/" in key for key in backend._d))
+
+        retry = PromptTask(
+            task_id=initial.task_id,
+            run_id=initial.run_id,
+            source_id=initial.source_id,
+            payload=initial.payload,
+            max_length=initial.max_length,
+            attempt=1,
+        )
+        (ref,) = adapter.produce_refs([retry], capture=_eagle3_contract())
+
+        self.assertEqual(1, ref.metadata["generation"])
+        self.assertEqual([False, True], [request["replace"] for request in requests])
+        self.assertEqual(0, store.discard_external_attempts())
+        self.assertTrue(all("/g1/" in key for key in backend._d))
+        self.assertFalse(any("/g2/" in key for key in backend._d))
+
+    def test_terminal_lost_response_is_reclaimed_without_a_ref(self):
+        backend, server, store, adapter = _mk()
+
+        def lose_response(url, json_body, timeout):
+            server(url, json_body, timeout)
+            raise ConnectionError("response lost after server write")
+
+        adapter.post_fn = lose_response
+        with self.assertRaisesRegex(ConnectionError, "response lost"):
+            adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+
+        self.assertTrue(backend._d)
+        self.assertEqual(1, store.health()["provisional_external"])
+        self.assertEqual(
+            1,
+            store.discard_external_attempts(reason="terminal-producer-cleanup"),
+        )
+        self.assertFalse(backend._d)
+        self.assertEqual(0, store.health()["provisional_external"])
+
+    def test_later_invalid_row_does_not_strand_an_adopted_prefix(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def corrupt_second_identity(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            rows[1]["meta_info"]["spec_capture"]["store_id"] = "wrong-store"
+            return rows
+
+        _, _, store, adapter = _mk(
+            server=corrupt_second_identity,
+            backend=backend,
+        )
+        with self.assertRaisesRegex(RuntimeError, "wrong object identity"):
+            adapter.produce_refs(
+                [_task(0, 4), _task(1, 4)],
+                capture=_eagle3_contract(),
+            )
+
+        self.assertEqual(0, store.health()["resident_samples"])
+        self.assertEqual(2, store.health()["provisional_external"])
+        self.assertEqual(2, store.discard_external_attempts())
+        self.assertFalse(backend._d)
+
+    def test_failed_provisional_cleanup_remains_retryable(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        key = "run0/run0:t0/g1/input_ids"
+        backend._d[key] = b"captured"
+        store.track_external_attempt(
+            "run0:t0",
+            generation=1,
+            feature_names=["input_ids"],
+        )
+
+        original_remove = backend.remove
+        original_exists = backend.is_exist
+        backend.remove = lambda _key: -1
+
+        def unavailable(_key):
+            raise RuntimeError("metadata unavailable")
+
+        backend.is_exist = unavailable
+        with self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
+            store.discard_external_attempts()
+
+        health = store.health()
+        self.assertEqual(1, health["resident_samples"])
+        self.assertEqual(1, health["provisional_external"])
+        self.assertEqual(1, health["release_pending"])
+
+        backend.remove = original_remove
+        backend.is_exist = original_exists
+        store.drain_pending_removals(retry_interval_s=0)
+        self.assertFalse(backend._d)
+        self.assertEqual(0, store.health()["provisional_external"])
 
     def test_verify_specs_matches_tensor_verification_semantics(self):
         contract = _eagle3_contract()

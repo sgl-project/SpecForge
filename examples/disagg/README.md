@@ -147,11 +147,12 @@ processes. That test harness is not the production service supervisor.
 Online configs use Mooncake. Offline configs may use either a typed
 `shared_dir` store or Mooncake. `deployment.disaggregated.control_dir` is the
 one attempt root from which the launcher derives the reference channel or
-manifest and lifecycle markers. An online deployment may place the consumer's
-SQLite/WAL and rank inboxes in a node-local
-`deployment.disaggregated.consumer_state_dir`; this is currently restricted to
-one trainer node. Always choose fresh control and consumer-state directories
-for a new attempt. An offline Mooncake producer must also set a positive
+manifest and lifecycle markers. An online deployment places the consumer's
+rank-0 SQLite/WAL in the node-local
+`deployment.disaggregated.consumer_state_dir`. Multi-node trainers require this
+field and keep their rank inboxes under the shared `control_dir`. Always choose
+fresh control and consumer-state directories for a new attempt. An offline
+Mooncake producer must also set a positive
 `deployment.disaggregated.producer_segment_size`; online roles and the offline
 consumer use zero because they do not own feature allocations.
 

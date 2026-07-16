@@ -76,6 +76,15 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_finite_online_run_can_derive_its_schedule_from_the_producer(self):
+        payload = _online_payload("domino")
+        payload["training"].pop("max_steps")
+
+        config = Config.model_validate(payload)
+
+        self.assertIsNone(config.training.max_steps)
+        self.assertIsNone(config.training.total_steps)
+
     def test_removed_vlm_pixel_knobs_are_rejected(self):
         for field in ("min_pixels", "max_pixels"):
             payload = copy.deepcopy(MINIMAL)

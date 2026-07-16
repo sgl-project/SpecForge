@@ -54,7 +54,6 @@ a tombstone-then-free protocol — a follow-up tied to the shared metadata index
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 import uuid
@@ -228,6 +227,11 @@ class MooncakeFeatureStore(FeatureStore):
         # (consumer) so each side can free the sample it owns/consumed without the
         # ref in hand at release() time.
         self._sample_names: Dict[str, List[str]] = {}
+        # Server capture registers deterministic keys before issuing HTTP. If
+        # the response is lost, no SampleRef exists to adopt/abort them. Keep a
+        # shared (multi-adapter) provisional index so terminal producer cleanup
+        # can reclaim those hard-pinned objects; a successful adopt clears it.
+        self._external_provisional: Dict[Tuple[str, int], List[str]] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
         # Samples whose remote remove() failed. gc() performs bounded
         # steady-state retries; lifecycle drain either removes them or raises.
@@ -252,53 +256,8 @@ class MooncakeFeatureStore(FeatureStore):
         # keys are gone -> get() raises (B5), no payload-carried gen needed.
         return f"{self.store_id}/{sample_id}/g{gen}/{name}"
 
-    # PROFILE_STORE=N -> every N get ops print one [store rK] line with
-    # get/exists/remove latency, get bandwidth, and release-pending depth.
-    _prof_store = int(os.environ.get("PROFILE_STORE", "0"))
-
-    def _sp(self) -> dict:
-        s = getattr(self, "_sp_state", None)
-        if s is None:
-            s = {
-                "get_n": 0,
-                "get_s": 0.0,
-                "get_b": 0,
-                "ex_n": 0,
-                "ex_s": 0.0,
-                "put_n": 0,
-                "put_s": 0.0,
-                "put_b": 0,
-                "rm_ok": 0,
-                "rm_fail": 0,
-                "gc_s": 0.0,
-            }
-            self._sp_state = s
-        return s
-
-    def _sp_print(self) -> None:
-        s = self._sp()
-        rank = os.environ.get("RANK", "?")
-        get_gbps = s["get_b"] / s["get_s"] / 1e9 if s["get_s"] else 0.0
-        put_gbps = s["put_b"] / s["put_s"] / 1e9 if s["put_s"] else 0.0
-        print(
-            f"[store r{rank}] gets={s['get_n']} get_ms={1000*s['get_s']/max(1,s['get_n']):.1f} "
-            f"get_GBps={get_gbps:.2f} exists_ms={1000*s['ex_s']/max(1,s['ex_n']):.2f} "
-            f"puts={s['put_n']} put_GBps={put_gbps:.2f} "
-            f"rm_ok={s['rm_ok']} rm_fail={s['rm_fail']} "
-            f"pend={len(self._release_pending)} gc_ms={1000*s['gc_s']:.0f}",
-            flush=True,
-        )
-        self._sp_state = None
-
     # -- store wrappers (status-code aware) --------------------------------
     def _store_exists(self, key: str) -> bool:
-        if self._prof_store:
-            s = self._sp()
-            _t = time.monotonic()
-            rc = int(self._store.is_exist(key)) == 1
-            s["ex_s"] += time.monotonic() - _t
-            s["ex_n"] += 1
-            return rc
         return int(self._store.is_exist(key)) == 1
 
     def _store_put_tensor(self, key: str, t: torch.Tensor) -> None:
@@ -312,7 +271,6 @@ class MooncakeFeatureStore(FeatureStore):
         registration.
         """
         nb = _nbytes(t)
-        _t0 = time.monotonic() if self._prof_store else 0.0
         try:
             self._store.register_buffer(t.data_ptr(), nb)
         except Exception:  # pragma: no cover - some builds auto-register
@@ -324,11 +282,6 @@ class MooncakeFeatureStore(FeatureStore):
                 self._store.unregister_buffer(t.data_ptr())
             except Exception:  # pragma: no cover
                 pass
-        if self._prof_store:
-            s = self._sp()
-            s["put_s"] += time.monotonic() - _t0
-            s["put_n"] += 1
-            s["put_b"] += nb
         if rc is not None and int(rc) < 0:
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
 
@@ -338,21 +291,6 @@ class MooncakeFeatureStore(FeatureStore):
         The receive buffer is registered with the transfer engine for the get_into
         (required by the raw-buffer path), then unregistered.
         """
-        if self._prof_store:
-            s = self._sp()
-            _t = time.monotonic()
-            try:
-                self._store_get_tensor_inner(key, out)
-            finally:
-                s["get_s"] += time.monotonic() - _t
-                s["get_n"] += 1
-                s["get_b"] += _nbytes(out)
-                if s["get_n"] >= self._prof_store:
-                    self._sp_print()
-            return
-        self._store_get_tensor_inner(key, out)
-
-    def _store_get_tensor_inner(self, key: str, out: torch.Tensor) -> None:
         nb = _nbytes(out)
         try:
             self._store.register_buffer(out.data_ptr(), nb)
@@ -381,13 +319,8 @@ class MooncakeFeatureStore(FeatureStore):
         try:
             rc = self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
-            if self._prof_store:
-                self._sp()["rm_fail"] += 1
             return False
-        ok = rc is None or int(rc) == 0
-        if self._prof_store:
-            self._sp()["rm_ok" if ok else "rm_fail"] += 1
-        return ok
+        return rc is None or int(rc) == 0
 
     # -- write -------------------------------------------------------------
     def put(
@@ -478,7 +411,8 @@ class MooncakeFeatureStore(FeatureStore):
                 f"cannot adopt {sample_ref.sample_id}: ref carries no generation"
             )
         with self._lock:
-            self._generation[sample_ref.sample_id] = int(gen)
+            gen = int(gen)
+            self._generation[sample_ref.sample_id] = gen
             self._sample_names[sample_ref.sample_id] = list(
                 sample_ref.feature_keys.keys()
             )
@@ -486,6 +420,80 @@ class MooncakeFeatureStore(FeatureStore):
                 sample_ref.estimated_bytes or 0
             )
             self._put_time[sample_ref.sample_id] = self._clock()
+            self._external_provisional.pop((sample_ref.sample_id, gen), None)
+
+    def track_external_attempt(
+        self,
+        sample_id: str,
+        *,
+        generation: int,
+        feature_names: List[str],
+    ) -> None:
+        """Track server-owned keys before an HTTP response makes a ref adoptable."""
+        names = list(dict.fromkeys(str(name) for name in feature_names))
+        if not names:
+            raise ValueError("external capture attempt must name at least one feature")
+        with self._lock:
+            self._external_provisional[(str(sample_id), int(generation))] = names
+
+    def discard_external_attempts(
+        self, *, reason: str = "unadopted-external-capture"
+    ) -> int:
+        """Abort server writes that never produced an adoptable response.
+
+        The index belongs to the shared store rather than an adapter, so a retry
+        that succeeds through another capture server clears the provisional
+        entry in :meth:`adopt` and cannot be deleted by the failed adapter's
+        shutdown path. Physical-remove failures remain visible to
+        :meth:`drain_pending_removals`.
+        """
+        with self._lock:
+            attempts = list(self._external_provisional.items())
+
+        errors: Dict[str, str] = {}
+        discarded = 0
+        for (sample_id, generation), names in attempts:
+            with self._lock:
+                attempt_key = (sample_id, generation)
+                # A response can be adopted after the snapshot but before this
+                # attempt is visited. adopt() removes the provisional entry
+                # under the same lock, so never delete that now-live sample.
+                if attempt_key not in self._external_provisional:
+                    continue
+                current = self._generation.get(sample_id)
+                if current is not None:
+                    if current != generation:
+                        errors[sample_id] = (
+                            f"cannot discard provisional sample {sample_id!r} "
+                            f"generation {generation}: adopted generation is {current}"
+                        )
+                        continue
+                else:
+                    self._generation[sample_id] = generation
+                    self._sample_names[sample_id] = names
+                    self._sample_bytes[sample_id] = 0
+                    self._put_time[sample_id] = self._clock()
+                try:
+                    # RLock keeps adopt() from racing between the ownership
+                    # check above and this removal attempt. abort() reacquires
+                    # the same lock and either frees the keys or records them
+                    # in _release_pending for lifecycle drain.
+                    self.abort(sample_id, reason=reason)
+                except BaseException as exc:
+                    # Preserve both explicit provisional ownership and a
+                    # retryable removal entry.  Terminal drain can now reclaim
+                    # the keys even when a Mooncake metadata probe itself
+                    # failed, rather than losing every remaining snapshot item.
+                    self._release_pending.setdefault(sample_id, 0)
+                    errors[sample_id] = f"{type(exc).__name__}: {exc}"
+                    continue
+                self._external_provisional.pop(attempt_key, None)
+                discarded += 1
+        if errors:
+            raise RuntimeError(
+                "could not discard all provisional external captures: " f"{errors}"
+            )
+        return discarded
 
     # -- read --------------------------------------------------------------
     def get(
@@ -582,11 +590,14 @@ class MooncakeFeatureStore(FeatureStore):
 
     def _free_bookkeeping_locked(self, sample_id: str) -> int:
         """Drop in-process tracking for a sample. Returns bytes accounted freed."""
+        generation = self._generation.get(sample_id)
         nbytes = self._sample_bytes.pop(sample_id, 0)
         self._generation.pop(sample_id, None)
         self._put_time.pop(sample_id, None)
         self._sample_names.pop(sample_id, None)
         self._release_pending.pop(sample_id, None)
+        if generation is not None:
+            self._external_provisional.pop((sample_id, generation), None)
         return nbytes
 
     def _still_leased_locked(self, sample_id: str, generation: Optional[int]) -> bool:
@@ -707,7 +718,6 @@ class MooncakeFeatureStore(FeatureStore):
         )
 
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
-        _t0 = time.monotonic() if self._prof_store else 0.0
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:
@@ -742,8 +752,6 @@ class MooncakeFeatureStore(FeatureStore):
                     self._release_pending[sid] = attempts
             self._stats["force_freed"] += freed
             self._stats["force_freed_bytes"] += freed_bytes
-        if self._prof_store:
-            self._sp()["gc_s"] += time.monotonic() - _t0
         return {
             "force_freed": freed,
             "force_freed_bytes": freed_bytes,
@@ -761,6 +769,7 @@ class MooncakeFeatureStore(FeatureStore):
                 "store_id": self.store_id,
                 "backend": "mooncake",
                 "resident_samples": len(self._generation),
+                "provisional_external": len(self._external_provisional),
                 "active_leases": len(self._active_leases),
                 "resident_bytes": sum(self._sample_bytes.values()),
                 "max_resident_bytes": self.max_resident_bytes,

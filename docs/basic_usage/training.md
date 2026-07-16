@@ -16,6 +16,40 @@ temporary move-only Python import paths were removed rather than deprecated.
 Downstream launchers should migrate to a typed run config and `specforge train`;
 there is no compatibility dispatch to the previous trainers.
 
+### Defaults when migrating removed trainers
+
+The typed schema defaults existed before the old trainers were removed, but
+they are not identical to defaults embedded in every deleted script. If an old
+launch omitted these flags, write the legacy value explicitly in its new YAML
+when reproducing that run:
+
+| Removed CLI default | Typed run field and default | Legacy value to preserve |
+| --- | --- | --- |
+| DFlash/Domino `--num-epochs=6` | `training.num_epochs: 1` | `6` |
+| DFlash/Domino `--learning-rate=6e-4` | `training.learning_rate: 1e-4` | `6e-4` |
+| DFlash/Domino `--warmup-ratio=0.04` | `training.warmup_ratio: 0.015` | `0.04` |
+| DFlash/Domino `--max-grad-norm=1.0` | `training.max_grad_norm: 0.5` | `1.0` |
+| DFlash/Domino `--max-length=3072` | `data.max_length: 2048` | `3072` |
+| DFlash/Domino `--chat-template=qwen` | `data.chat_template: llama3` | `qwen` |
+| DFlash/Domino `--save-interval=1000` | `training.save_interval: 0` | `1000` |
+| DFlash/Domino `--dist-timeout=30` | `training.dist_timeout: 10` | `30` |
+| EAGLE3 `--kl-decay=3.0` | `training.kl_decay: 1.0` | `3.0` |
+
+The old DFlash/Domino `--eval-interval=1000` did not identify an evaluation
+source by itself. In the unified runtime, evaluation is deliberately off by
+default and must be paired with `data.eval_hidden_states_path`.
+
+Two numerical lifecycle details are also deliberate. All unified FSDP methods
+keep buffers in float32; the removed EAGLE3 and DFlash scripts used bfloat16
+buffers, while the removed Domino script already used float32. Consequently,
+bit-for-bit comparisons to old EAGLE3/DFlash baselines must account for that
+dtype change. Also, `global_step`, LR/loss horizons, logging, saving, and Domino
+lambda decay are all expressed in completed optimizer updates. Fixed datasets
+are validated before backend/optimizer assembly to contain complete accumulation windows;
+finite online plans train only complete global optimizer quanta. The old
+scripts mixed micro-batch counters with a ceil-derived optimizer horizon, so
+accumulation greater than one did not have the same boundary semantics.
+
 ## Launch a run
 
 Use the command directly for every checked-in topology:
@@ -68,7 +102,7 @@ model:
   torch_dtype: bfloat16
 
 data:
-  train_data_path: dataset/sharegpt_train.jsonl
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
   max_length: 4096
   chat_template: qwen
   cache_dir: ./cache
@@ -217,8 +251,9 @@ assembly. In particular:
   schema;
 - DSpark requires disaggregated server capture;
 - offline feature training supports EAGLE3, DFlash, and Domino;
-- every online run is disaggregated, uses `model.target_backend=sglang`, and sets
-  either `training.total_steps` or `training.max_steps`;
+- every online run is disaggregated and uses `model.target_backend=sglang`;
+  finite runs may omit both step fields so the producer can publish the exact
+  optimizer horizon derived from the prepared prompt plan;
 - EAGLE3 local offline runs derive and cache a deterministic vocabulary mapping
   from the feature corpus when `model.vocab_mapping_path` is empty. EAGLE3
   disaggregated runs require an explicit shared mapping so producer and
@@ -226,10 +261,11 @@ assembly. In particular:
 
 There is no fallback to a removed training script.
 
-Step limits are global optimizer updates. `training.max_steps` is a stop cap
-and becomes the optimizer/loss schedule horizon when `training.total_steps` is
-omitted. `training.total_steps` can describe a longer schedule, but does not by
-itself stop an online stream.
+Step limits are global optimizer updates. `training.max_steps` is a stop cap and,
+when set without `training.total_steps`, the fallback optimizer/loss schedule
+horizon. `training.total_steps` can describe a longer schedule, but does not by
+itself stop an online stream. When a finite online run omits both, the producer
+publishes the exact schedule horizon and the consumer trains to EOF.
 
 ## Parallel topologies
 

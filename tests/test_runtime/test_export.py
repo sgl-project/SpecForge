@@ -6,7 +6,8 @@ to_hf output must reload through AutoDraftModel.from_pretrained with
 bit-identical draft weights; to_sglang output must carry exactly the serving
 key set (no trainer prefixes, no embeddings, t2d/d2t present).
 
-GPU-only. Run on the H200 box via rcli.
+The legacy checkpoint compatibility checks run on CPU. The end-to-end exporter
+round trips require GPU and can be run on the H200 box via rcli.
 """
 
 import os
@@ -16,6 +17,64 @@ import unittest
 import torch
 
 CUDA = torch.cuda.is_available()
+
+
+class TestLegacyVocabMappingCompatibility(unittest.TestCase):
+    def setUp(self):
+        from tests.test_runtime import _fixtures as fx
+
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+
+        self.tempdir = tempfile.TemporaryDirectory(prefix="legacy_export_")
+        self.addCleanup(self.tempdir.cleanup)
+        self.cfg_path = fx.write_draft_config(
+            os.path.join(self.tempdir.name, "draft.json")
+        )
+        self.vocab_path = fx.write_vocab_mapping(
+            os.path.join(self.tempdir.name, "mapping.pt")
+        )
+        config = AutoDraftModelConfig.from_file(self.cfg_path)
+        model = AutoDraftModel.from_config(config, torch_dtype=torch.bfloat16)
+        self.legacy_state = {
+            key: value
+            for key, value in model.state_dict().items()
+            if "embed" not in key.lower() and key not in {"t2d", "d2t"}
+        }
+
+    def test_mapping_restores_legacy_checkpoint_buffers(self):
+        from specforge.export.checkpoint_io import materialize_draft
+
+        model = materialize_draft(
+            {"draft_state_dict": self.legacy_state},
+            self.cfg_path,
+            vocab_mapping_path=self.vocab_path,
+        )
+        expected = torch.load(self.vocab_path, map_location="cpu", weights_only=True)
+
+        self.assertTrue(torch.equal(model.t2d.cpu(), expected["t2d"]))
+        self.assertTrue(torch.equal(model.d2t.cpu(), expected["d2t"]))
+
+    def test_missing_mapping_buffers_remain_strict_without_mapping(self):
+        from specforge.export.checkpoint_io import materialize_draft
+
+        with self.assertRaisesRegex(ValueError, "d2t.*t2d"):
+            materialize_draft(
+                {"draft_state_dict": self.legacy_state},
+                self.cfg_path,
+            )
+
+    def test_mapping_does_not_tolerate_other_missing_weights(self):
+        from specforge.export.checkpoint_io import materialize_draft
+
+        incomplete = dict(self.legacy_state)
+        incomplete.pop("fc.weight")
+
+        with self.assertRaisesRegex(ValueError, r"fc\.weight"):
+            materialize_draft(
+                {"draft_state_dict": incomplete},
+                self.cfg_path,
+                vocab_mapping_path=self.vocab_path,
+            )
 
 
 @unittest.skipUnless(CUDA, "export round-trip requires CUDA")

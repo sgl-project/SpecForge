@@ -22,7 +22,7 @@ import abc
 import json
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from specforge.runtime.contracts import SampleRef
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
@@ -33,6 +33,16 @@ class MetadataStore(abc.ABC):
     @abc.abstractmethod
     def commit_sample(self, ref: SampleRef) -> bool:
         """Record a committed sample. Returns True if new, False if duplicate."""
+
+    def commit_samples(self, refs: Sequence[SampleRef]) -> List[bool]:
+        """Record a batch and return one freshness result per input ref.
+
+        The default preserves compatibility with stores that only implement the
+        original single-ref API. Durable stores should override this method so
+        the whole batch shares one transaction.
+        """
+
+        return [self.commit_sample(ref) for ref in refs]
 
     @abc.abstractmethod
     def is_committed(self, sample_id: str) -> bool: ...
@@ -74,11 +84,18 @@ class InMemoryMetadataStore(MetadataStore):
         self._optimizer_durable: bool = False
 
     def commit_sample(self, ref: SampleRef) -> bool:
+        return self.commit_samples([ref])[0]
+
+    def commit_samples(self, refs: Sequence[SampleRef]) -> List[bool]:
         with self._lock:
-            if ref.sample_id in self._committed:
-                return False
-            self._committed[ref.sample_id] = ref
-            return True
+            fresh = []
+            for ref in refs:
+                if ref.sample_id in self._committed:
+                    fresh.append(False)
+                    continue
+                self._committed[ref.sample_id] = ref
+                fresh.append(True)
+            return fresh
 
     def is_committed(self, sample_id: str) -> bool:
         with self._lock:
@@ -129,6 +146,9 @@ class NoOpMetadataStore(MetadataStore):
 
     def commit_sample(self, ref: SampleRef) -> bool:
         return True
+
+    def commit_samples(self, refs: Sequence[SampleRef]) -> List[bool]:
+        return [True] * len(refs)
 
     def is_committed(self, sample_id: str) -> bool:
         return False
@@ -181,13 +201,30 @@ class SQLiteMetadataStore(MetadataStore):
             self._conn.commit()
 
     def commit_sample(self, ref: SampleRef) -> bool:
+        return self.commit_samples([ref])[0]
+
+    def commit_samples(self, refs: Sequence[SampleRef]) -> List[bool]:
+        if not refs:
+            return []
+        serialized = [(ref.sample_id, json.dumps(ref_to_dict(ref))) for ref in refs]
         with self._lock:
-            cur = self._conn.execute(
-                "INSERT OR IGNORE INTO committed (sample_id, ref_json) VALUES (?, ?)",
-                (ref.sample_id, json.dumps(ref_to_dict(ref))),
-            )
-            self._conn.commit()
-            return cur.rowcount == 1  # 0 == duplicate (idempotent, at-least-once)
+            fresh = []
+            try:
+                # One FULL-synchronous transaction amortizes the durability
+                # barrier across every ref returned by a source-channel poll.
+                self._conn.execute("BEGIN IMMEDIATE")
+                for record in serialized:
+                    cur = self._conn.execute(
+                        "INSERT OR IGNORE INTO committed "
+                        "(sample_id, ref_json) VALUES (?, ?)",
+                        record,
+                    )
+                    fresh.append(cur.rowcount == 1)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            return fresh
 
     def is_committed(self, sample_id: str) -> bool:
         with self._lock:

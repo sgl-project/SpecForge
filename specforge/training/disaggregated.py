@@ -17,6 +17,7 @@ hyperparameters.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Callable, Optional, Sequence
@@ -25,6 +26,7 @@ from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
+_ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
 _ONLINE_CONTROL_SUFFIXES = (
     ".closed",
     ".consumed_count",
@@ -32,6 +34,7 @@ _ONLINE_CONTROL_SUFFIXES = (
     ".consumer_done",
     ".consumer_failed",
     ".consumer_quantum",
+    _ONLINE_SCHEDULE_SUFFIX,
 )
 _OFFLINE_CONTROL_SUFFIXES = (".done", ".consumed", ".failed", ".consumer_failed")
 
@@ -198,20 +201,109 @@ def _consumer_database_path(cfg: Config) -> Optional[str]:
     return os.path.join(state_dir, "consumer.sqlite")
 
 
+def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
+    """Describe the exact finite online schedule prepared by the producer."""
+    from specforge.training.schedule import resolve_online_total_steps
+
+    trainer = cfg.deployment.trainer
+    dp_size = trainer.nnodes * trainer.nproc_per_node
+    total_steps = resolve_online_total_steps(
+        num_prompts=num_prompts,
+        prompt_epochs=cfg.training.num_epochs,
+        dp_size=dp_size,
+        batch_size=cfg.training.batch_size,
+        accumulation_steps=cfg.training.accumulation_steps,
+    )
+    return {
+        "version": 1,
+        "total_steps": total_steps,
+        "num_prompts": num_prompts,
+        "prompt_epochs": cfg.training.num_epochs,
+        "prompt_seed": cfg.training.seed,
+        "dp_size": dp_size,
+        "batch_size": cfg.training.batch_size,
+        "accumulation_steps": cfg.training.accumulation_steps,
+    }
+
+
+def _read_online_total_steps(cfg: Config, channel_path: str) -> int:
+    """Read and validate the producer-owned online schedule contract."""
+    schedule_path = channel_path + _ONLINE_SCHEDULE_SUFFIX
+    _wait_for(
+        schedule_path,
+        timeout_s=_optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT"),
+        failure_path=channel_path + ".failed",
+    )
+    try:
+        with open(schedule_path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"invalid online schedule record {schedule_path}: {exc}"
+        ) from exc
+
+    trainer = cfg.deployment.trainer
+    expected = {
+        "version": 1,
+        "prompt_epochs": cfg.training.num_epochs,
+        "prompt_seed": cfg.training.seed,
+        "dp_size": trainer.nnodes * trainer.nproc_per_node,
+        "batch_size": cfg.training.batch_size,
+        "accumulation_steps": cfg.training.accumulation_steps,
+    }
+    mismatches = {
+        key: (payload.get(key), value)
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"online schedule record {schedule_path} does not match this "
+            f"consumer configuration: {mismatches}"
+        )
+    total_steps = payload.get("total_steps")
+    if not isinstance(total_steps, int) or total_steps < 1:
+        raise ValueError(
+            f"online schedule record {schedule_path} has invalid "
+            f"total_steps={total_steps!r}"
+        )
+    return total_steps
+
+
+def _optional_timeout_s(name: str) -> Optional[float]:
+    """Read an explicitly configured positive timeout.
+
+    Long-running producer/consumer coordination is unbounded by default.  A
+    deployment may opt into a terminal timeout through the corresponding
+    environment variable, but zero and negative values are almost certainly a
+    configuration mistake and match neither the schema nor useful semantics.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        timeout_s = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number, got {raw!r}") from exc
+    if timeout_s <= 0:
+        raise ValueError(f"{name} must be positive, got {raw!r}")
+    return timeout_s
+
+
 def _wait_for(
     path: str,
     *,
-    timeout_s: float = 1800.0,
+    timeout_s: Optional[float] = None,
     failure_path: Optional[str] = None,
 ) -> None:
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     while not os.path.exists(path):
         failure = _read_control(failure_path) if failure_path else None
         if failure is not None:
             raise RuntimeError(
                 f"remote role failed while waiting for {path}: {failure}"
             )
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for {path}")
         time.sleep(0.25)
 
@@ -222,7 +314,7 @@ def _hold_mooncake_producer(manifest: str) -> None:
     consumed = manifest + ".consumed"
     _wait_for(
         consumed,
-        timeout_s=float(os.environ.get("DISAGG_PRODUCER_HOLD_S", "3600")),
+        timeout_s=_optional_timeout_s("DISAGG_PRODUCER_HOLD_S"),
         failure_path=manifest + ".consumer_failed",
     )
 
@@ -463,6 +555,12 @@ def _build_online(
                 input_tools,
                 draft_config=draft_config,
             )
+        if cfg.training.total_steps is None and cfg.training.max_steps is None:
+            schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
+            _write_control(
+                channel_path + _ONLINE_SCHEDULE_SUFFIX,
+                json.dumps(schedule, sort_keys=True),
+            )
         layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
             cfg, algorithm
         )
@@ -486,7 +584,7 @@ def _build_online(
             for url in _server_urls(cfg)
         ]
         target_repr = streaming.target_representation
-        peer_wait_timeout_s = float(os.environ.get("DISAGG_PEER_WAIT_TIMEOUT", "1800"))
+        peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
         high_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
         in_flight_high_watermark = int(
             high_watermark_override or cfg.runtime.in_flight_high_watermark
@@ -518,6 +616,7 @@ def _build_online(
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
+            prompt_seed=cfg.training.seed,
             lease=cfg.runtime.producer_lease,
             in_flight_high_watermark=in_flight_high_watermark,
             in_flight_low_watermark=in_flight_low_watermark,
@@ -542,9 +641,13 @@ def _build_online(
             primary_exc = None
             try:
                 produced = drive(should_stop=channel.consumer_stopped)
-                deadline = time.monotonic() + peer_wait_timeout_s
+                deadline = (
+                    time.monotonic() + peer_wait_timeout_s
+                    if peer_wait_timeout_s is not None
+                    else None
+                )
                 while not channel.consumer_stopped():
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError(
                             "producer timed out waiting for the consumer result "
                             f"after {peer_wait_timeout_s:.0f}s"
@@ -581,6 +684,14 @@ def _build_online(
                     f"published-ref scan: {type(exc).__name__}: {exc}"
                 )
             try:
+                store.discard_external_attempts(
+                    reason="online-attempt-unadopted-capture"
+                )
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"unadopted-capture cleanup: {type(exc).__name__}: {exc}"
+                )
+            try:
                 drain_feature_store_removals(store)
             except Exception as exc:
                 cleanup_errors.append(
@@ -605,6 +716,9 @@ def _build_online(
 
     from specforge.launch import build_disagg_online_consumer
 
+    total_steps = cfg.training.total_steps
+    if total_steps is None and cfg.training.max_steps is None:
+        total_steps = _read_online_total_steps(cfg, channel_path)
     bundle = build_model_bundle(cfg)
     trainer = build_disagg_online_consumer(
         algorithm=algorithm,
@@ -619,7 +733,7 @@ def _build_online(
         batch_size=cfg.training.batch_size,
         accumulation_steps=cfg.training.accumulation_steps,
         max_steps=cfg.training.max_steps,
-        total_steps=cfg.training.total_steps,
+        total_steps=total_steps,
         save_interval=cfg.training.save_interval,
         idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0")) or None,
         metadata_db_path=_consumer_database_path(cfg),

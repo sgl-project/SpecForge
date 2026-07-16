@@ -259,6 +259,19 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek-V2-Lite's tokenizer renders plain-text role headers. They must not
+# reuse DeepSeek-V3's special-token headers or the assistant loss mask will be
+# anchored at text that never appears in the rendered conversation.
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v2",
+    template=ChatTemplate(
+        assistant_header="Assistant: ",
+        user_header="User: ",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="ling-flash-2.0",
     template=ChatTemplate(

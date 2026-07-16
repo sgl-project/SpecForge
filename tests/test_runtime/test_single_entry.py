@@ -2,6 +2,7 @@
 """CPU-only lifecycle gates for the single public SpecForge entry point."""
 
 import os
+import signal
 import sys
 import types
 import unittest
@@ -10,9 +11,11 @@ from unittest import mock
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.application import bind_run
 from specforge.cli import (
+    _WorkerTermination,
     _bootstrap_single_process_env,
     _train,
     _validate_world_size,
+    _worker_signal_unwind,
     main,
 )
 from specforge.config import Config
@@ -110,14 +113,22 @@ class TestTrainingRunLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "new attempt-specific path"):
             _claim_fresh_control_path(path, (".closed", ".failed"))
 
-    def test_online_fresh_attempt_rejects_stale_consumer_quantum(self):
+    def test_online_fresh_attempt_rejects_stale_control_records(self):
         import tempfile
 
-        path = os.path.join(tempfile.mkdtemp(prefix="attempt_quantum_"), "refs.jsonl")
-        with open(path + ".consumer_quantum", "w", encoding="utf-8") as stream:
-            stream.write("8")
-        with self.assertRaisesRegex(ValueError, "consumer_quantum"):
-            _claim_fresh_control_path(path, _ONLINE_CONTROL_SUFFIXES)
+        for suffix, value in (
+            (".consumer_quantum", "8"),
+            (".schedule.json", '{"total_steps": 8}'),
+        ):
+            with self.subTest(suffix=suffix):
+                path = os.path.join(
+                    tempfile.mkdtemp(prefix="attempt_control_"),
+                    "refs.jsonl",
+                )
+                with open(path + suffix, "w", encoding="utf-8") as stream:
+                    stream.write(value)
+                with self.assertRaisesRegex(ValueError, suffix.removeprefix(".")):
+                    _claim_fresh_control_path(path, _ONLINE_CONTROL_SUFFIXES)
 
     def test_disaggregated_assembly_failure_notifies_the_peer(self):
         import tempfile
@@ -211,6 +222,36 @@ class TestTrainingRunLifecycle(unittest.TestCase):
 
 
 class TestCliLifecycle(unittest.TestCase):
+    def test_worker_sigterm_unwinds_cleanup_before_restoring_handlers(self):
+        managed = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            managed.append(signal.SIGHUP)
+        originals = {signum: object() for signum in managed}
+        current = dict(originals)
+        cleanup_observations = []
+
+        def set_signal(signum, handler):
+            previous = current[signum]
+            current[signum] = handler
+            return previous
+
+        with (
+            mock.patch("specforge.cli.signal.signal", side_effect=set_signal),
+            self.assertRaises(_WorkerTermination) as raised,
+        ):
+            with _worker_signal_unwind():
+                try:
+                    current[signal.SIGTERM](signal.SIGTERM, None)
+                finally:
+                    cleanup_observations.append(dict(current))
+
+        self.assertEqual(signal.SIGTERM, raised.exception.signum)
+        self.assertEqual(
+            {signum: signal.SIG_IGN for signum in managed},
+            cleanup_observations[0],
+        )
+        self.assertEqual(originals, current)
+
     def test_capture_only_producer_does_not_import_distributed_cuda_runtime(self):
         cfg = Config.model_validate(
             {

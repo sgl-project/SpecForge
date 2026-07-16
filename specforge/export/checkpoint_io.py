@@ -81,7 +81,9 @@ def materialize_draft(
 
     Validates the state dict against the architecture: unexpected keys fail, and
     the only tolerated missing keys are the embeddings (excluded from draft
-    checkpoints by design — serving loads them from the target).
+    checkpoints by design — serving loads them from the target). Legacy
+    ``t2d``/``d2t`` buffers are tolerated only when ``vocab_mapping_path`` is
+    supplied to restore them.
     """
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
@@ -93,14 +95,18 @@ def materialize_draft(
             f"checkpoint carries weights the {type(model).__name__} architecture "
             f"does not have: {sorted(unexpected)}"
         )
-    non_embed_missing = [key for key in missing if "embed" not in key.lower()]
+    tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
+    non_embed_missing = [
+        key for key in missing if "embed" not in key.lower() and key not in tolerated
+    ]
     if non_embed_missing:
         raise ValueError(
             f"checkpoint is missing non-embedding draft weights: "
             f"{sorted(non_embed_missing)}"
         )
     if vocab_mapping_path:
-        # Explicitly refresh the serving vocabulary mapping when requested.
+        # Refresh current checkpoints and restore legacy checkpoints that predate
+        # the mapping buffers.
         model.load_vocab_mapping(vocab_mapping_path)
     return model
 

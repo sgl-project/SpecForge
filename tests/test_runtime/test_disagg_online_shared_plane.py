@@ -92,7 +92,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
             )
         store.close()
 
-    def _build(self, *, resume_from=None):
+    def _build(self, *, resume_from=None, idle_timeout_s=None):
         from specforge.launch import build_disagg_online_consumer
 
         captured = {}
@@ -123,8 +123,21 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 metadata_db_path=self.db,
                 inbox_dir=os.path.join(self.work, "inboxes"),
                 resume_from=resume_from,
+                idle_timeout_s=idle_timeout_s,
             )
         return trainer, captured, _FakeDistributor.latest
+
+    def test_idle_timeout_is_unbounded_unless_explicitly_configured(self):
+        _trainer, captured, distributor = self._build()
+
+        self.assertIsNone(distributor.kwargs["idle_timeout_s"])
+        self.assertIsNone(captured["ref_source"]["queue"].idle_timeout_s)
+
+    def test_explicit_idle_timeout_reaches_both_consumer_waits(self):
+        _trainer, captured, distributor = self._build(idle_timeout_s=12.5)
+
+        self.assertEqual(12.5, distributor.kwargs["idle_timeout_s"])
+        self.assertEqual(12.5, captured["ref_source"]["queue"].idle_timeout_s)
 
     def test_crash_before_ack_requeues_every_committed_ref(self):
         self._seed_ledger()

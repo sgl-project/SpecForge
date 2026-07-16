@@ -279,7 +279,9 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
     tp_size: int = Field(default=1, gt=0)
-    mem_fraction_static: float = Field(default=0.85, gt=0.0, le=1.0)
+    #: Optional server-specific override. When omitted, inherit the canonical
+    #: model.sglang_mem_fraction_static setting instead of silently shadowing it.
+    mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
 
@@ -719,11 +721,17 @@ class Config(StrictConfigModel):
                     "deployment.disaggregated.consumer_state_dir is valid only "
                     "for online disaggregated training"
                 )
-            if self.deployment.trainer.nnodes != 1:
-                raise ValueError(
-                    "node-local consumer_state_dir currently requires "
-                    "deployment.trainer.nnodes=1"
-                )
+        if (
+            mode == "online"
+            and deployment == "disaggregated"
+            and managed_local is None
+            and self.deployment.trainer.nnodes > 1
+            and consumer_state_dir is None
+        ):
+            raise ValueError(
+                "multi-node online consumers require an explicit node-local "
+                "deployment.disaggregated.consumer_state_dir for SQLite/WAL"
+            )
         if managed_local is not None:
             if mode != "online":
                 raise ValueError("managed_local supports online capture only")
@@ -784,16 +792,6 @@ class Config(StrictConfigModel):
                     "divide every managed capture-server tp_size; incompatible "
                     f"tp sizes: {incompatible_tp_sizes}"
                 )
-        if (
-            mode == "online"
-            and deployment == "disaggregated"
-            and self.training.total_steps is None
-            and self.training.max_steps is None
-        ):
-            raise ValueError(
-                "disaggregated streaming runs require training.total_steps or "
-                "training.max_steps"
-            )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
         if self.training.attention_backend == "usp":

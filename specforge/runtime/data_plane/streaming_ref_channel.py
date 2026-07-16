@@ -141,6 +141,49 @@ class StreamingRefChannel:
         finally:
             os.close(fd)
 
+    def publish_batch(self, refs: Sequence[SampleRef]) -> None:
+        """Append a ref batch with one open/write cycle and durability barrier.
+
+        Complete JSONL records count as published as soon as their bytes reach
+        the kernel, including when a later write or the final fsync fails. This
+        matches :meth:`publish` ownership semantics while allowing ephemeral DP
+        inboxes to amortize one fsync across an optimizer dispatch window.
+        """
+
+        refs = tuple(refs)
+        if not refs:
+            return
+        assert_no_tensors(refs)
+        records = [
+            (json.dumps(ref_to_dict(ref), separators=(",", ":")) + "\n").encode("utf-8")
+            for ref in refs
+        ]
+        payload = b"".join(records)
+        record_ends = []
+        end = 0
+        for record in records:
+            end += len(record)
+            record_ends.append(end)
+
+        fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            offset = 0
+            published_in_batch = 0
+            while offset < len(payload):
+                written = os.write(fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("reference channel batch append made no progress")
+                offset += written
+                while (
+                    published_in_batch < len(record_ends)
+                    and record_ends[published_in_batch] <= offset
+                ):
+                    self._published += 1
+                    published_in_batch += 1
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def begin_publish(self, refs: Sequence[SampleRef]) -> RefPublishTransaction:
         """Create an observable batch publication boundary without writing yet."""
 

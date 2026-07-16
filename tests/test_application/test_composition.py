@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -128,20 +129,28 @@ class ApplicationCompositionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "require model.vocab_mapping_path"):
             resolve_run(Config.model_validate(payload))
 
-    def test_local_model_identity_hashes_large_same_size_artifacts(self):
-        from specforge.training.assembly import _model_source_identity
+    def test_local_model_identity_tracks_large_same_size_artifact_changes(self):
+        from specforge.training.provenance import model_source_identity
 
         with TemporaryDirectory(prefix="model-identity-") as directory:
             shard = Path(directory) / "model-00001-of-00001.safetensors"
             with shard.open("wb") as stream:
                 stream.seek(64 * 1024 * 1024)
                 stream.write(b"a")
-            original = _model_source_identity(directory)
+            original = model_source_identity(directory)
 
+            original_stat = shard.stat()
             with shard.open("r+b") as stream:
                 stream.seek(-1, 2)
                 stream.write(b"b")
-            changed = _model_source_identity(directory)
+            os.utime(
+                shard,
+                ns=(
+                    original_stat.st_atime_ns,
+                    original_stat.st_mtime_ns + 1_000_000_000,
+                ),
+            )
+            changed = model_source_identity(directory)
 
         self.assertNotEqual(original, changed)
 

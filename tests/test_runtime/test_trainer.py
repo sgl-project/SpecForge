@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -143,6 +144,101 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(result.metrics["ce_loss"], 1.25)
         self.assertEqual(result.metrics["lambda_base"], 0.75)
         self.assertNotIn("non_scalar_debug", result.metrics)
+
+    @staticmethod
+    def _eagle_output(
+        *,
+        corrects=(1.0, 3.0),
+        acc_denoms=(2.0, 4.0),
+        losses=(2.0, 4.0),
+        loss_denoms=(2.0, 4.0),
+        acceptance_rates=(0.25, 0.75),
+    ):
+        tensor_list = lambda values: [  # noqa: E731
+            torch.tensor(value, dtype=torch.float32) for value in values
+        ]
+        return StepOutput(
+            loss=torch.tensor(99.0),
+            metrics={
+                "plosses": tensor_list(losses),
+                "acces": tensor_list(
+                    [
+                        correct / denominator
+                        for correct, denominator in zip(corrects, acc_denoms)
+                    ]
+                ),
+                "acceptance_rates": tensor_list(acceptance_rates),
+                "acc_corrects": tensor_list(corrects),
+                "acc_denoms": tensor_list(acc_denoms),
+                "metric_losses": tensor_list(losses),
+                "metric_loss_denoms": tensor_list(loss_denoms),
+            },
+        )
+
+    def test_eagle_metrics_preserve_ttt_positions_and_count_weighting(self):
+        strat = FakeStrategy()
+        strat.ploss_decay = 0.5
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+
+        result = core._result(self._eagle_output(), grad_norm=None, stepped=False)
+
+        self.assertAlmostEqual(result.metrics["acc_0"], 0.5)
+        self.assertAlmostEqual(result.metrics["acc_1"], 0.75)
+        self.assertAlmostEqual(result.metrics["acc"], 4 / 6)
+        self.assertAlmostEqual(result.metrics["ploss_0"], 2.0)
+        self.assertAlmostEqual(result.metrics["ploss_1"], 4.0)
+        self.assertAlmostEqual(result.metrics["loss"], 4.0)
+        self.assertAlmostEqual(result.metrics["acceptance_rate_0"], 0.25)
+        self.assertAlmostEqual(result.metrics["acceptance_rate_1"], 0.75)
+        self.assertAlmostEqual(result.metrics["acceptance_rate"], 0.5)
+        self.assertNotIn("acces", result.metrics)
+        self.assertNotIn("acceptance_rates", result.metrics)
+        self.assertNotIn("plosses", result.metrics)
+
+    def test_eagle_metrics_sum_counts_across_data_parallel_ranks(self):
+        strat = FakeStrategy()
+        strat.ploss_decay = 0.8
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        # Remote rank rows use the same packed layout as controller.py:
+        # correct, acc denom, loss numerator, loss denom, acceptance numerator,
+        # acceptance denom.
+        remote = torch.tensor(
+            [
+                [8.0, 1.0],
+                [10.0, 2.0],
+                [100.0, 16.0],
+                [10.0, 2.0],
+                [9.0, 1.0],
+                [10.0, 2.0],
+            ]
+        )
+
+        def all_reduce(value, *, op, group):
+            self.assertIs(op, torch.distributed.ReduceOp.SUM)
+            self.assertIsNone(group)
+            value.add_(remote)
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch(
+                "torch.distributed.all_reduce", side_effect=all_reduce
+            ) as reduce,
+        ):
+            result = core._result(self._eagle_output(), grad_norm=None, stepped=False)
+
+        reduce.assert_called_once()
+        self.assertAlmostEqual(result.metrics["acc_0"], 9 / 12, places=6)
+        self.assertAlmostEqual(result.metrics["acc_1"], 4 / 6, places=6)
+        self.assertAlmostEqual(result.metrics["acc"], 13 / 18, places=6)
+        self.assertAlmostEqual(result.metrics["ploss_0"], 104 / 12, places=6)
+        self.assertAlmostEqual(result.metrics["ploss_1"], 32 / 6, places=6)
+        self.assertAlmostEqual(
+            result.metrics["loss"], 104 / 12 + 0.8 * (32 / 6), places=5
+        )
+        self.assertAlmostEqual(result.metrics["acceptance_rate_0"], 9.5 / 12, places=6)
+        self.assertAlmostEqual(result.metrics["acceptance_rate_1"], 4 / 6, places=6)
 
     def test_validate_batch_missing_feature(self):
         strat = FakeStrategy()

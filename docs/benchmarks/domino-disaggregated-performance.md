@@ -111,7 +111,7 @@ at approximately 44% measured MFU.
 
 ## Why per-sample trainer demand is low
 
-The synchronized `PROFILE_STEPS` measurements at batch size two were:
+The benchmark's synchronized step measurements at batch size two were:
 
 | `num_anchors` | Forward | Backward | Optimizer | Data wait |
 | --- | --- | --- | --- | --- |
@@ -172,12 +172,8 @@ layers.
 
 ## Profiling controls
 
-The measured implementation retains these default-off environment controls:
-
-- `PROFILE_PRODUCER=N` for producer and HTTP timing;
-- `PROFILE_LOADER=N` for loader timing;
-- `PROFILE_STORE=N` for Mooncake store timing;
-- `PROFILE_DISTRIB=seconds` for distributor status;
-- `PROFILE_STEPS=N` for data-wait, forward, backward, and optimizer timing;
-- `PROFILE_TORCH=N` for the rank-0 Torch profiler;
-- `FSDP_SHARDING=NO_SHARD` for controlled comparison.
+Production runs expose the typed `profiling` configuration (`enabled`,
+`start_step`, `num_steps`, and `record_shapes`) for bounded PyTorch traces on
+trainer ranks. The component timers used to collect this benchmark were
+temporary measurement instrumentation and are not runtime environment APIs.
+`FSDP_SHARDING=NO_SHARD` remains available for controlled sharding comparisons.

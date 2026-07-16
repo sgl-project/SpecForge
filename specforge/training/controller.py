@@ -91,15 +91,139 @@ def _dp_mean(x: Any) -> Any:
     return x / world
 
 
-def _synchronize_device() -> None:
-    """Synchronize the active accelerator for opt-in timing diagnostics."""
-    from specforge.utils import get_device_type
+_EAGLE3_STRUCTURED_METRIC_KEYS = frozenset(
+    {
+        "acces",
+        "acceptance_rates",
+        "plosses",
+        "acc_corrects",
+        "acc_denoms",
+        "metric_losses",
+        "metric_loss_denoms",
+    }
+)
 
-    device_type = get_device_type()
-    if device_type == "cuda":
-        torch.cuda.synchronize()
-    elif device_type == "npu" and hasattr(torch, "npu"):
-        torch.npu.synchronize()
+
+def _metric_vector(values: Any, *, device: torch.device, name: str) -> torch.Tensor:
+    """Normalize one per-TTT metric sequence without losing its positions."""
+    if isinstance(values, torch.Tensor):
+        vector = values.detach().flatten()
+    elif isinstance(values, (list, tuple)):
+        vector = torch.stack(
+            [torch.as_tensor(value).detach().reshape(()) for value in values]
+        )
+    else:
+        raise TypeError(f"{name} must be a tensor or sequence, got {type(values)!r}")
+    if vector.numel() == 0:
+        raise ValueError(f"{name} must contain at least one TTT position")
+    return vector.to(device=device, dtype=torch.float32)
+
+
+def _reduce_eagle3_metrics(
+    raw: Dict[str, Any],
+    *,
+    device: torch.device,
+    process_group: Any,
+    ploss_decay: float,
+) -> Optional[Dict[str, float]]:
+    """Reduce EAGLE3's per-position training telemetry as numerators/counts.
+
+    Accuracy and p-loss are ratios, so averaging rank-local ratios biases the
+    result whenever ranks carry different token counts.  Pack every numerator
+    and denominator into one collective and form ratios only after the global
+    SUM.  Acceptance rate has no separate count in the model contract; weight
+    it by the corresponding p-loss token count, matching the evaluator's
+    batch-size-invariant convention.
+    """
+    required = {
+        "acc_corrects",
+        "acc_denoms",
+        "metric_losses",
+        "metric_loss_denoms",
+    }
+    if not required.issubset(raw):
+        return None
+
+    corrects = _metric_vector(raw["acc_corrects"], device=device, name="acc_corrects")
+    acc_denoms = _metric_vector(raw["acc_denoms"], device=device, name="acc_denoms")
+    losses = _metric_vector(raw["metric_losses"], device=device, name="metric_losses")
+    loss_denoms = _metric_vector(
+        raw["metric_loss_denoms"], device=device, name="metric_loss_denoms"
+    )
+    length = corrects.numel()
+    vectors = {
+        "acc_denoms": acc_denoms,
+        "metric_losses": losses,
+        "metric_loss_denoms": loss_denoms,
+    }
+    acceptance_rates = None
+    if "acceptance_rates" in raw:
+        acceptance_rates = _metric_vector(
+            raw["acceptance_rates"], device=device, name="acceptance_rates"
+        )
+        vectors["acceptance_rates"] = acceptance_rates
+    mismatched = {
+        name: value.numel()
+        for name, value in vectors.items()
+        if value.numel() != length
+    }
+    if mismatched:
+        raise ValueError(
+            "EAGLE3 structured metric lengths must match acc_corrects "
+            f"({length}); got {mismatched}"
+        )
+
+    # Rows: accuracy numerator/denominator, p-loss numerator/denominator,
+    # acceptance numerator/denominator.  The last two rows stay zero when the
+    # strategy does not expose acceptance telemetry.
+    packed = torch.stack(
+        (
+            corrects,
+            acc_denoms,
+            losses * loss_denoms,
+            loss_denoms,
+            (
+                acceptance_rates * loss_denoms
+                if acceptance_rates is not None
+                else torch.zeros_like(loss_denoms)
+            ),
+            (
+                loss_denoms
+                if acceptance_rates is not None
+                else torch.zeros_like(loss_denoms)
+            ),
+        )
+    )
+
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        world = dist.get_world_size(process_group)
+        if world > 1:
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=process_group)
+
+    reduced_acc = packed[0] / packed[1].clamp_min(1e-6)
+    reduced_ploss = packed[2] / packed[3].clamp_min(1e-6)
+    result: Dict[str, float] = {}
+    for index, value in enumerate(reduced_acc.tolist()):
+        result[f"acc_{index}"] = float(value)
+    for index, value in enumerate(reduced_ploss.tolist()):
+        result[f"ploss_{index}"] = float(value)
+
+    result["acc"] = float(packed[0].sum().div(packed[1].sum().clamp_min(1e-6)).item())
+    weights = torch.tensor(
+        [ploss_decay**index for index in range(length)],
+        dtype=reduced_ploss.dtype,
+        device=reduced_ploss.device,
+    )
+    result["loss"] = float((reduced_ploss * weights).sum().item())
+
+    if acceptance_rates is not None:
+        reduced_acceptance = packed[4] / packed[5].clamp_min(1e-6)
+        for index, value in enumerate(reduced_acceptance.tolist()):
+            result[f"acceptance_rate_{index}"] = float(value)
+        result["acceptance_rate"] = float(reduced_acceptance.mean().item())
+    return result
 
 
 class TrainerCore:
@@ -125,80 +249,36 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        import os as _os
-
-        _P = int(_os.environ.get("PROFILE_STEPS", "0"))
-        if _P:
-            import time as _t
-
-            _synchronize_device()
-            _a0 = _t.perf_counter()
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
         loss = out.loss / self.accumulation_steps
         self._micro += 1
         # The boundary is known before backward so the backend can defer the FSDP
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
-        if _P:
-            _synchronize_device()
-            _a1 = _t.perf_counter()
         self.backend.backward(loss, is_boundary=stepped)
-        if _P:
-            _synchronize_device()
-            _a2 = _t.perf_counter()
         grad_norm = self.backend.step() if stepped else None
-        if _P:
-            _synchronize_device()
-            _a3 = _t.perf_counter()
-            acc = getattr(self, "_prof2", None)
-            if acc is None:
-                acc = {
-                    "fwd": 0.0,
-                    "bwd": 0.0,
-                    "opt": 0.0,
-                    "n": 0,
-                    "B": 0,
-                    "padT": 0,
-                    "useful": 0.0,
-                }
-                self._prof2 = acc
-            acc["fwd"] += _a1 - _a0
-            acc["bwd"] += _a2 - _a1
-            acc["opt"] += _a3 - _a2
-            acc["n"] += 1
-            try:
-                _tt = batch.tensors
-                _lm = _tt.get("loss_mask")
-                _ref = _lm if _lm is not None else _tt.get("input_ids")
-                if _ref is not None and _ref.dim() >= 2:
-                    acc["B"] += int(_ref.shape[0])
-                    acc["padT"] += int(_ref.shape[-1])
-                if _lm is not None:
-                    acc["useful"] += float(_lm.sum().item())
-            except Exception:
-                pass
-            if acc["n"] >= _P:
-                _n = acc["n"]
-                print(
-                    f"[profile2] n={_n} fwd={acc['fwd']/_n*1000:.1f}ms "
-                    f"bwd={acc['bwd']/_n*1000:.1f}ms opt={acc['opt']/_n*1000:.1f}ms | "
-                    f"avgB={acc['B']/_n:.1f} avgPadT={acc['padT']/_n:.0f} "
-                    f"avgUsefulTok={acc['useful']/_n:.0f}",
-                    flush=True,
-                )
-                self._prof2 = None
         return self._result(out, grad_norm, stepped)
 
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
-        # DP-average loss AND accuracy across ranks before logging, matching stock
-        # DFlash reports a data-parallel mean for loss and accuracy.
-        metrics: Dict[str, Any] = {"loss": _scalar(_dp_mean(out.loss))}
-        structured_metric_keys = ("acces", "acceptance_rates", "plosses")
-        for key in structured_metric_keys:
-            if key in out.metrics:
-                metrics[key.rstrip("es") if key == "acces" else key] = _scalar(
-                    out.metrics[key]
-                )
+        # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
+        # positions and reduce counts before ratios; scalarizing its lists here
+        # would both collapse the TTT structure and log one rank's local data.
+        metric_device = (
+            out.loss.device
+            if isinstance(out.loss, torch.Tensor)
+            else torch.device("cpu")
+        )
+        parallel_config = getattr(self.backend, "parallel_config", None)
+        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        structured = _reduce_eagle3_metrics(
+            out.metrics,
+            device=metric_device,
+            process_group=process_group,
+            ploss_decay=float(getattr(self.strategy, "ploss_decay", 1.0)),
+        )
+        # Other strategies expose scalar loss/accuracy and retain the established
+        # data-parallel mean convention.
+        metrics: Dict[str, Any] = structured or {"loss": _scalar(_dp_mean(out.loss))}
         if "accuracy" in out.metrics:
             # DP-average the accuracy across ranks.
             # so the logged curve is smooth, not a single rank's noisy local batch.
@@ -207,7 +287,7 @@ class TrainerCore:
         # the generic trainer their algorithm-specific names. Move CPU schedule
         # scalars (for example Domino's lambda_base) onto the loss device before
         # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
-        reserved_metric_keys = set(structured_metric_keys) | {"accuracy", "loss"}
+        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {"accuracy", "loss"}
         for key, value in out.metrics.items():
             if key in reserved_metric_keys:
                 continue
@@ -316,20 +396,9 @@ class TrainerController:
         from specforge.training.profiling import ProfilingOptions, StepProfiler
 
         options = profiling_options or ProfilingOptions()
-        env_steps = int(os.environ.get("PROFILE_TORCH", "0"))
-        trace_path = None
-        if env_steps > 0 and not options.enabled:
-            options = ProfilingOptions(
-                enabled=True,
-                start_step=int(os.environ.get("PROFILE_TORCH_WARMUP", "40")),
-                num_steps=env_steps,
-                record_shapes=True,
-            )
-            trace_path = os.environ.get("PROFILE_TORCH_TRACE") or None
         self._step_profiler = StepProfiler(
             options,
             output_dir=output_dir,
-            trace_path=trace_path,
         )
 
     def fit(self, data: Iterable[TrainBatch]) -> int:
@@ -348,10 +417,6 @@ class TrainerController:
             self.eval_interval > 0 and self.eval_data_factory is not None
         )
         pending_ack: List[str] = []
-        import time as _time
-
-        _PROFILE = int(os.environ.get("PROFILE_STEPS", "0"))
-        _prof = {"data": 0.0, "step": 0.0, "n": 0}
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -375,16 +440,10 @@ class TrainerController:
                     stream = it
             _it = iter(stream)
             while True:
-                if _PROFILE:
-                    _synchronize_device()
-                    _pt0 = _time.perf_counter()
                 try:
                     batch = next(_it)
                 except StopIteration:
                     break
-                if _PROFILE:
-                    _synchronize_device()
-                    _pt1 = _time.perf_counter()
                 self._epoch_batch += 1
                 self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
@@ -398,26 +457,6 @@ class TrainerController:
                     ),
                 )
                 self.last_metrics = result.metrics
-                if _PROFILE:
-                    _synchronize_device()
-                    _pt2 = _time.perf_counter()
-                    _prof["data"] += _pt1 - _pt0
-                    _prof["step"] += _pt2 - _pt1
-                    _prof["n"] += 1
-                    if _prof["n"] >= _PROFILE:
-                        _d = _prof["data"] / _prof["n"] * 1000
-                        _s = _prof["step"] / _prof["n"] * 1000
-                        _tot = _prof["data"] + _prof["step"]
-                        print(
-                            f"[profile] microsteps={_prof['n']} "
-                            f"data_wait={_d:.1f}ms compute={_s:.1f}ms "
-                            f"data_frac={100 * _prof['data'] / _tot:.0f}% "
-                            f"step_total={_d + _s:.1f}ms",
-                            flush=True,
-                        )
-                        _prof["data"] = 0.0
-                        _prof["step"] = 0.0
-                        _prof["n"] = 0
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
                 if not result.optimizer_stepped:

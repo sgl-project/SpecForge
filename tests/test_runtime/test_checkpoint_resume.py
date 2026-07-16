@@ -170,6 +170,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         strategy_kwargs=None,
         spec_name="eagle3",
         max_grad_norm=1.0,
+        total_steps=100,
     ):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import DataFlowController
@@ -197,7 +198,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     lr=0.05,
                     max_grad_norm=max_grad_norm,
                     warmup_ratio=0.0,
-                    total_steps=100,
+                    total_steps=(total_steps if total_steps is not None else max_steps),
                 ),
                 run_id=run_id,
                 output_dir=out_dir,
@@ -205,6 +206,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 accumulation_steps=1,
                 num_epochs=1,
                 max_steps=max_steps,
+                total_steps=total_steps,
                 save_interval=0,
                 logger=None,
                 log_interval=50,
@@ -217,6 +219,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         return trainer, model, seen
 
     def test_resume_continues_where_the_run_stopped(self):
+        from specforge.training.checkpoint import CheckpointManager
+
         workdir = tempfile.mkdtemp(prefix="trainer_resume_cpu_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
 
@@ -237,6 +241,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         # when phase 2 completes, so retaining that mutable symlink would make
         # the later no-op check resume a different checkpoint than ``w_cut``.
         checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
+        checkpoint_state = CheckpointManager.read_resume_state(checkpoint_uri)
+        self.assertEqual(checkpoint_state["effective_total_steps"], 100)
         w_cut = model1.draft_model.w.detach().clone()
         masters_cut = [
             t.detach().cpu().clone() for t in t1.backend.optimizer.fp32_params
@@ -299,6 +305,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 "strategy": "eagle3",
                 "run_id": "rz",
                 "world_size": 1,
+                "effective_total_steps": 100,
             }
             payload.update(overrides)
             torch.save(payload, os.path.join(d, "training_state.pt"))
@@ -383,6 +390,71 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 ),
                 checkpoint_extra=required_peagle_contract,
                 spec_name="peagle",
+            )
+
+    def test_resume_rejects_a_changed_implicit_schedule_horizon(self):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_horizon_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
+        source_dir = os.path.join(workdir, "source")
+        source, _, _ = self._make_trainer(
+            source_dir,
+            feat_dir=feat_dir,
+            max_steps=1,
+            total_steps=None,
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(source_dir, "rz-latest"))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "effective_total_steps=1 but this run has effective_total_steps=2",
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "changed"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                total_steps=None,
+                resume_from=checkpoint,
+            )
+
+    def test_legacy_checkpoint_recovers_horizon_from_scheduler_state(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_legacy_horizon_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
+        source_dir = os.path.join(workdir, "source")
+        source, _, _ = self._make_trainer(
+            source_dir,
+            feat_dir=feat_dir,
+            max_steps=1,
+            total_steps=6,
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(source_dir, "rz-latest"))
+        state_path = os.path.join(checkpoint, "training_state.pt")
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        state.pop("effective_total_steps")
+        torch.save(state, state_path)
+
+        resumed, _, _ = self._make_trainer(
+            os.path.join(workdir, "same"),
+            feat_dir=feat_dir,
+            max_steps=2,
+            total_steps=6,
+            resume_from=checkpoint,
+        )
+        self.assertEqual(resumed._controller.total_steps, 6)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "effective_total_steps=6 but this run has effective_total_steps=7",
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "changed"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                total_steps=7,
+                resume_from=checkpoint,
             )
 
     def test_resume_rejects_partial_weights_except_provider_owned_omissions(self):
@@ -688,6 +760,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     accumulation_steps=1,
                     num_epochs=1,
                     max_steps=max_steps,
+                    total_steps=100,
                     save_interval=0,
                     logger=None,
                     log_interval=50,
