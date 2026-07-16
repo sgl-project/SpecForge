@@ -146,7 +146,9 @@ class LaunchPlan:
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
-    shutdown_grace_s: float = 5.0
+    # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
+    # failure-sentinel publication inside this window before SIGKILL.
+    shutdown_grace_s: float = 30.0
 
     def render(self) -> str:
         payload = {
@@ -760,6 +762,13 @@ def build_launch_plan(
         )
         if command.argv[: len(worker_prefix)] == worker_prefix:
             return LaunchPlan("worker", role, worker_env=consumer_env)
+        if deployment is not None:
+            return LaunchPlan(
+                "command",
+                role,
+                commands=(command,),
+                shutdown_grace_s=deployment.shutdown_grace_s,
+            )
         return LaunchPlan("command", role, commands=(command,))
 
     producer = CommandSpec(
@@ -793,7 +802,12 @@ def build_launch_plan(
             ),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
-    return LaunchPlan("supervisor", "both", commands=(producer, consumer))
+    return LaunchPlan(
+        "supervisor",
+        "both",
+        commands=(producer, consumer),
+        shutdown_grace_s=deployment.shutdown_grace_s,
+    )
 
 
 def _process_group_exists(pgid: int) -> bool:

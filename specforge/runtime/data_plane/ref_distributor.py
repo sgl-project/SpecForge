@@ -210,7 +210,15 @@ class RefDistributor:
             candidates = []
             for ref in raw:
                 if ref.sample_id in self._skip:
-                    self._skip.discard(ref.sample_id)
+                    # Released samples stay skip-listed for the whole replay:
+                    # the prior attempt settled EVERY publication it polled
+                    # (ack for the fresh one, immediate settle for duplicates)
+                    # into the persisted consumed sidecar this attempt seeded
+                    # from. Settling a re-polled duplicate again would advance
+                    # consumed past the producer's published accounting and
+                    # crash its reconciliation; a duplicate the prior attempt
+                    # never polled merely under-counts, which only tightens
+                    # backpressure and is safe.
                     self.stats["skipped"] += 1
                     continue
                 candidates.append(ref)

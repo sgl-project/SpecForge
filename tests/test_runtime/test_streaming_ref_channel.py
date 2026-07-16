@@ -242,6 +242,31 @@ class TestStreamingRefChannel(unittest.TestCase):
         restarted.mark_consumed(2)
         self.assertEqual(first.consumed_remote(), 5)
 
+    def test_mark_consumed_is_thread_safe_across_ack_and_fail_paths(self):
+        # The trainer thread acks batches while the prefetch worker settles
+        # failures; both call mark_consumed on the same channel. Lost updates
+        # or tmp-file collisions under-report consumption to the producer,
+        # which then never releases backpressure.
+        channel = StreamingRefChannel(self.path)
+        increments, threads = 2000, 4
+        errors = []
+
+        def hammer():
+            try:
+                for _ in range(increments):
+                    channel.mark_consumed(1)
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        workers = [threading.Thread(target=hammer) for _ in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(channel.consumed_remote(), increments * threads)
+
     def test_stream_idle_timeout_when_producer_silent(self):
         r = StreamingRefChannel(self.path)
         t = {"now": 0.0}

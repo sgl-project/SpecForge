@@ -414,38 +414,6 @@ def _install_dataset_vocab_mapping(
         os.replace(temporary, path)
 
 
-def _ensure_vocab_mapping(
-    cfg: Config,
-    bundle: ModelBundle,
-    prompts: List[dict],
-    algorithm: AlgorithmRegistration,
-) -> None:
-    """Generate the online EAGLE-family map from its prepared prompt plan."""
-    # Avoid walking (and validating) the prompt payload when no mapping can be
-    # needed.  This is common for equal-vocabulary targets and keeps assembly
-    # independent of the online prompt schema for non-mapping runs.
-    if FeatureMode.STREAMING not in algorithm.providers.vocab_mapping_modes:
-        return
-    if (
-        cfg.model.vocab_mapping_path
-        or bundle.draft_vocab_size == bundle.target_vocab_size
-    ):
-        return
-
-    counts: Counter = Counter()
-    for task in prompts:
-        payload = task["payload"]
-        for token_id, keep in zip(payload["input_ids"], payload["loss_mask"]):
-            if keep:
-                counts[int(token_id)] += 1
-    _install_dataset_vocab_mapping(
-        cfg,
-        bundle,
-        counts=counts,
-        dataset_identity=cfg.data.cache_key or _prompt_cache_key(cfg),
-    )
-
-
 def _ensure_offline_vocab_mapping(
     cfg: Config,
     bundle: ModelBundle,

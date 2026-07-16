@@ -36,7 +36,13 @@ from typing import Any, Callable, Mapping, Optional
 logger = logging.getLogger(__name__)
 
 MODEL_SOURCE_IDENTITY_FORMAT_FIELD = "source_identity_format"
-MODEL_SOURCE_IDENTITY_FORMAT = "stat-v1"
+MODEL_SOURCE_IDENTITY_FORMAT = "stat-v2"
+
+# stat-v1 additionally embedded st_ctime_ns/st_dev/st_ino, which are not stable
+# across NFS/FUSE/overlay remounts or pod reschedules, so byte-identical weights
+# on the same volume were rejected after a restart. stat-v1 checkpoints stay
+# resumable by projecting their shard records onto the stat-v2 fields.
+_LEGACY_STAT_V1_FORMAT = "stat-v1"
 
 _LEGACY_HASH_CACHE_VERSION = 1
 _LEGACY_HASH_CACHE_DIRECTORY = ".specforge-provenance-cache"
@@ -78,18 +84,17 @@ def _metadata_file_identity(
     # keeps exact descriptor provenance without reading multi-GB weight shards.
     if path.endswith(".json"):
         return ("sha256", name, stat.st_size, _sha256_file(path))
+    # Binary shards use the rsync-style (name, size, mtime) quick check only.
+    # ctime/device/inode are deliberately excluded: they change across
+    # NFS/FUSE/overlay remounts and pod reschedules even when the bytes are
+    # identical, so embedding them rejects exactly the resumes this contract
+    # exists to serve. Content-level identity is still pinned by the sha256'd
+    # JSON descriptors above (config + safetensors index cover shard layout).
     return (
         "stat",
         name,
         stat.st_size,
         stat.st_mtime_ns,
-        # ctime changes for both in-place writes and same-path replacements,
-        # including copies that deliberately preserve mtime. This keeps the
-        # cheap resume identity from accepting different same-size shard bytes;
-        # device/inode also covers filesystems with coarse ctime resolution.
-        stat.st_ctime_ns,
-        stat.st_dev,
-        stat.st_ino,
     )
 
 
@@ -103,7 +108,7 @@ def model_source_identity(path: Optional[str]) -> Any:
         return ("reference", path)
     if os.path.isfile(expanded):
         return (
-            "file-stat-v1",
+            "file-stat-v2",
             expanded,
             _metadata_file_identity(expanded, "", os.stat(expanded)),
         )
@@ -112,7 +117,7 @@ def model_source_identity(path: Optional[str]) -> Any:
         _metadata_file_identity(file_path, name, stat)
         for name, file_path, stat in _tracked_files(expanded)
     )
-    return ("directory-stat-v1", expanded, files)
+    return ("directory-stat-v2", expanded, files)
 
 
 def _legacy_model_source_identity_uncached(path: Optional[str]) -> Any:
@@ -326,9 +331,40 @@ def _legacy_source_from_current(identity: Any, *, cache_root: str) -> Any:
     kind = identity[0]
     if kind == "reference":
         return tuple(identity)
-    if kind not in {"file-stat-v1", "directory-stat-v1"} or len(identity) < 2:
+    if kind not in {"file-stat-v2", "directory-stat-v2"} or len(identity) < 2:
         raise ValueError(f"unsupported current model source identity: {identity!r}")
     return legacy_model_source_identity(identity[1], cache_root=cache_root)
+
+
+def _stat_v1_source_to_v2(identity: Any) -> Any:
+    """Project one stat-v1 source identity onto its remount-stable fields."""
+
+    if identity is None:
+        return None
+    if not isinstance(identity, (tuple, list)) or not identity:
+        raise ValueError(f"saved model source identity is malformed: {identity!r}")
+    kind = identity[0]
+    if kind == "reference":
+        return tuple(identity)
+
+    def project(record: Any) -> tuple[Any, ...]:
+        record = tuple(record)
+        if record and record[0] == "sha256":
+            return record
+        if record and record[0] == "stat" and len(record) >= 4:
+            # ("stat", name, size, mtime_ns, ctime_ns, dev, ino) -> v2 prefix.
+            return record[:4]
+        raise ValueError(f"unsupported stat-v1 file identity: {record!r}")
+
+    if kind == "file-stat-v1" and len(identity) == 3:
+        return ("file-stat-v2", identity[1], project(identity[2]))
+    if kind == "directory-stat-v1" and len(identity) == 3:
+        return (
+            "directory-stat-v2",
+            identity[1],
+            tuple(project(record) for record in identity[2]),
+        )
+    raise ValueError(f"unsupported stat-v1 model source identity: {identity!r}")
 
 
 def model_provenance_for_resume_comparison(
@@ -336,12 +372,14 @@ def model_provenance_for_resume_comparison(
     saved: Any,
     *,
     cache_root: str,
-) -> Any:
-    """Adapt current provenance to an old checkpoint's comparison format.
+) -> tuple[Any, Any]:
+    """Return ``(current, saved)`` adapted onto one comparable format.
 
     Current checkpoints compare their metadata identities directly.  A saved
-    mapping with no format field is the legacy full-content contract; reconstruct
-    that exact value lazily so existing checkpoints remain resumable.
+    stat-v1 mapping is projected onto the remount-stable stat-v2 fields.  A
+    saved mapping with no format field is the legacy full-content contract;
+    reconstruct that exact value lazily so existing checkpoints remain
+    resumable.
     """
 
     current_mapping = _mapping(current, name="current")
@@ -350,13 +388,19 @@ def model_provenance_for_resume_comparison(
     saved_format = saved_mapping.get(MODEL_SOURCE_IDENTITY_FORMAT_FIELD)
 
     if current_format is None:
-        return current
+        return current, saved
     if current_format != MODEL_SOURCE_IDENTITY_FORMAT:
         raise ValueError(
             f"unsupported current model provenance format {current_format!r}"
         )
     if saved_format == current_format:
-        return current
+        return current, saved
+    if saved_format == _LEGACY_STAT_V1_FORMAT:
+        projected = dict(saved_mapping)
+        projected[MODEL_SOURCE_IDENTITY_FORMAT_FIELD] = MODEL_SOURCE_IDENTITY_FORMAT
+        for field in _MODEL_SOURCE_FIELDS:
+            projected[field] = _stat_v1_source_to_v2(projected.get(field))
+        return current, projected
     if saved_format is not None:
         raise ValueError(
             "checkpoint model provenance uses unsupported identity format "
@@ -373,9 +417,12 @@ def model_provenance_for_resume_comparison(
             )
         return tuple((key, migrated[key]) for key in sorted(migrated))
 
-    return _rank_zero_value(
-        legacy_value,
-        operation="legacy model provenance hashing",
+    return (
+        _rank_zero_value(
+            legacy_value,
+            operation="legacy model provenance hashing",
+        ),
+        saved,
     )
 
 

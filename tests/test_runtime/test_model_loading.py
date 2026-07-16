@@ -23,7 +23,6 @@ from specforge.training.model_loading import (
 def _run_config(strategy: str, **model_overrides) -> Config:
     model = {
         "target_model_path": "target/model",
-        "target_backend": "hf",
         **model_overrides,
     }
     if strategy == "eagle3":

@@ -150,6 +150,42 @@ class OfflineMooncakeCleanupTest(unittest.TestCase):
                 )
                 self.assertEqual(1, store.drain_calls)
 
+    def test_failure_sentinel_is_published_before_the_cleanup_sweep(self):
+        # The abort sweep can take minutes over thousands of refs and the
+        # process may be SIGKILLed at supervisor-grace expiry mid-sweep. The
+        # remote consumer's .failed wait is unbounded by default, so the
+        # sentinel must be durable BEFORE the first abort, not after the last.
+        class _SentinelOrderingStore(_RecordingStore):
+            def __init__(self, manifest_holder):
+                super().__init__()
+                self.manifest_holder = manifest_holder
+                self.sentinel_seen_before_abort = []
+
+            def abort(self, sample_id, *, reason):
+                self.sentinel_seen_before_abort.append(
+                    Path(self.manifest_holder["manifest"] + ".failed").exists()
+                )
+                super().abort(sample_id, reason=reason)
+
+        holder: dict = {}
+        refs = [SimpleNamespace(sample_id=f"sample-{index}") for index in range(2)]
+        store = _SentinelOrderingStore(holder)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            self._producer_run(
+                tmp,
+                store,
+                self._successful_ingest(refs),
+                hold_side_effect=TimeoutError("producer hold timed out"),
+            ) as (run, _write_manifest, manifest),
+        ):
+            holder["manifest"] = manifest
+            with self.assertRaisesRegex(TimeoutError, "hold timed out"):
+                run.run()
+
+        self.assertEqual(len(store.abort_calls), 2)
+        self.assertEqual(store.sentinel_seen_before_abort, [True, True])
+
     def test_partial_ingestion_failure_cleans_every_tracked_ref(self):
         refs = [SimpleNamespace(sample_id=f"sample-{index}") for index in range(2)]
         store = _RecordingStore()

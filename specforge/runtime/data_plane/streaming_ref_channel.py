@@ -116,6 +116,10 @@ class StreamingRefChannel:
         self._read_offset = 0
         self._buf = ""
         self._consumed = 0
+        # ``mark_consumed`` is called from both the trainer thread (batch acks)
+        # and the prefetch worker (failure settlement), so the increment and
+        # the sidecar publish must be one atomic section.
+        self._consumed_lock = threading.Lock()
 
     # -- producer ----------------------------------------------------------
     def publish(self, ref: SampleRef) -> None:
@@ -338,16 +342,23 @@ class StreamingRefChannel:
 
     def mark_consumed(self, n: int) -> None:
         """Record n more consumed refs in the sidecar the producer reads back."""
-        self._consumed += n
-        tmp = self.path + _CONSUMED_SUFFIX + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(str(self._consumed))
-        os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
+        with self._consumed_lock:
+            self._consumed += n
+            # Thread-unique tmp name: a concurrent writer must never observe
+            # (or os.replace away) another writer's half-written counter file.
+            tmp = (
+                f"{self.path}{_CONSUMED_SUFFIX}"
+                f".tmp.{os.getpid()}.{threading.get_ident()}"
+            )
+            with open(tmp, "w") as f:
+                f.write(str(self._consumed))
+            os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
 
     def seed_consumed(self) -> int:
         """Continue an existing consumed counter after a consumer restart."""
-        self._consumed = self.consumed_remote()
-        return self._consumed
+        with self._consumed_lock:
+            self._consumed = self.consumed_remote()
+            return self._consumed
 
     def stream(
         self,

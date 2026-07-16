@@ -277,6 +277,29 @@ class LaunchPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match YAML"):
             build_launch_plan(_config(nproc=4), config_path="run.yaml", env=distributed)
 
+    def test_plain_supervisor_consumes_configured_shutdown_grace(self):
+        # SIGTERM-trapped workers need this window for Mooncake drains and
+        # checkpoint flushes; it must be configurable outside managed_local too.
+        default_plan = build_launch_plan(
+            _config(mode="disaggregated", nproc=2),
+            config_path="run.yaml",
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(default_plan.shutdown_grace_s, 30.0)
+
+        raw = _config(mode="disaggregated", nproc=2).model_dump()
+        raw["deployment"]["disaggregated"]["shutdown_grace_s"] = 90.0
+        plan = build_launch_plan(
+            Config.model_validate(raw),
+            config_path="run.yaml",
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(plan.shutdown_grace_s, 90.0)
+
     def test_disaggregated_auto_supervises_both_roles_on_one_node(self):
         plan = build_launch_plan(
             _config(mode="disaggregated", nproc=2),

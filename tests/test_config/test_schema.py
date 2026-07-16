@@ -345,10 +345,17 @@ class ConfigSchemaTest(unittest.TestCase):
         dspark = Config.model_validate(dspark_payload)
         resolve_run(dspark)
         self.assertEqual(dspark.training.strategy, "dspark")
+        # The in-process HF/custom backends were removed with the server-only
+        # cutover; retired names must fail at load for BOTH topologies rather
+        # than being silently ignored on offline runs.
         invalid_backend = _online_payload("dflash")
         invalid_backend["model"]["target_backend"] = "hf"
-        with self.assertRaisesRegex(ValidationError, "external SGLang"):
+        with self.assertRaisesRegex(ValidationError, "target_backend"):
             Config.model_validate(invalid_backend)
+        offline_backend = copy.deepcopy(MINIMAL)
+        offline_backend["model"]["target_backend"] = "custom"
+        with self.assertRaisesRegex(ValidationError, "target_backend"):
+            Config.model_validate(offline_backend)
 
         unknown = copy.deepcopy(MINIMAL)
         unknown["training"] = {"strategy": "unknown_algorithm"}

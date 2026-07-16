@@ -21,7 +21,6 @@ ONLINE_DEPLOYMENT = {
 def _payload(strategy: str, **model_overrides):
     model = {
         "target_model_path": "target/model",
-        "target_backend": "hf",
         **model_overrides,
     }
     data = (

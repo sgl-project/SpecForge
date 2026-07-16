@@ -390,6 +390,13 @@ def _build_offline(
                 _hold_mooncake_producer(manifest)
             except BaseException as exc:
                 primary_exc = exc
+                # Publish the failure sentinel BEFORE the Mooncake abort sweep:
+                # the sweep can take minutes over thousands of refs, and a
+                # supervisor SIGKILL at grace expiry mid-sweep must not leave a
+                # remote consumer waiting forever on a sentinel that never
+                # arrives. A cleanup failure below overwrites this record with
+                # the combined error.
+                _publish_control_failure(manifest + ".failed", primary_exc)
 
             cleanup_exc = None
             if (
@@ -418,7 +425,6 @@ def _build_offline(
                 _publish_control_failure(manifest + ".failed", combined)
                 raise combined from primary_exc
             if primary_exc is not None:
-                _publish_control_failure(manifest + ".failed", primary_exc)
                 raise primary_exc
             if cleanup_exc is not None:
                 _publish_control_failure(manifest + ".failed", cleanup_exc)

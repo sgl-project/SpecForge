@@ -301,18 +301,23 @@ class Trainer:
                 persisted = state.get(key)
                 persisted_available = key in state
                 comparison_current = current
+                comparison_persisted = persisted
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
                     from specforge.training.provenance import (
                         model_provenance_for_resume_comparison,
                     )
 
-                    comparison_current = model_provenance_for_resume_comparison(
+                    (
+                        comparison_current,
+                        comparison_persisted,
+                    ) = model_provenance_for_resume_comparison(
                         current,
                         persisted,
                         cache_root=output_dir,
                     )
                 if key == "effective_total_steps" and key not in state:
                     persisted = _legacy_scheduler_total_steps(state)
+                    comparison_persisted = persisted
                     persisted_available = persisted is not None
                     if not persisted_available:
                         raise ValueError(
@@ -327,10 +332,11 @@ class Trainer:
                         f"algorithm resume semantic {key}; start a fresh run "
                         "rather than guessing the prior objective"
                     )
-                if persisted_available and persisted != comparison_current:
+                if persisted_available and comparison_persisted != comparison_current:
                     raise ValueError(
                         f"checkpoint {resume_from} was written with "
-                        f"{key}={persisted} but this run has {key}={current}; "
+                        f"{key}={comparison_persisted} but this run has "
+                        f"{key}={comparison_current}; "
                         f"resume with the original configuration"
                     )
             saved_weights = state["draft_state_dict"]

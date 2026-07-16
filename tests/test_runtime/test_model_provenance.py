@@ -55,7 +55,7 @@ class ModelProvenanceTest(unittest.TestCase):
             ) as sha256_file:
                 identity = provenance.model_source_identity(directory)
 
-        self.assertEqual(identity[0], "directory-stat-v1")
+        self.assertEqual(identity[0], "directory-stat-v2")
         self.assertEqual(
             [Path(call.args[0]).name for call in sha256_file.call_args_list],
             [descriptor.name],
@@ -94,27 +94,98 @@ class ModelProvenanceTest(unittest.TestCase):
         compute.assert_not_called()
         broadcast.assert_called_once()
 
-    def test_same_size_preserved_mtime_replacement_changes_shard_identity(self):
+    def test_shard_identity_survives_inode_and_ctime_churn(self):
+        # A remount (NFS/FUSE/overlay) or pod reschedule presents byte-identical
+        # shards under new inode/device numbers and a new ctime. The identity
+        # must be a pure function of (name, size, mtime) so those resumes work.
+        with TemporaryDirectory(prefix="model-provenance-remount-") as directory:
+            shard = Path(directory) / "model.safetensors"
+            shard.write_bytes(b"same-weights")
+            original_stat = shard.stat()
+            original = provenance.model_source_identity(directory)
+
+            replacement = Path(directory) / "replacement.safetensors"
+            replacement.write_bytes(b"same-weights")
+            os.replace(replacement, shard)
+            os.utime(
+                shard,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            remounted = provenance.model_source_identity(directory)
+
+        self.assertEqual(original, remounted)
+
+    def test_shard_identity_changes_with_mtime_or_size(self):
         with TemporaryDirectory(prefix="model-provenance-replace-") as directory:
             shard = Path(directory) / "model.safetensors"
             shard.write_bytes(b"old-weights")
             original_stat = shard.stat()
             original = provenance.model_source_identity(directory)
 
-            replacement = Path(directory) / "replacement.safetensors"
-            replacement.write_bytes(b"new-weights")
-            os.utime(
-                replacement,
-                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-            )
-            os.replace(replacement, shard)
+            shard.write_bytes(b"new-weights")
+            self.assertNotEqual(original, provenance.model_source_identity(directory))
+
+            shard.write_bytes(b"different-size")
             os.utime(
                 shard,
                 ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
             )
-            replaced = provenance.model_source_identity(directory)
+            self.assertNotEqual(original, provenance.model_source_identity(directory))
 
-        self.assertNotEqual(original, replaced)
+    def test_stat_v1_checkpoint_is_projected_onto_stable_fields(self):
+        # Checkpoints written by the stat-v1 format embedded ctime/dev/ino for
+        # every shard; those fields must be ignored on resume while the stable
+        # name/size/mtime prefix (and the descriptor hash) still gate identity.
+        current_mapping = {
+            provenance.MODEL_SOURCE_IDENTITY_FORMAT_FIELD: (
+                provenance.MODEL_SOURCE_IDENTITY_FORMAT
+            ),
+            "target_model": (
+                "directory-stat-v2",
+                "/models/target",
+                (
+                    ("sha256", "config.json", 2, "abc123"),
+                    ("stat", "model.safetensors", 11, 1_000),
+                ),
+            ),
+            "draft_config": ("reference", "remote/draft"),
+            "vocab_mapping": None,
+        }
+        saved_mapping = dict(current_mapping)
+        saved_mapping[provenance.MODEL_SOURCE_IDENTITY_FORMAT_FIELD] = "stat-v1"
+        saved_mapping["target_model"] = (
+            "directory-stat-v1",
+            "/models/target",
+            (
+                ("sha256", "config.json", 2, "abc123"),
+                # Same name/size/mtime, different ctime/dev/ino (pre-remount).
+                ("stat", "model.safetensors", 11, 1_000, 2_000, 64, 999),
+            ),
+        )
+
+        current_cmp, saved_cmp = provenance.model_provenance_for_resume_comparison(
+            current_mapping,
+            saved_mapping,
+            cache_root=os.devnull,
+        )
+        self.assertEqual(current_cmp, current_mapping)
+        self.assertEqual(dict(saved_cmp), current_mapping)
+
+        drifted = dict(saved_mapping)
+        drifted["target_model"] = (
+            "directory-stat-v1",
+            "/models/target",
+            (
+                ("sha256", "config.json", 2, "abc123"),
+                ("stat", "model.safetensors", 11, 5_000, 2_000, 64, 999),
+            ),
+        )
+        current_cmp, saved_cmp = provenance.model_provenance_for_resume_comparison(
+            current_mapping,
+            drifted,
+            cache_root=os.devnull,
+        )
+        self.assertNotEqual(dict(saved_cmp), dict(current_cmp))
 
     def test_legacy_resume_hashes_once_then_reuses_stat_keyed_cache(self):
         with TemporaryDirectory(prefix="legacy-provenance-") as directory:
@@ -169,8 +240,8 @@ class ModelProvenanceTest(unittest.TestCase):
                     cache_root=cache_root,
                 )
 
-            self.assertEqual(first, saved)
-            self.assertEqual(second, saved)
+            self.assertEqual(first, (saved, saved))
+            self.assertEqual(second, (saved, saved))
             self.assertEqual(first_hash_count, 2)
             self.assertEqual(sha256_file.call_count, first_hash_count)
             cache_files = list(
@@ -192,13 +263,14 @@ class ModelProvenanceTest(unittest.TestCase):
             provenance,
             "legacy_model_source_identity",
         ) as legacy_identity:
-            comparison = provenance.model_provenance_for_resume_comparison(
+            current_cmp, saved_cmp = provenance.model_provenance_for_resume_comparison(
                 current,
                 current,
                 cache_root="unused",
             )
 
-        self.assertIs(comparison, current)
+        self.assertIs(current_cmp, current)
+        self.assertIs(saved_cmp, current)
         legacy_identity.assert_not_called()
 
     def test_unknown_saved_identity_format_fails_loudly(self):
@@ -209,7 +281,7 @@ class ModelProvenanceTest(unittest.TestCase):
             "target_model": ("reference", "remote/target"),
         }
         saved_mapping = dict(current_mapping)
-        saved_mapping[provenance.MODEL_SOURCE_IDENTITY_FORMAT_FIELD] = "future-v2"
+        saved_mapping[provenance.MODEL_SOURCE_IDENTITY_FORMAT_FIELD] = "future-v9"
 
         with self.assertRaisesRegex(ValueError, "unsupported identity format"):
             provenance.model_provenance_for_resume_comparison(

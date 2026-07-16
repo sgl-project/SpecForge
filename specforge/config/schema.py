@@ -47,7 +47,10 @@ class ModelConfig(StrictConfigModel):
     draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
     #: Optional DFlash block-size override (auto-generated default: 16).
     draft_block_size: Optional[int] = Field(default=None, gt=0)
-    target_backend: Literal["sglang", "hf", "custom"] = "sglang"
+    #: Online capture always runs on an external SGLang server; the in-process
+    #: HF/custom target backends were removed with the server-only cutover, so
+    #: configs naming them fail at load instead of being silently ignored.
+    target_backend: Literal["sglang"] = "sglang"
     #: Retained for offline/config migration only. The server-only online path
     #: transports complete feature records and does not shard target outputs in
     #: the trainer.
@@ -377,6 +380,11 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
+    #: SIGTERM-to-SIGKILL grace for a plain (non-managed) supervisor teardown.
+    #: Workers translate SIGTERM into cleanup (Mooncake drains, checkpoint
+    #: flush, failure sentinels), so this window must cover that work.
+    #: managed_local supervisors use managed_local.shutdown_grace_s instead.
+    shutdown_grace_s: float = Field(default=30.0, gt=0)
     managed_local: Optional[ManagedLocalStackConfig] = None
 
     @model_validator(mode="after")

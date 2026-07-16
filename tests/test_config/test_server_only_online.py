@@ -48,12 +48,12 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             Config.model_validate(_online_payload(topology="local_colocated"))
 
     def test_online_requires_the_sglang_server_backend(self):
+        # The retired in-process backends are no longer schema values at all,
+        # so the rejection is the enum itself rather than the online validator.
         for backend in ("hf", "custom"):
             with (
                 self.subTest(backend=backend),
-                self.assertRaisesRegex(
-                    ValidationError, "external SGLang capture server"
-                ),
+                self.assertRaisesRegex(ValidationError, "target_backend"),
             ):
                 Config.model_validate(_online_payload(backend=backend))
 
@@ -66,21 +66,29 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
         ):
             resolve_run(config)
 
-    def test_offline_feature_consumers_do_not_lose_backend_compatibility(self):
-        for backend in ("sglang", "hf", "custom"):
-            with self.subTest(backend=backend):
-                config = Config.model_validate(
-                    {
-                        "model": {
-                            "target_model_path": "target",
-                            "draft_model_config": "draft.json",
-                            "vocab_mapping_path": "mapping.pt",
-                            "target_backend": backend,
-                        },
-                        "data": {"hidden_states_path": "features"},
-                    }
-                )
-                self.assertEqual(config.mode, "offline")
+    def test_offline_configs_reject_retired_backends_instead_of_ignoring_them(self):
+        # Offline consumers never instantiate a target inference backend, but a
+        # config naming a retired backend must fail at load rather than be
+        # silently ignored — training.md promises retired options stay loud.
+        def _offline_payload(backend):
+            return {
+                "model": {
+                    "target_model_path": "target",
+                    "draft_model_config": "draft.json",
+                    "vocab_mapping_path": "mapping.pt",
+                    "target_backend": backend,
+                },
+                "data": {"hidden_states_path": "features"},
+            }
+
+        config = Config.model_validate(_offline_payload("sglang"))
+        self.assertEqual(config.mode, "offline")
+        for backend in ("hf", "custom"):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValidationError, "target_backend"),
+            ):
+                Config.model_validate(_offline_payload(backend))
 
     def test_every_online_recipe_uses_the_server_data_plane(self):
         online_recipes = []

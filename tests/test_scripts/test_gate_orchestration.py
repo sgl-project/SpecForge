@@ -396,7 +396,7 @@ fi
             "Target TP/EP and model-specific inference stay on that server",
             customization,
         )
-        self.assertIn("HF/custom online target loading is unsupported", recipes)
+        self.assertIn("retired `hf`/`custom` names fail at config load", recipes)
         self.assertIn(
             "Online disaggregated consumers must keep it at 1",
             recipes,

@@ -298,6 +298,44 @@ class TestRefDistributor(unittest.TestCase):
         _pump_until_quiet(dist)
         store.close()
 
+    def test_resume_never_settles_released_duplicates_twice(self):
+        # At-least-once delivery can leave TWO records of one sample on the
+        # channel file. The prior attempt settled both (ack for the fresh one,
+        # immediate settle for the duplicate) into the consumed sidecar. A
+        # resume that re-polls the file must not settle either record again:
+        # consumed would advance past the producer's published accounting and
+        # crash its byte reconciliation.
+        ledger_path = os.path.join(self.dir, "resume-dup.sqlite")
+        store = SQLiteMetadataStore(ledger_path)
+        original = DataFlowController("run0", metadata_store=store)
+        ref = _ref("s0")
+        self.producer.publish(ref)
+        self.producer.publish(ref)  # at-least-once duplicate record
+        original.commit_samples("old-distributor", [ref])
+        original.ack_train_refs(
+            "trainer", ["s0"], global_step=1, optimizer_durable=True
+        )
+        # The prior attempt settled the ack AND its polled duplicate.
+        self.source.mark_consumed(2)
+
+        restarted = DataFlowController("run0", metadata_store=store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        self.assertEqual(report["released"], ["s0"])
+        dist = self._distributor(
+            dp_size=1,
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+        )
+        _pump_until_quiet(dist)
+
+        self.assertEqual(dist.stats["skipped"], 2)
+        # published == consumed: nothing over-advanced, in-flight is exactly 0.
+        self.assertEqual(self.producer.consumed_remote(), 2)
+        self.assertEqual(self.producer.in_flight_remote(), 0)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        store.close()
+
     def test_resume_repairs_ack_committed_before_inbox_counter(self):
         ledger_path = os.path.join(self.dir, "resume-counter.sqlite")
         store = SQLiteMetadataStore(ledger_path)

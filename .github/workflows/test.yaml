@@ -50,6 +50,10 @@ jobs:
           uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
           MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
           uv pip install -v . --prerelease=allow
+          # The live server-capture gate needs the Mooncake client AND the
+          # mooncake_master console script; the isolated venv cannot see the
+          # container's site-packages. cu130 image -> the cuda13 wheel.
+          uv pip install mooncake-transfer-engine-cuda13
 
       - name: Run live server-capture numerics gate
         timeout-minutes: 15

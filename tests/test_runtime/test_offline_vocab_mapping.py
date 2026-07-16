@@ -145,7 +145,6 @@ class OfflineVocabMappingTest(unittest.TestCase):
                 {
                     "model": {
                         "target_model_path": "target/model",
-                        "target_backend": "hf",
                     },
                     "data": {
                         "hidden_states_path": str(feature_dir),
