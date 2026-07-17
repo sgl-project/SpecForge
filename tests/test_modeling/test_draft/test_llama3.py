@@ -2,6 +2,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -11,7 +12,10 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaForCausalLMEagle3,
     LlamaMLP,
+    LlamaMutiRotaryEmbedding,
     LlamaRMSNorm,
+    LlamaRotaryEmbedding,
+    get_rope_config,
 )
 
 # from model_module import LlamaForCausalLMEagle3
@@ -60,6 +64,52 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         self.assertIsInstance(model.midlayer.input_layernorm, LlamaRMSNorm)
         self.assertIsInstance(model.midlayer.post_attention_layernorm, LlamaRMSNorm)
         self.assertEqual(model.midlayer.hidden_size, self.config.hidden_size)
+
+    def test_get_rope_config_supports_v4_and_v5(self):
+        rope_parameters = {"rope_type": "default", "rope_theta": 123456.0}
+        self.assertEqual(
+            get_rope_config(SimpleNamespace(rope_parameters=rope_parameters)),
+            (123456.0, rope_parameters),
+        )
+
+        rope_scaling = {"rope_type": "linear", "factor": 2.0}
+        self.assertEqual(
+            get_rope_config(
+                SimpleNamespace(rope_theta=654321.0, rope_scaling=rope_scaling)
+            ),
+            (654321.0, rope_scaling),
+        )
+
+    def test_rope_parameters_are_used(self):
+        for rope_parameters, expected_type in (
+            (
+                {"rope_type": "default", "rope_theta": 123456.0},
+                LlamaRotaryEmbedding,
+            ),
+            (
+                {
+                    "rope_type": "mrope",
+                    "rope_theta": 123456.0,
+                    "mrope_section": [1, 1, 0],
+                },
+                LlamaMutiRotaryEmbedding,
+            ),
+        ):
+            with self.subTest(rope_type=rope_parameters["rope_type"]):
+                config = LlamaConfig(
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=4,
+                    num_key_value_heads=2,
+                    max_position_embeddings=64,
+                    rope_parameters=rope_parameters,
+                )
+
+                attention = LlamaAttention(config)
+
+                self.assertIsInstance(attention.rotary_emb, expected_type)
+                self.assertEqual(attention.rotary_emb.base, 123456.0)
+                self.assertIs(attention.rope_scaling, config.rope_parameters)
 
     def test_save_pretrained(self):
         """Test the model's save_pretrained functionality."""

@@ -44,6 +44,16 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
 
         torch.testing.assert_close(reloaded.mask_hidden, model.mask_hidden)
 
+    def test_rope_parameters_theta_is_used(self):
+        config = self._tiny_config()
+        config.rope_parameters = {"rope_type": "default", "rope_theta": 123456.0}
+
+        model = PEagleDraftModel(config)
+        self.assertEqual(model.rotary_emb.base, 123456.0)
+
+        model._rebuild_rotary_embedding()
+        self.assertEqual(model.rotary_emb.base, 123456.0)
+
     def test_online_wrapper_uses_draft_model_mask_hidden(self):
         config = self._tiny_config()
         draft_model = PEagleDraftModel(config)

@@ -106,6 +106,24 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def get_rope_config(config):
+    """Get (rope_theta, rope_params) from config, supporting both v4 and v5.
+
+    Trust-remote-code configs or parent configs passed to sub-models may not
+    have the v5 ``rope_parameters`` property, so we fall back to the v4-style
+    ``config.rope_theta`` / ``config.rope_scaling`` attributes.
+
+    Returns:
+        (rope_theta, rope_params): In v5, rope_params is the full
+        rope_parameters dict (which subsumes rope_scaling and includes
+        rope_theta). In v4, rope_params is the rope_scaling dict or None.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is not None:
+        return rope_params["rope_theta"], rope_params
+    return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -550,14 +568,16 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        rope_theta, rope_scaling = get_rope_config(self.config)
+        self.rope_scaling = rope_scaling
+
+        if rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
+                base=rope_theta,
             )
         else:
-            rope_scaling = self.config.rope_scaling
 
             def rope_get(key, default=None):
                 if isinstance(rope_scaling, dict):
@@ -571,7 +591,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_theta,
                 )
                 return
             elif scaling_type == "linear":
@@ -582,6 +602,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "dynamic":
@@ -592,6 +613,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "llama3":
@@ -599,7 +621,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_theta,
                     scaling_factor=(
                         scaling_factor if scaling_factor is not None else 1.0
                     ),
@@ -609,12 +631,15 @@ class LlamaAttention(nn.Module):
                 )
             elif scaling_type == "mrope":
                 self.rotary_emb = LlamaMutiRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                 )
             elif scaling_type == "yarn":
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     original_max_position_embeddings=rope_get(
                         "original_max_position_embeddings"
                     ),
@@ -669,7 +694,7 @@ class LlamaAttention(nn.Module):
                     key_states,
                     cos,
                     sin,
-                    self.config.rope_scaling["mrope_section"],
+                    self.rope_scaling["mrope_section"],
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len)
@@ -700,7 +725,7 @@ class LlamaAttention(nn.Module):
                     key_states,
                     cos,
                     sin,
-                    self.config.rope_scaling["mrope_section"],
+                    self.rope_scaling["mrope_section"],
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
@@ -810,7 +835,7 @@ class LlamaFlexAttention(LlamaAttention):
                 key_states,
                 cos,
                 sin,
-                self.config.rope_scaling["mrope_section"],
+                self.rope_scaling["mrope_section"],
             )
         else:
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
@@ -1300,7 +1325,7 @@ class LlamaFlashAttention(LlamaAttention):
                 key_states,
                 cos,
                 sin,
-                self.config.rope_scaling["mrope_section"],
+                self.rope_scaling["mrope_section"],
                 unsqueeze_dim=2,
             )
         else:
