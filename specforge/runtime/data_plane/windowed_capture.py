@@ -714,10 +714,45 @@ class SQLiteWindowedCaptureRegistry:
         depth = int(consumer["prefetch_depth"])
         if depth == 0:
             return
+        # READY rows are cached results, not occupied producer slots. Keep a
+        # rolling number of capture operations active until the legal window is full.
+        outstanding = conn.execute(
+            "SELECT COUNT(DISTINCT e.source_index) FROM interests i "
+            "JOIN entries e ON e.source_index=i.source_index "
+            "WHERE i.consumer_id=? AND i.kind='window' AND e.priority=? "
+            "AND e.state IN (?,?,?)",
+            (
+                consumer_id,
+                int(CapturePriority.PREFETCH),
+                CaptureState.QUEUED.value,
+                CaptureState.CAPTURING.value,
+                CaptureState.COMMITTING.value,
+            ),
+        ).fetchone()[0]
+        remaining = max(0, depth - int(outstanding))
+        if remaining == 0:
+            return
         cursor = int(consumer["cursor"])
-        stop = min(int(consumer["total_samples"]), cursor + depth)
-        for source_index in range(cursor, stop):
-            row = self._ensure_entry(conn, source_index)
+        stop = min(
+            int(consumer["total_samples"]),
+            cursor + int(consumer["lookahead"]) + 1,
+        )
+        candidates = conn.execute(
+            "SELECT DISTINCT e.* FROM interests i JOIN entries e ON "
+            "e.source_index=i.source_index WHERE i.consumer_id=? AND "
+            "i.kind='window' AND e.source_index>=? AND e.source_index<? AND "
+            "e.state IN (?,?) AND e.prefetch_suppressed=0 "
+            "ORDER BY e.source_index LIMIT ?",
+            (
+                consumer_id,
+                cursor,
+                stop,
+                CaptureState.ABSENT.value,
+                CaptureState.FAILED.value,
+                remaining,
+            ),
+        ).fetchall()
+        for row in candidates:
             self._queue_entry(conn, row, CapturePriority.PREFETCH)
 
     def _drop_demand_if_idle_locked(
@@ -1347,6 +1382,12 @@ class SQLiteWindowedCaptureRegistry:
                     self._meta_int(conn, "recapture_count") + 1,
                 )
             self._record_peaks_locked(conn)
+            interested = conn.execute(
+                "SELECT DISTINCT consumer_id FROM interests WHERE source_index=?",
+                (request.source_index,),
+            ).fetchall()
+            for consumer in interested:
+                self._top_up_prefetch_locked(conn, consumer["consumer_id"])
 
     def fail_capture(
         self,

@@ -208,6 +208,24 @@ class TestWindowedCaptureStateMachine(WindowedRegistryFixture):
         self.assertEqual(snapshot["consumers"]["fast"]["cursor"], 1)
         self.assertEqual(snapshot["consumers"]["slow"]["cursor"], 0)
 
+    def test_prefetch_slots_roll_forward_through_the_legal_window(self):
+        self.initialize(samples=8, consumers=("fast",))
+        self.register("fast", lookahead=5, prefetch_depth=2)
+
+        for expected in ((0, 1), (2, 3), (4, 5)):
+            requests = self.registry.claim_batch(8)
+            self.assertEqual(
+                tuple(request.source_index for request in requests),
+                expected,
+            )
+            for request in requests:
+                self.complete(request)
+
+        self.assertEqual(self.registry.claim_batch(8), ())
+        snapshot = self.registry.snapshot()
+        self.assertEqual(snapshot["capture_count"], 6)
+        self.assertEqual(snapshot["consumers"]["fast"]["cursor"], 0)
+
     def test_round_robin_demand_fairness(self):
         self.initialize(samples=6)
         for consumer_id in ("a", "b", "c"):
