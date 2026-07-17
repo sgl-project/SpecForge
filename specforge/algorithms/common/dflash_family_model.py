@@ -140,6 +140,7 @@ class OnlineDFlashModel(nn.Module):
         dpace_alpha: float = 0.5,
         draft_kernel_backend: str = "torch",
         linear_cross_entropy_backend: str = "torch",
+        compact_zero_weight_ce_rows: bool = False,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -167,6 +168,11 @@ class OnlineDFlashModel(nn.Module):
                 "linear_cross_entropy_backend="
                 f"{linear_cross_entropy_backend!r}; must be one of "
                 f"{sorted(_VALID_LINEAR_CE_BACKENDS)}"
+            )
+        if compact_zero_weight_ce_rows and linear_cross_entropy_backend != "liger":
+            raise ValueError(
+                "compact_zero_weight_ce_rows=True requires "
+                "linear_cross_entropy_backend='liger'"
             )
         if linear_cross_entropy_backend == "liger":
             weight = getattr(target_lm_head, "weight", None)
@@ -196,6 +202,7 @@ class OnlineDFlashModel(nn.Module):
         self.dpace_alpha = dpace_alpha
         self.draft_kernel_backend = draft_kernel_backend
         self.linear_cross_entropy_backend = linear_cross_entropy_backend
+        self.compact_zero_weight_ce_rows = compact_zero_weight_ce_rows
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -407,12 +414,33 @@ class OnlineDFlashModel(nn.Module):
         flat_targets = target_ids.view(-1)
         if self.linear_cross_entropy_backend == "liger":
             lm_head_bias = getattr(self.lm_head, "bias", None)
+            flat_hidden = output_hidden.reshape(-1, output_hidden.size(-1))
+            active_indices = None
+            if self.compact_zero_weight_ce_rows:
+                compact_indices = torch.nonzero(
+                    binary_eval_mask > 0, as_tuple=False
+                ).flatten()
+                if compact_indices.numel() > 0:
+                    active_indices = compact_indices
+                    flat_hidden = flat_hidden.index_select(0, active_indices)
+                    ce_targets = flat_targets.index_select(0, active_indices)
+                else:
+                    ce_targets = flat_targets
+            else:
+                ce_targets = flat_targets
             loss_per_token, token_accuracy = frozen_linear_cross_entropy(
-                output_hidden.reshape(-1, output_hidden.size(-1)),
+                flat_hidden,
                 self.lm_head.weight.detach(),
-                flat_targets,
+                ce_targets,
                 lm_head_bias.detach() if lm_head_bias is not None else None,
             )
+            if active_indices is not None:
+                loss_per_token = loss_per_token.new_zeros(
+                    flat_targets.shape
+                ).index_copy(0, active_indices, loss_per_token)
+                token_accuracy = token_accuracy.new_zeros(
+                    flat_targets.shape
+                ).index_copy(0, active_indices, token_accuracy)
         else:
             logits = self.lm_head(output_hidden)
             flat_logits = logits.view(-1, logits.size(-1))
