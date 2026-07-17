@@ -155,8 +155,12 @@ class HFEagle3TargetEngine(Eagle3TargetEngine):
                 "device_mesh": get_tp_device_mesh(),
             }
         else:
+            # Load on CPU first, then move to the target device. This mirrors the
+            # DFlash HF backend and avoids transformers' device_map / allocator
+            # warmup path on NPU, which can run out of memory when the NPU
+            # allocator pool is small even though total device memory is large.
             device_kwargs = {
-                "device_map": device,
+                "low_cpu_mem_usage": True,
             }
 
         target_model = AutoModelForCausalLM.from_pretrained(
@@ -166,6 +170,10 @@ class HFEagle3TargetEngine(Eagle3TargetEngine):
             **device_kwargs,
             **kwargs,
         )
+
+        if tp_size == 1 and device:
+            target_model = target_model.to(device)
+
         return cls(target_model)
 
     def _get_transformer_layers(self):

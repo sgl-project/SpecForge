@@ -377,6 +377,7 @@ class SGLangCaptureBackend:
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         return_last_hidden_states: bool = False,
+        capture_aux_hidden_states: bool = True,
         return_logits: bool = True,
         shard_returns: bool = False,
     ):
@@ -417,7 +418,7 @@ class SGLangCaptureBackend:
         logits_list, aux_hidden_states_list, last_hidden_states_list = (
             self._extend_eagle3(
                 reqs,
-                capture_aux_hidden_states=True,
+                capture_aux_hidden_states=capture_aux_hidden_states,
                 return_last_hidden_states=return_last_hidden_states,
                 return_logits=return_logits,
                 shard_returns=shard_returns,
