@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "run_id": "qwen3-8b-dflash-production",
+  "capture": {
+    "target_model_path": "/path/to/Qwen3-8B",
+    "tokenizer_path": "/path/to/Qwen3-8B",
+    "draft_config_path": "/path/to/SpecForge/configs/qwen3-8b-dflash.json",
+    "train_data_path": "/path/to/training-data.jsonl",
+    "chat_template": "qwen",
+    "is_preformatted": false,
+    "max_length": 3072,
+    "max_prompts": 20,
+    "dataset_num_proc": 8,
+    "capture_layer_ids": [1, 9, 17, 25, 33]
+  },
+  "server": {
+    "python_executable": "/path/to/server-environment/bin/python",
+    "url": "http://127.0.0.1:30000",
+    "gpu": 4,
+    "mem_fraction_static": 0.85,
+    "readiness_timeout_s": 900.0,
+    "readiness_poll_s": 2.0,
+    "trust_remote_code": false
+  },
+  "mooncake": {
+    "mode": "managed",
+    "master_executable": "/path/to/training-environment/bin/mooncake_master",
+    "local_hostname": "127.0.0.1",
+    "metadata_server": "http://127.0.0.1:8080/metadata",
+    "master_server_addr": "127.0.0.1:50051",
+    "protocol": "tcp",
+    "rdma_devices": "",
+    "global_segment_size": 68719476736,
+    "client_buffer_size": 1073741824,
+    "metrics_port": 50052
+  },
+  "training": {
+    "python_executable": "/path/to/training-environment/bin/python",
+    "batch_size": 2,
+    "accumulation_steps": 1,
+    "attention_backend": "flex_attention",
+    "flex_kernel_options": {"num_stages": 2},
+    "compact_zero_weight_ce_rows": true,
+    "draft_kernel_backend": "liger",
+    "gradient_clip_backend": "fused_adamw",
+    "linear_cross_entropy_backend": "liger",
+    "max_grad_norm": 1.0,
+    "checkpoint": {
+      "periodic": null,
+      "save_epoch_end": true
+    },
+    "log_interval": 1,
+    "mask_token_id": 151669,
+    "embedding_key": null,
+    "lm_head_key": null,
+    "trust_remote_code": false
+  },
+  "runtime": {
+    "delivery_mode": "async_window",
+    "consumer_prefetch_batches": 1,
+    "run_dir": "/path/to/SpecForge/outputs/qwen3-8b-dflash-production",
+    "gpu_lock_path_pattern": "/tmp/specforge-gpu-{gpu_id}.lock",
+    "nvidia_smi_executable": "/usr/bin/nvidia-smi",
+    "gpu_max_used_memory_mib": 1024,
+    "gpu_poll_s": 60.0,
+    "gpu_monitor": {
+      "enabled": true,
+      "poll_s": 1.0,
+      "strict_process_ownership": true
+    },
+    "process_poll_s": 0.5,
+    "termination_grace_s": 20.0,
+    "kill_grace_s": 10.0,
+    "master_readiness_timeout_s": 60.0,
+    "master_readiness_poll_s": 0.5,
+    "idle_timeout_s": 1800.0,
+    "consumer_registration_timeout_s": 300.0,
+    "consumer_heartbeat_timeout_s": 30.0,
+    "consumer_heartbeat_interval_s": 5.0,
+    "finalize_timeout_s": 600.0,
+    "gc_poll_s": 5.0,
+    "window_lookbehind": 2,
+    "window_lookahead": 40,
+    "max_prefetch_per_consumer": 8,
+    "max_outstanding_per_consumer": 8,
+    "max_live_refs": 48,
+    "max_live_bytes": 61847529062,
+    "capture_batch_size": 8,
+    "capture_batch_wait_s": 0.002,
+    "registry_poll_s": 0.01,
+    "max_capture_retries": 2,
+    "capture_retry_backoff_s": 0.05,
+    "capture_reserve_bytes_per_sample": 134217728
+  },
+  "variants": [
+    {
+      "subscription_id": "dflash-g7",
+      "seed": 42,
+      "loss_type": "dflash",
+      "loss_decay_gamma": 7.0,
+      "dpace_alpha": 0.5,
+      "num_anchors": 256,
+      "learning_rate": 0.0006,
+      "warmup_ratio": 0.04,
+      "gpu": 3
+    },
+    {
+      "subscription_id": "dflash-uniform",
+      "seed": 43,
+      "loss_type": "dflash",
+      "loss_decay_gamma": null,
+      "dpace_alpha": 0.5,
+      "num_anchors": 256,
+      "learning_rate": 0.0006,
+      "warmup_ratio": 0.04,
+      "gpu": 5
+    },
+    {
+      "subscription_id": "dpace-a05",
+      "seed": 44,
+      "loss_type": "dpace",
+      "loss_decay_gamma": null,
+      "dpace_alpha": 0.5,
+      "num_anchors": 256,
+      "learning_rate": 0.0006,
+      "warmup_ratio": 0.04,
+      "gpu": 7
+    }
+  ]
+}
