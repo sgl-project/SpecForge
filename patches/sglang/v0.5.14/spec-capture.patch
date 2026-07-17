@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index a99d25267..f5d0b35e7 100644
+index a99d252..f5d0b35 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -94,6 +94,9 @@ class LogitsProcessorOutput:
@@ -9,7 +9,7 @@ index a99d25267..f5d0b35e7 100644
 +    # Spec-training capture: under FULL+aux, `hidden_states` is the aux
 +    # concatenation, so the post-norm last hidden is exposed here separately.
 +    last_hidden_states: Optional[torch.Tensor] = None
- 
+
      ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
      # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
 @@ -361,6 +364,16 @@ class LogitsProcessor(nn.Module):
@@ -27,7 +27,7 @@ index a99d25267..f5d0b35e7 100644
 +            else None
 +        )
          del hidden_states
- 
+
          if not logits_metadata.extend_return_logprob:
 @@ -374,6 +387,7 @@ class LogitsProcessor(nn.Module):
              return LogitsProcessorOutput(
@@ -38,7 +38,7 @@ index a99d25267..f5d0b35e7 100644
                  # workaround since ForwardBatch is local to forward_batch_generation().
                  # They should be moved to GenerationBatchResult to keep this class clean.
 diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
-index b05334dea..2853c8231 100644
+index b05334d..2853c82 100644
 --- a/python/sglang/srt/managers/detokenizer_manager.py
 +++ b/python/sglang/srt/managers/detokenizer_manager.py
 @@ -441,6 +441,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
@@ -50,13 +50,13 @@ index b05334dea..2853c8231 100644
              indexer_topk=indexer_topk,
              customized_info=recv_obj.customized_info,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 951f35495..2359c31b7 100644
+index 951f354..2359c31 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -284,6 +284,10 @@ class GenerateReqInput(BaseReq):
      # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
      multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
- 
+
 +    # Spec-training capture sink instructions (see spec_capture_sink.py).
 +    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
 +    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
@@ -79,17 +79,17 @@ index 951f35495..2359c31b7 100644
 @@ -842,6 +851,9 @@ class TokenizedGenerateReqInput(BaseReq):
      # Pre-computed delimiter indices for multi-item scoring
      multi_item_delimiter_indices: Optional[List[int]] = None
- 
+
 +    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
 +    spec_capture: Optional[Dict] = None
 +
      # For observability
      time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
- 
+
 @@ -1179,6 +1191,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
      # The trainer step id. Used to know which step's weights are used for sampling.
      token_steps: List[List[int]] = None
- 
+
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
@@ -99,7 +99,7 @@ index 951f35495..2359c31b7 100644
 @@ -1247,6 +1262,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
      # The trainer step id. Used to know which step's weights are used for sampling.
      token_steps: List[List[int]] = None
- 
+
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
@@ -107,7 +107,7 @@ index 951f35495..2359c31b7 100644
      customized_info: Optional[Dict[str, List[Any]]] = None
      # Detailed breakdown of cached tokens by source (device/host/storage)
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index f1dc81d17..a93a466b7 100755
+index f1dc81d..e4e84cd 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -708,6 +708,7 @@ class Req(ReqDllmMixin):
@@ -122,25 +122,36 @@ index f1dc81d17..a93a466b7 100755
              }
          self.sampling_params = sampling_params
          self.custom_logit_processor = custom_logit_processor
--        self.return_hidden_states = return_hidden_states
-+        # Spec-training capture: piggyback the return_hidden_states path (fires
-+        # CaptureHiddenMode.FULL); the sink consumes the slices, not the response.
++        # Keep the client response flag separate from internal spec capture.
++        # ScheduleBatch enables CaptureHiddenMode.FULL for either use case.
 +        self.spec_capture = spec_capture
-+        self.return_hidden_states = return_hidden_states or spec_capture is not None
+         self.return_hidden_states = return_hidden_states
 +        self.spec_capture_aux: List[torch.Tensor] = []
 +        self.spec_capture_last_hidden: List[torch.Tensor] = []
 +        self.spec_capture_result = None  # per-request sink result -> output field
- 
+
          # extra key for classifying the request (e.g. cache_salt)
          if lora_id is not None:
+@@ -1865,7 +1872,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             has_grammar=any(req.grammar for req in reqs),
+             device=req_to_token_pool.device,
+             spec_algorithm=spec_algorithm,
+-            return_hidden_states=any(req.return_hidden_states for req in reqs),
++            return_hidden_states=any(
++                req.return_hidden_states or req.spec_capture is not None
++                for req in reqs
++            ),
+             is_prefill_only=all(req.is_prefill_only for req in reqs),
+             chunked_req=chunked_req,
+             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index abba37441..3018b8247 100644
+index abba374..701ee17 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -576,6 +576,25 @@ class Scheduler(
- 
+
          self.init_batch_result_processor()
- 
+
 +        if server_args.enable_spec_capture:
 +            # Capture needs single-pass prefill; chunking would drop all but the
 +            # final chunk's hidden rows.
@@ -161,23 +172,23 @@ index abba37441..3018b8247 100644
 +            spec_capture_sink.maybe_init_sink(server_args)
 +
          self.is_initializing = False
- 
+
      def init_zbal_on_npu(self):
-@@ -2054,6 +2067,7 @@ class Scheduler(
+@@ -2054,6 +2073,7 @@ class Scheduler(
                  dllm_config=self.dllm_config,
                  time_stats=recv_req.time_stats,
                  multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
 +                spec_capture=recv_req.spec_capture,
              )
              req.tokenizer = self.tokenizer
- 
+
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index a9d5f0c28..001eff804 100644
+index a9d5f0c..001eff8 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -257,6 +257,18 @@ class SchedulerBatchResultProcessor:
                          )
- 
+
                      if (
 +                        req.spec_capture is not None
 +                        and logits_output.hidden_states is not None
@@ -194,10 +205,10 @@ index a9d5f0c28..001eff804 100644
                          req.return_hidden_states
                          and logits_output.hidden_states is not None
                      ):
-@@ -462,6 +474,62 @@ class SchedulerBatchResultProcessor:
+@@ -462,6 +474,66 @@ class SchedulerBatchResultProcessor:
                      f"Placeholder zeros would be appended to output_ids."
                  )
- 
+
 +    def _append_spec_capture_states(
 +        self,
 +        *,
@@ -208,15 +219,19 @@ index a9d5f0c28..001eff804 100644
 +        """Accumulate captured rows as CPU tensors for the Mooncake sink.
 +
 +        Same offset arithmetic as ``_append_prefill_hidden_states`` but keeps
-+        tensor slices (aux concat in ``hidden_states``, post-norm last in
-+        ``last_hidden_states``) rather than the JSON-able response payload.
++        only the artifacts requested by this capture as CPU tensor slices.
 +        """
 +        start = hidden_state_offset
 +        end = start + len(req.origin_input_ids)
-+        req.spec_capture_aux.append(
-+            logits_output.hidden_states[start:end].cpu().clone()
-+        )
-+        if logits_output.last_hidden_states is not None:
++        requested_artifacts = req.spec_capture.get("features") or {}
++        if "aux" in requested_artifacts:
++            req.spec_capture_aux.append(
++                logits_output.hidden_states[start:end].cpu().clone()
++            )
++        if (
++            "last_hidden" in requested_artifacts
++            and logits_output.last_hidden_states is not None
++        ):
 +            req.spec_capture_last_hidden.append(
 +                logits_output.last_hidden_states[start:end].cpu().clone()
 +            )
@@ -258,7 +273,7 @@ index a9d5f0c28..001eff804 100644
          self,
          *,
 diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-index f95c59f6f..9e64326a1 100644
+index f95c59f..9e64326 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
 @@ -273,6 +273,7 @@ class _GenerationStreamAccumulator:
@@ -287,7 +302,7 @@ index f95c59f6f..9e64326a1 100644
              indexer_topk=self.indexer_topk,
              customized_info=self.customized_info,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index bf932611a..f0e821ec4 100644
+index bf93261..f0e821e 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -1172,6 +1172,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -310,13 +325,13 @@ index bf932611a..f0e821ec4 100644
                  val = recv_obj.routed_experts[i]
                  if val is not None:
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 1cff5c983..a5935fa3c 100644
+index 1cff5c9..a5935fa 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -471,6 +471,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                      # if there is no aux layer, set to None
                      self.eagle_aux_hidden_state_layer_ids = None
- 
+
 +        if server_args.enable_spec_capture and not self.is_draft_worker:
 +            # Aux capture without a draft worker, routed to the strategy's own
 +            # capture method (they wire different submodules — e.g. VL models
@@ -332,12 +347,28 @@ index 1cff5c983..a5935fa3c 100644
 +
          if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
              from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
- 
+
+diff --git a/python/sglang/srt/models/qwen2.py b/python/sglang/srt/models/qwen2.py
+--- a/python/sglang/srt/models/qwen2.py
++++ b/python/sglang/srt/models/qwen2.py
+@@ -386,6 +386,12 @@ class Qwen2Model(nn.Module):
+                 }
+             )
+         else:
++            # Capture after the final transformer layer but before final norm.
++            # The ordinary pre-layer hook cannot observe end_layer itself.
++            if self.end_layer in self.layers_to_capture:
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             if hidden_states.shape[0] != 0:
+                 if residual is None:
+                     hidden_states = self.norm(hidden_states)
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index c7162c16d..d515b3c69 100644
+index c7162c1..d7c98f1 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -2127,6 +2127,25 @@ class ServerArgs:
+@@ -2127,6 +2127,44 @@ class ServerArgs:
          bool,
          "Enable returning hidden states with responses.",
      ] = False
@@ -360,15 +391,34 @@ index c7162c16d..d515b3c69 100644
 +        "match the draft strategy being trained; they wire capture onto "
 +        "different submodules (VL targets only populate the dflash path).",
 +    ] = "eagle3"
++    spec_capture_store_id: A[
++        Optional[str],
++        "Server-owned Mooncake namespace for spec capture. Required with "
++        "--enable-spec-capture; requests cannot override it.",
++    ] = None
++    spec_capture_max_sample_bytes: A[
++        int,
++        "Maximum total bytes a single spec-capture request may hard-pin.",
++    ] = 1 << 30
++    spec_capture_inventory_db: A[
++        Optional[str],
++        "Server-side durable capture transaction inventory. Required with "
++        "--enable-spec-capture so response-loss retries can reclaim old keys.",
++    ] = None
++    spec_capture_lifecycle_db: A[
++        Optional[str],
++        "Shared SpecForge owner lifecycle DB. Every planned Mooncake key is "
++        "recorded here before its first hard-pinned write.",
++    ] = None
      enable_return_routed_experts: A[
          bool,
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 000000000..d317b2801
+index 0000000..a633c56
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,620 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -377,9 +427,9 @@ index 000000000..d317b2801
 +#     http://www.apache.org/licenses/LICENSE-2.0
 +"""Server-side spec-training capture sink (SpecForge DataFlow transport).
 +
-+Under ``--enable-spec-capture``, a request's ``spec_capture`` dict tells this
-+sink to write the prefill's captured tensors straight into a Mooncake store
-+(one hard-pinned object per tensor at ``{store_id}/{sample_id}/g{gen}/{name}``,
++Under ``--enable-spec-capture``, an authenticated request's ``spec_capture``
++dict tells this sink to write captured tensors into the server-owned Mooncake
++namespace (one object per tensor at ``{store_id}/{sample_id}/g{gen}/{name}``,
 +raw bytes — shape/dtype travel on the returned spec). Feature tensors never
 +touch the response path; ``meta_info["spec_capture"]`` returns only keys +
 +shapes/dtypes. Strategy naming is the client's (the ``features`` mapping); the
@@ -388,7 +438,7 @@ index 000000000..d317b2801
 +
 +Request schema::
 +
-+    {"store_id", "sample_id", "gen", "replace", # key namespace / retry policy
++    {"auth_token", "sample_id", "gen",        # capability / id / staleness
 +     "features": {"aux": <name>, "last_hidden": <name>},   # artifact -> feature
 +     "passthrough": [{"name", "data", "shape", "dtype"}]}  # client tensors verbatim
 +
@@ -401,9 +451,15 @@ index 000000000..d317b2801
 +
 +from __future__ import annotations
 +
++import hmac
++import json
 +import logging
++import math
 +import os
++import re
++import sqlite3
 +import threading
++import time
 +from typing import Any, Dict, List, Optional
 +
 +import torch
@@ -428,19 +484,92 @@ index 000000000..d317b2801
 +
 +_ARTIFACT_AUX = "aux"
 +_ARTIFACT_LAST_HIDDEN = "last_hidden"
++_ALLOWED_FEATURE_NAMES = {
++    "attention_mask",
++    "hidden_state",
++    "hidden_states",
++    "input_ids",
++    "loss_mask",
++    "target",
++}
++_SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
++_MAX_PASSTHROUGH_FEATURES = 8
 +
 +
 +class SpecCaptureSink:
 +    """Writes captured per-request tensors into Mooncake in SpecForge layout."""
 +
-+    def __init__(self, aux_layer_ids: Optional[List[int]] = None) -> None:
++    def __init__(
++        self,
++        *,
++        store_id: str,
++        auth_token: str,
++        max_sample_bytes: int,
++        inventory_db_path: str,
++        lifecycle_db_path: str,
++        aux_layer_ids: Optional[List[int]] = None,
++    ) -> None:
++        if not store_id or "/" in store_id or store_id in {".", ".."}:
++            raise ValueError("spec-capture store id must be one safe path segment")
++        if not auth_token:
++            raise ValueError("SGLANG_SPEC_CAPTURE_TOKEN must be non-empty")
++        if max_sample_bytes <= 0:
++            raise ValueError("spec-capture max sample bytes must be positive")
++        if not inventory_db_path:
++            raise ValueError("spec-capture inventory DB path must be non-empty")
++        if not lifecycle_db_path:
++            raise ValueError("spec-capture lifecycle DB path must be non-empty")
++        self.store_id = store_id
++        self.auth_token = auth_token
++        self.max_sample_bytes = int(max_sample_bytes)
 +        self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else None
++        self.inventory_db_path = os.path.abspath(inventory_db_path)
++        os.makedirs(os.path.dirname(self.inventory_db_path), exist_ok=True)
++        self._inventory = sqlite3.connect(
++            self.inventory_db_path, check_same_thread=False, timeout=30.0
++        )
++        self._inventory.execute("PRAGMA journal_mode=WAL")
++        self._inventory.execute("PRAGMA synchronous=FULL")
++        self._inventory.execute("PRAGMA busy_timeout=30000")
++        self._inventory.execute(
++            "CREATE TABLE IF NOT EXISTS captures ("
++            "sample_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, "
++            "keys_json TEXT NOT NULL, result_json TEXT, state TEXT NOT NULL, "
++            "prior_generation INTEGER, prior_keys_json TEXT)"
++        )
++        capture_columns = {
++            row[1] for row in self._inventory.execute("PRAGMA table_info(captures)")
++        }
++        if "prior_generation" not in capture_columns:
++            self._inventory.execute(
++                "ALTER TABLE captures ADD COLUMN prior_generation INTEGER"
++            )
++        if "prior_keys_json" not in capture_columns:
++            self._inventory.execute(
++                "ALTER TABLE captures ADD COLUMN prior_keys_json TEXT"
++            )
++        self._inventory.commit()
++        self.lifecycle_db_path = os.path.abspath(lifecycle_db_path)
++        os.makedirs(os.path.dirname(self.lifecycle_db_path), exist_ok=True)
++        self._lifecycle = sqlite3.connect(
++            self.lifecycle_db_path, check_same_thread=False, timeout=30.0
++        )
++        self._lifecycle.execute("PRAGMA journal_mode=WAL")
++        self._lifecycle.execute("PRAGMA synchronous=FULL")
++        self._lifecycle.execute("PRAGMA busy_timeout=30000")
++        self._lifecycle.execute(
++            "CREATE TABLE IF NOT EXISTS mooncake_objects ("
++            "store_id TEXT NOT NULL, sample_id TEXT NOT NULL, "
++            "generation INTEGER NOT NULL, feature_names_json TEXT NOT NULL, "
++            "estimated_bytes INTEGER NOT NULL, state TEXT NOT NULL, "
++            "reason TEXT, updated_at REAL NOT NULL, "
++            "PRIMARY KEY (store_id, sample_id, generation))"
++        )
++        self._lifecycle.commit()
 +        self._store = None
 +        self._put_config = None
 +        self._lock = threading.Lock()
-+        # Retried HTTP requests reuse deterministic keys.  Striped locks keep
-+        # replacement atomic per key without retaining one lock per sample.
-+        self._write_locks = [threading.Lock() for _ in range(256)]
++        self._write_lock = threading.Lock()
 +
 +    # -- connection ---------------------------------------------------------
 +    def _connect(self):
@@ -487,37 +616,291 @@ index 000000000..d317b2801
 +    def _tkey(store_id: str, sample_id: str, gen: int, name: str) -> str:
 +        return f"{store_id}/{sample_id}/g{gen}/{name}"
 +
-+    def _put_tensor(
-+        self, key: str, t: torch.Tensor, *, replace: bool = False
-+    ) -> None:
++    def _put_tensor(self, key: str, t: torch.Tensor) -> None:
 +        store = self._connect()
 +        t = t.detach().to("cpu").contiguous()
 +        nbytes = t.element_size() * t.numel()
-+        lock = self._write_locks[hash(key) % len(self._write_locks)]
-+        with lock:
-+            if replace:
-+                # Do not probe with is_exist(): Mooncake existence checks can
-+                # acquire a read lease that prevents the following removal.
-+                self._remove_quiet(key)
++        try:
++            store.register_buffer(t.data_ptr(), nbytes)
++        except Exception:
++            pass  # some builds auto-register
++        try:
++            rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
++        finally:
 +            try:
-+                store.register_buffer(t.data_ptr(), nbytes)
++                store.unregister_buffer(t.data_ptr())
 +            except Exception:
-+                pass  # some builds auto-register
-+            try:
-+                rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
-+            finally:
-+                try:
-+                    store.unregister_buffer(t.data_ptr())
-+                except Exception:
-+                    pass
++                pass
 +        if rc is not None and int(rc) < 0:
 +            raise RuntimeError(f"spec-capture put_from failed (status {rc}) for {key}")
 +
-+    def _remove_quiet(self, key: str) -> None:
-+        try:
-+            self._connect().remove(key)
-+        except Exception:
-+            pass
++    def _remove_exact(self, key: str, *, force: bool) -> None:
++        store = self._connect()
++        rc = store.remove(key, force)
++        if rc is not None and int(rc) not in (0, -704):
++            raise RuntimeError(
++                f"spec-capture remove failed (status {rc}) for {key}"
++            )
++
++    def _inventory_row(self, sample_id: str):
++        return self._inventory.execute(
++            "SELECT generation, keys_json, result_json, state, "
++            "prior_generation, prior_keys_json FROM captures "
++            "WHERE sample_id=?",
++            (sample_id,),
++        ).fetchone()
++
++    def _record_lifecycle(
++        self,
++        sample_id: str,
++        gen: int,
++        feature_names: List[str],
++        estimated_bytes: int,
++        state: str,
++    ) -> None:
++        names_json = json.dumps(sorted(feature_names), separators=(",", ":"))
++        row = self._lifecycle.execute(
++            "SELECT feature_names_json, estimated_bytes, state FROM "
++            "mooncake_objects WHERE store_id=? AND sample_id=? AND generation=?",
++            (self.store_id, sample_id, gen),
++        ).fetchone()
++        if row is not None:
++            if row[0] != names_json or int(row[1]) != int(estimated_bytes):
++                raise RuntimeError(
++                    f"spec-capture lifecycle identity changed for {sample_id} "
++                    f"generation {gen}"
++                )
++            if row[2] in {"tombstoned", "cleaned"}:
++                raise RuntimeError(
++                    f"spec-capture lifecycle refuses {sample_id} generation {gen} "
++                    f"from state {row[2]!r}"
++                )
++            if state == "planned" or row[2] == "resident":
++                return
++            self._lifecycle.execute(
++                "UPDATE mooncake_objects SET state='resident', updated_at=? WHERE "
++                "store_id=? AND sample_id=? AND generation=? AND state='planned'",
++                (time.time(), self.store_id, sample_id, gen),
++            )
++        else:
++            self._lifecycle.execute(
++                "INSERT INTO mooncake_objects "
++                "(store_id, sample_id, generation, feature_names_json, "
++                "estimated_bytes, state, reason, updated_at) "
++                "VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
++                (
++                    self.store_id,
++                    sample_id,
++                    gen,
++                    names_json,
++                    int(estimated_bytes),
++                    state,
++                    time.time(),
++                ),
++            )
++        self._lifecycle.commit()
++
++    def _mark_lifecycle_cleaned(self, sample_id: str, gen: int) -> None:
++        self._lifecycle.execute(
++            "UPDATE mooncake_objects SET state='cleaned', updated_at=? WHERE "
++            "store_id=? AND sample_id=? AND generation=?",
++            (time.time(), self.store_id, sample_id, gen),
++        )
++        self._lifecycle.commit()
++
++    def _reject_stale_generation(self, sample_id: str, gen: int) -> None:
++        row = self._inventory_row(sample_id)
++        if row is not None and int(row[0]) > gen:
++            raise ValueError(
++                f"stale spec-capture generation {gen}; latest is {row[0]}"
++            )
++
++    def _finish_replacement(
++        self,
++        sample_id: str,
++        gen: int,
++        prior_gen: int,
++        prior_keys: List[str],
++    ) -> None:
++        for key in prior_keys:
++            self._remove_exact(key, force=False)
++        self._mark_lifecycle_cleaned(sample_id, prior_gen)
++        cursor = self._inventory.execute(
++            "UPDATE captures SET state='writing', prior_generation=NULL, "
++            "prior_keys_json=NULL WHERE sample_id=? AND generation=? "
++            "AND state='replacing'",
++            (sample_id, gen),
++        )
++        if cursor.rowcount != 1:
++            raise RuntimeError(
++                f"spec-capture replacement journal changed for {sample_id} "
++                f"generation {gen}"
++            )
++        self._inventory.commit()
++
++    def _prepare_write(self, sample_id: str, gen: int, keys: List[str]):
++        row = self._inventory_row(sample_id)
++        if row is None:
++            self._inventory.execute(
++                "INSERT INTO captures "
++                "(sample_id, generation, keys_json, result_json, state, "
++                "prior_generation, prior_keys_json) "
++                "VALUES (?, ?, ?, NULL, 'writing', NULL, NULL)",
++                (sample_id, gen, json.dumps(keys, separators=(",", ":"))),
++            )
++            self._inventory.commit()
++            return None
++
++        current_gen, keys_json, result_json, state, prior_gen, prior_keys_json = row
++        current_gen = int(current_gen)
++        if current_gen > gen:
++            raise ValueError(
++                f"stale spec-capture generation {gen}; latest is {current_gen}"
++            )
++        if current_gen == gen and state == "committed":
++            return json.loads(result_json)
++        if state == "replacing":
++            if prior_gen is None or prior_keys_json is None:
++                raise RuntimeError(
++                    f"incomplete replacement journal for {sample_id} generation "
++                    f"{current_gen}"
++                )
++            self._finish_replacement(
++                sample_id,
++                current_gen,
++                int(prior_gen),
++                list(json.loads(prior_keys_json)),
++            )
++            row = self._inventory_row(sample_id)
++            current_gen, keys_json, result_json, state, _, _ = row
++            current_gen = int(current_gen)
++        if current_gen == gen:
++            if state != "writing":
++                raise RuntimeError(
++                    f"invalid spec-capture inventory state {state!r} for "
++                    f"{sample_id}"
++                )
++            for key in json.loads(keys_json):
++                self._remove_exact(key, force=True)
++            return None
++        if state not in {"writing", "committed"}:
++            raise RuntimeError(
++                f"invalid spec-capture inventory state {state!r} for {sample_id}"
++            )
++
++        prior_keys = list(json.loads(keys_json))
++        self._inventory.execute(
++            "INSERT OR REPLACE INTO captures "
++            "(sample_id, generation, keys_json, result_json, state, "
++            "prior_generation, prior_keys_json) "
++            "VALUES (?, ?, ?, NULL, 'replacing', ?, ?)",
++            (
++                sample_id,
++                gen,
++                json.dumps(keys, separators=(",", ":")),
++                current_gen,
++                json.dumps(prior_keys, separators=(",", ":")),
++            ),
++        )
++        self._inventory.commit()
++        self._finish_replacement(sample_id, gen, current_gen, prior_keys)
++        return None
++
++    def _commit_write(self, sample_id: str, gen: int, result: Dict[str, Any]):
++        cursor = self._inventory.execute(
++            "UPDATE captures SET result_json=?, state='committed' "
++            "WHERE sample_id=? AND generation=? AND state='writing'",
++            (json.dumps(result, separators=(",", ":")), sample_id, gen),
++        )
++        if cursor.rowcount != 1:
++            raise RuntimeError(
++                f"spec-capture write transaction changed for {sample_id} "
++                f"generation {gen}"
++            )
++        self._inventory.commit()
++
++    @staticmethod
++    def _validate_feature_name(name: Any) -> str:
++        name = str(name)
++        if name not in _ALLOWED_FEATURE_NAMES:
++            raise ValueError(f"spec-capture feature name {name!r} is not allowed")
++        return name
++
++    def _validate_request(
++        self,
++        spec: Dict[str, Any],
++        aux: Optional[torch.Tensor],
++        last_hidden: Optional[torch.Tensor],
++    ) -> tuple[str, int, Dict[str, str], List[Dict[str, Any]], int]:
++        supplied = str(spec.get("auth_token") or "")
++        if not hmac.compare_digest(supplied, self.auth_token):
++            raise PermissionError("invalid spec-capture capability")
++        if "store_id" in spec:
++            raise ValueError("spec-capture store_id is server-owned")
++        sample_id = str(spec.get("sample_id") or "")
++        if not _SAFE_SAMPLE_ID.fullmatch(sample_id) or not sample_id.startswith(
++            self.store_id + ":"
++        ):
++            raise ValueError(
++                "spec-capture sample_id must be safe and prefixed by the "
++                "server-owned store id"
++            )
++        gen = int(spec.get("gen", 1))
++        if not 1 <= gen <= 2**31 - 1:
++            raise ValueError("spec-capture generation is out of range")
++
++        features = dict(spec.get("features") or {})
++        unknown_artifacts = set(features) - {_ARTIFACT_AUX, _ARTIFACT_LAST_HIDDEN}
++        if unknown_artifacts:
++            raise ValueError(
++                f"unknown spec-capture artifacts: {sorted(unknown_artifacts)}"
++            )
++        features = {
++            artifact: self._validate_feature_name(name)
++            for artifact, name in features.items()
++        }
++        passthrough = list(spec.get("passthrough") or [])
++        if len(passthrough) > _MAX_PASSTHROUGH_FEATURES:
++            raise ValueError("too many spec-capture passthrough features")
++
++        names = list(features.values())
++        total_bytes = 0
++        selected_artifacts = (
++            (_ARTIFACT_AUX, aux),
++            (_ARTIFACT_LAST_HIDDEN, last_hidden),
++        )
++        for artifact, tensor in selected_artifacts:
++            if artifact in features and tensor is not None:
++                total_bytes += tensor.element_size() * tensor.numel()
++        for item in passthrough:
++            name = self._validate_feature_name(item.get("name"))
++            names.append(name)
++            dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
++            if dtype is None:
++                raise ValueError(
++                    f"spec-capture passthrough {name!r} has unsupported dtype "
++                    f"{item.get('dtype')!r}"
++                )
++            shape = [int(d) for d in item.get("shape") or []]
++            if not shape or len(shape) > 4 or any(d <= 0 for d in shape):
++                raise ValueError(
++                    f"spec-capture passthrough {name!r} has invalid shape {shape}"
++                )
++            numel = math.prod(shape)
++            if numel != len(item.get("data") or []):
++                raise ValueError(
++                    f"spec-capture passthrough {name!r} shape requires {numel} "
++                    f"values, got {len(item.get('data') or [])}"
++                )
++            total_bytes += numel * torch.empty((), dtype=dtype).element_size()
++        if len(names) != len(set(names)):
++            raise ValueError("spec-capture feature names must be unique")
++        if total_bytes > self.max_sample_bytes:
++            raise ValueError(
++                f"spec-capture sample is {total_bytes} bytes, above the "
++                f"{self.max_sample_bytes}-byte limit"
++            )
++        return sample_id, gen, features, passthrough, total_bytes
 +
 +    # -- the one entry point --------------------------------------------------
 +    def put_sample(
@@ -533,65 +916,85 @@ index 000000000..d317b2801
 +        stored with a leading batch dim of 1. On any failure the keys already
 +        written are best-effort removed (no partial sample is consumable).
 +        """
-+        store_id = str(spec["store_id"])
-+        sample_id = str(spec["sample_id"])
-+        gen = int(spec.get("gen", 1))
-+        replace = bool(spec.get("replace", False))
-+        features: Dict[str, str] = dict(spec.get("features") or {})
++        sample_id, gen, features, passthrough, total_bytes = self._validate_request(
++            spec, aux, last_hidden
++        )
 +
-+        written: List[str] = []
++        artifact_names = list(features.values()) + [
++            str(item["name"]) for item in passthrough
++        ]
++        planned_keys = [
++            self._tkey(self.store_id, sample_id, gen, name)
++            for name in artifact_names
++        ]
 +        result_feats: Dict[str, Dict[str, Any]] = {}
 +
 +        def _write(name: str, t: torch.Tensor) -> None:
-+            key = self._tkey(store_id, sample_id, gen, name)
-+            self._put_tensor(key, t, replace=replace)
-+            written.append(key)
++            key = self._tkey(self.store_id, sample_id, gen, name)
++            self._put_tensor(key, t)
 +            result_feats[name] = {
 +                "shape": list(t.shape),
 +                "dtype": _DTYPE_STR.get(t.dtype, str(t.dtype).replace("torch.", "")),
 +            }
 +
-+        try:
-+            aux_name = features.get(_ARTIFACT_AUX)
-+            if aux_name is not None:
-+                if aux is None:
-+                    raise RuntimeError(
++        with self._write_lock:
++            self._reject_stale_generation(sample_id, gen)
++            self._record_lifecycle(
++                sample_id, gen, artifact_names, total_bytes, "planned"
++            )
++            cached = self._prepare_write(sample_id, gen, planned_keys)
++            if cached is not None:
++                self._record_lifecycle(
++                    sample_id, gen, artifact_names, total_bytes, "resident"
++                )
++                return cached
++            try:
++                aux_name = features.get(_ARTIFACT_AUX)
++                if aux_name is not None:
++                    if aux is None:
++                        raise RuntimeError(
 +                        "spec_capture requested 'aux' but no aux hidden states were "
 +                        "captured — launch the server with --enable-spec-capture "
 +                        "(and optionally --spec-capture-aux-layer-ids)"
 +                    )
-+                _write(aux_name, aux.unsqueeze(0))
-+            lh_name = features.get(_ARTIFACT_LAST_HIDDEN)
-+            if lh_name is not None:
-+                if last_hidden is None:
-+                    raise RuntimeError(
++                    _write(aux_name, aux.unsqueeze(0))
++                lh_name = features.get(_ARTIFACT_LAST_HIDDEN)
++                if lh_name is not None:
++                    if last_hidden is None:
++                        raise RuntimeError(
 +                        "spec_capture requested 'last_hidden' but the logits "
 +                        "processor did not return it (is aux capture enabled?)"
 +                    )
-+                _write(lh_name, last_hidden.unsqueeze(0))
-+            for item in spec.get("passthrough") or []:
-+                dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
-+                if dtype is None:
-+                    raise RuntimeError(
++                    _write(lh_name, last_hidden.unsqueeze(0))
++                for item in passthrough:
++                    dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
++                    if dtype is None:
++                        raise RuntimeError(
 +                        f"spec_capture passthrough {item.get('name')!r}: "
 +                        f"unsupported dtype {item.get('dtype')!r}"
 +                    )
-+                t = torch.tensor(item["data"], dtype=dtype).reshape(
-+                    [int(d) for d in item["shape"]]
-+                )
-+                _write(str(item["name"]), t)
-+        except Exception:
-+            for key in written:
-+                self._remove_quiet(key)
-+            raise
++                    t = torch.tensor(item["data"], dtype=dtype).reshape(
++                        [int(d) for d in item["shape"]]
++                    )
++                    _write(str(item["name"]), t)
++            except Exception:
++                for key in planned_keys:
++                    self._remove_exact(key, force=True)
++                self._mark_lifecycle_cleaned(sample_id, gen)
++                raise
 +
-+        return {
-+            "sample_id": sample_id,
-+            "store_id": store_id,
-+            "gen": gen,
-+            "aux_layer_ids": self.aux_layer_ids,
-+            "features": result_feats,
-+        }
++            result = {
++                "sample_id": sample_id,
++                "store_id": self.store_id,
++                "gen": gen,
++                "aux_layer_ids": self.aux_layer_ids,
++                "features": result_feats,
++            }
++            self._commit_write(sample_id, gen, result)
++            self._record_lifecycle(
++                sample_id, gen, artifact_names, total_bytes, "resident"
++            )
++            return result
 +
 +
 +_SINK: Optional[SpecCaptureSink] = None
@@ -605,7 +1008,31 @@ index 000000000..d317b2801
 +    """
 +    global _SINK
 +    if getattr(server_args, "enable_spec_capture", False) and _SINK is None:
++        store_id = getattr(server_args, "spec_capture_store_id", None)
++        if not store_id:
++            raise ValueError(
++                "--enable-spec-capture requires --spec-capture-store-id"
++            )
++        auth_token = os.environ.get("SGLANG_SPEC_CAPTURE_TOKEN")
++        if not auth_token:
++            raise ValueError(
++                "--enable-spec-capture requires SGLANG_SPEC_CAPTURE_TOKEN"
++            )
++        lifecycle_db_path = getattr(server_args, "spec_capture_lifecycle_db", None)
++        if not lifecycle_db_path:
++            raise ValueError(
++                "--enable-spec-capture requires --spec-capture-lifecycle-db"
++            )
 +        _SINK = SpecCaptureSink(
++            store_id=store_id,
++            auth_token=auth_token,
++            max_sample_bytes=getattr(
++                server_args, "spec_capture_max_sample_bytes", 1 << 30
++            ),
++            inventory_db_path=getattr(
++                server_args, "spec_capture_inventory_db", None
++            ),
++            lifecycle_db_path=lifecycle_db_path,
 +            aux_layer_ids=getattr(server_args, "spec_capture_aux_layer_ids", None)
 +        )
 +

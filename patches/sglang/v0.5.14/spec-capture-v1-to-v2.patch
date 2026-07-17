@@ -1,0 +1,29 @@
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -484,15 +484,19 @@ class SchedulerBatchResultProcessor:
+         """Accumulate captured rows as CPU tensors for the Mooncake sink.
+
+         Same offset arithmetic as ``_append_prefill_hidden_states`` but keeps
+-        tensor slices (aux concat in ``hidden_states``, post-norm last in
+-        ``last_hidden_states``) rather than the JSON-able response payload.
++        only the artifacts requested by this capture as CPU tensor slices.
+         """
+         start = hidden_state_offset
+         end = start + len(req.origin_input_ids)
+-        req.spec_capture_aux.append(
+-            logits_output.hidden_states[start:end].cpu().clone()
+-        )
+-        if logits_output.last_hidden_states is not None:
++        requested_artifacts = req.spec_capture.get("features") or {}
++        if "aux" in requested_artifacts:
++            req.spec_capture_aux.append(
++                logits_output.hidden_states[start:end].cpu().clone()
++            )
++        if (
++            "last_hidden" in requested_artifacts
++            and logits_output.last_hidden_states is not None
++        ):
+             req.spec_capture_last_hidden.append(
+                 logits_output.last_hidden_states[start:end].cpu().clone()
+             )
