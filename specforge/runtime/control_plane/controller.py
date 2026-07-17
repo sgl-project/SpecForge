@@ -27,13 +27,20 @@ import dataclasses
 import threading
 import uuid
 from collections import OrderedDict, deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
+from specforge.runtime.contracts import (
+    DeploymentMode,
+    PromptTask,
+    SampleRef,
+    assert_no_tensors,
+)
 from specforge.runtime.control_plane.backpressure import BackpressureController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
+    NoOpMetadataStore,
+    SQLiteMetadataStore,
 )
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
@@ -82,6 +89,7 @@ class DataFlowController:
         sample_queue: Optional[SampleRefQueue] = None,
         metadata_store: Optional[MetadataStore] = None,
         backpressure: Optional[BackpressureController] = None,
+        max_prompt_attempts: Optional[int] = None,
     ) -> None:
         self.run_id = run_id
         self.sample_queue = sample_queue or SampleRefQueue()
@@ -90,6 +98,10 @@ class DataFlowController:
         # behavior). The controller owns the pause decision; the policy only
         # reads capacity (FeatureStore.health) — no tensors cross this seam.
         self.backpressure = backpressure
+        # Retryable-failure bound: a task failed this many attempts goes
+        # terminal instead of requeueing (None = retry forever). Bounds a
+        # poisoned prompt that would otherwise pin the pool non-empty forever.
+        self.max_prompt_attempts = max_prompt_attempts
         self._prompts: "OrderedDict[str, PromptTask]" = OrderedDict()
         self._prompt_pending: Deque[str] = deque()
         self._prompt_leased: Dict[str, str] = {}  # task_id -> worker_id
@@ -186,14 +198,24 @@ class DataFlowController:
                 task = self._prompts.get(task_id)
                 if task is None:
                     continue
-                if retryable:
+                attempts_left = (
+                    self.max_prompt_attempts is None
+                    or task.attempt + 1 < self.max_prompt_attempts
+                )
+                if retryable and attempts_left:
                     self._prompts[task_id] = dataclasses.replace(
                         task, attempt=task.attempt + 1
                     )
                     if task_id not in self._prompt_pending:
                         self._prompt_pending.append(task_id)
+                elif retryable:
+                    self._prompt_failed[task_id] = (
+                        f"{reason} (attempts exhausted: {task.attempt + 1})"
+                    )
+                    self._prompts.pop(task_id, None)
                 else:
                     self._prompt_failed[task_id] = reason
+                    self._prompts.pop(task_id, None)
 
     def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> None:
         fresh: List[SampleRef] = []
@@ -204,6 +226,7 @@ class DataFlowController:
             if ref.source_task_id is not None:
                 with self._lock:
                     self._prompt_leased.pop(ref.source_task_id, None)
+                    self._prompts.pop(ref.source_task_id, None)
             fresh.append(ref)
         if fresh:
             self.sample_queue.put(fresh)
@@ -269,35 +292,22 @@ class DataFlowController:
     def reconcile_on_restart(
         self, feature_store: Optional[Any] = None
     ) -> Dict[str, Any]:
-        """Rebuild queue + release state from the single durable marker.
+        """Rebuild queue + release state from the durable ``{acked, global_step,
+        optimizer_durable}`` marker; call once on a fresh controller over a
+        *durable* store after a crash.
 
-        Call once on a fresh controller backed by a *durable* metadata store
-        (e.g. ``SQLiteMetadataStore`` reopened on the same DB file) after a crash.
-        In-process lease state did not survive the crash, so release state is
-        *derived* solely from the durable ``{acked, global_step}`` marker — never
-        a separate fact that could disagree with the optimizer step.
-
-        Per ``failure_recovery.md`` (B4), each committed sample lands in one row:
-
-        | durable state                | action                              |
-        |------------------------------|-------------------------------------|
-        | acked AND step committed     | released (idempotent free)          |
-        | committed, not durably acked | replay/requeue (at-least-once)      |
-        | never committed (in-flight)  | not here; rollout retries on id     |
-
-        Re-training a leased-but-unacked sample is allowed (idempotent effects);
-        the guarantee is **no data loss** (every committed-unacked sample is
-        requeued) and **no duplicate train** (an acked+stepped sample is never
-        requeued — the exact crash window "after ack, before release" is safe
-        because the durable ack already records it as trained).
+        Committed-but-unacked samples are requeued (at-least-once; re-training an
+        unacked sample is safe). Acked samples under the optimizer-durable marker
+        are released and never requeued — trusting the marker ALONE: resuming a
+        checkpoint whose global_step is OLDER than the marker's still releases
+        samples whose weight updates that rollback discarded. That pairing is
+        data loss reconcile cannot repair; the caller must reject it (the
+        disagg-online builders raise on it).
         """
         marker = self.store.durable_marker()
         acked = marker["acked"]
-        # Release eligibility is gated on the optimizer-durable marker, NOT on a
-        # global_step scalar that the ack API leaves None by default — otherwise a
-        # durable ack with global_step omitted would force every acked sample to
-        # replay (duplicate train). (Coarse: optimizer_durable is a run-level
-        # flag; a per-sample durability column is the future refinement.)
+        # Release gates on the optimizer-durable flag, not the global_step scalar
+        # (acks may omit global_step; forcing replay then would duplicate-train).
         step_committed = bool(marker["optimizer_durable"])
         requeued: List[str] = []
         released: List[str] = []
@@ -355,4 +365,21 @@ class DataFlowController:
         return status
 
 
-__all__ = ["DataFlowController", "TrainLease"]
+def build_control_plane_for_mode(
+    deployment_mode: DeploymentMode,
+    run_id: str,
+    *,
+    metadata_db_path: Optional[str] = None,
+) -> Tuple[DataFlowController, bool]:
+    """Build the control-plane collaborators for a deployment mode."""
+    if deployment_mode == "local_colocated":
+        store: Optional[MetadataStore] = NoOpMetadataStore()
+        durable_ack = False
+    else:
+        store = SQLiteMetadataStore(metadata_db_path) if metadata_db_path else None
+        durable_ack = True
+    controller = DataFlowController(run_id, metadata_store=store)
+    return controller, durable_ack
+
+
+__all__ = ["DataFlowController", "TrainLease", "build_control_plane_for_mode"]

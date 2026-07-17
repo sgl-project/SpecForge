@@ -22,14 +22,14 @@ from transformers import AutoConfig
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
-from specforge.core.domino import OnlineDominoModel
+from specforge.core.dflash import OnlineDominoModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.target.dflash_target_model import (
+from specforge.inference.target_engine.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
 )
+from specforge.modeling.draft.domino import DominoDraftModel
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -163,7 +163,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
+def build_models(args) -> Tuple[DFlashTargetModel, DominoDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
@@ -240,7 +240,7 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    draft_model = DominoDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -430,13 +430,11 @@ def get_lambda_base(
     lambda_start: float = 1.0,
     decay_ratio: float = 0.5,
 ) -> float:
-    decay_steps = max(1, int(total_steps * decay_ratio))
-    progress = min(global_step / decay_steps, 1.0)
-    lambda_base = lambda_start * (1.0 - progress)
+    # Delegates to the runtime's single source of the Domino lambda schedule so the
+    # standalone script and DominoTrainStrategy cannot drift.
+    from specforge.training.strategies.base import linear_lambda_base
 
-    # Clamp to [0, 1].
-    lambda_base = max(0.0, min(1.0, lambda_base))
-    return lambda_base
+    return linear_lambda_base(global_step, total_steps, lambda_start, decay_ratio)
 
 
 def main():
@@ -479,7 +477,7 @@ def main():
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DFlashDraftModel.from_pretrained(
+        loaded_model = DominoDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
@@ -550,7 +548,7 @@ def main():
         use_orig_params=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
+            buffer_dtype=torch.float32,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )

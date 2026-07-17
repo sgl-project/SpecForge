@@ -2,8 +2,9 @@
 """MTP target-model data generation, decoupled from Eagle3TargetModel.
 
 All MTP-specific logic lives here, including VLM-aware language model and
-transformer-layer discovery.  ``eagle3_target_model.py`` is left untouched
-except for the ``capture_aux_hidden_states`` parameter on ``extend()``.
+transformer-layer discovery.  The only change to the shared EAGLE3 target path
+is the ``capture_aux_hidden_states`` parameter on ``extend()``
+(``specforge/inference/target_engine/sglang_backend/capture.py``).
 """
 
 import logging
@@ -12,7 +13,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from specforge.modeling.target.eagle3_target_model import (
+from specforge.inference.target_engine.eagle3_target_model import (
     CustomEagle3TargetModel,
     Eagle3TargetOutput,
     HFEagle3TargetModel,
