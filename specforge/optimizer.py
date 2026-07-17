@@ -8,6 +8,8 @@ from specforge.utils import print_on_rank0
 
 logger = logging.getLogger(__name__)
 
+_ADAMW_BACKENDS = frozenset({"torch", "fused"})
+
 
 class BF16Optimizer:
     """AdamW over fp32 master copies of the bf16 trainable params, with grad
@@ -21,6 +23,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        adamw_backend="torch",
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -31,9 +34,33 @@ class BF16Optimizer:
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
-        self.optimizer = torch.optim.AdamW(
-            self.fp32_params, lr=lr, weight_decay=weight_decay
-        )
+        if adamw_backend not in _ADAMW_BACKENDS:
+            raise ValueError(
+                f"adamw_backend={adamw_backend!r}; must be one of "
+                f"{sorted(_ADAMW_BACKENDS)}"
+            )
+        if adamw_backend == "fused":
+            devices = {param.device for param in self.fp32_params}
+            if (
+                len(devices) != 1
+                or next(iter(devices), torch.device("cpu")).type != "cuda"
+            ):
+                raise ValueError(
+                    "adamw_backend='fused' requires trainable parameters on one "
+                    "CUDA device"
+                )
+            self.optimizer = torch.optim.AdamW(
+                self.fp32_params,
+                lr=lr,
+                weight_decay=weight_decay,
+                foreach=False,
+                fused=True,
+            )
+        else:
+            self.optimizer = torch.optim.AdamW(
+                self.fp32_params, lr=lr, weight_decay=weight_decay
+            )
+        self.adamw_backend = adamw_backend
         self.last_grad_norm = None
         self._grad_norm_process_group = None
         self._reduce_grad_norm_across_ranks = True
@@ -53,11 +80,16 @@ class BF16Optimizer:
         self._grad_norm_process_group = process_group
         self._reduce_grad_norm_across_ranks = enabled
 
-    def _clip_grad_norm(self):
-        """Clip all FSDP shards with one global L2-norm coefficient."""
-        grads = [mp.grad for mp in self.fp32_params if mp.grad is not None]
+    def _global_grad_norm(self, grads, *, foreach: bool = False):
+        """Return the L2 norm across every rank-local gradient shard."""
         if grads:
-            total_norm_sq = torch.stack([grad.square().sum() for grad in grads]).sum()
+            if foreach:
+                local_norm = torch.nn.utils.get_total_norm(grads, foreach=True)
+                total_norm_sq = local_norm.square()
+            else:
+                total_norm_sq = torch.stack(
+                    [grad.square().sum() for grad in grads]
+                ).sum()
         else:
             device = self.fp32_params[0].device if self.fp32_params else "cpu"
             total_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
@@ -73,11 +105,31 @@ class BF16Optimizer:
                 group=self._grad_norm_process_group,
             )
 
-        total_norm = total_norm_sq.sqrt()
+        return total_norm_sq.sqrt()
+
+    def _clip_grad_norm(self):
+        """Clip all FSDP shards with one global L2-norm coefficient."""
+        grads = [mp.grad for mp in self.fp32_params if mp.grad is not None]
+        total_norm = self._global_grad_norm(grads)
+
         clip_coef = torch.clamp(self.max_grad_norm / (total_norm + 1e-6), max=1.0)
         for grad in grads:
             grad.mul_(clip_coef)
         return total_norm
+
+    def _fused_adamw_step(self):
+        gradients = [mp.grad for mp in self.fp32_params if mp.grad is not None]
+        grad_norm = self._global_grad_norm(gradients, foreach=True)
+        if gradients:
+            self.optimizer.grad_scale = ((grad_norm + 1e-6) / self.max_grad_norm).clamp(
+                min=1.0
+            )
+        try:
+            self.optimizer.step()
+        finally:
+            if hasattr(self.optimizer, "grad_scale"):
+                del self.optimizer.grad_scale
+        return grad_norm
 
     def step(self):
         with torch.no_grad():
@@ -85,9 +137,12 @@ class BF16Optimizer:
                 mp.grad = (
                     p.grad.detach().to(torch.float32) if p.grad is not None else None
                 )
-        grad_norm = self._clip_grad_norm()
+        if self.adamw_backend == "fused":
+            grad_norm = self._fused_adamw_step()
+        else:
+            grad_norm = self._clip_grad_norm()
+            self.optimizer.step()
         self.last_grad_norm = grad_norm.detach()
-        self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
         with torch.no_grad():
@@ -109,7 +164,30 @@ class BF16Optimizer:
                 f"{saved_max_grad_norm} but this run has "
                 f"max_grad_norm={self.max_grad_norm}"
             )
-        self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
+        saved_backend = state_dict.get("adamw_backend", "torch")
+        if saved_backend not in _ADAMW_BACKENDS:
+            raise ValueError(f"checkpoint has invalid adamw_backend={saved_backend!r}")
+        if saved_backend != self.adamw_backend:
+            raise ValueError(
+                "checkpoint adamw_backend does not match this optimizer "
+                f"(checkpoint={saved_backend!r}, current={self.adamw_backend!r})"
+            )
+        optimizer_state = state_dict["optimizer_state_dict"]
+        param_groups = optimizer_state.get("param_groups", [])
+        if saved_backend == "fused" and any(
+            group.get("foreach") is not False or group.get("fused") is not True
+            for group in param_groups
+        ):
+            raise ValueError(
+                "fused AdamW checkpoint does not carry the fused execution flags"
+            )
+        if saved_backend == "torch" and any(
+            group.get("fused") is True for group in param_groups
+        ):
+            raise ValueError(
+                "torch AdamW checkpoint unexpectedly enables the fused backend"
+            )
+        self.optimizer.load_state_dict(optimizer_state)
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
         print_on_rank0("Successfully loaded scheduler state_dict.")
@@ -139,6 +217,7 @@ class BF16Optimizer:
 
     def state_dict(self):
         return {
+            "adamw_backend": self.adamw_backend,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "max_grad_norm": self.max_grad_norm,
