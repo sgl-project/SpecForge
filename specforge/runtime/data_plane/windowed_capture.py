@@ -46,9 +46,9 @@ from typing import (
 )
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
-from specforge.runtime.control_plane.metadata_store import (
-    sample_ref_from_json,
-    sample_ref_to_json,
+from specforge.runtime.data_plane.ref_serialization import (
+    ref_from_dict,
+    ref_to_dict,
 )
 
 if TYPE_CHECKING:
@@ -509,7 +509,7 @@ class SQLiteWindowedCaptureRegistry:
                         key=self._key(conn, int(row["source_index"])),
                         source_index=int(row["source_index"]),
                         generation=int(row["generation"]),
-                        ref=sample_ref_from_json(row["ref_json"]),
+                        ref=ref_from_dict(json.loads(row["ref_json"])),
                     )
                 )
                 continue
@@ -1056,7 +1056,7 @@ class SQLiteWindowedCaptureRegistry:
                     key=ticket.key,
                     source_index=ticket.source_index,
                     generation=int(row["generation"]),
-                    ref=sample_ref_from_json(row["ref_json"]),
+                    ref=ref_from_dict(json.loads(row["ref_json"])),
                     ready_at_request=ticket.ready_at_request,
                     wait_s=time.monotonic() - started,
                 )
@@ -1278,7 +1278,7 @@ class SQLiteWindowedCaptureRegistry:
                 f"capture estimated_bytes={estimated} exceeds reserved upper bound "
                 f"{request.reserved_bytes}; reclaim the payload and fail the request"
             )
-        return sample_ref_to_json(ref), estimated
+        return json.dumps(ref_to_dict(ref), separators=(",", ":")), estimated
 
     def mark_committing(self, request: CaptureRequest, ref: SampleRef) -> None:
         """Persist payload identity before exposing the READY transition."""
@@ -1559,7 +1559,7 @@ class SQLiteWindowedCaptureRegistry:
                         key=self._key(conn, int(row["source_index"])),
                         source_index=int(row["source_index"]),
                         generation=int(row["generation"]),
-                        ref=sample_ref_from_json(row["ref_json"]),
+                        ref=ref_from_dict(json.loads(row["ref_json"])),
                     )
                 )
             return tuple(candidates)

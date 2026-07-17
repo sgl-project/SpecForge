@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from specforge.runtime.contracts import TrainBatch
+from specforge.runtime.input_pipeline import batch_input_pipeline_stage
 
 
 @dataclass(frozen=True)
@@ -432,10 +433,14 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
+        with batch_input_pipeline_stage(batch, "h2d"):
+            input_ids = t["input_ids"].to(device)
+            hidden_states = t["hidden_states"].to(device)
+            loss_mask = t["loss_mask"].to(device)
         loss, accuracy, model_metrics = self.dflash_model(
-            input_ids=t["input_ids"].to(device),
-            hidden_states=t["hidden_states"].to(device),
-            loss_mask=t["loss_mask"].to(device),
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
         )
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
@@ -478,11 +483,16 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
+        with batch_input_pipeline_stage(batch, "h2d"):
+            input_ids = t["input_ids"].to(device)
+            hidden_states = t["hidden_states"].to(device)
+            loss_mask = t["loss_mask"].to(device)
+            target_last_hidden_states = t["target_last_hidden_states"].to(device)
         loss, accuracy, model_metrics = self.dspark_model(
-            input_ids=t["input_ids"].to(device),
-            hidden_states=t["hidden_states"].to(device),
-            loss_mask=t["loss_mask"].to(device),
-            target_last_hidden_states=t["target_last_hidden_states"].to(device),
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+            target_last_hidden_states=target_last_hidden_states,
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -549,10 +559,14 @@ class DominoTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         lambda_base = self._lambda_base(ctx)
+        with batch_input_pipeline_stage(batch, "h2d"):
+            input_ids = t["input_ids"].to(device)
+            hidden_states = t["hidden_states"].to(device)
+            loss_mask = t["loss_mask"].to(device)
         loss, accuracy, model_metrics = self.domino_model(
-            input_ids=t["input_ids"].to(device),
-            hidden_states=t["hidden_states"].to(device),
-            loss_mask=t["loss_mask"].to(device),
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
             lambda_base=lambda_base,
         )
         metrics = dict(model_metrics)

@@ -12,6 +12,7 @@ import unittest
 from dataclasses import dataclass
 from unittest import mock
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.inference.capture import CaptureConfig
 from specforge.launch import (
     build_disagg_online_windowed_consumer,
@@ -408,7 +409,7 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
             "specforge.training.Trainer", return_value=assembled
         ) as trainer:
             result = _assemble_trainer(
-                spec=mock.sentinel.spec,
+                algorithm=builtin_algorithm_registry().resolve("dflash"),
                 controller=mock.sentinel.controller,
                 store=mock.sentinel.store,
                 ref_source={"queue": mock.sentinel.queue},
@@ -429,11 +430,11 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                 logger=None,
                 log_interval=1,
                 collate_fn=mock.sentinel.collate,
-                loader_prefetch_batches=3,
+                dataloader_num_workers=3,
             )
 
-        self.assertEqual(result, (mock.sentinel.trainer, mock.sentinel.loader))
-        self.assertEqual(trainer.call_args.kwargs["loader_prefetch_batches"], 3)
+        self.assertIs(result, assembled)
+        self.assertEqual(trainer.call_args.kwargs["dataloader_num_workers"], 3)
 
     def test_producer_requires_stable_task_ids(self):
         with tempfile.TemporaryDirectory() as root:
@@ -477,9 +478,14 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
             )
             fake_trainer = mock.Mock()
             fake_loader = mock.Mock()
+            fake_trainer._loader = fake_loader
+            fake_loader.metrics.return_value = {
+                "stages": {"store_get": {"count": 1}},
+                "counters": {},
+            }
             with mock.patch(
                 "specforge.launch._assemble_trainer",
-                return_value=(fake_trainer, fake_loader),
+                return_value=fake_trainer,
             ) as assemble:
                 runtime = build_disagg_online_windowed_consumer(
                     consumer_id="a",
@@ -503,6 +509,10 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
             try:
                 self.assertIs(runtime.controller.sample_queue, runtime.queue)
                 self.assertTrue(assemble.call_args.kwargs["durable_ack"])
+                self.assertEqual(
+                    runtime.accounting_snapshot()["input_pipeline"],
+                    fake_loader.metrics.return_value,
+                )
             finally:
                 runtime.control.fail("test cleanup")
                 runtime.close()
