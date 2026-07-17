@@ -19,6 +19,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+from specforge.ops.dflash_kernels import configure_dflash_draft_kernels
+
 from .registry import register_draft
 
 
@@ -248,7 +250,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, draft_kernel_backend: str = "torch") -> None:
         super().__init__(config)
         self.config = config
         self.layers = nn.ModuleList(
@@ -278,6 +280,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+        configure_dflash_draft_kernels(self, draft_kernel_backend)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config

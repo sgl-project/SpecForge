@@ -35,6 +35,7 @@ _VALID_LOSS_TYPES = {
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
 _VALID_LINEAR_CE_BACKENDS = {"torch", "liger"}
+_VALID_DRAFT_KERNEL_BACKENDS = {"torch", "liger"}
 
 
 def compute_accept_len(
@@ -137,6 +138,7 @@ class OnlineDFlashModel(nn.Module):
         loss_decay_gamma: Optional[float] = None,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        draft_kernel_backend: str = "torch",
         linear_cross_entropy_backend: str = "torch",
     ):
         super().__init__()
@@ -146,6 +148,20 @@ class OnlineDFlashModel(nn.Module):
             )
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        if draft_kernel_backend not in _VALID_DRAFT_KERNEL_BACKENDS:
+            raise ValueError(
+                f"draft_kernel_backend={draft_kernel_backend!r}; must be one of "
+                f"{sorted(_VALID_DRAFT_KERNEL_BACKENDS)}"
+            )
+        actual_draft_kernel_backend = getattr(
+            draft_model, "draft_kernel_backend", "torch"
+        )
+        if actual_draft_kernel_backend != draft_kernel_backend:
+            raise ValueError(
+                "draft_kernel_backend does not match the configured draft model: "
+                f"wrapper={draft_kernel_backend!r}, "
+                f"draft={actual_draft_kernel_backend!r}"
+            )
         if linear_cross_entropy_backend not in _VALID_LINEAR_CE_BACKENDS:
             raise ValueError(
                 "linear_cross_entropy_backend="
@@ -178,6 +194,7 @@ class OnlineDFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.draft_kernel_backend = draft_kernel_backend
         self.linear_cross_entropy_backend = linear_cross_entropy_backend
 
         self._cached_block_mask: Optional[BlockMask] = None
