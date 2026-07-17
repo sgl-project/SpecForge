@@ -212,6 +212,29 @@ class TestGpuMonitor(GpuMonitorFixture):
         )
         self.assertEqual(len(monitor.violations), 2)
 
+    def test_cross_process_group_descendant_is_owned(self):
+        backend = _FakeBackend(values={3: _sample(pids=(202,))})
+        process_groups = {202: 9009}
+        process_parents = {202: 101, 101: 7001, 7001: 1}
+        monitor = GpuMonitor(
+            [self.assignment],
+            self.root / "samples.jsonl",
+            self.root / "summary.json",
+            poll_s=0.005,
+            backend=backend,
+            strict_process_ownership=True,
+            output=io.StringIO(),
+            process_group_lookup=process_groups.__getitem__,
+            process_parent_lookup=process_parents.__getitem__,
+        )
+        monitor.register_process_group("target-server", 7001)
+        monitor.start()
+        self.assertTrue(backend.sampled.wait(timeout=1.0))
+        summary = monitor.stop()
+
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(monitor.violations, [])
+
     def test_stop_is_idempotent(self):
         backend = _FakeBackend()
         monitor = self.monitor(backend)

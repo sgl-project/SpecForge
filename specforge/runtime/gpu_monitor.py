@@ -79,6 +79,20 @@ def _as_text(value: Any) -> str:
     return str(value)
 
 
+def _process_parent_pid(pid: int) -> int:
+    """Read a process parent without adding a runtime dependency."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+            stat = stream.read()
+    except FileNotFoundError as exc:
+        raise ProcessLookupError(pid) from exc
+    _, separator, suffix = stat.rpartition(")")
+    fields = suffix.split()
+    if not separator or len(fields) < 2:
+        raise OSError(f"could not parse /proc/{pid}/stat")
+    return int(fields[1])
+
+
 class NvmlBackend:
     """Thin lazy wrapper around the official ``nvidia-ml-py`` bindings."""
 
@@ -479,6 +493,7 @@ class GpuMonitor:
         low_utilization_pct: int = 10,
         output: TextIO = sys.stderr,
         process_group_lookup: Callable[[int], int] = os.getpgid,
+        process_parent_lookup: Callable[[int], int] = _process_parent_pid,
     ) -> None:
         assignments = tuple(assignments)
         if not assignments:
@@ -508,6 +523,7 @@ class GpuMonitor:
         self.low_utilization_pct = low_utilization_pct
         self.output = output
         self._process_group_lookup = process_group_lookup
+        self._process_parent_lookup = process_parent_lookup
         self._assignment_by_role = {
             assignment.process_role: assignment for assignment in assignments
         }
@@ -553,12 +569,29 @@ class GpuMonitor:
         return self._summary
 
     def register_process_group(self, process_role: str, pgid: int) -> None:
+        """Register a supervised process-group leader and its descendants."""
         if process_role not in self._assignment_by_role:
             raise ValueError(f"unknown monitored process role {process_role!r}")
         if pgid <= 0:
             raise ValueError("process group id must be positive")
         with self._lock:
             self._expected_process_groups[process_role] = int(pgid)
+
+    def _is_process_tree_member(self, pid: int, root_pid: int) -> bool:
+        current = pid
+        visited: set[int] = set()
+        while current > 1 and current not in visited:
+            if current == root_pid:
+                return True
+            visited.add(current)
+            try:
+                current = self._process_parent_lookup(current)
+            except ProcessLookupError:
+                return False
+            except OSError as exc:
+                self._record_error(f"process-parent:pid={current}", exc)
+                return False
+        return current == root_pid
 
     def start(self) -> bool:
         if self._started:
@@ -756,7 +789,9 @@ class GpuMonitor:
             except OSError as exc:
                 self._record_error(f"process-group:pid={pid}", exc)
                 continue
-            if observed_pgid != expected_pgid:
+            if observed_pgid != expected_pgid and not self._is_process_tree_member(
+                pid, expected_pgid
+            ):
                 unexpected.append({"pid": pid, "pgid": observed_pgid})
         if unexpected:
             self._record_violation(
