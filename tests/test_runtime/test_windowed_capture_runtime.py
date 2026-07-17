@@ -385,6 +385,43 @@ class TestWindowedCaptureService(unittest.TestCase):
 
 
 class TestWindowedLaunchBuilders(unittest.TestCase):
+    def test_shared_assembler_forwards_loader_prefetch_depth(self):
+        from specforge.launch import _assemble_trainer
+
+        assembled = mock.Mock()
+        assembled.controller = mock.sentinel.trainer
+        assembled.loader = mock.sentinel.loader
+        with mock.patch(
+            "specforge.training.Trainer", return_value=assembled
+        ) as trainer:
+            result = _assemble_trainer(
+                spec=mock.sentinel.spec,
+                controller=mock.sentinel.controller,
+                store=mock.sentinel.store,
+                ref_source={"queue": mock.sentinel.queue},
+                model=mock.sentinel.model,
+                target_head=None,
+                optimizer_factory=mock.sentinel.optimizer,
+                run_id="run",
+                output_dir="output",
+                batch_size=1,
+                accumulation_steps=1,
+                num_epochs=1,
+                max_steps=1,
+                save_interval=0,
+                eval_interval=0,
+                tp_size=1,
+                sp_ulysses_size=1,
+                sp_ring_size=1,
+                logger=None,
+                log_interval=1,
+                collate_fn=mock.sentinel.collate,
+                loader_prefetch_batches=3,
+            )
+
+        self.assertEqual(result, (mock.sentinel.trainer, mock.sentinel.loader))
+        self.assertEqual(trainer.call_args.kwargs["loader_prefetch_batches"], 3)
+
     def test_producer_requires_stable_task_ids(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(ValueError, "stable task_id"):
