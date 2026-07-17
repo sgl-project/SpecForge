@@ -10,7 +10,6 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
-from yunchang.comm import SeqAllToAll4D
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -1346,6 +1345,18 @@ class LlamaUSPFlashAttention(LlamaAttention):
         assert (
             dist.is_initialized()
         ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        # yunchang depends on CUDA flash-attn; import it lazily so this only fails when
+        # the `usp` attention backend is actually selected, not on every draft-model
+        # import (e.g. on ROCm, where yunchang is unavailable).
+        try:
+            from yunchang.comm import SeqAllToAll4D
+        except ImportError as e:
+            raise ImportError(
+                "The `usp` attention backend requires `yunchang` (which depends on CUDA "
+                "flash-attn) and is not available on this platform. Use `sdpa` or "
+                "`flex_attention` instead, e.g. on ROCm."
+            ) from e
+        self._SeqAllToAll4D = SeqAllToAll4D
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             raise NotImplementedError(
                 f"LlamaMutiRotaryEmbedding is currently not supported for LlamaUSPFlashAttention."
@@ -1379,7 +1390,7 @@ class LlamaUSPFlashAttention(LlamaAttention):
         # =============================================================
         query_states = self.q_proj(hidden_states)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        query_states = SeqAllToAll4D.apply(
+        query_states = self._SeqAllToAll4D.apply(
             self.ulysses_pg,
             query_states,
             self.scatter_idx,
@@ -1391,7 +1402,7 @@ class LlamaUSPFlashAttention(LlamaAttention):
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
-        key_states = SeqAllToAll4D.apply(
+        key_states = self._SeqAllToAll4D.apply(
             self.ulysses_pg,
             key_states,
             self.scatter_idx,
@@ -1403,7 +1414,7 @@ class LlamaUSPFlashAttention(LlamaAttention):
         value_states = value_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
-        value_states = SeqAllToAll4D.apply(
+        value_states = self._SeqAllToAll4D.apply(
             self.ulysses_pg,
             value_states,
             self.scatter_idx,
@@ -1463,7 +1474,7 @@ class LlamaUSPFlashAttention(LlamaAttention):
         # =============================================================
         # 4. Ulysses Gather & Output Projection
         # =============================================================
-        attn_output = SeqAllToAll4D.apply(
+        attn_output = self._SeqAllToAll4D.apply(
             self.ulysses_pg,
             attn_output,
             self.gather_idx,  # Scatter idx: 1 (Seq)
@@ -1553,6 +1564,12 @@ class LlamaDecoderLayer(nn.Module):
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
         elif attention_backend == "fa":
+            if _std_flash_attn_import_error is not None:
+                raise ImportError(
+                    "The `fa` attention backend requires `flash_attn`, which is not "
+                    "installed (or failed to import). Install a flash-attn build for "
+                    "your platform, or use `sdpa` / `flex_attention` (e.g. on ROCm)."
+                ) from _std_flash_attn_import_error
             self.self_attn = LlamaFlashAttention(config=config)
         elif attention_backend == "usp":
             self.self_attn = LlamaUSPFlashAttention(config=config)
