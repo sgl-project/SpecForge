@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+import os
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef
@@ -1651,9 +1653,546 @@ def build_disagg_online_consumer(
         raise
 
 
+def _windowed_prompt_tasks(run_id: str, prompts) -> List[Any]:
+    """Normalize a restart-stable canonical prompt stream."""
+    from specforge.runtime.contracts import PromptTask, assert_no_tensors
+
+    tasks = []
+    for prompt in prompts:
+        if isinstance(prompt, PromptTask):
+            task = prompt
+            if task.run_id != run_id:
+                raise ValueError(
+                    f"prompt {task.task_id!r} run_id={task.run_id!r} does not "
+                    f"match capture run {run_id!r}"
+                )
+        else:
+            assert_no_tensors(prompt)
+            task_id = prompt.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError(
+                    "windowed capture requires an explicit stable task_id on "
+                    "every prompt"
+                )
+            task = PromptTask(
+                task_id=task_id,
+                run_id=run_id,
+                source_id=str(prompt.get("source_id", "prompt_source")),
+                payload=dict(prompt.get("payload", prompt)),
+                max_length=int(prompt.get("max_length", 2048)),
+                chat_template=prompt.get("chat_template"),
+                loss_mask_policy=dict(prompt.get("loss_mask_policy", {})),
+                target_model_version=str(prompt.get("target_model_version", "unknown")),
+                draft_weight_version=prompt.get("draft_weight_version"),
+                metadata=dict(prompt.get("metadata", {})),
+            )
+        assert_no_tensors(task)
+        tasks.append(task)
+    if not tasks:
+        raise ValueError("windowed capture prompts must not be empty")
+    ids = [task.task_id for task in tasks]
+    if len(ids) != len(set(ids)):
+        raise ValueError("windowed capture task_ids must be unique")
+    return tasks
+
+
+def _resolve_window_algorithm(
+    strategy: str | AlgorithmRegistration,
+) -> AlgorithmRegistration:
+    if isinstance(strategy, AlgorithmRegistration):
+        return strategy
+    from specforge.algorithms.builtin import builtin_algorithm_registry
+
+    try:
+        return builtin_algorithm_registry().resolve(strategy)
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def build_disagg_windowed_capture_contract(
+    *,
+    strategy: str | AlgorithmRegistration,
+    modality: str = "text",
+    target_hidden_size: int,
+    target_model_version: str,
+    tokenizer_version: str,
+    target_vocab_size: Optional[int] = None,
+    draft_vocab_size: Optional[int] = None,
+    target_repr: str = "logits",
+    aux_hidden_state_layer_ids=None,
+    vocab_map_version: Optional[str] = None,
+):
+    """Build the typed capture request and its cross-process identity digest."""
+    from specforge.inference.capture import CaptureConfig
+    from specforge.runtime.data_plane.windowed_capture import capture_contract_digest
+
+    algorithm = _resolve_window_algorithm(strategy)
+    feature_contract = algorithm.spec.feature_contract("streaming", modality)
+    capture = CaptureConfig.from_strategy(
+        required_features=feature_contract.required_tensors,
+        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids or ()),
+        target_repr=target_repr,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        vocab_map_version=vocab_map_version,
+    )
+    digest = capture_contract_digest(
+        {
+            "strategy": algorithm.name,
+            "capture": capture,
+            "target_model_version": target_model_version,
+            "tokenizer_version": tokenizer_version,
+        }
+    )
+    return capture, digest
+
+
+@dataclass
+class DisaggWindowedProducerRuntime:
+    registry: Any
+    service: Any
+    contract_digest: str
+
+    def drive(self, max_rounds: int = 10_000_000, *, should_stop=None) -> int:
+        return self.service.drive(should_stop=should_stop, max_rounds=max_rounds)
+
+    def accounting_snapshot(self) -> Dict[str, Any]:
+        snapshot = self.service.snapshot()
+        snapshot["contract_digest"] = self.contract_digest
+        return snapshot
+
+    def close(self) -> None:
+        self.registry.close()
+
+
+def build_disagg_online_windowed_producer(
+    *,
+    prompts,
+    feature_store: FeatureStore,
+    feature_source: Any,
+    run_id: str,
+    consumer_ids,
+    registry_db_path: str,
+    max_live_refs: int,
+    target_hidden_size: int,
+    target_model_version: str,
+    tokenizer_version: str,
+    strategy: str = "eagle3",
+    target_vocab_size: Optional[int] = None,
+    draft_vocab_size: Optional[int] = None,
+    target_repr: str = "logits",
+    aux_hidden_state_layer_ids=None,
+    vocab_map_version: Optional[str] = None,
+    max_live_bytes: Optional[int] = None,
+    capture_reservation_bytes: Optional[int] = None,
+    capture_batch_size: int = 8,
+    max_capture_retries: int = 2,
+    retry_backoff_s: float = 0.05,
+    consumer_registration_timeout_s: float = 600.0,
+    consumer_heartbeat_timeout_s: float = 120.0,
+    registry_poll_s: float = 0.01,
+    recover: bool = False,
+) -> DisaggWindowedProducerRuntime:
+    """Build one demand-driven producer for fixed independent consumers."""
+    from specforge.runtime.data_plane.windowed_capture import (
+        SQLiteWindowedCaptureRegistry,
+    )
+    from specforge.runtime.data_plane.windowed_capture_runtime import (
+        WindowedCaptureService,
+    )
+
+    tasks = _windowed_prompt_tasks(run_id, prompts)
+    incompatible_prompts = [
+        task.task_id
+        for task in tasks
+        if task.target_model_version not in ("unknown", target_model_version)
+    ]
+    if incompatible_prompts:
+        raise ValueError(
+            "windowed prompts target a different model version: "
+            f"{incompatible_prompts[:8]}"
+        )
+    capture, digest = build_disagg_windowed_capture_contract(
+        strategy=strategy,
+        target_hidden_size=target_hidden_size,
+        target_model_version=target_model_version,
+        tokenizer_version=tokenizer_version,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        target_repr=target_repr,
+        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
+        vocab_map_version=vocab_map_version,
+    )
+    registry = SQLiteWindowedCaptureRegistry(
+        registry_db_path,
+        max_live_refs=max_live_refs,
+        max_live_bytes=max_live_bytes,
+        capture_reservation_bytes=capture_reservation_bytes,
+        poll_s=registry_poll_s,
+    )
+    try:
+        registry.initialize_run(
+            run_id=run_id,
+            contract_digest=digest,
+            source_sample_ids=[task.task_id for task in tasks],
+            expected_consumers=tuple(consumer_ids),
+            recover_inflight=recover,
+            recovery_store=feature_store if recover else None,
+        )
+        service = WindowedCaptureService(
+            registry,
+            prompts=tasks,
+            feature_source=feature_source,
+            capture=capture,
+            owner_store=feature_store,
+            capture_batch_size=capture_batch_size,
+            max_capture_retries=max_capture_retries,
+            retry_backoff_s=retry_backoff_s,
+            consumer_registration_timeout_s=consumer_registration_timeout_s,
+            consumer_heartbeat_timeout_s=consumer_heartbeat_timeout_s,
+            poll_s=registry_poll_s,
+        )
+    except BaseException:
+        registry.close()
+        raise
+    return DisaggWindowedProducerRuntime(registry, service, digest)
+
+
+@dataclass
+class DisaggWindowedConsumerRuntime:
+    trainer: Any
+    loader: Any
+    queue: Any
+    control: Any
+    controller: DataFlowController
+    registry: Any
+    max_steps: Optional[int]
+
+    def run(self) -> int:
+        """Train to EOF or to this consumer's explicit independent step cap."""
+        try:
+            self.control.mark_ready()
+            step = self.trainer.fit()
+            self.control.ensure_healthy()
+            if self.queue.drained():
+                self.control.complete()
+            elif self.max_steps is not None and step >= self.max_steps:
+                self.queue.close()
+                self.control.complete(allow_partial=True)
+            else:
+                raise RuntimeError(
+                    "windowed consumer stopped before EOF without reaching its "
+                    "configured max_steps"
+                )
+            return step
+        except BaseException as exc:
+            try:
+                self.queue.close()
+            except BaseException as cleanup_error:
+                exc.add_note(f"failed to close windowed queue: {cleanup_error!r}")
+            try:
+                state = self.registry.snapshot()["consumers"][self.control.consumer_id][
+                    "state"
+                ]
+                if state != "completed":
+                    self.control.fail(exc)
+            except BaseException as cleanup_error:
+                exc.add_note(f"failed to report consumer failure: {cleanup_error!r}")
+            raise
+
+    def accounting_snapshot(self) -> Dict[str, Any]:
+        marker = self.controller.store.durable_marker()
+        return {
+            "consumer_id": self.control.consumer_id,
+            "window": self.registry.snapshot()["consumers"][self.control.consumer_id],
+            "committed": self.controller.store.committed_count(),
+            "acked": len(marker["acked"]),
+            "global_step": marker["global_step"],
+        }
+
+    def close(self) -> None:
+        self.control.close()
+        close_store = getattr(self.controller.store, "close", None)
+        if callable(close_store):
+            close_store()
+        self.registry.close()
+
+
+def _durable_window_cursor(metadata_store: MetadataStore) -> int:
+    """Return the contiguous optimizer-durable prefix in canonical fetch order."""
+    marker = metadata_store.durable_marker()
+    acked = marker["acked"]
+    cursor = 0
+    for sample_id in metadata_store.all_committed_ids():
+        if sample_id not in acked:
+            break
+        cursor += 1
+    return cursor
+
+
+def build_disagg_online_windowed_consumer(
+    *,
+    consumer_id: str,
+    registry_db_path: str,
+    max_live_refs: int,
+    contract_digest: str,
+    total_samples: int,
+    feature_store: FeatureStore,
+    eagle3_model,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    metadata_db_path: str,
+    lookbehind: int = 0,
+    lookahead: int = 0,
+    prefetch_depth: int = 0,
+    max_outstanding: int = 1,
+    strategy: str | AlgorithmRegistration = "eagle3",
+    modality: str = "text",
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    num_epochs: int = 1,
+    max_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    collate_fn=None,
+    idle_timeout_s: Optional[float] = 1800.0,
+    logger=None,
+    log_interval: int = 50,
+    strategy_kwargs: Optional[dict] = None,
+    resume: bool = False,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
+    max_live_bytes: Optional[int] = None,
+    capture_reservation_bytes: Optional[int] = None,
+    heartbeat_interval_s: float = 5.0,
+    initialization_timeout_s: float = 600.0,
+    registry_poll_s: float = 0.01,
+    loader_prefetch_batches: int = 0,
+    consumer_control=None,
+) -> DisaggWindowedConsumerRuntime:
+    """Build one single-GPU trainer over an independent windowed cursor."""
+    from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
+    from specforge.runtime.data_plane.windowed_capture import (
+        SQLiteWindowedCaptureRegistry,
+        WindowedCaptureQueue,
+    )
+    from specforge.runtime.data_plane.windowed_capture_runtime import (
+        start_windowed_consumer_control,
+    )
+
+    if num_epochs != 1:
+        raise ValueError("windowed canonical streams support exactly one epoch")
+    if max_steps is not None and max_steps < 1:
+        raise ValueError("max_steps must be >= 1 or None")
+    if resume_from is not None and not resume:
+        raise ValueError("resume_from requires resume=True")
+    if max_outstanding < batch_size * accumulation_steps:
+        raise ValueError(
+            "max_outstanding must cover batch_size * accumulation_steps so "
+            "optimizer-boundary ACKs cannot deadlock the queue"
+        )
+    if hasattr(feature_store, "lifetime_owner") and feature_store.lifetime_owner:
+        raise ValueError("windowed consumers must not own shared payload lifetime")
+
+    owns_registry = consumer_control is None
+    registry = (
+        consumer_control.registry
+        if not owns_registry
+        else SQLiteWindowedCaptureRegistry(
+            registry_db_path,
+            max_live_refs=max_live_refs,
+            max_live_bytes=max_live_bytes,
+            capture_reservation_bytes=capture_reservation_bytes,
+            poll_s=registry_poll_s,
+        )
+    )
+    metadata_store = None
+    try:
+        initialized = registry.wait_initialized(initialization_timeout_s)
+        observed = (
+            initialized["run_id"],
+            initialized["contract_digest"],
+            initialized["total_samples"],
+            initialized["max_live_refs"],
+            initialized["max_live_bytes"],
+            initialized["capture_reservation_bytes"],
+        )
+        expected = (
+            run_id,
+            contract_digest,
+            total_samples,
+            max_live_refs,
+            max_live_bytes,
+            capture_reservation_bytes or 0,
+        )
+        if observed != expected:
+            raise RuntimeError(
+                f"windowed registry identity mismatch: expected={expected!r}, "
+                f"observed={observed!r}"
+            )
+
+        os.makedirs(os.path.dirname(os.path.abspath(metadata_db_path)), exist_ok=True)
+        metadata_store = SQLiteMetadataStore(metadata_db_path)
+        if not resume and metadata_store.committed_count():
+            raise ValueError(
+                "windowed consumer metadata store is not fresh; pass resume=True "
+                "with a matching checkpoint or use a new run directory"
+            )
+        durable_cursor = _durable_window_cursor(metadata_store) if resume else 0
+        if durable_cursor and resume_from is None:
+            raise ValueError(
+                "windowed consumer resume found an acknowledged prefix but no "
+                "resume_from checkpoint; skipping trained samples without restoring "
+                "their weight updates would lose data"
+            )
+        if resume_from is not None:
+            marker_step = metadata_store.durable_marker()["global_step"]
+            checkpoint_step = _checkpoint_global_step(resume_from)
+            if marker_step is not None and marker_step > checkpoint_step:
+                raise RuntimeError(
+                    f"durable marker global_step={marker_step} is ahead of "
+                    f"checkpoint global_step={checkpoint_step}"
+                )
+        if consumer_control is None:
+            existing = registry.snapshot()["consumers"].get(consumer_id)
+            if existing is not None and not resume:
+                raise RuntimeError(
+                    f"consumer {consumer_id!r} already exists; pass resume=True"
+                )
+            consumer_control = start_windowed_consumer_control(
+                registry,
+                consumer_id,
+                lookbehind=lookbehind,
+                lookahead=lookahead,
+                prefetch_depth=prefetch_depth,
+                max_outstanding=max_outstanding,
+                heartbeat_interval_s=heartbeat_interval_s,
+                durable_cursor=durable_cursor,
+            )
+        else:
+            if consumer_control.consumer_id != consumer_id:
+                raise ValueError("consumer_control identity mismatch")
+            existing = registry.snapshot()["consumers"][consumer_id]
+            expected_window = (
+                lookbehind,
+                lookahead,
+                prefetch_depth,
+                max_outstanding,
+            )
+            observed_window = tuple(
+                int(existing[name])
+                for name in (
+                    "lookbehind",
+                    "lookahead",
+                    "prefetch_depth",
+                    "max_outstanding",
+                )
+            )
+            if observed_window != expected_window:
+                raise ValueError(
+                    f"consumer_control window mismatch: expected={expected_window}, "
+                    f"observed={observed_window}"
+                )
+            if resume:
+                registry.resume_consumer(consumer_id, durable_cursor=durable_cursor)
+    except BaseException as exc:
+        if owns_registry and consumer_control is not None:
+            try:
+                consumer_control.fail(exc)
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    f"failed to report windowed consumer setup failure: "
+                    f"{cleanup_error!r}"
+                )
+        if metadata_store is not None:
+            metadata_store.close()
+        if owns_registry:
+            registry.close()
+        raise
+
+    queue = None
+    try:
+        controller = DataFlowController(run_id, metadata_store=metadata_store)
+        queue = WindowedCaptureQueue(
+            registry,
+            consumer_id,
+            idle_timeout_s=idle_timeout_s,
+            record_refs=lambda refs: controller.record_external_refs(list(refs)),
+        )
+        controller.sample_queue = queue
+        algorithm = _resolve_window_algorithm(strategy)
+        trainer = _assemble_trainer(
+            algorithm=algorithm,
+            modality=modality,
+            controller=controller,
+            store=feature_store,
+            ref_source={"queue": queue, "defer_ack_until_durable": True},
+            model=eagle3_model,
+            target_head=None,
+            optimizer_factory=optimizer_factory,
+            run_id=run_id,
+            output_dir=output_dir,
+            batch_size=batch_size,
+            accumulation_steps=accumulation_steps,
+            num_epochs=1,
+            max_steps=max_steps,
+            total_steps=total_steps,
+            save_interval=save_interval,
+            eval_interval=eval_interval,
+            tp_size=1,
+            sp_ulysses_size=1,
+            sp_ring_size=1,
+            logger=logger,
+            log_interval=log_interval,
+            collate_fn=_streaming_collate(algorithm, modality, collate_fn),
+            strategy_kwargs=strategy_kwargs,
+            per_sample_transform=None,
+            durable_ack=True,
+            resume_from=resume_from,
+            max_checkpoints=max_checkpoints,
+            dataloader_num_workers=loader_prefetch_batches,
+        )
+    except BaseException as exc:
+        if queue is not None:
+            try:
+                queue.close()
+            except BaseException as cleanup_error:
+                exc.add_note(f"failed to close windowed queue: {cleanup_error!r}")
+        try:
+            consumer_control.fail(exc)
+        except BaseException as cleanup_error:
+            exc.add_note(
+                f"failed to report windowed consumer setup failure: "
+                f"{cleanup_error!r}"
+            )
+        metadata_store.close()
+        if owns_registry:
+            registry.close()
+        raise
+    return DisaggWindowedConsumerRuntime(
+        trainer,
+        trainer._loader,
+        queue,
+        consumer_control,
+        controller,
+        registry,
+        max_steps,
+    )
+
+
+
+
 __all__ = [
     "build_offline_runtime",
     "build_disagg_offline_runtime",
     "build_disagg_online_producer",
     "build_disagg_online_consumer",
+    "build_disagg_windowed_capture_contract",
+    "build_disagg_online_windowed_producer",
+    "build_disagg_online_windowed_consumer",
+    "DisaggWindowedProducerRuntime",
+    "DisaggWindowedConsumerRuntime",
 ]

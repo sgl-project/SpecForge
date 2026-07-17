@@ -200,7 +200,14 @@ class DataFlowController:
             self.sample_queue.put(fresh)
         return fresh
 
-    # -- offline ingest ----------------------------------------------------
+    def record_external_refs(self, refs: List[SampleRef]) -> int:
+        """Ledger refs supplied by an external queue without enqueueing them."""
+        committed = 0
+        for ref in refs:
+            assert_no_tensors(ref)
+            committed += int(self.store.commit_sample(ref))
+        return committed
+
     # -- train-side durable ack -------------------------------------------
     def ack_train_refs(
         self,

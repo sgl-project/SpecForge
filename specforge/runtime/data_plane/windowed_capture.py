@@ -567,6 +567,9 @@ class SQLiteWindowedCaptureRegistry:
                         json.loads(row["expected_consumers_json"])
                     ),
                     "status": row["status"],
+                    "max_live_refs": int(row["max_live_refs"]),
+                    "max_live_bytes": row["max_live_bytes"],
+                    "capture_reservation_bytes": int(row["capture_reservation_bytes"]),
                 }
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -1233,7 +1236,13 @@ class SQLiteWindowedCaptureRegistry:
         self, request: CaptureRequest, ref: SampleRef
     ) -> tuple[str, int]:
         assert_no_tensors(ref)
-        generation = ref.metadata.get("generation")
+        # Storage backends own ``generation`` as the physical object locator.
+        # Recapture scheduling is a separate namespace: runtime adapters attach
+        # ``window_generation`` without rewriting the store's generation.  The
+        # fallback preserves refs produced directly against the registry.
+        generation = ref.metadata.get(
+            "window_generation", ref.metadata.get("generation")
+        )
         if (
             isinstance(generation, bool)
             or not isinstance(generation, int)
@@ -1247,6 +1256,15 @@ class SQLiteWindowedCaptureRegistry:
             raise ValueError(
                 f"capture ref source_task_id={ref.source_task_id!r} does not match "
                 f"{request.key.source_sample_id!r}"
+            )
+        with self._lock:
+            run = self._conn.execute(
+                "SELECT run_id FROM run_config WHERE singleton=1"
+            ).fetchone()
+        if run is None or ref.run_id != run["run_id"]:
+            raise ValueError(
+                f"capture ref run_id={ref.run_id!r} does not match registry run "
+                f"{None if run is None else run['run_id']!r}"
             )
         estimated = ref.estimated_bytes
         if (
@@ -1691,7 +1709,18 @@ class SQLiteWindowedCaptureRegistry:
         )
         self._prune_orphans_locked(conn)
 
-    def complete_consumer(self, consumer_id: str) -> None:
+    def complete_consumer(
+        self, consumer_id: str, *, allow_partial: bool = False
+    ) -> None:
+        """Mark one consumer complete and release all of its cache interests.
+
+        The default remains strict and requires the canonical stream to drain.
+        ``allow_partial`` is reserved for an explicit launcher step budget: the
+        consumer completed its configured work, even though other consumers may
+        continue farther through the shared source stream.
+        """
+        if not isinstance(allow_partial, bool):
+            raise TypeError("allow_partial must be a bool")
         with self._transaction() as conn:
             consumer = conn.execute(
                 "SELECT * FROM consumers WHERE consumer_id=?", (consumer_id,)
@@ -1707,12 +1736,14 @@ class SQLiteWindowedCaptureRegistry:
                 "(SELECT COUNT(*) FROM read_leases WHERE consumer_id=?)",
                 (consumer_id, consumer_id),
             ).fetchone()[0]
-            if int(consumer["cursor"]) != int(consumer["total_samples"]):
+            if not allow_partial and int(consumer["cursor"]) != int(
+                consumer["total_samples"]
+            ):
                 raise RuntimeError(
                     f"consumer {consumer_id!r} completed at cursor "
                     f"{consumer['cursor']}/{consumer['total_samples']}"
                 )
-            if outstanding:
+            if outstanding and not allow_partial:
                 raise RuntimeError(
                     f"consumer {consumer_id!r} completed with {outstanding} "
                     "outstanding acquisitions"
@@ -1909,6 +1940,7 @@ class WindowedCaptureQueue:
         consumer_id: str,
         *,
         idle_timeout_s: Optional[float] = 1800.0,
+        record_refs: Optional[Callable[[Sequence[SampleRef]], None]] = None,
     ) -> None:
         if idle_timeout_s is not None and idle_timeout_s <= 0:
             raise ValueError("idle_timeout_s must be > 0 or None")
@@ -1919,6 +1951,9 @@ class WindowedCaptureQueue:
         self.consumer_id = consumer_id
         self.total_samples = int(snapshot["total_samples"])
         self.idle_timeout_s = idle_timeout_s
+        if record_refs is not None and not callable(record_refs):
+            raise TypeError("record_refs must be callable or None")
+        self._record_refs = record_refs
         self._next_fetch = int(snapshot["consumers"][consumer_id]["cursor"])
         self._leases: dict[str, CaptureReadLease] = {}
         self._closed = False
@@ -1963,6 +1998,12 @@ class WindowedCaptureQueue:
                 raise RuntimeError(
                     "windowed capture batch contains duplicate sample IDs"
                 )
+            if self._record_refs is not None:
+                try:
+                    self._record_refs(refs)
+                except BaseException:
+                    self.registry.abandon_leases(self.consumer_id, acquired)
+                    raise
             with self._state_lock:
                 if self._closed:
                     self.registry.abandon_leases(self.consumer_id, acquired)
@@ -2007,15 +2048,31 @@ class WindowedCaptureQueue:
         with self._state_lock:
             return len(self._leases)
 
-    def finalize(self) -> None:
+    def drained(self) -> bool:
         with self._state_lock:
-            if self._next_fetch != self.total_samples or self._leases:
+            return self._next_fetch == self.total_samples and not self._leases
+
+    def finalize(self) -> None:
+        self.complete()
+
+    def complete(self, *, allow_partial: bool = False) -> None:
+        with self._state_lock:
+            if not allow_partial and (
+                self._next_fetch != self.total_samples or self._leases
+            ):
                 raise RuntimeError(
                     f"consumer {self.consumer_id!r} queue did not drain: "
                     f"next={self._next_fetch}/{self.total_samples}, "
                     f"leases={len(self._leases)}"
                 )
-            self.registry.complete_consumer(self.consumer_id)
+            if allow_partial and self._leases:
+                self.registry.abandon_leases(
+                    self.consumer_id, list(self._leases.values())
+                )
+                self._leases.clear()
+            self.registry.complete_consumer(
+                self.consumer_id, allow_partial=allow_partial
+            )
             self._closed = True
 
     def close(self, error: Optional[BaseException | str] = None) -> None:
