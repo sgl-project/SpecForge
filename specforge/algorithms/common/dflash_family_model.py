@@ -138,6 +138,7 @@ class OnlineDFlashModel(nn.Module):
         loss_decay_gamma: Optional[float] = None,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        flex_kernel_options: Optional[Dict[str, object]] = None,
         draft_kernel_backend: str = "torch",
         linear_cross_entropy_backend: str = "torch",
         compact_zero_weight_ce_rows: bool = False,
@@ -200,6 +201,13 @@ class OnlineDFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        if flex_kernel_options is not None and attention_backend != "flex_attention":
+            raise ValueError(
+                "flex_kernel_options require attention_backend='flex_attention'"
+            )
+        self.flex_kernel_options = (
+            dict(flex_kernel_options) if flex_kernel_options is not None else None
+        )
         self.draft_kernel_backend = draft_kernel_backend
         self.linear_cross_entropy_backend = linear_cross_entropy_backend
         self.compact_zero_weight_ce_rows = compact_zero_weight_ce_rows
@@ -351,11 +359,16 @@ class OnlineDFlashModel(nn.Module):
                 device=device,
             )
 
+        draft_forward_kwargs = {}
+        if self.flex_kernel_options is not None:
+            draft_forward_kwargs["kernel_options"] = self.flex_kernel_options
+
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **draft_forward_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
 
@@ -501,6 +514,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         shift_label: bool = False,
+        flex_kernel_options: Optional[Dict[str, object]] = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -512,6 +526,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             loss_type="dflash",
+            flex_kernel_options=flex_kernel_options,
         )
         self.shift_label = shift_label
 
@@ -800,6 +815,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
+        flex_kernel_options: Optional[Dict[str, object]] = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -811,6 +827,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             loss_type="dflash",
+            flex_kernel_options=flex_kernel_options,
         )
         if dspark_ce_loss_alpha < 0:
             raise ValueError("dspark_ce_loss_alpha must be >= 0")
