@@ -144,6 +144,19 @@ class TestWindowedCaptureService(unittest.TestCase):
         self.addCleanup(registry.close)
         return registry
 
+    def test_rejects_negative_batch_wait(self):
+        registry = self.registry()
+        store = _OwnerStore()
+        with self.assertRaisesRegex(ValueError, "batch_wait_s"):
+            WindowedCaptureService(
+                registry,
+                prompts=_prompts(12),
+                feature_source=_RefSource(store),
+                capture=_capture(),
+                owner_store=store,
+                batch_wait_s=-0.001,
+            )
+
     def test_physical_generation_is_not_rewritten_by_window_generation(self):
         registry = self.registry(max_live_refs=1)
         registry.register_consumer("a")

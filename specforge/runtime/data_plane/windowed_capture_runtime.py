@@ -188,6 +188,7 @@ class WindowedCaptureService:
         capture: CaptureConfig,
         owner_store: Any,
         capture_batch_size: int = 8,
+        batch_wait_s: float = 0.002,
         max_capture_retries: int = 2,
         retry_backoff_s: float = 0.05,
         consumer_registration_timeout_s: float = 600.0,
@@ -204,12 +205,15 @@ class WindowedCaptureService:
         if max_capture_retries < 0:
             raise ValueError("max_capture_retries must be >= 0")
         for name, value in (
+            ("batch_wait_s", batch_wait_s),
             ("retry_backoff_s", retry_backoff_s),
             ("consumer_registration_timeout_s", consumer_registration_timeout_s),
             ("consumer_heartbeat_timeout_s", consumer_heartbeat_timeout_s),
             ("poll_s", poll_s),
         ):
-            if value < 0 or (name != "retry_backoff_s" and value == 0):
+            if value < 0 or (
+                name not in {"batch_wait_s", "retry_backoff_s"} and value == 0
+            ):
                 raise ValueError(f"{name} has invalid duration {value}")
         if not callable(getattr(feature_source, "produce_refs", None)):
             raise TypeError(
@@ -239,6 +243,7 @@ class WindowedCaptureService:
         self.capture = capture
         self.owner_store = owner_store
         self.capture_batch_size = capture_batch_size
+        self.batch_wait_s = batch_wait_s
         self.max_capture_retries = max_capture_retries
         self.retry_backoff_s = retry_backoff_s
         self.consumer_registration_timeout_s = consumer_registration_timeout_s
@@ -383,6 +388,8 @@ class WindowedCaptureService:
                 self.registry.finalize_run()
                 return self.captured_refs
 
+            if snapshot["queued"] and self.batch_wait_s:
+                time.sleep(self.batch_wait_s)
             requests = self.registry.claim_batch(self.capture_batch_size)
             if requests:
                 self._capture_requests(requests)
