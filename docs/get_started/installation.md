@@ -49,6 +49,23 @@ ROCm-compatible SGLang capture service; offline feature consumers can start
 without target inference. PyTorch exposes ROCm accelerators through its
 `torch.cuda` API and uses NCCL for distributed runs.
 
+If your ROCm `torch` build is pulled from a separate index, install SpecForge
+without dependencies (`pip install --no-deps -e .`) so the ROCm wheel is not
+silently replaced by the CUDA `torch` pinned in `pyproject.toml`.
+
+Known issues on ROCm:
+
+- `ImportError: cannot import name 'VideoReader' from 'torchvision.io'` — newer
+  `datasets` tensorizes through torchvision video support that some ROCm
+  torchvision builds omit. Install a torchvision build with video support or pin
+  an older `datasets`.
+- Gated target models (e.g. `meta-llama/*`) require a Hugging Face token;
+  otherwise embedding loading fails with `403 Forbidden`. Log in with
+  `huggingface-cli login`, or use an already-cached model with `HF_HUB_OFFLINE=1`.
+- Harmless `torch._dynamo` "compilation metrics ... not JSON serializable"
+  warnings and FSDP deprecation `FutureWarning`s may appear during training; they
+  do not affect the run.
+
 ### Ascend NPU
 
 Install the vendor-matched PyTorch and `torch_npu` packages first, then install
