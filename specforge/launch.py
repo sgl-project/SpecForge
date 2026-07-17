@@ -1911,6 +1911,7 @@ class DisaggWindowedConsumerRuntime:
             "committed": self.controller.store.committed_count(),
             "acked": len(marker["acked"]),
             "global_step": marker["global_step"],
+            "queue": self.queue.metrics(),
             "input_pipeline": self.loader.metrics(),
         }
 

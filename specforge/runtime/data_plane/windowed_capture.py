@@ -1959,6 +1959,12 @@ class WindowedCaptureQueue:
         self._closed = False
         self._get_lock = threading.Lock()
         self._state_lock = threading.RLock()
+        self._metrics: dict[str, float | int] = {
+            "refs": 0,
+            "ready_at_request_refs": 0,
+            "demand_wait_s": 0.0,
+            "max_demand_wait_s": 0.0,
+        }
 
     def get(self, n: int, timeout_s: float = 0.0) -> list[SampleRef]:
         del timeout_s  # Registry waits use the explicit idle timeout.
@@ -2010,6 +2016,15 @@ class WindowedCaptureQueue:
                     return []
                 self._leases.update((lease.ref.sample_id, lease) for lease in acquired)
                 self._next_fetch = stop
+                for lease in acquired:
+                    self._metrics["refs"] += 1
+                    self._metrics["ready_at_request_refs"] += int(
+                        lease.ready_at_request
+                    )
+                    self._metrics["demand_wait_s"] += lease.wait_s
+                    self._metrics["max_demand_wait_s"] = max(
+                        self._metrics["max_demand_wait_s"], lease.wait_s
+                    )
             return refs
 
     def _resolve_leases(self, refs: Sequence[SampleRef]) -> list[CaptureReadLease]:
@@ -2047,6 +2062,23 @@ class WindowedCaptureQueue:
     def in_flight(self) -> int:
         with self._state_lock:
             return len(self._leases)
+
+    def metrics(self) -> dict[str, float | int]:
+        with self._state_lock:
+            refs = int(self._metrics["refs"])
+            return {
+                **self._metrics,
+                "ready_at_request_ratio": (
+                    float(self._metrics["ready_at_request_refs"]) / refs
+                    if refs
+                    else 0.0
+                ),
+                "mean_demand_wait_s": (
+                    float(self._metrics["demand_wait_s"]) / refs if refs else 0.0
+                ),
+                "next_fetch": self._next_fetch,
+                "in_flight": len(self._leases),
+            }
 
     def drained(self) -> bool:
         with self._state_lock:

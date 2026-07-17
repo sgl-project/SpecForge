@@ -513,6 +513,7 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     runtime.accounting_snapshot()["input_pipeline"],
                     fake_loader.metrics.return_value,
                 )
+                self.assertEqual(runtime.accounting_snapshot()["queue"]["refs"], 0)
             finally:
                 runtime.control.fail("test cleanup")
                 runtime.close()

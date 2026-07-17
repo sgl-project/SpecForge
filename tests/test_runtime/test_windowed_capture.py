@@ -464,6 +464,12 @@ class TestWindowedCaptureQueueAndSoak(WindowedRegistryFixture):
         last = queue.get(1)
         queue.ack(last)
         self.assertEqual(queue.get(1), [])
+        metrics = queue.metrics()
+        self.assertEqual(metrics["refs"], 3)
+        self.assertEqual(metrics["ready_at_request_refs"], 3)
+        self.assertEqual(metrics["ready_at_request_ratio"], 1.0)
+        self.assertEqual(metrics["next_fetch"], 3)
+        self.assertEqual(metrics["in_flight"], 0)
         self.assertEqual(
             self.registry.snapshot()["consumers"]["trainer"]["state"],
             "completed",
