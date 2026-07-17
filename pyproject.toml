@@ -43,6 +43,7 @@ dev = [
     "pre-commit",
 ]
 fa = ["flash-attn", "ninja", "packaging"]
+liger = ["liger-kernel==0.8.0"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}

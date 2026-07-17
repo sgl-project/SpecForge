@@ -110,6 +110,10 @@ class _FixedHead(nn.Module):
     def __init__(self, logits: torch.Tensor):
         super().__init__()
         self.register_buffer("fixed_logits", logits)
+        self.register_buffer(
+            "weight", torch.empty(logits.shape[-1], 4, dtype=logits.dtype)
+        )
+        self.bias = None
 
     def forward(self, hidden_states):
         return self.fixed_logits.to(device=hidden_states.device)
@@ -389,6 +393,34 @@ class TestDFlashLosses(unittest.TestCase):
         torch.testing.assert_close(got, batch_loss, rtol=0, atol=1e-10)
         self.assertFalse(torch.allclose(got, token_count_loss))
 
+    def test_liger_backend_preserves_dflash_and_dpace_reductions(self):
+        accuracy = torch.zeros_like(self.neg_log_q).view(-1)
+        with (
+            patch.object(_dflash_module, "validate_liger_installation"),
+            patch.object(
+                _dflash_module,
+                "frozen_linear_cross_entropy",
+                return_value=(self.neg_log_q.view(-1), accuracy),
+            ) as fused_ce,
+        ):
+            dflash = self._forward_loss(
+                loss_type="dflash",
+                loss_decay_gamma=7.0,
+                linear_cross_entropy_backend="liger",
+            )
+            dpace = self._forward_loss(
+                loss_type="dpace",
+                dpace_alpha=0.5,
+                linear_cross_entropy_backend="liger",
+            )
+
+        want_dflash = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=7.0)
+        dpace_weight = _naive_dpace_weight(self.q, self.binary_mask, 0.5, "dpace")
+        want_dpace = (self.neg_log_q * dpace_weight * self.binary_mask).sum() / 2.0
+        torch.testing.assert_close(dflash, want_dflash, rtol=0, atol=1e-8)
+        torch.testing.assert_close(dpace, want_dpace, rtol=0, atol=1e-10)
+        self.assertEqual(fused_ce.call_count, 2)
+
     def test_alpha_changes_dpace_loss(self):
         low_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.1)
         high_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.9)
@@ -411,6 +443,28 @@ class TestDFlashLosses(unittest.TestCase):
                 self.keep_mask,
                 loss_type="dpace",
                 dpace_alpha=1.5,
+            )
+
+    def test_invalid_linear_cross_entropy_backend_rejected(self):
+        with self.assertRaisesRegex(ValueError, "linear_cross_entropy_backend"):
+            _make_model(
+                self.logits,
+                self.anchors,
+                self.keep_mask,
+                linear_cross_entropy_backend="unknown",
+            )
+
+    def test_liger_backend_rejects_trainable_lm_head(self):
+        with self.assertRaisesRegex(ValueError, "frozen target LM head"):
+            OnlineDFlashModel(
+                draft_model=_FixedDraft(hidden_size=4),
+                target_lm_head=nn.Linear(4, self.logits.shape[-1], bias=False),
+                target_embed_tokens=nn.Embedding(self.logits.shape[-1], 4),
+                mask_token_id=0,
+                block_size=self.logits.shape[2],
+                attention_backend="sdpa",
+                num_anchors=self.anchors.shape[1],
+                linear_cross_entropy_backend="liger",
             )
 
     def test_dflash_draft_stub_does_not_leak_to_sys_modules(self):

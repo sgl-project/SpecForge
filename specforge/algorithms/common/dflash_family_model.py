@@ -8,6 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.ops.fused_linear_cross_entropy import (
+    frozen_linear_cross_entropy,
+    validate_liger_installation,
+)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -30,6 +34,7 @@ _VALID_LOSS_TYPES = {
     "dpace-continuation-value-only",
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_VALID_LINEAR_CE_BACKENDS = {"torch", "liger"}
 
 
 def compute_accept_len(
@@ -132,6 +137,7 @@ class OnlineDFlashModel(nn.Module):
         loss_decay_gamma: Optional[float] = None,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        linear_cross_entropy_backend: str = "torch",
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -140,6 +146,27 @@ class OnlineDFlashModel(nn.Module):
             )
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        if linear_cross_entropy_backend not in _VALID_LINEAR_CE_BACKENDS:
+            raise ValueError(
+                "linear_cross_entropy_backend="
+                f"{linear_cross_entropy_backend!r}; must be one of "
+                f"{sorted(_VALID_LINEAR_CE_BACKENDS)}"
+            )
+        if linear_cross_entropy_backend == "liger":
+            weight = getattr(target_lm_head, "weight", None)
+            if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+                raise ValueError(
+                    "linear_cross_entropy_backend='liger' requires a linear target "
+                    "LM head with a 2D weight"
+                )
+            if any(
+                parameter.requires_grad for parameter in target_lm_head.parameters()
+            ):
+                raise ValueError(
+                    "linear_cross_entropy_backend='liger' requires a frozen target "
+                    "LM head"
+                )
+            validate_liger_installation()
 
         self.draft_model = draft_model
         self.lm_head = target_lm_head
@@ -151,6 +178,7 @@ class OnlineDFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.linear_cross_entropy_backend = linear_cross_entropy_backend
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -328,8 +356,6 @@ class OnlineDFlashModel(nn.Module):
             loss_mask=loss_mask,
         )
 
-        logits = self.lm_head(output_hidden)
-
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
@@ -361,10 +387,23 @@ class OnlineDFlashModel(nn.Module):
         binary_eval_mask = weight_mask.view(-1)
 
         # --- Cross entropy ---
-        flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
-
-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        if self.linear_cross_entropy_backend == "liger":
+            lm_head_bias = getattr(self.lm_head, "bias", None)
+            loss_per_token, token_accuracy = frozen_linear_cross_entropy(
+                output_hidden.reshape(-1, output_hidden.size(-1)),
+                self.lm_head.weight.detach(),
+                flat_targets,
+                lm_head_bias.detach() if lm_head_bias is not None else None,
+            )
+        else:
+            logits = self.lm_head(output_hidden)
+            flat_logits = logits.view(-1, logits.size(-1))
+            loss_per_token = F.cross_entropy(
+                flat_logits, flat_targets, reduction="none"
+            )
+            with torch.no_grad():
+                token_accuracy = (flat_logits.argmax(dim=-1) == flat_targets).float()
 
         if self.loss_type == "dflash":
             # Preserve the existing DFlash weighted-mean behavior.
@@ -396,8 +435,7 @@ class OnlineDFlashModel(nn.Module):
 
         # --- Accuracy ---
         with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+            correct = token_accuracy * (binary_eval_mask > 0.5)
             accuracy_denom = binary_eval_mask.sum()
             accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
 
