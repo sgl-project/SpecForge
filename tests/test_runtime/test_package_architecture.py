@@ -691,7 +691,7 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertNotIn("get_target_engine", source)
         self.assertNotIn("return_last_hidden_states=True", source)
         self.assertNotIn("return_logits=False", source)
-        self.assertIn("load_offline_eagle3_capture", source)
+        self.assertIn("load_offline_capture", source)
 
     def test_only_canonical_draft_configs_are_checked_in(self):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}

@@ -33,7 +33,7 @@ from .utils import wrap_offline_eagle3_logits_processors
 
 
 class OfflineSGLangCaptureBackend:
-    """Frozen local target used only to materialize offline EAGLE3 features."""
+    """Frozen local target used only to materialize offline features."""
 
     def __init__(self, model_runner: SGLangRunner) -> None:
         self.model_runner = model_runner
@@ -85,6 +85,30 @@ class OfflineSGLangCaptureBackend:
 
     def set_eagle3_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
         self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
+
+    def set_capture_layers(
+        self,
+        layer_ids: Optional[List[int]] = None,
+        *,
+        capture_method: str,
+    ) -> None:
+        """Set auxiliary layers through the strategy's SGLang capture API."""
+
+        setter_name = {
+            "eagle3": "set_eagle3_layers_to_capture",
+            "dflash": "set_dflash_layers_to_capture",
+        }.get(capture_method)
+        if setter_name is None:
+            raise ValueError(
+                "offline SGLang capture method must be 'eagle3' or 'dflash', "
+                f"got {capture_method!r}"
+            )
+        setter = getattr(self.model_runner.model, setter_name, None)
+        if not callable(setter):
+            raise RuntimeError(
+                f"target model does not expose SGLang capture hook {setter_name!r}"
+            )
+        setter(layer_ids)
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):
@@ -177,7 +201,8 @@ class OfflineSGLangCaptureBackend:
             last_hidden_states = getattr(output, "last_hidden_states", None)
             if aux_hidden_states is None or last_hidden_states is None:
                 raise RuntimeError(
-                    "SGLang did not return the hidden states required for EAGLE3"
+                    "SGLang did not return the hidden states required for "
+                    "offline feature preparation"
                 )
             aux_rows = torch.split(aux_hidden_states, input_lens, dim=0)
             last_rows = torch.split(last_hidden_states, input_lens, dim=0)
@@ -185,6 +210,21 @@ class OfflineSGLangCaptureBackend:
             self._clear_pools()
 
         return data, aux_rows, last_rows
+
+    def capture(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ):
+        """Capture generic auxiliary and final target states."""
+
+        return self.capture_eagle3(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+        )
 
 
 __all__ = ["OfflineSGLangCaptureBackend"]

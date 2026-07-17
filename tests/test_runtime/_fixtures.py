@@ -229,6 +229,42 @@ def write_offline_files_dflash(d, n=4, seq=32, hidden=H, vocab=V, seed=0):
     return d
 
 
+def write_offline_files_dspark(
+    d,
+    n=4,
+    seq=32,
+    captured_width=H,
+    target_hidden=H,
+    vocab=V,
+    seed=0,
+):
+    """Write synthetic DSpark offline target-layer and final-state features."""
+
+    os.makedirs(d, exist_ok=True)
+    generator = torch.Generator().manual_seed(seed)
+    for index in range(n):
+        torch.save(
+            {
+                "input_ids": torch.randint(0, vocab, (seq,), generator=generator),
+                "loss_mask": torch.ones(seq, dtype=torch.long),
+                "hidden_states": torch.randn(
+                    1,
+                    seq,
+                    captured_width,
+                    generator=generator,
+                ).to(torch.bfloat16),
+                "target_last_hidden_states": torch.randn(
+                    1,
+                    seq,
+                    target_hidden,
+                    generator=generator,
+                ).to(torch.bfloat16),
+            },
+            os.path.join(d, f"{index:04d}.ckpt"),
+        )
+    return d
+
+
 def build_dflash(
     workdir,
     *,

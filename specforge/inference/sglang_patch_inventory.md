@@ -33,14 +33,15 @@ version-pinned APIs required for offline EAGLE3 preprocessing:
 | Dependency | Upgrade risk |
 |---|---|
 | `CaptureHiddenMode.FULL` and logits-processor replacement | hidden-state output fields or pruning behavior may change |
-| `set_eagle3_layers_to_capture` | layer-selection API may move |
+| `set_eagle3_layers_to_capture` / `set_dflash_layers_to_capture` | strategy-specific layer-selection APIs may move |
 | `ScheduleBatch`, `ForwardBatch`, and `ModelRunner` construction | constructor and memory-pool setup may change |
 | splitting captured states by request input length | token packing conventions may change |
 | DP-attention/model-parallel initialization patches | distributed group signatures may change |
 
-This package computes no logits and supports only the text EAGLE3 state capture
-needed by the preprocessing script. It does not provide HF/custom backends,
-DFlash/VLM capture, online rollout, or a general target-engine factory.
+This package computes no logits and supports text EAGLE3 and DFlash-family
+state capture needed by the preprocessing script. It does not provide
+HF/custom backends, VLM capture, online rollout, or a general target-engine
+factory.
 
 `tests/test_runtime/test_sglang_0514_compat.py` guards the patched 0.5.14 API
 seams, and
