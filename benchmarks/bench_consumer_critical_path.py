@@ -13,20 +13,30 @@ import argparse
 import gc
 import json
 import statistics
+import sys
 import time
+from pathlib import Path
 from typing import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
 from transformers import Qwen3Config
 
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.ops.fused_linear_cross_entropy import frozen_linear_cross_entropy
-from specforge.optimizer import BF16Optimizer
-from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
-from specforge.runtime.data_plane.feature_store import LocalFeatureStore
-from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
-from specforge.training.strategies.registry import resolve_strategy
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from specforge.modeling.draft.dflash import DFlashDraftModel  # noqa: E402
+from specforge.ops.fused_linear_cross_entropy import (  # noqa: E402
+    frozen_linear_cross_entropy,
+)
+from specforge.optimizer import BF16Optimizer  # noqa: E402
+from specforge.runtime.data_plane.feature_dataloader import (  # noqa: E402
+    FeatureDataLoader,
+)
+from specforge.runtime.data_plane.feature_store import LocalFeatureStore  # noqa: E402
+from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue  # noqa: E402
+from specforge.training.strategies.registry import resolve_strategy  # noqa: E402
 
 
 def _timing_summary(samples_ms: list[float]) -> dict[str, float]:
@@ -374,7 +384,8 @@ def benchmark_draft(args) -> dict[str, object]:
         iterations=args.iterations,
     )
     peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
-    del model, noise, target, positions
+    forward = None
+    model = noise = target = positions = None
     _clear_cuda()
     return {
         "forward": forward_result,
@@ -426,7 +437,8 @@ def _benchmark_linear_ce_backend(args, backend: str) -> dict[str, object]:
         iterations=args.iterations,
     )
     peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
-    del hidden, weight, targets, token_weights
+    prepare_loss = forward = None
+    hidden = weight = targets = token_weights = None
     _clear_cuda()
     return {
         "forward": forward_result,
@@ -490,7 +502,8 @@ def _benchmark_optimizer_backend(args, backend: str) -> dict[str, float]:
         iterations=args.iterations,
         before=assign_gradients,
     )
-    del optimizer, model, gradients
+    assign_gradients = None
+    optimizer = model = gradients = None
     _clear_cuda()
     return result
 
