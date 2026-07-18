@@ -1,0 +1,171 @@
+diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
+--- a/python/sglang/srt/spec_capture_sink.py
++++ b/python/sglang/srt/spec_capture_sink.py
+@@ -17,7 +17,8 @@
+
+ Request schema::
+
+-    {"auth_token", "sample_id", "gen",        # capability / id / staleness
++    {"auth_token", "store_id", "sample_id", "gen", "replace",
++                                            # capability / namespace / retry
+      "features": {"aux": <name>, "last_hidden": <name>},   # artifact -> feature
+      "passthrough": [{"name", "data", "shape", "dtype"}]}  # client tensors verbatim
+
+@@ -148,7 +149,10 @@
+         self._store = None
+         self._put_config = None
+         self._lock = threading.Lock()
+-        self._write_lock = threading.Lock()
++        # Retried HTTP requests reuse deterministic keys.  Striped locks keep
++        # replacement atomic without retaining one lock per sample or key.
++        self._sample_locks = [threading.RLock() for _ in range(256)]
++        self._write_locks = [threading.Lock() for _ in range(256)]
+
+     # -- connection ---------------------------------------------------------
+     def _connect(self):
+@@ -195,21 +199,29 @@
+     def _tkey(store_id: str, sample_id: str, gen: int, name: str) -> str:
+         return f"{store_id}/{sample_id}/g{gen}/{name}"
+
+-    def _put_tensor(self, key: str, t: torch.Tensor) -> None:
++    def _put_tensor(
++        self, key: str, t: torch.Tensor, *, replace: bool = False
++    ) -> None:
+         store = self._connect()
+         t = t.detach().to("cpu").contiguous()
+         nbytes = t.element_size() * t.numel()
+-        try:
+-            store.register_buffer(t.data_ptr(), nbytes)
+-        except Exception:
+-            pass  # some builds auto-register
+-        try:
+-            rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
+-        finally:
++        lock = self._write_locks[hash(key) % len(self._write_locks)]
++        with lock:
++            if replace:
++                # Do not probe with is_exist(): Mooncake existence checks can
++                # acquire a read lease that prevents the following removal.
++                self._remove_exact(key, force=True)
+             try:
+-                store.unregister_buffer(t.data_ptr())
++                store.register_buffer(t.data_ptr(), nbytes)
+             except Exception:
+-                pass
++                pass  # some builds auto-register
++            try:
++                rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
++            finally:
++                try:
++                    store.unregister_buffer(t.data_ptr())
++                except Exception:
++                    pass
+         if rc is not None and int(rc) < 0:
+             raise RuntimeError(f"spec-capture put_from failed (status {rc}) for {key}")
+
+@@ -410,12 +422,17 @@
+         spec: Dict[str, Any],
+         aux: Optional[torch.Tensor],
+         last_hidden: Optional[torch.Tensor],
+-    ) -> tuple[str, int, Dict[str, str], List[Dict[str, Any]], int]:
++    ) -> tuple[
++        str, str, int, bool, Dict[str, str], List[Dict[str, Any]], int
++    ]:
+         supplied = str(spec.get("auth_token") or "")
+         if not hmac.compare_digest(supplied, self.auth_token):
+             raise PermissionError("invalid spec-capture capability")
+-        if "store_id" in spec:
+-            raise ValueError("spec-capture store_id is server-owned")
++        store_id = str(spec.get("store_id") or "")
++        if store_id != self.store_id:
++            raise ValueError(
++                "spec-capture store_id must match the server-owned namespace"
++            )
+         sample_id = str(spec.get("sample_id") or "")
+         if not _SAFE_SAMPLE_ID.fullmatch(sample_id) or not sample_id.startswith(
+             self.store_id + ":"
+@@ -427,6 +444,9 @@
+         gen = int(spec.get("gen", 1))
+         if not 1 <= gen <= 2**31 - 1:
+             raise ValueError("spec-capture generation is out of range")
++        replace = spec.get("replace", False)
++        if type(replace) is not bool:
++            raise ValueError("spec-capture replace must be a boolean")
+
+         features = dict(spec.get("features") or {})
+         unknown_artifacts = set(features) - {_ARTIFACT_AUX, _ARTIFACT_LAST_HIDDEN}
+@@ -479,7 +499,7 @@
+                 f"spec-capture sample is {total_bytes} bytes, above the "
+                 f"{self.max_sample_bytes}-byte limit"
+             )
+-        return sample_id, gen, features, passthrough, total_bytes
++        return store_id, sample_id, gen, replace, features, passthrough, total_bytes
+
+     # -- the one entry point --------------------------------------------------
+     def put_sample(
+@@ -495,28 +515,41 @@
+         stored with a leading batch dim of 1. On any failure the keys already
+         written are best-effort removed (no partial sample is consumable).
+         """
+-        sample_id, gen, features, passthrough, total_bytes = self._validate_request(
+-            spec, aux, last_hidden
+-        )
++        (
++            store_id,
++            sample_id,
++            gen,
++            replace,
++            features,
++            passthrough,
++            total_bytes,
++        ) = self._validate_request(spec, aux, last_hidden)
+
+         artifact_names = list(features.values()) + [
+             str(item["name"]) for item in passthrough
+         ]
+         planned_keys = [
+-            self._tkey(self.store_id, sample_id, gen, name)
++            self._tkey(store_id, sample_id, gen, name)
+             for name in artifact_names
+         ]
++        written: List[str] = []
+         result_feats: Dict[str, Dict[str, Any]] = {}
+
+         def _write(name: str, t: torch.Tensor) -> None:
+-            key = self._tkey(self.store_id, sample_id, gen, name)
+-            self._put_tensor(key, t)
++            key = self._tkey(store_id, sample_id, gen, name)
++            # Include the attempted key in rollback: a negative put status may
++            # still follow a partial remote write.
++            written.append(key)
++            self._put_tensor(key, t, replace=replace)
+             result_feats[name] = {
+                 "shape": list(t.shape),
+                 "dtype": _DTYPE_STR.get(t.dtype, str(t.dtype).replace("torch.", "")),
+             }
+
+-        with self._write_lock:
++        sample_lock = self._sample_locks[
++            hash((store_id, sample_id)) % len(self._sample_locks)
++        ]
++        with sample_lock:
+             self._reject_stale_generation(sample_id, gen)
+             self._record_lifecycle(
+                 sample_id, gen, artifact_names, total_bytes, "planned"
+@@ -557,14 +590,14 @@
+                     )
+                     _write(str(item["name"]), t)
+             except Exception:
+-                for key in planned_keys:
++                for key in written:
+                     self._remove_exact(key, force=True)
+                 self._mark_lifecycle_cleaned(sample_id, gen)
+                 raise
+
+             result = {
+                 "sample_id": sample_id,
+-                "store_id": self.store_id,
++                "store_id": store_id,
+                 "gen": gen,
+                 "aux_layer_ids": self.aux_layer_ids,
+                 "features": result_feats,

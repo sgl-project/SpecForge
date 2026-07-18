@@ -5,10 +5,12 @@
 set -euo pipefail
 
 readonly EXPECTED_PATCH_SHA256="a07c015a584bfff053d1358b1cc3c28ee79f1983ed8298953732c5ebe40647fb"
-readonly EXPECTED_MIGRATION_SHA256="a41469afa9355a7384f1cd9d700836a9ecc8dc13c8488d73e867730f40ea6c59"
+readonly EXPECTED_V1_TO_V2_SHA256="a41469afa9355a7384f1cd9d700836a9ecc8dc13c8488d73e867730f40ea6c59"
+readonly EXPECTED_V2_TO_V3_SHA256="4395b9a515d2fcd4ae101bf6dd2d8e960b3786a0a4e8059aa12113a8c182496a"
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly PATCH_PATH="$REPO_ROOT/patches/sglang/v0.5.14/spec-capture.patch"
-readonly MIGRATION_PATH="$REPO_ROOT/patches/sglang/v0.5.14/spec-capture-v1-to-v2.patch"
+readonly V1_TO_V2_PATH="$REPO_ROOT/patches/sglang/v0.5.14/spec-capture-v1-to-v2.patch"
+readonly V2_TO_V3_PATH="$REPO_ROOT/patches/sglang/v0.5.14/spec-capture-v2-to-v3.patch"
 
 usage() {
     cat >&2 <<'EOF'
@@ -17,9 +19,10 @@ Usage:
   scripts/apply_sglang_spec_capture_patch.sh --python /path/to/python --check
   scripts/apply_sglang_spec_capture_patch.sh --python /path/to/python --reverse
 
-Modes are idempotent. --apply upgrades the exact previous capture patch when
-needed. --check performs no writes and succeeds only when the exact current
-v0.5.14 patch is applied and its imports and launch-server flags work.
+Modes are idempotent. --apply upgrades exact supported prior capture-patch
+revisions when needed. --check performs no writes and succeeds only when the
+exact current v0.5.14 patch is applied and its imports and launch-server flags
+work.
 EOF
 }
 
@@ -65,15 +68,20 @@ fi
 [[ -n "$python_executable" && -x "$python_executable" ]] \
     || die "Python executable is unavailable"
 [[ -f "$PATCH_PATH" && ! -L "$PATCH_PATH" ]] || die "patch file is unavailable"
-[[ -f "$MIGRATION_PATH" && ! -L "$MIGRATION_PATH" ]] \
-    || die "patch migration file is unavailable"
+for migration_path in "$V1_TO_V2_PATH" "$V2_TO_V3_PATH"; do
+    [[ -f "$migration_path" && ! -L "$migration_path" ]] \
+        || die "patch migration file is unavailable: $migration_path"
+done
 
 actual_patch_sha256="$(sha256sum "$PATCH_PATH" | awk '{print $1}')"
 [[ "$actual_patch_sha256" == "$EXPECTED_PATCH_SHA256" ]] || die \
     "patch SHA256 mismatch: expected $EXPECTED_PATCH_SHA256, got $actual_patch_sha256"
-actual_migration_sha256="$(sha256sum "$MIGRATION_PATH" | awk '{print $1}')"
-[[ "$actual_migration_sha256" == "$EXPECTED_MIGRATION_SHA256" ]] || die \
-    "migration SHA256 mismatch: expected $EXPECTED_MIGRATION_SHA256, got $actual_migration_sha256"
+actual_v1_to_v2_sha256="$(sha256sum "$V1_TO_V2_PATH" | awk '{print $1}')"
+[[ "$actual_v1_to_v2_sha256" == "$EXPECTED_V1_TO_V2_SHA256" ]] || die \
+    "v1-to-v2 SHA256 mismatch: expected $EXPECTED_V1_TO_V2_SHA256, got $actual_v1_to_v2_sha256"
+actual_v2_to_v3_sha256="$(sha256sum "$V2_TO_V3_PATH" | awk '{print $1}')"
+[[ "$actual_v2_to_v3_sha256" == "$EXPECTED_V2_TO_V3_SHA256" ]] || die \
+    "v2-to-v3 SHA256 mismatch: expected $EXPECTED_V2_TO_V3_SHA256, got $actual_v2_to_v3_sha256"
 
 mapfile -t package_info < <("$python_executable" - <<'PY'
 import importlib.metadata
@@ -127,12 +135,17 @@ for target in "${patch_targets[@]}"; do
     [[ "$target" == sglang/srt/* && "$target" != *".."* ]] \
         || die "unsafe patch target $target"
 done
-mapfile -t migration_targets < <(
-    sed -n 's#^+++ b/python/##p' "$MIGRATION_PATH" | LC_ALL=C sort -u
+mapfile -t v1_to_v2_targets < <(
+    sed -n 's#^+++ b/python/##p' "$V1_TO_V2_PATH" | LC_ALL=C sort -u
 )
-[[ "${migration_targets[*]}" == \
+[[ "${v1_to_v2_targets[*]}" == \
     "sglang/srt/managers/scheduler_components/batch_result_processor.py" ]] \
-    || die "patch migration has an unexpected target inventory"
+    || die "v1-to-v2 migration has an unexpected target inventory"
+mapfile -t v2_to_v3_targets < <(
+    sed -n 's#^+++ b/python/##p' "$V2_TO_V3_PATH" | LC_ALL=C sort -u
+)
+[[ "${v2_to_v3_targets[*]}" == "sglang/srt/spec_capture_sink.py" ]] \
+    || die "v2-to-v3 migration has an unexpected target inventory"
 
 patch_probe() {
     local direction="$1"
@@ -160,8 +173,22 @@ patch_probe() {
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/spec-capture-patch.XXXXXX")"
 trap 'rm -rf "$tmpdir"' EXIT
 
+apply_probe_migration() {
+    local patch_path="$1"
+    local probe_root="$2"
+    local output_file="$3"
+    if ! patch --batch --forward -p2 -d "$probe_root" \
+        < "$patch_path" >"$output_file" 2>&1; then
+        return 1
+    fi
+    ! grep -Eqi \
+        '(^|[[:space:]])(ignoring|skipping)([[:space:]]|$)|FAILED|does not exist|malformed patch' \
+        "$output_file"
+}
+
 probe_legacy_upgrade() {
-    local probe_root="$tmpdir/legacy-upgrade"
+    local source_version="$1"
+    local probe_root="$tmpdir/legacy-v${source_version}"
     local target source destination
     for target in "${patch_targets[@]}"; do
         source="$sglang_parent/$target"
@@ -170,28 +197,32 @@ probe_legacy_upgrade() {
         mkdir -p "$(dirname "$destination")"
         cp -- "$source" "$destination"
     done
-    if ! patch --batch --forward -p2 -d "$probe_root" \
-        < "$MIGRATION_PATH" >"$tmpdir/legacy-migration.log" 2>&1; then
-        return 1
+    if ((source_version == 1)); then
+        apply_probe_migration \
+            "$V1_TO_V2_PATH" "$probe_root" "$tmpdir/legacy-v1-to-v2.log" \
+            || return 1
     fi
-    if grep -Eqi \
-        '(^|[[:space:]])(ignoring|skipping)([[:space:]]|$)|FAILED|does not exist|malformed patch' \
-        "$tmpdir/legacy-migration.log"; then
-        return 1
-    fi
-    patch_probe reverse "$tmpdir/legacy-current.log" "$PATCH_PATH" "$probe_root"
+    apply_probe_migration \
+        "$V2_TO_V3_PATH" "$probe_root" "$tmpdir/legacy-v2-to-v3.log" \
+        || return 1
+    patch_probe \
+        reverse "$tmpdir/legacy-current-v${source_version}.log" \
+        "$PATCH_PATH" "$probe_root"
 }
 
 forward_ok=0
 reverse_ok=0
-legacy_upgrade_ok=0
+legacy_version=0
 patch_probe forward "$tmpdir/forward.log" && forward_ok=1
 patch_probe reverse "$tmpdir/reverse.log" && reverse_ok=1
 if ((forward_ok == 0 && reverse_ok == 0)); then
-    probe_legacy_upgrade && legacy_upgrade_ok=1
+    probe_legacy_upgrade 2 && legacy_version=2
+    if ((legacy_version == 0)); then
+        probe_legacy_upgrade 1 && legacy_version=1
+    fi
 fi
 
-if ((forward_ok == reverse_ok && legacy_upgrade_ok == 0)); then
+if ((forward_ok == reverse_ok && legacy_version == 0)); then
     echo "forward dry-run:" >&2
     sed -n '1,80p' "$tmpdir/forward.log" >&2
     echo "reverse dry-run:" >&2
@@ -266,28 +297,37 @@ PY
 }
 
 upgrade_legacy_tree() {
-    if ! patch --batch --forward -p2 -d "$sglang_parent" \
-        < "$MIGRATION_PATH" >"$tmpdir/migration-apply.log" 2>&1; then
-        sed -n '1,80p' "$tmpdir/migration-apply.log" >&2
-        die "legacy spec-capture patch migration failed"
+    local migration_path migration_name migration_log
+    local -a migrations=("$V2_TO_V3_PATH")
+    if ((legacy_version == 1)); then
+        migrations=("$V1_TO_V2_PATH" "${migrations[@]}")
     fi
+    for migration_path in "${migrations[@]}"; do
+        migration_name="$(basename "$migration_path" .patch)"
+        migration_log="$tmpdir/${migration_name}-apply.log"
+        if ! patch --batch --forward -p2 -d "$sglang_parent" \
+            < "$migration_path" >"$migration_log" 2>&1; then
+            sed -n '1,80p' "$migration_log" >&2
+            die "$migration_name migration failed"
+        fi
+    done
     patch_probe reverse "$tmpdir/post-migration.log" \
         || die "legacy migration did not produce the exact current patch state"
     forward_ok=0
     reverse_ok=1
-    legacy_upgrade_ok=0
+    legacy_version=0
 }
 
 case "$mode" in
     check)
-        ((legacy_upgrade_ok == 0)) \
-            || die "legacy spec-capture patch is applied; run --apply to upgrade it"
+        ((legacy_version == 0)) \
+            || die "spec-capture patch v$legacy_version is applied; run --apply to upgrade it"
         ((reverse_ok == 1)) || die "spec-capture patch is not applied"
         verify_patched_tree
         echo "verified spec-capture patch $EXPECTED_PATCH_SHA256 in $sglang_root"
         ;;
     apply)
-        if ((legacy_upgrade_ok == 1)); then
+        if ((legacy_version > 0)); then
             upgrade_legacy_tree
         elif ((forward_ok == 1)); then
             patch --batch --forward -p2 -d "$sglang_parent" \
@@ -300,7 +340,7 @@ case "$mode" in
         echo "python=$python_realpath sglang=$sglang_version root=$sglang_root"
         ;;
     reverse)
-        if ((legacy_upgrade_ok == 1)); then
+        if ((legacy_version > 0)); then
             upgrade_legacy_tree
         fi
         if ((reverse_ok == 1)); then
