@@ -81,12 +81,14 @@ def materialize_draft(
 
     Validates the state dict against the architecture: unexpected keys fail, and
     the only tolerated missing keys are the embeddings (excluded from draft
-    checkpoints by design — serving loads them from the target).
+    checkpoints by design — serving loads them from the target). Legacy
+    ``t2d``/``d2t`` buffers are tolerated only when ``vocab_mapping_path`` is
+    supplied to restore them.
     """
-    from specforge.modeling.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
-    model = AutoEagle3DraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
+    model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
     if unexpected:
         raise ValueError(
@@ -95,7 +97,7 @@ def materialize_draft(
         )
     tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
     non_embed_missing = [
-        k for k in missing if "embed" not in k.lower() and k not in tolerated
+        key for key in missing if "embed" not in key.lower() and key not in tolerated
     ]
     if non_embed_missing:
         raise ValueError(
@@ -103,8 +105,8 @@ def materialize_draft(
             f"{sorted(non_embed_missing)}"
         )
     if vocab_mapping_path:
-        # tolerated above precisely so a legacy checkpoint that predates the
-        # t2d/d2t buffers can be exported by supplying the mapping here.
+        # Refresh current checkpoints and restore legacy checkpoints that predate
+        # the mapping buffers.
         model.load_vocab_mapping(vocab_mapping_path)
     return model
 

@@ -9,9 +9,10 @@
 """On-disk checkpoint lifecycle: layout, rotation, best tracking, resume reads.
 
 A checkpoint is ``{run_id}-step{N}/`` under ``output_dir``: ``training_state.pt``
-(rank0 shared payload) plus ``training_state_rank{r}.pt`` per rank (optimizer/RNG
-are rank-local under FSDP). Run-scoped ``{run_id}-latest``/``{run_id}-best`` links
-and ``{run_id}.best_meta.json`` sit beside them; multi-rank runs need a shared fs.
+(rank0 shared payload) plus ``training_state_rank{r}.pt`` per rank. FSDP optimizer
+and all RNG state are rank-local; replicated DDP optimizer state is stored once
+in the shared payload. Run-scoped ``{run_id}-latest``/``{run_id}-best`` links and
+``{run_id}.best_meta.json`` sit beside them; multi-rank runs need a shared fs.
 """
 
 from __future__ import annotations
@@ -231,13 +232,10 @@ class CheckpointManager:
         """Read a checkpoint into this rank's resume dict: the shared payload plus
         ``'backend'`` = this rank's ``training_state_rank{r}.pt`` content, passed
         through untouched (``{}`` when absent and ``require_full_state`` is False).
-        Accepts a checkpoint dir, its ``training_state.pt``, or a ``file://`` URI.
+        Accepts a checkpoint dir, its ``training_state.pt``, a ``file://`` URI,
+        or an output/run root containing exactly one checkpoint lineage.
         """
-        path = str(path)
-        if path.startswith("file://"):
-            path = path[len("file://") :]
-        if os.path.basename(path) == STATE_FILE:
-            path = os.path.dirname(path)
+        path = cls.resolve_resume_dir(path)
         state = torch.load(
             os.path.join(path, STATE_FILE),
             map_location=map_location,
@@ -252,6 +250,11 @@ class CheckpointManager:
             state["backend"] = torch.load(
                 rank_path, map_location=map_location, weights_only=False
             )
+            if (
+                state["backend"].get("optimizer") is None
+                and "replicated_optimizer_state" in state
+            ):
+                state["backend"]["optimizer"] = state["replicated_optimizer_state"]
             return state
         state["backend"] = {}
         if require_full_state and int(state.get("global_step") or 0) > 0:
@@ -263,6 +266,61 @@ class CheckpointManager:
                 f"weights and counters only"
             )
         return state
+
+    @classmethod
+    def resolve_resume_dir(cls, path: str) -> str:
+        """Resolve one unambiguous resume target to its checkpoint directory.
+
+        A run output directory is convenient in declarative configs, but it
+        must never choose between unrelated runs silently.  Prefer its single
+        complete ``*-latest`` pointer; when symlinks are unavailable, fall back
+        to the highest complete ``<run-id>-stepN`` directory only if all
+        candidates belong to the same run id.
+        """
+        path = str(path)
+        if path.startswith("file://"):
+            path = path[len("file://") :]
+        path = os.path.abspath(os.path.expanduser(path))
+        if os.path.basename(path) == STATE_FILE:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"checkpoint state file does not exist: {path}")
+            path = os.path.dirname(path)
+        if os.path.isfile(os.path.join(path, STATE_FILE)):
+            return path
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"checkpoint path does not exist: {path}")
+
+        latest = []
+        for candidate in glob.glob(os.path.join(glob.escape(path), "*-latest")):
+            resolved = os.path.realpath(candidate)
+            if os.path.isfile(os.path.join(resolved, STATE_FILE)):
+                latest.append(resolved)
+        latest = sorted(set(latest))
+        if len(latest) == 1:
+            return latest[0]
+        if len(latest) > 1:
+            raise ValueError(
+                f"resume root {path} contains multiple complete *-latest runs: "
+                f"{latest}; select one checkpoint explicitly"
+            )
+
+        by_run: Dict[str, list[Tuple[int, str]]] = {}
+        pattern = re.compile(r"^(.+)-step(\d+)$")
+        for candidate in glob.glob(os.path.join(glob.escape(path), "*-step*")):
+            match = pattern.match(os.path.basename(candidate))
+            if match and os.path.isfile(os.path.join(candidate, STATE_FILE)):
+                by_run.setdefault(match.group(1), []).append(
+                    (int(match.group(2)), candidate)
+                )
+        if not by_run:
+            raise FileNotFoundError(f"no complete checkpoint found under {path}")
+        if len(by_run) > 1:
+            raise ValueError(
+                f"resume root {path} contains multiple checkpoint runs: "
+                f"{sorted(by_run)}; select one checkpoint explicitly"
+            )
+        candidates = next(iter(by_run.values()))
+        return max(candidates, key=lambda item: item[0])[1]
 
     def latest_dir(self) -> Optional[str]:
         """Directory of the newest complete checkpoint, or None."""

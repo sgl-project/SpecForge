@@ -188,7 +188,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
-        return [(num_target_layers // 2)]
+        return [num_target_layers // 2]
     start = 1
     end = num_target_layers - 3
     span = end - start
@@ -209,6 +209,45 @@ def extract_context_feature(
         selected_states.append(hidden_states[layer_id + offset])
     target_hidden = torch.cat(selected_states, dim=-1)
     return target_hidden
+
+
+def normalize_draft_head_checkpoint_keys(
+    module,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+):
+    """Map checkpoint-only nested head names onto the direct module layout.
+
+    Early Domino/DSpark checkpoints saved their auxiliary heads beneath a
+    ``logit_head`` container. The live architecture no longer owns that wrapper,
+    but those tensors remain valid and must not be dropped during warm start or
+    full resume.
+    """
+
+    del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    checkpoint_prefixes = (
+        ("logit_head.prefix_gru.", "prefix_gru."),
+        ("logit_head.embed_proj.", "embed_proj."),
+        ("logit_head.markov_head.", "markov_head."),
+        ("logit_head.confidence_head.", "confidence_head."),
+    )
+    for key in list(state_dict):
+        if not key.startswith(prefix):
+            continue
+        local_key = key[len(prefix) :]
+        for checkpoint_prefix, model_prefix in checkpoint_prefixes:
+            if not local_key.startswith(checkpoint_prefix):
+                continue
+            normalized_key = prefix + model_prefix + local_key[len(checkpoint_prefix) :]
+            if normalized_key not in state_dict:
+                state_dict[normalized_key] = state_dict[key]
+            state_dict.pop(key)
+            break
 
 
 @register_draft
@@ -244,38 +283,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
         self._init_draft_head(config, dflash_config)
-        self.register_load_state_dict_pre_hook(self._remap_legacy_draft_head_keys)
+        self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
-
-    @staticmethod
-    def _remap_legacy_draft_head_keys(
-        module,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        legacy_prefixes = (
-            ("logit_head.prefix_gru.", "prefix_gru."),
-            ("logit_head.embed_proj.", "embed_proj."),
-            ("logit_head.markov_head.", "markov_head."),
-            ("logit_head.confidence_head.", "confidence_head."),
-        )
-        for key in list(state_dict.keys()):
-            if not key.startswith(prefix):
-                continue
-            local_key = key[len(prefix) :]
-            for old_prefix, new_prefix in legacy_prefixes:
-                if local_key.startswith(old_prefix):
-                    new_key = prefix + new_prefix + local_key[len(old_prefix) :]
-                    if new_key not in state_dict:
-                        state_dict[new_key] = state_dict[key]
-                    state_dict.pop(key)
-                    break
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
@@ -312,6 +321,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> Optional[torch.Tensor]:
         del hidden_states, prev_token_ids
         return None
+
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Sample one speculative block from the draft-model hidden states.
+
+        DFlash predicts the whole suffix in one LM-head call. Draft families
+        with an auxiliary logits head can override this boundary without
+        duplicating the target-cache and acceptance logic in ``spec_generate``.
+        """
+        del block_output_ids
+        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        return sample(draft_logits)
 
     def forward(
         self,
@@ -391,20 +416,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start + block_size
-                    ],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                    is_causal=False,
-                )[:, -block_size + 1 :, :]
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[
+                    :, past_key_values_draft.get_seq_length() : start + block_size
+                ],
+                past_key_values=past_key_values_draft,
+                use_cache=True,
+                is_causal=False,
             )
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            block_output_ids[:, 1:] = self._sample_draft_tokens(
+                target,
+                draft_hidden,
+                block_output_ids,
+            )
 
             output = target(
                 block_output_ids,

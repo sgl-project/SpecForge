@@ -8,17 +8,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """DataFlowController: the metadata-only scheduler / debug boundary.
 
-The controller owns prompt and sample lifecycle, leases, and worker registration.
-It NEVER touches tensors — every public method that accepts
+The controller owns prompt and sample lifecycle, acknowledgements, and worker
+registration. It NEVER touches tensors — every public method that accepts
 a record runs ``assert_no_tensors`` (this is what ``test_controller_carries_no_tensor``
 exercises). All large tensors travel through the data plane (FeatureStore);
-online ``commit_samples`` and offline ``enqueue_offline_refs`` converge onto the
-same ``SampleRefQueue`` so the trainer path has no online/offline branch.
+Online ``commit_samples`` feeds the private local/distributor staging queue.
+Offline refs remain a fixed list owned by ``FeatureDataLoader`` and never enter
+this queue or ledger.
 
-Recovery-critical state (committed-sample dedup and the durable ack transaction)
-lives behind a ``MetadataStore`` so a durable backend (SQLite → Redis/DB) is a
-swap, not a rewrite. The current backend is in-process; the public surface already
-matches the durable controller shape so a later Ray/service deployment is mechanical.
+Committed-sample dedup and acknowledgements live behind a ``MetadataStore``;
+online consumers use one SQLite ledger shared by their ranks.
 """
 
 from __future__ import annotations
@@ -27,58 +26,14 @@ import dataclasses
 import threading
 import uuid
 from collections import OrderedDict, deque
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional
 
-from specforge.runtime.contracts import (
-    DeploymentMode,
-    PromptTask,
-    SampleRef,
-    assert_no_tensors,
-)
-from specforge.runtime.control_plane.backpressure import BackpressureController
+from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
-    NoOpMetadataStore,
-    SQLiteMetadataStore,
 )
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
-
-
-class TrainLease:
-    """A train-side lease client that routes lease/ack/fail through the controller.
-
-    Exposes the loader-facing ``get/ack/fail`` shape so ``FeatureDataLoader`` can
-    consume it interchangeably with a raw queue — but every op goes through the
-    controller, so the durable ack transaction is recorded and a disaggregated
-    (cross-node) trainer is a drop-in (it never holds a raw in-process queue).
-    """
-
-    def __init__(self, controller: "DataFlowController", trainer_id: str) -> None:
-        self._controller = controller
-        self._trainer_id = trainer_id
-
-    def get(self, max_refs: int, timeout_s: Optional[float] = None) -> List[SampleRef]:
-        return self._controller.lease_train_refs(self._trainer_id, max_refs, timeout_s)
-
-    def ack(
-        self,
-        refs: List[SampleRef],
-        *,
-        global_step: Optional[int] = None,
-        optimizer_durable: bool = False,
-    ) -> None:
-        self._controller.ack_train_refs(
-            self._trainer_id,
-            [r.sample_id for r in refs],
-            global_step=global_step,
-            optimizer_durable=optimizer_durable,
-        )
-
-    def fail(self, refs: List[SampleRef], reason: str, retryable: bool) -> None:
-        self._controller.fail_refs(
-            self._trainer_id, [r.sample_id for r in refs], reason, retryable
-        )
 
 
 class DataFlowController:
@@ -86,18 +41,13 @@ class DataFlowController:
         self,
         run_id: str,
         *,
-        sample_queue: Optional[SampleRefQueue] = None,
         metadata_store: Optional[MetadataStore] = None,
-        backpressure: Optional[BackpressureController] = None,
         max_prompt_attempts: Optional[int] = None,
+        enable_sample_queue: bool = True,
     ) -> None:
         self.run_id = run_id
-        self.sample_queue = sample_queue or SampleRefQueue()
+        self.sample_queue = SampleRefQueue() if enable_sample_queue else None
         self.store = metadata_store or InMemoryMetadataStore()
-        # Optional backpressure policy. None = never pause / no caps (M1-M4
-        # behavior). The controller owns the pause decision; the policy only
-        # reads capacity (FeatureStore.health) — no tensors cross this seam.
-        self.backpressure = backpressure
         # Retryable-failure bound: a task failed this many attempts goes
         # terminal instead of requeueing (None = retry forever). Bounds a
         # poisoned prompt that would otherwise pin the pool non-empty forever.
@@ -125,20 +75,18 @@ class DataFlowController:
             self._trainers[trainer_id] = dict(info)
         return trainer_id
 
-    def train_lease(self, trainer_id: Optional[str] = None) -> TrainLease:
-        """Return a train-side lease client (lease + ack route through here)."""
-        if trainer_id is None:
-            trainer_id = self.register_trainer({"role": "trainer"})
-        return TrainLease(self, trainer_id)
-
     # -- prompt lifecycle (online) ----------------------------------------
     def ingest_prompts(self, prompts: List[Dict[str, Any]]) -> List[str]:
+        prepared: List[PromptTask] = []
         task_ids: List[str] = []
-        with self._lock:
-            for p in prompts:
-                assert_no_tensors(p)
-                task_id = p.get("task_id") or f"task-{uuid.uuid4().hex[:12]}"
-                task = PromptTask(
+        for p in prompts:
+            # Every PromptTask field below is either taken from this validated
+            # input or built from tensor-free defaults/scalar conversions. One
+            # boundary check therefore avoids walking long token lists twice.
+            assert_no_tensors(p)
+            task_id = p.get("task_id") or f"task-{uuid.uuid4().hex[:12]}"
+            prepared.append(
+                PromptTask(
                     task_id=task_id,
                     run_id=self.run_id,
                     source_id=str(p.get("source_id", "prompt_source")),
@@ -150,29 +98,21 @@ class DataFlowController:
                     draft_weight_version=p.get("draft_weight_version"),
                     metadata=p.get("metadata", {}),
                 )
-                assert_no_tensors(task)
-                self._prompts[task_id] = task
-                self._prompt_pending.append(task_id)
-                task_ids.append(task_id)
+            )
+            task_ids.append(task_id)
+
+        # Validation and object construction can be expensive for large prompt
+        # batches, so keep them outside the controller's global state lock.
+        with self._lock:
+            for task in prepared:
+                self._prompts[task.task_id] = task
+                self._prompt_pending.append(task.task_id)
         return task_ids
 
     def lease_prompt_tasks(self, worker_id: str, max_tasks: int) -> List[PromptTask]:
-        # Backpressure: pause leasing entirely above the high watermark (a paused
-        # rollout that asks for work is "rollout starvation" — logged distinctly
-        # from trainer starvation). Consult the policy *outside* the controller
-        # lock; it takes the store lock internally.
-        if self.backpressure is not None and self.backpressure.should_pause_prompts():
-            self.backpressure.note_rollout_starved()
-            return []
         out: List[PromptTask] = []
         with self._lock:
-            grant = max_tasks
-            if self.backpressure is not None:
-                inflight = sum(
-                    1 for w in self._prompt_leased.values() if w == worker_id
-                )
-                grant = self.backpressure.cap_prompt_grant(inflight, max_tasks)
-            for _ in range(grant):
+            for _ in range(max_tasks):
                 if not self._prompt_pending:
                     break
                 task_id = self._prompt_pending.popleft()
@@ -180,14 +120,29 @@ class DataFlowController:
                 out.append(self._prompts[task_id])
         return out
 
+    def complete_prompt_tasks(self, worker_id: str, task_ids: List[str]) -> None:
+        """Retire successfully captured prompts that belong to another TP rank.
+
+        Colocated target-TP ranks keep replicated prompt schedules so they can
+        execute the same frozen-target forward.  After capture, each rank trains
+        only its local batch partition; peer-owned prompts therefore complete on
+        this controller without producing a local ``SampleRef``.
+        """
+        with self._lock:
+            for task_id in task_ids:
+                owner = self._prompt_leased.get(task_id)
+                if owner is not None and owner != worker_id:
+                    continue
+                self._prompt_leased.pop(task_id, None)
+                self._prompts.pop(task_id, None)
+
     def fail_prompt_tasks(
         self, worker_id: str, task_ids: List[str], reason: str, retryable: bool
     ) -> None:
         """Release failed prompt leases and optionally requeue them.
 
-        This is intentionally separate from ``fail_refs``. Prompt failures happen
-        before a ``SampleRef`` exists, so routing them through the train-sample
-        queue would be a no-op and would leave prompt leases stuck.
+        Prompt failures happen before a ``SampleRef`` exists, so they release or
+        retire the prompt lease directly rather than touching sample staging.
         """
         with self._lock:
             for task_id in task_ids:
@@ -217,43 +172,36 @@ class DataFlowController:
                     self._prompt_failed[task_id] = reason
                     self._prompts.pop(task_id, None)
 
-    def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> None:
-        fresh: List[SampleRef] = []
+    def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> List[SampleRef]:
+        """Commit refs and return the subset newly accepted by the ledger.
+
+        The returned refs are the exact deduplication result from
+        :meth:`MetadataStore.commit_samples`. Callers that need freshness should
+        use this result instead of inferring it from a separate ledger query.
+        """
+
         for ref in refs:
             assert_no_tensors(ref)  # online no-tensor guard
-            if not self.store.commit_sample(ref):
-                continue  # idempotent on sample_id (at-least-once delivery)
-            if ref.source_task_id is not None:
-                with self._lock:
+
+        freshness = self.store.commit_samples(refs)
+        if len(freshness) != len(refs):
+            raise RuntimeError(
+                "metadata store returned an invalid commit result: "
+                f"expected {len(refs)} entries, got {len(freshness)}"
+            )
+        fresh = [ref for ref, is_fresh in zip(refs, freshness) if is_fresh]
+
+        with self._lock:
+            for ref in fresh:
+                if ref.source_task_id is not None:
                     self._prompt_leased.pop(ref.source_task_id, None)
                     self._prompts.pop(ref.source_task_id, None)
-            fresh.append(ref)
-        if fresh:
+        if fresh and self.sample_queue is not None:
             self.sample_queue.put(fresh)
+        return fresh
 
     # -- offline ingest ----------------------------------------------------
-    def enqueue_offline_refs(self, refs: List[SampleRef]) -> None:
-        fresh: List[SampleRef] = []
-        for ref in refs:
-            assert_no_tensors(ref)
-            if self.store.commit_sample(ref):
-                fresh.append(ref)
-        if fresh:
-            self.sample_queue.put(fresh)
-
-    # -- train-side lease/ack ---------------------------------------------
-    def lease_train_refs(
-        self, trainer_id: str, max_refs: int, timeout_s: Optional[float] = None
-    ) -> List[SampleRef]:
-        if self.backpressure is not None:
-            max_refs = self.backpressure.cap_train_lease(max_refs)
-        refs = self.sample_queue.get(max_refs, timeout_s=timeout_s)
-        # Empty lease == trainer outran rollout (or rollout is paused). Logged as
-        # trainer starvation — the opposite condition from rollout starvation.
-        if not refs and self.backpressure is not None:
-            self.backpressure.note_trainer_starved()
-        return refs
-
+    # -- train-side durable ack -------------------------------------------
     def ack_train_refs(
         self,
         trainer_id: str,
@@ -264,9 +212,7 @@ class DataFlowController:
     ) -> None:
         """Ack consumed refs at the trainer's optimizer-step boundary.
 
-        Records the durable ``{acked sample_ids, global_step, optimizer-durable
-        marker}`` transaction *then* releases the queue lease, so restart can
-        derive release state from the single committed marker.
+        Records the durable ack transaction, then releases the queue lease.
         """
         self.store.record_train_ack(
             sample_ids, global_step=global_step, optimizer_durable=optimizer_durable
@@ -276,57 +222,47 @@ class DataFlowController:
             for r in (self.store.get_committed(s) for s in sample_ids)
             if r is not None
         ]
-        self.sample_queue.ack(refs)
+        if self.sample_queue is not None:
+            self.sample_queue.ack(refs)
 
-    def fail_refs(
-        self, owner_id: str, sample_ids: List[str], reason: str, retryable: bool
-    ) -> None:
-        refs = [
-            r
-            for r in (self.store.get_committed(s) for s in sample_ids)
-            if r is not None
-        ]
-        self.sample_queue.fail(refs, reason, retryable)
-
-    # -- restart reconciliation (B4) --------------------------------------
     def reconcile_on_restart(
         self, feature_store: Optional[Any] = None
     ) -> Dict[str, Any]:
-        """Rebuild queue + release state from the durable ``{acked, global_step,
-        optimizer_durable}`` marker; call once on a fresh controller over a
-        *durable* store after a crash.
+        """Rebuild the transient train queue from one durable online ledger.
 
-        Committed-but-unacked samples are requeued (at-least-once; re-training an
-        unacked sample is safe). Acked samples under the optimizer-durable marker
-        are released and never requeued — trusting the marker ALONE: resuming a
-        checkpoint whose global_step is OLDER than the marker's still releases
-        samples whose weight updates that rollback discarded. That pairing is
-        data loss reconcile cannot repair; the caller must reject it (the
-        disagg-online builders raise on it).
+        Samples covered by an optimizer-durable ack are released. Every other
+        committed sample is requeued for at-least-once training. The operation
+        is idempotent because ``SampleRefQueue.put`` deduplicates by sample id.
         """
+        if self.sample_queue is None:
+            raise ValueError("restart reconciliation requires a trainer sample queue")
         marker = self.store.durable_marker()
         acked = marker["acked"]
-        # Release gates on the optimizer-durable flag, not the global_step scalar
-        # (acks may omit global_step; forcing replay then would duplicate-train).
-        step_committed = bool(marker["optimizer_durable"])
+        optimizer_durable = bool(marker["optimizer_durable"])
         requeued: List[str] = []
         released: List[str] = []
-        for sid in self.store.all_committed_ids():
-            if sid in acked and step_committed:
-                released.append(sid)
+        for sample_id in self.store.all_committed_ids():
+            ref = self.store.get_committed(sample_id)
+            if optimizer_durable and sample_id in acked:
+                released.append(sample_id)
                 if feature_store is not None:
-                    # idempotent free; safe if the sample was already freed
-                    feature_store.abort(sid, reason="reconciled-released")
-            else:
-                ref = self.store.get_committed(sid)
-                if ref is not None:
-                    self.sample_queue.put([ref])  # idempotent on sample_id
-                    requeued.append(sid)
+                    # A restarted authority owns a fresh Mooncake client. It may
+                    # never have materialized refs that belonged to another DP
+                    # rank, so seed generation/key bookkeeping from the durable
+                    # committed ref before asking it to remove remote objects.
+                    adopt = getattr(feature_store, "adopt", None)
+                    if callable(adopt) and ref is not None:
+                        adopt(ref)
+                    feature_store.abort(sample_id, reason="reconciled-released")
+                continue
+            if ref is not None:
+                self.sample_queue.put([ref])
+                requeued.append(sample_id)
         return {
             "requeued": requeued,
             "released": released,
             "global_step": marker["global_step"],
-            "optimizer_durable": marker["optimizer_durable"],
+            "optimizer_durable": optimizer_durable,
         }
 
     # NOTE: weight publishing (publish_weight_version / latest_weight_version) is
@@ -350,36 +286,18 @@ class DataFlowController:
             "prompts_leased": leased,
             "prompts_failed": failed,
             "samples_committed": committed,
-            # train_backlog = samples produced but not yet acked-as-trained: the
-            # count-based "trainer behind rollout" signal for backpressure.
+            # Samples produced but not yet durably acked by the trainer.
             "train_backlog": committed - acked,
-            "queue_depth": self.sample_queue.depth(),
-            "queue_in_flight": self.sample_queue.in_flight(),
+            "queue_depth": self.sample_queue.depth() if self.sample_queue else 0,
+            "queue_in_flight": (
+                self.sample_queue.in_flight() if self.sample_queue else 0
+            ),
             "rollout_workers": workers,
             "trainers": trainers,
             "durable_global_step": marker["global_step"],
             "durable_acked": acked,
         }
-        if self.backpressure is not None:
-            status["backpressure"] = self.backpressure.snapshot()
         return status
 
 
-def build_control_plane_for_mode(
-    deployment_mode: DeploymentMode,
-    run_id: str,
-    *,
-    metadata_db_path: Optional[str] = None,
-) -> Tuple[DataFlowController, bool]:
-    """Build the control-plane collaborators for a deployment mode."""
-    if deployment_mode == "local_colocated":
-        store: Optional[MetadataStore] = NoOpMetadataStore()
-        durable_ack = False
-    else:
-        store = SQLiteMetadataStore(metadata_db_path) if metadata_db_path else None
-        durable_ack = True
-    controller = DataFlowController(run_id, metadata_store=store)
-    return controller, durable_ack
-
-
-__all__ = ["DataFlowController", "TrainLease", "build_control_plane_for_mode"]
+__all__ = ["DataFlowController"]

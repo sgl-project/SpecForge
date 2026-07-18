@@ -10,8 +10,8 @@
 
 ``Trainer`` WRAPS — does not replace — the runtime training seam
 (``TrainerController`` / ``TrainerCore`` / ``DraftTrainStrategy`` /
-``FSDPTrainingBackend``). Future managers (CheckpointManager / Evaluator /
-lr_scheduler — Phase D) land here on top of the same seam.
+``FSDPTrainingBackend``). ``CheckpointManager`` and the learning-rate schedule
+live here on top of the same seam.
 
 Import-light: the ``Trainer`` (which imports the GPU/model-heavy runtime backend)
 is imported lazily so ``import specforge.training`` stays cheap.

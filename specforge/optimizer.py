@@ -100,6 +100,15 @@ class BF16Optimizer:
         """Restore optimizer/scheduler state and, when present, the rank-local
         fp32 master params; without them the masters are re-cloned from the
         bf16 weights and the resume is not numerically faithful."""
+        saved_max_grad_norm = state_dict.get("max_grad_norm")
+        if saved_max_grad_norm is not None and float(saved_max_grad_norm) != float(
+            self.max_grad_norm
+        ):
+            raise ValueError(
+                "checkpoint optimizer used max_grad_norm="
+                f"{saved_max_grad_norm} but this run has "
+                f"max_grad_norm={self.max_grad_norm}"
+            )
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
@@ -132,6 +141,7 @@ class BF16Optimizer:
         return {
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "max_grad_norm": self.max_grad_norm,
             # rank-local fp32 masters; without them a resume re-quantizes from bf16
             "fp32_params": [t.detach().cpu() for t in self.fp32_params],
         }

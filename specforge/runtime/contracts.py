@@ -33,8 +33,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a hard torch depende
 SCHEMA_VERSION = 1
 
 RunMode = Literal["online", "offline"]
-DeploymentMode = Literal["local_colocated", "dataflow_colocated", "disaggregated"]
-DraftStrategyName = Literal["eagle3", "dflash", "domino", "dspark"]
+DraftStrategyName = Literal["eagle3", "dflash", "domino", "dspark", "peagle"]
 # Tagged union for the EAGLE3 target feature. The *strategy* owns the
 # projection so the trainer core stays branch-free:
 #   - pruned_logits: rollout applied the t2d vocab map; stored (seq, draft_vocab)
@@ -140,6 +139,9 @@ class TrainBatch:
 # ---------------------------------------------------------------------------
 # No-tensor invariant
 # ---------------------------------------------------------------------------
+_METADATA_SCALAR_TYPES = (str, bytes, bool, int, float)
+
+
 def _looks_like_tensor(obj: Any) -> bool:
     """Duck-typed tensor / ndarray detection without importing torch/numpy."""
     cls = type(obj)
@@ -158,7 +160,8 @@ def assert_no_tensors(obj: Any, *, _path: str = "<root>") -> None:
     records (including their ``metadata``) never smuggle a tensor through a
     controller API. ``test_controller_carries_no_tensor`` exercises this.
     """
-    if obj is None or isinstance(obj, (str, bytes, bool, int, float)):
+    scalar_types = _METADATA_SCALAR_TYPES
+    if obj is None or isinstance(obj, scalar_types):
         return
     if _looks_like_tensor(obj):
         raise TypeError(
@@ -167,14 +170,24 @@ def assert_no_tensors(obj: Any, *, _path: str = "<root>") -> None:
         )
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         for f in dataclasses.fields(obj):
-            assert_no_tensors(getattr(obj, f.name), _path=f"{_path}.{f.name}")
+            value = getattr(obj, f.name)
+            if value is None or isinstance(value, scalar_types):
+                continue
+            assert_no_tensors(value, _path=f"{_path}.{f.name}")
         return
     if isinstance(obj, dict):
         for k, v in obj.items():
+            if v is None or isinstance(v, scalar_types):
+                continue
             assert_no_tensors(v, _path=f"{_path}[{k!r}]")
         return
     if isinstance(obj, (list, tuple, set, frozenset)):
+        # Token-id and mask sequences dominate prompt payloads. Avoid a Python
+        # call and path formatting for every primitive element while preserving
+        # recursive checks for nested containers and tensor-like values.
         for i, v in enumerate(obj):
+            if v is None or isinstance(v, scalar_types):
+                continue
             assert_no_tensors(v, _path=f"{_path}[{i}]")
         return
     # Other scalar/opaque metadata (e.g. a version string container) is fine.
@@ -184,7 +197,6 @@ def assert_no_tensors(obj: Any, *, _path: str = "<root>") -> None:
 __all__ = [
     "SCHEMA_VERSION",
     "RunMode",
-    "DeploymentMode",
     "DraftStrategyName",
     "TargetRepr",
     "PromptTask",

@@ -130,16 +130,6 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
-    name="qwen2-vl",
-    template=ChatTemplate(
-        assistant_header="<|im_start|>assistant\n",
-        user_header="<|im_start|>user\n",
-        system_prompt="You are a helpful assistant.",
-        end_of_turn_token="<|im_end|>\n",
-    ),
-)
-
-TEMPLATE_REGISTRY.register(
     name="phi3",
     template=ChatTemplate(
         assistant_header="<|assistant|>\n",
@@ -265,6 +255,19 @@ TEMPLATE_REGISTRY.register(
         assistant_header="<｜Assistant｜>",
         user_header="<｜User｜>",
         system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
+
+# DeepSeek-V2-Lite's tokenizer renders plain-text role headers. They must not
+# reuse DeepSeek-V3's special-token headers or the assistant loss mask will be
+# anchored at text that never appears in the rendered conversation.
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v2",
+    template=ChatTemplate(
+        assistant_header="Assistant: ",
+        user_header="User: ",
+        system_prompt=None,
         end_of_turn_token="<｜end▁of▁sentence｜>",
     ),
 )

@@ -1,8 +1,8 @@
 import unittest
 
 import torch
-
 from datasets import Dataset
+
 from specforge.data.preprocessing import build_eagle3_dataset
 from specforge.data.template import TEMPLATE_REGISTRY, ChatTemplate
 
