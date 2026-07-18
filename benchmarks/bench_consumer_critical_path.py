@@ -3,7 +3,7 @@
 No model weights or datasets are downloaded. Run one process on one GPU, for
 example::
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python benchmarks/bench_consumer_critical_path.py \
+    CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_consumer_critical_path.py \
         --device cuda:0 --warmup 4 --iterations 20
 """
 
