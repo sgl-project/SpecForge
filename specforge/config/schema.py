@@ -19,16 +19,16 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-from specforge.config.flex_attention import validate_flex_kernel_options
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
 SGLANG_CAPTURE_CONTEXT_HEADROOM = 7
+_SAFE_FANOUT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class StrictConfigModel(BaseModel):
@@ -355,6 +355,181 @@ class ManagedLocalStackConfig(StrictConfigModel):
         return self
 
 
+class WindowedConsumerConfig(StrictConfigModel):
+    """One independently scheduled single-GPU fanout consumer."""
+
+    consumer_id: str = Field(min_length=1, max_length=128)
+    seed: int = Field(ge=0)
+    loss_type: Literal[
+        "dflash",
+        "dpace",
+        "dpace-cumulative-confidence-only",
+        "dpace-continuation-value-only",
+    ]
+    loss_decay_gamma: Optional[float] = Field(default=None, ge=0.0)
+    dpace_alpha: float = Field(ge=0.0, le=1.0)
+    draft_block_size: Optional[int] = Field(default=None, gt=0)
+    num_anchors: int = Field(gt=0)
+    learning_rate: float = Field(gt=0.0)
+    warmup_ratio: float = Field(ge=0.0, le=1.0)
+    cuda_visible_device: Optional[str] = None
+    resume_from: Optional[str] = None
+    window_lookbehind: Optional[int] = Field(default=None, ge=0)
+    window_lookahead: Optional[int] = Field(default=None, ge=0)
+    max_prefetch: Optional[int] = Field(default=None, ge=0)
+
+    @field_validator("consumer_id")
+    @classmethod
+    def _safe_consumer_id(cls, value: str) -> str:
+        if _SAFE_FANOUT_ID.fullmatch(value) is None:
+            raise ValueError(
+                "windowed fanout consumer_id must contain only letters, digits, "
+                "dots, underscores, and hyphens"
+            )
+        return value
+
+    @field_validator("cuda_visible_device")
+    @classmethod
+    def _single_cuda_device(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        _validate_cuda_devices(
+            [value], field_name="windowed_fanout.consumers[].cuda_visible_device"
+        )
+        return value
+
+    @field_validator("resume_from")
+    @classmethod
+    def _non_empty_resume(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and (not value or value.strip() != value):
+            raise ValueError(
+                "windowed fanout resume_from must be non-empty without "
+                "surrounding whitespace"
+            )
+        return value
+
+
+class WindowedFanoutConfig(StrictConfigModel):
+    """Bounded shared-capture policy for independent consumers."""
+
+    consumers: List[WindowedConsumerConfig] = Field(min_length=1)
+    window_lookbehind: int = Field(default=2, ge=0)
+    window_lookahead: int = Field(default=40, ge=0)
+    max_prefetch_per_consumer: int = Field(default=8, ge=0)
+    max_outstanding_per_consumer: int = Field(default=8, gt=0)
+    max_live_refs: int = Field(default=48, gt=0)
+    max_live_bytes: int = Field(gt=0)
+    capture_reservation_bytes: int = Field(default=128 << 20, gt=0)
+    capture_max_sample_bytes: int = Field(default=128 << 20, gt=0)
+    capture_batch_size: int = Field(default=8, gt=0)
+    capture_batch_wait_s: float = Field(default=0.002, ge=0.0)
+    registry_poll_s: float = Field(default=0.01, gt=0.0)
+    max_capture_retries: int = Field(default=2, ge=0)
+    capture_retry_backoff_s: float = Field(default=0.05, ge=0.0)
+    consumer_registration_timeout_s: float = Field(default=300.0, gt=0.0)
+    consumer_heartbeat_timeout_s: float = Field(default=30.0, gt=0.0)
+    consumer_heartbeat_interval_s: float = Field(default=5.0, gt=0.0)
+    consumer_idle_timeout_s: float = Field(default=1800.0, gt=0.0)
+    consumer_prefetch_batches: int = Field(default=1, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_window_contract(self):
+        ids = [consumer.consumer_id for consumer in self.consumers]
+        if len(ids) != len(set(ids)):
+            raise ValueError("windowed fanout consumer ids must be unique")
+        configured_devices = [
+            consumer.cuda_visible_device
+            for consumer in self.consumers
+            if consumer.cuda_visible_device is not None
+        ]
+        if len(configured_devices) != len(set(configured_devices)):
+            raise ValueError("windowed fanout consumer CUDA devices must be unique")
+        if self.consumer_heartbeat_timeout_s <= self.consumer_heartbeat_interval_s:
+            raise ValueError(
+                "windowed fanout heartbeat timeout must exceed its interval"
+            )
+        if self.max_prefetch_per_consumer > self.window_lookahead + 1:
+            raise ValueError(
+                "windowed fanout max_prefetch_per_consumer must not exceed "
+                "window_lookahead + 1"
+            )
+        if self.max_live_refs < self.max_outstanding_per_consumer:
+            raise ValueError(
+                "windowed fanout max_live_refs must cover per-consumer "
+                "outstanding refs"
+            )
+        if self.max_live_bytes < self.capture_reservation_bytes:
+            raise ValueError(
+                "windowed fanout max_live_bytes must cover one capture reservation"
+            )
+        if self.capture_max_sample_bytes > self.capture_reservation_bytes:
+            raise ValueError(
+                "windowed fanout capture_max_sample_bytes must not exceed "
+                "capture_reservation_bytes"
+            )
+        invalid_prefetch = {
+            consumer.consumer_id: (
+                (
+                    self.max_prefetch_per_consumer
+                    if consumer.max_prefetch is None
+                    else consumer.max_prefetch
+                ),
+                (
+                    self.window_lookahead
+                    if consumer.window_lookahead is None
+                    else consumer.window_lookahead
+                ),
+            )
+            for consumer in self.consumers
+            if (
+                self.max_prefetch_per_consumer
+                if consumer.max_prefetch is None
+                else consumer.max_prefetch
+            )
+            > (
+                self.window_lookahead
+                if consumer.window_lookahead is None
+                else consumer.window_lookahead
+            )
+            + 1
+        }
+        if invalid_prefetch:
+            raise ValueError(
+                "windowed fanout consumer prefetch exceeds effective lookahead: "
+                f"{invalid_prefetch}"
+            )
+        return self
+
+    def consumer(self, consumer_id: str) -> WindowedConsumerConfig:
+        for consumer in self.consumers:
+            if consumer.consumer_id == consumer_id:
+                return consumer
+        raise ValueError(
+            f"unknown windowed fanout consumer {consumer_id!r}; expected one of "
+            f"{[consumer.consumer_id for consumer in self.consumers]}"
+        )
+
+    def window_for(self, consumer_id: str) -> tuple[int, int, int]:
+        consumer = self.consumer(consumer_id)
+        return (
+            (
+                self.window_lookbehind
+                if consumer.window_lookbehind is None
+                else consumer.window_lookbehind
+            ),
+            (
+                self.window_lookahead
+                if consumer.window_lookahead is None
+                else consumer.window_lookahead
+            ),
+            (
+                self.max_prefetch_per_consumer
+                if consumer.max_prefetch is None
+                else consumer.max_prefetch
+            ),
+        )
+
+
 class DisaggregatedDeploymentConfig(StrictConfigModel):
     """Shared, non-secret topology for producer/consumer launch planning."""
 
@@ -388,6 +563,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: managed_local supervisors use managed_local.shutdown_grace_s instead.
     shutdown_grace_s: float = Field(default=30.0, gt=0)
     managed_local: Optional[ManagedLocalStackConfig] = None
+    windowed_fanout: Optional[WindowedFanoutConfig] = None
 
     @model_validator(mode="after")
     def _validate_store(self):
@@ -405,6 +581,8 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
             raise ValueError(
                 "deployment.disaggregated.store_root is required for shared_dir"
             )
+        if self.windowed_fanout is not None and self.backend != "mooncake":
+            raise ValueError("windowed_fanout requires backend=mooncake")
         if self.managed_local is not None:
             if self.backend != "mooncake":
                 raise ValueError("managed_local requires backend=mooncake")
@@ -472,11 +650,6 @@ class TrainingConfig(StrictConfigModel):
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
     )
-    flex_kernel_options: Optional[dict[str, bool | int | float | str]] = None
-    draft_kernel_backend: Literal["torch", "liger"] = "torch"
-    linear_cross_entropy_backend: Literal["torch", "liger"] = "torch"
-    compact_zero_weight_ce_rows: bool = False
-    adamw_backend: Literal["torch", "fused"] = "torch"
     #: Trainer tensor parallelism. The unified runtime currently requires one;
     #: target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)
@@ -525,13 +698,6 @@ class TrainingConfig(StrictConfigModel):
     role: Literal["auto", "all", "producer", "consumer"] = "all"
     seed: int = 42
 
-    @field_validator("flex_kernel_options")
-    @classmethod
-    def _validate_flex_kernel_options(cls, value):
-        return validate_flex_kernel_options(
-            value, field_name="training.flex_kernel_options"
-        )
-
     @model_validator(mode="after")
     def _validate_training_shape(self):
         if not 0.0 <= self.dpace_alpha <= 1.0:
@@ -557,30 +723,6 @@ class TrainingConfig(StrictConfigModel):
             raise ValueError(
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
-            )
-        if (
-            self.flex_kernel_options is not None
-            and self.attention_backend != "flex_attention"
-        ):
-            raise ValueError(
-                "training.flex_kernel_options require attention_backend='flex_attention'"
-            )
-        if (
-            self.compact_zero_weight_ce_rows
-            and self.linear_cross_entropy_backend != "liger"
-        ):
-            raise ValueError(
-                "training.compact_zero_weight_ce_rows=true requires "
-                "linear_cross_entropy_backend='liger'"
-            )
-        dflash_only = (
-            self.draft_kernel_backend != "torch"
-            or self.linear_cross_entropy_backend != "torch"
-            or self.compact_zero_weight_ce_rows
-        )
-        if dflash_only and self.strategy != "dflash":
-            raise ValueError(
-                "training draft/linear kernel backends are supported only for dflash"
             )
         return self
 
@@ -757,6 +899,11 @@ class Config(StrictConfigModel):
             if self.deployment.disaggregated is not None
             else None
         )
+        windowed_fanout = (
+            self.deployment.disaggregated.windowed_fanout
+            if self.deployment.disaggregated is not None
+            else None
+        )
         consumer_state_dir = (
             self.deployment.disaggregated.consumer_state_dir
             if self.deployment.disaggregated is not None
@@ -779,6 +926,95 @@ class Config(StrictConfigModel):
                 "multi-node online consumers require an explicit node-local "
                 "deployment.disaggregated.consumer_state_dir for SQLite/WAL"
             )
+        if windowed_fanout is not None:
+            if mode != "online" or deployment != "disaggregated":
+                raise ValueError(
+                    "deployment.disaggregated.windowed_fanout requires online "
+                    "disaggregated training"
+                )
+            if self.training.strategy != "dflash":
+                raise ValueError("windowed_fanout currently supports DFlash only")
+            if self.training.num_epochs != 1:
+                raise ValueError("windowed_fanout supports exactly one prompt epoch")
+            if (
+                self.deployment.trainer.nnodes != 1
+                or self.deployment.trainer.nproc_per_node != 1
+            ):
+                raise ValueError(
+                    "windowed_fanout consumers are independent single-process "
+                    "workers; keep deployment.trainer at 1x1"
+                )
+            configured_capture_servers = (
+                managed_local.capture_servers
+                if managed_local is not None
+                else self.deployment.disaggregated.server_urls
+            )
+            if configured_capture_servers and len(configured_capture_servers) != 1:
+                raise ValueError(
+                    "windowed_fanout currently requires exactly one capture server"
+                )
+            if self.data.max_prompts is None or self.data.max_prompts < 1:
+                raise ValueError(
+                    "windowed_fanout requires a positive data.max_prompts "
+                    "for a fixed capture inventory"
+                )
+            effective_batch = (
+                self.training.batch_size * self.training.accumulation_steps
+            )
+            if self.data.max_prompts % effective_batch:
+                raise ValueError(
+                    "windowed_fanout data.max_prompts must be divisible by "
+                    "training.batch_size * training.accumulation_steps"
+                )
+            total_steps = self.data.max_prompts // effective_batch
+            if (
+                self.training.total_steps is not None
+                and self.training.total_steps != total_steps
+            ):
+                raise ValueError(
+                    "windowed_fanout training.total_steps must match the fixed "
+                    f"prompt inventory ({total_steps})"
+                )
+            if windowed_fanout.max_outstanding_per_consumer < effective_batch:
+                raise ValueError(
+                    "windowed_fanout max_outstanding_per_consumer must cover "
+                    "training.batch_size * training.accumulation_steps"
+                )
+            configured_store_id = self.deployment.disaggregated.store_id
+            if configured_store_id not in (None, self.run_id):
+                raise ValueError(
+                    "windowed_fanout requires deployment.disaggregated.store_id "
+                    "to equal run_id"
+                )
+            if self.training.resume_from is not None:
+                raise ValueError(
+                    "windowed_fanout resume checkpoints belong to individual "
+                    "consumer entries, not training.resume_from"
+                )
+            if managed_local is None:
+                missing_devices = [
+                    consumer.consumer_id
+                    for consumer in windowed_fanout.consumers
+                    if consumer.cuda_visible_device is None
+                ]
+                if missing_devices:
+                    raise ValueError(
+                        "non-managed windowed_fanout consumers require "
+                        "cuda_visible_device: "
+                        f"{missing_devices}"
+                    )
+            else:
+                explicit_devices = [
+                    consumer.consumer_id
+                    for consumer in windowed_fanout.consumers
+                    if consumer.cuda_visible_device is not None
+                ]
+                if explicit_devices:
+                    raise ValueError(
+                        "managed_local windowed_fanout derives consumer devices "
+                        "from trainer_cuda_visible_devices; remove per-consumer "
+                        f"devices from {explicit_devices}"
+                    )
         if managed_local is not None:
             if mode != "online":
                 raise ValueError("managed_local supports online capture only")
@@ -790,6 +1026,17 @@ class Config(StrictConfigModel):
                 )
             if self.training.resume_from is not None:
                 raise ValueError("managed_local does not support resume")
+            if windowed_fanout is not None:
+                resumed_consumers = [
+                    consumer.consumer_id
+                    for consumer in windowed_fanout.consumers
+                    if consumer.resume_from is not None
+                ]
+                if resumed_consumers:
+                    raise ValueError(
+                        "managed_local requires a fresh fanout attempt; consumer "
+                        f"resume is configured for {resumed_consumers}"
+                    )
             minimum_context_length = (
                 self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
             )
@@ -817,13 +1064,22 @@ class Config(StrictConfigModel):
                     "managed_local capture servers do not support SGLang DP "
                     f"options: {unsupported_dp_options}"
                 )
+            expected_trainer_devices = (
+                len(windowed_fanout.consumers)
+                if windowed_fanout is not None
+                else self.deployment.trainer.nproc_per_node
+            )
             if (
                 len(managed_local.trainer_cuda_visible_devices)
-                != self.deployment.trainer.nproc_per_node
+                != expected_trainer_devices
             ):
                 raise ValueError(
                     "managed_local trainer_cuda_visible_devices count must equal "
-                    "deployment.trainer.nproc_per_node"
+                    + (
+                        "the windowed_fanout consumer count"
+                        if windowed_fanout is not None
+                        else "deployment.trainer.nproc_per_node"
+                    )
                 )
             ep_size = self.model.sglang_ep_size
             incompatible_tp_sizes = sorted(

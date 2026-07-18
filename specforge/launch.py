@@ -1779,6 +1779,7 @@ def build_disagg_online_windowed_producer(
     target_model_version: str,
     tokenizer_version: str,
     strategy: str = "eagle3",
+    modality: str = "text",
     target_vocab_size: Optional[int] = None,
     draft_vocab_size: Optional[int] = None,
     target_repr: Optional[str] = None,
@@ -1816,6 +1817,7 @@ def build_disagg_online_windowed_producer(
         )
     capture, digest = build_disagg_windowed_capture_contract(
         strategy=strategy,
+        modality=modality,
         target_hidden_size=target_hidden_size,
         target_model_version=target_model_version,
         tokenizer_version=tokenizer_version,
@@ -1912,7 +1914,6 @@ class DisaggWindowedConsumerRuntime:
             "acked": len(marker["acked"]),
             "global_step": marker["global_step"],
             "queue": self.queue.metrics(),
-            "input_pipeline": self.loader.metrics(),
         }
 
     def close(self) -> None:
@@ -1943,7 +1944,7 @@ def build_disagg_online_windowed_consumer(
     contract_digest: str,
     total_samples: int,
     feature_store: FeatureStore,
-    eagle3_model,
+    draft_model,
     optimizer_factory,
     run_id: str,
     output_dir: str,
@@ -2136,7 +2137,7 @@ def build_disagg_online_windowed_consumer(
             controller=controller,
             store=feature_store,
             ref_source={"queue": queue, "defer_ack_until_durable": True},
-            model=eagle3_model,
+            model=draft_model,
             target_head=None,
             optimizer_factory=optimizer_factory,
             run_id=run_id,
@@ -2194,4 +2195,6 @@ __all__ = [
     "build_disagg_offline_runtime",
     "build_disagg_online_producer",
     "build_disagg_online_consumer",
+    "build_disagg_online_windowed_producer",
+    "build_disagg_online_windowed_consumer",
 ]
