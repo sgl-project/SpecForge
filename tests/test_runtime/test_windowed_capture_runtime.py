@@ -541,12 +541,14 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     max_outstanding=2,
                     batch_size=1,
                     accumulation_steps=2,
+                    loader_prefetch_batches=3,
                     initialization_timeout_s=1.0,
                     heartbeat_interval_s=0.1,
                 )
             try:
                 self.assertIsNone(runtime.controller.sample_queue)
                 self.assertTrue(assemble.call_args.kwargs["durable_ack"])
+                self.assertEqual(assemble.call_args.kwargs["dataloader_num_workers"], 3)
                 unexpected = set(assemble.call_args.kwargs) - set(
                     inspect.signature(_assemble_trainer).parameters
                 )

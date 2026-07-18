@@ -2,12 +2,16 @@
 """Executable contract tests for the SGLang spec-capture patch artifact."""
 
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
+import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
+import venv
 from pathlib import Path
 
 import torch
@@ -185,6 +189,101 @@ class TestSGLangCapturePatch(unittest.TestCase):
         self.assertIn(f'EXPECTED_PATCH_SHA256="{patch_digest}"', installer)
         self.assertIn(f'EXPECTED_V1_TO_V2_SHA256="{v1_to_v2_digest}"', installer)
         self.assertIn(f'EXPECTED_V2_TO_V3_SHA256="{v2_to_v3_digest}"', installer)
+
+    def test_installer_upgrades_v1_and_v2_trees(self):
+        try:
+            installed_version = importlib.metadata.version("sglang")
+        except importlib.metadata.PackageNotFoundError:
+            self.skipTest("sglang is not installed")
+        if installed_version != "0.5.14":
+            self.skipTest(f"requires sglang==0.5.14, found {installed_version}")
+
+        package_spec = importlib.util.find_spec("sglang")
+        self.assertIsNotNone(package_spec)
+        self.assertIsNotNone(package_spec.origin)
+        package_root = Path(package_spec.origin).resolve().parent
+
+        with tempfile.TemporaryDirectory(prefix="sglang-legacy-installer-") as root:
+            env_root = Path(root) / "env"
+            venv.EnvBuilder(with_pip=False).create(env_root)
+            python = env_root / "bin/python"
+            site_packages = Path(
+                subprocess.run(
+                    [
+                        str(python),
+                        "-c",
+                        "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            parent_paths = sorted(
+                {
+                    str(Path(entry).resolve())
+                    for entry in sys.path
+                    if entry and Path(entry).is_dir()
+                }
+            )
+            (site_packages / "specforge-parent-runtime.pth").write_text(
+                "\n".join(parent_paths) + "\n",
+                encoding="utf-8",
+            )
+            shutil.copytree(package_root, site_packages / "sglang")
+            dist_info = site_packages / "sglang-0.5.14.dist-info"
+            dist_info.mkdir()
+            (dist_info / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: sglang\nVersion: 0.5.14\n",
+                encoding="utf-8",
+            )
+
+            def run_installer(mode: str, *, check: bool = True):
+                return subprocess.run(
+                    [
+                        "bash",
+                        str(_INSTALLER),
+                        "--python",
+                        str(python),
+                        mode,
+                    ],
+                    check=check,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+
+            # Normalize either a clean or already-patched source installation.
+            run_installer("--apply")
+            for source_version, reverse_migrations in (
+                (2, (_V2_TO_V3_PATCH,)),
+                (1, (_V2_TO_V3_PATCH, _V1_TO_V2_PATCH)),
+            ):
+                for migration in reverse_migrations:
+                    subprocess.run(
+                        [
+                            "patch",
+                            "--batch",
+                            "--reverse",
+                            "-p2",
+                            "-d",
+                            str(site_packages),
+                        ],
+                        input=migration.read_bytes(),
+                        check=True,
+                        capture_output=True,
+                    )
+
+                legacy_check = run_installer("--check", check=False)
+                self.assertEqual(legacy_check.returncode, 2)
+                self.assertIn(
+                    f"spec-capture patch v{source_version} is applied",
+                    legacy_check.stderr,
+                )
+                upgraded = run_installer("--apply")
+                self.assertIn(
+                    "applied and verified spec-capture patch", upgraded.stdout
+                )
 
     def test_remove_exact_uses_force_without_granting_a_read_lease(self):
         module = _load_sink_module()
