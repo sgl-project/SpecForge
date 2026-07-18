@@ -340,10 +340,10 @@ def _draft_contract(manifest: FanoutManifest) -> tuple[int, int, tuple[int, ...]
 
 
 def _windowed_capture_contract(manifest: FanoutManifest):
-    from specforge.launch import build_disagg_windowed_capture_contract
+    from specforge.production_fanout import build_windowed_capture_contract
 
     target_hidden_size, _, layer_ids = _draft_contract(manifest)
-    return build_disagg_windowed_capture_contract(
+    return build_windowed_capture_contract(
         strategy="dflash",
         target_hidden_size=target_hidden_size,
         target_model_version=manifest.capture.target_model_path,
@@ -512,7 +512,7 @@ def run_producer(manifest: FanoutManifest) -> None:
         ServerCaptureSchema,
         SGLangServerCaptureAdapter,
     )
-    from specforge.launch import build_disagg_online_windowed_producer
+    from specforge.production_fanout import build_windowed_producer
 
     tokenizer = None
     if not manifest.capture.is_pretokenized:
@@ -540,7 +540,7 @@ def run_producer(manifest: FanoutManifest) -> None:
         ),
         target_model_version=manifest.capture.target_model_path,
     )
-    runtime = build_disagg_online_windowed_producer(
+    runtime = build_windowed_producer(
         prompts=prompts,
         feature_store=owner_store,
         feature_source=adapter,
@@ -699,8 +699,8 @@ def _training_logger(label: str):
 
 
 def run_consumer(manifest: FanoutManifest, subscription_id: str) -> None:
-    from specforge.launch import build_disagg_online_windowed_consumer
     from specforge.optimizer import BF16Optimizer
+    from specforge.production_fanout import build_windowed_consumer
 
     variant = manifest.variant(subscription_id)
     from specforge.runtime.data_plane.windowed_capture import (
@@ -809,7 +809,7 @@ def run_consumer(manifest: FanoutManifest, subscription_id: str) -> None:
             "consumer_control": control,
             "loader_prefetch_batches": (manifest.runtime.consumer_prefetch_batches),
         }
-        runtime = build_disagg_online_windowed_consumer(**common)
+        runtime = build_windowed_consumer(**common)
     except BaseException as exc:
         if control is not None:
             try:

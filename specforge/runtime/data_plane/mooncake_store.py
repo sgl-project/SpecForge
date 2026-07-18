@@ -1158,20 +1158,15 @@ class MooncakeFeatureStore(FeatureStore):
                 ):
                     freed_bytes += self._free_bookkeeping_locked(sid)
                     freed += 1
-                elif attempts >= self.max_release_attempts:
-                    if sid in self._required_reclaims:
-                        # A globally-consumed fan-out object must not disappear
-                        # from accounting while it is still remotely resident.
-                        # Keep it retryable and fail the coordinator loudly.
-                        self._release_pending[sid] = attempts
-                        exhausted_required.append(sid)
-                    else:
-                        # Preserve the legacy bounded best-effort behavior for
-                        # ordinary consume-once release/abort callers.
-                        freed_bytes += self._free_bookkeeping_locked(sid)
-                        freed += 1
                 else:
                     self._release_pending[sid] = attempts
+                    if (
+                        attempts >= self.max_release_attempts
+                        and sid in self._required_reclaims
+                    ):
+                        # A globally-consumed fan-out object must not disappear
+                        # from accounting while it is still remotely resident.
+                        exhausted_required.append(sid)
             if self._lifecycle is not None:
                 records = {
                     (record.sample_id, record.generation): record

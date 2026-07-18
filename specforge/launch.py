@@ -2187,16 +2187,9 @@ def build_disagg_online_windowed_consumer(
     )
 
 
-
-
 __all__ = [
     "build_offline_runtime",
     "build_disagg_offline_runtime",
     "build_disagg_online_producer",
     "build_disagg_online_consumer",
-    "build_disagg_windowed_capture_contract",
-    "build_disagg_online_windowed_producer",
-    "build_disagg_online_windowed_consumer",
-    "DisaggWindowedProducerRuntime",
-    "DisaggWindowedConsumerRuntime",
 ]
