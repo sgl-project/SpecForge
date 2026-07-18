@@ -2119,18 +2119,20 @@ def build_disagg_online_windowed_consumer(
 
     queue = None
     try:
-        controller = DataFlowController(run_id, metadata_store=metadata_store)
+        controller = DataFlowController(
+            run_id,
+            metadata_store=metadata_store,
+            enable_sample_queue=False,
+        )
         queue = WindowedCaptureQueue(
             registry,
             consumer_id,
             idle_timeout_s=idle_timeout_s,
             record_refs=lambda refs: controller.record_external_refs(list(refs)),
         )
-        controller.sample_queue = queue
         algorithm = _resolve_window_algorithm(strategy)
         trainer = _assemble_trainer(
             algorithm=algorithm,
-            modality=modality,
             controller=controller,
             store=feature_store,
             ref_source={"queue": queue, "defer_ack_until_durable": True},

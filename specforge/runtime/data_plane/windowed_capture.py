@@ -2074,11 +2074,23 @@ class WindowedCaptureQueue:
         return [self._leases[ref.sample_id] for ref in refs]
 
     def ack(self, refs: list[SampleRef]) -> None:
+        self.ack_ids([ref.sample_id for ref in refs])
+
+    def ack_ids(self, sample_ids: list[str]) -> None:
+        """Acknowledge the exact leased prefix after its durable train ACK."""
+        if not sample_ids:
+            return
         with self._state_lock:
-            leases = self._resolve_leases(refs)
+            expected = list(self._leases)[: len(sample_ids)]
+            if expected != list(sample_ids):
+                raise RuntimeError(
+                    "windowed queue acknowledgement is not the leased prefix: "
+                    f"expected={expected}, got={list(sample_ids)}"
+                )
+            leases = [self._leases[sample_id] for sample_id in sample_ids]
             self.registry.release_and_advance(self.consumer_id, leases)
-            for ref in refs:
-                self._leases.pop(ref.sample_id)
+            for sample_id in sample_ids:
+                self._leases.pop(sample_id)
 
     def fail(self, refs: list[SampleRef], reason: str, retryable: bool) -> None:
         del reason

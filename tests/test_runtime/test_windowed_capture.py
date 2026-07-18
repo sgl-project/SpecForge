@@ -463,7 +463,7 @@ class TestWindowedCaptureResume(WindowedRegistryFixture):
 
 
 class TestWindowedCaptureQueueAndSoak(WindowedRegistryFixture):
-    def test_1p1c_queue_preserves_order_and_duplicate_ack_is_loud(self):
+    def test_1p1c_queue_preserves_order_and_requires_prefix_ack(self):
         self.registry.close()
         self.registry = self.make_registry(max_live_refs=3)
         self.initialize(samples=3, consumers=("trainer",))
@@ -476,8 +476,10 @@ class TestWindowedCaptureQueueAndSoak(WindowedRegistryFixture):
         self.assertEqual(
             [ref.source_task_id for ref in first], ["source-0", "source-1"]
         )
-        queue.ack(first)
-        with self.assertRaisesRegex(RuntimeError, "not leased"):
+        with self.assertRaisesRegex(RuntimeError, "leased prefix"):
+            queue.ack_ids([first[1].sample_id])
+        queue.ack_ids([ref.sample_id for ref in first])
+        with self.assertRaisesRegex(RuntimeError, "leased prefix"):
             queue.ack(first)
         last = queue.get(1)
         queue.ack(last)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import os
 import tempfile
 import threading
@@ -455,6 +456,8 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                 )
 
     def test_consumer_builder_ledgers_window_refs_and_validates_capacity(self):
+        from specforge.launch import _assemble_trainer
+
         with tempfile.TemporaryDirectory() as root:
             owner = _OwnerStore()
             producer = build_disagg_online_windowed_producer(
@@ -507,8 +510,12 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     heartbeat_interval_s=0.1,
                 )
             try:
-                self.assertIs(runtime.controller.sample_queue, runtime.queue)
+                self.assertIsNone(runtime.controller.sample_queue)
                 self.assertTrue(assemble.call_args.kwargs["durable_ack"])
+                unexpected = set(assemble.call_args.kwargs) - set(
+                    inspect.signature(_assemble_trainer).parameters
+                )
+                self.assertEqual(unexpected, set())
                 self.assertEqual(
                     runtime.accounting_snapshot()["input_pipeline"],
                     fake_loader.metrics.return_value,
