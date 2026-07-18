@@ -19,6 +19,7 @@ from specforge.inference.capture import CaptureConfig
 from specforge.launch import (
     build_disagg_online_windowed_consumer,
     build_disagg_online_windowed_producer,
+    build_disagg_windowed_capture_contract,
 )
 from specforge.runtime.contracts import FeatureSpec, PromptTask, SampleRef
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
@@ -422,6 +423,15 @@ class TestWindowedCaptureService(unittest.TestCase):
 
 
 class TestWindowedLaunchBuilders(unittest.TestCase):
+    def test_dflash_window_contract_does_not_default_to_logits(self):
+        capture, _digest = build_disagg_windowed_capture_contract(
+            strategy="dflash",
+            target_hidden_size=8,
+            target_model_version="fixture",
+            tokenizer_version="fixture",
+        )
+        self.assertIsNone(capture.target_repr)
+
     def test_shared_assembler_forwards_loader_prefetch_depth(self):
         from specforge.launch import _assemble_trainer
 
@@ -503,7 +513,7 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
             )
             fake_trainer = mock.Mock()
             fake_loader = mock.Mock()
-            fake_trainer._loader = fake_loader
+            fake_trainer.loader = fake_loader
             fake_loader.metrics.return_value = {
                 "stages": {"store_get": {"count": 1}},
                 "counters": {},

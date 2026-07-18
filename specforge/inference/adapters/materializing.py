@@ -125,6 +125,12 @@ class MaterializingRefSource:
                 continue
             recorded = tensors.pop("__aux_layer_ids__", None)
             try:
+                if capture.aux_hidden_state_layer_ids and recorded is None:
+                    raise CaptureMismatchError(
+                        f"[{sample_id}] capture omitted aux-layer ids; cannot "
+                        "verify requested layers "
+                        f"{capture.aux_hidden_state_layer_ids}"
+                    )
                 verify_capture(
                     tensors,
                     capture,

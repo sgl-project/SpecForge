@@ -1718,7 +1718,7 @@ def build_disagg_windowed_capture_contract(
     tokenizer_version: str,
     target_vocab_size: Optional[int] = None,
     draft_vocab_size: Optional[int] = None,
-    target_repr: str = "logits",
+    target_repr: Optional[str] = None,
     aux_hidden_state_layer_ids=None,
     vocab_map_version: Optional[str] = None,
 ):
@@ -1781,7 +1781,7 @@ def build_disagg_online_windowed_producer(
     strategy: str = "eagle3",
     target_vocab_size: Optional[int] = None,
     draft_vocab_size: Optional[int] = None,
-    target_repr: str = "logits",
+    target_repr: Optional[str] = None,
     aux_hidden_state_layer_ids=None,
     vocab_map_version: Optional[str] = None,
     max_live_bytes: Optional[int] = None,
@@ -2180,7 +2180,7 @@ def build_disagg_online_windowed_consumer(
         raise
     return DisaggWindowedConsumerRuntime(
         trainer,
-        trainer._loader,
+        trainer.loader,
         queue,
         consumer_control,
         controller,

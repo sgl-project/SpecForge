@@ -68,15 +68,28 @@ class InputPipelineRecorder:
     def stage(self, name: str) -> Iterator[None]:
         pushed = self._push_nvtx(name)
         started = self._clock()
+        body_error: Optional[BaseException] = None
         try:
-            yield
+            try:
+                yield
+            except BaseException as exc:
+                body_error = exc
+                raise
         finally:
-            self.record(name, self._clock() - started)
-            if pushed:
-                try:
-                    torch.cuda.nvtx.range_pop()
-                except (AttributeError, RuntimeError):
-                    pass
+            try:
+                self.record(name, self._clock() - started)
+            except BaseException as timing_error:
+                if body_error is None:
+                    raise
+                body_error.add_note(
+                    f"failed to record pipeline timing: {timing_error!r}"
+                )
+            finally:
+                if pushed:
+                    try:
+                        torch.cuda.nvtx.range_pop()
+                    except (AttributeError, RuntimeError):
+                        pass
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

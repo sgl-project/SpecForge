@@ -1021,7 +1021,16 @@ def run_launcher(
                 ),
                 output=output,
             )
-            gpu_monitor.start()
+            monitor_started = gpu_monitor.start()
+            if (
+                not monitor_started
+                and manifest.runtime.gpu_monitor.strict_process_ownership
+            ):
+                raise LauncherError(
+                    "GPU monitor failed to start while strict process ownership "
+                    "is enabled",
+                    role="gpu-monitor",
+                )
         for signum in old_handlers:
             signal.signal(signum, supervisor.request_shutdown)
         handlers_installed = True

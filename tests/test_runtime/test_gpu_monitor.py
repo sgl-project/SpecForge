@@ -255,6 +255,22 @@ class TestGpuMonitor(GpuMonitorFixture):
             {"compute_process_count", "unexpected_compute_process"},
         )
         self.assertEqual(len(monitor.violations), 2)
+        self.assertTrue(all(value["count"] >= 1 for value in monitor.violations))
+
+    def test_duplicate_violation_increments_uniform_count(self):
+        monitor = GpuMonitor(
+            [self.assignment],
+            self.root / "samples.jsonl",
+            self.root / "summary.json",
+            backend=_FakeBackend(values={}),
+            output=io.StringIO(),
+        )
+        violation = {"timestamp_ns": 1, "kind": "fixture", "gpu": 3}
+
+        monitor._record_violation(violation)
+        monitor._record_violation({**violation, "timestamp_ns": 2})
+
+        self.assertEqual(monitor.violations[0]["count"], 2)
 
     def test_cross_process_group_descendant_is_owned(self):
         backend = _FakeBackend(values={3: _sample(pids=(202,))})

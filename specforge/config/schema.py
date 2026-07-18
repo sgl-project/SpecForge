@@ -23,6 +23,8 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from specforge.config.flex_attention import validate_flex_kernel_options
+
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
@@ -526,18 +528,9 @@ class TrainingConfig(StrictConfigModel):
     @field_validator("flex_kernel_options")
     @classmethod
     def _validate_flex_kernel_options(cls, value):
-        if value is None or "num_stages" not in value:
-            return value
-        num_stages = value["num_stages"]
-        if (
-            isinstance(num_stages, bool)
-            or not isinstance(num_stages, int)
-            or num_stages < 1
-        ):
-            raise ValueError(
-                "training.flex_kernel_options.num_stages must be a positive integer"
-            )
-        return value
+        return validate_flex_kernel_options(
+            value, field_name="training.flex_kernel_options"
+        )
 
     @model_validator(mode="after")
     def _validate_training_shape(self):

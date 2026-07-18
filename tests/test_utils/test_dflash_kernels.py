@@ -1,5 +1,6 @@
 import unittest
 from importlib.metadata import PackageNotFoundError
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -49,6 +50,7 @@ class _Draft(torch.nn.Module):
         self.layers = torch.nn.ModuleList([_Layer(), _Layer()])
         self.norm = _Norm()
         self.hidden_norm = _Norm()
+        self.config = SimpleNamespace(hidden_act="silu")
 
 
 def _liger_rms_forward(self, hidden_states):
@@ -121,6 +123,16 @@ class TestDFlashDraftKernels(unittest.TestCase):
         with mock.patch.object(dflash_kernels, "version", return_value="0.9.0"):
             with self.assertRaisesRegex(RuntimeError, "requires liger-kernel==0.8.0"):
                 dflash_kernels.validate_dflash_draft_kernel_backend("liger")
+
+    def test_liger_binding_rejects_non_swiglu_activation(self):
+        draft = _Draft()
+        draft.config.hidden_act = "gelu"
+        with (
+            mock.patch.object(dflash_kernels, "_load_liger_draft_forwards") as load,
+            self.assertRaisesRegex(ValueError, "config.hidden_act"),
+        ):
+            dflash_kernels.configure_dflash_draft_kernels(draft, "liger")
+        load.assert_not_called()
 
     def test_unknown_backend_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "draft_kernel_backend"):

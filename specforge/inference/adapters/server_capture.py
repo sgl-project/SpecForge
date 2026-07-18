@@ -456,8 +456,9 @@ class SGLangServerCaptureAdapter:
             )
 
             def reject(reason: str, *, retryable: bool) -> ServerCaptureFailure:
-                self.store.adopt(cleanup_ref)
-                self.store.reclaim(cleanup_ref, reason=reason)
+                if not retryable:
+                    self.store.adopt(cleanup_ref)
+                    self.store.reclaim(cleanup_ref, reason=reason)
                 return ServerCaptureFailure(
                     task_id=task.task_id,
                     reason=f"server_capture:{reason}",

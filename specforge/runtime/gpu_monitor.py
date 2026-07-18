@@ -848,6 +848,7 @@ class GpuMonitor:
         key = json.dumps(key_payload, sort_keys=True, separators=(",", ":"))
         with self._lock:
             if key in self._violations_by_key:
+                self._violations_by_key[key]["count"] += 1
                 return
             if len(self._violations_by_key) >= _MAX_RECORDED_VIOLATIONS - 1:
                 key = "__truncated__"
@@ -859,7 +860,7 @@ class GpuMonitor:
                     "count": 1,
                 }
                 return
-            self._violations_by_key[key] = dict(violation)
+            self._violations_by_key[key] = {**violation, "count": 1}
 
     def _record_error(self, stage: str, exc: BaseException) -> None:
         error = _error_text(exc)

@@ -74,6 +74,21 @@ class TestInputPipelineRecorder(unittest.TestCase):
         with self.assertRaises(ValueError):
             recorder.increment("counter", True)
 
+    def test_timing_failure_does_not_mask_body_exception(self):
+        ticks = iter((1.0, float("nan")))
+        recorder = InputPipelineRecorder(clock=lambda: next(ticks), emit_nvtx=False)
+
+        with self.assertRaisesRegex(RuntimeError, "body failed") as raised:
+            with recorder.stage("fetch"):
+                raise RuntimeError("body failed")
+
+        self.assertTrue(
+            any(
+                "failed to record pipeline timing" in note
+                for note in raised.exception.__notes__
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

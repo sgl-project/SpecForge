@@ -96,6 +96,10 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "flex_kernel_options"):
             Config.model_validate(invalid)
         invalid = copy.deepcopy(payload)
+        invalid["training"]["flex_kernel_options"] = {"numStages": 2}
+        with self.assertRaisesRegex(ValidationError, "unsupported keys"):
+            Config.model_validate(invalid)
+        invalid = copy.deepcopy(payload)
         invalid["training"]["linear_cross_entropy_backend"] = "torch"
         with self.assertRaisesRegex(ValidationError, "compact_zero_weight"):
             Config.model_validate(invalid)

@@ -257,6 +257,12 @@ class TestFanoutManifest(FanoutManifestFixture):
                 with self.assertRaisesRegex(ManifestError, "num_stages"):
                     self.write_manifest(payload)
 
+        payload = self.payload()
+        payload["training"]["attention_backend"] = "flex_attention"
+        payload["training"]["flex_kernel_options"] = {"numStages": 2}
+        with self.assertRaisesRegex(ManifestError, "unsupported keys"):
+            self.write_manifest(payload)
+
     def test_linear_cross_entropy_backend_defaults_to_torch(self):
         payload = self.payload()
         del payload["training"]["linear_cross_entropy_backend"]
@@ -1060,6 +1066,7 @@ class _FakeSupervisor:
 
 class _FakeGpuMonitor:
     instances = []
+    start_result = True
 
     def __init__(self, assignments, sample_path, summary_path, **kwargs):
         self.assignments = tuple(assignments)
@@ -1074,7 +1081,7 @@ class _FakeGpuMonitor:
 
     def start(self):
         self.started = True
-        return True
+        return self.start_result
 
     def register_process_group(self, role, pgid):
         self.process_groups[role] = pgid
@@ -1095,6 +1102,7 @@ class TestLauncherOrchestration(FanoutManifestFixture):
         _FakeSupervisor.instances.clear()
         _FakeSupervisor.monitor_error = None
         _FakeGpuMonitor.instances.clear()
+        _FakeGpuMonitor.start_result = True
 
     def run_launcher(self):
         with (
@@ -1178,6 +1186,35 @@ class TestLauncherOrchestration(FanoutManifestFixture):
             },
         )
         self.assertEqual(monitor.health_checks, 1)
+
+    def test_strict_gpu_monitor_start_failure_aborts_before_workers(self):
+        payload = self.payload()
+        payload["runtime"]["gpu_monitor"] = {
+            "enabled": True,
+            "poll_s": 0.25,
+            "strict_process_ownership": True,
+        }
+        self.write_manifest(payload)
+        _FakeGpuMonitor.start_result = False
+        with (
+            mock.patch.object(launcher, "GPUReservationSet", _FakeReservationSet),
+            mock.patch.object(launcher, "ProcessSupervisor", _FakeSupervisor),
+            mock.patch.object(launcher, "GpuMonitor", _FakeGpuMonitor),
+            mock.patch.object(launcher, "wait_for_free_gpus"),
+            mock.patch.object(launcher, "_prepare_run_directories"),
+            self.assertRaisesRegex(LauncherError, "failed to start"),
+        ):
+            launcher.run_launcher(
+                self.manifest_path,
+                dry_run=False,
+                wait_for_gpus_enabled=True,
+                output=io.StringIO(),
+            )
+
+        self.assertTrue(_FakeGpuMonitor.instances[0].stopped)
+        self.assertFalse(
+            any(event[0] == "start" for event in _FakeSupervisor.instances[0].events)
+        )
 
     def test_enabled_gpu_monitor_stops_after_worker_failure(self):
         payload = self.payload()

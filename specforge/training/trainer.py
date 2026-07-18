@@ -508,6 +508,10 @@ class Trainer:
     def last_checkpoint_step(self) -> Optional[int]:
         return self._controller.last_checkpoint_step
 
+    @property
+    def loader(self):
+        return self._loader
+
     def fit(self) -> int:
         """Run training and configured evaluation through one lifecycle."""
         loader_close_attempted = False

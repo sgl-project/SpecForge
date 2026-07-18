@@ -22,6 +22,8 @@ from pydantic import (
     model_validator,
 )
 
+from specforge.config.flex_attention import validate_flex_kernel_options
+
 SCHEMA_VERSION = 1
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _LOSS_TYPES = {
@@ -187,18 +189,7 @@ class TrainingConfig(_StrictModel):
     @field_validator("flex_kernel_options")
     @classmethod
     def valid_flex_kernel_options(cls, value):
-        if value is None or "num_stages" not in value:
-            return value
-        num_stages = value["num_stages"]
-        if (
-            isinstance(num_stages, bool)
-            or not isinstance(num_stages, int)
-            or num_stages < 1
-        ):
-            raise ValueError(
-                "flex_kernel_options.num_stages must be a positive integer"
-            )
-        return value
+        return validate_flex_kernel_options(value, field_name="flex_kernel_options")
 
     @model_validator(mode="after")
     def flex_options_contract(self) -> "TrainingConfig":

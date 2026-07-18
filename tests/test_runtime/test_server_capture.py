@@ -556,6 +556,27 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertIn("injected sink error", results[0].reason)
         self.assertIsInstance(results[1], SampleRef)
 
+    def test_retryable_rejection_does_not_block_the_replacement_attempt(self):
+        class BusyRemovalStore(_FakeMooncakeStore):
+            def is_exist(self, key):
+                return 1
+
+            def remove(self, key):
+                return -1
+
+        backend = BusyRemovalStore()
+        server = _StubCaptureServer(backend, error_sample_ids={"run0:t0"})
+        _, _, store, adapter = _mk(server=server, backend=backend)
+
+        (failure,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertIsInstance(failure, ServerCaptureFailure)
+        self.assertTrue(failure.retryable)
+        server.error_sample_ids.clear()
+        (replacement,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+
+        self.assertIsInstance(replacement, SampleRef)
+        self.assertEqual(store.health()["release_pending"], 0)
+
     def test_response_feature_set_mismatch_reclaims_server_keys(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend)

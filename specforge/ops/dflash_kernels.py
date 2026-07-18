@@ -62,6 +62,13 @@ def validate_dflash_draft_kernel_backend(backend: str) -> None:
 def configure_dflash_draft_kernels(draft_model, backend: str) -> None:
     """Bind fused forwards only on one DFlash draft model instance."""
 
+    if backend == "liger":
+        hidden_act = getattr(getattr(draft_model, "config", None), "hidden_act", None)
+        if hidden_act not in ("silu", "swish"):
+            raise ValueError(
+                "draft_kernel_backend='liger' requires config.hidden_act to be "
+                f"'silu' or 'swish', found {hidden_act!r}"
+            )
     validate_dflash_draft_kernel_backend(backend)
     if backend == "torch":
         draft_model.draft_kernel_backend = backend

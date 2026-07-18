@@ -36,8 +36,11 @@ def _task(index: int) -> PromptTask:
 
 
 class _FeatureSource:
-    def __init__(self, *, missing_loss_mask: int = -1) -> None:
+    def __init__(
+        self, *, missing_loss_mask: int = -1, include_aux_metadata: bool = True
+    ) -> None:
         self.missing_loss_mask = missing_loss_mask
+        self.include_aux_metadata = include_aux_metadata
         self.generated = []
 
     def generate_features(self, tasks, *, capture):
@@ -49,6 +52,8 @@ class _FeatureSource:
                 "hidden_states": torch.full((1, 2, 24), float(index)),
                 "loss_mask": torch.ones(1, 2, dtype=torch.long),
             }
+            if self.include_aux_metadata:
+                features["__aux_layer_ids__"] = (2, 18, 33)
             if index == self.missing_loss_mask:
                 features.pop("loss_mask")
             self.generated.append(features)
@@ -126,6 +131,22 @@ class TestMaterializingRefSource(unittest.TestCase):
             self.assertEqual(second.task_id, "task-1")
             self.assertFalse(second.retryable)
             self.assertEqual(store.health()["resident_samples"], 1)
+
+    def test_omitted_aux_layer_ids_are_rejected_before_write(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = SharedDirFeatureStore(root, store_id="features")
+            source = MaterializingRefSource(
+                _FeatureSource(include_aux_metadata=False),
+                store,
+                run_id="run",
+                strategy="dflash",
+            )
+
+            (result,) = source.produce_refs([_task(0)], capture=_capture())
+
+            self.assertIsInstance(result, MaterializationFailure)
+            self.assertIn("omitted aux-layer ids", result.reason)
+            self.assertEqual(store.health()["resident_samples"], 0)
 
     def test_put_failure_is_aligned_retryable_and_aborted(self):
         store = _FailingPutStore()
