@@ -19,8 +19,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from specforge.ops.dflash_kernels import configure_dflash_draft_kernels
-
 from .registry import register_draft
 
 
@@ -102,9 +100,16 @@ class Qwen3DFlashAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        kv_input = torch.cat((target_hidden, hidden_states), dim=1)
-        k = self.k_proj(kv_input).view(bsz, ctx_len + q_len, -1, self.head_dim)
-        v = self.v_proj(kv_input).view(bsz, ctx_len + q_len, -1, self.head_dim)
+        k_ctx = self.k_proj(target_hidden)
+        k_noise = self.k_proj(hidden_states)
+        v_ctx = self.v_proj(target_hidden)
+        v_noise = self.v_proj(hidden_states)
+        k = torch.cat([k_ctx, k_noise], dim=1).view(
+            bsz, ctx_len + q_len, -1, self.head_dim
+        )
+        v = torch.cat([v_ctx, v_noise], dim=1).view(
+            bsz, ctx_len + q_len, -1, self.head_dim
+        )
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
@@ -250,7 +255,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
 
-    def __init__(self, config, *, draft_kernel_backend: str = "torch") -> None:
+    def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
         self.layers = nn.ModuleList(
@@ -280,7 +285,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
-        configure_dflash_draft_kernels(self, draft_kernel_backend)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config

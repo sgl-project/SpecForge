@@ -26,7 +26,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import torch
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.runtime.input_pipeline import batch_input_pipeline_stage
 from specforge.training.backend import TrainingBackend
 from specforge.training.strategies.base import (
     DraftTrainStrategy,
@@ -259,8 +258,7 @@ class TrainerCore:
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
         grad_norm = self.backend.step() if stepped else None
-        with batch_input_pipeline_stage(batch, "step_result"):
-            return self._result(out, grad_norm, stepped)
+        return self._result(out, grad_norm, stepped)
 
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
@@ -517,8 +515,7 @@ class TrainerController:
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
-                    with batch_input_pipeline_stage(batch, "step_log"):
-                        self.logger(log_metrics, self.global_step)
+                    self.logger(log_metrics, self.global_step)
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:
                     eval_metrics = self.evaluate_configured()

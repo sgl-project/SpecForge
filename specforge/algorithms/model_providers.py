@@ -152,14 +152,9 @@ def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
 
     draft_config._attn_implementation = cfg.training.attention_backend
-    model_kwargs = {}
-    architectures = tuple(getattr(draft_config, "architectures", None) or ())
-    if architectures == ("DFlashDraftModel",):
-        model_kwargs["draft_kernel_backend"] = cfg.training.draft_kernel_backend
     draft_model = AutoDraftModel.from_config(
         draft_config,
         torch_dtype=_torch_dtype(cfg),
-        **model_kwargs,
     )
     _warm_start(cfg, draft_model, draft_config)
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
@@ -325,7 +320,6 @@ def _build_dflash_family_model(
         "attention_backend": cfg.training.attention_backend,
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
-        "flex_kernel_options": cfg.training.flex_kernel_options,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
     return AlgorithmModelParts(
@@ -351,9 +345,6 @@ def build_dflash_model(
             **common,
             loss_type=cfg.training.loss_type,
             dpace_alpha=cfg.training.dpace_alpha,
-            draft_kernel_backend=cfg.training.draft_kernel_backend,
-            linear_cross_entropy_backend=cfg.training.linear_cross_entropy_backend,
-            compact_zero_weight_ce_rows=cfg.training.compact_zero_weight_ce_rows,
         ),
     )
 

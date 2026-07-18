@@ -29,10 +29,6 @@ import torch
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.data_plane.feature_store import FeatureStore
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
-from specforge.runtime.input_pipeline import (
-    InputPipelineRecorder,
-    attach_input_pipeline_recorder,
-)
 
 PerSampleTransform = Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
 CollateFn = Callable[[List[Dict[str, torch.Tensor]]], Dict[str, Any]]
@@ -110,7 +106,6 @@ class FeatureDataLoader:
         ack: bool = True,
         gc_interval_s: Optional[float] = 15.0,
         num_workers: int = 0,
-        pipeline_recorder: Optional[InputPipelineRecorder] = None,
     ) -> None:
         if (queue is None) == (refs is None):
             raise ValueError(
@@ -134,7 +129,6 @@ class FeatureDataLoader:
         if num_workers < 0:
             raise ValueError("num_workers must be >= 0")
         self.num_workers = int(num_workers)
-        self.pipeline_recorder = pipeline_recorder or InputPipelineRecorder()
         self._seek_batches = 0
         # Remote stores defer a physical free while the get() read-lease is live
         # (Mooncake remove -> -706): release() parks it and gc() must retry.
@@ -195,28 +189,23 @@ class FeatureDataLoader:
                     )
 
     def _materialize(self, ref: SampleRef) -> Dict[str, torch.Tensor]:
-        with self.pipeline_recorder.stage("store_get"):
-            tensors, handle = self.store.get(ref, device=self.device)
+        tensors, handle = self.store.get(ref, device=self.device)
         try:
             if self.clone_on_fetch:
-                with self.pipeline_recorder.stage("clone"):
-                    tensors = {k: v.clone() for k, v in tensors.items()}
+                tensors = {k: v.clone() for k, v in tensors.items()}
         finally:
             # ``get`` has already registered a read lease. Clone/device or
             # tensor validation failures must not strand that handle.
-            with self.pipeline_recorder.stage("store_release"):
-                self.store.release(handle, reason="loaded")
+            self.store.release(handle, reason="loaded")
         self._maybe_gc()
         if self.per_sample_transform is not None:
-            with self.pipeline_recorder.stage("transform"):
-                tensors = self.per_sample_transform(tensors)
+            tensors = self.per_sample_transform(tensors)
         return tensors
 
     def _make_batch(self, refs: List[SampleRef]) -> TrainBatch:
         self._validate_refs(refs)
         per_sample = [self._materialize(r) for r in refs]
-        with self.pipeline_recorder.stage("collate"):
-            batch_tensors = self.collate_fn(per_sample)
+        batch_tensors = self.collate_fn(per_sample)
         non_tensors = [
             name
             for name, value in batch_tensors.items()
@@ -224,16 +213,14 @@ class FeatureDataLoader:
         ]
         if non_tensors:
             raise TypeError(f"collate_fn returned non-tensors for {non_tensors}")
-        metadata = {
-            "target_repr": refs[0].metadata.get("target_repr"),
-            "ttt_length": refs[0].metadata.get("ttt_length"),
-        }
-        attach_input_pipeline_recorder(metadata, self.pipeline_recorder)
         return TrainBatch(
             sample_ids=[r.sample_id for r in refs],
             strategy=self.strategy,
             tensors=batch_tensors,
-            metadata=metadata,
+            metadata={
+                "target_repr": refs[0].metadata.get("target_repr"),
+                "ttt_length": refs[0].metadata.get("ttt_length"),
+            },
         )
 
     def _settle_incomplete_queue_batch(self, refs: List[SampleRef]) -> None:
@@ -344,8 +331,7 @@ class FeatureDataLoader:
             yield from self._iter_queue_prefetch(depth)
             return
         while True:
-            with self.pipeline_recorder.stage("queue_get"):
-                refs = self.queue.get(self.batch_size, timeout_s=0.0)
+            refs = self.queue.get(self.batch_size, timeout_s=0.0)
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
@@ -358,8 +344,7 @@ class FeatureDataLoader:
                 raise
             yield batch
             if self.ack:
-                with self.pipeline_recorder.stage("queue_ack"):
-                    self.queue.ack(refs)
+                self.queue.ack(refs)
 
     def _iter_queue_prefetch(self, depth: int) -> Iterator[TrainBatch]:
         state = _QueuePrefetchState(depth)
@@ -375,14 +360,13 @@ class FeatureDataLoader:
             return False
 
         def get_refs_interruptibly() -> List[SampleRef]:
-            with self.pipeline_recorder.stage("queue_get"):
-                get_interruptible = getattr(self.queue, "get_interruptible", None)
-                if callable(get_interruptible):
-                    return get_interruptible(
-                        self.batch_size,
-                        stop_event=state.stop,
-                    )
-                return self.queue.get(self.batch_size, timeout_s=_PREFETCH_POLL_S)
+            get_interruptible = getattr(self.queue, "get_interruptible", None)
+            if callable(get_interruptible):
+                return get_interruptible(
+                    self.batch_size,
+                    stop_event=state.stop,
+                )
+            return self.queue.get(self.batch_size, timeout_s=_PREFETCH_POLL_S)
 
         def _worker() -> None:
             try:
@@ -435,21 +419,14 @@ class FeatureDataLoader:
 
         try:
             while not state.stop.is_set():
-                prefetched_before_wait = not state.buffer.empty()
-                with self.pipeline_recorder.stage("prefetch_wait"):
-                    try:
-                        item = state.buffer.get(timeout=_PREFETCH_POLL_S)
-                    except queue_module.Empty:
-                        continue
+                try:
+                    item = state.buffer.get(timeout=_PREFETCH_POLL_S)
+                except queue_module.Empty:
+                    continue
                 if item is eos:
                     return
                 if isinstance(item, BaseException):
                     raise item
-                self.pipeline_recorder.increment(
-                    "prefetch_ready_batches"
-                    if prefetched_before_wait
-                    else "prefetch_waited_batches"
-                )
                 batch, refs = item
                 # From this point the trainer owns the refs. In deferred-ack
                 # mode its optimizer-boundary transaction decides their
@@ -458,8 +435,7 @@ class FeatureDataLoader:
                 state.mark_yielded_or_failed(refs)
                 yield batch
                 if self.ack:
-                    with self.pipeline_recorder.stage("queue_ack"):
-                        self.queue.ack(refs)
+                    self.queue.ack(refs)
         finally:
             self._shutdown_prefetch(state)
 
@@ -520,13 +496,6 @@ class FeatureDataLoader:
     def set_epoch(self, epoch: int) -> None:
         # hook for per-epoch shuffling of the offline ref set (no-op for now)
         self._epoch = epoch
-
-    def metrics(self) -> dict[str, Any]:
-        return {
-            "num_workers": self.num_workers,
-            "clone_on_fetch": self.clone_on_fetch,
-            **self.pipeline_recorder.snapshot(),
-        }
 
     def close(self) -> None:
         """Stop online prefetch and settle every batch it never yielded.

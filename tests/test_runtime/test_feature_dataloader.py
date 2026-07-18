@@ -173,33 +173,6 @@ class TestFeatureDataLoader(unittest.TestCase):
             # all refs acked
             self.assertEqual(q.in_flight(), 0)
             self.assertEqual(q.depth(), 0)
-            metrics = loader.metrics()
-            self.assertEqual(metrics["stages"]["store_get"]["count"], 4)
-            self.assertEqual(metrics["stages"]["transform"]["count"], 4)
-            self.assertEqual(metrics["stages"]["collate"]["count"], 2)
-            self.assertEqual(metrics["stages"]["queue_ack"]["count"], 2)
-
-    def test_queue_prefetch_metrics_count_materialized_batches(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._write_offline_files(d, n=4)
-            q = SampleRefQueue()
-            q.put(OfflineManifestReader(d, run_id="run").read())
-            loader = FeatureDataLoader(
-                LocalFeatureStore("prefetch-metrics"),
-                q,
-                batch_size=2,
-                collate_fn=_simple_collate,
-                per_sample_transform=_OFFLINE_EAGLE3_TRANSFORM,
-                num_workers=2,
-            )
-
-            self.assertEqual(len(list(loader)), 2)
-            counters = loader.metrics()["counters"]
-            self.assertEqual(
-                counters.get("prefetch_ready_batches", 0)
-                + counters.get("prefetch_waited_batches", 0),
-                2,
-            )
 
     def test_drop_last(self):
         with tempfile.TemporaryDirectory() as d:
