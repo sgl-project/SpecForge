@@ -203,15 +203,19 @@ class TestSGLangCapturePatch(unittest.TestCase):
         )
         writes = []
         sink._remove_exact = lambda key, *, force: None
-        sink._put_tensor = lambda key, tensor: writes.append((key, tensor.clone()))
+        sink._put_tensor = lambda key, tensor, **_kwargs: writes.append(
+            (key, tensor.clone())
+        )
         return sink, writes
 
     @staticmethod
     def _request(**overrides):
         request = {
             "auth_token": "secret",
+            "store_id": "run0",
             "sample_id": "run0:s0",
             "gen": 1,
+            "replace": False,
             "features": {"aux": "hidden_states"},
             "passthrough": [
                 {
@@ -242,7 +246,7 @@ class TestSGLangCapturePatch(unittest.TestCase):
         sink, writes = self._sink()
         states_at_write = []
 
-        def record_write(key, tensor):
+        def record_write(key, tensor, **_kwargs):
             row = sink._lifecycle.execute(
                 "SELECT state, feature_names_json, estimated_bytes FROM "
                 "mooncake_objects WHERE store_id=? AND sample_id=? AND generation=?",
@@ -294,7 +298,7 @@ class TestSGLangCapturePatch(unittest.TestCase):
         removed = []
         calls = 0
 
-        def fail_second_write(key, tensor):
+        def fail_second_write(key, tensor, **_kwargs):
             nonlocal calls
             calls += 1
             if calls == 2:
@@ -327,7 +331,7 @@ class TestSGLangCapturePatch(unittest.TestCase):
     def test_failed_cleanup_leaves_planned_row_for_owner_takeover(self):
         sink, _ = self._sink()
 
-        def fail_write(key, tensor):
+        def fail_write(key, tensor, **_kwargs):
             raise RuntimeError("injected put failure")
 
         def fail_remove(key, *, force):
@@ -354,7 +358,7 @@ class TestSGLangCapturePatch(unittest.TestCase):
     def test_capability_namespace_schema_and_quota_are_enforced(self):
         cases = (
             ({"auth_token": "wrong"}, "capability"),
-            ({"store_id": "attacker"}, "server-owned"),
+            ({"store_id": "attacker"}, "server-owned namespace"),
             ({"sample_id": "other:s0"}, "prefixed"),
             ({"features": {"aux": "../../escape"}}, "not allowed"),
             (
@@ -439,7 +443,7 @@ class TestSGLangCapturePatch(unittest.TestCase):
                 keys = set()
 
                 def attach(sink):
-                    sink._put_tensor = lambda key, tensor: keys.add(key)
+                    sink._put_tensor = lambda key, tensor, **_kwargs: keys.add(key)
                     sink._remove_exact = lambda key, *, force: keys.discard(key)
 
                 first, _ = self._sink(inventory_path=inventory)
@@ -468,7 +472,9 @@ class TestSGLangCapturePatch(unittest.TestCase):
                     if remove_calls == crash_after:
                         raise RuntimeError("injected replacement crash")
 
-                interrupted._put_tensor = lambda key, tensor: keys.add(key)
+                interrupted._put_tensor = (
+                    lambda key, tensor, **_kwargs: keys.add(key)
+                )
                 interrupted._remove_exact = crash_during_remove
                 with self.assertRaisesRegex(RuntimeError, "replacement crash"):
                     interrupted.put_sample(

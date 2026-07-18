@@ -246,6 +246,11 @@ class MooncakeFeatureStore(FeatureStore):
         # free (zero-copy mode). Owner instances cache these on put/adopt/get;
         # non-owner readers intentionally do not retain a per-sample index.
         self._sample_names: Dict[str, List[str]] = {}
+        # Server capture registers deterministic keys before issuing HTTP. If
+        # the response is lost, no SampleRef exists to adopt/abort them. Keep a
+        # shared (multi-adapter) provisional index so terminal producer cleanup
+        # can reclaim those hard-pinned objects; a successful adopt clears it.
+        self._external_provisional: Dict[Tuple[str, int], List[str]] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
         # Samples whose remote remove() failed. gc() performs bounded
         # steady-state retries; lifecycle drain either removes them or raises.
@@ -579,6 +584,7 @@ class MooncakeFeatureStore(FeatureStore):
             self._sample_names[sample_ref.sample_id] = feature_names
             self._sample_bytes[sample_ref.sample_id] = sample_bytes
             self._put_time[sample_ref.sample_id] = self._clock()
+            self._external_provisional.pop((sample_ref.sample_id, gen), None)
             over_budget = (
                 self.max_resident_bytes is not None
                 and projected > self.max_resident_bytes
@@ -596,6 +602,81 @@ class MooncakeFeatureStore(FeatureStore):
                 f"{self.max_resident_bytes} bytes; server-written sample was "
                 "scheduled for required cleanup"
             )
+
+    def track_external_attempt(
+        self,
+        sample_id: str,
+        *,
+        generation: int,
+        feature_names: List[str],
+    ) -> None:
+        """Track server-owned keys before an HTTP response makes a ref adoptable."""
+        self._require_lifetime_owner("track external capture")
+        names = list(dict.fromkeys(str(name) for name in feature_names))
+        if not names:
+            raise ValueError("external capture attempt must name at least one feature")
+        with self._lock:
+            self._external_provisional[(str(sample_id), int(generation))] = names
+
+    def discard_external_attempts(
+        self, *, reason: str = "unadopted-external-capture"
+    ) -> int:
+        """Abort server writes that never produced an adoptable response.
+
+        The index belongs to the shared store rather than an adapter, so a retry
+        that succeeds through another capture server clears the provisional
+        entry in :meth:`adopt` and cannot be deleted by the failed adapter's
+        shutdown path. Physical-remove failures remain visible to
+        :meth:`drain_pending_removals`.
+        """
+        self._require_lifetime_owner("discard external captures")
+        with self._lock:
+            attempts = list(self._external_provisional.items())
+
+        errors: Dict[str, str] = {}
+        discarded = 0
+        for (sample_id, generation), names in attempts:
+            with self._lock:
+                attempt_key = (sample_id, generation)
+                # A response can be adopted after the snapshot but before this
+                # attempt is visited. adopt() removes the provisional entry
+                # under the same lock, so never delete that now-live sample.
+                if attempt_key not in self._external_provisional:
+                    continue
+                current = self._generation.get(sample_id)
+                if current is not None:
+                    if current != generation:
+                        errors[sample_id] = (
+                            f"cannot discard provisional sample {sample_id!r} "
+                            f"generation {generation}: adopted generation is {current}"
+                        )
+                        continue
+                else:
+                    self._generation[sample_id] = generation
+                    self._sample_names[sample_id] = names
+                    self._sample_bytes[sample_id] = 0
+                    self._put_time[sample_id] = self._clock()
+                try:
+                    # RLock keeps adopt() from racing between the ownership
+                    # check above and this removal attempt. abort() reacquires
+                    # the same lock and either frees the keys or records them
+                    # in _release_pending for lifecycle drain.
+                    self.abort(sample_id, reason=reason)
+                except BaseException as exc:
+                    # Preserve both explicit provisional ownership and a
+                    # retryable removal entry.  Terminal drain can now reclaim
+                    # the keys even when a Mooncake metadata probe itself
+                    # failed, rather than losing every remaining snapshot item.
+                    self._release_pending.setdefault(sample_id, 0)
+                    errors[sample_id] = f"{type(exc).__name__}: {exc}"
+                    continue
+                self._external_provisional.pop(attempt_key, None)
+                discarded += 1
+        if errors:
+            raise RuntimeError(
+                "could not discard all provisional external captures: " f"{errors}"
+            )
+        return discarded
 
     # -- read --------------------------------------------------------------
     def get(
@@ -794,6 +875,8 @@ class MooncakeFeatureStore(FeatureStore):
         self._release_pending.pop(sample_id, None)
         self._force_release_pending.discard(sample_id)
         self._required_reclaims.discard(sample_id)
+        if generation is not None:
+            self._external_provisional.pop((sample_id, generation), None)
         return nbytes
 
     def _tombstone_locked(self, sample_id: str, reason: str) -> Optional[int]:
@@ -1154,6 +1237,7 @@ class MooncakeFeatureStore(FeatureStore):
                     if self._lifecycle is not None and self.lifetime_owner
                     else len(self._generation)
                 ),
+                "provisional_external": len(self._external_provisional),
                 "active_leases": len(self._active_leases),
                 "resident_bytes": (
                     sum(record.estimated_bytes for record in lifecycle_pending)

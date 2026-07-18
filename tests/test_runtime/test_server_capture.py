@@ -22,10 +22,11 @@ from unittest import mock
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
+    ServerCaptureSchema,
     SGLangServerCaptureAdapter,
-    resolve_server_capture_schema,
 )
 from specforge.inference.capture import (
     CaptureConfig,
@@ -87,7 +88,6 @@ class _StubCaptureServer:
         self,
         backend: _FakeMooncakeStore,
         *,
-        store_id: str = "run0",
         capture_token: str = "unit-capture-token",
         hidden: int = HIDDEN,
         aux_width: int = len(AUX_LAYERS) * HIDDEN,
@@ -95,11 +95,10 @@ class _StubCaptureServer:
         error_sample_ids=(),
     ) -> None:
         self.backend = backend
-        self.store_id = store_id
         self.capture_token = capture_token
         self.hidden = hidden
         self.aux_width = aux_width
-        self.aux_layer_ids = list(aux_layer_ids)
+        self.aux_layer_ids = None if aux_layer_ids is None else list(aux_layer_ids)
         self.error_sample_ids = set(error_sample_ids)
         self.expected: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -131,7 +130,7 @@ class _StubCaptureServer:
             feats: Dict[str, Dict[str, Any]] = {}
 
             def _write(name: str, t: torch.Tensor) -> None:
-                self._put(f"{self.store_id}/{sid}/g{gen}/{name}", t)
+                self._put(f"{spec['store_id']}/{sid}/g{gen}/{name}", t)
                 written[name] = t
                 feats[name] = {"shape": list(t.shape), "dtype": _dtype_str(t)}
 
@@ -159,7 +158,7 @@ class _StubCaptureServer:
                     "meta_info": {
                         "spec_capture": {
                             "sample_id": sid,
-                            "store_id": self.store_id,
+                            "store_id": spec["store_id"],
                             "gen": gen,
                             "aux_layer_ids": self.aux_layer_ids,
                             "features": feats,
@@ -243,7 +242,39 @@ def _dspark_contract() -> CaptureConfig:
     )
 
 
-def _mk(strategy="eagle3", server=None, backend=None):
+def _capture_schema(algorithm: str) -> ServerCaptureSchema:
+    registration = builtin_algorithm_registry().resolve(algorithm)
+    layout = registration.providers.server_streaming_for("text").layout
+    return ServerCaptureSchema(
+        aux_feature=layout.aux_feature,
+        last_hidden_feature=layout.last_hidden_feature,
+        passthrough=layout.passthrough,
+        attention_mask_feature=layout.attention_mask_feature,
+    )
+
+
+class _GenericRequestInputAdapter:
+    def __init__(self, request_inputs):
+        self.request_inputs = request_inputs
+        self.seen_tasks = None
+
+    def load_input_tools(self, config):
+        return config
+
+    def prepare_prompts(self, config, input_tools, *, draft_config):
+        return []
+
+    def build_request_inputs(self, tasks):
+        self.seen_tasks = list(tasks)
+        return self.request_inputs
+
+
+def _mk(
+    algorithm="eagle3",
+    server=None,
+    backend=None,
+    request_input_adapter=None,
+):
     backend = backend or _FakeMooncakeStore()
     server = server or _StubCaptureServer(backend)
     store = MooncakeFeatureStore(store=backend, store_id="run0")
@@ -251,7 +282,9 @@ def _mk(strategy="eagle3", server=None, backend=None):
         "http://server:30000",
         store,
         run_id="run0",
-        strategy=strategy,
+        algorithm=algorithm,
+        schema=_capture_schema(algorithm),
+        request_input_adapter=request_input_adapter,
         post_fn=server,
         capture_token="unit-capture-token",
     )
@@ -262,20 +295,27 @@ class TestServerCaptureAdapter(unittest.TestCase):
     def test_capture_capability_and_namespace_are_client_guarded(self):
         backend = _FakeMooncakeStore()
         store = MooncakeFeatureStore(store=backend, store_id="run0")
+        schema = _capture_schema("eagle3")
         with mock.patch.dict(os.environ, {"SGLANG_SPEC_CAPTURE_TOKEN": ""}):
             with self.assertRaisesRegex(ValueError, "requires capture_token"):
                 SGLangServerCaptureAdapter(
-                    "http://server:30000", store, run_id="run0"
+                    "http://server:30000",
+                    store,
+                    run_id="run0",
+                    algorithm="eagle3",
+                    schema=schema,
                 )
         with self.assertRaisesRegex(ValueError, "run_id == store.store_id"):
             SGLangServerCaptureAdapter(
                 "http://server:30000",
                 store,
                 run_id="other",
+                algorithm="eagle3",
+                schema=schema,
                 capture_token="unit-capture-token",
             )
 
-    def test_request_sends_capability_but_not_store_namespace(self):
+    def test_request_sends_capability_and_bound_store_namespace(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend)
         captured = []
@@ -287,62 +327,103 @@ class TestServerCaptureAdapter(unittest.TestCase):
         _, _, _, adapter = _mk(server=inspect_request, backend=backend)
         adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
         self.assertEqual(captured[0]["auth_token"], "unit-capture-token")
-        self.assertNotIn("store_id", captured[0])
+        self.assertEqual(captured[0]["store_id"], "run0")
 
-    def test_response_identity_mismatch_is_rejected(self):
-        backend = _FakeMooncakeStore()
-        server = _StubCaptureServer(backend, store_id="wrong-store")
-        _, _, _, adapter = _mk(server=server, backend=backend)
-        (result,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
-        self.assertIsInstance(result, ServerCaptureFailure)
-        self.assertFalse(result.retryable)
-        self.assertIn("identity mismatch", result.reason)
-
-    def test_response_feature_set_mismatch_reclaims_server_keys(self):
+    def test_generic_adapter_inputs_merge_with_runtime_owned_request_fields(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend)
+        posted = []
 
-        def omit_feature(url, json_body, timeout):
-            rows = server(url, json_body, timeout)
-            rows[0]["meta_info"]["spec_capture"]["features"].pop("loss_mask")
-            return rows
+        def recording_server(url, json_body, timeout):
+            posted.append(json_body)
+            return server(url, json_body, timeout)
 
-        _, _, _, adapter = _mk(server=omit_feature, backend=backend)
-        (result,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
-        self.assertIsInstance(result, ServerCaptureFailure)
-        self.assertFalse(result.retryable)
-        self.assertIn("feature set mismatch", result.reason)
-        self.assertEqual(backend._d, {})
-
-    def test_malformed_metadata_reclaims_only_the_bad_row(self):
-        backend = _FakeMooncakeStore()
-        server = _StubCaptureServer(backend)
-
-        def corrupt_first_row(url, json_body, timeout):
-            rows = server(url, json_body, timeout)
-            rows[0]["meta_info"]["spec_capture"]["features"][
-                "hidden_state"
-            ].pop("shape")
-            return rows
-
-        _, _, _, adapter = _mk(server=corrupt_first_row, backend=backend)
-        results = adapter.produce_refs(
-            [_task(0, 4), _task(1, 5)], capture=_eagle3_contract()
+        tasks = [_task(0, 4), _task(1, 6)]
+        model_inputs = {
+            "input_ids": [task.payload["input_ids"] for task in tasks],
+            "multi_modal_data": {
+                "image": ["image-0", "image-1"],
+            },
+        }
+        input_adapter = _GenericRequestInputAdapter(model_inputs)
+        _, _, _, capture_adapter = _mk(
+            server=recording_server,
+            backend=backend,
+            request_input_adapter=input_adapter,
         )
-        self.assertIsInstance(results[0], ServerCaptureFailure)
-        self.assertIsInstance(results[1], SampleRef)
-        self.assertFalse(any("/run0:t0/g1/" in key for key in backend._d))
-        self.assertTrue(any("/run0:t1/g1/" in key for key in backend._d))
 
-    def test_health_reports_rpc_batch_profile(self):
-        _, _, _, adapter = _mk(strategy="dflash")
-        adapter.produce_refs(
-            [_task(0, 4), _task(1, 5)], capture=_dflash_contract()
+        refs = capture_adapter.produce_refs(tasks, capture=_eagle3_contract())
+
+        self.assertTrue(all(isinstance(ref, SampleRef) for ref in refs))
+        self.assertEqual(tasks, input_adapter.seen_tasks)
+        self.assertEqual(1, len(posted))
+        request = posted[0]
+        self.assertEqual(model_inputs["input_ids"], request["input_ids"])
+        self.assertEqual(
+            model_inputs["multi_modal_data"],
+            request["multi_modal_data"],
         )
-        health = adapter.health()
-        self.assertEqual(health["rpc_calls"], 1)
-        self.assertEqual(health["rpc_tasks"], 2)
-        self.assertEqual(health["mean_batch_size"], 2.0)
+        self.assertEqual(
+            {"temperature": 0.0, "max_new_tokens": 1},
+            request["sampling_params"],
+        )
+        self.assertEqual(2, len(request["spec_capture"]))
+
+    def test_generic_adapter_cannot_override_runtime_owned_request_fields(self):
+        task = _task(0, 4)
+        for reserved_field in ("sampling_params", "spec_capture"):
+            with self.subTest(field=reserved_field):
+                input_adapter = _GenericRequestInputAdapter(
+                    {
+                        "input_ids": [task.payload["input_ids"]],
+                        reserved_field: "plugin-owned",
+                    }
+                )
+                _, _, _, capture_adapter = _mk(request_input_adapter=input_adapter)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"runtime-owned request fields: \\['{reserved_field}'\\]",
+                ):
+                    capture_adapter.produce_refs(
+                        [task],
+                        capture=_eagle3_contract(),
+                    )
+
+    def test_generic_adapter_must_return_nonempty_model_input_mapping(self):
+        task = _task(0, 4)
+        cases = (
+            ([], TypeError, "must return a mapping"),
+            ({}, ValueError, "returned no model inputs"),
+        )
+        for request_inputs, exception_type, message in cases:
+            with self.subTest(request_inputs=request_inputs):
+                _, _, _, capture_adapter = _mk(
+                    request_input_adapter=_GenericRequestInputAdapter(request_inputs)
+                )
+                with self.assertRaisesRegex(exception_type, message):
+                    capture_adapter.produce_refs(
+                        [task],
+                        capture=_eagle3_contract(),
+                    )
+
+    def test_required_loss_mask_never_defaults_to_all_ones(self):
+        task = PromptTask(
+            task_id="t0",
+            run_id="run0",
+            source_id="unit",
+            payload={"input_ids": [1, 2, 3]},
+            max_length=3,
+        )
+        backend, server, _, adapter = _mk()
+
+        with self.assertRaisesRegex(
+            ValueError, "required capture payload 'loss_mask' is missing"
+        ):
+            adapter.produce_refs([task], capture=_eagle3_contract())
+
+        self.assertFalse(server.expected)
+        self.assertFalse(backend._d)
 
     def test_eagle3_refs_and_zero_copy_roundtrip(self):
         backend, server, store, adapter = _mk()
@@ -377,7 +458,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertFalse(any(backend._d))
 
     def test_dflash_schema_names_and_no_target(self):
-        backend, server, store, adapter = _mk(strategy="dflash")
+        backend, server, store, adapter = _mk(algorithm="dflash")
         refs = adapter.produce_refs([_task(0, 5)], capture=_dflash_contract())
         (ref,) = refs
         self.assertIsInstance(ref, SampleRef)
@@ -393,7 +474,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertEqual(out["input_ids"].tolist(), [list(range(1, 6))])
 
     def test_dspark_schema_includes_target_last_hidden(self):
-        backend, server, store, adapter = _mk(strategy="dspark")
+        backend, server, store, adapter = _mk(algorithm="dspark")
         refs = adapter.produce_refs([_task(0, 5)], capture=_dspark_contract())
         (ref,) = refs
         self.assertIsInstance(ref, SampleRef)
@@ -434,7 +515,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
             return [[row] for row in rows]
 
         _, _, _, adapter = _mk(
-            strategy="dflash", server=wrapped_server, backend=backend
+            algorithm="dflash", server=wrapped_server, backend=backend
         )
         refs = adapter.produce_refs(
             [_task(0, 5), _task(1, 6)], capture=_dflash_contract()
@@ -452,6 +533,18 @@ class TestServerCaptureAdapter(unittest.TestCase):
         # the mismatched sample's server-written keys were freed via abort
         self.assertFalse(any(backend._d), f"leaked keys: {list(backend._d)}")
 
+    def test_missing_aux_layer_ids_fails_loud_and_frees_keys(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend, aux_layer_ids=None)
+        _, _, _, adapter = _mk(server=server, backend=backend)
+
+        (result,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+
+        self.assertIsInstance(result, ServerCaptureFailure)
+        self.assertFalse(result.retryable)
+        self.assertIn("capture omitted aux-layer ids", result.reason)
+        self.assertFalse(any(backend._d), f"leaked keys: {list(backend._d)}")
+
     def test_per_task_server_error_becomes_failure_marker(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend, error_sample_ids={"run0:t0"})
@@ -462,6 +555,52 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertIsInstance(results[0], ServerCaptureFailure)
         self.assertIn("injected sink error", results[0].reason)
         self.assertIsInstance(results[1], SampleRef)
+
+    def test_response_feature_set_mismatch_reclaims_server_keys(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def omit_feature(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            rows[0]["meta_info"]["spec_capture"]["features"].pop("loss_mask")
+            return rows
+
+        _, _, _, adapter = _mk(server=omit_feature, backend=backend)
+        (result,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertIsInstance(result, ServerCaptureFailure)
+        self.assertFalse(result.retryable)
+        self.assertIn("feature set mismatch", result.reason)
+        self.assertFalse(backend._d)
+
+    def test_malformed_metadata_reclaims_only_the_bad_row(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def corrupt_first_row(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            rows[0]["meta_info"]["spec_capture"]["features"][
+                "hidden_state"
+            ].pop("shape")
+            return rows
+
+        _, _, _, adapter = _mk(server=corrupt_first_row, backend=backend)
+        results = adapter.produce_refs(
+            [_task(0, 4), _task(1, 5)], capture=_eagle3_contract()
+        )
+        self.assertIsInstance(results[0], ServerCaptureFailure)
+        self.assertIsInstance(results[1], SampleRef)
+        self.assertFalse(any("/run0:t0/g1/" in key for key in backend._d))
+        self.assertTrue(any("/run0:t1/g1/" in key for key in backend._d))
+
+    def test_health_reports_rpc_batch_profile(self):
+        _, _, _, adapter = _mk(algorithm="dflash")
+        adapter.produce_refs(
+            [_task(0, 4), _task(1, 5)], capture=_dflash_contract()
+        )
+        health = adapter.health()
+        self.assertEqual(health["rpc_calls"], 1)
+        self.assertEqual(health["rpc_tasks"], 2)
+        self.assertEqual(health["mean_batch_size"], 2.0)
 
     def test_rollout_worker_ref_path(self):
         from specforge.inference.rollout_worker import RolloutWorker
@@ -496,19 +635,123 @@ class TestServerCaptureAdapter(unittest.TestCase):
         with self.assertRaises(KeyError):
             store.get(ref)
 
-    def test_retry_bumps_generation(self):
+    def test_retry_reuses_generation_after_a_lost_response(self):
         backend, server, store, adapter = _mk()
-        task = PromptTask(
+        initial = PromptTask(
             task_id="t0",
             run_id="run0",
             source_id="unit",
-            payload={"input_ids": [1, 2, 3]},
+            payload={"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1]},
             max_length=3,
-            attempt=2,
         )
-        (ref,) = adapter.produce_refs([task], capture=_eagle3_contract())
-        self.assertEqual(ref.metadata["generation"], 3)
-        self.assertTrue(any("/g3/" in k for k in backend._d))
+        original_post = adapter.post_fn
+        requests = []
+
+        def lose_first_response(url, json_body, timeout):
+            requests.append(json_body["spec_capture"][0])
+            response = original_post(url, json_body, timeout)
+            if len(requests) == 1:
+                raise ConnectionError("response lost after server write")
+            return response
+
+        adapter.post_fn = lose_first_response
+        with self.assertRaisesRegex(ConnectionError, "response lost"):
+            adapter.produce_refs([initial], capture=_eagle3_contract())
+        self.assertTrue(backend._d)
+        self.assertTrue(all("/g1/" in key for key in backend._d))
+
+        retry = PromptTask(
+            task_id=initial.task_id,
+            run_id=initial.run_id,
+            source_id=initial.source_id,
+            payload=initial.payload,
+            max_length=initial.max_length,
+            attempt=1,
+        )
+        (ref,) = adapter.produce_refs([retry], capture=_eagle3_contract())
+
+        self.assertEqual(1, ref.metadata["generation"])
+        self.assertEqual([False, True], [request["replace"] for request in requests])
+        self.assertEqual(0, store.discard_external_attempts())
+        self.assertTrue(all("/g1/" in key for key in backend._d))
+        self.assertFalse(any("/g2/" in key for key in backend._d))
+
+    def test_terminal_lost_response_is_reclaimed_without_a_ref(self):
+        backend, server, store, adapter = _mk()
+
+        def lose_response(url, json_body, timeout):
+            server(url, json_body, timeout)
+            raise ConnectionError("response lost after server write")
+
+        adapter.post_fn = lose_response
+        with self.assertRaisesRegex(ConnectionError, "response lost"):
+            adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+
+        self.assertTrue(backend._d)
+        self.assertEqual(1, store.health()["provisional_external"])
+        self.assertEqual(
+            1,
+            store.discard_external_attempts(reason="terminal-producer-cleanup"),
+        )
+        self.assertFalse(backend._d)
+        self.assertEqual(0, store.health()["provisional_external"])
+
+    def test_later_invalid_row_does_not_strand_an_adopted_prefix(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def corrupt_second_identity(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            rows[1]["meta_info"]["spec_capture"]["store_id"] = "wrong-store"
+            return rows
+
+        _, _, store, adapter = _mk(
+            server=corrupt_second_identity,
+            backend=backend,
+        )
+        with self.assertRaisesRegex(RuntimeError, "wrong object identity"):
+            adapter.produce_refs(
+                [_task(0, 4), _task(1, 4)],
+                capture=_eagle3_contract(),
+            )
+
+        self.assertEqual(0, store.health()["resident_samples"])
+        self.assertEqual(2, store.health()["provisional_external"])
+        self.assertEqual(2, store.discard_external_attempts())
+        self.assertFalse(backend._d)
+
+    def test_failed_provisional_cleanup_remains_retryable(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        key = "run0/run0:t0/g1/input_ids"
+        backend._d[key] = b"captured"
+        store.track_external_attempt(
+            "run0:t0",
+            generation=1,
+            feature_names=["input_ids"],
+        )
+
+        original_remove = backend.remove
+        original_exists = backend.is_exist
+        backend.remove = lambda _key: -1
+
+        def unavailable(_key):
+            raise RuntimeError("metadata unavailable")
+
+        backend.is_exist = unavailable
+        with self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
+            store.discard_external_attempts()
+
+        health = store.health()
+        self.assertEqual(1, health["resident_samples"])
+        self.assertEqual(1, health["provisional_external"])
+        self.assertEqual(1, health["release_pending"])
+
+        backend.remove = original_remove
+        backend.is_exist = original_exists
+        store.drain_pending_removals(retry_interval_s=0)
+        self.assertFalse(backend._d)
+        self.assertEqual(0, store.health()["provisional_external"])
 
     def test_verify_specs_matches_tensor_verification_semantics(self):
         contract = _eagle3_contract()
@@ -539,9 +782,18 @@ class TestServerCaptureAdapter(unittest.TestCase):
                 recorded_aux_layer_ids=(1, 2, 3),
             )
 
-    def test_unknown_strategy_raises(self):
-        with self.assertRaises(KeyError):
-            resolve_server_capture_schema("nonexistent")
+    def test_transport_requires_an_injected_capture_schema(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        with self.assertRaisesRegex(TypeError, "injected ServerCaptureSchema"):
+            SGLangServerCaptureAdapter(
+                "http://server:30000",
+                store,
+                run_id="run0",
+                algorithm="eagle3",
+                schema=object(),
+                capture_token="unit-capture-token",
+            )
 
 
 class TestLoaderGcPump(unittest.TestCase):
@@ -618,7 +870,8 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
             "http://server:30000",
             store,
             run_id="run0",
-            strategy="dflash",
+            algorithm="dflash",
+            schema=_capture_schema("dflash"),
             post_fn=server,
             capture_token="unit-capture-token",
         )
@@ -634,8 +887,9 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
         channel = StreamingRefChannel(
             os.path.join(tempfile.mkdtemp(prefix="sc_prod_"), "refs.jsonl")
         )
+        channel.publish_consumer_quantum(1)
         _workers, drive = build_disagg_online_producer(
-            strategy="dflash",
+            algorithm=builtin_algorithm_registry().resolve("dflash"),
             feature_source=adapter,
             prompts=prompts,
             feature_store=store,

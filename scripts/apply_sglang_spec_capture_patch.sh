@@ -4,7 +4,7 @@
 # shell environment can never redirect this operation to another site-packages.
 set -euo pipefail
 
-readonly EXPECTED_PATCH_SHA256="6228db7da2b9f73088dab2352182e5b739ac89781587f0ced4216baf60e217d8"
+readonly EXPECTED_PATCH_SHA256="a07c015a584bfff053d1358b1cc3c28ee79f1983ed8298953732c5ebe40647fb"
 readonly EXPECTED_MIGRATION_SHA256="a41469afa9355a7384f1cd9d700836a9ecc8dc13c8488d73e867730f40ea6c59"
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly PATCH_PATH="$REPO_ROOT/patches/sglang/v0.5.14/spec-capture.patch"
