@@ -31,22 +31,11 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
-from transformers import ImageProcessingMixin, PreTrainedTokenizer
-
 from datasets import Dataset as HFDataset
+from tqdm import tqdm
+from transformers import PreTrainedTokenizer
 
 from ..distributed import get_draft_sp_group, get_sp_ring_group
-
-try:
-    from qwen_vl_utils import process_vision_info
-
-    HAS_QWEN_VL_UTILS = True
-except ImportError:
-    HAS_QWEN_VL_UTILS = False
-    process_vision_info = None
-
-
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
@@ -177,122 +166,6 @@ def preprocess_conversations(
     return results
 
 
-def preprocess_vlm_conversations(
-    processor: ImageProcessingMixin,
-    examples: List[Conversation],
-    chat_template: ChatTemplate,
-    max_length: int = 2048,
-) -> Dict[str, List[torch.Tensor]]:
-    """
-    Preprocess a batch of ShareGPT style conversations.
-
-    Args:
-        processor: The image processor to use for processing images.
-        examples: A list of examples, where each example is a dictionary containing:
-            - image: The image in the conversation.
-            - conversations: A list of conversations, where each conversation is a list of messages.
-        chat_template: The chat template to use for formatting the conversations.
-        max_length: The maximum length of the tokenized input.
-
-    Returns:
-        A dictionary containing:
-            - input_ids: List of tokenized input IDs.
-            - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
-            - attention_mask: List of attention masks.
-            - pixel_values: List of pixel values for images in the examples.
-            - image_grid_thw: List of image grid tensors.
-    """
-    system_prompt = chat_template.system_prompt
-
-    # prepare result
-    results = {
-        "input_ids": [],
-        "loss_mask": [],
-        "attention_mask": [],
-        "pixel_values": [],
-        "image_grid_thw": [],
-    }
-
-    # Note: currently, we assume that each example has only one image
-    for i, image in enumerate(examples["image"]):
-        source = examples["conversations"][i]
-        messages = [{"role": "system", "content": system_prompt}]
-        if not source:
-            # if the source is None, skip it
-            continue
-
-        if source[0]["role"] != "user":
-            # if the first message is not from user, skip it
-            source = source[1:]
-
-        convroles = ["user", "assistant"]
-        for j, sentence in enumerate(source):
-            role = sentence["role"]
-            assert role == convroles[j % 2], f"unexpected role {role}"
-            if role == "user":
-                # if the message is from user and has image, process the image
-                messages.append(
-                    {
-                        "role": role,
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": image,
-                            },
-                            {"type": "text", "text": sentence["content"]},
-                        ],
-                    }
-                )
-            else:
-                messages.append({"role": role, "content": sentence["content"]})
-
-        conversation = processor.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        # get vision infor use qwen_vl_utils
-        if not HAS_QWEN_VL_UTILS:
-            raise ImportError(
-                "qwen_vl_utils is required for VLM preprocessing but is not installed. "
-                "Please install it to use VLM features."
-            )
-        image_inputs, video_inputs = process_vision_info(messages)
-        assert image_inputs is not None, "image_inputs must not be None"
-
-        encoding = processor(
-            text=[conversation],
-            images=image_inputs,
-            videos=video_inputs,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-            return_offsets_mapping=True,
-            add_special_tokens=False,
-        )
-        input_ids = encoding.input_ids[0]
-        offsets = encoding.offset_mapping[0]
-        pixel_values = encoding.pixel_values
-        image_grid_thw = encoding.image_grid_thw[0]
-
-        # get conversation with image info for loss mask generation
-        decoded_conversation = processor.tokenizer.decode(
-            encoding.input_ids[0], skip_special_tokens=False
-        )
-
-        # Apply loss mask
-        loss_mask = _apply_loss_mask_from_chat_template(
-            decoded_conversation, offsets, chat_template
-        )
-
-        results["input_ids"].append(input_ids[None, :])
-        results["loss_mask"].append(loss_mask[None, :])
-        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
-        results["pixel_values"].append(pixel_values)
-        results["image_grid_thw"].append(image_grid_thw[None, :])
-    return results
-
-
 def build_eagle3_dataset(
     dataset: HFDataset,
     tokenizer: PreTrainedTokenizer,
@@ -302,8 +175,6 @@ def build_eagle3_dataset(
     num_proc: Optional[int] = 8,
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
-    is_vlm: Optional[bool] = False,
-    processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
     minimum_valid_tokens: Optional[int] = None,
@@ -323,8 +194,6 @@ def build_eagle3_dataset(
         num_proc: The number of processes to use for multiprocessing.
         cache_dir: The directory to use for caching the processed dataset.
         cache_key: The key to use for caching the processed dataset.
-        is_vlm: Whether the dataset is for VLM models.
-        processor: The image processor to use for processing images.
         is_preformatted: Whether the dataset contains preformatted text of the conversation
                         (e.g. includes system prompt, user and assistant start and end tokens)
                         and doesn't need to have the chat template applied.
@@ -342,9 +211,6 @@ def build_eagle3_dataset(
     if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
         raise ValueError("minimum_valid_tokens must be >= 0")
 
-    if is_vlm:
-        assert processor is not None, "processor must be provided when is_vlm is True"
-
     # Validate chat_template requirement
     if chat_template is None:
         raise ValueError("chat_template must be provided for all dataset types")
@@ -360,14 +226,7 @@ def build_eagle3_dataset(
 
     def preprocess_function(examples):
         # Handle different dataset formats
-        if is_vlm:
-            processed = preprocess_vlm_conversations(
-                processor,
-                examples,
-                template,
-                max_length,
-            )
-        elif is_preformatted:
+        if is_preformatted:
             # Handle pre-formatted text (should be in "text" column)
             if "text" not in examples:
                 raise ValueError(
@@ -448,18 +307,11 @@ def build_eagle3_dataset(
     if num_proc is not None and num_proc > 1:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    # adjust batch size based on dataset type
-    if is_vlm:
-        batch_size = (
-            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
-        )
-    else:
-        batch_size = 1000  # default for conversations
     dataset = dataset.map(
         preprocess_function,
         batched=True,
         num_proc=num_proc,
-        batch_size=batch_size,
+        batch_size=1000,
         remove_columns=original_cols,
         # keep_in_memory=True,
         load_from_cache_file=load_from_cache_file,
@@ -763,6 +615,79 @@ def generate_vocab_mapping_file(
     torch.save(vocab_mapping, vocab_mapping_path)
     print(f"Saved vocab mapping to: {vocab_mapping_path}")
     return vocab_mapping_path
+
+
+def process_offline_eagle3_sample(
+    raw: Dict[str, torch.Tensor], max_len: int
+) -> Dict[str, torch.Tensor]:
+    """Normalize one prepared EAGLE3 feature sample for the canonical loader.
+
+    Hidden-state preparation stores the target final state under
+    hidden_state and auxiliary layers under aux_hidden_state. Training consumes
+    those tensors as target and hidden_state respectively.
+    """
+    hidden_state = raw["aux_hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    target = raw["hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
+    if loss_mask.numel() > 0:
+        loss_mask[0, -1] = 0
+
+    return {
+        "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),
+        "loss_mask": loss_mask,
+        "target": target,
+        "hidden_state": hidden_state,
+        "input_ids": input_ids,
+    }
+
+
+def process_offline_dflash_sample(
+    raw: Dict[str, torch.Tensor], max_len: int
+) -> Dict[str, torch.Tensor]:
+    """Normalize one prepared DFlash-family feature sample.
+
+    DFlash and Domino consume the same capture contract: token ids, a loss
+    mask, and the concatenated target-layer states.  Unlike EAGLE3, there is no
+    auxiliary/final-state swap and no target distribution.  Offline feature
+    files may store ``hidden_states`` as either ``[seq, width]`` or
+    ``[1, seq, width]``; the canonical loader always receives a leading batch
+    dimension.
+    """
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
+    hidden_states = raw["hidden_states"]
+    if hidden_states.dim() == 3:
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                "offline DFlash hidden_states must have shape [seq, width] or "
+                f"[1, seq, width], got {tuple(hidden_states.shape)}"
+            )
+        hidden_states = hidden_states.squeeze(0)
+    if hidden_states.dim() != 2:
+        raise ValueError(
+            "offline DFlash hidden_states must have shape [seq, width] or "
+            f"[1, seq, width], got {tuple(hidden_states.shape)}"
+        )
+    hidden_states = hidden_states[:max_len].unsqueeze(0)
+
+    sequence_lengths = {
+        input_ids.shape[1],
+        loss_mask.shape[1],
+        hidden_states.shape[1],
+    }
+    if len(sequence_lengths) != 1:
+        raise ValueError(
+            "offline DFlash features have mismatched sequence lengths after "
+            f"truncation: input_ids={input_ids.shape[1]}, "
+            f"loss_mask={loss_mask.shape[1]}, "
+            f"hidden_states={hidden_states.shape[1]}"
+        )
+    return {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_states": hidden_states,
+    }
 
 
 def process_token_dict_to_mappings(

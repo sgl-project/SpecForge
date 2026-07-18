@@ -7,6 +7,10 @@ from transformers import LlamaConfig
 from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaFlashAttention,
+    _std_flash_attn_varlen_backward,
+    _std_flash_attn_varlen_func,
+    _std_flash_pad_input,
+    _std_flash_unpad_input,
     prepare_decoder_attention_mask,
 )
 from specforge.utils import padding
@@ -14,6 +18,18 @@ from tests.test_utils.utils import norm_tensor
 
 TTT_LENGTH = 7
 torch.manual_seed(0)
+
+
+def _has_standard_flash_attention() -> bool:
+    return all(
+        x is not None
+        for x in (
+            _std_flash_attn_varlen_func,
+            _std_flash_attn_varlen_backward,
+            _std_flash_unpad_input,
+            _std_flash_pad_input,
+        )
+    )
 
 
 def assert_similar(ref, out):
@@ -26,6 +42,11 @@ def assert_similar(ref, out):
     assert abs(1 - norm_ratio) <= 0.025, f"{norm_ratio=}"
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@unittest.skipUnless(
+    _has_standard_flash_attention(),
+    "requires standard flash-attn varlen forward/backward interface",
+)
 class TestFlashAttention(unittest.TestCase):
 
     def setUp(self):

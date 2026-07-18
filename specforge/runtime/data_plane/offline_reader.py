@@ -12,11 +12,9 @@ The reader walks a directory of SpecForge offline feature files (the ``.ckpt`` /
 ``.ckpt.gz`` produced by ``scripts/prepare_hidden_states.py``) and emits one
 metadata-only ``SampleRef`` per file, referencing the file in place via a
 ``file://`` URI (read-only existing-file mode — no tensor copy, no tensor
-through the controller). The actual per-sample normalization (the
-``OfflineEagle3Dataset.process_data`` swap: stored ``aux_hidden_state`` becomes
-the draft input ``hidden_state`` and stored ``hidden_state`` becomes the
-``target``) is the FeatureDataLoader's job, keeping this reader independent of
-the model code.
+through the controller). The strategy registry selects the raw feature keys and
+the FeatureDataLoader applies the strategy's per-sample normalization, keeping
+this reader independent of model code.
 """
 
 from __future__ import annotations
@@ -84,7 +82,7 @@ class OfflineManifestReader:
         feature_keys: tuple = _OFFLINE_EAGLE3_KEYS,
         ttt_length: int = 7,
         max_len: int = 2048,
-        target_repr: str = "hidden_state",
+        target_repr: Optional[str] = "hidden_state",
         validate_files: bool = True,
     ) -> None:
         self.hidden_states_path = hidden_states_path
@@ -121,7 +119,7 @@ class OfflineManifestReader:
             num_tokens=num_tokens,
             estimated_bytes=estimated_bytes,
             metadata={
-                "format": "offline_eagle3",
+                "format": f"offline_{self.strategy}",
                 "target_repr": self.target_repr,
                 "schema_version": SCHEMA_VERSION,
                 "ttt_length": self.ttt_length,

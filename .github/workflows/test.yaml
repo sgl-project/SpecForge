@@ -50,6 +50,22 @@ jobs:
           uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
           MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
           uv pip install -v . --prerelease=allow
+          # The live server-capture gate needs the Mooncake client AND the
+          # mooncake_master console script; the isolated venv cannot see the
+          # container's site-packages. cu130 image -> the cuda13 wheel.
+          uv pip install mooncake-transfer-engine-cuda13
+
+      - name: Run live server-capture numerics gate
+        timeout-minutes: 15
+        shell: bash
+        env:
+          SPECFORGE_RUN_SERVER_CAPTURE_TESTS: "1"
+        run: |
+          source sf/bin/activate
+          export PYTHONPATH=$PWD
+          bash scripts/apply_sglang_spec_capture_patch.sh
+          python -c 'import importlib.util, shutil, torch; assert torch.cuda.is_available(), "live capture gate requires CUDA"; assert importlib.util.find_spec("mooncake.store"), "live capture gate requires mooncake.store"; assert shutil.which("mooncake_master") or __import__("os").environ.get("MOONCAKE_MASTER_SERVER_ADDR"), "live capture gate requires mooncake_master"'
+          python -m unittest tests.test_runtime.test_server_capture_gate -v
 
       - name: Run test
         timeout-minutes: 45

@@ -1,18 +1,19 @@
+import tempfile
 import unittest
-from argparse import Namespace
 from unittest.mock import MagicMock, patch
 
 import torch
 from transformers import LlamaConfig
 
-from scripts.train_peagle import resolve_mask_token_id
-from specforge.core.peagle import (
+from specforge.algorithms.peagle.model import (
     OnlinePEagleModel,
     compute_peagle_metrics,
     create_peagle_mask_mod,
     generate_cod_sample_indices,
 )
+from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.peagle import PEagleDraftModel
+from specforge.training.model_utils import resolve_mask_token_id
 
 
 class TestPEagleTrainingSemantics(unittest.TestCase):
@@ -56,6 +57,22 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
 
         self.assertTrue(model.embed_tokens.weight.requires_grad)
 
+    def test_norm_before_residual_round_trips_through_config(self):
+        config = self._tiny_config()
+        model = PEagleDraftModel(config, norm_before_residual=True)
+
+        self.assertTrue(model.config.norm_before_residual)
+        with tempfile.TemporaryDirectory() as output_dir:
+            model.save_pretrained(output_dir)
+            direct = PEagleDraftModel.from_pretrained(output_dir)
+            automatic = AutoDraftModel.from_pretrained(output_dir)
+
+        for reloaded in (direct, automatic):
+            self.assertIsInstance(reloaded, PEagleDraftModel)
+            self.assertTrue(reloaded.config.norm_before_residual)
+            self.assertTrue(reloaded.norm_before_residual)
+            self.assertTrue(reloaded.layers[0].norm_before_residual)
+
     def test_compute_metrics_masks_targets_outside_draft_vocab(self):
         logits = torch.tensor(
             [
@@ -79,7 +96,10 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         def fake_loss(logits, target_p, position_mask):
             return torch.tensor(0.0, device=logits.device)
 
-        with patch("specforge.core.peagle.LogSoftmaxLoss.apply", side_effect=fake_loss):
+        with patch(
+            "specforge.algorithms.peagle.model.LogSoftmaxLoss.apply",
+            side_effect=fake_loss,
+        ):
             _loss, metrics = compute_peagle_metrics(
                 logits=logits,
                 targets=targets,
@@ -116,6 +136,63 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
             torch.all(loss_mask[0, sampled_target_pos[parallel_depth_mask]] == 1)
         )
 
+    def test_cod_sampling_never_emits_negative_anchors(self):
+        torch.manual_seed(0)
+        loss_mask = torch.ones(1, 8, dtype=torch.long)
+
+        anchor_pos, depth = generate_cod_sample_indices(
+            seq_length=loss_mask.shape[1],
+            loss_mask=loss_mask,
+            num_depths=4,
+            down_sample_ratio=1.0,
+            down_sample_ratio_min=1.0,
+        )
+
+        sampled_target_pos = anchor_pos + depth
+        self.assertTrue(torch.all(anchor_pos >= 0))
+        self.assertTrue(torch.all(sampled_target_pos < loss_mask.shape[1]))
+        self.assertTrue(torch.all(loss_mask[0, sampled_target_pos] == 1))
+
+    def test_cod_sampling_does_not_cross_packed_document_boundaries(self):
+        torch.manual_seed(0)
+        loss_mask = torch.ones(1, 6, dtype=torch.long)
+        lengths = torch.tensor([3, 3], dtype=torch.long)
+
+        anchor_pos, depth = generate_cod_sample_indices(
+            seq_length=loss_mask.shape[1],
+            loss_mask=loss_mask,
+            lengths=lengths,
+            num_depths=3,
+            down_sample_ratio=1.0,
+            down_sample_ratio_min=1.0,
+        )
+
+        target_pos = anchor_pos + depth
+        document_ids = torch.tensor([0, 0, 0, 1, 1, 1])
+        parallel = depth > 0
+        self.assertTrue(
+            torch.all(
+                document_ids[anchor_pos[parallel]] == document_ids[target_pos[parallel]]
+            )
+        )
+
+    def test_online_wrapper_rejects_batch_larger_than_one(self):
+        config = self._tiny_config()
+        wrapper = OnlinePEagleModel(
+            draft_model=PEagleDraftModel(config),
+            mask_token_id=0,
+        )
+        input_ids = torch.ones(2, 4, dtype=torch.long)
+
+        with self.assertRaisesRegex(ValueError, "batch size 1"):
+            wrapper(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                target=torch.zeros(2, 4, config.vocab_size),
+                loss_mask=torch.ones_like(input_ids),
+                hidden_states=torch.zeros(2, 4, 3 * config.hidden_size),
+            )
+
     def test_peagle_mask_respects_documents_depth_order_and_padding(self):
         anchor_pos = torch.tensor([0, 1, 1, 2, 4, 4, 5])
         depth = torch.tensor([0, 0, 1, 0, 0, 1, 0])
@@ -145,70 +222,59 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
 
 
 class TestPEagleMaskTokenResolution(unittest.TestCase):
-    def _args(self, mask_token_id=None):
-        return Namespace(
-            mask_token_id=mask_token_id,
-            target_model_path="target",
-            trust_remote_code=False,
+    def _resolve(self, tokenizer, explicit=None):
+        return resolve_mask_token_id(
+            explicit=explicit,
+            tokenizer=tokenizer,
+            embedding_vocab_size=32,
         )
 
     def test_explicit_mask_token_is_validated(self):
+        tokenizer = MagicMock()
         with self.assertRaises(ValueError):
-            resolve_mask_token_id(self._args(mask_token_id=33), embedding_vocab_size=32)
+            self._resolve(tokenizer, explicit=33)
         with self.assertRaises(ValueError):
-            resolve_mask_token_id(self._args(mask_token_id=-1), embedding_vocab_size=32)
+            self._resolve(tokenizer, explicit=-1)
 
-        self.assertEqual(
-            resolve_mask_token_id(
-                self._args(mask_token_id=31), embedding_vocab_size=32
-            ),
-            31,
-        )
+        self.assertEqual(self._resolve(tokenizer, explicit=31), 31)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_tokenizer_mask_token_takes_priority(self, mock_auto_tokenizer):
+    def test_tokenizer_mask_token_takes_priority(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = 7
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
+        tokenizer.__len__.return_value = 30
 
-        self.assertEqual(resolve_mask_token_id(self._args(), 32), 7)
+        self.assertEqual(self._resolve(tokenizer), 7)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_unused_embedding_slot_takes_priority_over_pad(self, mock_auto_tokenizer):
+    def test_unused_embedding_slot_takes_priority_over_pad(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = None
         tokenizer.pad_token_id = 3
         tokenizer.eos_token_id = 4
         tokenizer.unk_token_id = 5
         tokenizer.__len__.return_value = 30
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
 
-        self.assertEqual(resolve_mask_token_id(self._args(), 32), 30)
+        self.assertEqual(self._resolve(tokenizer), 30)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_pad_fallback_when_no_mask_or_unused_slot(self, mock_auto_tokenizer):
+    def test_pad_fallback_when_no_mask_or_unused_slot(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = None
         tokenizer.pad_token_id = 3
         tokenizer.eos_token_id = 4
         tokenizer.unk_token_id = 5
         tokenizer.__len__.return_value = 32
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
 
-        self.assertEqual(resolve_mask_token_id(self._args(), 32), 3)
+        self.assertEqual(self._resolve(tokenizer), 3)
 
-    @patch("scripts.train_peagle.AutoTokenizer")
-    def test_fallback_token_must_fit_embedding_vocab(self, mock_auto_tokenizer):
+    def test_fallback_token_must_fit_embedding_vocab(self):
         tokenizer = MagicMock()
         tokenizer.mask_token_id = None
         tokenizer.pad_token_id = 33
         tokenizer.eos_token_id = None
         tokenizer.unk_token_id = None
         tokenizer.__len__.return_value = 32
-        mock_auto_tokenizer.from_pretrained.return_value = tokenizer
 
         with self.assertRaises(ValueError):
-            resolve_mask_token_id(self._args(), 32)
+            self._resolve(tokenizer)
 
 
 if __name__ == "__main__":

@@ -25,12 +25,21 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    basic_usage/data_preparation.md
    basic_usage/training.md
+   basic_usage/disaggregated_training.md
 
 .. toctree::
    :maxdepth: 1
    :caption: Advanced Features
 
    advanced_features/customization.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Benchmarks
+
+   benchmarks/benchmark.md
+   benchmarks/eagle3-disaggregated-parity.md
+   benchmarks/domino-disaggregated-performance.md
 
 .. toctree::
    :maxdepth: 1
@@ -45,9 +54,3 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    examples/llama3-eagle3-online.md
    examples/llama3-eagle3-offline.md
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Benchmarks
-
-   benchmarks/benchmark.md

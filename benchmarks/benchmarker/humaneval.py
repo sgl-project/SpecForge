@@ -49,9 +49,11 @@ def check_code_passes_tests(code: str, test_code: str, entry_point: str) -> bool
         namespace = {}
         # Execute the code (function definition)
         exec(code, namespace)
-        # Execute the test code (which contains assertions)
-        # If no exception is raised, the tests pass
+        # HumanEval test payloads define check(candidate); they do not invoke it.
         exec(test_code, namespace)
+        checker = namespace.get("check")
+        if checker is not None:
+            checker(namespace[entry_point])
         return True
     except AssertionError:
         # Assertion failed - test didn't pass
@@ -83,7 +85,8 @@ class HumanEvalBenchmarker(Benchmarker):
             if self.num_samples is not None and idx >= self.num_samples:
                 break
 
-            questions.append({"question": q["prompt"]})
+            prompt = q["prompt"]
+            questions.append({"question": prompt})
 
             # Store test case and entry point for evaluation
             test_code = q.get("test", "")
@@ -95,6 +98,7 @@ class HumanEvalBenchmarker(Benchmarker):
             canonical_solution = q.get("canonical_solution", "")
             labels.append(
                 {
+                    "prompt": prompt,
                     "test": test_code,
                     "entry_point": entry_point,
                     "canonical_solution": canonical_solution,
@@ -123,13 +127,11 @@ class HumanEvalBenchmarker(Benchmarker):
         correct = 0
         valid_count = 0
 
-        for i, (pred, label) in enumerate(zip(predictions, labels)):
+        for pred, label in zip(predictions, labels):
             if label is not None and isinstance(label, dict):
                 valid_count += 1
                 if pred is not None:
                     try:
-                        # Get the prompt (function signature and docstring)
-                        prompt = self.questions[i]["question"]
                         entry_point = label.get("entry_point", "")
 
                         # The prompt contains the function signature (e.g., "def function_name(...):")
@@ -153,12 +155,14 @@ class HumanEvalBenchmarker(Benchmarker):
                                 full_code = pred_str
                             else:
                                 # Different function or no match, combine with prompt
+                                prompt = label.get("prompt", "")
                                 full_code = prompt + "\n" + pred_str
                         elif pred_str.startswith("def "):
                             # Has function definition but we can't verify entry_point, use as-is
                             full_code = pred_str
                         else:
                             # Generated code is just the body, combine with prompt
+                            prompt = label.get("prompt", "")
                             full_code = prompt + "\n" + pred_str
 
                         # Check if code passes tests
@@ -168,9 +172,8 @@ class HumanEvalBenchmarker(Benchmarker):
                             full_code, test_code, entry_point
                         ):
                             correct += 1
-                    except Exception as e:
+                    except Exception:
                         # If evaluation fails, consider it incorrect
-                        # Uncomment for debugging: print(f"Error evaluating code {i}: {e}")
                         pass
 
         return correct / valid_count if valid_count > 0 else 0.0

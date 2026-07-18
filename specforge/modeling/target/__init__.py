@@ -1,17 +1,5 @@
-from .eagle3_target_model import (
-    CustomEagle3TargetModel,
-    Eagle3TargetModel,
-    HFEagle3TargetModel,
-    SGLangEagle3TargetModel,
-    get_eagle3_target_model,
-)
-from .target_head import TargetHead
+"""Trainable target-head components used by offline EAGLE3 training.
 
-__all__ = [
-    "Eagle3TargetModel",
-    "SGLangEagle3TargetModel",
-    "HFEagle3TargetModel",
-    "CustomEagle3TargetModel",
-    "get_eagle3_target_model",
-    "TargetHead",
-]
+Frozen online capture runs in an external server; standalone preprocessing uses
+:mod:`specforge.offline_capture`.
+"""

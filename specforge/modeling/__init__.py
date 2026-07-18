@@ -1,21 +1,5 @@
-# from .auto import AutoDistributedTargetModel, AutoDraftModelConfig, AutoEagle3DraftModel
-from .auto import AutoDraftModelConfig, AutoEagle3DraftModel
-from .draft.llama3_eagle import LlamaForCausalLMEagle3
-from .draft.peagle import PEagleDraftModel
-from .target.eagle3_target_model import (
-    CustomEagle3TargetModel,
-    HFEagle3TargetModel,
-    SGLangEagle3TargetModel,
-    get_eagle3_target_model,
-)
+"""Draft and target modeling implementations.
 
-__all__ = [
-    "LlamaForCausalLMEagle3",
-    "PEagleDraftModel",
-    "SGLangEagle3TargetModel",
-    "HFEagle3TargetModel",
-    "CustomEagle3TargetModel",
-    "get_eagle3_target_model",
-    "AutoDraftModelConfig",
-    "AutoEagle3DraftModel",
-]
+Import concrete types from their owning modules; this package does not maintain
+the pre-runtime aggregate model API.
+"""
