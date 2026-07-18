@@ -25,6 +25,7 @@ a reachable/spawnable ``mooncake_master``; opt in locally with
 
 import importlib.util
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,8 @@ import torch
 CUDA = torch.cuda.is_available()
 ENABLED = os.environ.get("SPECFORGE_RUN_SERVER_CAPTURE_TESTS") == "1"
 PORT = 30989
+STORE_ID = "server-capture-gate"
+CAPTURE_TOKEN = "server-capture-gate-token"
 AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
@@ -87,6 +90,8 @@ class TestServerCaptureGate(unittest.TestCase):
         from transformers import LlamaConfig, LlamaForCausalLM
 
         cls.workdir = tempfile.mkdtemp(prefix="spec_capture_gate_")
+        cls.inventory_db_path = os.path.join(cls.workdir, "capture_inventory.sqlite3")
+        cls.lifecycle_db_path = os.path.join(cls.workdir, "mooncake_lifecycle.sqlite3")
         cfg = LlamaConfig(
             hidden_size=H,
             intermediate_size=128,
@@ -127,7 +132,10 @@ class TestServerCaptureGate(unittest.TestCase):
             MOONCAKE_LOCAL_HOSTNAME=os.environ.get(
                 "MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"
             ),
+            SGLANG_SPEC_CAPTURE_TOKEN=CAPTURE_TOKEN,
         )
+        cls.server_log = open(os.path.join(cls.workdir, "server.log"), "w")
+        cls.addClassCleanup(cls.server_log.close)
         cls.server = subprocess.Popen(
             [
                 sys.executable,
@@ -144,15 +152,23 @@ class TestServerCaptureGate(unittest.TestCase):
                 "-1",
                 "--disable-radix-cache",
                 "--enable-spec-capture",
+                "--spec-capture-store-id",
+                STORE_ID,
+                "--spec-capture-inventory-db",
+                cls.inventory_db_path,
+                "--spec-capture-lifecycle-db",
+                cls.lifecycle_db_path,
                 "--spec-capture-aux-layer-ids",
                 *[str(i) for i in AUX_LAYER_IDS],
                 "--port",
                 str(PORT),
             ],
-            stdout=open(os.path.join(cls.workdir, "server.log"), "w"),
+            stdout=cls.server_log,
             stderr=subprocess.STDOUT,
             env=env,
+            start_new_session=True,
         )
+        cls.addClassCleanup(cls._terminate_process_group, cls.server)
         import requests
 
         deadline = time.time() + 300
@@ -180,11 +196,15 @@ class TestServerCaptureGate(unittest.TestCase):
                 "no MOONCAKE_MASTER_SERVER_ADDR in env and no mooncake_master "
                 "binary on PATH"
             )
+        cls.master_log = open(os.path.join(cls.workdir, "mooncake_master.log"), "w")
+        cls.addClassCleanup(cls.master_log.close)
         cls.master = subprocess.Popen(
             [binary, "--enable-http-metadata-server=true"],
-            stdout=open(os.path.join(cls.workdir, "mooncake_master.log"), "w"),
+            stdout=cls.master_log,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
+        cls.addClassCleanup(cls._terminate_process_group, cls.master)
         time.sleep(3)
         if cls.master.poll() is not None:
             raise unittest.SkipTest(
@@ -198,22 +218,25 @@ class TestServerCaptureGate(unittest.TestCase):
         os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1")
         os.environ.setdefault("MOONCAKE_PROTOCOL", "tcp")
 
-    @classmethod
-    def tearDownClass(cls):
-        for proc in (cls.server, cls.master):
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+    @staticmethod
+    def _terminate_process_group(proc):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
 
     # -- helpers ---------------------------------------------------------------
-    def _store(self, store_id):
+    def _store(self):
         from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
         return MooncakeFeatureStore(
-            store_id=store_id,
+            store_id=STORE_ID,
+            lifecycle_db_path=self.lifecycle_db_path,
             setup_kwargs={
                 "local_hostname": os.environ["MOONCAKE_LOCAL_HOSTNAME"],
                 "metadata_server": os.environ["MOONCAKE_METADATA_SERVER"],
@@ -225,13 +248,13 @@ class TestServerCaptureGate(unittest.TestCase):
             },
         )
 
-    def _tasks(self, rows):
+    def _tasks(self, rows, *, prefix):
         from specforge.runtime.contracts import PromptTask
 
         return [
             PromptTask(
-                task_id=f"t{i}",
-                run_id="gate0",
+                task_id=f"{prefix}-t{i}",
+                run_id=STORE_ID,
                 source_id="gate",
                 payload={
                     "input_ids": list(r),
@@ -279,13 +302,14 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.runtime.contracts import SampleRef
 
         rows = [[5, 6, 7, 8, 9, 10], [11, 12, 13, 14]]
-        store = self._store("gate-eagle3")
+        store = self._store()
         adapter = SGLangServerCaptureAdapter(
             f"http://localhost:{PORT}",
             store,
-            run_id="gate0",
+            run_id=STORE_ID,
             algorithm="eagle3",
             schema=_capture_schema("eagle3"),
+            capture_token=CAPTURE_TOKEN,
         )
         contract = CaptureConfig.from_strategy(
             required_features={
@@ -299,7 +323,9 @@ class TestServerCaptureGate(unittest.TestCase):
             target_repr="hidden_state",
             target_hidden_size=H,
         )
-        refs = adapter.produce_refs(self._tasks(rows), capture=contract)
+        refs = adapter.produce_refs(
+            self._tasks(rows, prefix="eagle3"), capture=contract
+        )
         for ref in refs:
             self.assertIsInstance(ref, SampleRef, f"expected a ref, got failure: {ref}")
 
@@ -392,13 +418,14 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.runtime.contracts import SampleRef
 
         rows = [[3, 1, 4, 1, 5]]
-        store = self._store("gate-dflash")
+        store = self._store()
         adapter = SGLangServerCaptureAdapter(
             f"http://localhost:{PORT}",
             store,
-            run_id="gate1",
+            run_id=STORE_ID,
             algorithm="dflash",
             schema=_capture_schema("dflash"),
+            capture_token=CAPTURE_TOKEN,
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
@@ -406,7 +433,9 @@ class TestServerCaptureGate(unittest.TestCase):
             target_repr="hidden_state",
             target_hidden_size=H,
         )
-        (ref,) = adapter.produce_refs(self._tasks(rows), capture=contract)
+        (ref,) = adapter.produce_refs(
+            self._tasks(rows, prefix="dflash"), capture=contract
+        )
         self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
         out, handle = store.get(ref)
         self.assertEqual(sorted(out), ["hidden_states", "input_ids", "loss_mask"])
