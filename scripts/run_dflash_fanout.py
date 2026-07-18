@@ -27,6 +27,7 @@ from specforge.config.production_fanout import (  # noqa: E402
     ManifestError,
     VariantConfig,
     load_manifest,
+    parse_host_port,
     resolve_executable,
     validate_launch_inputs,
 )
@@ -103,6 +104,11 @@ def build_role_commands(
     script = os.path.realpath(__file__)
     commands: list[RoleCommand] = []
     if manifest.mooncake.mode == "managed":
+        master_host, master_port = parse_host_port(
+            manifest.mooncake.master_server_addr,
+            "mooncake.master_server_addr",
+        )
+        metadata_url = urlparse(manifest.mooncake.metadata_server)
         master_env = dict(env)
         master_env["CUDA_VISIBLE_DEVICES"] = ""
         commands.append(
@@ -114,6 +120,10 @@ def build_role_commands(
                         sibling_of=manifest.training.python_executable,
                     ),
                     "--enable-http-metadata-server=true",
+                    f"--rpc_address={master_host}",
+                    f"--rpc_port={master_port}",
+                    f"--http_metadata_server_host={metadata_url.hostname}",
+                    f"--http_metadata_server_port={metadata_url.port}",
                     f"--metrics_port={manifest.mooncake.metrics_port}",
                 ),
                 env=master_env,

@@ -399,6 +399,27 @@ class TestRoleCommands(FanoutManifestFixture):
         self.assertNotIn("receipt", flattened.lower())
         self.assertNotIn("audit", flattened.lower())
 
+    def test_managed_mooncake_uses_manifest_endpoints(self):
+        payload = self.payload()
+        payload["mooncake"].update(
+            {
+                "metadata_server": "http://127.0.0.1:18187/metadata",
+                "master_server_addr": "127.0.0.1:52107",
+                "metrics_port": 52108,
+            }
+        )
+        manifest = self.write_manifest(payload)
+        commands = launcher.build_role_commands(manifest, base_env={})
+        master = next(
+            command for command in commands if command.role == "mooncake-master"
+        )
+
+        self.assertIn("--rpc_address=127.0.0.1", master.argv)
+        self.assertIn("--rpc_port=52107", master.argv)
+        self.assertIn("--http_metadata_server_host=127.0.0.1", master.argv)
+        self.assertIn("--http_metadata_server_port=18187", master.argv)
+        self.assertIn("--metrics_port=52108", master.argv)
+
     def test_dry_run_has_no_filesystem_or_gpu_side_effects(self):
         payload = self.payload()
         payload["runtime"]["gpu_monitor"] = {
