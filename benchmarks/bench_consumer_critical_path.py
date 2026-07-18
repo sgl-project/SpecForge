@@ -26,6 +26,7 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[1])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from specforge.algorithms.builtin import builtin_algorithm_registry  # noqa: E402
 from specforge.modeling.draft.dflash import DFlashDraftModel  # noqa: E402
 from specforge.ops.fused_linear_cross_entropy import (  # noqa: E402
     frozen_linear_cross_entropy,
@@ -36,7 +37,6 @@ from specforge.runtime.data_plane.feature_dataloader import (  # noqa: E402
 )
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore  # noqa: E402
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue  # noqa: E402
-from specforge.training.strategies.registry import resolve_strategy  # noqa: E402
 
 
 def _timing_summary(samples_ms: list[float]) -> dict[str, float]:
@@ -174,20 +174,19 @@ def _loader_run(
         )
     queue = SampleRefQueue()
     queue.put(refs)
-    strategy = resolve_strategy("dflash")
+    algorithm = builtin_algorithm_registry().resolve("dflash")
+    streaming = algorithm.providers.server_streaming_for("text")
     loader = FeatureDataLoader(
         store,
         queue,
         batch_size=1,
-        collate_fn=strategy.make_online_collate(),
+        collate_fn=streaming.build_collator(),
         device=device,
-        feature_names=sorted(strategy.required_features),
         clone_on_fetch=False,
         drop_last=False,
         strategy="dflash",
         gc_interval_s=None,
-        prefetch_batches=2 if prefetch else 0,
-        prefetch_to_device=prefetch,
+        num_workers=2 if prefetch else 0,
     )
     iterator = iter(loader)
     for _ in range(warmup):
