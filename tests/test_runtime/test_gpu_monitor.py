@@ -128,6 +128,13 @@ class TestGpuMonitor(GpuMonitorFixture):
         self.assertEqual(summary["gpus"]["3"]["sample_count"], len(samples))
         self.assertEqual(summary["gpus"]["3"]["logical_role"], "producer")
         self.assertEqual(summary["gpus"]["3"]["observed_compute_pids"], [123])
+        self.assertEqual(
+            summary["gpus"]["3"]["device_memory_used_bytes"]["max"], 8 << 30
+        )
+        self.assertEqual(
+            summary["gpus"]["3"]["compute_process_memory_used_bytes"]["max"],
+            4 << 30,
+        )
         self.assertEqual(samples[0]["memory_used_mib"], 8192)
         self.assertEqual(samples[0]["compute_pids"], [123])
         self.assertEqual(
@@ -138,9 +145,45 @@ class TestGpuMonitor(GpuMonitorFixture):
         self.assertIsNotNone(summary["collection_duration_ms"]["max"])
         self.assertFalse(monitor.thread.is_alive())
         self.assertTrue(backend.closed)
+        self.assertIsNone(monitor._handle)
         self.assertFalse(hasattr(monitor, "samples"))
         persisted = json.loads((self.root / "summary.json").read_text())
         self.assertEqual(persisted["gpus"]["3"]["sample_count"], len(samples))
+
+    def test_session_start_write_failure_cleans_partial_start(self):
+        backend = _FakeBackend()
+        monitor = self.monitor(backend)
+        handle = mock.Mock()
+        handle.write.side_effect = OSError("disk full")
+
+        with mock.patch("builtins.open", return_value=handle):
+            self.assertFalse(monitor.start())
+
+        self.assertTrue(backend.closed)
+        self.assertFalse(monitor.thread.is_alive())
+        self.assertIsNone(monitor._handle)
+        handle.close.assert_called_once_with()
+        summary = monitor.stop()
+        self.assertEqual(summary["status"], "degraded")
+        self.assertIn("disk full", summary["write_failure"])
+
+    def test_thread_start_failure_cleans_partial_start(self):
+        backend = _FakeBackend()
+        monitor = self.monitor(backend)
+
+        with mock.patch.object(
+            monitor.thread, "start", side_effect=RuntimeError("thread unavailable")
+        ):
+            self.assertFalse(monitor.start())
+
+        self.assertTrue(backend.closed)
+        self.assertFalse(monitor.thread.is_alive())
+        self.assertIsNone(monitor._handle)
+        summary = monitor.stop()
+        self.assertEqual(summary["status"], "degraded")
+        self.assertTrue(
+            any(value["stage"] == "thread-start" for value in summary["errors"])
+        )
 
     def test_initialization_failure_is_visible_but_does_not_raise(self):
         backend = _FakeBackend(open_error=RuntimeError("NVML unavailable"))
@@ -162,6 +205,7 @@ class TestGpuMonitor(GpuMonitorFixture):
         self.assertIn("NVML unavailable", output.getvalue())
         self.assertFalse(monitor.thread.is_alive())
         self.assertTrue(backend.closed)
+        self.assertIsNone(monitor._handle)
 
     def test_sample_failure_is_counted_and_preserves_error_records(self):
         backend = _FakeBackend(sample_error=RuntimeError("driver timeout"))
@@ -319,6 +363,45 @@ class TestBoundedAggregation(unittest.TestCase):
         self.assertEqual(sum(aggregate.gpu_utilization_histogram), 100_000)
         self.assertEqual(aggregate.observed_pids, {123})
         self.assertEqual(aggregate.summary()["gpu_utilization_pct"]["p95"], 75)
+        self.assertEqual(
+            aggregate.summary()["compute_process_memory_used_bytes"]["count"],
+            100_000,
+        )
+
+    def test_compute_process_memory_aggregation_semantics(self):
+        aggregate = _GpuAggregate()
+        rows = [
+            {
+                "timestamp_monotonic_ns": 1,
+                **_sample(pids=(101, 202)),
+            },
+            {
+                "timestamp_monotonic_ns": 2,
+                **_sample(pids=()),
+            },
+            {
+                "timestamp_monotonic_ns": 3,
+                **_sample(pids=(303,)),
+            },
+            {
+                "timestamp_monotonic_ns": 4,
+                **_sample(pids=()),
+                "field_errors": {"compute_processes": "NVML unavailable"},
+            },
+        ]
+        rows[2]["compute_processes"][0]["used_memory_bytes"] = None
+        for row in rows:
+            aggregate.add(row, low_utilization_pct=10)
+
+        summary = aggregate.summary()
+        self.assertEqual(
+            summary["memory_used_bytes"], summary["device_memory_used_bytes"]
+        )
+        self.assertEqual(
+            summary["compute_process_memory_used_bytes"],
+            {"count": 2, "mean": 4 << 30, "min": 0.0, "max": 8 << 30},
+        )
+        self.assertEqual(summary["compute_process_memory_unavailable_samples"], 2)
 
     def test_window_summary_excludes_startup_samples(self):
         samples = [
@@ -352,6 +435,34 @@ class TestBoundedAggregation(unittest.TestCase):
         self.assertEqual(gpu["gpu_utilization_pct"]["p50"], 80)
         self.assertEqual(gpu["gpu_utilization_pct"]["p95"], 100)
         self.assertEqual(gpu["max_compute_processes"], 1)
+        self.assertTrue(summary["valid"])
+        self.assertEqual(summary["invalid_reasons"], [])
+
+    def test_window_summary_rejects_one_sample_and_zero_coverage(self):
+        assignment = GpuRoleAssignment(3, "producer", "target-server")
+        sample = {
+            "timestamp_monotonic_ns": 2_000_000_000,
+            "gpu": 3,
+            **_sample(),
+        }
+
+        one_sample = summarize_gpu_window(
+            [sample],
+            [assignment],
+            start_monotonic_ns=1_000_000_000,
+            end_monotonic_ns=3_000_000_000,
+        )
+        self.assertFalse(one_sample["valid"])
+        self.assertIn("at least 2", one_sample["invalid_reasons"][0])
+
+        zero_coverage = summarize_gpu_window(
+            [sample, dict(sample)],
+            [assignment],
+            start_monotonic_ns=1_000_000_000,
+            end_monotonic_ns=3_000_000_000,
+        )
+        self.assertFalse(zero_coverage["valid"])
+        self.assertIn("zero sample coverage", zero_coverage["invalid_reasons"][0])
 
     def test_window_summary_rejects_empty_interval(self):
         with self.assertRaisesRegex(ValueError, "positive duration"):
@@ -465,15 +576,23 @@ class TestRealNvmlMonitor(unittest.TestCase):
             )
             self.assertTrue(monitor.start())
             deadline = time.monotonic() + 2.0
-            while not list(iter_gpu_samples(monitor.sample_path)):
+            while len(list(iter_gpu_samples(monitor.sample_path))) < 2:
                 if time.monotonic() >= deadline:
-                    self.fail("NVML monitor did not produce a sample")
+                    self.fail("NVML monitor did not produce two samples")
                 time.sleep(0.01)
             summary = monitor.stop()
 
             self.assertIn(summary["status"], {"ok", "degraded"})
             self.assertNotEqual(summary["gpus"][str(gpu)]["gpu_uuid"], "unknown")
             samples = list(iter_gpu_samples(monitor.sample_path))
+            gpu_summary = summary["gpus"][str(gpu)]
+            self.assertEqual(
+                gpu_summary["compute_process_memory_used_bytes"]["count"],
+                len(samples),
+            )
+            self.assertEqual(
+                gpu_summary["compute_process_memory_unavailable_samples"], 0
+            )
             own_pid_rows = [
                 value for value in samples if os.getpid() in value["compute_pids"]
             ]

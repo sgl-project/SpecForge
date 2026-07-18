@@ -260,6 +260,22 @@ class _ScalarStats:
         }
 
 
+def _compute_process_memory_used_bytes(row: Mapping[str, Any]) -> Optional[int]:
+    field_errors = row.get("field_errors") or {}
+    if "compute_processes" in field_errors:
+        return None
+    processes = row.get("compute_processes")
+    if processes is None:
+        return None
+    total = 0
+    for process in processes:
+        value = process.get("used_memory_bytes")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        total += value
+    return total
+
+
 def _add_histogram(histogram: list[int], value: Any) -> None:
     if value is None:
         return
@@ -289,6 +305,8 @@ class _GpuAggregate:
     gpu_utilization_histogram: list[int] = field(default_factory=lambda: [0] * 101)
     memory_utilization_histogram: list[int] = field(default_factory=lambda: [0] * 101)
     memory_used: _ScalarStats = field(default_factory=_ScalarStats)
+    compute_process_memory_used: _ScalarStats = field(default_factory=_ScalarStats)
+    compute_process_memory_unavailable_samples: int = 0
     power_draw: _ScalarStats = field(default_factory=_ScalarStats)
     temperature: _ScalarStats = field(default_factory=_ScalarStats)
     clock_sm: _ScalarStats = field(default_factory=_ScalarStats)
@@ -321,6 +339,11 @@ class _GpuAggregate:
         if gpu_utilization is not None and float(gpu_utilization) < low_utilization_pct:
             self.low_utilization_samples += 1
         self.memory_used.add(row.get("memory_used_bytes"))
+        process_memory = _compute_process_memory_used_bytes(row)
+        if process_memory is None:
+            self.compute_process_memory_unavailable_samples += 1
+        else:
+            self.compute_process_memory_used.add(process_memory)
         self.power_draw.add(row.get("power_draw_mw"))
         self.temperature.add(row.get("temperature_c"))
         self.clock_sm.add(row.get("clock_sm_mhz"))
@@ -402,7 +425,15 @@ class _GpuAggregate:
                 "p50": _histogram_percentile(self.memory_utilization_histogram, 0.50),
                 "p95": _histogram_percentile(self.memory_utilization_histogram, 0.95),
             },
+            # Keep memory_used_bytes as the legacy device-wide field.
             "memory_used_bytes": self.memory_used.summary(),
+            "device_memory_used_bytes": self.memory_used.summary(),
+            "compute_process_memory_used_bytes": (
+                self.compute_process_memory_used.summary()
+            ),
+            "compute_process_memory_unavailable_samples": (
+                self.compute_process_memory_unavailable_samples
+            ),
             "power_draw_mw": self.power_draw.summary(),
             "energy_joules": self.energy_joules,
             "temperature_c": self.temperature.summary(),
@@ -460,6 +491,23 @@ def summarize_gpu_window(
             continue
         aggregate.add(row, low_utilization_pct=low_utilization_pct)
 
+    per_gpu = {
+        str(gpu): {
+            **asdict(assignment_by_gpu[gpu]),
+            **aggregates[gpu].summary(),
+        }
+        for gpu in sorted(assignment_by_gpu)
+    }
+    invalid_reasons = []
+    for gpu, aggregate in per_gpu.items():
+        if aggregate["sample_count"] < 2:
+            invalid_reasons.append(
+                f"GPU {gpu} has {aggregate['sample_count']} sample(s); at least 2 are "
+                "required"
+            )
+        elif aggregate["coverage_s"] is None or aggregate["coverage_s"] <= 0:
+            invalid_reasons.append(f"GPU {gpu} has zero sample coverage")
+
     return {
         "schema_version": SAMPLE_SCHEMA_VERSION,
         "interval": interval_name,
@@ -467,13 +515,9 @@ def summarize_gpu_window(
         "end_monotonic_ns": end_monotonic_ns,
         "duration_s": (end_monotonic_ns - start_monotonic_ns) / 1e9,
         "low_utilization_threshold_pct": low_utilization_pct,
-        "gpus": {
-            str(gpu): {
-                **asdict(assignment_by_gpu[gpu]),
-                **aggregates[gpu].summary(),
-            }
-            for gpu in sorted(assignment_by_gpu)
-        },
+        "valid": not invalid_reasons,
+        "invalid_reasons": invalid_reasons,
+        "gpus": per_gpu,
     }
 
 
@@ -605,37 +649,19 @@ class GpuMonitor:
         try:
             devices = self.backend.open([value.gpu for value in self.assignments])
             self._devices = {int(gpu): device for gpu, device in devices.items()}
+            self._backend_open = True
             missing = sorted(
                 {value.gpu for value in self.assignments} - set(self._devices)
             )
             if missing:
                 raise GpuMonitorError(f"NVML backend omitted GPUs {missing}")
-            self._backend_open = True
         except Exception as exc:
-            try:
-                self.backend.close()
-            except Exception as close_exc:
-                self._record_error("initialization-close", close_exc)
-            self._record_error("initialization", exc)
-            timestamp_ns = time.time_ns()
-            timestamp_monotonic_ns = time.monotonic_ns()
-            self._write_record(
-                {
-                    "schema_version": SAMPLE_SCHEMA_VERSION,
-                    "record_type": "error",
-                    "timestamp_ns": timestamp_monotonic_ns,
-                    "timestamp_unix_ns": timestamp_ns,
-                    "timestamp_monotonic_ns": timestamp_monotonic_ns,
-                    "stage": "initialization",
-                    "error": _error_text(exc),
-                }
-            )
-            print(
-                f"[gpu-monitor] degraded: {_error_text(exc)}",
-                file=self.output,
-                flush=True,
-            )
-            return False
+            if not self._backend_open:
+                try:
+                    self.backend.close()
+                except Exception as close_exc:
+                    self._record_error("initialization-close", close_exc)
+            return self._abort_start("initialization", exc)
 
         self._write_record(
             {
@@ -651,7 +677,17 @@ class GpuMonitor:
                 ],
             }
         )
-        self.thread.start()
+        if self._write_failure is not None:
+            return self._abort_start(
+                "session-start-write",
+                GpuMonitorError(
+                    f"failed to write session_start: {self._write_failure}"
+                ),
+            )
+        try:
+            self.thread.start()
+        except Exception as exc:
+            return self._abort_start("thread-start", exc)
         print(
             f"[gpu-monitor] started gpus={[value.gpu for value in self.assignments]} "
             f"samples={self.sample_path}",
@@ -863,6 +899,48 @@ class GpuMonitor:
         except (OSError, TypeError, ValueError) as exc:
             self._write_failure = _error_text(exc)
 
+    def _close_output(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._handle.close()
+        except OSError as exc:
+            self._record_error("output-close", exc)
+        finally:
+            self._handle = None
+
+    def _abort_start(self, stage: str, exc: BaseException) -> bool:
+        self._record_error(stage, exc)
+        timestamp_ns = time.time_ns()
+        timestamp_monotonic_ns = time.monotonic_ns()
+        self._write_record(
+            {
+                "schema_version": SAMPLE_SCHEMA_VERSION,
+                "record_type": "error",
+                "timestamp_ns": timestamp_monotonic_ns,
+                "timestamp_unix_ns": timestamp_ns,
+                "timestamp_monotonic_ns": timestamp_monotonic_ns,
+                "stage": stage,
+                "error": _error_text(exc),
+            }
+        )
+        self._stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=max(10.0, self.poll_s * 2.0))
+        if self.thread.is_alive():
+            self._record_error(
+                "startup-cleanup", GpuMonitorError("GPU monitor thread did not stop")
+            )
+        else:
+            self._close_backend()
+        self._close_output()
+        print(
+            f"[gpu-monitor] degraded: {_error_text(exc)}",
+            file=self.output,
+            flush=True,
+        )
+        return False
+
     def _close_backend(self) -> None:
         if not self._backend_open:
             return
@@ -916,8 +994,7 @@ class GpuMonitor:
                 except OSError as exc:
                     self._write_failure = self._write_failure or _error_text(exc)
                 finally:
-                    self._handle.close()
-                    self._handle = None
+                    self._close_output()
             self._summary = self._build_summary()
         try:
             _atomic_write_json(self.summary_path, self._summary)
