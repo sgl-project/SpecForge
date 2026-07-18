@@ -18,11 +18,8 @@ import torch
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PATCH = _ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture.patch"
-_V1_TO_V2_PATCH = (
-    _ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture-v1-to-v2.patch"
-)
-_V2_TO_V3_PATCH = (
-    _ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture-v2-to-v3.patch"
+_BASE_TO_CURRENT_PATCH = (
+    _ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture-base-to-current.patch"
 )
 _INSTALLER = _ROOT / "scripts" / "apply_sglang_spec_capture_patch.sh"
 
@@ -107,90 +104,39 @@ class TestSGLangCapturePatch(unittest.TestCase):
             body,
         )
 
-    def test_v1_to_v2_migration_round_trip(self):
-        legacy = (
-            '        """Accumulate captured rows as CPU tensors for the Mooncake sink.\n'
-            "\n"
-            "        Same offset arithmetic as ``_append_prefill_hidden_states`` but keeps\n"
-            "        tensor slices (aux concat in ``hidden_states``, post-norm last in\n"
-            "        ``last_hidden_states``) rather than the JSON-able response payload.\n"
-            '        """\n'
-            "        start = hidden_state_offset\n"
-            "        end = start + len(req.origin_input_ids)\n"
-            "        req.spec_capture_aux.append(\n"
-            "            logits_output.hidden_states[start:end].cpu().clone()\n"
-            "        )\n"
-            "        if logits_output.last_hidden_states is not None:\n"
-            "            req.spec_capture_last_hidden.append(\n"
-            "                logits_output.last_hidden_states[start:end].cpu().clone()\n"
-            "            )\n"
+    def test_base_to_current_migration_is_well_formed_and_scoped(self):
+        result = subprocess.run(
+            ["git", "apply", "--numstat", str(_BASE_TO_CURRENT_PATCH)],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = (
-                root
-                / "sglang/srt/managers/scheduler_components/batch_result_processor.py"
-            )
-            target.parent.mkdir(parents=True)
-            target.write_text(legacy, encoding="utf-8")
-            command = ["patch", "--batch", "-p2", "-d", str(root)]
-
-            subprocess.run(
-                [*command, "--forward"],
-                input=_V1_TO_V2_PATCH.read_bytes(),
-                check=True,
-                capture_output=True,
-            )
-            current = target.read_text(encoding="utf-8")
-            self.assertIn('if "aux" in requested_artifacts:', current)
-            self.assertIn('"last_hidden" in requested_artifacts', current)
-
-            subprocess.run(
-                [*command, "--reverse"],
-                input=_V1_TO_V2_PATCH.read_bytes(),
-                check=True,
-                capture_output=True,
-            )
-            self.assertEqual(target.read_text(encoding="utf-8"), legacy)
-
-    def test_v2_to_v3_migration_round_trip(self):
-        current = _extract_sink().read_text(encoding="utf-8")
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "sglang/srt/spec_capture_sink.py"
-            target.parent.mkdir(parents=True)
-            target.write_text(current, encoding="utf-8")
-            command = ["patch", "--batch", "-p2", "-d", str(root)]
-
-            subprocess.run(
-                [*command, "--reverse"],
-                input=_V2_TO_V3_PATCH.read_bytes(),
-                check=True,
-                capture_output=True,
-            )
-            previous = target.read_text(encoding="utf-8")
-            self.assertIn("self._write_lock = threading.Lock()", previous)
-            self.assertIn('if "store_id" in spec:', previous)
-            self.assertNotIn("replace=replace", previous)
-
-            subprocess.run(
-                [*command, "--forward"],
-                input=_V2_TO_V3_PATCH.read_bytes(),
-                check=True,
-                capture_output=True,
-            )
-            self.assertEqual(target.read_text(encoding="utf-8"), current)
+        targets = {line.split("\t", 2)[-1] for line in result.stdout.splitlines()}
+        self.assertEqual(
+            targets,
+            {
+                "python/sglang/srt/managers/schedule_batch.py",
+                "python/sglang/srt/managers/scheduler_components/"
+                "batch_result_processor.py",
+                "python/sglang/srt/models/qwen2.py",
+                "python/sglang/srt/server_args.py",
+                "python/sglang/srt/spec_capture_sink.py",
+            },
+        )
 
     def test_installer_pins_patch_and_migration_digests(self):
         installer = _INSTALLER.read_text(encoding="utf-8")
         patch_digest = hashlib.sha256(_PATCH.read_bytes()).hexdigest()
-        v1_to_v2_digest = hashlib.sha256(_V1_TO_V2_PATCH.read_bytes()).hexdigest()
-        v2_to_v3_digest = hashlib.sha256(_V2_TO_V3_PATCH.read_bytes()).hexdigest()
+        migration_digest = hashlib.sha256(
+            _BASE_TO_CURRENT_PATCH.read_bytes()
+        ).hexdigest()
         self.assertIn(f'EXPECTED_PATCH_SHA256="{patch_digest}"', installer)
-        self.assertIn(f'EXPECTED_V1_TO_V2_SHA256="{v1_to_v2_digest}"', installer)
-        self.assertIn(f'EXPECTED_V2_TO_V3_SHA256="{v2_to_v3_digest}"', installer)
+        self.assertIn(
+            f'EXPECTED_BASE_TO_CURRENT_SHA256="{migration_digest}"', installer
+        )
 
-    def test_installer_upgrades_v1_and_v2_trees(self):
+    def test_installer_upgrades_the_published_base_patch(self):
         try:
             installed_version = importlib.metadata.version("sglang")
         except importlib.metadata.PackageNotFoundError:
@@ -255,35 +201,25 @@ class TestSGLangCapturePatch(unittest.TestCase):
 
             # Normalize either a clean or already-patched source installation.
             run_installer("--apply")
-            for source_version, reverse_migrations in (
-                (2, (_V2_TO_V3_PATCH,)),
-                (1, (_V2_TO_V3_PATCH, _V1_TO_V2_PATCH)),
-            ):
-                for migration in reverse_migrations:
-                    subprocess.run(
-                        [
-                            "patch",
-                            "--batch",
-                            "--reverse",
-                            "-p2",
-                            "-d",
-                            str(site_packages),
-                        ],
-                        input=migration.read_bytes(),
-                        check=True,
-                        capture_output=True,
-                    )
+            subprocess.run(
+                [
+                    "patch",
+                    "--batch",
+                    "--reverse",
+                    "-p2",
+                    "-d",
+                    str(site_packages),
+                ],
+                input=_BASE_TO_CURRENT_PATCH.read_bytes(),
+                check=True,
+                capture_output=True,
+            )
 
-                legacy_check = run_installer("--check", check=False)
-                self.assertEqual(legacy_check.returncode, 2)
-                self.assertIn(
-                    f"spec-capture patch v{source_version} is applied",
-                    legacy_check.stderr,
-                )
-                upgraded = run_installer("--apply")
-                self.assertIn(
-                    "applied and verified spec-capture patch", upgraded.stdout
-                )
+            base_check = run_installer("--check", check=False)
+            self.assertEqual(base_check.returncode, 2)
+            self.assertIn("published base spec-capture patch", base_check.stderr)
+            upgraded = run_installer("--apply")
+            self.assertIn("applied and verified spec-capture patch", upgraded.stdout)
 
     def test_remove_exact_uses_force_without_granting_a_read_lease(self):
         module = _load_sink_module()
