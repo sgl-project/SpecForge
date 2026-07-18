@@ -16,8 +16,13 @@ import unittest
 
 import torch
 
+from specforge.runtime.control_plane.controller import DataFlowController
+from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
-from specforge.runtime.data_plane.feature_store import LocalFeatureStore
+from specforge.runtime.data_plane.feature_store import (
+    LocalFeatureStore,
+    drain_feature_store_removals,
+)
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
 
@@ -304,6 +309,140 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         res = fs.gc()  # now the remove succeeds
         self.assertEqual(res["force_freed"], 1)
         self.assertEqual(fs.health()["release_pending"], 0)
+
+    def test_lifecycle_drain_retries_with_injected_sleep(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        fake.fail_remove = True
+        fs.abort("s0")
+        self.assertEqual(fs.health()["release_pending"], 1)
+
+        sleeps = []
+
+        def release_remote_lease(interval):
+            sleeps.append(interval)
+            fake.fail_remove = False
+
+        report = drain_feature_store_removals(
+            fs,
+            max_attempts=2,
+            retry_interval_s=0.125,
+            sleep=release_remote_lease,
+        )
+        self.assertEqual(sleeps, [0.125])
+        self.assertEqual(report["attempts"], 2)
+        self.assertEqual(report["release_pending"], 0)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertEqual(fs.health()["force_freed_total"], 1)
+        self.assertFalse(_phys_resident(fake))
+
+    def test_lifecycle_drain_does_not_renew_read_lease_between_retries(self):
+        clock = _FakeClock()
+        lease_ttl = 1.0
+
+        class LeaseFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.lease_until = {}
+                self.exists_calls = 0
+
+            def is_exist(self, key):
+                self.exists_calls += 1
+                self.lease_until[key] = clock() + lease_ttl
+                return super().is_exist(key)
+
+            def remove(self, key):
+                self.remove_calls += 1
+                if clock() < self.lease_until.get(key, 0.0):
+                    return -706
+                self._d.pop(key, None)
+                return 0
+
+        fake = LeaseFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+        fs.release(handle)
+        self.assertEqual(fs.health()["release_pending"], 1)
+        # get() and release-time failure each probe once. Drain retries must not
+        # probe again, or each probe would move lease_until forward forever.
+        expected_probes = 2 * len(ref.feature_keys)
+        self.assertEqual(fake.exists_calls, expected_probes)
+
+        report = drain_feature_store_removals(
+            fs,
+            max_attempts=6,
+            retry_interval_s=0.25,
+            sleep=clock.advance,
+        )
+
+        self.assertEqual(report["attempts"], 5)
+        self.assertEqual(fake.exists_calls, expected_probes)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertEqual(fs.health()["force_freed_total"], 1)
+        self.assertFalse(_phys_resident(fake))
+
+    def test_lifecycle_drain_is_bounded_and_never_hides_remote_leak(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0", max_release_attempts=1)
+        fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        fake.fail_remove = True
+        fs.abort("s0")
+
+        # Steady-state gc exhausts its window but must retain the key metadata;
+        # otherwise finalization would falsely report a clean shutdown.
+        fs.gc()
+        fs.gc()
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertEqual(fs.health()["resident_samples"], 1)
+
+        with self.assertRaisesRegex(RuntimeError, "could not drain 1 pending"):
+            drain_feature_store_removals(
+                fs,
+                max_attempts=2,
+                retry_interval_s=0.0,
+                sleep=lambda _interval: self.fail("zero interval must not sleep"),
+            )
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertEqual(fs.health()["force_freed_total"], 0)
+        self.assertTrue(_phys_resident(fake))
+
+    def test_restart_authority_adopts_acked_remote_ref_before_removing(self):
+        fake = _FakeMooncakeStore()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = producer.put(_tensors(), sample_id="remote-rank-1", metadata=_meta())
+        ledger = InMemoryMetadataStore()
+        original = DataFlowController("run0", metadata_store=ledger)
+        original.commit_samples("distributor", [ref])
+        original.ack_train_refs(
+            "trainer", [ref.sample_id], global_step=4, optimizer_durable=True
+        )
+
+        # This new authority has never put/get/adopted the remote rank's sample.
+        # Reconciliation must recover its key metadata from the committed ref;
+        # abort(sample_id) alone would otherwise be a false-success no-op.
+        restarted_store = MooncakeFeatureStore(store=fake, store_id="run0")
+        self.assertEqual(restarted_store.health()["resident_samples"], 0)
+        fake.fail_remove = True
+        restarted = DataFlowController("run0", metadata_store=ledger)
+        report = restarted.reconcile_on_restart(restarted_store)
+
+        self.assertEqual(report["released"], ["remote-rank-1"])
+        self.assertEqual(report["requeued"], [])
+        self.assertTrue(_phys_resident(fake, sid="remote-rank-1"))
+        self.assertEqual(restarted_store.health()["release_pending"], 1)
+
+        # The online-resume builder invokes this lifecycle gate immediately
+        # after reconciliation; emulate the lease expiring between attempts.
+        drain_feature_store_removals(
+            restarted_store,
+            max_attempts=2,
+            retry_interval_s=0.01,
+            sleep=lambda _interval: setattr(fake, "fail_remove", False),
+        )
+        self.assertFalse(_phys_resident(fake, sid="remote-rank-1"))
+        self.assertEqual(restarted_store.health()["resident_samples"], 0)
 
     def test_equivalence_with_local_feature_store(self):
         src = _tensors()
