@@ -17,14 +17,13 @@ The checked-in recipes are:
 | Online EAGLE3 | `examples/configs/qwen3-8b-eagle3-disaggregated.yaml` |
 | Online P-EAGLE | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` |
 | Online DFlash | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` |
-| Managed-local one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
+| Online one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
 | Online Domino | `examples/configs/qwen3-8b-domino-disaggregated.yaml` |
-| Managed-local one-server + DP7 Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml` |
-| Managed-local two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
+| Online two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
 | Online DSpark | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` |
 | Online Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-disaggregated.yaml` |
-| Managed-local one-server + DP2 Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
-| Managed-local two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
+| Online one-server + DP2 Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
+| Online two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
 | Offline EAGLE3 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` |
 | Offline Qwen2.5-7B EAGLE3 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` |
 
