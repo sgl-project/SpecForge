@@ -25,8 +25,8 @@ a reachable/spawnable ``mooncake_master``; opt in locally with
 
 import importlib.util
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
