@@ -14,6 +14,7 @@ zero-copy ``MooncakeFeatureStore.get``. The real-server end-to-end lives in
 """
 
 import ctypes
+import dataclasses
 import os
 import tempfile
 import unittest
@@ -694,6 +695,29 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertEqual(0, store.discard_external_attempts())
         self.assertTrue(all("/g1/" in key for key in backend._d))
         self.assertFalse(any("/g2/" in key for key in backend._d))
+
+    def test_windowed_recapture_uses_the_registry_generation(self):
+        backend, server, store, adapter = _mk()
+        requests = []
+        original_post = adapter.post_fn
+
+        def record_request(url, json_body, timeout):
+            requests.append(json_body["spec_capture"][0])
+            return original_post(url, json_body, timeout)
+
+        adapter.post_fn = record_request
+        task = dataclasses.replace(
+            _task(0, 4),
+            attempt=6,
+            metadata={"capture_generation": 7},
+        )
+
+        (ref,) = adapter.produce_refs([task], capture=_eagle3_contract())
+
+        self.assertEqual(ref.metadata["generation"], 7)
+        self.assertEqual(requests[0]["gen"], 7)
+        self.assertTrue(requests[0]["replace"])
+        self.assertTrue(all("/g7/" in key for key in backend._d))
 
     def test_terminal_lost_response_is_reclaimed_without_a_ref(self):
         backend, server, store, adapter = _mk()

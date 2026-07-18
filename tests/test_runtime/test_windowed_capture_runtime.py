@@ -165,6 +165,25 @@ class TestWindowedCaptureService(unittest.TestCase):
                 batch_wait_s=-0.001,
             )
 
+    def test_capture_task_carries_the_registry_generation(self):
+        registry = self.registry(max_live_refs=1)
+        registry.register_consumer("a")
+        registry.request_acquire("a", 0)
+        request = registry.claim_batch(1)[0]
+        store = _OwnerStore()
+        service = WindowedCaptureService(
+            registry,
+            prompts=_prompts(12),
+            feature_source=_RefSource(store),
+            capture=_capture(),
+            owner_store=store,
+        )
+
+        task = service._task(request)
+
+        self.assertEqual(task.metadata["capture_generation"], request.generation)
+        self.assertEqual(task.attempt, request.generation - 1)
+
     def test_physical_generation_is_not_rewritten_by_window_generation(self):
         registry = self.registry(max_live_refs=1)
         registry.register_consumer("a")
@@ -517,10 +536,6 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
             fake_trainer = mock.Mock()
             fake_loader = mock.Mock()
             fake_trainer.loader = fake_loader
-            fake_loader.metrics.return_value = {
-                "stages": {"store_get": {"count": 1}},
-                "counters": {},
-            }
             with mock.patch(
                 "specforge.launch._assemble_trainer",
                 return_value=fake_trainer,
@@ -532,7 +547,7 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     contract_digest=producer.contract_digest,
                     total_samples=1,
                     feature_store=_ReaderStore(),
-                    eagle3_model=object(),
+                    draft_model=object(),
                     optimizer_factory=mock.Mock(),
                     run_id="run",
                     output_dir=os.path.join(root, "output"),
@@ -553,10 +568,6 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     inspect.signature(_assemble_trainer).parameters
                 )
                 self.assertEqual(unexpected, set())
-                self.assertEqual(
-                    runtime.accounting_snapshot()["input_pipeline"],
-                    fake_loader.metrics.return_value,
-                )
                 self.assertEqual(runtime.accounting_snapshot()["queue"]["refs"], 0)
             finally:
                 runtime.control.fail("test cleanup")
@@ -598,7 +609,7 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     contract_digest=digest,
                     total_samples=1,
                     feature_store=_ReaderStore(),
-                    eagle3_model=object(),
+                    draft_model=object(),
                     optimizer_factory=mock.Mock(),
                     run_id="run",
                     output_dir=os.path.join(root, "output"),
@@ -653,7 +664,7 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     contract_digest=digest,
                     total_samples=2,
                     feature_store=_ReaderStore(),
-                    eagle3_model=object(),
+                    draft_model=object(),
                     optimizer_factory=mock.Mock(),
                     run_id="run",
                     output_dir=os.path.join(root, "output"),

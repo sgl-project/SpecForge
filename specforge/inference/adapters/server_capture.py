@@ -223,6 +223,16 @@ class SGLangServerCaptureAdapter:
     def _spec_capture_payload(self, task: PromptTask) -> Dict[str, Any]:
         input_ids = list(task.payload["input_ids"])
         length = len(input_ids)
+        generation = task.metadata.get("capture_generation", 1)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or not 1 <= generation <= 2**31 - 1
+        ):
+            raise ValueError(
+                f"task {task.task_id}: capture_generation must be an integer "
+                "in [1, 2**31 - 1]"
+            )
         features: Dict[str, str] = {}
         if self.schema.aux_feature is not None:
             features["aux"] = self.schema.aux_feature
@@ -265,13 +275,11 @@ class SGLangServerCaptureAdapter:
             "auth_token": self.capture_token,
             "store_id": self.store.store_id,
             "sample_id": self._sample_id(task),
-            # A task id is unique within a run, and retries happen only before
-            # its ref is committed.  Keep the generation stable so a response
-            # lost after the server write cannot strand gN when the retry writes
-            # gN+1.  The server patch replaces these deterministic keys on a
-            # retry (``replace``), bounding the attempt to one namespace.
-            "gen": 1,
-            "replace": int(task.attempt) > 0,
+            # Ordinary response-loss retries keep g1. Windowed recapture supplies
+            # its durable registry generation so a cleaned sample gets a fresh
+            # physical namespace instead of attempting to resurrect g1.
+            "gen": generation,
+            "replace": int(task.attempt) > 0 or generation > 1,
             "features": features,
             "passthrough": passthrough,
         }
@@ -442,7 +450,7 @@ class SGLangServerCaptureAdapter:
             expected_identity = {
                 "sample_id": self._sample_id(task),
                 "store_id": str(self.store.store_id),
-                "gen": 1,
+                "gen": int(request_spec["gen"]),
             }
             expected_features = set(request_spec["features"].values()) | {
                 item["name"] for item in request_spec["passthrough"]

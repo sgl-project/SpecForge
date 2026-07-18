@@ -271,7 +271,14 @@ class WindowedCaptureService:
                 f"capture registry requested unknown source "
                 f"{request.key.source_sample_id!r}"
             ) from exc
-        return dataclasses.replace(prompt, attempt=request.generation)
+        return dataclasses.replace(
+            prompt,
+            attempt=request.generation - 1,
+            metadata={
+                **prompt.metadata,
+                "capture_generation": request.generation,
+            },
+        )
 
     def _fail_requests(
         self,
