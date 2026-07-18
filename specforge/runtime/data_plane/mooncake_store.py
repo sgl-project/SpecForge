@@ -70,7 +70,10 @@ import torch
 from specforge.runtime.contracts import SCHEMA_VERSION, FeatureHandle, SampleRef
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
 from specforge.runtime.data_plane.feature_store import FeatureStore, spec_from_tensor
-from specforge.runtime.data_plane.mooncake_lifecycle import SQLiteMooncakeLifecycleIndex
+from specforge.runtime.data_plane.mooncake_lifecycle import (
+    LifecycleRecord,
+    SQLiteMooncakeLifecycleIndex,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +259,7 @@ class MooncakeFeatureStore(FeatureStore):
         # steady-state retries; lifecycle drain either removes them or raises.
         self._release_pending: Dict[str, int] = {}
         self._external_release_pending: Dict[Tuple[str, int], int] = {}
+        self._external_release_records: Dict[Tuple[str, int], LifecycleRecord] = {}
         self._force_release_pending: set[str] = set()
         self._external_force_release_pending: set[Tuple[str, int]] = set()
         # Fan-out reclaim is correctness-critical: unlike legacy best-effort
@@ -325,6 +329,17 @@ class MooncakeFeatureStore(FeatureStore):
                     "superseded-generation",
                 )
             self._external_release_pending.setdefault(identity, 0)
+
+    def _external_records_locked(self) -> Dict[Tuple[str, int], LifecycleRecord]:
+        records = dict(self._external_release_records)
+        if self._lifecycle is not None:
+            records.update(
+                {
+                    (record.sample_id, record.generation): record
+                    for record in self._lifecycle.pending()
+                }
+            )
+        return records
 
     def _require_lifetime_owner(self, operation: str) -> None:
         if not self.lifetime_owner:
@@ -476,8 +491,40 @@ class MooncakeFeatureStore(FeatureStore):
         if self._zero_copy:
             # One hard-pinned object per tensor, DMA'd straight from its storage.
             # staged keeps the source tensors alive across the synchronous puts.
-            for name, t in staged.items():
-                self._store_put_tensor(self._tkey(sample_id, gen, name), t)
+            attempted: List[str] = []
+            try:
+                for name, t in staged.items():
+                    attempted.append(name)
+                    self._store_put_tensor(self._tkey(sample_id, gen, name), t)
+            except BaseException as error:
+                leaked = [
+                    name
+                    for name in attempted
+                    if not self._store_remove(
+                        self._tkey(sample_id, gen, name), force=False
+                    )
+                ]
+                identity = (sample_id, gen)
+                if self._lifecycle is not None:
+                    self._lifecycle.tombstone(sample_id, gen, "partial-put-failure")
+                    if not leaked:
+                        self._lifecycle.mark_cleaned(sample_id, gen)
+                if leaked:
+                    record = LifecycleRecord(
+                        sample_id=sample_id,
+                        generation=gen,
+                        feature_names=tuple(leaked),
+                        estimated_bytes=sum(_nbytes(staged[name]) for name in leaked),
+                        state="tombstoned",
+                    )
+                    with self._lock:
+                        self._external_release_records[identity] = record
+                        self._external_release_pending.setdefault(identity, 0)
+                    error.add_note(
+                        "partial Mooncake put cleanup is pending for "
+                        f"{sample_id!r} generation {gen}: {leaked}"
+                    )
+                raise
             # Overwrite-safe: drop the prior generation's tensor keys so a stale
             # ref's keys are gone (its get() then raises -> no use-after-free).
             if prior_gen is not None and prior_gen != gen:
@@ -567,6 +614,29 @@ class MooncakeFeatureStore(FeatureStore):
             inventory = self._lifecycle.record(sample_ref.sample_id, gen)
             if inventory is not None:
                 sample_bytes = inventory.estimated_bytes
+        if sample_bytes == 0 and feature_names:
+            sizes: List[int] = []
+            for name in feature_names:
+                try:
+                    size = int(
+                        self._store.get_size(
+                            self._tkey(sample_ref.sample_id, gen, name)
+                        )
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    sizes = []
+                    break
+                if size < 0:
+                    sizes = []
+                    break
+                sizes.append(size)
+            if sizes:
+                sample_bytes = sum(sizes)
+        if sample_bytes == 0 and self.max_resident_bytes is not None:
+            raise ValueError(
+                f"cannot adopt {sample_ref.sample_id}: payload size is unknown "
+                "while max_resident_bytes is enforced"
+            )
         with self._lock:
             if sample_ref.sample_id in self._release_pending:
                 raise RuntimeError(
@@ -1025,6 +1095,7 @@ class MooncakeFeatureStore(FeatureStore):
                     self._lifecycle.mark_cleaned(record.sample_id, record.generation)
                     self._external_release_pending.pop(identity, None)
                     self._external_force_release_pending.discard(identity)
+                    self._external_release_records.pop(identity, None)
                 else:
                     self._external_release_pending.setdefault(identity, 0)
                     if force:
@@ -1057,8 +1128,10 @@ class MooncakeFeatureStore(FeatureStore):
         for attempt in range(max_attempts):
             attempts_run = attempt + 1
             with self._lock:
+                self._sync_lifecycle_pending_locked()
                 pending = list(self._release_pending)
-                if not pending:
+                external_pending = list(self._external_release_pending)
+                if not pending and not external_pending:
                     return {
                         "removed": removed,
                         "removed_bytes": removed_bytes,
@@ -1091,8 +1164,45 @@ class MooncakeFeatureStore(FeatureStore):
                             self.max_release_attempts,
                             self._release_pending.get(sample_id, 0) + 1,
                         )
-                remaining = list(self._release_pending)
-            if not remaining:
+                records = self._external_records_locked()
+                for identity in external_pending:
+                    record = records.get(identity)
+                    if record is None:
+                        self._external_release_pending.pop(identity, None)
+                        self._external_force_release_pending.discard(identity)
+                        self._external_release_records.pop(identity, None)
+                        continue
+                    label = f"{record.sample_id}:g{record.generation}"
+                    try:
+                        physically_removed = self._try_physical_free_record(
+                            record,
+                            force=identity in self._external_force_release_pending,
+                        )
+                    except Exception as exc:
+                        last_errors[label] = f"{type(exc).__name__}: {exc}"
+                        physically_removed = False
+                    if physically_removed:
+                        if self._lifecycle is not None:
+                            lifecycle_record = self._lifecycle.record(*identity)
+                            if lifecycle_record is not None:
+                                self._lifecycle.mark_cleaned(*identity)
+                        self._external_release_pending.pop(identity, None)
+                        self._external_force_release_pending.discard(identity)
+                        self._external_release_records.pop(identity, None)
+                        removed += 1
+                        removed_bytes += record.estimated_bytes
+                        self._stats["force_freed"] += 1
+                        self._stats["force_freed_bytes"] += record.estimated_bytes
+                        last_errors.pop(label, None)
+                    else:
+                        self._external_release_pending[identity] = min(
+                            self.max_release_attempts,
+                            self._external_release_pending.get(identity, 0) + 1,
+                        )
+                remaining_count = len(self._release_pending) + len(
+                    self._external_release_pending
+                )
+            if not remaining_count:
                 return {
                     "removed": removed,
                     "removed_bytes": removed_bytes,
@@ -1104,6 +1214,10 @@ class MooncakeFeatureStore(FeatureStore):
 
         with self._lock:
             remaining = list(self._release_pending)
+            remaining.extend(
+                f"{sample_id}:g{generation}"
+                for sample_id, generation in self._external_release_pending
+            )
         preview = remaining[:16]
         detail = f"; last errors={last_errors}" if last_errors else ""
         raise RuntimeError(
@@ -1121,7 +1235,6 @@ class MooncakeFeatureStore(FeatureStore):
             }
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
-        exhausted_required: List[str] = []
         with self._lock:
             self._sync_lifecycle_pending_locked()
             # max-hold sweep: force-free abandoned samples (spare still-leased)
@@ -1160,40 +1273,35 @@ class MooncakeFeatureStore(FeatureStore):
                     freed += 1
                 else:
                     self._release_pending[sid] = attempts
-                    if (
-                        attempts >= self.max_release_attempts
-                        and sid in self._required_reclaims
-                    ):
-                        # A globally-consumed fan-out object must not disappear
-                        # from accounting while it is still remotely resident.
-                        exhausted_required.append(sid)
-            if self._lifecycle is not None:
-                records = {
-                    (record.sample_id, record.generation): record
-                    for record in self._lifecycle.pending()
-                }
-                for identity in list(self._external_release_pending):
-                    record = records.get(identity)
-                    if record is None:
-                        self._external_release_pending.pop(identity, None)
-                        self._external_force_release_pending.discard(identity)
-                        continue
-                    attempts = self._external_release_pending[identity] + 1
-                    if self._try_physical_free_record(
-                        record,
-                        force=identity in self._external_force_release_pending,
-                    ):
+            records = self._external_records_locked()
+            for identity in list(self._external_release_pending):
+                record = records.get(identity)
+                if record is None:
+                    self._external_release_pending.pop(identity, None)
+                    self._external_force_release_pending.discard(identity)
+                    self._external_release_records.pop(identity, None)
+                    continue
+                if (
+                    self._external_release_pending[identity]
+                    >= self.max_release_attempts
+                ):
+                    continue
+                attempts = self._external_release_pending[identity] + 1
+                if self._try_physical_free_record(
+                    record,
+                    force=identity in self._external_force_release_pending,
+                ):
+                    if self._lifecycle is not None:
                         self._lifecycle.mark_cleaned(*identity)
-                        self._external_release_pending.pop(identity, None)
-                        self._external_force_release_pending.discard(identity)
-                        freed += 1
-                        freed_bytes += record.estimated_bytes
-                    else:
-                        self._external_release_pending[identity] = attempts
-                        if attempts >= self.max_release_attempts:
-                            exhausted_required.append(
-                                f"{record.sample_id}:g{record.generation}"
-                            )
+                    self._external_release_pending.pop(identity, None)
+                    self._external_force_release_pending.discard(identity)
+                    self._external_release_records.pop(identity, None)
+                    freed += 1
+                    freed_bytes += record.estimated_bytes
+                else:
+                    self._external_release_pending[identity] = min(
+                        self.max_release_attempts, attempts
+                    )
             self._stats["force_freed"] += freed
             self._stats["force_freed_bytes"] += freed_bytes
             report = {
@@ -1202,12 +1310,6 @@ class MooncakeFeatureStore(FeatureStore):
                 "release_pending": len(self._release_pending)
                 + len(self._external_release_pending),
             }
-        if exhausted_required:
-            raise RuntimeError(
-                "required Mooncake fan-out reclaim exceeded "
-                f"max_release_attempts={self.max_release_attempts} for "
-                f"{sorted(exhausted_required)}; objects remain tracked and retryable"
-            )
         return report
 
     def health(self) -> Dict[str, Any]:

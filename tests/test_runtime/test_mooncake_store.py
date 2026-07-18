@@ -9,6 +9,7 @@ end-to-end test against ``mooncake`` is gated below on the package import.
 """
 
 import ctypes
+import dataclasses
 import importlib.util
 import os
 import tempfile
@@ -276,6 +277,46 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         with self.assertRaises(MemoryError):
             fs.put(_tensors(), sample_id="s0", metadata=_meta())
 
+    def test_adopt_recovers_remote_size_before_enforcing_budget(self):
+        fake = _FakeMooncakeStore()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
+        unknown_size_ref = dataclasses.replace(ref, estimated_bytes=0)
+        owner = MooncakeFeatureStore(
+            store=fake,
+            store_id="run0",
+            max_resident_bytes=ref.estimated_bytes - 1,
+        )
+
+        with self.assertRaises(MemoryError):
+            owner.adopt(unknown_size_ref)
+
+    def test_partial_zero_copy_put_removes_written_keys(self):
+        fake = _FakeMooncakeStore()
+        fake.fail_put_call = 2
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+
+        with self.assertRaises(RuntimeError):
+            fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        self.assertEqual(fake._d, {})
+        self.assertEqual(fs.health()["release_pending"], 0)
+
+    def test_partial_zero_copy_put_tracks_failed_cleanup_until_drain(self):
+        fake = _FakeMooncakeStore()
+        fake.fail_put_call = 2
+        fake.fail_remove = True
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+
+        with self.assertRaises(RuntimeError):
+            fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        self.assertEqual(fs.health()["release_pending"], 1)
+
+        fake.fail_remove = False
+        report = fs.drain_pending_removals(max_attempts=1, retry_interval_s=0)
+        self.assertEqual(report["release_pending"], 0)
+        self.assertEqual(fake._d, {})
+
     def test_gc_force_frees_past_max_hold(self):
         clock = _FakeClock()
         fs = _store(max_hold_age_s=10.0, clock=clock)
@@ -407,6 +448,50 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fs.health()["release_pending"], 1)
         self.assertEqual(fs.health()["force_freed_total"], 0)
         self.assertTrue(_phys_resident(fake))
+
+    def test_drain_includes_superseded_generation_removals(self):
+        fake = _FakeMooncakeStore()
+        with tempfile.TemporaryDirectory() as tempdir:
+            fs = MooncakeFeatureStore(
+                store=fake,
+                store_id="run0",
+                lifecycle_db_path=os.path.join(tempdir, "lifecycle.db"),
+            )
+            fs.put(_tensors(), sample_id="s0", metadata=_meta())
+            fake.fail_remove = True
+            fs.put(_tensors(), sample_id="s0", metadata=_meta())
+            fs.gc()
+            self.assertEqual(fs.health()["release_pending"], 1)
+
+            fake.fail_remove = False
+            report = fs.drain_pending_removals(max_attempts=1, retry_interval_s=0)
+
+        self.assertEqual(report["release_pending"], 0)
+        self.assertFalse(any("/g1/" in key for key in fake._d))
+        self.assertTrue(any("/g2/" in key for key in fake._d))
+
+    def test_external_gc_retry_budget_is_capped_and_drain_stays_authoritative(self):
+        fake = _FakeMooncakeStore()
+        with tempfile.TemporaryDirectory() as tempdir:
+            fs = MooncakeFeatureStore(
+                store=fake,
+                store_id="run0",
+                max_release_attempts=1,
+                lifecycle_db_path=os.path.join(tempdir, "lifecycle.db"),
+            )
+            fs.put(_tensors(), sample_id="s0", metadata=_meta())
+            fake.fail_remove = True
+            fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+            for _ in range(5):
+                report = fs.gc()
+                self.assertEqual(report["release_pending"], 1)
+            self.assertEqual(set(fs._external_release_pending.values()), {1})
+            with self.assertRaisesRegex(RuntimeError, "could not drain 1 pending"):
+                fs.drain_pending_removals(
+                    max_attempts=2,
+                    retry_interval_s=0,
+                )
 
     def test_restart_authority_adopts_acked_remote_ref_before_removing(self):
         fake = _FakeMooncakeStore()
@@ -552,7 +637,7 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
         # (which would begin with the PK zip magic or the pickle protocol byte).
         fake = _FakeMooncakeStore()
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
-        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        fs.put(_tensors(), sample_id="s0", metadata=_meta())
         blob = fake._d["run0/s0/g1/hidden_state"]
         self.assertEqual(len(blob), 4 * 8 * 4)  # 4x8 float32, exactly the raw bytes
         self.assertFalse(blob[:2] == b"PK")  # not a torch.save zip archive
@@ -711,9 +796,10 @@ class TestMooncakeDurableLifecycle(unittest.TestCase):
             with self.assertRaises(KeyError):
                 reader.get(ref)
 
-    def test_restarted_owner_cleans_partial_planned_write(self):
+    def test_restarted_owner_retries_partial_write_cleanup(self):
         fake = _FakeMooncakeStore()
         fake.fail_put_call = 2
+        fake.fail_remove = True
         with tempfile.TemporaryDirectory() as workdir:
             lifecycle = os.path.join(workdir, "lifecycle.db")
             original = MooncakeFeatureStore(
@@ -722,9 +808,10 @@ class TestMooncakeDurableLifecycle(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "put_from failed"):
                 original.put(_tensors(), sample_id="s0", metadata=_meta())
 
-            self.assertEqual(original._lifecycle.state("s0", 1), "planned")
+            self.assertEqual(original._lifecycle.state("s0", 1), "tombstoned")
             self.assertTrue(_phys_resident(fake))
             fake.fail_put_call = None
+            fake.fail_remove = False
 
             recovered = MooncakeFeatureStore(
                 store=fake, store_id="run0", lifecycle_db_path=lifecycle
