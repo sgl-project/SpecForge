@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.utils.flop_counter import FlopCounterMode
 from transformers import Qwen3Config
 
-from specforge.core.dflash import OnlineDominoModel
+from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
 H200_BF16_TFLOPS = 989.5  # SXM, dense

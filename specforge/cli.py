@@ -6,217 +6,261 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""The ``specforge`` console entry point.
+"""The single public SpecForge training entry point.
 
 ``specforge train --config run.yaml [section.field=value ...]`` builds the
 validated :class:`~specforge.config.Config`, assembles the models, and runs
 training through the DataFlow launch builders — the same wiring the
 programmatic path uses, behind one typed config.
 
-Run under torchrun for multi-rank:
-    torchrun --standalone --nproc_per_node 8 $(which specforge) train --config run.yaml
+``deployment.trainer`` defines the process topology. The CLI self-launches
+multi-rank workers and recognizes an existing torchrun worker environment
+without nesting another launcher.
 
-v1 drives the ``eagle3`` strategy end-to-end (offline hidden-state features or
-online rollout from pre-tokenized prompts). DFlash/Domino model assembly still
-lives in their dedicated scripts; their strategy configs are accepted but
-rejected here with a pointer.
+Model/data assembly lives in :mod:`specforge.training.assembly`; this module is
+deliberately limited to command parsing and distributed process lifecycle.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-from typing import List, Optional
+import os
+import signal
+import socket
+from contextlib import contextmanager
+from typing import Iterator, List, Optional
 
 from specforge.config import Config, load_config
 
 
-def _load_prompts(path: str) -> List[dict]:
-    """Read pre-tokenized prompts jsonl into PromptTask payloads."""
-    prompts = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            prompts.append(
-                {
-                    "payload": {
-                        "input_ids": record["input_ids"],
-                        "loss_mask": record["loss_mask"],
-                    }
-                }
-            )
-    return prompts
+class _WorkerTermination(BaseException):
+    """Translate a process signal into normal Python stack unwinding."""
+
+    def __init__(self, signum: int):
+        self.signum = signum
 
 
-def _build_eagle3_model(cfg: Config):
-    import torch
+@contextmanager
+def _worker_signal_unwind() -> Iterator[None]:
+    """Make worker termination run training and distributed cleanup blocks.
 
-    from specforge import AutoDraftModelConfig, AutoEagle3DraftModel, OnlineEagle3Model
-
-    draft_config = AutoDraftModelConfig.from_file(cfg.model.draft_model_config)
-    draft_model = AutoEagle3DraftModel.from_config(
-        draft_config,
-        attention_backend=cfg.training.attention_backend,
-        torch_dtype=torch.bfloat16,
-    ).cuda()
-    if cfg.model.vocab_mapping_path:
-        draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
-    if cfg.model.load_target_embedding:
-        draft_model.load_embedding(
-            cfg.model.target_model_path, embedding_key=cfg.model.embedding_key
-        )
-    draft_model.freeze_embedding()
-    return OnlineEagle3Model(
-        draft_model=draft_model,
-        length=cfg.training.ttt_length,
-        attention_backend=cfg.training.attention_backend,
-    ).cuda()
-
-
-def _optimizer_factory(cfg: Config):
-    from specforge.optimizer import BF16Optimizer
-
-    def factory(draft_module):
-        return BF16Optimizer(
-            draft_module,
-            lr=cfg.training.learning_rate,
-            max_grad_norm=cfg.training.max_grad_norm,
-            warmup_ratio=cfg.training.warmup_ratio,
-            total_steps=cfg.training.total_steps or cfg.training.max_steps or 10_000,
-        )
-
-    return factory
-
-
-def build_from_config(cfg: Config):
-    """Assemble ``(trainer, loader, drive_rollout | None)`` from a Config.
-
-    The wiring is exactly the programmatic ``build_offline_runtime`` /
-    ``build_online_runtime`` path — the config only parameterizes it.
+    Managed supervisors terminate worker process groups with SIGTERM.  Python's
+    default SIGTERM action exits immediately, bypassing ``finally`` blocks.  The
+    first managed signal is therefore raised as a ``BaseException``; subsequent
+    signals are ignored while cleanup runs, after which the original handlers
+    are restored.  A supervising parent may still enforce its grace period with
+    SIGKILL if cleanup cannot finish.
     """
-    if cfg.training.strategy != "eagle3":
-        raise NotImplementedError(
-            f"specforge train drives strategy 'eagle3'; for "
-            f"{cfg.training.strategy!r} use its dedicated script "
-            f"(scripts/train_{cfg.training.strategy}.py)"
-        )
+    managed_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        managed_signals.append(signal.SIGHUP)
+    previous_handlers = {}
 
-    t = cfg.training
-    common = dict(
-        strategy=t.strategy,
-        optimizer_factory=_optimizer_factory(cfg),
-        run_id=cfg.run_id,
-        output_dir=cfg.output_dir,
-        ttt_length=t.ttt_length,
-        batch_size=t.batch_size,
-        accumulation_steps=t.accumulation_steps,
-        max_steps=t.max_steps,
-        total_steps=t.total_steps,
-        save_interval=t.save_interval,
-        eval_interval=t.eval_interval,
-        max_checkpoints=t.max_checkpoints,
-        tp_size=t.tp_size,
-        sp_ulysses_size=t.sp_ulysses_size,
-        sp_ring_size=t.sp_ring_size,
-        logger=lambda metrics, step: print(f"step {step}: {metrics}", flush=True),
-        resume_from=t.resume_from,
+    def unwind(signum, _frame):
+        for installed in previous_handlers:
+            signal.signal(installed, signal.SIG_IGN)
+        raise _WorkerTermination(signum)
+
+    try:
+        for signum in managed_signals:
+            try:
+                previous_handlers[signum] = signal.signal(signum, unwind)
+            except ValueError:
+                # Embedded callers may execute the CLI from a non-main thread,
+                # where Python does not permit signal handler installation.
+                for installed, handler in previous_handlers.items():
+                    signal.signal(installed, handler)
+                previous_handlers.clear()
+                break
+        yield
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def _bootstrap_single_process_env() -> None:
+    """Provide ``env://`` rendezvous values for a direct one-GPU invocation."""
+    required = ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT")
+    present = [name for name in required if name in os.environ]
+    if present:
+        missing = [name for name in required if name not in os.environ]
+        if missing:
+            raise ValueError(
+                "distributed environment is incomplete; present="
+                f"{present}, missing={missing}. Launch with torchrun or unset the "
+                "partial distributed variables for a one-process run."
+            )
+        return
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as rendezvous:
+        rendezvous.bind(("127.0.0.1", 0))
+        port = rendezvous.getsockname()[1]
+    os.environ.update(
+        {
+            "RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_RANK": "0",
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+        }
     )
-    eagle3_model = _build_eagle3_model(cfg)
-
-    if cfg.mode == "offline":
-        from specforge.launch import build_offline_runtime
-        from specforge.modeling.target import TargetHead
-
-        target_head = TargetHead.from_pretrained(
-            cfg.model.target_model_path, lm_head_key=cfg.model.lm_head_key
-        )
-        trainer, loader = build_offline_runtime(
-            hidden_states_path=cfg.data.hidden_states_path,
-            eagle3_model=eagle3_model,
-            target_head=target_head,
-            max_len=cfg.data.max_length,
-            num_epochs=t.num_epochs,
-            log_interval=t.log_interval,
-            deployment_mode=t.deployment_mode,
-            metadata_db_path=t.metadata_db_path,
-            **common,
-        )
-        return trainer, loader, None
-
-    import torch as _torch
-    from transformers import AutoConfig
-
-    from specforge.inference.target_engine import get_target_engine
-    from specforge.launch import build_online_runtime
-
-    target = get_target_engine(
-        cfg.model.target_model_path,
-        strategy=t.strategy,
-        backend=cfg.model.target_backend,
-        trust_remote_code=cfg.model.trust_remote_code,
-        torch_dtype=getattr(_torch, cfg.model.torch_dtype),
-        device="cuda",
-    )
-    # The capture contract must be set BEFORE the first rollout: None derives
-    # the backend defaults; explicit ids pin the aux layers.
-    target.set_capture_layers(cfg.model.aux_hidden_state_layer_ids)
-    target_config = AutoConfig.from_pretrained(
-        cfg.model.target_model_path, trust_remote_code=cfg.model.trust_remote_code
-    )
-    trainer, loader, workers, controller, drive_rollout = build_online_runtime(
-        target_model=target,
-        prompts=_load_prompts(cfg.data.prompts_path),
-        eagle3_model=eagle3_model,
-        target_hidden_size=int(target_config.hidden_size),
-        target_vocab_size=int(target_config.vocab_size),
-        target_repr="logits",
-        aux_hidden_state_layer_ids=cfg.model.aux_hidden_state_layer_ids,
-        num_epochs=1,  # online rollout output is a consume-once stream
-        log_interval=t.log_interval,
-        **common,
-    )
-    return trainer, loader, drive_rollout
 
 
-def _train(cfg: Config) -> int:
+def _validate_world_size(cfg: Config, world_size: int) -> None:
+    cfg.validate_world_size(world_size)
+
+
+def _train(resolved) -> int:
     from accelerate.utils import set_seed
+
+    cfg = resolved.config
+    # Make the typed recipe authoritative for the backend's existing FSDP
+    # sharding seam in both direct and managed-local worker processes.
+    os.environ["FSDP_SHARDING"] = cfg.training.fsdp_sharding
+    set_seed(cfg.training.seed)
+    if cfg.training.role == "producer":
+        # A server-capture/offline-ingest producer owns no trainer process
+        # group and must not initialize CUDA merely to publish feature refs.
+        from specforge.application import build_application_run
+
+        return build_application_run(resolved).run()
 
     from specforge.distributed import destroy_distributed, init_distributed
 
-    set_seed(cfg.training.seed)
+    _bootstrap_single_process_env()
+    _validate_world_size(cfg, int(os.environ["WORLD_SIZE"]))
     init_distributed(
+        timeout=cfg.training.dist_timeout,
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
     )
     try:
-        trainer, loader, drive_rollout = build_from_config(cfg)
-        if drive_rollout is not None:
-            produced = drive_rollout()
-            print(f"[online] rollout produced {produced} samples", flush=True)
-        return trainer.fit(loader)
+        import torch.distributed as dist
+
+        _validate_world_size(cfg, dist.get_world_size())
+        from specforge.application import build_application_run
+
+        return build_application_run(resolved).run()
     finally:
         destroy_distributed()
+
+
+def _config_for_role(cfg: Config, role: str) -> Config:
+    """Resolve a launch role without changing the persisted run config.
+
+    A shared disaggregated config may contain trainer-only state used by the
+    consumer child.  The capture-only producer must ignore that state when the
+    launcher derives its role from the shared config.
+    """
+    raw = cfg.model_dump()
+    raw["training"]["role"] = role
+    disaggregated = raw["deployment"].get("disaggregated")
+    if disaggregated is not None and disaggregated.get("managed_local") is not None:
+        # This field describes services owned by the parent supervisor.  A role
+        # child consumes the already-derived environment and must not attempt to
+        # validate or own that stack again.
+        disaggregated["managed_local"] = None
+    if role == "producer":
+        raw["profiling"]["enabled"] = False
+    return Config.model_validate(raw)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="specforge")
     sub = parser.add_subparsers(dest="command", required=True)
     train = sub.add_parser("train", help="train a draft model from a typed config")
-    train.add_argument("--config", required=True, help="YAML or JSON run config")
+    train.add_argument("-c", "--config", required=True, help="YAML or JSON run config")
+    train.add_argument(
+        "--role",
+        choices=("auto", "all", "producer", "consumer", "both"),
+        default="auto",
+        help=(
+            "launch selection (default: offline local all or online/disaggregated "
+            "producer+consumer)"
+        ),
+    )
+    train.add_argument(
+        "--node-rank",
+        type=int,
+        default=None,
+        help="node-local rank for an explicit multi-node trainer launch",
+    )
+    train.add_argument(
+        "--plan",
+        action="store_true",
+        help="print the resolved process plan without starting workers",
+    )
     train.add_argument(
         "overrides",
         nargs="*",
         help="dotted overrides, e.g. training.learning_rate=1e-4",
     )
+    export = sub.add_parser(
+        "export", help="materialize a runtime checkpoint as a model directory"
+    )
+    export.add_argument("--to", choices=("hf", "sglang"), required=True)
+    export.add_argument("--checkpoint", required=True)
+    export.add_argument("--draft-config", required=True)
+    export.add_argument("--output-dir", required=True)
+    export.add_argument("--vocab-mapping", default=None)
+    export.add_argument(
+        "--embedding-source",
+        default=None,
+        help="target model path supplying a frozen embedding for HF export",
+    )
+    export.add_argument("--embedding-key", default="model.embed_tokens.weight")
     args = parser.parse_args(argv)
 
     if args.command == "train":
         cfg = load_config(args.config, args.overrides)
-        _train(cfg)
+        from specforge.application import bind_run, resolve_run
+        from specforge.launch_plan import build_launch_plan, run_commands
+
+        resolved = resolve_run(cfg)
+        plan = build_launch_plan(
+            resolved.config,
+            algorithm=resolved.algorithm,
+            config_path=args.config,
+            overrides=args.overrides,
+            requested_role=args.role,
+            node_rank=args.node_rank,
+        )
+        if args.plan:
+            print(plan.render())
+            return 0
+        if plan.kind == "worker":
+            os.environ.update(plan.worker_env)
+            role_config = _config_for_role(resolved.config, plan.role)
+            try:
+                with _worker_signal_unwind():
+                    _train(bind_run(role_config, resolved.algorithm))
+            except _WorkerTermination as received:
+                return 128 + received.signum
+            return 0
+        return run_commands(plan)
+    elif args.to == "hf":
+        from specforge.export.to_hf import export_to_hf
+
+        export_to_hf(
+            args.checkpoint,
+            args.draft_config,
+            args.output_dir,
+            vocab_mapping_path=args.vocab_mapping,
+            embedding_source=args.embedding_source,
+            embedding_key=args.embedding_key,
+        )
+    else:
+        if args.embedding_source is not None:
+            parser.error("--embedding-source is only valid with --to hf")
+        from specforge.export.to_sglang import export_to_sglang
+
+        export_to_sglang(
+            args.checkpoint,
+            args.draft_config,
+            args.output_dir,
+            vocab_mapping_path=args.vocab_mapping,
+        )
     return 0
 
 

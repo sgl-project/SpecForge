@@ -1,11 +1,11 @@
+import os
 from datetime import timedelta
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
-from specforge.utils import print_with_rank
+from specforge.utils import get_device_type, print_with_rank
 
 _DEVICE_MESH = None
 _TP_DEVICE_MESH = None
@@ -16,6 +16,73 @@ _DRAFT_DP_GROUP = None
 _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
+
+_DISTRIBUTED_BACKENDS = {
+    "cpu": "gloo",
+    "cuda": "nccl",
+    "npu": "hccl",
+}
+
+
+def _distributed_backend(device_type: str) -> str:
+    try:
+        return _DISTRIBUTED_BACKENDS[device_type]
+    except KeyError:
+        raise ValueError(
+            f"unsupported distributed device type {device_type!r}; "
+            f"supported: {sorted(_DISTRIBUTED_BACKENDS)}"
+        ) from None
+
+
+def _device_module(device_type: str):
+    """Return the active accelerator module, importing torch-npu lazily."""
+    if device_type == "npu" and not hasattr(torch, "npu"):
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "SPECFORGE_DEVICE=npu requires a compatible torch-npu package"
+            ) from exc
+    module = getattr(torch, device_type, None)
+    if module is None:
+        raise RuntimeError(
+            f"PyTorch does not expose the requested {device_type!r} device module"
+        )
+    return module
+
+
+def _load_yunchang_globals():
+    """Import sequence-parallel globals only inside trainer initialization."""
+
+    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+
+    return PROCESS_GROUP, set_seq_parallel_pg
+
+
+def _bind_local_device(device_type: str) -> int:
+    """Bind this torchrun rank to one visible CUDA/NPU device."""
+    if device_type == "cpu":
+        return 0
+    module = _device_module(device_type)
+    if not module.is_available():
+        raise RuntimeError(f"requested {device_type!r} accelerator is not available")
+    count = int(module.device_count())
+    if count <= 0:
+        raise RuntimeError(f"requested {device_type!r} accelerator has no devices")
+    if dist.is_initialized():
+        rank_fallback = dist.get_rank() % count
+    else:
+        # ``torchrun`` supplies LOCAL_RANK, while ``mp.spawn``-style launchers
+        # commonly supply only RANK before the default process group exists.
+        rank_fallback = int(os.environ.get("RANK", "0")) % count
+    local_rank = int(os.environ.get("LOCAL_RANK", rank_fallback))
+    if not 0 <= local_rank < count:
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} is outside the {count} visible "
+            f"{device_type} devices"
+        )
+    module.set_device(local_rank)
+    return local_rank
 
 
 def get_tp_group():
@@ -72,10 +139,19 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    print_with_rank(f"bind to device {local_rank}")
+    device_type = get_device_type()
+    backend = _distributed_backend(device_type)
+    # HCCL requires the process to bind its local NPU before process-group
+    # initialization; doing the same for NCCL also removes ambiguous rank/device
+    # inference on heterogeneous hosts.
+    local_rank = _bind_local_device(device_type)
+    # Yunchang probes the active CUDA device while importing. Keep it behind
+    # the trainer-only, device-bound initialization boundary so config loading
+    # and prompt preprocessing remain safe in CPU-only producer processes.
+    process_group, set_seq_parallel_pg = _load_yunchang_globals()
+
+    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
+    print_with_rank(f"bind to {device_type} device {local_rank}")
 
     world_size = dist.get_world_size()
     dp_size = world_size // tp_size
@@ -84,7 +160,7 @@ def init_distributed(
     ), f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
 
     device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+        device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
 
     assert (
@@ -93,7 +169,7 @@ def init_distributed(
 
     draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
     draft_device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda",
+        device_type,
         (draft_dp_size, sp_ulysses_size * sp_ring_size),
         mesh_dim_names=("draft_dp", "sp"),
     )
@@ -103,10 +179,10 @@ def init_distributed(
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
 
-    sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
-    sp_ring_group = PROCESS_GROUP.RING_PG
+    sp_ulysses_group = process_group.ULYSSES_PG
+    sp_ring_group = process_group.RING_PG
     # we need to create a 1D submesh
-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
+    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
     global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
@@ -117,11 +193,13 @@ def init_distributed(
     _DP_GROUP = dp_group
     _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
     _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _DEVICE_MESH, _TP_DEVICE_MESH, _TP_GROUP
+    global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _SP_ULYSSES_GROUP, _SP_RING_GROUP
     # Teardown must never crash the process. Several handles can alias the same
     # underlying group (e.g. DP and draft-DP when there is no sequence
     # parallelism), and degenerate single-rank SP groups (created when
@@ -149,7 +227,23 @@ def destroy_distributed():
     # The all-ranks DP group may alias the default group, in which case
     # destroying it above already tore the default group down.
     if dist.is_initialized():
-        dist.destroy_process_group()
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+    # Process-group and DeviceMesh objects are invalid after teardown. Keeping
+    # them reachable makes a later single-process load look initialized while
+    # collectives fail against stale handles.
+    _DEVICE_MESH = None
+    _TP_DEVICE_MESH = None
+    _TP_GROUP = None
+    _DP_DEVICE_MESH = None
+    _DP_GROUP = None
+    _DRAFT_DP_GROUP = None
+    _DRAFT_SP_GROUP = None
+    _SP_ULYSSES_GROUP = None
+    _SP_RING_GROUP = None
 
 
 def shard_tensor(

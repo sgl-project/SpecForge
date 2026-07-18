@@ -1,28 +1,18 @@
-# Benchmarking for Speculative Decoding
+# Benchmarking speculative decoding
 
-## Overview
+The repository keeps the model-quality and serving-performance benchmark suite
+under `benchmarks/`. It is independent from training: train and export a draft
+through the unified `specforge` CLI, then benchmark that exported artifact
+against an SGLang server.
 
-We provide a unified script to test the performance of the Speculative Decoding with EAGLE3 algorithm on multiple datasets. You can follow the steps below to run the benchmarks.
+## Run server and benchmarks together
 
-## Run Benchmarks
+From the repository root:
 
-### Launch SGLang and Benchmarker Concurrently
-
-`bench_eagle3.py` can help you launch a SGLang server process and a Benchmarking process concurrently. In this way, you don't have to launch the SGLang server manually, this script will manually handle the SGLang launch under different speculative decoding configurations. Some important arguments are:
-- `--model-path`: the path to the target model.
-- `--speculative-draft-model-path`: the path to the draft model.
-- `--port`: the port to launch the SGLang server.
-- `--trust-remote-code`: trust the remote code.
-- `--mem-fraction-static`: the memory fraction for the static memory.
-- `--tp-size`: the tensor parallelism size.
-- `--attention-backend`: the attention backend.
-- `--config-list`: the list of speculative decoding configuration to test, the format is `<batch-size>,<num-steps>,<topk>,<num-draft-tokens>`.
-- `--benchmark-list`: the list of benchmarks to test, the format is `<benchmark-name>:<num-prompts>:<subset>`.
-
-```shell
-python3 bench_eagle3.py \
+```bash
+python benchmarks/bench_eagle3.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
+    --speculative-draft-model-path /path/to/exported-draft \
     --port 30000 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \
@@ -33,35 +23,65 @@ python3 bench_eagle3.py \
     --dtype bfloat16
 ```
 
-### Launch Benchmarker Independently
+Each `--config-list` entry is
+`batch-size,num-steps,topk,num-draft-tokens`. Benchmark selectors use
+`name[:num-prompts[:subset,...]]`. Available datasets include AIME, C-Eval,
+FinanceQA, GPQA, GSM8K, HumanEval, LiveCodeBench, MATH-500, MBPP, MMLU,
+MMStar, MT-Bench, and SimpleQA.
 
-If you want to launch the SGLang server independently, you can use the following command.
+## Benchmark an existing server
 
-```shell
-# you can launch a server
-python3 -m sglang.launch_server \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
-    --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4 \
-    --mem-fraction-static 0.75 \
-    --cuda-graph-max-bs 1 \
-    --tp 1 \
-    --trust-remote-code \
-    --host 0.0.0.0 \
-    --port 30000 \
-    --dtype bfloat16
-```
-
-Then we can start benchmarking. Note that you should use the same host and port as the one used in the SGLang server. Note that `--skip-launch-server` is required to skip the launch of the SGLang server.
+Start SGLang separately, then add `--skip-launch-server`:
 
 ```bash
-python bench_eagle3.py \
-        --model-path meta-llama/Llama-3.1-8B-Instruct \
-        --port 30000 \
-        --config-list 1,3,1,4 \
-        --benchmark-list mtbench:5 ceval:5:accountant gsm8k:5 humaneval:5 math500:5 mtbench:5 aime:1 \
-        --skip-launch-server
+python benchmarks/bench_eagle3.py \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --port 30000 \
+    --config-list 1,3,1,4 \
+    --benchmark-list mtbench:5 gsm8k:5 humaneval:5 math500:5 \
+    --skip-launch-server
 ```
+
+Results are written as timestamped JSON under `--output-dir`. The standalone
+GPU microbenchmarks `bench_domino_mfu.py`,
+`specforge/benchmarks/benchmark_flex_attention.py`, and
+`specforge/benchmarks/benchmark_loss.py` cover trainer MFU, attention, and loss
+kernel behavior respectively.
+
+HumanEval and MBPP execute model-generated Python while scoring. Run those two
+benchmarks only in an isolated container or devbox with no credentials or
+production data mounted.
+
+## Retained validation artifacts
+
+The repository keeps the existing training-equivalence and convergence plots
+as provenance for the runtime cutover. They are reference results, not a
+substitute for rerunning the benchmark suite on the current commit.
+
+### DataFlow cutover equivalence
+
+These 100-step traces compare the former trainer (`main`) with colocated and
+disaggregated DataFlow execution. Keeping them next to the benchmark suite
+makes the behavioral evidence available after the duplicate trainers are
+removed.
+
+![Qwen2.5-0.5B DFlash legacy, colocated, and disaggregated loss equivalence](../../examples/assets/qwen2.5-0.5b-dflash-vs-main.png)
+
+![Qwen2.5-0.5B EAGLE3 legacy, colocated, and disaggregated loss equivalence](../../examples/assets/qwen2.5-0.5b-eagle3-vs-main.png)
+
+The [Qwen2.5-7B EAGLE3 offline parity record](eagle3-disaggregated-parity.md)
+preserves the corresponding two-node metric comparison and its current
+rank-dispatch command.
+
+### Qwen3.6-27B DFlash training curves
+
+The retained curves cover both the eight-H200 colocated run and the two-GPU
+online-disaggregated producer/consumer run.
+
+The separate [Domino disaggregated performance findings](domino-disaggregated-performance.md)
+preserve the measured one-server + DP7 tuning study, its MFU analysis, and the
+canonical YAML form of the relevant controls.
+
+![Qwen3.6-27B DFlash colocated training loss and draft-token accuracy](../../examples/assets/qwen36-27b-dflash-nemotron-6ep.png)
+
+![Qwen3.6-27B DFlash online-disaggregated training loss and draft-token accuracy](../../examples/disagg/assets/qwen36-27b-dflash-nemotron-disagg.png)

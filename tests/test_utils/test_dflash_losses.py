@@ -1,8 +1,8 @@
 # coding=utf-8
 """Formula-level tests for DFlash/D-PACE/DSpark loss behavior.
 
-The tests load the core wrappers directly with a lightweight draft model stub so
-they can run on CPU without importing the full modeling stack.
+The tests load the algorithm-family models with a lightweight draft model stub
+so they can run on CPU without importing the full modeling stack.
 They still exercise the online wrappers: anchor sampling, draft
 output, and LM head output are made deterministic.
 """
@@ -30,14 +30,17 @@ class _DFlashDraftStub(nn.Module):
 _stub_dflash_draft.DFlashDraftModel = _DFlashDraftStub
 
 _spec = importlib.util.spec_from_file_location(
-    "specforge.core.dflash", REPO / "specforge" / "core" / "dflash.py"
+    "specforge.algorithms.common.dflash_family_model",
+    REPO / "specforge" / "algorithms" / "common" / "dflash_family_model.py",
 )
 _dflash_module = importlib.util.module_from_spec(_spec)
 
 _pkg_specforge = types.ModuleType("specforge")
 _pkg_specforge.__path__ = [str(REPO / "specforge")]
-_pkg_core = types.ModuleType("specforge.core")
-_pkg_core.__path__ = [str(REPO / "specforge" / "core")]
+_pkg_algorithms = types.ModuleType("specforge.algorithms")
+_pkg_algorithms.__path__ = [str(REPO / "specforge" / "algorithms")]
+_pkg_common = types.ModuleType("specforge.algorithms.common")
+_pkg_common.__path__ = [str(REPO / "specforge" / "algorithms" / "common")]
 _pkg_modeling = types.ModuleType("specforge.modeling")
 _pkg_modeling.__path__ = [str(REPO / "specforge" / "modeling")]
 _pkg_draft = types.ModuleType("specforge.modeling.draft")
@@ -47,8 +50,9 @@ with patch.dict(
     sys.modules,
     {
         "specforge": _pkg_specforge,
-        "specforge.core": _pkg_core,
-        "specforge.core.dflash": _dflash_module,
+        "specforge.algorithms": _pkg_algorithms,
+        "specforge.algorithms.common": _pkg_common,
+        "specforge.algorithms.common.dflash_family_model": _dflash_module,
         "specforge.modeling": _pkg_modeling,
         "specforge.modeling.draft": _pkg_draft,
         "specforge.modeling.draft.dflash": _stub_dflash_draft,

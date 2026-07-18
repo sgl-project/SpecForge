@@ -6,8 +6,15 @@ Speculative decoding is an important and powerful technique for speeding up infe
 
 - regularly maintained by the SGLang team: the code is runnable out-of-the-box
 - directly compatible with SGLang: there is no additional efforts for porting to SGLang
-- provide performant training capabilities: we provided online/offline/tensor-parallel/FSDP to suit your needs
+- provide SGLang-server online training and local/disaggregated offline training
+  through one runtime, including consumer DP, offline USP, evaluation,
+  checkpoint selection, and CUDA/ROCm/Ascend portability
 
 ## ✅ SGLang-ready
 
-As SpecForge is built by the SGLang, we ensure that the draft models trained with SpecForge are directly compatible with [SGLang](https://github.com/sgl-project/sglang). This means that no postprocessing or weights conversion is required, providing users with a seamless experience from training to serving. We export our data in the Hugging Face format, so you can load it to other serving frameworks as well if the model is supported by them.
+As SpecForge is built by the SGLang team, draft models trained with SpecForge
+can be exported for [SGLang](https://github.com/sgl-project/sglang) serving.
+Runtime checkpoints retain training state, so materialize a serving directory
+with the shared `specforge export` command. SGLang and Hugging Face export
+targets use the same checkpoint surface; there are no method-specific
+conversion scripts.
