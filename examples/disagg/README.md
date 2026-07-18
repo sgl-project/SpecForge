@@ -110,11 +110,19 @@ specforge train -c \
   examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
 
 specforge train -c \
+  examples/configs/qwen3-8b-dflash-windowed-fanout.yaml
+
+specforge train -c \
   examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
 ```
 
-These recipes preserve the old DFlash and Domino one-server + DP7
-self-contained topologies. The genuine two-server Domino recipe is:
+The first recipe preserves the DFlash one-server + DP7 topology. The windowed
+recipe instead launches one producer on GPU 0 and three independent DFlash
+consumers on GPUs 1-3. They share compatible captures but keep separate cursors,
+windows, trainer state, and hyperparameters. Its block/anchor pairs are 4/64,
+8/128, and 16/256 so the example does not depend on optional compact-loss or
+custom-kernel optimizations. The Domino recipe preserves its
+one-server + DP7 topology. The genuine two-server Domino recipe is:
 
 ```bash
 specforge train -c \

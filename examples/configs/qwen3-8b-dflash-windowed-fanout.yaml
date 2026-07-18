@@ -1,0 +1,98 @@
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dflash.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_attention_backend: flashinfer
+  sglang_mem_fraction_static: 0.5
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-8b_regen.jsonl
+  max_prompts: 48
+  max_length: 3072
+  chat_template: qwen
+  build_dataset_num_proc: 32
+  cache_dir: ./cache
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  max_steps: 24
+  total_steps: 24
+  batch_size: 2
+  accumulation_steps: 1
+  attention_backend: flex_attention
+  max_grad_norm: 1.0
+  save_interval: 0
+  log_interval: 1
+  dist_timeout: 30
+
+tracking:
+  report_to: none
+
+run_id: qwen3-8b-dflash-windowed-fanout
+output_dir: ./outputs/qwen3-8b-dflash-windowed-fanout
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: ./outputs/qwen3-8b-dflash-windowed-fanout/control
+    backend: mooncake
+    client_buffer_size: 1073741824
+    windowed_fanout:
+      window_lookbehind: 2
+      window_lookahead: 16
+      max_prefetch_per_consumer: 8
+      max_outstanding_per_consumer: 8
+      max_live_refs: 48
+      max_live_bytes: 25769803776
+      capture_reservation_bytes: 536870912
+      capture_max_sample_bytes: 536870912
+      capture_batch_size: 8
+      consumer_prefetch_batches: 1
+      consumers:
+        - consumer_id: dflash-b4
+          seed: 42
+          loss_type: dflash
+          loss_decay_gamma: 7.0
+          dpace_alpha: 0.5
+          draft_block_size: 4
+          num_anchors: 64
+          learning_rate: 0.0006
+          warmup_ratio: 0.04
+        - consumer_id: dflash-b8
+          seed: 43
+          loss_type: dflash
+          loss_decay_gamma: 7.0
+          dpace_alpha: 0.5
+          draft_block_size: 8
+          num_anchors: 128
+          learning_rate: 0.0006
+          warmup_ratio: 0.04
+        - consumer_id: dflash-b16
+          seed: 44
+          loss_type: dflash
+          loss_decay_gamma: 7.0
+          dpace_alpha: 0.5
+          draft_block_size: 16
+          num_anchors: 256
+          learning_rate: 0.0006
+          warmup_ratio: 0.04
+    managed_local:
+      trainer_cuda_visible_devices: ["1", "2", "3"]
+      shutdown_grace_s: 120
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 1073741824
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5

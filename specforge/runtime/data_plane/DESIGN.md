@@ -14,6 +14,8 @@ See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the complete topology.
 - Offline refs are fixed and re-iterable. Online refs are consume-once and are
   never replayed as a second consumer epoch; resume rebuilds or reconciles only
   the untrained suffix.
+- Independent fanout keeps one fixed source-index inventory, bounds both live
+  refs and live bytes, and never requires consumers to advance in lockstep.
 
 ## Topology map
 
@@ -150,6 +152,35 @@ feature-store client. A second cleanup-error collective completes before each
 private inbox advances its exact acknowledged prefix. This ordering keeps
 producer backpressure and restart accounting aligned with durable optimizer
 progress.
+
+### Windowed independent consumers
+
+The original `windowed_capture` import is a compatibility facade over three
+ownership-focused modules:
+
+- `windowed_capture_contracts.py` defines capture keys, requests, leases,
+  failures, and the canonical contract digest;
+- `windowed_capture_registry.py` owns all SQLite transactions, generations,
+  consumer cursors, interest accounting, reservations, and reclamation;
+- `windowed_capture_queue.py` adapts one consumer cursor to the loader queue
+  protocol.
+
+`windowed_capture_runtime.py` adds producer batching/retry and consumer
+heartbeat control. A consumer registers before model loading so producer
+startup does not mistake long CUDA/model initialization for a missing worker.
+Its queue acquires refs in source order and advances the registry cursor only
+after the optimizer-durable ACK reaches the queue.
+
+The registry distinguishes soft window interest from hard demand/read interest.
+It can evict a ready entry used only for lookahead, but cannot evict an acquired
+lease. Capture slots and bytes are reserved in the same transaction that claims
+work. A failed or reclaimed attempt fences its generation, so a delayed capture
+completion cannot publish stale payload metadata.
+
+The producer is the Mooncake lifetime owner and drains every retained object on
+success, failure, or signal unwind. Consumers create non-owner store clients and
+may finish or fail independently; the registry removes only that consumer's
+waiters, leases, and window interests.
 
 ## Attempt lifecycle
 
