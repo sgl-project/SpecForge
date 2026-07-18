@@ -76,9 +76,7 @@ class MaterializingRefSource:
     def _sample_id(self, task: PromptTask) -> str:
         return f"{self.run_id}:{task.task_id}"
 
-    def _put_metadata(
-        self, task: PromptTask, capture: CaptureConfig
-    ) -> Dict[str, Any]:
+    def _put_metadata(self, task: PromptTask, capture: CaptureConfig) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
             "source_task_id": task.task_id,

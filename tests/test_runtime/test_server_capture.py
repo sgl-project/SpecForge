@@ -578,9 +578,9 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
         def corrupt_first_row(url, json_body, timeout):
             rows = server(url, json_body, timeout)
-            rows[0]["meta_info"]["spec_capture"]["features"][
-                "hidden_state"
-            ].pop("shape")
+            rows[0]["meta_info"]["spec_capture"]["features"]["hidden_state"].pop(
+                "shape"
+            )
             return rows
 
         _, _, _, adapter = _mk(server=corrupt_first_row, backend=backend)
@@ -594,9 +594,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
     def test_health_reports_rpc_batch_profile(self):
         _, _, _, adapter = _mk(algorithm="dflash")
-        adapter.produce_refs(
-            [_task(0, 4), _task(1, 5)], capture=_dflash_contract()
-        )
+        adapter.produce_refs([_task(0, 4), _task(1, 5)], capture=_dflash_contract())
         health = adapter.health()
         self.assertEqual(health["rpc_calls"], 1)
         self.assertEqual(health["rpc_tasks"], 2)

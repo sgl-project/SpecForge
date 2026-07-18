@@ -151,9 +151,7 @@ class TestMaterializingRefSource(unittest.TestCase):
 
         results = source.produce_refs([_task(0), _task(1)], capture=_capture())
 
-        self.assertEqual(
-            [result.task_id for result in results], ["task-0", "task-1"]
-        )
+        self.assertEqual([result.task_id for result in results], ["task-0", "task-1"])
         self.assertTrue(all(not result.retryable for result in results))
         self.assertTrue(
             all(

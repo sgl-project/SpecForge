@@ -59,12 +59,8 @@ class TestDisaggregatedStore(unittest.TestCase):
         self.assertEqual(out["x"].sum().item(), 4.0)  # ones(1,4) intact
 
     def test_fanout_reader_release_defers_free_to_lifetime_owner(self):
-        producer = SharedDirFeatureStore(
-            self.root, store_id="st", lifetime_owner=True
-        )
-        reader = SharedDirFeatureStore(
-            self.root, store_id="st", lifetime_owner=False
-        )
+        producer = SharedDirFeatureStore(self.root, store_id="st", lifetime_owner=True)
+        reader = SharedDirFeatureStore(self.root, store_id="st", lifetime_owner=False)
         ref = producer.put({"x": torch.ones(1, 4)}, sample_id="s0", metadata={})
 
         out, handle = reader.get(ref)

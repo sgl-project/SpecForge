@@ -49,9 +49,7 @@ class TestDFlashFlexKernelOptions(unittest.TestCase):
 
     def test_forwards_options_to_flex_attention(self):
         options = {"num_stages": 2}
-        model, draft = self._model(
-            attention_backend="flex_attention", options=options
-        )
+        model, draft = self._model(attention_backend="flex_attention", options=options)
         with patch.object(
             _dflash_module, "create_dflash_block_mask", return_value=object()
         ):

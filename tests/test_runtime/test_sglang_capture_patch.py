@@ -472,9 +472,7 @@ class TestSGLangCapturePatch(unittest.TestCase):
                     if remove_calls == crash_after:
                         raise RuntimeError("injected replacement crash")
 
-                interrupted._put_tensor = (
-                    lambda key, tensor, **_kwargs: keys.add(key)
-                )
+                interrupted._put_tensor = lambda key, tensor, **_kwargs: keys.add(key)
                 interrupted._remove_exact = crash_during_remove
                 with self.assertRaisesRegex(RuntimeError, "replacement crash"):
                     interrupted.put_sample(

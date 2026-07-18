@@ -46,10 +46,7 @@ from typing import (
 )
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
-from specforge.runtime.data_plane.ref_serialization import (
-    ref_from_dict,
-    ref_to_dict,
-)
+from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
 
 if TYPE_CHECKING:
     from specforge.runtime.data_plane.feature_store import FeatureStore

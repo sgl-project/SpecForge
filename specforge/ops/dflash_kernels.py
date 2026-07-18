@@ -17,8 +17,7 @@ def _load_liger_draft_forwards() -> tuple[Callable, Callable]:
         installed_version = version("liger-kernel")
     except PackageNotFoundError as exc:
         raise RuntimeError(
-            "draft_kernel_backend='liger' requires "
-            "`pip install 'specforge[liger]'`"
+            "draft_kernel_backend='liger' requires " "`pip install 'specforge[liger]'`"
         ) from exc
     if installed_version != _LIGER_VERSION:
         raise RuntimeError(

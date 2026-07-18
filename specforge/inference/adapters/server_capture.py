@@ -510,9 +510,7 @@ class SGLangServerCaptureAdapter:
                 recorded_aux_layer_ids = self._aux_layer_ids_from_result(result)
             except (KeyError, TypeError, ValueError) as exc:
                 out.append(
-                    reject(
-                        f"malformed feature metadata: {exc}", retryable=False
-                    )
+                    reject(f"malformed feature metadata: {exc}", retryable=False)
                 )
                 continue
             # A capture shorter than the prompt is corrupt (classic cause: a
@@ -555,9 +553,7 @@ class SGLangServerCaptureAdapter:
             except CaptureMismatchError as exc:
                 # Loud boundary failure; free the server-written keys so a
                 # mismatched sample is never consumable.
-                out.append(
-                    reject(f"capture contract mismatch: {exc}", retryable=False)
-                )
+                out.append(reject(f"capture contract mismatch: {exc}", retryable=False))
                 continue
             # Do not transfer a successful row out of provisional ownership
             # until every row in the response has passed structural and

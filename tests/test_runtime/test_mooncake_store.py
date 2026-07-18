@@ -676,9 +676,7 @@ class TestMooncakeDurableLifecycle(unittest.TestCase):
             first_ref = owner.put(_tensors(), sample_id="s0", metadata=_meta())
             owner.reclaim(first_ref)
             for index in range(1, 50):
-                ref = owner.put(
-                    _tensors(), sample_id=f"s{index}", metadata=_meta()
-                )
+                ref = owner.put(_tensors(), sample_id=f"s{index}", metadata=_meta())
                 owner.reclaim(ref)
 
             self.assertEqual(owner.health()["local_tombstones"], 0)
