@@ -132,7 +132,9 @@ def main():
     logger = lambda m, s: print(f"step {s}: {m}", flush=True)
 
     if online:
-        from specforge.runtime.launch import build_online_eagle3_runtime
+        # `strategy=` selects the draft model (here eagle3); the runtime resolves
+        # its StrategySpec. The topology is the builder; the model is a parameter.
+        from specforge.launch import build_online_runtime
 
         # Online target produces features in-loop (any backend exposing
         # generate_eagle3_data — HF or SGLang). is_online=True returns the model.
@@ -143,37 +145,37 @@ def main():
 
         # num_epochs=1: the rollout output is a consume-once stream. Multi-epoch
         # online (re-rollout each epoch) is a follow-up; one rollout pass here.
-        trainer, loader, workers, controller, drive_rollout = (
-            build_online_eagle3_runtime(
-                target_model=target_model,
-                prompts=prompts,
-                eagle3_model=eagle3_model,
-                optimizer_factory=optimizer_factory,
-                run_id="eagle3-online",
-                output_dir=args.output_dir,
-                target_hidden_size=hidden_size,
-                target_vocab_size=vocab_size,
-                target_repr="logits",
-                ttt_length=args.ttt_length,
-                batch_size=args.target_batch_size,
-                accumulation_steps=args.draft_accumulation_steps,
-                num_epochs=1,
-                max_steps=args.max_num_steps,
-                save_interval=args.save_interval,
-                tp_size=args.tp_size,
-                sp_ulysses_size=args.sp_ulysses_size,
-                sp_ring_size=args.sp_ring_size,
-                logger=logger,
-            )
+        trainer, loader, workers, controller, drive_rollout = build_online_runtime(
+            strategy="eagle3",
+            target_model=target_model,
+            prompts=prompts,
+            eagle3_model=eagle3_model,
+            optimizer_factory=optimizer_factory,
+            run_id="eagle3-online",
+            output_dir=args.output_dir,
+            target_hidden_size=hidden_size,
+            target_vocab_size=vocab_size,
+            target_repr="logits",
+            ttt_length=args.ttt_length,
+            batch_size=args.target_batch_size,
+            accumulation_steps=args.draft_accumulation_steps,
+            num_epochs=1,
+            max_steps=args.max_num_steps,
+            save_interval=args.save_interval,
+            tp_size=args.tp_size,
+            sp_ulysses_size=args.sp_ulysses_size,
+            sp_ring_size=args.sp_ring_size,
+            logger=logger,
         )
         produced = drive_rollout()
         print(f"[online] rollout produced {produced} samples", flush=True)
         trainer.fit(loader)
     else:
-        from specforge.runtime.launch import build_offline_eagle3_runtime
+        from specforge.launch import build_offline_runtime
 
         target_head, _ = build_target_model(args, draft_config, is_online=False)
-        trainer, loader = build_offline_eagle3_runtime(
+        trainer, loader = build_offline_runtime(
+            strategy="eagle3",
             hidden_states_path=args.train_hidden_states_path,
             eagle3_model=eagle3_model,
             target_head=target_head,

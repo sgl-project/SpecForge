@@ -864,15 +864,10 @@ def run_backward_and_update(
     ploss.backward()
 
     if global_step % args.draft_accumulation_steps == 0:
-        grad_norm = optimizer.step()
-        if dist.is_initialized():
-            grad_norm = grad_norm.detach().float()
-            if torch.cuda.is_available():
-                grad_norm = grad_norm.to(torch.cuda.current_device())
-            grad_norm = grad_norm.pow(2)
-            dist.all_reduce(grad_norm, op=dist.ReduceOp.SUM)
-            grad_norm = grad_norm.sqrt()
-        return grad_norm
+        # BF16Optimizer computes the distributed pre-clip norm internally so
+        # every shard uses the same clipping coefficient. Reducing it again
+        # here would inflate the reported norm by sqrt(world_size).
+        return optimizer.step()
     return None
 
 

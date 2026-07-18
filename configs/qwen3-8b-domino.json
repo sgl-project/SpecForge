@@ -1,11 +1,12 @@
 {
+  "emb_dim": 256,
   "architectures": [
-    "DFlashDraftModel"
+    "DominoDraftModel"
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,
   "auto_map": {
-    "AutoModel": "dflash.DFlashDraftModel"
+    "AutoModel": "domino.DominoDraftModel"
   },
   "block_size": 16,
   "bos_token_id": 151643,

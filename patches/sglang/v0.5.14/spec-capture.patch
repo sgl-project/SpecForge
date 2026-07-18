@@ -1,0 +1,602 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index a99d25267..f5d0b35e7 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -94,6 +94,9 @@ class LogitsProcessorOutput:
+     # Used by speculative decoding (EAGLE)
+     # The last hidden layers
+     hidden_states: Optional[torch.Tensor] = None
++    # Spec-training capture: under FULL+aux, `hidden_states` is the aux
++    # concatenation, so the post-norm last hidden is exposed here separately.
++    last_hidden_states: Optional[torch.Tensor] = None
+ 
+     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
+     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+@@ -361,6 +364,16 @@ class LogitsProcessor(nn.Module):
+             sample_indices,
+             logits_metadata,
+         )
++        # Spec-training capture: keep the post-norm last hidden (the training
++        # target) alongside the aux concatenation in hidden_states_to_store.
++        last_hidden_states_to_store = (
++            hidden_states
++            if (
++                logits_metadata.capture_hidden_mode.is_full()
++                and aux_hidden_states is not None
++            )
++            else None
++        )
+         del hidden_states
+ 
+         if not logits_metadata.extend_return_logprob:
+@@ -374,6 +387,7 @@ class LogitsProcessor(nn.Module):
+             return LogitsProcessorOutput(
+                 next_token_logits=sampled_logits,
+                 hidden_states=hidden_states_to_store,
++                last_hidden_states=last_hidden_states_to_store,
+                 # FIXME: These fields are not logits-related but are passed through here as a
+                 # workaround since ForwardBatch is local to forward_batch_generation().
+                 # They should be moved to GenerationBatchResult to keep this class clean.
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index b05334dea..2853c8231 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -441,6 +441,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+             output_token_entropy_val=recv_obj.output_token_entropy_val,
+             output_hidden_states=recv_obj.output_hidden_states,
++            spec_capture=recv_obj.spec_capture,
+             routed_experts=routed_experts,
+             indexer_topk=indexer_topk,
+             customized_info=recv_obj.customized_info,
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 951f35495..2359c31b7 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -284,6 +284,10 @@ class GenerateReqInput(BaseReq):
+     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+ 
++    # Spec-training capture sink instructions (see spec_capture_sink.py).
++    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
++    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
++
+     def contains_mm_input(self) -> bool:
+         return (
+             has_valid_data(self.image_data)
+@@ -743,6 +747,11 @@ class GenerateReqInput(BaseReq):
+                 if self.multi_item_delimiter_indices is not None
+                 else None
+             ),
++            spec_capture=(
++                self.spec_capture[i]
++                if isinstance(self.spec_capture, list)
++                else self.spec_capture
++            ),
+         )
+         cache[i] = sub
+         return sub
+@@ -842,6 +851,9 @@ class TokenizedGenerateReqInput(BaseReq):
+     # Pre-computed delimiter indices for multi-item scoring
+     multi_item_delimiter_indices: Optional[List[int]] = None
+ 
++    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
++    spec_capture: Optional[Dict] = None
++
+     # For observability
+     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+ 
+@@ -1179,6 +1191,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     # The trainer step id. Used to know which step's weights are used for sampling.
+     token_steps: List[List[int]] = None
+ 
++    # Spec-training capture: one result dict per request (see spec_capture_sink).
++    spec_capture: Optional[List[Any]] = None
++
+     # Customized info
+     customized_info: Optional[Dict[str, List[Any]]] = None
+     # Detailed breakdown of cached tokens by source (device/host/storage)
+@@ -1247,6 +1262,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     # The trainer step id. Used to know which step's weights are used for sampling.
+     token_steps: List[List[int]] = None
+ 
++    # Spec-training capture: one result dict per request (see spec_capture_sink).
++    spec_capture: Optional[List[Any]] = None
++
+     # Customized info
+     customized_info: Optional[Dict[str, List[Any]]] = None
+     # Detailed breakdown of cached tokens by source (device/host/storage)
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index f1dc81d17..a93a466b7 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -708,6 +708,7 @@ class Req(ReqDllmMixin):
+         ] = None,
+         return_pooled_hidden_states: bool = False,
+         multi_item_delimiter_indices: Optional[List[int]] = None,
++        spec_capture: Optional[Dict[str, Any]] = None,
+     ):
+         # Input and output info
+         self.rid = rid
+@@ -771,7 +772,13 @@ class Req(ReqDllmMixin):
+             }
+         self.sampling_params = sampling_params
+         self.custom_logit_processor = custom_logit_processor
+-        self.return_hidden_states = return_hidden_states
++        # Spec-training capture: piggyback the return_hidden_states path (fires
++        # CaptureHiddenMode.FULL); the sink consumes the slices, not the response.
++        self.spec_capture = spec_capture
++        self.return_hidden_states = return_hidden_states or spec_capture is not None
++        self.spec_capture_aux: List[torch.Tensor] = []
++        self.spec_capture_last_hidden: List[torch.Tensor] = []
++        self.spec_capture_result = None  # per-request sink result -> output field
+ 
+         # extra key for classifying the request (e.g. cache_salt)
+         if lora_id is not None:
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index abba37441..3018b8247 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -576,6 +576,25 @@ class Scheduler(
+ 
+         self.init_batch_result_processor()
+ 
++        if server_args.enable_spec_capture:
++            # Capture needs single-pass prefill; chunking would drop all but the
++            # final chunk's hidden rows.
++            if server_args.chunked_prefill_size != -1:
++                raise ValueError(
++                    "--enable-spec-capture requires --chunked-prefill-size -1 "
++                    "(single-pass prefill) so captured hidden states cover the "
++                    "whole sequence"
++                )
++            if not server_args.disable_radix_cache:
++                raise ValueError(
++                    "--enable-spec-capture requires --disable-radix-cache: a "
++                    "prefix-cache hit skips prefilling (and capturing) the "
++                    "cached tokens, silently truncating the stored hidden states"
++                )
++            from sglang.srt import spec_capture_sink
++
++            spec_capture_sink.maybe_init_sink(server_args)
++
+         self.is_initializing = False
+ 
+     def init_zbal_on_npu(self):
+@@ -2054,6 +2067,7 @@ class Scheduler(
+                 dllm_config=self.dllm_config,
+                 time_stats=recv_req.time_stats,
+                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
++                spec_capture=recv_req.spec_capture,
+             )
+             req.tokenizer = self.tokenizer
+ 
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index a9d5f0c28..001eff804 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -257,6 +257,18 @@ class SchedulerBatchResultProcessor:
+                         )
+ 
+                     if (
++                        req.spec_capture is not None
++                        and logits_output.hidden_states is not None
++                    ):
++                        # Spec-training capture: keep tensor slices, sink on finish.
++                        hidden_state_offset = self._append_spec_capture_states(
++                            req=req,
++                            logits_output=logits_output,
++                            hidden_state_offset=hidden_state_offset,
++                        )
++                        if req.finished():
++                            self._sink_spec_capture(req)
++                    elif (
+                         req.return_hidden_states
+                         and logits_output.hidden_states is not None
+                     ):
+@@ -462,6 +474,62 @@ class SchedulerBatchResultProcessor:
+                     f"Placeholder zeros would be appended to output_ids."
+                 )
+ 
++    def _append_spec_capture_states(
++        self,
++        *,
++        req: Req,
++        logits_output: LogitsProcessorOutput,
++        hidden_state_offset: int,
++    ) -> int:
++        """Accumulate captured rows as CPU tensors for the Mooncake sink.
++
++        Same offset arithmetic as ``_append_prefill_hidden_states`` but keeps
++        tensor slices (aux concat in ``hidden_states``, post-norm last in
++        ``last_hidden_states``) rather than the JSON-able response payload.
++        """
++        start = hidden_state_offset
++        end = start + len(req.origin_input_ids)
++        req.spec_capture_aux.append(
++            logits_output.hidden_states[start:end].cpu().clone()
++        )
++        if logits_output.last_hidden_states is not None:
++            req.spec_capture_last_hidden.append(
++                logits_output.last_hidden_states[start:end].cpu().clone()
++            )
++        return end
++
++    def _sink_spec_capture(self, req: Req) -> None:
++        """Write a finished capture request's tensors to the Mooncake sink.
++
++        Runs on the attention-TP rank that streams output; the per-request result
++        (or an ``{"error": ...}`` marker) is set on ``req.spec_capture_result``,
++        returned to the client via the dedicated ``spec_capture`` output field
++        (a per-request channel, unlike per-token ``customized_info``).
++        """
++        from sglang.srt import spec_capture_sink
++
++        sink = spec_capture_sink.get_sink()
++        if sink is None or self.output_streamer.ps.attn_tp_rank != 0:
++            return
++        aux = torch.cat(req.spec_capture_aux, dim=0) if req.spec_capture_aux else None
++        last_hidden = (
++            torch.cat(req.spec_capture_last_hidden, dim=0)
++            if req.spec_capture_last_hidden
++            else None
++        )
++        try:
++            req.spec_capture_result = sink.put_sample(
++                req.spec_capture, aux=aux, last_hidden=last_hidden
++            )
++        except Exception as e:
++            logger.error("spec-capture sink failed for %s: %s", req.rid, e)
++            req.spec_capture_result = {
++                "sample_id": req.spec_capture.get("sample_id"),
++                "error": str(e),
++            }
++        req.spec_capture_aux = []
++        req.spec_capture_last_hidden = []
++
+     def _append_prefill_hidden_states(
+         self,
+         *,
+diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+index f95c59f6f..9e64326a1 100644
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -273,6 +273,7 @@ class _GenerationStreamAccumulator:
+     spec_correct_drafts_histogram: list = field(default_factory=list)
+     retraction_counts: list = field(default_factory=list)
+     output_hidden_states: Optional[list] = None
++    spec_capture: list = field(default_factory=list)
+     routed_experts: Optional[list] = None
+     indexer_topk: Optional[list] = None
+     customized_info: dict = field(default_factory=dict)
+@@ -482,6 +483,8 @@ class _GenerationStreamAccumulator:
+                 self.output_hidden_states.append(hs)
+             else:
+                 self.output_hidden_states.append(None)
++        # Per-request spec-capture result (aligned with rids), like the field above.
++        self.spec_capture.append(getattr(req, "spec_capture_result", None))
+         if self.return_routed_experts:
+             self.routed_experts.append(
+                 req.routed_experts if req.return_routed_experts else None
+@@ -540,6 +543,7 @@ class _GenerationStreamAccumulator:
+             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
+             output_token_entropy_val=None,
+             output_hidden_states=self.output_hidden_states,
++            spec_capture=self.spec_capture or None,
+             routed_experts=self.routed_experts,
+             indexer_topk=self.indexer_topk,
+             customized_info=self.customized_info,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index bf932611a..f0e821ec4 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1172,6 +1172,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                 mm_data_mooncake=obj.mm_data_mooncake,
+                 encoder_urls=obj.encoder_urls,
++                spec_capture=obj.spec_capture,
+             )
+         elif isinstance(obj, EmbeddingReqInput):
+             # Resolve unresolved embed overrides now that input_ids are available
+@@ -1922,6 +1923,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 hidden_states = recv_obj.output_hidden_states[i]
+                 if hidden_states is not None:
+                     meta_info["hidden_states"] = hidden_states
++            if getattr(recv_obj, "spec_capture", None):
++                sc = recv_obj.spec_capture[i]
++                if sc is not None:
++                    meta_info["spec_capture"] = sc
+             if getattr(recv_obj, "routed_experts", None):
+                 val = recv_obj.routed_experts[i]
+                 if val is not None:
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 1cff5c983..a5935fa3c 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -471,6 +471,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                     # if there is no aux layer, set to None
+                     self.eagle_aux_hidden_state_layer_ids = None
+ 
++        if server_args.enable_spec_capture and not self.is_draft_worker:
++            # Aux capture without a draft worker, routed to the strategy's own
++            # capture method (they wire different submodules — e.g. VL models
++            # only populate layers_to_capture via the dflash path).
++            if getattr(server_args, "spec_capture_method", "eagle3") == "dflash":
++                self.dflash_use_aux_hidden_state = True
++                self.dflash_target_layer_ids = server_args.spec_capture_aux_layer_ids
++            else:
++                self.eagle_use_aux_hidden_state = True
++                self.eagle_aux_hidden_state_layer_ids = (
++                    server_args.spec_capture_aux_layer_ids
++                )
++
+         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+ 
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index c7162c16d..d515b3c69 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2127,6 +2127,25 @@ class ServerArgs:
+         bool,
+         "Enable returning hidden states with responses.",
+     ] = False
++    enable_spec_capture: A[
++        bool,
++        "Enable server-side speculative-training capture: per-request aux/last "
++        "hidden states are written to a Mooncake store (SpecForge DataFlow "
++        "layout) instead of the response payload. Enables aux-hidden-state "
++        "capture on the target model without a speculative draft worker.",
++    ] = False
++    spec_capture_aux_layer_ids: A[
++        Optional[List[int]],
++        "Target layer ids whose hidden states are captured (concatenated) for "
++        "spec-capture requests. Defaults to the model's EAGLE3 default layers "
++        "(low/mid/high) when unset.",
++    ] = None
++    spec_capture_method: A[
++        str,
++        "Capture method for --enable-spec-capture: 'eagle3' or 'dflash'. Must "
++        "match the draft strategy being trained; they wire capture onto "
++        "different submodules (VL targets only populate the dflash path).",
++    ] = "eagle3"
+     enable_return_routed_experts: A[
+         bool,
+         "Enable returning routed experts of each layer with responses.",
+diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
+new file mode 100644
+index 000000000..d317b2801
+--- /dev/null
++++ b/python/sglang/srt/spec_capture_sink.py
+@@ -0,0 +1,231 @@
++# Copyright 2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++"""Server-side spec-training capture sink (SpecForge DataFlow transport).
++
++Under ``--enable-spec-capture``, a request's ``spec_capture`` dict tells this
++sink to write the prefill's captured tensors straight into a Mooncake store
++(one hard-pinned object per tensor at ``{store_id}/{sample_id}/g{gen}/{name}``,
++raw bytes — shape/dtype travel on the returned spec). Feature tensors never
++touch the response path; ``meta_info["spec_capture"]`` returns only keys +
++shapes/dtypes. Strategy naming is the client's (the ``features`` mapping); the
++server knows only generic artifacts. Self-contained: the scheduler hooks are
++one-liners, every capture decision lives here.
++
++Request schema::
++
++    {"store_id", "sample_id", "gen",           # key namespace / id / staleness
++     "features": {"aux": <name>, "last_hidden": <name>},   # artifact -> feature
++     "passthrough": [{"name", "data", "shape", "dtype"}]}  # client tensors verbatim
++
++Response (``meta_info["spec_capture"]``): ``{"sample_id", "store_id", "gen",
++"aux_layer_ids", "features": {name: {"shape", "dtype"}}}``.
++
++Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
++``MooncakeFeatureStore``).
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import threading
++from typing import Any, Dict, List, Optional
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++# torch dtype -> the FeatureSpec dtype string SpecForge's zero-copy get() maps
++# back to a torch dtype. Keep in sync with MooncakeFeatureStore._TORCH_DTYPES.
++_DTYPE_STR = {
++    torch.float32: "float32",
++    torch.float64: "float64",
++    torch.float16: "float16",
++    torch.bfloat16: "bfloat16",
++    torch.int64: "int64",
++    torch.int32: "int32",
++    torch.int16: "int16",
++    torch.int8: "int8",
++    torch.uint8: "uint8",
++    torch.bool: "bool",
++}
++_STR_DTYPE = {v: k for k, v in _DTYPE_STR.items()}
++
++_ARTIFACT_AUX = "aux"
++_ARTIFACT_LAST_HIDDEN = "last_hidden"
++
++
++class SpecCaptureSink:
++    """Writes captured per-request tensors into Mooncake in SpecForge layout."""
++
++    def __init__(self, aux_layer_ids: Optional[List[int]] = None) -> None:
++        self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else None
++        self._store = None
++        self._put_config = None
++        self._lock = threading.Lock()
++
++    # -- connection ---------------------------------------------------------
++    def _connect(self):
++        if self._store is not None:
++            return self._store
++        with self._lock:
++            if self._store is not None:
++                return self._store
++            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
++
++            store = MooncakeDistributedStore()
++            rc = store.setup(
++                local_hostname=os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
++                metadata_server=os.environ.get(
++                    "MOONCAKE_METADATA_SERVER", "http://localhost:8080/metadata"
++                ),
++                global_segment_size=int(
++                    os.environ.get("MOONCAKE_GLOBAL_SEGMENT_SIZE", 1 << 30)
++                ),
++                local_buffer_size=int(
++                    os.environ.get("MOONCAKE_LOCAL_BUFFER_SIZE", 1 << 30)
++                ),
++                protocol=os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
++                rdma_devices=os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
++                master_server_addr=os.environ.get(
++                    "MOONCAKE_MASTER_SERVER_ADDR", "localhost:50051"
++                ),
++            )
++            if rc is not None and int(rc) != 0:
++                raise RuntimeError(f"spec-capture mooncake setup failed (status {rc})")
++            # Hard-pin every object: SpecForge (not Mooncake's LRU) is the
++            # lifetime authority — a committed feature must never be evicted
++            # before the trainer consumes it.
++            cfg = ReplicateConfig()
++            cfg.replica_num = 1
++            cfg.with_hard_pin = True
++            self._put_config = cfg
++            self._store = store
++            logger.info("spec-capture mooncake sink connected")
++            return store
++
++    # -- key/put primitives (pinned to MooncakeFeatureStore's layout) --------
++    @staticmethod
++    def _tkey(store_id: str, sample_id: str, gen: int, name: str) -> str:
++        return f"{store_id}/{sample_id}/g{gen}/{name}"
++
++    def _put_tensor(self, key: str, t: torch.Tensor) -> None:
++        store = self._connect()
++        t = t.detach().to("cpu").contiguous()
++        nbytes = t.element_size() * t.numel()
++        try:
++            store.register_buffer(t.data_ptr(), nbytes)
++        except Exception:
++            pass  # some builds auto-register
++        try:
++            rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
++        finally:
++            try:
++                store.unregister_buffer(t.data_ptr())
++            except Exception:
++                pass
++        if rc is not None and int(rc) < 0:
++            raise RuntimeError(f"spec-capture put_from failed (status {rc}) for {key}")
++
++    def _remove_quiet(self, key: str) -> None:
++        try:
++            self._connect().remove(key)
++        except Exception:
++            pass
++
++    # -- the one entry point --------------------------------------------------
++    def put_sample(
++        self,
++        spec: Dict[str, Any],
++        *,
++        aux: Optional[torch.Tensor],
++        last_hidden: Optional[torch.Tensor],
++    ) -> Dict[str, Any]:
++        """Write one sample's artifacts; return the meta_info result dict.
++
++        ``aux``/``last_hidden`` are the per-request (L, W) captured tensors,
++        stored with a leading batch dim of 1. On any failure the keys already
++        written are best-effort removed (no partial sample is consumable).
++        """
++        store_id = str(spec["store_id"])
++        sample_id = str(spec["sample_id"])
++        gen = int(spec.get("gen", 1))
++        features: Dict[str, str] = dict(spec.get("features") or {})
++
++        written: List[str] = []
++        result_feats: Dict[str, Dict[str, Any]] = {}
++
++        def _write(name: str, t: torch.Tensor) -> None:
++            key = self._tkey(store_id, sample_id, gen, name)
++            self._put_tensor(key, t)
++            written.append(key)
++            result_feats[name] = {
++                "shape": list(t.shape),
++                "dtype": _DTYPE_STR.get(t.dtype, str(t.dtype).replace("torch.", "")),
++            }
++
++        try:
++            aux_name = features.get(_ARTIFACT_AUX)
++            if aux_name is not None:
++                if aux is None:
++                    raise RuntimeError(
++                        "spec_capture requested 'aux' but no aux hidden states were "
++                        "captured — launch the server with --enable-spec-capture "
++                        "(and optionally --spec-capture-aux-layer-ids)"
++                    )
++                _write(aux_name, aux.unsqueeze(0))
++            lh_name = features.get(_ARTIFACT_LAST_HIDDEN)
++            if lh_name is not None:
++                if last_hidden is None:
++                    raise RuntimeError(
++                        "spec_capture requested 'last_hidden' but the logits "
++                        "processor did not return it (is aux capture enabled?)"
++                    )
++                _write(lh_name, last_hidden.unsqueeze(0))
++            for item in spec.get("passthrough") or []:
++                dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
++                if dtype is None:
++                    raise RuntimeError(
++                        f"spec_capture passthrough {item.get('name')!r}: "
++                        f"unsupported dtype {item.get('dtype')!r}"
++                    )
++                t = torch.tensor(item["data"], dtype=dtype).reshape(
++                    [int(d) for d in item["shape"]]
++                )
++                _write(str(item["name"]), t)
++        except Exception:
++            for key in written:
++                self._remove_quiet(key)
++            raise
++
++        return {
++            "sample_id": sample_id,
++            "store_id": store_id,
++            "gen": gen,
++            "aux_layer_ids": self.aux_layer_ids,
++            "features": result_feats,
++        }
++
++
++_SINK: Optional[SpecCaptureSink] = None
++
++
++def maybe_init_sink(server_args) -> None:
++    """Called from Scheduler init on the writer rank when spec capture is on.
++
++    Connection to Mooncake is lazy (first put), so a capture-enabled server
++    without a reachable Mooncake master still boots and serves normal traffic.
++    """
++    global _SINK
++    if getattr(server_args, "enable_spec_capture", False) and _SINK is None:
++        _SINK = SpecCaptureSink(
++            aux_layer_ids=getattr(server_args, "spec_capture_aux_layer_ids", None)
++        )
++
++
++def get_sink() -> Optional[SpecCaptureSink]:
++    return _SINK

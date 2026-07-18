@@ -131,7 +131,7 @@ class TestEquivOfflineEagle3(unittest.TestCase):
             LocalFeatureStore,
             OfflineManifestReader,
         )
-        from specforge.runtime.training.strategy import Eagle3TrainStrategy
+        from specforge.training.strategies.base import Eagle3TrainStrategy
 
         H, V, D, SEQ, N, BS, TTT = 64, 256, 64, 16, 4, 2, 3
 
