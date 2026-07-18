@@ -459,6 +459,53 @@ class ProcessSupervisor:
             except ProcessLookupError:
                 pass
 
+    @staticmethod
+    def _proc_snapshot() -> dict[int, tuple[str, int, int]]:
+        snapshot: dict[int, tuple[str, int, int]] = {}
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return snapshot
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+                    raw = handle.read()
+                fields = raw[raw.rfind(")") + 2 :].split()
+                snapshot[pid] = (fields[0], int(fields[1]), int(fields[3]))
+            except (OSError, IndexError, ValueError):
+                continue
+        return snapshot
+
+    @classmethod
+    def _owned_pids(
+        cls, children: Sequence[ManagedChild], known: Sequence[int] = ()
+    ) -> set[int]:
+        snapshot = cls._proc_snapshot()
+        session_ids = {child.pgid for child in children}
+        owned = set(known) | session_ids
+        owned.update(
+            pid for pid, (_state, _ppid, sid) in snapshot.items() if sid in session_ids
+        )
+        changed = True
+        while changed:
+            changed = False
+            for pid, (_state, ppid, _sid) in snapshot.items():
+                if ppid in owned and pid not in owned:
+                    owned.add(pid)
+                    changed = True
+        return {pid for pid in owned if pid in snapshot and snapshot[pid][0] != "Z"}
+
+    @staticmethod
+    def _signal_pids(pids: Sequence[int], signum: int) -> None:
+        for pid in pids:
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+
     def _wait_groups(
         self, children: Sequence[ManagedChild], timeout_s: float
     ) -> list[ManagedChild]:
@@ -475,11 +522,17 @@ class ProcessSupervisor:
         active = [child for child in children if not child.log_handle.closed]
         if not active:
             return
+        tracked_pids = self._owned_pids(active)
         self._signal(active, signal.SIGTERM)
+        self._signal_pids(tracked_pids, signal.SIGTERM)
         alive = self._wait_groups(active, self.termination_grace_s)
-        if alive:
+        tracked_pids = self._owned_pids(active, tracked_pids)
+        alive_pids = self._owned_pids((), tracked_pids)
+        if alive or alive_pids:
             self._signal(alive, signal.SIGKILL)
+            self._signal_pids(alive_pids, signal.SIGKILL)
             alive = self._wait_groups(alive, self.kill_grace_s)
+            alive_pids = self._owned_pids((), alive_pids)
         for child in active:
             try:
                 child.process.wait(timeout=0.1)
@@ -488,10 +541,11 @@ class ProcessSupervisor:
                 child.process.wait(timeout=self.kill_grace_s)
             finally:
                 child.log_handle.close()
-        if alive:
+        if alive or alive_pids:
             raise LauncherError(
-                "process groups remained after SIGKILL: "
-                f"{[child.command.role for child in alive]}"
+                "managed processes remained after SIGKILL: "
+                f"roles={[child.command.role for child in alive]}, "
+                f"pids={sorted(alive_pids)}"
             )
 
     def stop_roles(self, roles: Sequence[str]) -> None:

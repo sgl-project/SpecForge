@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1265,6 +1266,35 @@ class TestProcessSupervisor(unittest.TestCase):
             supervisor.monitor(["peer", "failed"])
         supervisor.shutdown()
         self.assertIsNotNone(peer.process.poll())
+
+    def test_shutdown_reaps_descendant_that_escapes_the_process_group(self):
+        supervisor = self.supervisor()
+        pid_path = os.path.join(self.workdir, "escaped.pid")
+        code = (
+            "import pathlib, subprocess, sys, time; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)'], "
+            "start_new_session=True); "
+            f"pathlib.Path({pid_path!r}).write_text(str(child.pid)); "
+            "time.sleep(30)"
+        )
+        supervisor.start(self.command("parent", code))
+        deadline = time.monotonic() + 2.0
+        while not os.path.exists(pid_path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(os.path.exists(pid_path))
+        escaped_pid = int(Path(pid_path).read_text(encoding="utf-8"))
+
+        try:
+            supervisor.shutdown()
+        finally:
+            try:
+                os.kill(escaped_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        snapshot = ProcessSupervisor._proc_snapshot()
+        self.assertTrue(escaped_pid not in snapshot or snapshot[escaped_pid][0] == "Z")
 
     def test_monitor_runs_external_health_check(self):
         supervisor = self.supervisor()

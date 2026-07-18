@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -29,6 +30,7 @@ from specforge.runtime.data_plane.windowed_capture import (
 )
 from specforge.runtime.data_plane.windowed_capture_runtime import (
     WindowedCaptureService,
+    WindowedConsumerControl,
     start_windowed_consumer_control,
 )
 
@@ -216,6 +218,26 @@ class TestWindowedCaptureService(unittest.TestCase):
 
         control.ensure_healthy()
         control.close()
+
+    def test_heartbeat_recovers_from_a_transient_sqlite_failure(self):
+        registry = mock.Mock()
+        registry.heartbeat.side_effect = [
+            None,
+            sqlite3.OperationalError("database is locked"),
+            None,
+        ]
+        control = WindowedConsumerControl(
+            registry=registry,
+            consumer_id="a",
+            heartbeat_interval_s=0.001,
+        ).start()
+        deadline = time.monotonic() + 1.0
+        while registry.heartbeat.call_count < 3 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+        control.ensure_healthy()
+        control.close()
+        self.assertGreaterEqual(registry.heartbeat.call_count, 3)
 
     def test_external_ledger_failure_abandons_queue_lease(self):
         registry = self.registry(max_live_refs=1)

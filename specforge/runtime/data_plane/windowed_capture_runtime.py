@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import dataclasses
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -43,9 +44,17 @@ class WindowedConsumerControl:
             raise ValueError("heartbeat_interval_s must be > 0")
 
     def _heartbeat_loop(self) -> None:
+        consecutive_transient_failures = 0
         while not self._stop.wait(self.heartbeat_interval_s):
             try:
                 self.registry.heartbeat(self.consumer_id, ready=self._ready.is_set())
+                consecutive_transient_failures = 0
+            except sqlite3.OperationalError as exc:
+                consecutive_transient_failures += 1
+                if consecutive_transient_failures < 3:
+                    continue
+                self._error = exc
+                return
             except BaseException as exc:  # exposed synchronously by ensure_healthy
                 # WindowedCaptureQueue may observe EOF and complete the consumer
                 # between heartbeat intervals. That terminal race is success.

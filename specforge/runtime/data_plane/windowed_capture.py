@@ -467,9 +467,13 @@ class SQLiteWindowedCaptureRegistry:
             completed: list[EvictionCandidate] = []
             try:
                 for candidate in recovery_candidates:
-                    recovery_store.reclaim(
-                        candidate.ref, reason="interrupted-capture-recovery"
-                    )
+                    try:
+                        recovery_store.reclaim(
+                            candidate.ref, reason="interrupted-capture-recovery"
+                        )
+                    except KeyError:
+                        # Recovery is idempotent across a crash after physical reclaim.
+                        pass
                     completed.append(candidate)
             except BaseException:
                 if completed:
@@ -643,7 +647,7 @@ class SQLiteWindowedCaptureRegistry:
         conn.execute(
             "UPDATE entries SET state=?,generation=generation+1,priority=?,"
             "queued_at=?,captured_at=NULL,reserved_bytes=0,last_error=NULL,"
-            "prefetch_suppressed=0 WHERE source_index=?",
+            "retry_count=0,prefetch_suppressed=0 WHERE source_index=?",
             (
                 CaptureState.QUEUED.value,
                 int(priority),
@@ -1682,10 +1686,19 @@ class SQLiteWindowedCaptureRegistry:
                 store.reclaim(candidate.ref, reason=reason)
                 completed.append(candidate)
         except BaseException as error:
+            cleanup_candidates = candidates[len(completed) :]
             if completed:
-                self.finish_evictions(completed)
-            pending = candidates[len(completed) :]
-            self.cancel_evictions(pending, error)
+                try:
+                    self.finish_evictions(completed)
+                except BaseException as finish_error:
+                    cleanup_candidates = candidates
+                    error.add_note(
+                        f"failed to finish completed evictions: {finish_error!r}"
+                    )
+            try:
+                self.cancel_evictions(cleanup_candidates, error)
+            except BaseException as cancel_error:
+                error.add_note(f"failed to cancel pending evictions: {cancel_error!r}")
             raise
         self.finish_evictions(completed)
         return len(completed)
@@ -2009,61 +2022,71 @@ class WindowedCaptureQueue:
         if isinstance(n, bool) or not isinstance(n, int) or n < 1:
             raise ValueError("n must be a positive integer")
         with self._get_lock:
-            with self._state_lock:
-                if self._closed:
-                    return []
-                start = self._next_fetch
-                if start >= self.total_samples:
-                    if not self._leases:
-                        self.registry.complete_consumer(self.consumer_id)
-                        self._closed = True
-                    return []
-                stop = min(self.total_samples, start + n)
-            tickets = self.registry.request_many(self.consumer_id, range(start, stop))
-            acquired: list[CaptureReadLease] = []
-            try:
-                for ticket in tickets:
-                    acquired.append(
-                        self.registry.wait_ready(ticket, timeout_s=self.idle_timeout_s)
-                    )
-            except BaseException:
-                acquired_indices = {lease.source_index for lease in acquired}
-                for ticket in tickets:
-                    if ticket.source_index not in acquired_indices:
-                        try:
-                            self.registry.cancel_acquire(ticket)
-                        except RuntimeError:
-                            pass
-                self.registry.abandon_leases(self.consumer_id, acquired)
-                raise
-            refs = [lease.ref for lease in acquired]
-            if len({ref.sample_id for ref in refs}) != len(refs):
-                self.registry.abandon_leases(self.consumer_id, acquired)
-                raise RuntimeError(
-                    "windowed capture batch contains duplicate sample IDs"
+            while True:
+                with self._state_lock:
+                    if self._closed:
+                        return []
+                    start = self._next_fetch
+                    if start >= self.total_samples:
+                        if not self._leases:
+                            self.registry.complete_consumer(self.consumer_id)
+                            self._closed = True
+                        return []
+                    stop = min(self.total_samples, start + n)
+                tickets = self.registry.request_many(
+                    self.consumer_id, range(start, stop)
                 )
-            if self._record_refs is not None:
+                acquired: list[CaptureReadLease] = []
                 try:
-                    self._record_refs(refs)
+                    for ticket in tickets:
+                        acquired.append(
+                            self.registry.wait_ready(
+                                ticket, timeout_s=self.idle_timeout_s
+                            )
+                        )
                 except BaseException:
+                    acquired_indices = {lease.source_index for lease in acquired}
+                    for ticket in tickets:
+                        if ticket.source_index not in acquired_indices:
+                            try:
+                                self.registry.cancel_acquire(ticket)
+                            except RuntimeError:
+                                pass
                     self.registry.abandon_leases(self.consumer_id, acquired)
                     raise
-            with self._state_lock:
-                if self._closed:
+                refs = [lease.ref for lease in acquired]
+                if len({ref.sample_id for ref in refs}) != len(refs):
                     self.registry.abandon_leases(self.consumer_id, acquired)
-                    return []
-                self._leases.update((lease.ref.sample_id, lease) for lease in acquired)
-                self._next_fetch = stop
-                for lease in acquired:
-                    self._metrics["refs"] += 1
-                    self._metrics["ready_at_request_refs"] += int(
-                        lease.ready_at_request
+                    raise RuntimeError(
+                        "windowed capture batch contains duplicate sample IDs"
                     )
-                    self._metrics["demand_wait_s"] += lease.wait_s
-                    self._metrics["max_demand_wait_s"] = max(
-                        self._metrics["max_demand_wait_s"], lease.wait_s
+                if self._record_refs is not None:
+                    try:
+                        self._record_refs(refs)
+                    except BaseException:
+                        self.registry.abandon_leases(self.consumer_id, acquired)
+                        raise
+                with self._state_lock:
+                    if self._closed:
+                        self.registry.abandon_leases(self.consumer_id, acquired)
+                        return []
+                    if self._next_fetch < start:
+                        self.registry.abandon_leases(self.consumer_id, acquired)
+                        continue
+                    self._leases.update(
+                        (lease.ref.sample_id, lease) for lease in acquired
                     )
-            return refs
+                    self._next_fetch = max(self._next_fetch, stop)
+                    for lease in acquired:
+                        self._metrics["refs"] += 1
+                        self._metrics["ready_at_request_refs"] += int(
+                            lease.ready_at_request
+                        )
+                        self._metrics["demand_wait_s"] += lease.wait_s
+                        self._metrics["max_demand_wait_s"] = max(
+                            self._metrics["max_demand_wait_s"], lease.wait_s
+                        )
+                return refs
 
     def _resolve_leases(self, refs: Sequence[SampleRef]) -> list[CaptureReadLease]:
         missing = [ref.sample_id for ref in refs if ref.sample_id not in self._leases]

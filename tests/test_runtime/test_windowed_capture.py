@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.data_plane.windowed_capture import (
@@ -30,6 +32,12 @@ class _ReclaimStore:
 
     def reclaim(self, ref: SampleRef, *, reason: str = "consumed") -> None:
         self.reclaimed.append((ref.sample_id, int(ref.metadata["generation"]), reason))
+
+
+class _AlreadyReclaimedStore(_ReclaimStore):
+    def reclaim(self, ref: SampleRef, *, reason: str = "consumed") -> None:
+        super().reclaim(ref, reason=reason)
+        raise KeyError("cannot reclaim untracked sample")
 
 
 class WindowedRegistryFixture(unittest.TestCase):
@@ -293,6 +301,33 @@ class TestWindowedCaptureStateMachine(WindowedRegistryFixture):
             replacement.generation,
         )
 
+    def test_fresh_demand_resets_exhausted_capture_retry_budget(self):
+        self.initialize(samples=1, consumers=("a",))
+        self.register("a")
+        failed_ticket = self.registry.request_acquire("a", 0)
+        failed = self.registry.claim_batch(1)[0]
+        self.assertFalse(
+            self.registry.fail_capture(
+                failed, "first demand exhausted", retryable=True, max_retries=0
+            )
+        )
+        with self.assertRaisesRegex(CaptureFailedError, "first demand exhausted"):
+            self.registry.wait_ready(failed_ticket, timeout_s=1.0)
+
+        retry_ticket = self.registry.request_acquire("a", 0)
+        fresh = self.registry.claim_batch(1)[0]
+        self.assertTrue(
+            self.registry.fail_capture(
+                fresh, "fresh transient", retryable=True, max_retries=1
+            )
+        )
+        replacement = self.registry.claim_batch(1)[0]
+        self.complete(replacement)
+        self.assertEqual(
+            self.registry.wait_ready(retry_ticket, timeout_s=1.0).generation,
+            replacement.generation,
+        )
+
     def test_failed_consumer_drops_only_its_waiter_and_window(self):
         self.initialize(samples=2, consumers=("failed", "healthy"))
         self.register("failed")
@@ -461,6 +496,32 @@ class TestWindowedCaptureResume(WindowedRegistryFixture):
         lease = resumed.wait_ready(ticket, timeout_s=1.0)
         self.assertEqual(lease.generation, 2)
 
+    def test_committing_recovery_treats_already_reclaimed_payload_as_complete(self):
+        self.initialize(samples=1, consumers=("a",))
+        self.register("a")
+        ticket = self.registry.request_acquire("a", 0)
+        interrupted = self.registry.claim_batch(1)[0]
+        self.registry.mark_committing(interrupted, self.ref(interrupted))
+        path = self.registry.path
+        self.registry.close()
+
+        resumed = self.make_registry(path=path, max_live_refs=8)
+        self.registry = resumed
+        store = _AlreadyReclaimedStore()
+        resumed.initialize_run(
+            run_id="capture-run",
+            contract_digest=self.digest,
+            source_sample_ids=["source-0"],
+            expected_consumers=("a",),
+            recover_inflight=True,
+            recovery_store=store,
+        )
+
+        replacement = resumed.claim_batch(1)[0]
+        self.assertEqual(replacement.generation, interrupted.generation + 1)
+        self.complete(replacement)
+        self.assertEqual(resumed.wait_ready(ticket, timeout_s=1.0).generation, 2)
+
 
 class TestWindowedCaptureQueueAndSoak(WindowedRegistryFixture):
     def test_1p1c_queue_preserves_order_and_requires_prefix_ack(self):
@@ -494,6 +555,80 @@ class TestWindowedCaptureQueueAndSoak(WindowedRegistryFixture):
             self.registry.snapshot()["consumers"]["trainer"]["state"],
             "completed",
         )
+
+    def test_concurrent_retry_rewind_is_not_overwritten_by_get(self):
+        self.initialize(samples=4, consumers=("trainer",))
+        self.register("trainer", lookahead=3, prefetch_depth=4, max_outstanding=4)
+        for request in self.registry.claim_batch(4):
+            self.complete(request)
+        queue = WindowedCaptureQueue(self.registry, "trainer", idle_timeout_s=1.0)
+        first = queue.get(2)
+        original_request_many = self.registry.request_many
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_request_many(consumer_id, source_indices):
+            indices = tuple(source_indices)
+            tickets = original_request_many(consumer_id, indices)
+            if indices == (2, 3):
+                entered.set()
+                self.assertTrue(release.wait(timeout=1.0))
+            return tickets
+
+        result: list[list[SampleRef]] = []
+        with mock.patch.object(
+            self.registry, "request_many", side_effect=blocked_request_many
+        ):
+            thread = threading.Thread(target=lambda: result.append(queue.get(2)))
+            thread.start()
+            self.assertTrue(entered.wait(timeout=1.0))
+            queue.fail(first, "retry", retryable=True)
+            release.set()
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(
+            [ref.source_task_id for ref in result[0]], ["source-0", "source-1"]
+        )
+        queue.ack(result[0])
+        remaining = queue.get(2)
+        self.assertEqual(
+            [ref.source_task_id for ref in remaining], ["source-2", "source-3"]
+        )
+        queue.ack(remaining)
+
+    def test_reclaim_preserves_store_error_when_metadata_cleanup_also_fails(self):
+        self.initialize(samples=2, consumers=("trainer",))
+        self.register("trainer", lookahead=1, prefetch_depth=2, max_outstanding=2)
+        for request in self.registry.claim_batch(2):
+            self.complete(request)
+        queue = WindowedCaptureQueue(self.registry, "trainer", idle_timeout_s=1.0)
+        refs = queue.get(2)
+        queue.ack(refs)
+
+        store = _ReclaimStore()
+        original_reclaim = store.reclaim
+
+        def fail_second(ref, *, reason="consumed"):
+            if store.reclaimed:
+                raise OSError("physical reclaim failed")
+            original_reclaim(ref, reason=reason)
+
+        store.reclaim = fail_second
+        with (
+            mock.patch.object(
+                self.registry,
+                "finish_evictions",
+                side_effect=RuntimeError("metadata finish failed"),
+            ),
+            self.assertRaisesRegex(OSError, "physical reclaim failed") as raised,
+        ):
+            self.registry.reclaim(store)
+
+        self.assertTrue(
+            any("metadata finish failed" in note for note in raised.exception.__notes__)
+        )
+        self.assertEqual(len(self.registry.begin_evictions()), 2)
 
     def test_skewed_1p3c_soak_stays_within_slots_and_bytes(self):
         self.registry.close()
