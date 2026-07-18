@@ -14,6 +14,13 @@ try:
 except ImportError:
     wandb = None
 
+# A local ``wandb/`` output directory is importable as a namespace package when
+# the real client is absent. Treat that case as an unavailable dependency too.
+if wandb is not None and not all(
+    callable(getattr(wandb, name, None)) for name in ("login", "init", "log", "finish")
+):
+    wandb = None
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
@@ -138,6 +145,11 @@ class WandbTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
+        if wandb is None:
+            raise RuntimeError(
+                "To use --report-to wandb, install the W&B client: "
+                "'pip install wandb'."
+            )
         if self.rank == 0:
             if args.wandb_dir is None:
                 args.wandb_dir = self._default_wandb_dir()

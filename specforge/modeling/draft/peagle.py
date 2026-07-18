@@ -15,6 +15,7 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaRotaryEmbedding,
     rotate_half,
 )
+from specforge.modeling.draft.registry import register_draft
 
 
 class PEagleAttention(nn.Module):
@@ -170,6 +171,7 @@ class PEagleStandardLayer(nn.Module):
         return hidden_states
 
 
+@register_draft
 class PEagleDraftModel(Eagle3DraftModel):
     """P-EAGLE draft model with multi-layer architecture.
 
@@ -184,9 +186,14 @@ class PEagleDraftModel(Eagle3DraftModel):
     def __init__(
         self,
         config: LlamaConfig,
-        norm_before_residual: bool = False,
+        norm_before_residual: Optional[bool] = None,
     ) -> None:
         super().__init__(config)
+        if norm_before_residual is None:
+            norm_before_residual = getattr(config, "norm_before_residual", False)
+        norm_before_residual = bool(norm_before_residual)
+        config.architectures = [type(self).__name__]
+        config.norm_before_residual = norm_before_residual
         self.config = config
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
@@ -227,6 +234,30 @@ class PEagleDraftModel(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+    def _rebuild_rotary_embedding(self) -> None:
+        """Recreate non-persistent RoPE buffers after low-memory HF loading."""
+        reference = self.fc.weight
+        rotary_emb = LlamaRotaryEmbedding(
+            dim=getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            ),
+            max_position_embeddings=self.config.max_position_embeddings,
+            base=getattr(self.config, "rope_theta", 10000),
+            device=reference.device,
+        )
+        self.rotary_emb = rotary_emb.to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        model = super().from_pretrained(*args, **kwargs)
+        model._rebuild_rotary_embedding()
+        return model
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

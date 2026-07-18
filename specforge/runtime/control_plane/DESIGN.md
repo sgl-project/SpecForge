@@ -43,6 +43,12 @@ flowchart TD
 
 The `DataFlowController` is a passive metadata-only coordinator: it has no run loop, and every record-accepting entrypoint runs `assert_no_tensors`. It holds prompt lifecycle state — `_prompts`, a `_prompt_pending` deque, `_prompt_leased`, and `_prompt_failed` — under a single `_lock` that guards only the prompt/worker/trainer mutations and the `status()` snapshot; the sample-commit and train paths instead rely on the store's and queue's own internal locking. Durable/recovery state lives behind the `MetadataStore` seam: `commit_sample` dedups by `sample_id` (False = duplicate, dropped) and `record_train_ack` commits {acked sample_ids, global_step, optimizer_durable} as one atomic transaction. Online `commit_samples` and offline `enqueue_offline_refs` converge by enqueuing only fresh refs onto the same `SampleRefQueue`, so the trainer path has no online/offline branch. `ack_train_refs` deliberately orders `record_train_ack` BEFORE `sample_queue.ack` so a restart reconciles release state from the single committed marker. `TrainLease` is a stateless adapter that forwards `get`/`ack`/`fail` through the controller, so a cross-node trainer never holds a raw in-process queue and the durable ack is always recorded. Weight publishing / a weight-version registry is explicitly not yet implemented (flagged in source NOTEs).
 
+## Deployment modes
+
+The same code path serves every `DeploymentMode`; `build_control_plane_for_mode(mode, run_id)` builds the controller and durable-ack policy. `local_colocated` uses `NoOpMetadataStore` and `durable_ack=False`. `dataflow_colocated` / `disaggregated` keep the durable store (SQLite when a path is given, else the controller's in-memory default) and optimizer-boundary ack.
+
+The no-op axis is the *store + durable-ack transaction*. Prompt leasing and in-process `SampleRefQueue` bookkeeping stay shared across modes, and backpressure remains opt-in. Because `NoOpMetadataStore` retains nothing, `status()` committed/acked/backlog counts read 0 and `TrainLease`/`fail_refs` cannot reconstruct refs; cross-process trainers need a retaining store.
+
 ## Endpoints
 
 ### What this plane calls into

@@ -21,33 +21,30 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.target.dflash_target_model import (
+from specforge.inference.target_engine.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
 )
+from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import (
     get_last_checkpoint,
     get_local_device,
-    load_tokenizer,
     print_on_rank0,
     print_with_rank,
 )
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train DFlash Draft Model")
-
+def _add_model_args(parser: argparse.ArgumentParser) -> None:
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
@@ -82,46 +79,11 @@ def parse_args():
         default=512,
         help="Number of anchor positions per sequence",
     )
-    model_group.add_argument(
-        "--loss-decay-gamma",
-        type=float,
-        default=None,
-        help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables. "
-        "Only applies when --loss-type dflash.",
-    )
-    model_group.add_argument(
-        "--loss-type",
-        type=str,
-        default=None,
-        choices=[
-            "dflash",
-            "vp_drafter",
-            "dpace",
-            "dpace-cumulative-confidence-only",
-            "dpace-continuation-value-only",
-        ],
-        help=(
-            "Training objective. If omitted, reads dflash_config.training_mode or "
-            "dflash_config.loss_type from the draft config, defaulting to dflash."
-        ),
-    )
-    model_group.add_argument(
-        "--dpace-alpha",
-        type=float,
-        default=0.5,
-        help="Smoothing alpha for D-PACE position weights.",
-    )
-    model_group.add_argument(
-        "--prefix-weight-base",
-        type=float,
-        default=None,
-        help=(
-            "VP-Drafter prefix length sampling base. Values below 1 prefer shorter "
-            "visible prefixes; defaults to dflash_config.prefix_weight_base or 0.9."
-        ),
-    )
-    model_group.add_argument(
+
+
+def _add_target_head_args(parser: argparse.ArgumentParser) -> None:
+    target_head_group = parser.add_argument_group("target embedding/head")
+    target_head_group.add_argument(
         "--embedding-key",
         type=str,
         default=None,
@@ -129,13 +91,68 @@ def parse_args():
         "Default: 'model.embed_tokens.weight' for standard models, "
         "'model.language_model.embed_tokens.weight' for multimodal models like Qwen3.5-A3B.",
     )
-    model_group.add_argument(
+    target_head_group.add_argument(
         "--lm-head-key",
         type=str,
         default=None,
         help="LM head weight key in the target model. Default: 'lm_head.weight'.",
     )
 
+
+def _add_dflash_loss_args(parser: argparse.ArgumentParser) -> None:
+    loss_group = parser.add_argument_group("dflash loss selection: dflash/dpace")
+    loss_group.add_argument(
+        "--loss-type",
+        type=str,
+        default="dflash",
+        choices=[
+            "dflash",
+            "dpace",
+            "dpace-cumulative-confidence-only",
+            "dpace-continuation-value-only",
+        ],
+        help=("Training objective for this DFlash-family entry point. "),
+    )
+
+    loss_group.add_argument(
+        "--loss-decay-gamma",
+        type=float,
+        default=None,
+        help="Exponential position-decay gamma for --loss-type dflash. "
+        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+    )
+
+    loss_group.add_argument(
+        "--dpace-alpha",
+        type=float,
+        default=0.5,
+        help="Smoothing alpha for D-PACE objectives.",
+    )
+
+
+def _add_dspark_method_args(parser: argparse.ArgumentParser) -> None:
+    dspark_group = parser.add_argument_group("method: dspark disaggregated")
+    dspark_group.add_argument(
+        "--dspark-ce-loss-alpha",
+        type=float,
+        default=0.1,
+        help="Weight for DSpark next-token cross entropy.",
+    )
+    dspark_group.add_argument(
+        "--dspark-l1-loss-alpha",
+        type=float,
+        default=0.9,
+        help="Weight for DSpark draft/target distribution L1 loss.",
+    )
+    dspark_group.add_argument(
+        "--dspark-confidence-head-alpha",
+        type=float,
+        default=1.0,
+        help="Weight for DSpark confidence-head BCE loss.",
+    )
+
+
+def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -148,6 +165,8 @@ def parse_args():
         default=int(os.environ.get("SPECFORGE_DATA_NUM_PROC", 8)),
     )
 
+
+def _add_training_args(parser: argparse.ArgumentParser) -> None:
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
     training_group.add_argument("--batch-size", type=int, default=1)
@@ -159,6 +178,8 @@ def parse_args():
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
 
+
+def _add_output_args(parser: argparse.ArgumentParser) -> None:
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
     output_group.add_argument("--cache-dir", type=str, default="./cache")
@@ -166,6 +187,8 @@ def parse_args():
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
 
+
+def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
         "--tp-size",
@@ -184,6 +207,43 @@ def parse_args():
     sglang_group = parser.add_argument_group("sglang backend")
     SGLangBackendArgs.add_args(sglang_group)
 
+
+def _build_parser(
+    *,
+    description: str,
+    method: str,
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
+    _add_model_args(parser)
+
+    if method == "dflash":
+        _add_dflash_loss_args(parser)
+    elif method == "dspark_disagg":
+        _add_dspark_method_args(parser)
+    else:
+        raise ValueError(f"unknown DFlash-family parser method: {method}")
+
+    _add_target_head_args(parser)
+    _add_dataset_args(parser)
+    _add_training_args(parser)
+    _add_output_args(parser)
+    _add_runtime_args(parser)
+    return parser
+
+
+def parse_args():
+    parser = _build_parser(
+        description="Train DFlash Draft Model",
+        method="dflash",
+    )
+    return parser.parse_args()
+
+
+def parse_dspark_disagg_args():
+    parser = _build_parser(
+        description="Train DSpark Draft Model with disaggregated server capture",
+        method="dspark_disagg",
+    )
     return parser.parse_args()
 
 
@@ -232,20 +292,8 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
 
-    args.loss_type = (
-        args.loss_type
-        or draft_config.dflash_config.get("training_mode")
-        or draft_config.dflash_config.get("loss_type")
-        or "dflash"
-    )
-    if args.prefix_weight_base is None:
-        args.prefix_weight_base = draft_config.dflash_config.get(
-            "prefix_weight_base", 0.9
-        )
-
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
-    print_on_rank0(f"Using DFlash training loss_type: {args.loss_type}")
 
     draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
 
@@ -452,14 +500,10 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = load_tokenizer(args.target_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
-    elif (
-        dflash_config := getattr(draft_model.config, "dflash_config", {})
-    ) and dflash_config.get("mask_token_id") is not None:
-        mask_token_id = dflash_config["mask_token_id"]
     elif tokenizer.mask_token_id is not None:
         mask_token_id = tokenizer.mask_token_id
     else:
@@ -500,7 +544,6 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
         loss_type=args.loss_type,
         dpace_alpha=args.dpace_alpha,
-        prefix_weight_base=args.prefix_weight_base,
     )
 
     # Wrap each transformer block as its own FSDP unit so that all-gather /
@@ -592,7 +635,7 @@ def main():
             )
             hidden_states = target_output.hidden_states.to(device, non_blocking=True)
 
-            loss, accuracy = dflash_model(
+            loss, accuracy, _model_metrics = dflash_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
