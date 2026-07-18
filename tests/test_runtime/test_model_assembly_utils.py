@@ -2,7 +2,9 @@
 
 import types
 import unittest
+from unittest import mock
 
+from specforge.config import Config
 from specforge.training.model_utils import resolve_mask_token_id
 
 
@@ -93,6 +95,86 @@ class TestResolveMaskTokenId(unittest.TestCase):
                 tokenizer=tokenizer,
                 embedding_vocab_size=32,
             )
+
+
+def _dflash_config(**training_overrides):
+    training = {
+        "strategy": "dflash",
+        "total_steps": 10,
+        "draft_kernel_backend": "liger",
+        "linear_cross_entropy_backend": "liger",
+        "compact_zero_weight_ce_rows": True,
+        "flex_kernel_options": {"num_stages": 2},
+        "adamw_backend": "fused",
+        **training_overrides,
+    }
+    return Config.model_validate(
+        {
+            "model": {
+                "target_model_path": "target",
+                "draft_model_config": "draft.json",
+                "mask_token_id": 7,
+            },
+            "data": {"hidden_states_path": "features"},
+            "training": training,
+        }
+    )
+
+
+class TestDFlashOptimizationWiring(unittest.TestCase):
+    def test_draft_model_receives_configured_kernel_backend(self):
+        from specforge.algorithms.model_providers import build_registered_draft
+
+        cfg = _dflash_config()
+        draft_config = types.SimpleNamespace(
+            architectures=["DFlashDraftModel"],
+            _attn_implementation=None,
+        )
+        draft_model = mock.Mock()
+        draft_model.to.return_value = draft_model
+        with mock.patch(
+            "specforge.modeling.auto.AutoDraftModel.from_config",
+            return_value=draft_model,
+        ) as factory:
+            result = build_registered_draft(cfg, draft_config)
+
+        self.assertIs(result, draft_model)
+        self.assertEqual(factory.call_args.kwargs["draft_kernel_backend"], "liger")
+
+    def test_training_model_and_optimizer_receive_optimized_backends(self):
+        from specforge.algorithms.model_providers import build_dflash_model
+        from specforge.training.assembly import _ConfiguredOptimizerFactory
+
+        cfg = _dflash_config()
+        draft_model = mock.Mock(block_size=16, target_layer_ids=[1, 2, 3])
+        draft_model.config = types.SimpleNamespace(dflash_config={}, vocab_size=32)
+        draft_model.to.return_value = draft_model
+        target = types.SimpleNamespace(lm_head=object(), embed_tokens=object())
+        built_model = mock.Mock()
+        built_model.to.return_value = built_model
+        with (
+            mock.patch(
+                "specforge.modeling.target.target_utils."
+                "TargetEmbeddingsAndHead.from_pretrained",
+                return_value=target,
+            ),
+            mock.patch(
+                "specforge.algorithms.common.dflash_family_model.OnlineDFlashModel",
+                return_value=built_model,
+            ) as model_factory,
+        ):
+            parts = build_dflash_model(cfg, draft_model, None, None, _Tokenizer())
+
+        self.assertIs(parts.model, built_model)
+        kwargs = model_factory.call_args.kwargs
+        self.assertEqual(kwargs["flex_kernel_options"], {"num_stages": 2})
+        self.assertEqual(kwargs["draft_kernel_backend"], "liger")
+        self.assertEqual(kwargs["linear_cross_entropy_backend"], "liger")
+        self.assertTrue(kwargs["compact_zero_weight_ce_rows"])
+
+        with mock.patch("specforge.optimizer.BF16Optimizer") as optimizer:
+            _ConfiguredOptimizerFactory(cfg)(mock.sentinel.module)
+        self.assertEqual(optimizer.call_args.kwargs["adamw_backend"], "fused")
 
 
 if __name__ == "__main__":

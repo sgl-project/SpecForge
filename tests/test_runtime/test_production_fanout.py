@@ -1,8 +1,8 @@
 # coding=utf-8
 """CPU tests for the production DFlash fan-out launcher."""
 
-import io
 import inspect
+import io
 import json
 import os
 import signal
@@ -478,7 +478,10 @@ class TestProducerPrompts(FanoutManifestFixture):
             eligible = [row for row in dataset if row["conversations"]]
             return [self._processed_row(index + 10) for index, _ in enumerate(eligible)]
 
-        with mock.patch("specforge.data.build_eagle3_dataset", side_effect=fake_build):
+        with mock.patch(
+            "specforge.data.preprocessing.build_eagle3_dataset",
+            side_effect=fake_build,
+        ):
             prompts = launcher._producer_prompts(manifest, tokenizer=object())
 
         self.assertEqual(batch_sizes, [4, 1])
@@ -505,7 +508,10 @@ class TestProducerPrompts(FanoutManifestFixture):
             self.assertTrue(kwargs["is_preformatted"])
             return [self._processed_row(index) for index in range(len(dataset))]
 
-        with mock.patch("specforge.data.build_eagle3_dataset", side_effect=fake_build):
+        with mock.patch(
+            "specforge.data.preprocessing.build_eagle3_dataset",
+            side_effect=fake_build,
+        ):
             prompts = launcher._producer_prompts(manifest, tokenizer=object())
 
         self.assertEqual(len(prompts), 4)
@@ -531,7 +537,7 @@ class TestProducerPrompts(FanoutManifestFixture):
         )
         manifest = self.write_manifest(payload)
 
-        with mock.patch("specforge.data.build_eagle3_dataset") as build:
+        with mock.patch("specforge.data.preprocessing.build_eagle3_dataset") as build:
             prompts = launcher._producer_prompts(manifest, tokenizer=None)
 
         build.assert_not_called()
@@ -578,7 +584,10 @@ class TestProducerPrompts(FanoutManifestFixture):
             self.assertEqual(kwargs["minimum_valid_tokens"], 32)
             return [self._processed_row(index) for index in range(len(dataset))]
 
-        with mock.patch("specforge.data.build_eagle3_dataset", side_effect=fake_build):
+        with mock.patch(
+            "specforge.data.preprocessing.build_eagle3_dataset",
+            side_effect=fake_build,
+        ):
             prompts = launcher._producer_prompts(manifest, tokenizer=object())
 
         self.assertEqual(len(prompts), 4)
@@ -808,7 +817,8 @@ class TestConsumerModelBuild(FanoutManifestFixture):
                 return_value=target,
             ),
             mock.patch(
-                "specforge.core.dflash.OnlineDFlashModel", return_value=built_model
+                "specforge.algorithms.common.dflash_family_model.OnlineDFlashModel",
+                return_value=built_model,
             ) as model_factory,
             mock.patch(
                 "specforge.ops.dflash_kernels.validate_dflash_draft_kernel_backend"
@@ -823,7 +833,7 @@ class TestConsumerModelBuild(FanoutManifestFixture):
             )
 
         self.assertIs(result, built_model)
-        from specforge.core.dflash import OnlineDFlashModel
+        from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 
         supported_parameters = set(inspect.signature(OnlineDFlashModel).parameters)
         self.assertLessEqual(
@@ -884,7 +894,8 @@ class TestConsumerModelBuild(FanoutManifestFixture):
                 return_value=target,
             ),
             mock.patch(
-                "specforge.core.dflash.OnlineDFlashModel", return_value=built_model
+                "specforge.algorithms.common.dflash_family_model.OnlineDFlashModel",
+                return_value=built_model,
             ) as model_factory,
         ):
             result = launcher._build_consumer_model(

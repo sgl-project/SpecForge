@@ -60,6 +60,14 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
+        "dflash_flex_kernel_options": training_model.flex_kernel_options,
+        "dflash_draft_kernel_backend": str(training_model.draft_kernel_backend),
+        "dflash_linear_cross_entropy_backend": str(
+            training_model.linear_cross_entropy_backend
+        ),
+        "dflash_compact_zero_weight_ce_rows": bool(
+            training_model.compact_zero_weight_ce_rows
+        ),
     }
 
 

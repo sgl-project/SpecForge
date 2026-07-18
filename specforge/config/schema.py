@@ -21,7 +21,7 @@ import json
 import os
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
@@ -470,6 +470,11 @@ class TrainingConfig(StrictConfigModel):
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
     )
+    flex_kernel_options: Optional[dict[str, bool | int | float | str]] = None
+    draft_kernel_backend: Literal["torch", "liger"] = "torch"
+    linear_cross_entropy_backend: Literal["torch", "liger"] = "torch"
+    compact_zero_weight_ce_rows: bool = False
+    adamw_backend: Literal["torch", "fused"] = "torch"
     #: Trainer tensor parallelism. The unified runtime currently requires one;
     #: target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)
@@ -518,6 +523,22 @@ class TrainingConfig(StrictConfigModel):
     role: Literal["auto", "all", "producer", "consumer"] = "all"
     seed: int = 42
 
+    @field_validator("flex_kernel_options")
+    @classmethod
+    def _validate_flex_kernel_options(cls, value):
+        if value is None or "num_stages" not in value:
+            return value
+        num_stages = value["num_stages"]
+        if (
+            isinstance(num_stages, bool)
+            or not isinstance(num_stages, int)
+            or num_stages < 1
+        ):
+            raise ValueError(
+                "training.flex_kernel_options.num_stages must be a positive integer"
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_training_shape(self):
         if not 0.0 <= self.dpace_alpha <= 1.0:
@@ -543,6 +564,30 @@ class TrainingConfig(StrictConfigModel):
             raise ValueError(
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
+            )
+        if (
+            self.flex_kernel_options is not None
+            and self.attention_backend != "flex_attention"
+        ):
+            raise ValueError(
+                "training.flex_kernel_options require attention_backend='flex_attention'"
+            )
+        if (
+            self.compact_zero_weight_ce_rows
+            and self.linear_cross_entropy_backend != "liger"
+        ):
+            raise ValueError(
+                "training.compact_zero_weight_ce_rows=true requires "
+                "linear_cross_entropy_backend='liger'"
+            )
+        dflash_only = (
+            self.draft_kernel_backend != "torch"
+            or self.linear_cross_entropy_backend != "torch"
+            or self.compact_zero_weight_ce_rows
+        )
+        if dflash_only and self.strategy != "dflash":
+            raise ValueError(
+                "training draft/linear kernel backends are supported only for dflash"
             )
         return self
 

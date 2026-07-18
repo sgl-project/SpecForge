@@ -246,6 +246,7 @@ class _ConfiguredOptimizerFactory:
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
             total_steps=self.total_steps,
+            adamw_backend=t.adamw_backend,
         )
 
 

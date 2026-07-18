@@ -456,7 +456,8 @@ def _producer_prompts(manifest: FanoutManifest, tokenizer) -> list[dict[str, Any
         )
 
     from datasets import Dataset
-    from specforge.data import build_eagle3_dataset
+
+    from specforge.data.preprocessing import build_eagle3_dataset
 
     while len(prompts) < manifest.capture.max_prompts:
         remaining = manifest.capture.max_prompts - len(prompts)
@@ -506,7 +507,11 @@ def _producer_prompts(manifest: FanoutManifest, tokenizer) -> list[dict[str, Any
 
 
 def run_producer(manifest: FanoutManifest) -> None:
-    from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
+    from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.inference.adapters.server_capture import (
+        ServerCaptureSchema,
+        SGLangServerCaptureAdapter,
+    )
     from specforge.launch import build_disagg_online_windowed_producer
 
     tokenizer = None
@@ -520,11 +525,19 @@ def run_producer(manifest: FanoutManifest) -> None:
     prompts = _producer_prompts(manifest, tokenizer)
     target_hidden_size, _, layer_ids = _draft_contract(manifest)
     owner_store = _fanout_store(manifest, lifetime_owner=True)
+    algorithm = builtin_algorithm_registry().resolve("dflash")
+    layout = algorithm.providers.server_streaming_for("text").layout
     adapter = SGLangServerCaptureAdapter(
         manifest.server.url,
         owner_store,
         run_id=manifest.run_id,
-        strategy="dflash",
+        algorithm=algorithm.name,
+        schema=ServerCaptureSchema(
+            aux_feature=layout.aux_feature,
+            last_hidden_feature=layout.last_hidden_feature,
+            passthrough=layout.passthrough,
+            attention_mask_feature=layout.attention_mask_feature,
+        ),
         target_model_version=manifest.capture.target_model_path,
     )
     runtime = build_disagg_online_windowed_producer(
@@ -581,7 +594,7 @@ def _build_consumer_model(manifest: FanoutManifest, variant: VariantConfig):
     import torch
     from transformers import AutoConfig, AutoTokenizer
 
-    from specforge.core.dflash import OnlineDFlashModel
+    from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
     from specforge.modeling.draft.dflash import DFlashDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
     from specforge.ops.dflash_kernels import validate_dflash_draft_kernel_backend

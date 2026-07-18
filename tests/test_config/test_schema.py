@@ -76,6 +76,34 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_dflash_optimization_options_are_typed_and_cross_validated(self):
+        payload = copy.deepcopy(MINIMAL)
+        payload["training"] = {
+            "strategy": "dflash",
+            "flex_kernel_options": {"num_stages": 2},
+            "draft_kernel_backend": "liger",
+            "linear_cross_entropy_backend": "liger",
+            "compact_zero_weight_ce_rows": True,
+            "adamw_backend": "fused",
+        }
+        training = Config.model_validate(payload).training
+        self.assertEqual(training.flex_kernel_options, {"num_stages": 2})
+        self.assertEqual(training.draft_kernel_backend, "liger")
+        self.assertEqual(training.adamw_backend, "fused")
+
+        invalid = copy.deepcopy(payload)
+        invalid["training"]["attention_backend"] = "sdpa"
+        with self.assertRaisesRegex(ValidationError, "flex_kernel_options"):
+            Config.model_validate(invalid)
+        invalid = copy.deepcopy(payload)
+        invalid["training"]["linear_cross_entropy_backend"] = "torch"
+        with self.assertRaisesRegex(ValidationError, "compact_zero_weight"):
+            Config.model_validate(invalid)
+        invalid = copy.deepcopy(payload)
+        invalid["training"]["strategy"] = "eagle3"
+        with self.assertRaisesRegex(ValidationError, "only for dflash"):
+            Config.model_validate(invalid)
+
     def test_finite_online_run_can_derive_its_schedule_from_the_producer(self):
         payload = _online_payload("domino")
         payload["training"].pop("max_steps")
