@@ -14,6 +14,8 @@ import unittest
 from dataclasses import dataclass
 from unittest import mock
 
+import torch
+
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.inference.capture import CaptureConfig
 from specforge.launch import (
@@ -34,6 +36,7 @@ from specforge.runtime.data_plane.windowed_capture_runtime import (
     WindowedConsumerControl,
     start_windowed_consumer_control,
 )
+from specforge.training.checkpoint import STATE_FILE
 
 
 class _OwnerStore:
@@ -602,6 +605,71 @@ class TestWindowedLaunchBuilders(unittest.TestCase):
                     resume=True,
                     initialization_timeout_s=1.0,
                 )
+
+    def test_consumer_resume_restores_durable_cursor_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as root:
+            registry_path = os.path.join(root, "window.db")
+            registry = SQLiteWindowedCaptureRegistry(
+                registry_path,
+                max_live_refs=2,
+                poll_s=0.001,
+            )
+            digest = capture_contract_digest(_capture())
+            registry.initialize_run(
+                run_id="run",
+                contract_digest=digest,
+                source_sample_ids=("source-0", "source-1"),
+                expected_consumers=("a",),
+            )
+            registry.close()
+
+            metadata_path = os.path.join(root, "consumer.db")
+            metadata = SQLiteMetadataStore(metadata_path)
+            ref = _RefSource(_OwnerStore()).produce_refs(
+                [_prompts(1)[0]], capture=_capture()
+            )[0]
+            metadata.commit_sample(ref)
+            metadata.record_train_ack(
+                [ref.sample_id], global_step=1, optimizer_durable=True
+            )
+            metadata.close()
+
+            checkpoint = os.path.join(root, "checkpoint")
+            os.makedirs(checkpoint)
+            torch.save({"global_step": 1}, os.path.join(checkpoint, STATE_FILE))
+            fake_trainer = mock.Mock()
+            fake_trainer.loader = mock.Mock()
+
+            with mock.patch(
+                "specforge.launch._assemble_trainer",
+                return_value=fake_trainer,
+            ) as assemble:
+                runtime = build_disagg_online_windowed_consumer(
+                    consumer_id="a",
+                    registry_db_path=registry_path,
+                    max_live_refs=2,
+                    contract_digest=digest,
+                    total_samples=2,
+                    feature_store=_ReaderStore(),
+                    eagle3_model=object(),
+                    optimizer_factory=mock.Mock(),
+                    run_id="run",
+                    output_dir=os.path.join(root, "output"),
+                    metadata_db_path=metadata_path,
+                    strategy="dflash",
+                    resume=True,
+                    resume_from=checkpoint,
+                    initialization_timeout_s=1.0,
+                    heartbeat_interval_s=0.1,
+                )
+            try:
+                self.assertEqual(
+                    runtime.registry.snapshot()["consumers"]["a"]["cursor"], 1
+                )
+                self.assertEqual(assemble.call_args.kwargs["resume_from"], checkpoint)
+            finally:
+                runtime.control.fail("test cleanup")
+                runtime.close()
 
     def test_producer_recovery_reclaims_committing_generation_and_replays(self):
         with tempfile.TemporaryDirectory() as root:

@@ -106,6 +106,29 @@ class TestControllerCarriesNoTensor(unittest.TestCase):
         self.assertEqual(ctrl.status()["samples_committed"], 1)
         self.assertEqual(ctrl.sample_queue.depth(), 1)
 
+    def test_record_external_refs_ledgers_without_enqueueing(self):
+        ctrl = DataFlowController("run1")
+        ref = _ref(0)
+
+        self.assertEqual(ctrl.record_external_refs([ref]), 1)
+        self.assertEqual(ctrl.record_external_refs([ref]), 0)
+        self.assertEqual(ctrl.store.all_committed_ids(), [ref.sample_id])
+        self.assertEqual(ctrl.sample_queue.depth(), 0)
+
+        bad = SampleRef(
+            sample_id="bad",
+            run_id="r",
+            source_task_id=None,
+            feature_store_uri="mem://x/bad",
+            feature_keys={},
+            feature_specs={},
+            strategy="eagle3",
+            metadata={"sneaky": torch.zeros(1)},
+        )
+        with self.assertRaises(TypeError):
+            ctrl.record_external_refs([bad])
+        self.assertEqual(ctrl.status()["samples_committed"], 1)
+
     def test_prompt_lease_and_commit_clears_lease(self):
         ctrl = DataFlowController("run1")
         ids = ctrl.ingest_prompts([{"payload": {"text": "hi"}, "max_length": 16}])
