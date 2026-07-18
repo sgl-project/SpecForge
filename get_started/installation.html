@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>🚀 Get Started &#8212; SGLang</title>
+    <title>🚀 Get Started &#8212; SpecForge</title>
   
   
   
@@ -33,8 +33,6 @@
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
-    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
-    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -48,7 +46,6 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'get_started/installation';</script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -58,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 14, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 18, 2026"/>
   </head>
   
   
@@ -137,8 +134,8 @@
       
     
     
-    <img src="../_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
-    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SpecForge - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SpecForge - Home"/>
   
   
 </a></div>
@@ -164,15 +161,18 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">🚀 Training</a></li>
-
-
-
-
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/disaggregated_training.html">Disaggregated training</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">💡 Customize Your Own Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">Customize a training run</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking speculative decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/eagle3-disaggregated-parity.html">EAGLE3 offline disaggregated parity</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
 <ul class="nav bd-sidenav">
@@ -181,12 +181,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">Eagle3 for Llama3 - Online</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">Eagle3 for Llama3 - Offline</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking for Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
 </ul>
 
     </div>
@@ -246,7 +242,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge" target="_blank"
    class="btn btn-sm btn-source-repository-button dropdown-item"
    title="Source repository"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -263,7 +259,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/blob/main/get_started/installation.md?plain=1" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/get_started/installation.md?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -280,7 +276,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/edit/main/get_started/installation.md" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/get_started/installation.md" target="_blank"
    class="btn btn-sm btn-source-edit-button dropdown-item"
    title="Suggest edit"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -297,7 +293,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/issues/new?title=Issue%20on%20page%20%2Fget_started/installation.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fget_started/installation.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -414,6 +410,12 @@
             <nav aria-label="Page">
                 <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">📦 Installation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#accelerator-specific-environments">Accelerator-specific environments</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#nvidia-cuda">NVIDIA CUDA</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#amd-rocm">AMD ROCm</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ascend-npu">Ascend NPU</a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -451,6 +453,41 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>specforge
 </pre></div>
 </div>
+</section>
+<section id="accelerator-specific-environments">
+<h2>Accelerator-specific environments<a class="headerlink" href="#accelerator-specific-environments" title="Link to this heading">#</a></h2>
+<section id="nvidia-cuda">
+<h3>NVIDIA CUDA<a class="headerlink" href="#nvidia-cuda" title="Link to this heading">#</a></h3>
+<p>The standard installation above uses the platform selected by PyTorch. Install
+a CUDA build compatible with the host driver, then run every recipe through
+the same <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code> entry.</p>
+</section>
+<section id="amd-rocm">
+<h3>AMD ROCm<a class="headerlink" href="#amd-rocm" title="Link to this heading">#</a></h3>
+<p>For the pinned ROCm environment, install the checked-in requirements before the
+package:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>requirements-rocm.txt
+python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+</pre></div>
+</div>
+<p>The file pins a ROCm 7.2 PyTorch stack. Use a wheel index and driver combination
+compatible with the host if your ROCm version differs. Online runs require a
+ROCm-compatible SGLang capture service; offline feature consumers can start
+without target inference. PyTorch exposes ROCm accelerators through its
+<code class="docutils literal notranslate"><span class="pre">torch.cuda</span></code> API and uses NCCL for distributed runs.</p>
+</section>
+<section id="ascend-npu">
+<h3>Ascend NPU<a class="headerlink" href="#ascend-npu" title="Link to this heading">#</a></h3>
+<p>Install the vendor-matched PyTorch and <code class="docutils literal notranslate"><span class="pre">torch_npu</span></code> packages first, then install
+SpecForge. The checked-in
+<a class="reference download internal" download="" href="../_downloads/80fb60b7b4b579275dcfe77789f8b58b/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a>
+and
+<a class="reference download internal" download="" href="../_downloads/f820e4a2c09b8871f7e1152d39b78da7/qwen3.5-4b-domino-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-domino-online-npu.yaml</span></code></span></a>
+recipes use external SGLang server capture with SDPA consumers. Install a
+compatible SGLang/Mooncake service first. The unified launcher detects the NPU
+device, self-launches the process count recorded in YAML, and selects HCCL; see
+the <a class="reference internal" href="../basic_usage/training.html#cuda-rocm-and-ascend-npu"><span class="std std-ref">training guide</span></a>.</p>
+</section>
 </section>
 </section>
 
@@ -502,6 +539,12 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">📦 Installation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#accelerator-specific-environments">Accelerator-specific environments</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#nvidia-cuda">NVIDIA CUDA</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#amd-rocm">AMD ROCm</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ascend-npu">Ascend NPU</a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -535,7 +578,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 14, 2026.
+  Last updated on Jul 18, 2026.
   <br/>
 </p>
   </div>

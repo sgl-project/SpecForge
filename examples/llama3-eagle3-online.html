@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Eagle3 for Llama3 - Online &#8212; SGLang</title>
+    <title>EAGLE3 for Llama 3.1 8B: online training &#8212; SpecForge</title>
   
   
   
@@ -33,8 +33,6 @@
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
-    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
-    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -48,17 +46,16 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'examples/llama3-eagle3-online';</script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Eagle3 for Llama3 - Offline" href="llama3-eagle3-offline.html" />
+    <link rel="next" title="EAGLE3 for Llama 3.1 8B: offline training" href="llama3-eagle3-offline.html" />
     <link rel="prev" title="📈 Performance Dashboard" href="../community_resources/dashboard.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 14, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 18, 2026"/>
   </head>
   
   
@@ -137,8 +134,8 @@
       
     
     
-    <img src="../_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
-    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SpecForge - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SpecForge - Home"/>
   
   
 </a></div>
@@ -164,15 +161,18 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">🚀 Training</a></li>
-
-
-
-
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/disaggregated_training.html">Disaggregated training</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">💡 Customize Your Own Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">Customize a training run</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking speculative decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/eagle3-disaggregated-parity.html">EAGLE3 offline disaggregated parity</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
 <ul class="nav bd-sidenav">
@@ -181,12 +181,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Eagle3 for Llama3 - Online</a></li>
-<li class="toctree-l1"><a class="reference internal" href="llama3-eagle3-offline.html">Eagle3 for Llama3 - Offline</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking for Speculative Decoding</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">EAGLE3 for Llama 3.1 8B: online training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
 </ul>
 
     </div>
@@ -246,7 +242,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge" target="_blank"
    class="btn btn-sm btn-source-repository-button dropdown-item"
    title="Source repository"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -263,7 +259,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/blob/main/examples/llama3-eagle3-online.md?plain=1" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/examples/llama3-eagle3-online.md?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -280,7 +276,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/edit/main/examples/llama3-eagle3-online.md" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/examples/llama3-eagle3-online.md" target="_blank"
    class="btn btn-sm btn-source-edit-button dropdown-item"
    title="Suggest edit"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -297,7 +293,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/issues/new?title=Issue%20on%20page%20%2Fexamples/llama3-eagle3-online.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fexamples/llama3-eagle3-online.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -403,7 +399,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>Eagle3 for Llama3 - Online</h1>
+    <h1>EAGLE3 for Llama 3.1 8B: online training</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -413,18 +409,10 @@
             </div>
             <nav aria-label="Page">
                 <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#training-on-sharegpt-dataset">Training on ShareGPT dataset</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-prepare-sharegpt-dataset"><strong>Step 1. Prepare ShareGPT dataset</strong></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-launch-online-training"><strong>Step 2. Launch Online Training</strong></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-benchmark"><strong>Step 3. Benchmark</strong></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#training-on-perfect-blend-dataset">Training on Perfect-Blend dataset</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-prepare-perfect-blend-dataset"><strong>Step 1. Prepare Perfect-Blend dataset</strong></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1"><strong>Step 2. Launch Online Training</strong></a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-sharegpt">1. Prepare ShareGPT</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#use-the-checked-in-run-config">2. Use the checked-in run config</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#train">3. Train</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#export-and-benchmark">4. Export and benchmark</a></li>
 </ul>
             </nav>
         </div>
@@ -436,76 +424,53 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="eagle3-for-llama3-online">
-<h1>Eagle3 for Llama3 - Online<a class="headerlink" href="#eagle3-for-llama3-online" title="Link to this heading">#</a></h1>
-<section id="introduction">
-<h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
-<p>This document provides a step-by-step guide on how to train the EAGLE3 model for the Llama3.1-8B-Instruct model in an online manner. In online training, we generate the hidden states required by EAGLE3 draft model on the fly during training. This example is using <code class="docutils literal notranslate"><span class="pre">ShareGPT</span></code> dataset for training, the performance is not optimal due to the size and limited coverage of the dataset. If you look for optimal performance, we recommend you to try more diverse datasets such as <a class="reference external" href="https://huggingface.co/datasets/facebook/perfect-blend"><code class="docutils literal notranslate"><span class="pre">Perfect-Blend</span></code></a>. We have also included a section on training on <code class="docutils literal notranslate"><span class="pre">Perfect-Blend</span></code> dataset at the end of this document.</p>
-</section>
-<section id="training-on-sharegpt-dataset">
-<h2>Training on ShareGPT dataset<a class="headerlink" href="#training-on-sharegpt-dataset" title="Link to this heading">#</a></h2>
-<section id="step-1-prepare-sharegpt-dataset">
-<h3><strong>Step 1. Prepare ShareGPT dataset</strong><a class="headerlink" href="#step-1-prepare-sharegpt-dataset" title="Link to this heading">#</a></h3>
-<p>First of all, we should download the dataset.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>./scripts/prepare_data.py<span class="w"> </span>--dataset<span class="w"> </span>sharegpt
+  <section class="tex2jax_ignore mathjax_ignore" id="eagle3-for-llama-3-1-8b-online-training">
+<h1>EAGLE3 for Llama 3.1 8B: online training<a class="headerlink" href="#eagle3-for-llama-3-1-8b-online-training" title="Link to this heading">#</a></h1>
+<p>Online training captures the target model’s hidden states while the draft model
+is training. This walkthrough uses ShareGPT for a small example; a broader,
+target-regenerated dataset is recommended for production checkpoints.</p>
+<section id="prepare-sharegpt">
+<h2>1. Prepare ShareGPT<a class="headerlink" href="#prepare-sharegpt" title="Link to this heading">#</a></h2>
+<p>Run from the repository root:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>./scripts/prepare_data.py<span class="w"> </span>--dataset<span class="w"> </span>sharegpt
 </pre></div>
 </div>
 </section>
-<section id="step-2-launch-online-training">
-<h3><strong>Step 2. Launch Online Training</strong><a class="headerlink" href="#step-2-launch-online-training" title="Link to this heading">#</a></h3>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--standalone<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>scripts/train_eagle3.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--target-model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--draft-model-config<span class="w"> </span>configs/llama3-8B-eagle3.json<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--train-data-path<span class="w"> </span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--output-dir<span class="w"> </span>./outputs/llama3-8b-eagle3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--num-epochs<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--learning-rate<span class="w"> </span>1e-4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max-length<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--chat-template<span class="w"> </span>llama3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--target-model-backend<span class="w"> </span>sglang<span class="w"> </span><span class="se">\</span>
+<section id="use-the-checked-in-run-config">
+<h2>2. Use the checked-in run config<a class="headerlink" href="#use-the-checked-in-run-config" title="Link to this heading">#</a></h2>
+<p>The canonical recipe is
+<a class="reference download internal" download="" href="../_downloads/aa00e80eaea05b0c37853b432ffe211b/llama3.1-8b-eagle3-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">examples/configs/llama3.1-8b-eagle3-online.yaml</span></code></span></a>.
+It already points at the ShareGPT output from step 1 and records the target,
+draft architecture, SGLang backend, optimizer settings, and output directory in
+the same typed contract used by every other training method. Edit that file or
+use dotted command-line overrides when model and data paths differ; do not
+create a second copy of the recipe in documentation.</p>
+</section>
+<section id="train">
+<h2>3. Train<a class="headerlink" href="#train" title="Link to this heading">#</a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/llama3.1-8b-eagle3-online.yaml
 </pre></div>
 </div>
+<p>The recipe points at an external SGLang capture server and starts the
+disaggregated producer/consumer roles. Configure target TP on the SGLang
+server; <code class="docutils literal notranslate"><span class="pre">deployment.trainer</span></code> controls only consumer data parallelism. See
+<a class="reference internal" href="../basic_usage/training.html#parallel-topologies"><span class="std std-ref">Parallel topologies</span></a>. For a
+short smoke run, append a small <code class="docutils literal notranslate"><span class="pre">training.max_steps</span></code> dotted override.</p>
 </section>
-<section id="step-3-benchmark">
-<h3><strong>Step 3. Benchmark</strong><a class="headerlink" href="#step-3-benchmark" title="Link to this heading">#</a></h3>
-<p>For <code class="docutils literal notranslate"><span class="pre">Llama3.1-8B</span></code>, we add a system prompt to all training data, following the approach used in the official repository. Consequently, when benchmarking, we should also include this system prompt to obtain the full accept length. Please uncomment the corresponding line and add the system prompt.</p>
-<p>The four numbers in the config represent: <code class="docutils literal notranslate"><span class="pre">batch_size,</span> <span class="pre">num_steps,</span> <span class="pre">topk,</span> <span class="pre">num_verify_tokens</span></code>.  You can adjust the values in the config list to experiment with different test cases.</p>
-<p>A pre-trained EAGLE model is available at <a class="reference external" href="https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct">zhuyksir/EAGLE3-Llama-3.1-8B-Instruct</a> for reference.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>benchmarks
-
-<span class="nv">config_list</span><span class="o">=(</span>
-<span class="w">    </span><span class="s2">&quot;4,3,1,4&quot;</span>
-<span class="w">    </span><span class="s2">&quot;4,7,10,60&quot;</span>
-<span class="o">)</span>
-python3<span class="w"> </span>bench_eagle3.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative-draft-model-path<span class="w"> </span>/YOUR/PATH/Llama-3.1-8B-Instruct/dev_outputs/epoch_0<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--config-list<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">config_list</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--benchmark-list<span class="w"> </span>mtbench<span class="w"> </span>gsm8k<span class="w"> </span>humaneval<span class="w"> </span>math500
+<section id="export-and-benchmark">
+<h2>4. Export and benchmark<a class="headerlink" href="#export-and-benchmark" title="Link to this heading">#</a></h2>
+<p>Llama 3.1 8B training and benchmarking should use the same system prompt. A
+reference draft checkpoint is available at
+<a class="reference external" href="https://huggingface.co/zhuyksir/EAGLE3-Llama-3.1-8B-Instruct">zhuyksir/EAGLE3-Llama-3.1-8B-Instruct</a>.</p>
+<p>The runtime checkpoint contains training state but is not directly loadable by
+the SGLang speculative decoder. Online resume is consumer-only and reuses the
+retained transport state; export the final checkpoint before serving:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span><span class="nb">export</span><span class="w"> </span>--to<span class="w"> </span>sglang<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--checkpoint<span class="w"> </span>./outputs/llama3.1-8b-eagle3-online/llama3.1-8b-eagle3-online-latest<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--draft-config<span class="w"> </span>configs/llama3-8B-eagle3.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-dir<span class="w"> </span>./exports/llama3.1-8b-eagle3-sglang
 </pre></div>
 </div>
-</section>
-</section>
-<section id="training-on-perfect-blend-dataset">
-<h2>Training on Perfect-Blend dataset<a class="headerlink" href="#training-on-perfect-blend-dataset" title="Link to this heading">#</a></h2>
-<section id="step-1-prepare-perfect-blend-dataset">
-<h3><strong>Step 1. Prepare Perfect-Blend dataset</strong><a class="headerlink" href="#step-1-prepare-perfect-blend-dataset" title="Link to this heading">#</a></h3>
-<p>First of all, we should download the dataset.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>./scripts/prepare_data.py<span class="w"> </span>--dataset<span class="w"> </span>perfectblend
-</pre></div>
-</div>
-</section>
-<section id="id1">
-<h3><strong>Step 2. Launch Online Training</strong><a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
-<p>We just need to change the <code class="docutils literal notranslate"><span class="pre">--train-data-path</span></code> to the path of the Perfect-Blend dataset (e.g. <code class="docutils literal notranslate"><span class="pre">./cache/dataset/perfectblend_train.jsonl</span></code>), then we can launch training smoothly.</p>
-</section>
 </section>
 </section>
 
@@ -534,7 +499,7 @@ python3<span class="w"> </span>bench_eagle3.py<span class="w"> </span><span clas
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Eagle3 for Llama3 - Offline</p>
+        <p class="prev-next-title">EAGLE3 for Llama 3.1 8B: offline training</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -556,18 +521,10 @@ python3<span class="w"> </span>bench_eagle3.py<span class="w"> </span><span clas
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#training-on-sharegpt-dataset">Training on ShareGPT dataset</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-prepare-sharegpt-dataset"><strong>Step 1. Prepare ShareGPT dataset</strong></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-launch-online-training"><strong>Step 2. Launch Online Training</strong></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-benchmark"><strong>Step 3. Benchmark</strong></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#training-on-perfect-blend-dataset">Training on Perfect-Blend dataset</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-prepare-perfect-blend-dataset"><strong>Step 1. Prepare Perfect-Blend dataset</strong></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1"><strong>Step 2. Launch Online Training</strong></a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-sharegpt">1. Prepare ShareGPT</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#use-the-checked-in-run-config">2. Use the checked-in run config</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#train">3. Train</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#export-and-benchmark">4. Export and benchmark</a></li>
 </ul>
   </nav></div>
 
@@ -601,7 +558,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 14, 2026.
+  Last updated on Jul 18, 2026.
   <br/>
 </p>
   </div>

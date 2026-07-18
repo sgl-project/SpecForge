@@ -4,15 +4,24 @@
 
 Data is an important aspect of speculative decoding as the quality of the dataset directly affects the acceptance rate of the draft model. In this section, we will introduce how to prepare the dataset for both online and offline training.
 
-## ☁️ Pre-supported Datasets
+## ☁️ Canonical Dataset Presets
 
-We have provided a script to prepare some sample datasets out of the box, these datasets include:
-1. [ultrachat](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) (200k)
-2. [sharegpt](https://huggingface.co/datasets/Aeala/ShareGPT_Vicuna_unfiltered) (120k)
-3. [perfectblend](https://huggingface.co/datasets/mlabonne/open-perfectblend) (1.4M)
-4. and others (we continuously add support for more datasets)
+`scripts/prepare_data.py --dataset NAME` exposes the same 19 text presets
+used by the checked-in recipes:
 
-You can run the script below to prepare the corresponding dataset.
+| Family | Presets |
+| --- | --- |
+| General chat | `ultrachat`, `sharegpt`, `eaglechat`, `perfectblend`, `perfectblend-llama3.1-8b-instruct`, `perfectblend-llama3.3-70b-instruct`, `perfectblend-llama4-scout-instruct`, `perfectblend-llama4-maverick-instruct`, `magpie-qwen2.5-pro-1m-v0.1`, `nebius-llama31-8b-infinity-instruct` |
+| Reasoning, math, and code | `opc`, `gsm8k`, `hendrycks_math`, `math_qa`, `codealpaca-20k`, `opencodeinstruct`, `magicoder-evol-instruct`, `sciq`, `camel` |
+
+VLM data preparation and training, including ALLaVA and ShareGPT4V, are not
+supported.
+
+Every successful preset writes the same stable `id` + `conversations` JSONL
+contract. Use `--split-eval` to create a deterministic 95/5 train/eval split;
+`opc` additionally accepts `--opc-subset`.
+
+Run the script from the repository root:
 
 ```bash
 # ultrachat
@@ -22,12 +31,36 @@ python scripts/prepare_data.py --dataset ultrachat
 python scripts/prepare_data.py --dataset sharegpt
 ```
 
-You can view the full list of pre-supported datasets using `python scripts/prepare_data.py --help`. The datasets are processed and saved as `jsonl` files in the `cache/dataset/<dataset_name>` directory of the project path by default.
+By default, each command writes `<preset>_train.jsonl` under `cache/dataset`.
+Use `--output-path` to choose another output directory and `--sample-size` to
+cap the number of source rows.
+
+For a local ShareGPT-format dataset, pass a JSON or JSONL file with
+`--data-path`:
+
+```bash
+python scripts/prepare_data.py \
+    --dataset sharegpt \
+    --data-path ./raw_sharegpt.jsonl \
+    --output-path ./cache/dataset
+```
+
+Each raw row must contain an `id` and a `conversations` list whose messages use
+ShareGPT's `from` and `value` keys. Custom paths are intentionally limited to
+the `sharegpt` preset.
 
 
 ## ↩️ Regenerate Datasets
 
 When training speculative decoding draft models for a specific target model, instead of using the original dataset, we can regenerate the assistant responses using the target model to better align the draft model with the target model's output distribution. This will improve the acceptance rate of the draft model and the overall performance of the speculative decoding. According to the [EAGLE1 paper](https://arxiv.org/pdf/2401.15077), the EAGLE method is not very sensitive to the dataset quality, which means the performance is still good even if you use the original dataset. However, if you are looking for optimal performance in the production environment, it is recommended to regenerate the dataset using the target model.
+
+The regeneration utility uses the OpenAI-compatible client to call SGLang's
+HTTP API. Install it in the source-checkout environment before running the
+repository script:
+
+```bash
+pip install -e '.[data]'
+```
 
 We can follow the following steps to regenerate the dataset. In the example below, we will use `meta-llama/Llama-3.1-8B-Instruct` as an example, you can replace it with your own target model.
 
@@ -35,10 +68,10 @@ We can follow the following steps to regenerate the dataset. In the example belo
 
 ```shell
 python3 -m sglang.launch_server \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --cuda-graph-bs 1 2 4 8 16 32 64 128 \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --cuda-graph-max-bs 128 \
     --dtype bfloat16 \
-    --mem-frac=0.8 \
+    --mem-fraction-static 0.8 \
     --port 30000
 ```
 
@@ -66,7 +99,7 @@ output into one generation-event row per assistant turn so every reasoning
 target is trained with the visible history available at its serving boundary:
 
 ```bash
-python scripts/explode_generation_events.py \
+python scripts/expand_reasoning_conversations.py \
     --input-file-path ./cache/dataset/sharegpt_train_regen_reasoning.jsonl \
     --output-file-path ./cache/dataset/sharegpt_train_regen_reasoning_exploded.jsonl
 ```
@@ -74,8 +107,8 @@ python scripts/explode_generation_events.py \
 Each event ends at its current assistant target and preserves that turn's
 `reasoning_content` and visible `content`. Historical assistant messages keep
 only visible `content`; their hidden reasoning is removed from the event
-context. Train the exploded output with the entry point's
-`train_only_last_turn` option enabled.
+context. Train the exploded output with `data.train_only_last_turn: true` in
+the typed run config.
 
 The converter accepts only successful rows with non-empty IDs, message content,
 and assistant `reasoning_content`. Invalid input is written to a skipped JSONL;
@@ -179,7 +212,7 @@ bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 
 Besides the provided datasets, you can also prepare your own dataset. We support two formats:
 
-#### Option 1: Conversation Format
+### Option 1: Conversation Format
 
 You should prepare the dataset in jsonl format and the schema should look like this:
 
@@ -195,7 +228,7 @@ You should prepare the dataset in jsonl format and the schema should look like t
 }
 ```
 
-#### Option 2: Pre-formatted Text Format
+### Option 2: Pre-formatted Text Format
 
 If you already have conversations formatted with a specific chat template, you can use the pre-formatted text directly:
 
@@ -208,15 +241,18 @@ If you already have conversations formatted with a specific chat template, you c
 
 This format is useful when you have pre-formatted prompts that were used during training of the target model and have raw generations from the target model.
 
-To use pre-formatted datasets, add the `--is-preformatted` flag to your training command. Note that the `--chat-template` parameter is still needed and should match the template used in your pre-formatted text, as it is used to identify user/assistant tokens to determine the assistant spans and generate the corresponding loss mask.
+To use preformatted datasets, set `data.is_preformatted: true` in the run
+config. `data.chat_template` is still required and must match the template used
+to create the text. SpecForge uses it to identify assistant spans and build the
+loss mask.
 
 ```bash
-# Online training with pre-formatted data
-torchrun --standalone --nproc_per_node 8 \
-    scripts/train_eagle3.py \
-    --is-preformatted \
-    --train-data-path ./your_preformatted_dataset.jsonl \
-    # ... other arguments
+# After copying a disaggregated online example YAML, set these data fields:
+# data:
+#   train_data_path: ./your_preformatted_dataset.jsonl
+#   is_preformatted: true
+#   chat_template: llama3
+specforge train --config ./my-eagle3-disaggregated.yaml
 ```
 
 For offline training, you can also use `--is-preformatted` when generating hidden states:
@@ -233,7 +269,14 @@ torchrun --nproc_per_node=8 \
     --max-length 2048
 ```
 
-Once you have the `jsonl` file ready, you can proceed with online training or generate hidden states for offline training. See the Training guide for more details.
+This `torchrun` command parallelizes feature preparation. The subsequent
+offline run still uses the one `specforge train` entry and self-launches the
+data-parallel or EAGLE3 USP topology recorded under `deployment.trainer`; its
+world size is independent of the feature-preparation job.
+
+Once the `jsonl` file is ready, use it in an online run config or generate
+hidden states for an offline config. See the [Training](training.md) guide for
+the complete run schema and supported combinations.
 
 
 ## ➕ Handling Multiple Datasets

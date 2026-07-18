@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Benchmarking for Speculative Decoding &#8212; SGLang</title>
+    <title>Benchmarking speculative decoding &#8212; SpecForge</title>
   
   
   
@@ -33,8 +33,6 @@
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
-    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
-    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=731335ad" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -48,16 +46,16 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'benchmarks/benchmark';</script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="prev" title="Eagle3 for Llama3 - Offline" href="../examples/llama3-eagle3-offline.html" />
+    <link rel="next" title="EAGLE3 offline disaggregated parity" href="eagle3-disaggregated-parity.html" />
+    <link rel="prev" title="Customize a training run" href="../advanced_features/customization.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 14, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 18, 2026"/>
   </head>
   
   
@@ -136,8 +134,8 @@
       
     
     
-    <img src="../_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
-    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SpecForge - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SpecForge - Home"/>
   
   
 </a></div>
@@ -163,15 +161,18 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">🚀 Training</a></li>
-
-
-
-
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/disaggregated_training.html">Disaggregated training</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">💡 Customize Your Own Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">Customize a training run</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Benchmarking speculative decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="eagle3-disaggregated-parity.html">EAGLE3 offline disaggregated parity</a></li>
+<li class="toctree-l1"><a class="reference internal" href="domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
 <ul class="nav bd-sidenav">
@@ -180,12 +181,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">Eagle3 for Llama3 - Online</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">Eagle3 for Llama3 - Offline</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
-<ul class="current nav bd-sidenav">
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Benchmarking for Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
 </ul>
 
     </div>
@@ -245,7 +242,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge" target="_blank"
    class="btn btn-sm btn-source-repository-button dropdown-item"
    title="Source repository"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -262,7 +259,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/blob/main/benchmarks/benchmark.md?plain=1" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/benchmarks/benchmark.md?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -279,7 +276,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/edit/main/benchmarks/benchmark.md" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/benchmarks/benchmark.md" target="_blank"
    class="btn btn-sm btn-source-edit-button dropdown-item"
    title="Suggest edit"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -296,7 +293,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sgl-project.github.io/issues/new?title=Issue%20on%20page%20%2Fbenchmarks/benchmark.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fbenchmarks/benchmark.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -402,7 +399,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>Benchmarking for Speculative Decoding</h1>
+    <h1>Benchmarking speculative decoding</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -412,10 +409,11 @@
             </div>
             <nav aria-label="Page">
                 <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-benchmarks">Run Benchmarks</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-sglang-and-benchmarker-concurrently">Launch SGLang and Benchmarker Concurrently</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-benchmarker-independently">Launch Benchmarker Independently</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-server-and-benchmarks-together">Run server and benchmarks together</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-an-existing-server">Benchmark an existing server</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#retained-validation-artifacts">Retained validation artifacts</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dataflow-cutover-equivalence">DataFlow cutover equivalence</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-6-27b-dflash-training-curves">Qwen3.6-27B DFlash training curves</a></li>
 </ul>
 </li>
 </ul>
@@ -429,31 +427,18 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="benchmarking-for-speculative-decoding">
-<h1>Benchmarking for Speculative Decoding<a class="headerlink" href="#benchmarking-for-speculative-decoding" title="Link to this heading">#</a></h1>
-<section id="overview">
-<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
-<p>We provide a unified script to test the performance of the Speculative Decoding with EAGLE3 algorithm on multiple datasets. You can follow the steps below to run the benchmarks.</p>
-</section>
-<section id="run-benchmarks">
-<h2>Run Benchmarks<a class="headerlink" href="#run-benchmarks" title="Link to this heading">#</a></h2>
-<section id="launch-sglang-and-benchmarker-concurrently">
-<h3>Launch SGLang and Benchmarker Concurrently<a class="headerlink" href="#launch-sglang-and-benchmarker-concurrently" title="Link to this heading">#</a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">bench_eagle3.py</span></code> can help you launch a SGLang server process and a Benchmarking process concurrently. In this way, you don’t have to launch the SGLang server manually, this script will manually handle the SGLang launch under different speculative decoding configurations. Some important arguments are:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">--model-path</span></code>: the path to the target model.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--speculative-draft-model-path</span></code>: the path to the draft model.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--port</span></code>: the port to launch the SGLang server.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--trust-remote-code</span></code>: trust the remote code.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code>: the memory fraction for the static memory.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--tp-size</span></code>: the tensor parallelism size.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--attention-backend</span></code>: the attention backend.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--config-list</span></code>: the list of speculative decoding configuration to test, the format is <code class="docutils literal notranslate"><span class="pre">&lt;batch-size&gt;,&lt;num-steps&gt;,&lt;topk&gt;,&lt;num-draft-tokens&gt;</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--benchmark-list</span></code>: the list of benchmarks to test, the format is <code class="docutils literal notranslate"><span class="pre">&lt;benchmark-name&gt;:&lt;num-prompts&gt;:&lt;subset&gt;</span></code>.</p></li>
-</ul>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>bench_eagle3.py<span class="w"> </span><span class="se">\</span>
+  <section class="tex2jax_ignore mathjax_ignore" id="benchmarking-speculative-decoding">
+<h1>Benchmarking speculative decoding<a class="headerlink" href="#benchmarking-speculative-decoding" title="Link to this heading">#</a></h1>
+<p>The repository keeps the model-quality and serving-performance benchmark suite
+under <code class="docutils literal notranslate"><span class="pre">benchmarks/</span></code>. It is independent from training: train and export a draft
+through the unified <code class="docutils literal notranslate"><span class="pre">specforge</span></code> CLI, then benchmark that exported artifact
+against an SGLang server.</p>
+<section id="run-server-and-benchmarks-together">
+<h2>Run server and benchmarks together<a class="headerlink" href="#run-server-and-benchmarks-together" title="Link to this heading">#</a></h2>
+<p>From the repository root:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/bench_eagle3.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative-draft-model-path<span class="w"> </span>lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--speculative-draft-model-path<span class="w"> </span>/path/to/exported-draft<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
@@ -464,36 +449,58 @@
 <span class="w">    </span>--dtype<span class="w"> </span>bfloat16
 </pre></div>
 </div>
+<p>Each <code class="docutils literal notranslate"><span class="pre">--config-list</span></code> entry is
+<code class="docutils literal notranslate"><span class="pre">batch-size,num-steps,topk,num-draft-tokens</span></code>. Benchmark selectors use
+<code class="docutils literal notranslate"><span class="pre">name[:num-prompts[:subset,...]]</span></code>. Available datasets include AIME, C-Eval,
+FinanceQA, GPQA, GSM8K, HumanEval, LiveCodeBench, MATH-500, MBPP, MMLU,
+MMStar, MT-Bench, and SimpleQA.</p>
 </section>
-<section id="launch-benchmarker-independently">
-<h3>Launch Benchmarker Independently<a class="headerlink" href="#launch-benchmarker-independently" title="Link to this heading">#</a></h3>
-<p>If you want to launch the SGLang server independently, you can use the following command.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># you can launch a server</span>
-python3<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative-algorithm<span class="w"> </span>EAGLE3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative-draft-model-path<span class="w"> </span>lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative-num-steps<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative-eagle-topk<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative-num-draft-tokens<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.75<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--cuda-graph-max-bs<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tp<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
+<section id="benchmark-an-existing-server">
+<h2>Benchmark an existing server<a class="headerlink" href="#benchmark-an-existing-server" title="Link to this heading">#</a></h2>
+<p>Start SGLang separately, then add <code class="docutils literal notranslate"><span class="pre">--skip-launch-server</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/bench_eagle3.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--dtype<span class="w"> </span>bfloat16
+<span class="w">    </span>--config-list<span class="w"> </span><span class="m">1</span>,3,1,4<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--benchmark-list<span class="w"> </span>mtbench:5<span class="w"> </span>gsm8k:5<span class="w"> </span>humaneval:5<span class="w"> </span>math500:5<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--skip-launch-server
 </pre></div>
 </div>
-<p>Then we can start benchmarking. Note that you should use the same host and port as the one used in the SGLang server. Note that <code class="docutils literal notranslate"><span class="pre">--skip-launch-server</span></code> is required to skip the launch of the SGLang server.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>bench_eagle3.py<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--config-list<span class="w"> </span><span class="m">1</span>,3,1,4<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--benchmark-list<span class="w"> </span>mtbench:5<span class="w"> </span>ceval:5:accountant<span class="w"> </span>gsm8k:5<span class="w"> </span>humaneval:5<span class="w"> </span>math500:5<span class="w"> </span>mtbench:5<span class="w"> </span>aime:1<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--skip-launch-server
-</pre></div>
-</div>
+<p>Results are written as timestamped JSON under <code class="docutils literal notranslate"><span class="pre">--output-dir</span></code>. The standalone
+GPU microbenchmarks <code class="docutils literal notranslate"><span class="pre">bench_domino_mfu.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">specforge/benchmarks/benchmark_flex_attention.py</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">specforge/benchmarks/benchmark_loss.py</span></code> cover trainer MFU, attention, and loss
+kernel behavior respectively.</p>
+<p>HumanEval and MBPP execute model-generated Python while scoring. Run those two
+benchmarks only in an isolated container or devbox with no credentials or
+production data mounted.</p>
+</section>
+<section id="retained-validation-artifacts">
+<h2>Retained validation artifacts<a class="headerlink" href="#retained-validation-artifacts" title="Link to this heading">#</a></h2>
+<p>The repository keeps the existing training-equivalence and convergence plots
+as provenance for the runtime cutover. They are reference results, not a
+substitute for rerunning the benchmark suite on the current commit.</p>
+<section id="dataflow-cutover-equivalence">
+<h3>DataFlow cutover equivalence<a class="headerlink" href="#dataflow-cutover-equivalence" title="Link to this heading">#</a></h3>
+<p>These 100-step traces compare the former trainer (<code class="docutils literal notranslate"><span class="pre">main</span></code>) with colocated and
+disaggregated DataFlow execution. Keeping them next to the benchmark suite
+makes the behavioral evidence available after the duplicate trainers are
+removed.</p>
+<p><img alt="Qwen2.5-0.5B DFlash legacy, colocated, and disaggregated loss equivalence" src="../_images/qwen2.5-0.5b-dflash-vs-main.png" /></p>
+<p><img alt="Qwen2.5-0.5B EAGLE3 legacy, colocated, and disaggregated loss equivalence" src="../_images/qwen2.5-0.5b-eagle3-vs-main.png" /></p>
+<p>The <a class="reference internal" href="eagle3-disaggregated-parity.html"><span class="std std-doc">Qwen2.5-7B EAGLE3 offline parity record</span></a>
+preserves the corresponding two-node metric comparison and its current
+rank-dispatch command.</p>
+</section>
+<section id="qwen3-6-27b-dflash-training-curves">
+<h3>Qwen3.6-27B DFlash training curves<a class="headerlink" href="#qwen3-6-27b-dflash-training-curves" title="Link to this heading">#</a></h3>
+<p>The retained curves cover both the eight-H200 colocated run and the two-GPU
+online-disaggregated producer/consumer run.</p>
+<p>The separate <a class="reference internal" href="domino-disaggregated-performance.html"><span class="std std-doc">Domino disaggregated performance findings</span></a>
+preserve the measured one-server + DP7 tuning study, its MFU analysis, and the
+canonical YAML form of the relevant controls.</p>
+<p><img alt="Qwen3.6-27B DFlash colocated training loss and draft-token accuracy" src="../_images/qwen36-27b-dflash-nemotron-6ep.png" /></p>
+<p><img alt="Qwen3.6-27B DFlash online-disaggregated training loss and draft-token accuracy" src="../_images/qwen36-27b-dflash-nemotron-disagg.png" /></p>
 </section>
 </section>
 </section>
@@ -510,13 +517,22 @@ python3<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<sp
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../examples/llama3-eagle3-offline.html"
+       href="../advanced_features/customization.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Eagle3 for Llama3 - Offline</p>
+        <p class="prev-next-title">Customize a training run</p>
       </div>
+    </a>
+    <a class="right-next"
+       href="eagle3-disaggregated-parity.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">EAGLE3 offline disaggregated parity</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
     </a>
 </div>
                 </footer>
@@ -536,10 +552,11 @@ python3<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<sp
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-benchmarks">Run Benchmarks</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-sglang-and-benchmarker-concurrently">Launch SGLang and Benchmarker Concurrently</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-benchmarker-independently">Launch Benchmarker Independently</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-server-and-benchmarks-together">Run server and benchmarks together</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-an-existing-server">Benchmark an existing server</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#retained-validation-artifacts">Retained validation artifacts</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dataflow-cutover-equivalence">DataFlow cutover equivalence</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-6-27b-dflash-training-curves">Qwen3.6-27B DFlash training curves</a></li>
 </ul>
 </li>
 </ul>
@@ -575,7 +592,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 14, 2026.
+  Last updated on Jul 18, 2026.
   <br/>
 </p>
   </div>

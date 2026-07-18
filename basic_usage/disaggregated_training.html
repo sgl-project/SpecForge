@@ -1,0 +1,953 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Disaggregated training &#8212; SpecForge</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'basic_usage/disaggregated_training';</script>
+    <link rel="icon" href="../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Customize a training run" href="../advanced_features/customization.html" />
+    <link rel="prev" title="Training" href="training.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Jul 18, 2026"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SpecForge - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SpecForge - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/about.html">⚡️ About SpecForge</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="data_preparation.html">📝 Data Preparation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="training.html">Training</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Disaggregated training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">Customize a training run</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking speculative decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/eagle3-disaggregated-parity.html">EAGLE3 offline disaggregated parity</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/specbundle.html">🔥 SpecBundle</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/dashboard.html">📈 Performance Dashboard</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/basic_usage/disaggregated_training.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/basic_usage/disaggregated_training.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fbasic_usage/disaggregated_training.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/basic_usage/disaggregated_training.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Disaggregated training</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#one-config-owns-the-launch-topology">One config owns the launch topology</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#single-node-producer-and-consumer">Single-node producer and consumer</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-server-capture">Multi-server capture</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#split-pools-and-multi-node-consumers">Split pools and multi-node consumers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#external-and-managed-local-services">External and managed-local services</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-runtime-contract">Online runtime contract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#offline-shared-directory-and-mooncake-stores">Offline shared-directory and Mooncake stores</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#resume-and-freshness">Resume and freshness</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="disaggregated-training">
+<h1>Disaggregated training<a class="headerlink" href="#disaggregated-training" title="Link to this heading">#</a></h1>
+<p>Disaggregation is a launch topology of the canonical training command:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml
+</pre></div>
+</div>
+<p>The producer captures or ingests features and the consumer runs the canonical
+trainer. Online training always uses this producer/consumer topology; there is
+no colocated target-inference path and no separate Python training entry.</p>
+<p>The checked-in recipes are:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Workflow</p></th>
+<th class="head"><p>Config</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Online EAGLE3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-eagle3-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Online P-EAGLE</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-peagle-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Online DFlash</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-dflash-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Managed-local one-server + DP7 Qwen3-8B DFlash</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Online Domino</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-domino-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Managed-local one-server + DP7 Qwen3-8B Domino</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Managed-local two-server Qwen3-8B Domino</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Online DSpark</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-4b-dspark-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Online Qwen3.6 DFlash</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3.6-27b-dflash-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Managed-local one-server + DP2 Qwen3.6 DFlash</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Managed-local two-server Qwen3.6 DFlash</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Offline EAGLE3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Offline Qwen2.5-7B EAGLE3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="one-config-owns-the-launch-topology">
+<h2>One config owns the launch topology<a class="headerlink" href="#one-config-owns-the-launch-topology" title="Link to this heading">#</a></h2>
+<p>Process topology and attempt paths live in the same typed run document as the
+model and training settings. An online deployment has this shape:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">deployment</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">disaggregated</span>
+<span class="w">  </span><span class="nt">trainer</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">nnodes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">    </span><span class="nt">nproc_per_node</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="w">  </span><span class="nt">disaggregated</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">control_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">outputs/qwen3-8b-dflash-disaggregated/control</span>
+<span class="w">    </span><span class="nt">consumer_state_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">outputs/qwen3-8b-dflash-disaggregated/consumer-state</span>
+<span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mooncake</span>
+<span class="w">    </span><span class="nt">server_urls</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http://127.0.0.1:30000</span>
+<span class="w">    </span><span class="nt">mooncake_metadata_server</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http://127.0.0.1:35880/metadata</span>
+<span class="w">    </span><span class="nt">mooncake_master_server_addr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">127.0.0.1:35551</span>
+<span class="w">    </span><span class="nt">mooncake_protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tcp</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">data.train_data_path</span></code> or <code class="docutils literal notranslate"><span class="pre">data.prompts_path</span></code> selects online mode;
+<code class="docutils literal notranslate"><span class="pre">data.hidden_states_path</span></code> selects offline mode. There is no second scenario
+flag to keep synchronized. The consumer world size is
+<code class="docutils literal notranslate"><span class="pre">nnodes</span> <span class="pre">*</span> <span class="pre">nproc_per_node</span></code>; it must satisfy the TP/USP topology in <code class="docutils literal notranslate"><span class="pre">training</span></code>.</p>
+<p>The control directory is attempt-scoped. The launcher deterministically derives
+the online reference channel and lifecycle markers, or the offline manifest,
+beneath that root. Online consumers put the rank-0 SQLite/WAL under
+<code class="docutils literal notranslate"><span class="pre">consumer_state_dir</span></code>; that path should be node-local and is required for
+multi-node trainers. Rank inboxes stay under the shared <code class="docutils literal notranslate"><span class="pre">control_dir</span></code> when
+<code class="docutils literal notranslate"><span class="pre">deployment.trainer.nnodes</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, so remote ranks never need to access the
+SQLite filesystem. A fresh attempt requires fresh control and consumer-state
+directories. <code class="docutils literal notranslate"><span class="pre">store_id</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">run_id</span></code> and can be set explicitly when the
+Mooncake deployment requires another namespace.</p>
+<p>Long producer/consumer waits are unbounded unless <code class="docutils literal notranslate"><span class="pre">idle_timeout_s</span></code>,
+<code class="docutils literal notranslate"><span class="pre">peer_wait_timeout_s</span></code>, or <code class="docutils literal notranslate"><span class="pre">producer_hold_s</span></code> is explicitly configured. This
+avoids terminating healthy training merely because it runs longer than a fixed
+wall-clock default. An explicitly configured timeout is terminal: expiration
+fails the attempt and runs its feature cleanup.</p>
+<p>The file loader translates the former <code class="docutils literal notranslate"><span class="pre">training.deployment_mode</span></code>,
+<code class="docutils literal notranslate"><span class="pre">training.server_urls</span></code>, and <code class="docutils literal notranslate"><span class="pre">training.metadata_db_path</span></code> fields at its migration
+boundary. New recipes use <code class="docutils literal notranslate"><span class="pre">deployment</span></code>; <code class="docutils literal notranslate"><span class="pre">training.role</span></code> remains the canonical
+persisted role selection and normally stays <code class="docutils literal notranslate"><span class="pre">auto</span></code> for a shared config.</p>
+</section>
+<section id="single-node-producer-and-consumer">
+<h2>Single-node producer and consumer<a class="headerlink" href="#single-node-producer-and-consumer" title="Link to this heading">#</a></h2>
+<p>With <code class="docutils literal notranslate"><span class="pre">deployment.trainer.nnodes:</span> <span class="pre">1</span></code>, omitting <code class="docutils literal notranslate"><span class="pre">--role</span></code> starts a supervisor for
+both SpecForge roles:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3-8b-dflash-disaggregated.yaml
+</pre></div>
+</div>
+<p>The checked-in online recipes use the local demo endpoints shown above, so the
+command and <code class="docutils literal notranslate"><span class="pre">--plan</span></code> need no hidden topology variables. Point those typed fields
+at the real services for a remote deployment. Environment values override the
+typed Mooncake endpoint fields when the same recipe runs on another node;
+<code class="docutils literal notranslate"><span class="pre">MOONCAKE_LOCAL_HOSTNAME</span></code> remains node-local.</p>
+<p>The producer is a direct single process. The consumer is automatically launched
+with the configured local process count. If either role fails, the supervisor
+terminates the owned sibling process group and returns the failing status. A
+clean offline shared-directory producer may finish before the consumer without
+canceling it.</p>
+<p>Inspect the resolved plan without starting processes:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3-8b-dflash-disaggregated.yaml<span class="w"> </span>--plan
+</pre></div>
+</div>
+<p>Plan output redacts secret-shaped overrides and credentials embedded in URLs.</p>
+</section>
+<section id="multi-server-capture">
+<h2>Multi-server capture<a class="headerlink" href="#multi-server-capture" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.server_urls</span></code> is an ordered worker topology, not merely
+a set of endpoints. The producer creates one capture adapter and one rollout
+worker for every list entry. All workers lease disjoint prompts from one
+controller, write into the same Mooncake namespace, and publish references to
+the same channel concurrently:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">deployment</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">disaggregated</span>
+<span class="w">  </span><span class="nt">trainer</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">nnodes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">    </span><span class="nt">nproc_per_node</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">  </span><span class="nt">disaggregated</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">control_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">outputs/qwen36-two-capture-servers/control</span>
+<span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mooncake</span>
+<span class="w">    </span><span class="nt">server_urls</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http://capture-0.example:30000</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http://capture-1.example:30000</span>
+</pre></div>
+</div>
+<p>Every server must use the same target model, revision, capture method, and
+auxiliary layer ids. A server failure returns its leased prompts to the shared
+pool; surviving workers can lease and finish them. A worker is removed after
+repeated consecutive failures, and the producer fails loudly rather than
+publishing a successful partial stream if every worker is lost or a prompt
+exhausts its bounded retries.</p>
+<p>Repeating one URL is also intentional: each occurrence creates another worker
+that can issue a blocking capture request to the same server. This can improve
+prefill occupancy without allocating another target replica, subject to that
+server’s request capacity. For example, the following temporary override uses
+four producer workers against one server while keeping the checked-in YAML as
+the source of every other setting:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3-8b-domino-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;deployment.disaggregated.server_urls=[&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;]&#39;</span>
+</pre></div>
+</div>
+<p>In the default external-services mode, listing one or more URLs never starts
+those servers. They must already be healthy and attached to the configured
+Mooncake deployment. The optional
+<code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.managed_local</span></code> profile is a separate, explicit
+single-node development convenience: when configured, it owns local Mooncake
+and capture-server processes and derives their endpoints. Omitting that block
+preserves the external-services behavior exactly. Managed-local launch is for a
+fresh online Mooncake run with automatic producer + consumer supervision; it is
+not a remote scheduler, resume path, existing-torchrun path, or replacement for
+explicit producer and consumer pools.</p>
+<p>The historical self-contained DFlash and Domino topologies each record one
+TP=1 capture server on GPU 0 and a DP=7 trainer on GPUs 1–7:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+</pre></div>
+</div>
+<p>The checked-in multi-server Qwen3-8B Domino recipe records two TP=1 capture
+servers on GPUs 0–1 and a DP=2 trainer on GPUs 2–3. It directly replaces the
+discoverable multi-server behavior of the deleted legacy shell while retaining
+the unified training entry:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml
+</pre></div>
+</div>
+<p>The Qwen3.6 DFlash one-server recipe owns a TP=1 server on GPU 0 and a DP=2
+trainer on GPUs 1–2. Its larger sibling records two TP=2 capture servers on
+GPUs 0–3 and a DP=2 trainer on GPUs 4–5:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+</pre></div>
+</div>
+<p>The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
+starts every configured capture server and waits for every health endpoint,
+then starts the existing producer/consumer plan. A service or role failure
+terminates the owned stack; a clean producer exit leaves capture storage alive
+until the consumer finishes. Normal completion stops capture servers before
+Mooncake. Logs remain under the configured <code class="docutils literal notranslate"><span class="pre">control_dir/logs/</span></code>.</p>
+<p>Managed capture derives SGLang <code class="docutils literal notranslate"><span class="pre">--context-length</span></code> as <code class="docutils literal notranslate"><span class="pre">data.max_length</span> <span class="pre">+</span> <span class="pre">7</span></code> to
+reserve the request headroom required by the capture endpoint. An explicit
+<code class="docutils literal notranslate"><span class="pre">model.sglang_context_length</span></code> must be at least that value.</p>
+</section>
+<section id="split-pools-and-multi-node-consumers">
+<h2>Split pools and multi-node consumers<a class="headerlink" href="#split-pools-and-multi-node-consumers" title="Link to this heading">#</a></h2>
+<p>The same YAML launches either role explicitly:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Inference/ingestion pool</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>producer
+
+<span class="c1"># Trainer pool</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer
+</pre></div>
+</div>
+<p>For offline features split across two physical nodes, the generic wrapper maps
+the launcher-provided rank to those same two commands:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rcli<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>--per-node<span class="w"> </span>&lt;job&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh&#39;</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">RCLI_NODE_RANK=0</span></code> selects the producer and rank 1 selects the consumer. The
+wrapper contains no trainer or transport setup; the shared <code class="docutils literal notranslate"><span class="pre">control_dir</span></code> and
+<code class="docutils literal notranslate"><span class="pre">store_root</span></code> remain in YAML and must resolve to the same fresh attempt storage
+on both nodes. <code class="docutils literal notranslate"><span class="pre">NODE_RANK</span></code>/<code class="docutils literal notranslate"><span class="pre">NUM_NODES</span></code> are accepted on other schedulers.</p>
+<p>For multiple consumer nodes, record the shared topology once:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">deployment</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">disaggregated</span>
+<span class="w">  </span><span class="nt">trainer</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">nnodes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">    </span><span class="nt">nproc_per_node</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="w">    </span><span class="nt">master_addr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trainer-0.example</span>
+<span class="w">    </span><span class="nt">master_port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">29500</span>
+<span class="w">  </span><span class="nt">disaggregated</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">control_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/shared/control/attempt-001</span>
+<span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mooncake</span>
+<span class="w">    </span><span class="nt">server_urls</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">http</span><span class="p p-Indicator">:</span><span class="nv">//capture-server</span><span class="p p-Indicator">:</span><span class="nv">30000</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>Then provide only the node-local identity on each trainer host:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># trainer-0</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">0</span>
+
+<span class="c1"># trainer-1</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">1</span>
+</pre></div>
+</div>
+<p>Automatic <code class="docutils literal notranslate"><span class="pre">--role</span> <span class="pre">both</span></code> rejects <code class="docutils literal notranslate"><span class="pre">nnodes</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>: SpecForge does not SSH to remote
+hosts or impersonate a cluster scheduler. An existing torchrun environment is
+detected and used as the worker environment rather than nesting another
+torchrun. A producer is rejected inside a multi-rank torchrun to prevent
+duplicate capture/ingestion roles.</p>
+<p>The separate-inference-node Qwen3-8B example keeps that scheduler boundary but
+restores full development-stack orchestration:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">DISAGG_STORE_ID</span><span class="o">=</span>qwen3-8b-two-node-attempt-001
+<span class="nb">export</span><span class="w"> </span><span class="nv">DISAGG_RUN_ROOT</span><span class="o">=</span>/shared/specforge/<span class="nv">$DISAGG_STORE_ID</span>
+rcli<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>--per-node<span class="w"> </span>&lt;job&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;bash examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh&#39;</span>
+</pre></div>
+</div>
+<p>Rank 0 starts and health-checks Mooncake and patched SGLang, then invokes the
+canonical producer role. Rank 1 invokes the canonical consumer role, whose
+process count still comes from the YAML. The wrapper coordinates only
+node-local services and shared lifecycle markers; it does not contain another
+trainer or construct <code class="docutils literal notranslate"><span class="pre">torchrun</span></code>. <code class="docutils literal notranslate"><span class="pre">NODE_RANK</span></code>/<code class="docutils literal notranslate"><span class="pre">NUM_NODES</span></code>/<code class="docutils literal notranslate"><span class="pre">HEAD_IP</span></code> may be used
+instead of the corresponding <code class="docutils literal notranslate"><span class="pre">RCLI_*</span></code> variables on another scheduler. Both
+nodes must see a fresh <code class="docutils literal notranslate"><span class="pre">DISAGG_RUN_ROOT</span></code>. References stay under its shared
+<code class="docutils literal notranslate"><span class="pre">control</span></code> directory, while the wrapper’s lifecycle markers stay at the shared
+run root. SQLite/WAL and rank inboxes default to the trainer-local
+<code class="docutils literal notranslate"><span class="pre">/tmp/specforge/$DISAGG_STORE_ID/consumer-state</span></code>. Set
+<code class="docutils literal notranslate"><span class="pre">DISAGG_CONSUMER_STATE_DIR</span></code> or <code class="docutils literal notranslate"><span class="pre">LOCAL_SCRATCH</span></code> to select another node-local
+path. This split-state form currently supports one trainer node only.</p>
+</section>
+<section id="external-and-managed-local-services">
+<h2>External and managed-local services<a class="headerlink" href="#external-and-managed-local-services" title="Link to this heading">#</a></h2>
+<p>Without <code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.managed_local</span></code>, the unified supervisor owns
+only SpecForge producer and consumer processes. Mooncake and patched SGLang are
+external, usually long-lived services managed by Kubernetes, Slurm, systemd, or
+the development environment. In this default mode, the training CLI does not
+start, stop, or assign GPUs to them.</p>
+<p>Install a Mooncake client compatible with the store’s <code class="docutils literal notranslate"><span class="pre">put_from</span></code>/<code class="docutils literal notranslate"><span class="pre">get_into</span></code>
+wire contract on the producer and consumer images:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># CUDA earlier than 13</span>
+pip<span class="w"> </span>install<span class="w"> </span>mooncake-transfer-engine
+
+<span class="c1"># CUDA 13 or later</span>
+pip<span class="w"> </span>install<span class="w"> </span>mooncake-transfer-engine-cuda13
+</pre></div>
+</div>
+<p>Online configs require Mooncake. Stable endpoints may be supplied by the typed
+deployment section or the environment:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MOONCAKE_METADATA_SERVER</span><span class="o">=</span>http://metadata-server:8080/metadata
+<span class="nb">export</span><span class="w"> </span><span class="nv">MOONCAKE_MASTER_SERVER_ADDR</span><span class="o">=</span>mooncake-master:50051
+<span class="nb">export</span><span class="w"> </span><span class="nv">MOONCAKE_LOCAL_HOSTNAME</span><span class="o">=</span>this-node-routable-address
+</pre></div>
+</div>
+<p>Keep <code class="docutils literal notranslate"><span class="pre">DISAGG_AUTH_TOKEN</span></code>, node-local hostnames, and device visibility out of
+checked-in YAML. <code class="docutils literal notranslate"><span class="pre">MOONCAKE_PROTOCOL</span></code> and <code class="docutils literal notranslate"><span class="pre">MOONCAKE_RDMA_DEVICES</span></code> may also be
+node-local deployment values.</p>
+<p>The online producer sends prompts to the URLs in
+<code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.server_urls</span></code>. Start a patched SGLang server separately
+with the model, capture method, and auxiliary layer ids matching the draft
+config. DFlash, Domino, and DSpark use the DFlash capture contract; EAGLE3 and
+P-EAGLE use the EAGLE3 capture contract. Capture rejects chunked prefill and
+radix-cache paths that can truncate the captured sequence. Online capture is
+text-only: VLM training, including Qwen2.5-VL, is not supported. Online
+evaluation is also not supported.</p>
+<p>The repository’s strict e2e gate remains a full local test-stack orchestrator:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>scripts/gates/run_disaggregated_overfit_gate.sh
+</pre></div>
+</div>
+<p>It starts and health-checks Mooncake and SGLang, invokes the canonical training
+entry, verifies overfit and serving behavior, and cleans up every process it
+owns. This preserves complete automated validation without turning the training
+CLI into a production service manager.</p>
+</section>
+<section id="online-runtime-contract">
+<h2>Online runtime contract<a class="headerlink" href="#online-runtime-contract" title="Link to this heading">#</a></h2>
+<p>Consumer ranks always use one path:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>RefDistributor (rank 0)
+  -&gt; one InboxChannel per rank
+  -&gt; one StreamingRefQueue per rank
+  -&gt; FeatureDataLoader
+  -&gt; DPAckController at the optimizer boundary
+</pre></div>
+</div>
+<p>Rank 0 publishes a global dispatch quantum before capture:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>quantum = consumer_world_size * batch_size * accumulation_steps
+</pre></div>
+</div>
+<p>When both <code class="docutils literal notranslate"><span class="pre">training.total_steps</span></code> and <code class="docutils literal notranslate"><span class="pre">training.max_steps</span></code> are omitted, the
+producer publishes the schedule horizon derived from the prepared prompt count,
+<code class="docutils literal notranslate"><span class="pre">training.num_epochs</span></code>, and this quantum. The consumer validates that contract,
+uses it for optimizer and Domino loss schedules, and still trains until EOF.</p>
+<p>The producer waits for that handshake. Configure bounded capture under
+<code class="docutils literal notranslate"><span class="pre">runtime</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">runtime</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">producer_lease</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="w">  </span><span class="nt">in_flight_high_watermark</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">  </span><span class="nt">in_flight_low_watermark</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">192</span>
+<span class="w">  </span><span class="nt">resident_high_watermark_bytes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+<span class="w">  </span><span class="nt">resident_low_watermark_bytes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+<span class="w">  </span><span class="nt">feature_store_max_resident_bytes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+</pre></div>
+</div>
+<p>High/low thresholds implement hysteresis. The optional hard resident cap rejects
+and cleans a new capture before publication. A partial quantum at EOF is settled
+without dispatch rather than training an incomplete optimizer step.</p>
+<p>Consumer rank 0 is the only source-channel reader and SQLite writer. At an
+optimizer boundary, <code class="docutils literal notranslate"><span class="pre">DPAckController</span></code> commits sample ids and the durable marker,
+removes their feature objects, then advances the channel counters. A crash
+before the transaction replays refs; a crash after it skips them.</p>
+</section>
+<section id="offline-shared-directory-and-mooncake-stores">
+<h2>Offline shared-directory and Mooncake stores<a class="headerlink" href="#offline-shared-directory-and-mooncake-stores" title="Link to this heading">#</a></h2>
+<p>The checked-in offline recipe uses a shared directory:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">deployment</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">disaggregated</span>
+<span class="w">  </span><span class="nt">trainer</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">nnodes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">    </span><span class="nt">nproc_per_node</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">  </span><span class="nt">disaggregated</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">control_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">outputs/qwen3-8b-eagle3-offline-disaggregated/control</span>
+<span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">shared_dir</span>
+<span class="w">    </span><span class="nt">store_root</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">outputs/qwen3-8b-eagle3-offline-disaggregated/features</span>
+</pre></div>
+</div>
+<p>Both paths must be visible at the same location from producer and consumer
+nodes. The producer ingests existing EAGLE3, DFlash, or Domino features and
+publishes a fixed manifest. Offline epochs remain re-iterable.</p>
+<p>Set <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">mooncake</span></code> instead, omit <code class="docutils literal notranslate"><span class="pre">store_root</span></code>, and provide the Mooncake
+endpoints to use the remote store. Also set a positive
+<code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.producer_segment_size</span></code>: unlike online server-owned
+captures, an offline producer owns the objects it ingests until the consumer
+acknowledges them. <code class="docutils literal notranslate"><span class="pre">MOONCAKE_GLOBAL_SEGMENT_SIZE</span></code> remains a compatibility
+fallback. The consumer uses a zero-sized client segment. A Mooncake offline
+producer remains alive until the consumer reports completion; the single-node
+supervisor handles that lifecycle.</p>
+</section>
+<section id="resume-and-freshness">
+<h2>Resume and freshness<a class="headerlink" href="#resume-and-freshness" title="Link to this heading">#</a></h2>
+<p>For every new online attempt, the consumer database and its WAL/SHM sidecars
+must not exist. The launcher checks that rule on global rank 0. Resume requires
+the retained database and a matching checkpoint:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>training.resume_from<span class="o">=</span>outputs/run/run-latest
+</pre></div>
+</div>
+<p>With the default <code class="docutils literal notranslate"><span class="pre">--role</span> <span class="pre">auto</span></code>, a disaggregated config containing
+<code class="docutils literal notranslate"><span class="pre">training.resume_from</span></code> resolves to consumer-only. Explicit <code class="docutils literal notranslate"><span class="pre">--role</span> <span class="pre">both</span></code> is
+rejected because producers are never resumed. Reuse the same control directory,
+store id, run id, output directory, consumer topology, and Mooncake objects.
+The durable optimizer-step acknowledgement must equal the checkpoint step.
+Because acknowledgements may advance between periodic checkpoints, a crash in
+that interval is deliberately rejected instead of replaying already-consumed
+samples or silently skipping optimizer state; use a more frequent save interval
+when that recovery window matters.</p>
+<p>Offline disaggregated resume also launches only the consumer against the
+retained manifest/store. Changing trainer world size during exact optimizer
+state resume is outside the current contract.</p>
+<p>The optional scripts <code class="docutils literal notranslate"><span class="pre">examples/disagg/run_online.sh</span></code> and
+<code class="docutils literal notranslate"><span class="pre">examples/disagg/run_offline.sh</span></code> are thin delegates to the same command. Their
+arguments use the CLI form, for example <code class="docutils literal notranslate"><span class="pre">run_online.sh</span> <span class="pre">--role</span> <span class="pre">producer</span></code>; they do
+not parse <code class="docutils literal notranslate"><span class="pre">NPROC_PER_NODE</span></code>, construct torchrun, or manage transport state.</p>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="training.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Training</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../advanced_features/customization.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Customize a training run</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#one-config-owns-the-launch-topology">One config owns the launch topology</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#single-node-producer-and-consumer">Single-node producer and consumer</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-server-capture">Multi-server capture</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#split-pools-and-multi-node-consumers">Split pools and multi-node consumers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#external-and-managed-local-services">External and managed-local services</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-runtime-contract">Online runtime contract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#offline-shared-directory-and-mooncake-stores">Offline shared-directory and Mooncake stores</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#resume-and-freshness">Resume and freshness</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SpecForge Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SpecForge.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Jul 18, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
