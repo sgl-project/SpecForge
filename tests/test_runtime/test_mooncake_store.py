@@ -30,10 +30,8 @@ from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 class _FakeMooncakeStore:
     """In-memory stand-in for MooncakeDistributedStore (API subset).
 
-    Supports BOTH the zero-copy raw-buffer API (``put_from``/``get_into`` +
-    ``register_buffer``, simulated with ctypes against the real buffer pointers)
-    and the legacy byte API (``put``/``get``), so the contract is exercised on
-    either transport without a running master.
+    The raw-buffer API (``put_from``/``get_into`` + ``register_buffer``) is
+    simulated with ctypes against the real buffer pointers.
     """
 
     def __init__(self) -> None:
@@ -48,18 +46,7 @@ class _FakeMooncakeStore:
     def is_exist(self, key):
         return 1 if key in self._d else 0
 
-    def put(self, key, value, config=None):
-        self.last_config = config
-        self.put_calls += 1
-        if self.put_calls == self.fail_put_call:
-            return -1
-        self._d[key] = bytes(value)
-        return 0
-
-    def get(self, key):
-        return self._d.get(key, b"")
-
-    # -- zero-copy raw-buffer API (ctypes-simulated) -----------------------
+    # -- raw-buffer API (ctypes-simulated) ---------------------------------
     def register_buffer(self, ptr, size):
         return 0
 
@@ -96,13 +83,9 @@ class _FakeMooncakeStore:
 
 
 def _phys_resident(fake, sid="s0", store_id="run0"):
-    """Transport-agnostic: do the sample's bytes physically exist in the fake?
-
-    pickle: one key ``run0/s0``; zero-copy: ``run0/s0/g{gen}/{name}`` keys.
-    """
-    exact = f"{store_id}/{sid}"
-    prefix = exact + "/"
-    return any(k == exact or k.startswith(prefix) for k in fake._d)
+    """Do any per-tensor objects for the sample remain in the fake?"""
+    prefix = f"{store_id}/{sid}/"
+    return any(k.startswith(prefix) for k in fake._d)
 
 
 class _FakeClock:
@@ -291,7 +274,7 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         with self.assertRaises(MemoryError):
             owner.adopt(unknown_size_ref)
 
-    def test_partial_zero_copy_put_removes_written_keys(self):
+    def test_partial_raw_put_removes_written_keys(self):
         fake = _FakeMooncakeStore()
         fake.fail_put_call = 2
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
@@ -302,7 +285,7 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fake._d, {})
         self.assertEqual(fs.health()["release_pending"], 0)
 
-    def test_partial_zero_copy_put_tracks_failed_cleanup_until_drain(self):
+    def test_partial_raw_put_tracks_failed_cleanup_until_drain(self):
         fake = _FakeMooncakeStore()
         fake.fail_put_call = 2
         fake.fail_remove = True
@@ -562,37 +545,21 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             fs.get(ref)  # logically aborted -> KeyError (no use-after-free)
 
-    def test_reput_with_failed_remove_warns_and_supersedes(self):
-        # Pickle path: re-put when the pre-remove of the prior hard-pinned blob
-        # fails must still publish the new generation (overwriting the single key)
-        # and warn loudly that a pinned blob may be orphaned. The stale ref is then
-        # refused by the generation guard (the overwrite replaced the blob).
-        # (Zero-copy uses distinct per-generation keys, so a failed remove leaves
-        # the stale generation readable -- covered separately below.)
-        fake = _FakeMooncakeStore()
-        fs = MooncakeFeatureStore(store=fake, store_id="run0", zero_copy=False)
-        ref1 = fs.put(_tensors(), sample_id="s0", metadata=_meta())
-        fake.fail_remove = True
-        with self.assertLogs(
-            "specforge.runtime.data_plane.mooncake_store", level="WARNING"
-        ) as cm:
-            ref2 = fs.put(_tensors(), sample_id="s0", metadata=_meta())
-        self.assertTrue(
-            any("orphan" in line.lower() for line in cm.output),
-            f"expected an orphan warning, got {cm.output}",
-        )
-        out, _ = fs.get(ref2)  # the new generation is resident + served
-        self.assertIn("hidden_state", out)
-        with self.assertRaises(KeyError):
-            fs.get(ref1)  # the superseded ref is refused (generation guard)
 
+class TestMooncakeFeatureStoreWireContract(unittest.TestCase):
+    """The only wire format is one raw Mooncake object per tensor."""
 
-class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
-    """Zero-copy transport specifics (the default): per-tensor keys, no pickle."""
+    def test_backend_without_raw_api_fails_fast(self):
+        class _ObjectOnly(_FakeMooncakeStore):
+            put_from = None
+            get_into = None
 
-    def test_zero_copy_is_the_default(self):
-        fs = _store()
-        self.assertTrue(fs._zero_copy)
+        with self.assertRaises(RuntimeError) as raised:
+            MooncakeFeatureStore(store=_ObjectOnly(), store_id="run0")
+        message = str(raised.exception)
+        self.assertIn("put_from/get_into", message)
+        self.assertIn("Upgrade", message)
+        self.assertIn("serialized put/get transport is not supported", message)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for pinning")
     def test_selected_get_can_fill_pinned_destination_directly(self):
@@ -606,21 +573,6 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
         self.assertTrue(out["hidden_state"].is_pinned())
         torch.testing.assert_close(out["hidden_state"], src["hidden_state"])
 
-    def test_falls_back_to_pickle_without_raw_api(self):
-        # a backend that lacks put_from/get_into must transparently use the blob
-        # path (and still round-trip).
-        class _ByteOnly(_FakeMooncakeStore):
-            put_from = None
-            get_into = None
-
-        fs = MooncakeFeatureStore(store=_ByteOnly(), store_id="run0")
-        self.assertFalse(fs._zero_copy)
-        src = _tensors()
-        ref = fs.put(src, sample_id="s0", metadata=_meta())
-        out, _ = fs.get(ref)
-        for k in src:
-            self.assertTrue(torch.equal(out[k], src[k]))
-
     def test_one_object_per_tensor_with_generation_in_key(self):
         fake = _FakeMooncakeStore()
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
@@ -629,18 +581,17 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
             set(fake._d),
             {"run0/s0/g1/hidden_state", "run0/s0/g1/target", "run0/s0/g1/input_ids"},
         )
-        # no pickle blob was written under the bare sample key
+        # No serialized aggregate object is written under the bare sample key.
         self.assertNotIn("run0/s0", fake._d)
 
-    def test_no_pickle_on_the_wire(self):
-        # the stored bytes are the raw tensor buffer, not a torch.save pickle
-        # (which would begin with the PK zip magic or the pickle protocol byte).
+    def test_wire_bytes_are_exactly_the_raw_tensor(self):
+        # The stored bytes are exactly the raw tensor buffer, not an archive.
         fake = _FakeMooncakeStore()
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
         fs.put(_tensors(), sample_id="s0", metadata=_meta())
-        blob = fake._d["run0/s0/g1/hidden_state"]
-        self.assertEqual(len(blob), 4 * 8 * 4)  # 4x8 float32, exactly the raw bytes
-        self.assertFalse(blob[:2] == b"PK")  # not a torch.save zip archive
+        wire_bytes = fake._d["run0/s0/g1/hidden_state"]
+        self.assertEqual(len(wire_bytes), 4 * 8 * 4)
+        self.assertFalse(wire_bytes[:2] == b"PK")
 
     def test_reput_success_supersedes_old_generation(self):
         fake = _FakeMooncakeStore()
@@ -657,7 +608,7 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
         # (a truncated / partially-written object the backend still reports
         # present) must raise -- never return a tensor whose uninitialized tail is
         # silent garbage. get_into returns the byte count, so a short count != nb
-        # is the signal. Simulate by truncating the stored blob.
+        # is the signal. Simulate by truncating the stored object.
         fake = _FakeMooncakeStore()
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
@@ -699,8 +650,8 @@ class TestMooncakeFeatureStoreCrossProcess(unittest.TestCase):
         self.assertEqual(producer.health()["resident_samples"], 1)
 
     def test_cross_process_stale_generation_rejected(self):
-        # producer re-puts (gen bumps on the shared blob); the consumer's original
-        # ref is stale and must be refused via the on-disk generation guard, even
+        # Producer re-puts (gen bumps in the key); the consumer's original ref is
+        # stale and must be refused via the missing generation objects, even
         # though the consumer's in-process index never saw either put.
         fake, producer, consumer = _shared_pair(retain_on_release=True)
         ref1 = producer.put(_tensors(), sample_id="s0", metadata=_meta())
@@ -720,8 +671,8 @@ class TestMooncakeFeatureStoreCrossProcess(unittest.TestCase):
             consumer.get(ref)
 
     def test_cross_process_consume_once_free_by_consumer(self):
-        # Consume-once consumer (retain_on_release=False) frees the shared blob on
-        # release; the producer can then no longer resolve the ref.
+        # Consume-once consumer (retain_on_release=False) frees the shared tensor
+        # objects on release; the producer can then no longer resolve the ref.
         fake, producer, consumer = _shared_pair()  # consumer frees on release
         ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
         _, handle = consumer.get(ref)
