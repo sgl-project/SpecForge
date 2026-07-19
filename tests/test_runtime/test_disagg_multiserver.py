@@ -66,6 +66,7 @@ def _adapter(store, post_fn, url="http://server:30000"):
         store,
         run_id="run0",
         algorithm=ALGORITHM.name,
+        capture_token="unit-capture-token",
         schema=ServerCaptureSchema(
             aux_feature=layout.aux_feature,
             last_hidden_feature=layout.last_hidden_feature,

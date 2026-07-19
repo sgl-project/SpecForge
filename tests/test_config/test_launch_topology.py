@@ -39,6 +39,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-4b-eagle3-online.yaml": 1,
     "qwen3-8b-dflash-disaggregated.yaml": 4,
     "qwen3-8b-dflash-1server-dp7-disaggregated.yaml": 7,
+    "qwen3-8b-dflash-windowed-fanout.yaml": 1,
     "qwen3-8b-dflash-online.yaml": 8,
     "qwen3-8b-domino-1server-dp7-disaggregated.yaml": 7,
     "qwen3-8b-domino-disaggregated.yaml": 4,
@@ -92,6 +93,75 @@ EXPECTED_DISAGGREGATED = {
         "backend": "mooncake",
         "server_urls": ["http://127.0.0.1:30000"],
         **LOCAL_MOONCAKE_ENDPOINTS,
+    },
+    "qwen3-8b-dflash-windowed-fanout.yaml": {
+        "control_dir": "./outputs/qwen3-8b-dflash-windowed-fanout/control",
+        "backend": "mooncake",
+        "client_buffer_size": 1073741824,
+        "windowed_fanout": {
+            "window_lookbehind": 2,
+            "window_lookahead": 16,
+            "max_prefetch_per_consumer": 8,
+            "max_outstanding_per_consumer": 8,
+            "max_live_refs": 48,
+            "max_live_bytes": 25769803776,
+            "capture_reservation_bytes": 536870912,
+            "capture_max_sample_bytes": 536870912,
+            "capture_batch_size": 8,
+            "consumer_prefetch_batches": 1,
+            "consumers": [
+                {
+                    "consumer_id": "dflash-b4",
+                    "seed": 42,
+                    "loss_type": "dflash",
+                    "loss_decay_gamma": 7.0,
+                    "dpace_alpha": 0.5,
+                    "draft_block_size": 4,
+                    "num_anchors": 64,
+                    "learning_rate": 0.0006,
+                    "warmup_ratio": 0.04,
+                },
+                {
+                    "consumer_id": "dflash-b8",
+                    "seed": 43,
+                    "loss_type": "dflash",
+                    "loss_decay_gamma": 7.0,
+                    "dpace_alpha": 0.5,
+                    "draft_block_size": 8,
+                    "num_anchors": 128,
+                    "learning_rate": 0.0006,
+                    "warmup_ratio": 0.04,
+                },
+                {
+                    "consumer_id": "dflash-b16",
+                    "seed": 44,
+                    "loss_type": "dflash",
+                    "loss_decay_gamma": 7.0,
+                    "dpace_alpha": 0.5,
+                    "draft_block_size": 16,
+                    "num_anchors": 256,
+                    "learning_rate": 0.0006,
+                    "warmup_ratio": 0.04,
+                },
+            ],
+        },
+        "managed_local": {
+            "trainer_cuda_visible_devices": ["1", "2", "3"],
+            "shutdown_grace_s": 120,
+            "mooncake": {
+                "protocol": "tcp",
+                "global_segment_size_bytes": 34359738368,
+                "local_buffer_size_bytes": 1073741824,
+            },
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0"],
+                    "tp_size": 1,
+                    "mem_fraction_static": 0.5,
+                }
+            ],
+        },
     },
     "qwen3-8b-dflash-1server-dp7-disaggregated.yaml": {
         "control_dir": ("outputs/qwen3-8b-dflash-1server-dp7-disaggregated/control"),
@@ -266,7 +336,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 55)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 56)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
