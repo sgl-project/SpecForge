@@ -1,13 +1,13 @@
 # Benchmarking inference serving
 
 Use `benchmarks/bench_eagle3.py` to compare EAGLE3 serving configurations and
-dataset quality. Use `specforge benchmark sglang` to measure any existing
+dataset quality. Use `specforge benchmark` to measure any existing
 SGLang deployment without assuming a particular speculative algorithm.
 
 | Runner | Server lifecycle | Measurements | Output |
 | --- | --- | --- | --- |
 | `python benchmarks/bench_eagle3.py` | Launches SGLang per configuration or uses an existing server | Latency, output throughput, acceptance length, and dataset accuracy when available | Timestamped JSON under `--output-dir` |
-| `specforge benchmark sglang` | Uses an existing SGLang server | Aggregate output throughput, acceptance length, and verification count when reported by SGLang | Console and optional `--output-json` |
+| `specforge benchmark` | Uses an existing SGLang server | Aggregate output throughput, acceptance length, and verification count when reported by SGLang | Console and optional `--output-json` |
 
 ## EAGLE3 benchmark matrix
 
@@ -51,7 +51,7 @@ The existing-server runner supports target-only and speculative deployments on
 GSM8K, MATH-500, HumanEval, MBPP, and MT-Bench.
 
 ```bash
-specforge benchmark sglang \
+specforge benchmark \
   --model Qwen/Qwen3-8B \
   --dataset gsm8k \
   --base-url http://127.0.0.1:30000 \

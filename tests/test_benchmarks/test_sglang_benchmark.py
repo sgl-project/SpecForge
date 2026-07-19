@@ -71,7 +71,6 @@ class SGLangBenchmarkTest(unittest.TestCase):
             status = main(
                 [
                     "benchmark",
-                    "sglang",
                     "--model",
                     "thinkingmachines/Inkling",
                     "--dataset",
@@ -87,7 +86,7 @@ class SGLangBenchmarkTest(unittest.TestCase):
 
         output = StringIO()
         with redirect_stdout(output), self.assertRaises(SystemExit) as exited:
-            main(["benchmark", "sglang", "--help"])
+            main(["benchmark", "--help"])
 
         self.assertEqual(exited.exception.code, 0)
         help_text = " ".join(output.getvalue().split())

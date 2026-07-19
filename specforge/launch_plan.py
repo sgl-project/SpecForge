@@ -19,7 +19,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
-from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config
+from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfig
 
 if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
@@ -359,6 +359,33 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
     return values
 
 
+def _sglang_argv(
+    model: ModelConfig,
+    *,
+    overrides: Optional[Mapping[str, object]] = None,
+) -> list[str]:
+    """Derive SGLang CLI args from all ``sglang_*`` fields on *model*.
+
+    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``.
+    Fields whose values require non-trivial resolution (server-level overrides,
+    fallback computations) are passed via *overrides* keyed by the original
+    field name; every other ``sglang_*`` field is read directly from *model*.
+    """
+    resolved = overrides or {}
+    argv: list[str] = []
+    for name in ModelConfig.model_fields:
+        if not name.startswith("sglang_"):
+            continue
+        value = resolved[name] if name in resolved else getattr(model, name)
+        flag = "--" + name.removeprefix("sglang_").replace("_", "-")
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+        elif value is not None:
+            argv.extend((flag, str(value)))
+    return argv
+
+
 def _managed_local_services(
     cfg: Config,
     *,
@@ -422,16 +449,6 @@ def _managed_local_services(
                 "--skip-tokenizer-init",
                 "--tp-size",
                 str(server.tp_size),
-                "--context-length",
-                str(capture_context_length),
-                "--mem-fraction-static",
-                str(
-                    server.mem_fraction_static
-                    if server.mem_fraction_static is not None
-                    else cfg.model.sglang_mem_fraction_static
-                ),
-                "--ep-size",
-                str(cfg.model.sglang_ep_size),
                 "--chunked-prefill-size",
                 "-1",
                 "--enable-spec-capture",
@@ -443,45 +460,25 @@ def _managed_local_services(
                 "127.0.0.1",
                 "--port",
                 str(server.port),
-                "--attention-backend",
-                server.attention_backend or cfg.model.sglang_attention_backend,
             ]
         )
-        for enabled, flag in (
-            (cfg.model.sglang_enable_nccl_nvls, "--enable-nccl-nvls"),
-            (cfg.model.sglang_enable_symm_mem, "--enable-symm-mem"),
-            (cfg.model.sglang_enable_torch_compile, "--enable-torch-compile"),
-        ):
-            if enabled:
-                argv.append(flag)
-        for value, flag in (
-            (cfg.model.sglang_max_running_requests, "--max-running-requests"),
-            (cfg.model.sglang_max_total_tokens, "--max-total-tokens"),
-            (cfg.model.sglang_dp_size, "--dp-size"),
-            (cfg.model.sglang_moe_a2a_backend, "--moe-a2a-backend"),
-            (cfg.model.sglang_moe_runner_backend, "--moe-runner-backend"),
-            (cfg.model.sglang_page_size, "--page-size"),
-            (cfg.model.sglang_quantization, "--quantization"),
-            (
-                cfg.model.sglang_fp4_gemm_runner_backend,
-                "--fp4-gemm-runner-backend",
-            ),
-            (
-                cfg.model.sglang_mamba_radix_cache_strategy,
-                "--mamba-radix-cache-strategy",
-            ),
-            (cfg.model.sglang_max_mamba_cache_size, "--max-mamba-cache-size"),
-            (
-                cfg.model.sglang_swa_full_tokens_ratio,
-                "--swa-full-tokens-ratio",
-            ),
-            (
-                cfg.model.sglang_mamba_full_memory_ratio,
-                "--mamba-full-memory-ratio",
-            ),
-        ):
-            if value is not None:
-                argv.extend((flag, str(value)))
+        argv.extend(
+            _sglang_argv(
+                cfg.model,
+                overrides={
+                    "sglang_context_length": capture_context_length,
+                    "sglang_mem_fraction_static": (
+                        server.mem_fraction_static
+                        if server.mem_fraction_static is not None
+                        else cfg.model.sglang_mem_fraction_static
+                    ),
+                    "sglang_attention_backend": (
+                        server.attention_backend
+                        or cfg.model.sglang_attention_backend
+                    ),
+                },
+            )
+        )
         service_env = {
             **shared_env,
             "CUDA_VISIBLE_DEVICES": ",".join(server.cuda_visible_devices),
