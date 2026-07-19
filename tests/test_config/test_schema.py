@@ -303,6 +303,30 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Config.model_validate(bad)
 
+    def test_removed_dspark_objective_selector_is_rejected(self):
+        payload = _online_payload("dspark")
+        payload["training"]["dspark_objective_mode"] = "legacy"
+        with self.assertRaisesRegex(ValidationError, "dspark_objective_mode"):
+            Config.model_validate(payload)
+
+    def test_objective_chunk_blocks_is_shared_and_typed(self):
+        for strategy in ("dflash", "domino", "dspark"):
+            payload = _online_payload(strategy)
+            payload["training"]["objective_chunk_blocks"] = 0
+            with self.subTest(strategy=strategy):
+                config = Config.model_validate(payload)
+                self.assertEqual(config.training.objective_chunk_blocks, 0)
+
+        payload = _online_payload("dflash")
+        payload["training"]["objective_chunk_blocks"] = -1
+        with self.assertRaisesRegex(ValidationError, "objective_chunk_blocks"):
+            Config.model_validate(payload)
+
+        payload = _online_payload("dspark")
+        payload["training"]["dspark_objective_chunk_blocks"] = 1
+        with self.assertRaisesRegex(ValidationError, "dspark_objective_chunk_blocks"):
+            Config.model_validate(payload)
+
     def test_unknown_fields_and_unsupported_modes_fail_early(self):
         with self.assertRaises(ValidationError):
             Config.model_validate(

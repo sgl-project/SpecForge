@@ -137,11 +137,24 @@ def _load_text_tokenizer(cfg: Config):
         )
     from transformers import AutoTokenizer
 
-    return AutoTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
+    if cfg.model.tokenizer_pad_token_id is not None:
+        tokenizer.pad_token_id = cfg.model.tokenizer_pad_token_id
+    elif tokenizer.pad_token_id is None:
+        fallback_id = tokenizer.eos_token_id
+        if fallback_id is None:
+            fallback_id = tokenizer.unk_token_id
+        if fallback_id is None:
+            raise ValueError(
+                "target tokenizer has no pad, EOS, or unknown token ID; set "
+                "model.tokenizer_pad_token_id explicitly"
+            )
+        tokenizer.pad_token_id = fallback_id
+    return tokenizer
 
 
 def _load_input_tools(
@@ -163,20 +176,27 @@ def _load_input_tools(
 def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:
     """Build the method-specific composite model and frozen target pieces."""
     import torch
-    from transformers import AutoConfig
+
+    from specforge.modeling.target.target_utils import (
+        load_target_config,
+        target_text_config,
+    )
+    from specforge.modeling.target.target_utils import (
+        target_vocab_size as resolve_target_vocab_size,
+    )
 
     provider = algorithm.providers.model
     draft_config, draft_model = _load_draft(cfg, algorithm)
     needs_input_tools = provider.needs_input_tools(cfg, draft_model)
     input_tools = _load_input_tools(cfg, algorithm) if needs_input_tools else None
-    target_config = AutoConfig.from_pretrained(
+    target_config = load_target_config(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
-    text_config = _target_text_config(target_config)
+    text_config = target_text_config(target_config)
     target_hidden_size = int(text_config.hidden_size)
-    target_vocab_size = int(text_config.vocab_size)
+    target_vocab_size = resolve_target_vocab_size(target_config)
     draft_vocab_size = int(
         getattr(draft_config, "draft_vocab_size", draft_config.vocab_size)
     )
@@ -246,6 +266,7 @@ class _ConfiguredOptimizerFactory:
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
             total_steps=self.total_steps,
+            offload_master=t.optimizer_cpu_offload,
         )
 
 
@@ -294,10 +315,18 @@ def _close_configured_logger(logger) -> None:
 
 
 def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
-    import json
+    source_path = path or cfg.data.prompts_path or cfg.data.train_data_path
+    content_hash = None
+    if source_path and os.path.isfile(source_path):
+        source_hasher = hashlib.sha256()
+        with open(source_path, "rb") as source_file:
+            for chunk in iter(lambda: source_file.read(8 * 1024 * 1024), b""):
+                source_hasher.update(chunk)
+        content_hash = source_hasher.hexdigest()
 
     identity = {
-        "path": path or cfg.data.prompts_path or cfg.data.train_data_path,
+        "path": source_path,
+        "content_hash": content_hash,
         "max_length": cfg.data.max_length,
         "chat_template": cfg.data.chat_template,
         "is_preformatted": cfg.data.is_preformatted,

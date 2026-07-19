@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import tokenize
 import tomllib
@@ -255,8 +256,11 @@ DRAFT_MODEL_BUILDERS = CANONICAL_LAUNCH_EXPORTS - {
 }
 
 CANONICAL_DRAFT_CONFIGS = {
+    "glm-5.2-dspark.json",
+    "inkling-dspark.json",
     "llama3-8B-eagle3.json",
     "qwen3-4b-dspark.json",
+    "qwen3-8b-dspark.json",
     "qwen3-8b-dflash.json",
     "qwen3-8b-domino.json",
     "qwen3-8b-eagle3.json",
@@ -696,6 +700,35 @@ class TestPackageArchitecture(unittest.TestCase):
     def test_only_canonical_draft_configs_are_checked_in(self):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
         self.assertTrue(CANONICAL_DRAFT_CONFIGS.issubset(present))
+
+    def test_dspark_configs_are_qwen3_gqa_only(self):
+        dspark_configs = {}
+        for path in sorted((REPO_ROOT / "configs").glob("*.json")):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if "DSparkDraftModel" in payload.get("architectures", []):
+                dspark_configs[path.name] = payload
+
+        self.assertEqual(
+            set(dspark_configs),
+            {
+                "glm-5.2-dspark.json",
+                "inkling-dspark.json",
+                "qwen3-4b-dspark.json",
+                "qwen3-8b-dspark.json",
+            },
+        )
+        for name, payload in dspark_configs.items():
+            with self.subTest(config=name):
+                self.assertEqual(payload["model_type"], "qwen3")
+                self.assertEqual(payload["dflash_config"]["attention_mode"], "gqa")
+                self.assertLess(
+                    payload["num_key_value_heads"],
+                    payload["num_attention_heads"],
+                )
+                self.assertEqual(
+                    payload["num_attention_heads"] % payload["num_key_value_heads"],
+                    0,
+                )
 
     def test_examples_and_scripts_do_not_bypass_the_cli(self):
         direct_imports = []

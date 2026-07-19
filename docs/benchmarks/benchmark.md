@@ -1,87 +1,83 @@
-# Benchmarking speculative decoding
+# Benchmarking inference serving
 
-The repository keeps the model-quality and serving-performance benchmark suite
-under `benchmarks/`. It is independent from training: train and export a draft
-through the unified `specforge` CLI, then benchmark that exported artifact
-against an SGLang server.
+Use `benchmarks/bench_eagle3.py` to compare EAGLE3 serving configurations and
+dataset quality. Use `specforge benchmark sglang` to measure any existing
+SGLang deployment without assuming a particular speculative algorithm.
 
-## Run server and benchmarks together
+| Runner | Server lifecycle | Measurements | Output |
+| --- | --- | --- | --- |
+| `python benchmarks/bench_eagle3.py` | Launches SGLang per configuration or uses an existing server | Latency, output throughput, acceptance length, and dataset accuracy when available | Timestamped JSON under `--output-dir` |
+| `specforge benchmark sglang` | Uses an existing SGLang server | Aggregate output throughput, acceptance length, and verification count when reported by SGLang | Console and optional `--output-json` |
 
-From the repository root:
+## EAGLE3 benchmark matrix
 
-```bash
-python benchmarks/bench_eagle3.py \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-draft-model-path /path/to/exported-draft \
-    --port 30000 \
-    --trust-remote-code \
-    --mem-fraction-static 0.8 \
-    --tp-size 1 \
-    --attention-backend fa3 \
-    --config-list 1,0,0,0 1,3,1,4 \
-    --benchmark-list mtbench gsm8k:5 ceval:5:accountant \
-    --dtype bfloat16
-```
-
-Each `--config-list` entry is
-`batch-size,num-steps,topk,num-draft-tokens`. Benchmark selectors use
-`name[:num-prompts[:subset,...]]`. Available datasets include AIME, C-Eval,
-FinanceQA, GPQA, GSM8K, HumanEval, LiveCodeBench, MATH-500, MBPP, MMLU,
-MMStar, MT-Bench, and SimpleQA.
-
-## Benchmark an existing server
-
-Start SGLang separately, then add `--skip-launch-server`:
+### Launch SGLang for each configuration
 
 ```bash
 python benchmarks/bench_eagle3.py \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --port 30000 \
-    --config-list 1,3,1,4 \
-    --benchmark-list mtbench:5 gsm8k:5 humaneval:5 math500:5 \
-    --skip-launch-server
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --speculative-draft-model-path /path/to/exported-draft \
+  --port 30000 \
+  --trust-remote-code \
+  --mem-fraction-static 0.8 \
+  --tp-size 1 \
+  --attention-backend fa3 \
+  --config-list 1,0,0,0 1,3,1,4 \
+  --benchmark-list mtbench gsm8k:5 ceval:5:accountant \
+  --dtype bfloat16
 ```
 
-Results are written as timestamped JSON under `--output-dir`. The standalone
-GPU microbenchmarks `bench_domino_mfu.py`,
-`specforge/benchmarks/benchmark_flex_attention.py`, and
-`specforge/benchmarks/benchmark_loss.py` cover trainer MFU, attention, and loss
-kernel behavior respectively.
+- `--config-list` uses `batch-size,num-steps,topk,num-draft-tokens`; `1,0,0,0` is a target-only baseline.
+- `--benchmark-list` uses `name[:num-prompts[:subset,...]]`.
+- Supported datasets are AIME, C-Eval, FinanceQA, GPQA, GSM8K, HumanEval, LiveCodeBench, MATH-500, MBPP, MMLU, MMStar, MT-Bench, and SimpleQA.
+- The runner starts a fresh server for each configuration, runs every requested dataset, flushes the cache between datasets, and writes results under `--output-dir`.
 
-HumanEval and MBPP execute model-generated Python while scoring. Run those two
-benchmarks only in an isolated container or devbox with no credentials or
-production data mounted.
+### Use an existing SGLang server
 
-## Retained validation artifacts
+```bash
+python benchmarks/bench_eagle3.py \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --port 30000 \
+  --config-list 1,3,1,4 \
+  --benchmark-list mtbench:5 gsm8k:5 humaneval:5 math500:5 \
+  --skip-launch-server
+```
 
-The repository keeps the existing training-equivalence and convergence plots
-as provenance for the runtime cutover. They are reference results, not a
-substitute for rerunning the benchmark suite on the current commit.
+With `--skip-launch-server`, the runner does not change the server's speculative settings. The first `--config-list` entry supplies only the request batch size.
 
-### DataFlow cutover equivalence
+## General SGLang benchmark
 
-These 100-step traces compare the former trainer (`main`) with colocated and
-disaggregated DataFlow execution. Keeping them next to the benchmark suite
-makes the behavioral evidence available after the duplicate trainers are
-removed.
+The existing-server runner supports target-only and speculative deployments on
+GSM8K, MATH-500, HumanEval, MBPP, and MT-Bench.
 
-![Qwen2.5-0.5B DFlash legacy, colocated, and disaggregated loss equivalence](../../examples/assets/qwen2.5-0.5b-dflash-vs-main.png)
+```bash
+specforge benchmark sglang \
+  --model Qwen/Qwen3-8B \
+  --dataset gsm8k \
+  --base-url http://127.0.0.1:30000 \
+  --num-prompts 1024 \
+  --concurrency 16 \
+  --output-json ./qwen3-8b-gsm8k.json
+```
 
-![Qwen2.5-0.5B EAGLE3 legacy, colocated, and disaggregated loss equivalence](../../examples/assets/qwen2.5-0.5b-eagle3-vs-main.png)
+- Start SGLang with the target-only or speculative configuration you want to measure; this command does not launch or reconfigure the server.
+- The runner flushes the server cache, runs one concurrency-sized warmup batch, excludes warmup from the measurement, and then sends `--num-prompts` requests.
+- The report includes output-token throughput and includes average acceptance length and speculative verification count when SGLang returns those fields.
 
-The [Qwen2.5-7B EAGLE3 offline parity record](eagle3-disaggregated-parity.md)
-preserves the corresponding two-node metric comparison and its current
-rank-dispatch command.
+## Comparing results
 
-### Qwen3.6-27B DFlash training curves
+Measure target-only and speculative decoding with the same target revision,
+tokenizer and chat template, prompts, sampling parameters, output length,
+hardware, tensor parallelism, and concurrency. For the EAGLE3 matrix, include a
+zero-step configuration in one run. With the general SGLang runner, benchmark
+matched target-only and speculative servers separately and compute speedup from
+their throughput results.
 
-The retained curves cover both the eight-H200 colocated run and the two-GPU
-online-disaggregated producer/consumer run.
+Do not compare absolute throughput across the matrix and existing-server runners
+because their batching and request scheduling differ.
 
-The separate [Domino disaggregated performance findings](domino-disaggregated-performance.md)
-preserve the measured one-server + DP7 tuning study, its MFU analysis, and the
-canonical YAML form of the relevant controls.
+## Safety
 
-![Qwen3.6-27B DFlash colocated training loss and draft-token accuracy](../../examples/assets/qwen36-27b-dflash-nemotron-6ep.png)
-
-![Qwen3.6-27B DFlash online-disaggregated training loss and draft-token accuracy](../../examples/disagg/assets/qwen36-27b-dflash-nemotron-disagg.png)
+The EAGLE3 HumanEval and MBPP scorers execute model-generated Python. Run them
+only in an isolated environment without credentials or production data. The
+general SGLang runner measures decoding and does not execute generated code.

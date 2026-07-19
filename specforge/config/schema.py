@@ -72,6 +72,9 @@ class ModelConfig(StrictConfigModel):
     #: DFlash-family and P-EAGLE mask token. ``None`` resolves it from the
     #: draft config, then the target tokenizer.
     mask_token_id: Optional[int] = None
+    #: Explicit tokenizer padding ID for released targets whose tokenizer
+    #: metadata omits it or whose padding row is outside the unpadded vocab.
+    tokenizer_pad_token_id: Optional[int] = Field(default=None, ge=0)
     #: SGLang target-engine tuning. Ignored by hf/custom backends.
     sglang_attention_backend: str = "flashinfer"
     sglang_mem_fraction_static: float = Field(default=0.4, gt=0.0, le=1.0)
@@ -84,6 +87,24 @@ class ModelConfig(StrictConfigModel):
     sglang_ep_size: int = Field(default=1, gt=0)
     sglang_max_running_requests: Optional[int] = Field(default=None, gt=0)
     sglang_max_total_tokens: Optional[int] = Field(default=None, gt=0)
+    sglang_dp_size: Optional[int] = Field(default=None, gt=0)
+    sglang_moe_a2a_backend: Optional[str] = None
+    sglang_moe_runner_backend: Optional[str] = None
+    sglang_page_size: Optional[int] = Field(default=None, gt=0)
+    sglang_quantization: Optional[str] = None
+    sglang_fp4_gemm_runner_backend: Optional[str] = None
+    sglang_mamba_radix_cache_strategy: Optional[str] = None
+    sglang_max_mamba_cache_size: Optional[int] = Field(default=None, gt=0)
+    sglang_swa_full_tokens_ratio: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+    )
+    sglang_mamba_full_memory_ratio: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+    )
 
     @model_validator(mode="after")
     def _validate_input_modality(self):
@@ -466,6 +487,9 @@ class TrainingConfig(StrictConfigModel):
     learning_rate: float = Field(default=1e-4, gt=0.0)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
+    #: Keep FP32 Adam masters and moments on CPU while the trainable draft
+    #: remains on the accelerator.
+    optimizer_cpu_offload: bool = False
     ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
@@ -483,6 +507,8 @@ class TrainingConfig(StrictConfigModel):
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
+    #: Anchor blocks per objective slice (0 = materialize all objective logits).
+    objective_chunk_blocks: int = Field(default=128, ge=0)
     loss_type: Literal[
         "dflash",
         "dpace",

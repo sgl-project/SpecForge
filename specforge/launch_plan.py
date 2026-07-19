@@ -434,7 +434,6 @@ def _managed_local_services(
                 str(cfg.model.sglang_ep_size),
                 "--chunked-prefill-size",
                 "-1",
-                "--disable-radix-cache",
                 "--enable-spec-capture",
                 "--spec-capture-method",
                 contract.method,
@@ -458,6 +457,28 @@ def _managed_local_services(
         for value, flag in (
             (cfg.model.sglang_max_running_requests, "--max-running-requests"),
             (cfg.model.sglang_max_total_tokens, "--max-total-tokens"),
+            (cfg.model.sglang_dp_size, "--dp-size"),
+            (cfg.model.sglang_moe_a2a_backend, "--moe-a2a-backend"),
+            (cfg.model.sglang_moe_runner_backend, "--moe-runner-backend"),
+            (cfg.model.sglang_page_size, "--page-size"),
+            (cfg.model.sglang_quantization, "--quantization"),
+            (
+                cfg.model.sglang_fp4_gemm_runner_backend,
+                "--fp4-gemm-runner-backend",
+            ),
+            (
+                cfg.model.sglang_mamba_radix_cache_strategy,
+                "--mamba-radix-cache-strategy",
+            ),
+            (cfg.model.sglang_max_mamba_cache_size, "--max-mamba-cache-size"),
+            (
+                cfg.model.sglang_swa_full_tokens_ratio,
+                "--swa-full-tokens-ratio",
+            ),
+            (
+                cfg.model.sglang_mamba_full_memory_ratio,
+                "--mamba-full-memory-ratio",
+            ),
         ):
             if value is not None:
                 argv.extend((flag, str(value)))

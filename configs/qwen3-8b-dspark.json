@@ -1,38 +1,31 @@
 {
-  "architectures": [
-    "DSparkDraftModel"
-  ],
+  "architectures": ["DSparkDraftModel"],
   "attention_bias": false,
   "attention_dropout": 0.0,
-  "auto_map": {
-    "AutoModel": "dspark.DSparkDraftModel"
-  },
+  "auto_map": {"AutoModel": "dspark.DSparkDraftModel"},
   "block_size": 7,
   "bos_token_id": 151643,
   "dflash_config": {
     "attention_mode": "gqa",
-    "mask_token_id": 151669,
-    "target_layer_ids": [1, 9, 17, 25, 33],
-    "projector_type": "dspark",
-    "markov_rank": 256,
-    "markov_head_type": "vanilla",
     "confidence_head_alpha": 1.0,
+    "confidence_head_with_markov": true,
     "enable_confidence_head": true,
-    "confidence_head_with_markov": true
+    "markov_head_type": "vanilla",
+    "markov_rank": 256,
+    "mask_token_id": 151669,
+    "projector_type": "dspark",
+    "target_layer_ids": [1, 9, 17, 25, 33]
   },
   "dtype": "bfloat16",
   "eos_token_id": 151645,
   "head_dim": 128,
   "hidden_act": "silu",
-  "hidden_size": 2560,
+  "hidden_size": 4096,
   "initializer_range": 0.02,
-  "intermediate_size": 9728,
+  "intermediate_size": 12288,
   "layer_types": [
-    "full_attention",
-    "full_attention",
-    "full_attention",
-    "full_attention",
-    "full_attention"
+    "full_attention", "full_attention", "full_attention",
+    "full_attention", "full_attention"
   ],
   "max_position_embeddings": 40960,
   "max_window_layers": 5,

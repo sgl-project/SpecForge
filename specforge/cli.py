@@ -210,6 +210,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="target model path supplying a frozen embedding for HF export",
     )
     export.add_argument("--embedding-key", default="model.embed_tokens.weight")
+    benchmark = sub.add_parser(
+        "benchmark",
+        help="benchmark a running inference server",
+    )
+    benchmark_subcommands = benchmark.add_subparsers(
+        dest="benchmark_command",
+        required=True,
+    )
+    sglang_benchmark = benchmark_subcommands.add_parser(
+        "sglang",
+        help="benchmark a running SGLang server",
+        description=(
+            "Measure throughput and optional speculative-decoding telemetry from "
+            "a running SGLang server."
+        ),
+    )
+    sglang_benchmark.add_argument("--model", required=True)
+    sglang_benchmark.add_argument(
+        "--dataset",
+        choices=("gsm8k", "math500", "humaneval", "mbpp", "mt-bench"),
+        required=True,
+    )
+    sglang_benchmark.add_argument("--max-new-tokens", type=int, default=2048)
+    sglang_benchmark.add_argument("--temperature", type=float, default=0.0)
+    sglang_benchmark.add_argument("--top-p", type=float, default=1.0)
+    sglang_benchmark.add_argument("--top-k", type=int, default=1)
+    sglang_benchmark.add_argument("--max-samples", type=int)
+    sglang_benchmark.add_argument("--num-prompts", type=int, default=1024)
+    sglang_benchmark.add_argument("--concurrency", type=int, default=1)
+    sglang_benchmark.add_argument("--base-url", default="http://127.0.0.1:30000")
+    sglang_benchmark.add_argument("--timeout-seconds", type=int, default=3600)
+    sglang_benchmark.add_argument("--enable-thinking", action="store_true")
+    sglang_benchmark.add_argument("--trust-remote-code", action="store_true")
+    sglang_benchmark.add_argument("--output-json")
     args = parser.parse_args(argv)
 
     if args.command == "train":
@@ -239,7 +273,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 128 + received.signum
             return 0
         return run_commands(plan)
-    elif args.to == "hf":
+    if args.command == "benchmark":
+        from specforge.benchmarks.sglang import run
+
+        return run(args)
+    if args.to == "hf":
         from specforge.export.to_hf import export_to_hf
 
         export_to_hf(
