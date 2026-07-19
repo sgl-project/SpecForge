@@ -9,8 +9,7 @@
 """Disaggregated offline producer: ingest features into a shared FeatureStore.
 
 This is the *producer* half of an offline disaggregated run. It reads SpecForge
-offline EAGLE3 feature files (the ``.ckpt`` produced by
-``scripts/prepare_hidden_states.py``) and ``put()``s each one into a
+offline feature files (``.ckpt`` / ``.ckpt.gz``) and ``put()``s each one into a
 :class:`SharedDirFeatureStore` that lives on a filesystem both pools share. The
 tensors land in the store (shared mount); the returned ``SampleRef``s are
 tensor-free metadata, which is all the consumer (trainer) needs to fetch them.
@@ -23,61 +22,63 @@ in-process ``OfflineManifestReader.read()`` list. The control-plane invariant
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
-from typing import List, Optional
+from typing import Callable, List, Optional
 
-from specforge.runtime.contracts import (
-    SCHEMA_VERSION,
-    FeatureSpec,
-    SampleRef,
-    assert_no_tensors,
-)
+from specforge.runtime.contracts import SCHEMA_VERSION, SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.feature_store import FeatureStore, load_feature_file
-from specforge.runtime.data_plane.offline_reader import (
-    _OFFLINE_EAGLE3_KEYS,
-    list_feature_files,
-)
+from specforge.runtime.data_plane.offline_reader import list_feature_files
+from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
 
 
 def ingest_offline_features(
     store: FeatureStore,
     hidden_states_path: str,
     *,
+    algorithm_name: str,
+    build_reader: Callable,
     run_id: str = "disagg",
     ttt_length: int = 7,
     max_len: int = 2048,
     limit: Optional[int] = None,
+    on_ref: Optional[Callable[[SampleRef], None]] = None,
 ) -> List[SampleRef]:
     """Load offline ``.ckpt`` features and ``put()`` them into ``store``.
 
-    Returns the ``disagg://`` ``SampleRef``s, in the same deterministic file
-    order as ``OfflineManifestReader``. The raw EAGLE3 keys
-    (``input_ids``/``loss_mask``/``hidden_state``/``aux_hidden_state``) are stored
-    verbatim — the consumer applies the identical ``OfflineEagle3Dataset``
-    aux->input / hidden->target swap at load time, so an offline run and a
-    disaggregated run see byte-identical tensors.
+    The application injects the algorithm-owned reader; this transport layer
+    does not import or resolve training algorithms. Tensors are copied
+    verbatim, and ``on_ref`` runs immediately after every successful ``put()``
+    so a lifecycle owner can retain refs needed to clean up a partial attempt.
     """
+    if not callable(build_reader):
+        raise TypeError("build_reader must be an injected callable")
+    reader = build_reader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+    )
+    feature_keys = tuple(reader.feature_keys)
     paths = list_feature_files(hidden_states_path)
     if limit is not None:
         paths = paths[:limit]
     refs: List[SampleRef] = []
     for index, path in enumerate(paths):
         raw = load_feature_file(path)
-        missing = [k for k in _OFFLINE_EAGLE3_KEYS if k not in raw]
+        missing = [key for key in feature_keys if key not in raw]
         if missing:
             raise KeyError(f"{path} missing required offline feature keys {missing}")
-        tensors = {k: raw[k] for k in _OFFLINE_EAGLE3_KEYS}
+        tensors = {key: raw[key] for key in feature_keys}
         input_ids = raw["input_ids"]
         ref = store.put(
             tensors,
             sample_id=f"{run_id}:{index:08d}",
             metadata={
                 "run_id": run_id,
-                "strategy": "eagle3",
-                "format": "offline_eagle3",
-                "target_repr": "hidden_state",
+                "strategy": algorithm_name,
+                "format": f"offline_{algorithm_name}",
+                "target_repr": reader.target_repr,
                 "ttt_length": ttt_length,
                 "max_len": max_len,
                 "num_tokens": int(input_ids.numel()),
@@ -85,19 +86,9 @@ def ingest_offline_features(
             },
         )
         refs.append(ref)
+        if on_ref is not None:
+            on_ref(ref)
     return refs
-
-
-def _ref_to_dict(ref: SampleRef) -> dict:
-    return dataclasses.asdict(ref)  # nested FeatureSpec -> dict; shape tuple -> list
-
-
-def _ref_from_dict(d: dict) -> SampleRef:
-    specs = {
-        name: FeatureSpec(**{**spec, "shape": tuple(spec["shape"])})
-        for name, spec in d["feature_specs"].items()
-    }
-    return SampleRef(**{**d, "feature_specs": specs})
 
 
 def write_ref_manifest(refs: List[SampleRef], path: str) -> None:
@@ -109,7 +100,7 @@ def write_ref_manifest(refs: List[SampleRef], path: str) -> None:
     assert_no_tensors(refs)
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "refs": [_ref_to_dict(r) for r in refs],
+        "refs": [ref_to_dict(r) for r in refs],
     }
     tmp = path + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -122,7 +113,7 @@ def read_ref_manifest(path: str) -> List[SampleRef]:
     """Read a ref manifest written by :func:`write_ref_manifest`."""
     with open(path) as f:
         payload = json.load(f)
-    return [_ref_from_dict(d) for d in payload["refs"]]
+    return [ref_from_dict(d) for d in payload["refs"]]
 
 
 __all__ = ["ingest_offline_features", "write_ref_manifest", "read_ref_manifest"]

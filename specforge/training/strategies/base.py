@@ -8,10 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """DraftTrainStrategy: per-draft-model required features + forward/loss + projection.
 
-A strategy is the only place that knows how a draft model (EAGLE3 / DFlash /
-Domino) turns a normalized ``TrainBatch`` into a loss; ``TrainerCore`` stays
-branch-free and the strategy owns the target projection. Imports model code,
-so it is imported by training entry points, not at package load.
+A strategy is the only place that knows how a draft model (EAGLE3 / P-EAGLE /
+DFlash / Domino) turns a normalized ``TrainBatch`` into a loss; ``TrainerCore``
+stays branch-free and the strategy owns the target projection. Imports model
+code, so it is imported by training entry points, not at package load.
 """
 
 from __future__ import annotations
@@ -53,8 +53,7 @@ def linear_lambda_base(
 ) -> float:
     """Domino base-loss weight: linear decay from ``lambda_start`` to 0 over the
     first ``total_steps * decay_ratio`` steps, then 0, clamped to ``[0, 1]``.
-    Single source for the runtime strategy and ``scripts/train_domino.py``;
-    requires a real ``total_steps`` (> 0)."""
+    Requires a real ``total_steps`` (> 0)."""
     decay_steps = max(1, int(total_steps * decay_ratio))
     progress = min(global_step / decay_steps, 1.0)
     return max(0.0, min(1.0, lambda_start * (1.0 - progress)))
@@ -86,6 +85,35 @@ class DraftTrainStrategy(abc.ABC):
         return state_dict
 
 
+def _prepare_eagle_target(
+    *,
+    target_head: Optional[nn.Module],
+    target_repr: Optional[str],
+    input_ids: torch.Tensor,
+    target: torch.Tensor,
+    loss_mask: torch.Tensor,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize EAGLE-family teacher features for a training forward.
+
+    Online capture already shifts logits and input IDs. Offline capture stores
+    the target model's final hidden state, so the frozen target head owns the
+    equivalent shift and projection to full-vocabulary logits.
+    """
+    if target_repr == "hidden_state":
+        if target_head is None:
+            raise ValueError(
+                "target_repr='hidden_state' requires a target_head to re-run "
+                "the lm_head projection"
+            )
+        input_ids, target, loss_mask = target_head.preprocess(
+            input_ids, target, loss_mask
+        )
+        target = target_head(target.to(device))
+        return input_ids.to(device), target, loss_mask.to(device)
+    return input_ids.to(device), target.to(device), loss_mask.to(device)
+
+
 class Eagle3TrainStrategy(DraftTrainStrategy):
     """EAGLE3 TTT strategy wrapping the existing ``OnlineEagle3Model``.
 
@@ -110,10 +138,71 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         *,
         target_head: Optional[nn.Module] = None,
         ploss_decay: float = 0.8,
+        compact_teacher: bool = False,
+        compact_teacher_chunk_size: Optional[int] = None,
     ) -> None:
         self.eagle3_model = eagle3_model
         self.target_head = target_head
         self.ploss_decay = ploss_decay
+        self.compact_teacher = compact_teacher
+        self.compact_teacher_chunk_size = compact_teacher_chunk_size
+        if compact_teacher:
+            self._validate_compact_teacher()
+
+    def _validate_compact_teacher(self) -> None:
+        """Validate the offline compact-teacher contract before the first step.
+
+        The strategy is constructed after the vocab mapping has been loaded and
+        after FSDP wrapping.  FSDP exposes the wrapped module as ``module``;
+        walking that one boundary keeps validation independent of the backend
+        while the actual forward still goes through the wrapped model.
+        """
+        if self.target_head is None:
+            raise ValueError(
+                "compact teacher requires the offline target_head; it is not "
+                "available for online capture"
+            )
+
+        model = self.eagle3_model
+        if not hasattr(model, "draft_model") and hasattr(model, "module"):
+            model = model.module
+        draft_model = getattr(model, "draft_model", None)
+        if draft_model is None:
+            raise ValueError(
+                "compact teacher requires an EAGLE3 model with a draft_model"
+            )
+
+        from specforge.core.compact_teacher import (
+            validate_compact_teacher_enabled,
+            validate_vocab_mapping_consistency,
+        )
+
+        target_head_weight = getattr(
+            getattr(self.target_head, "fc", None), "weight", None
+        )
+        vocab_size = (
+            int(target_head_weight.shape[0])
+            if target_head_weight is not None and target_head_weight.dim() >= 1
+            else int(
+                getattr(getattr(self.target_head, "config", None), "vocab_size", 0)
+            )
+        )
+        draft_vocab_size = int(
+            getattr(
+                getattr(draft_model, "config", None),
+                "draft_vocab_size",
+                int(draft_model.t2d.sum().item()),
+            )
+        )
+        validate_compact_teacher_enabled(
+            is_online=False,
+            draft_vocab_size=draft_vocab_size,
+            vocab_size=vocab_size,
+            t2d=draft_model.t2d,
+            target_head_weight=target_head_weight,
+            chunk_size=self.compact_teacher_chunk_size,
+        )
+        validate_vocab_mapping_consistency(draft_model.t2d, draft_model.d2t)
 
     def trainable_module(self) -> nn.Module:
         return self.eagle3_model
@@ -129,22 +218,14 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         loss_mask: torch.Tensor,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if target_repr == "hidden_state":
-            if self.target_head is None:
-                raise ValueError(
-                    "target_repr='hidden_state' requires a target_head to re-run "
-                    "the lm_head projection"
-                )
-            # mirrors offline run_forward: shift input_ids/target, add mask dim,
-            # then project the target last hidden state to full-vocab logits.
-            input_ids, target, loss_mask = self.target_head.preprocess(
-                input_ids, target, loss_mask
-            )
-            target = self.target_head(target.to(device))
-            return input_ids.to(device), target, loss_mask.to(device)
-        # logits / pruned_logits: rollout already produced (and shifted) the
-        # distribution.
-        return input_ids.to(device), target.to(device), loss_mask.to(device)
+        return _prepare_eagle_target(
+            target_head=self.target_head,
+            target_repr=target_repr,
+            input_ids=input_ids,
+            target=target,
+            loss_mask=loss_mask,
+            device=device,
+        )
 
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
@@ -154,9 +235,34 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         device = self._device()
         target_repr = batch.metadata.get("target_repr")
 
-        input_ids, target, loss_mask = self._prepare_target(
-            target_repr, t["input_ids"], t["target"], t["loss_mask"], device
-        )
+        compact_kwargs: Dict[str, Any] = {}
+        if self.compact_teacher:
+            if target_repr != "hidden_state":
+                raise ValueError(
+                    "compact teacher is offline-only and requires "
+                    "target_repr='hidden_state'"
+                )
+            # Preserve TargetHead.preprocess's shift exactly, but do not call
+            # TargetHead.forward: OnlineEagle3Model streams the frozen head in
+            # vocabulary chunks from these kwargs instead.
+            input_ids, target_hidden, loss_mask = self.target_head.preprocess(
+                t["input_ids"], t["target"], t["loss_mask"]
+            )
+            input_ids = input_ids.to(device)
+            target_hidden = target_hidden.to(device)
+            loss_mask = loss_mask.to(device)
+            from specforge.core.compact_teacher import build_offline_teacher_inputs
+
+            target, compact_kwargs = build_offline_teacher_inputs(
+                compact=True,
+                target_model=self.target_head,
+                target_hidden=target_hidden,
+                chunk_size_arg=self.compact_teacher_chunk_size,
+            )
+        else:
+            input_ids, target, loss_mask = self._prepare_target(
+                target_repr, t["input_ids"], t["target"], t["loss_mask"], device
+            )
         position_ids = t.get("position_ids")
         (
             plosses,
@@ -173,6 +279,7 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             target=target,
             hidden_states=t["hidden_state"].to(device),
             position_ids=position_ids.to(device) if position_ids is not None else None,
+            **compact_kwargs,
         )
         weights = [self.ploss_decay**i for i in range(len(plosses))]
         loss = sum(weights[i] * plosses[i] for i in range(len(plosses)))
@@ -202,6 +309,99 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
             if "draft_model." in k and not (embed_frozen and "embed" in k.lower())
+        }
+
+
+class PEagleTrainStrategy(DraftTrainStrategy):
+    """P-EAGLE COD strategy wrapping ``OnlinePEagleModel``.
+
+    P-EAGLE consumes the same target capture as EAGLE3. The runtime schema uses
+    the singular ``hidden_state`` name, while ``OnlinePEagleModel.forward`` uses
+    ``hidden_states``; this strategy is the explicit boundary between them.
+    """
+
+    name = "peagle"
+    required_features = {
+        "input_ids",
+        "attention_mask",
+        "loss_mask",
+        "hidden_state",
+        "target",
+    }
+
+    def __init__(
+        self,
+        peagle_model: nn.Module,
+        *,
+        target_head: Optional[nn.Module] = None,
+    ) -> None:
+        self.peagle_model = peagle_model
+        self.target_head = target_head
+
+    def trainable_module(self) -> nn.Module:
+        return self.peagle_model
+
+    def _device(self) -> torch.device:
+        return next(self.peagle_model.parameters()).device
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        self.validate_batch(batch)
+        tensors = batch.tensors
+        device = self._device()
+        input_ids, target, loss_mask = _prepare_eagle_target(
+            target_head=self.target_head,
+            target_repr=batch.metadata.get("target_repr"),
+            input_ids=tensors["input_ids"],
+            target=tensors["target"],
+            loss_mask=tensors["loss_mask"],
+            device=device,
+        )
+
+        lengths = tensors.get("lengths")
+        if lengths is None:
+            # P-EAGLE is currently batch-size 1. Deriving the document length
+            # from the padding mask prevents COD samples from treating padded
+            # positions as part of the document in the offline path.
+            lengths = tensors["attention_mask"].sum(dim=-1)
+
+        loss, model_metrics = self.peagle_model(
+            input_ids=input_ids,
+            attention_mask=tensors["attention_mask"].to(device),
+            loss_mask=loss_mask,
+            target=target,
+            hidden_states=tensors["hidden_state"].to(device),
+            lengths=lengths.to(device),
+        )
+        if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
+            raise ValueError(
+                "peagle model must return a scalar loss tensor; "
+                f"got {type(loss).__name__} with shape="
+                f"{getattr(loss, 'shape', None)}"
+            )
+
+        metrics = {
+            name: value.detach() if isinstance(value, torch.Tensor) else value
+            for name, value in model_metrics.items()
+        }
+        correct = metrics.get("full_acc_sum")
+        denominator = metrics.get("full_acc_total")
+        if correct is not None and denominator is not None:
+            correct = torch.as_tensor(correct, device=device)
+            denominator = torch.as_tensor(denominator, device=device)
+            metrics["accuracy"] = correct / denominator.clamp_min(1)
+
+        return StepOutput(loss=loss.reshape(()), metrics=metrics)
+
+    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Unlike the stock EAGLE3 path, P-EAGLE trains its token embeddings and
+        # mask_hidden parameter. Persist the complete draft model so both survive
+        # checkpoint/resume and export.
+        return {
+            key.replace("draft_model.", ""): value
+            for key, value in state_dict.items()
+            if "draft_model." in key
         }
 
 
@@ -237,14 +437,10 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
         )
-        return StepOutput(
-            loss=loss,
-            metrics={
-                "accuracy": accuracy.detach(),
-                # the accuracy's own denominator, so eval can weight it exactly
-                "accuracy_denom": model_metrics["accuracy_denom"],
-            },
-        )
+        metrics = {"accuracy": accuracy.detach()}
+        if "accuracy_denom" in model_metrics:
+            metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target
@@ -290,9 +486,9 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         )
         metrics = {
             "accuracy": accuracy.detach(),
-            "accuracy_denom": model_metrics["accuracy_denom"],
         }
         for name in (
+            "accuracy_denom",
             "ce_loss",
             "l1_loss",
             "confidence_loss",
@@ -359,15 +555,13 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss_mask=t["loss_mask"].to(device),
             lambda_base=lambda_base,
         )
-        return StepOutput(
-            loss=loss,
-            metrics={
-                "accuracy": accuracy.detach(),
-                # the accuracy's own denominator, so eval can weight it exactly
-                "accuracy_denom": model_metrics["accuracy_denom"],
-                "lambda_base": torch.tensor(float(lambda_base)),
-            },
+        metrics = dict(model_metrics)
+        metrics["accuracy"] = accuracy.detach()
+        metrics.setdefault(
+            "lambda_base",
+            torch.tensor(float(lambda_base), device=loss.device),
         )
+        return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target
@@ -382,6 +576,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
 __all__ = [
     "DraftTrainStrategy",
     "Eagle3TrainStrategy",
+    "PEagleTrainStrategy",
     "DFlashTrainStrategy",
     "DSparkTrainStrategy",
     "DominoTrainStrategy",

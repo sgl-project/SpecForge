@@ -156,8 +156,50 @@ class FeatureStore(abc.ABC):
         return {"force_freed": 0, "force_freed_bytes": 0, "release_pending": 0}
 
 
+def drain_feature_store_removals(
+    store: FeatureStore,
+    *,
+    max_attempts: int = 8,
+    retry_interval_s: float = 0.25,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Dict[str, int]:
+    """Bound lifecycle shutdown until deferred physical removes settle.
+
+    Most stores free synchronously and have nothing to drain.  A remote backend
+    may expose ``drain_pending_removals`` to retry fallible RPCs.  Keeping this
+    small adapter at the FeatureStore boundary lets online producer/consumer
+    finalization enforce the same loud contract without depending on Mooncake's
+    concrete class. The default is bounded to eight attempts and 1.75 seconds of
+    inter-attempt waiting; Mooncake's implementation avoids existence probes
+    between attempts so those waits let an existing read lease expire rather
+    than renewing it.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if retry_interval_s < 0:
+        raise ValueError("retry_interval_s must be >= 0")
+    drain = getattr(store, "drain_pending_removals", None)
+    if callable(drain):
+        return drain(
+            max_attempts=max_attempts,
+            retry_interval_s=retry_interval_s,
+            sleep=sleep,
+        )
+    health_fn = getattr(store, "health", None)
+    if not callable(health_fn):
+        return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
+    health = health_fn()
+    pending = int(health.get("release_pending", 0))
+    if pending:
+        raise RuntimeError(
+            f"{type(store).__name__} has {pending} pending removals but exposes "
+            "no drain_pending_removals lifecycle hook"
+        )
+    return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
+
+
 def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
-    """Load a SpecForge offline feature file (mirrors OfflineEagle3Dataset)."""
+    """Load one prepared SpecForge offline feature file."""
     if path.endswith(".gz"):
         with gzip.open(path, "rb") as f:
             return torch.load(io.BytesIO(f.read()), weights_only=False)
@@ -453,6 +495,22 @@ class LocalFeatureStore(FeatureStore):
         with self._lock:
             self._free_sample_locked(sample_id)
 
+    def abort_all(self, *, reason: str = "aborted") -> int:
+        """Evict all in-memory samples owned by this private local store.
+
+        Colocated-online runs create one store per lifecycle.  A worker can
+        commit valid samples and then raise on a later sample in the same
+        capture batch, so the caller may not receive every ref needed for
+        per-sample cleanup.  Lifecycle shutdown uses this local-only operation
+        to make that partial-commit path leak-free.  Returns samples evicted.
+        """
+        del reason
+        with self._lock:
+            sample_ids = list(self._mem)
+            for sample_id in sample_ids:
+                self._free_sample_locked(sample_id)
+            return len(sample_ids)
+
     # -- garbage collection / reclamation ----------------------------------
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         """Independent reclamation sweep. Idempotent; safe to call on a timer.
@@ -534,4 +592,10 @@ class LocalFeatureStore(FeatureStore):
             }
 
 
-__all__ = ["FeatureStore", "LocalFeatureStore", "load_feature_file", "spec_from_tensor"]
+__all__ = [
+    "FeatureStore",
+    "LocalFeatureStore",
+    "drain_feature_store_removals",
+    "load_feature_file",
+    "spec_from_tensor",
+]

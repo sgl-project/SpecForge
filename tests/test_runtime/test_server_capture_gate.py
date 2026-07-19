@@ -15,10 +15,11 @@ What is pinned here:
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
   dflash (aux only) requests, named per strategy by the client schema.
 
-OPT-IN: needs a GPU, sglang patched with
+The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
+GPU, sglang patched with
 ``patches/sglang/v0.5.14/spec-capture.patch`` (see
 ``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
-a reachable/spawnable ``mooncake_master``. Enable with
+a reachable/spawnable ``mooncake_master``; opt in locally with
 ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
 """
 
@@ -38,6 +39,20 @@ ENABLED = os.environ.get("SPECFORGE_RUN_SERVER_CAPTURE_TESTS") == "1"
 PORT = 30989
 AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
+
+
+def _capture_schema(algorithm: str):
+    from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.inference.adapters.server_capture import ServerCaptureSchema
+
+    registration = builtin_algorithm_registry().resolve(algorithm)
+    layout = registration.providers.server_streaming_for("text").layout
+    return ServerCaptureSchema(
+        aux_feature=layout.aux_feature,
+        last_hidden_feature=layout.last_hidden_feature,
+        passthrough=layout.passthrough,
+        attention_mask_feature=layout.attention_mask_feature,
+    )
 
 
 def _patched_sglang() -> bool:
@@ -266,7 +281,11 @@ class TestServerCaptureGate(unittest.TestCase):
         rows = [[5, 6, 7, 8, 9, 10], [11, 12, 13, 14]]
         store = self._store("gate-eagle3")
         adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}", store, run_id="gate0", strategy="eagle3"
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate0",
+            algorithm="eagle3",
+            schema=_capture_schema("eagle3"),
         )
         contract = CaptureConfig.from_strategy(
             required_features={
@@ -318,11 +337,8 @@ class TestServerCaptureGate(unittest.TestCase):
         self._train_step(fetched, head)
 
     def _train_step(self, fetched, head):
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
-        )
+        from specforge.algorithms.eagle3.model import OnlineEagle3Model
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -335,7 +351,7 @@ class TestServerCaptureGate(unittest.TestCase):
         draft_cfg = AutoDraftModelConfig.from_file(
             fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
         )
-        dm = AutoEagle3DraftModel.from_config(
+        dm = AutoDraftModel.from_config(
             draft_cfg, attention_backend="sdpa", torch_dtype=torch.bfloat16
         ).cuda()
         dm.load_vocab_mapping(
@@ -378,7 +394,11 @@ class TestServerCaptureGate(unittest.TestCase):
         rows = [[3, 1, 4, 1, 5]]
         store = self._store("gate-dflash")
         adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}", store, run_id="gate1", strategy="dflash"
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate1",
+            algorithm="dflash",
+            schema=_capture_schema("dflash"),
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
