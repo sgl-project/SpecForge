@@ -1,156 +1,148 @@
-# SpecForge DataFlow Runtime — Architecture (M1–M4)
+# SpecForge runtime architecture
 
-The runtime moves SpecForge from a trainer-centered god-script to explicit
-contracts across **two planes**. This is the cross-plane map; each plane also has
-its own design note (see "Per-plane internals" below).
+SpecForge has one public training entry point, `specforge train`. A typed run
+configuration selects an algorithm and a topology; it does not select a second
+trainer. The launch layer exposes exactly four topology builders:
 
-## Plane responsibilities
+- `build_offline_runtime`
+- `build_disagg_offline_runtime`
+- `build_disagg_online_producer`
+- `build_disagg_online_consumer`
 
-- **Contracts** — the stdlib-only data records every plane exchanges (`PromptTask`, `SampleRef`, `FeatureSpec`, `FeatureHandle`, `TrainBatch`) plus `assert_no_tensors`, which enforces the no-tensor boundary. Control-plane records carry metadata only; `TrainBatch` is the sole tensor carrier and lives only on the trainer side.
-- **Control plane** — `DataFlowController` (a passive coordinator with no run loop), `MetadataStore` (commit dedup + the single durable ack transaction), `SampleRefQueue` (lease/ack/fail transport), and `TrainLease`. Moves metadata only; every record-accepting entrypoint runs `assert_no_tensors`.
-- **Data plane** — `FeatureStore`/`LocalFeatureStore` is the only holder of tensors, addressed by metadata-only `SampleRef`. `FeatureDataLoader` is the bridge that materializes refs + store into collated `TrainBatch`es; `OfflineManifestReader` turns precomputed `.ckpt` files into in-place `file://` refs.
-- **Inference (compute)** — `RolloutWorker` + `SGLangAdapter` extract features from the target engine and commit only `SampleRef` metadata; `SGLangAdapter._project_target` is the sole target to draft projection site and `verify_capture` is the loud pre-`put` validator.
-- **Training (compute)** — `TrainerController` -> `TrainerCore` -> `DraftTrainStrategy` + `FSDPTrainingBackend` turn `TrainBatch`es into optimizer steps and checkpoints; the strategy owns projection/loss, the core is branch-free.
+All trainer-bearing builders converge on the same
+`Trainer -> FeatureDataLoader -> TrainerController -> TrainerCore` path. Only
+the reference source and feature-store backend change.
 
-## End-to-end flow
+## Supported paths
 
-**Online:** `RolloutWorker.run_once` leases prompts (`lease_prompt_tasks`), calls `generate_features` (which drives `generate_eagle3_data`), runs `verify_capture`, then `FeatureStore.put` writes tensors **directly to the data plane**. Only the resulting `SampleRef` metadata goes to the controller via `commit_samples`, which dedups through `MetadataStore.commit_sample` and enqueues fresh refs onto `SampleRefQueue`.
+| Mode | Producer side | Consumer reference source | Feature store | Iteration contract |
+| --- | --- | --- | --- | --- |
+| Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
+| Disaggregated offline | `CONFIG=path/to/offline-disagg.yaml run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
+| Online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
 
-**Offline:** `OfflineManifestReader.read()` emits in-place `file://` `SampleRef`s (no tensor copy) and the launcher calls `enqueue_offline_refs`, which dedups and enqueues onto the **same** `SampleRefQueue`.
+`training.num_epochs` on an online run controls how many prompt passes the
+producer creates. Each pass receives new task and sample ids. The consumer
+still iterates one consume-once stream exactly once; it never replays a prior
+stream as a second trainer epoch.
 
-**Convergence + training:** Both paths converge at `SampleRef` on one queue, so the trainer has no online/offline branch. `TrainerController.fit` drives `for batch in loader`; the `FeatureDataLoader` leases refs through a `TrainLease` (`lease_train_refs` via the controller) and fetches the actual tensors **directly** from the `FeatureStore` (`get`/`release` with clone-on-fetch). `TrainerCore.train_step` runs forward/loss/backward and steps the optimizer at the grad-accum boundary; at that boundary `ack_fn` calls `ack_train_refs`, which records the durable ack transaction (`record_train_ack`) **before** releasing the queue lease.
+## Cross-plane contracts
 
-## System map
+- The control plane carries `PromptTask` and `SampleRef` metadata only.
+  `assert_no_tensors` enforces this boundary.
+- The data plane carries feature tensors behind `FeatureStore` URIs.
+- `FeatureDataLoader` is the only bridge from refs plus a store to a
+  tensor-carrying `TrainBatch`.
+- The inference plane sends model inputs to an external spec-capture server,
+  adopts its Mooncake-backed refs, and commits only metadata.
+- The training plane resolves an algorithm step provider; the core training loop
+  does not branch on online, offline, colocated, or disaggregated deployment.
 
-Solid edges = control / metadata flow. Dashed edges = tensor flow (data plane).
-The `DataFlowController` is **passive**: callers point *into* it, and its only
-outbound edges go to its own `SampleRefQueue` and `MetadataStore`. Tensors never
-cross the controller.
+## Canonical online-disaggregated flow
+
+There is one consumer path for both one-rank and multi-rank runs:
 
 ```mermaid
-flowchart TD
-  classDef control fill:#e8f0fe,stroke:#3b6fd6,color:#0b2e6b;
-  classDef data fill:#fdeede,stroke:#d6893b,color:#6b3a0b;
-  classDef compute fill:#e6f6ea,stroke:#3bb061,color:#0b4a22;
-
-  subgraph COMPUTE[compute autonomous loops]
-    RW[RolloutWorker run_once loop]
-    SG[SGLangAdapter generate_features]
-    TGT[Eagle3TargetModel generate_eagle3_data]
-    TR[TrainerController fit loop]
-    CORE[TrainerCore train_step]
-    STRAT[Eagle3TrainStrategy forward_loss]
-    BE[FSDPTrainingBackend backward step]
-    LOADER[FeatureDataLoader iter]
-    OFF[OfflineManifestReader read]
+flowchart LR
+  subgraph P[producer pool]
+    SG[patched SGLang capture]
+    MCW[Mooncake tensor writes]
+    RW[RolloutWorker]
+    CH[StreamingRefChannel]
+    SG --> MCW
+    RW --> CH
   end
 
-  subgraph CONTROL[control plane metadata only]
-    CTRL[DataFlowController passive coordinator]
-    QUEUE[SampleRefQueue lease ack fail]
-    MS[MetadataStore commit dedup durable ack]
-    LEASE[TrainLease get ack fail]
+  subgraph C[consumer pool]
+    RD[RefDistributor on rank 0]
+    DB[(fresh SQLite ledger)]
+    I0[InboxChannel rank 0]
+    IN[InboxChannel rank N]
+    Q0[StreamingRefQueue rank 0]
+    QN[StreamingRefQueue rank N]
+    DL0[FeatureDataLoader rank 0]
+    DLN[FeatureDataLoader rank N]
+    ACK[DPAckController]
+
+    RD -->|dedup and durable commit| DB
+    RD -->|complete windows| I0
+    RD -->|complete windows| IN
+    I0 --> Q0 --> DL0
+    IN --> QN --> DLN
+    DL0 --> ACK
+    DLN --> ACK
+    ACK -->|one rank-0 durable transaction| DB
   end
 
-  subgraph DATA[data plane tensors only]
-    STORE[FeatureStore LocalFeatureStore]
-  end
-
-  RW -->|register_rollout_worker| CTRL
-  RW -->|lease_prompt_tasks| CTRL
-  RW -->|generate_features| SG
-  SG -->|generate_eagle3_data| TGT
-  RW -.->|put| STORE
-  RW -->|commit_samples| CTRL
-  RW -->|fail_prompt_tasks| CTRL
-
-  OFF -->|enqueue_offline_refs| CTRL
-
-  CTRL -->|commit_sample| MS
-  CTRL -->|record_train_ack| MS
-  CTRL -->|get_committed| MS
-  CTRL -->|put fresh refs| QUEUE
-  CTRL -->|get| QUEUE
-  CTRL -->|ack| QUEUE
-  CTRL -->|fail| QUEUE
-
-  TR -->|train_step| CORE
-  CORE -->|forward_loss| STRAT
-  CORE -->|backward step| BE
-  TR -->|for batch in loader| LOADER
-  LOADER -->|lease_train_refs get| LEASE
-  LEASE -->|lease_train_refs| CTRL
-  LEASE -->|ack_train_refs| CTRL
-  LEASE -->|fail_refs| CTRL
-  LOADER -.->|get release| STORE
-  TR -->|ack_fn ack_train_refs| CTRL
-
-  class RW,SG,TGT,TR,CORE,STRAT,BE,LOADER,OFF compute;
-  class CTRL,QUEUE,MS,LEASE control;
-  class STORE data;
+  CH --> RD
+  MCW -.->|tensor fetch| DL0
+  MCW -.->|tensor fetch| DLN
 ```
 
-## Endpoint reference
+The producer owns prompt scheduling only. It uses a no-op training ledger and
+has its local sample queue disabled. Rank 0 of the
+consumer is the only reader of the shared source channel and the only writer
+to the attempt's fresh retaining ledger. `RefDistributor` deduplicates refs and
+dispatches them round-robin into one private inbox per rank. Every rank adapts
+its `InboxChannel` through `StreamingRefQueue` and feeds the same
+`FeatureDataLoader` implementation.
 
-| Caller | Endpoint called | Plane | Purpose |
-|---|---|---|---|
-| RolloutWorker | register_rollout_worker | control | Register worker, obtain authoritative worker_id (no-tensor guard on info) |
-| RolloutWorker | lease_prompt_tasks | control | Pop up to max_tasks pending PromptTasks, mark leased to worker_id |
-| RolloutWorker | generate_features | compute | Ask the FeatureSource (SGLangAdapter) for one feature dict per task |
-| SGLangAdapter | generate_eagle3_data | compute | Run the target engine's batched forward to extract hidden_states/target |
-| RolloutWorker | put | data | Persist verified feature tensors directly to FeatureStore, get back a SampleRef |
-| RolloutWorker | abort | data | Clean up a partial/failed write so no corrupt sample is left |
-| RolloutWorker | commit_samples | control | Commit metadata-only SampleRefs; dedup + enqueue fresh refs |
-| RolloutWorker | fail_prompt_tasks | control | Release failed prompt leases (retryable or terminal) so none are stranded |
-| OfflineManifestReader | enqueue_offline_refs | control | Offline ingest: dedup + enqueue file:// SampleRefs onto the same queue |
-| DataFlowController | commit_sample | control | Dedup committed samples (True=new, False=duplicate) |
-| DataFlowController | record_train_ack | control | Persist the single durable ack transaction before releasing leases |
-| DataFlowController | get_committed | control | Resolve acked/failed sample_ids back to full SampleRef objects |
-| DataFlowController | put | control | Enqueue freshly committed refs onto the shared SampleRefQueue |
-| DataFlowController | get | control | Serve train-side leases from the SampleRefQueue |
-| DataFlowController | ack | control | Release queue leases after the durable ack transaction is recorded |
-| DataFlowController | fail | control | Route train-side ref failures through the queue (retryable flag) |
-| TrainLease | lease_train_refs | control | Loader's get(): lease train refs via the controller, not a raw queue |
-| TrainLease | ack_train_refs | control | ack(): record durable transaction + release leases via the controller |
-| TrainLease | fail_refs | control | fail(): route ref failures through the controller |
-| FeatureDataLoader | lease_train_refs (via TrainLease.get) | control | Lease a batch of refs from the stream |
-| FeatureDataLoader | get | data | Fetch a sample's tensors + lease FeatureHandle directly from the store |
-| FeatureDataLoader | release | data | Release the lease immediately after clone-on-fetch so prefetch can't race |
-| TrainerController | for batch in loader (__iter__) | compute | Drive the loader to yield collated TrainBatch objects |
-| TrainerController | train_step | compute | Run each micro-batch; read optimizer_stepped boundary signal |
-| TrainerController | eval_step | compute | Run eval batches and aggregate metrics |
-| TrainerController | ack_fn -> ack_train_refs | control | Close the ack loop: ack consumed sample_ids at the optimizer-step boundary |
-| TrainerCore | forward_loss | compute | Delegate model-specific forward + loss to the strategy |
-| TrainerCore | backward | compute | Run backward on the accumulation-scaled loss each micro-step |
-| TrainerCore | step | compute | Optimizer step + distributed grad-norm reduction at the accum boundary |
+At each optimizer boundary, all ranks call `DPAckController.ack_train_refs` in
+lockstep. It gathers their sample ids and rank 0 records one durable ack
+transaction. Only after that commit succeeds does each rank delete its local
+feature ids; cleanup errors are gathered before inbox acknowledgement. Inbox
+acknowledgements are also mirrored to the source channel so the producer's
+in-flight counter tracks refs that ranks have actually consumed.
 
-## Autonomy: loops + a passive coordinator
+### Optimizer-window handshake
 
-## Autonomous loops + one passive coordinator
+Before capture starts, consumer rank 0 publishes the global dispatch quantum:
 
-This is **not** a master/orchestrator that calls into sub-parts, and it is **not** a set of fully independent processes. It is a small number of **autonomous producer/consumer loops** coordinated by **one passive shared component**, the `DataFlowController`.
+```text
+quantum = dp_size * batch_size * accumulation_steps
+```
 
-- The **producer loop** is `RolloutWorker.run_once`, which runs on its own and *calls into* the controller (`lease_prompt_tasks`, `commit_samples`, `fail_prompt_tasks`). The controller never calls the worker.
-- The **consumer loop** is `TrainerController.fit`, which drives `for batch in loader`; the loader *calls into* the controller through `TrainLease` (`lease_train_refs` / `ack_train_refs` / `fail_refs`). The controller never calls the trainer.
-- The `DataFlowController` has **no run loop**. The only edges out of it go into its **own** `SampleRefQueue` and `MetadataStore`. Workers and the trainer point INTO the controller; that is what makes it passive.
+The producer waits for this sidecar and refuses to run when its in-flight high
+watermark is smaller than `quantum`. The canonical CLI reads
+`DISAGG_IN_FLIGHT_HIGH_WATERMARK`, which defaults to `256`.
 
-Tensors reinforce this: they **never** flow through the controller. `RolloutWorker` calls `FeatureStore.put` directly and `FeatureDataLoader` calls `FeatureStore.get`/`release` directly. Only metadata-bearing `SampleRef`s cross the control plane.
+`RefDistributor` releases refs only in complete `quantum` windows, giving every
+rank exactly `batch_size * accumulation_steps` refs per optimizer step. If EOF
+leaves a partial window, those refs are marked terminal, adopted for lifecycle
+tracking when required, their feature-store objects are aborted, and the source
+counter is settled. Every inbox then closes normally after the aligned prefix;
+an actual cleanup failure still poisons the inboxes. A partial global optimizer
+step is never dispatched.
 
-## Why this makes disaggregation mechanical
+The terminal tail remains committed-but-unacknowledged in the attempt's
+metadata ledger even though its feature objects are removed. A successfully
+completed attempt with such a tail must therefore start any later run with a
+fresh ledger; resume of that completed ledger is unsupported until the control
+plane records an explicit terminal-drop state.
 
-Because the loops are autonomous and only the coordinator is shared, moving components across nodes is a **swap, not a rewrite**:
+Every online producer requires fresh source-channel, store-id, and run-id
+artifacts. A fresh consumer requires a fresh SQLite ledger and rank 0 recreates
+its inboxes. Consumer-only recovery may instead reuse the retained ledger,
+channel/inboxes, Mooncake objects, and an exactly matching checkpoint; it
+reconciles the unacknowledged suffix but never restarts the producer.
 
-- **Durable backend swap:** all recovery-critical state sits behind the `MetadataStore` ABC (commit dedup + the atomic `record_train_ack` marker). A SQLite/Redis/DB backend is a new subclass injected into the controller — no controller rewrite, and `assert_no_tensors` keeps the seam importable without torch.
-- **`TrainLease` indirection:** the trainer never holds a raw in-process queue. It routes every `get`/`ack`/`fail` through the controller, so a cross-node trainer is a drop-in substitution and the durable ack transaction is always recorded.
-- **`partition_key` seam:** `SampleRefQueue.put`/`get` already accept a `partition_key` (currently accepted but ignored, single partition), reserving the per-DP-rank partitioning needed for a sharded/disaggregated queue without an API change.
-- **Online/offline convergence:** because `commit_samples` and `enqueue_offline_refs` land on the same queue and the trainer path is branch-free, the same consumer loop serves a disaggregated rollout fleet or a static offline manifest unchanged.
+## Offline topology
 
-## Per-plane internals
+Offline consumers receive a fixed ref list. Colocated refs point directly at
+precomputed files. The disaggregated producer copies or publishes those
+features into the selected cross-process store and writes one immutable
+manifest; the consumer waits for the success sentinel and reads that manifest.
+Both variants use `FeatureDataLoader` refs mode, so the data is re-iterable and
+the loader can seek to a persisted offline resume position.
 
-Each plane carries its own design note (landed with that plane's PR):
+## Per-plane notes
 
-- `contracts.py` / `CONTRACTS.md` — shared metadata records + `assert_no_tensors`
-- `data_plane/DESIGN.md` — storage, queue, loader, lifecycle
-- `control_plane/DESIGN.md` — controller, metadata store, lease/durability
-- `inference/DESIGN.md` — rollout worker, capture, sglang seam
-- `training/DESIGN.md` — trainer core, strategy, FSDP backend
+- [`contracts.py`](contracts.py) and [`CONTRACTS.md`](CONTRACTS.md) — shared
+  metadata and tensor contracts
+- [`control_plane/DESIGN.md`](control_plane/DESIGN.md) — prompt lifecycle,
+  metadata ledgers, distributed ack authority
+- [`data_plane/DESIGN.md`](data_plane/DESIGN.md) — stores, channels,
+  distribution, loading, and cleanup
+- [`../inference/DESIGN.md`](../inference/DESIGN.md) — rollout and capture
+- [`../training/DESIGN.md`](../training/DESIGN.md) — trainer, strategy, and
+  backend

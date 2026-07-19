@@ -1,30 +1,26 @@
-"""
-This script will generate the hidden states for the dataset use transformer as the target model backend.
-By generating hidden states in advance, we can avoid:
-- the memory overhead of loading target model
-- the latency overhead of generating hidden states for each request.
+"""Generate offline EAGLE3 features with a dedicated local SGLang capture.
 
-Optimized for lower memory usage and higher efficiency.
+The local target exists only for this preprocessing command. Online training
+consumes features from an external server and never loads a target model in the
+trainer process. Precomputing target features removes the target model's memory
+and latency cost from the later offline training run.
 
 Usage:
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --enable-aux-hidden-states \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
     --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
     --chat-template llama3 \
     --max-length 2048 \
     --tp-size 1 \
     --batch-size 32 \
-    --num-samples 1000 \
-    --output-path ./cache/hidden_states
+    --num-samples 1000
 
 For pre-formatted data (with chat template already applied), add --is-preformatted:
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --enable-aux-hidden-states \
     --data-path ./cache/dataset/preformatted_data.jsonl \
     --output-path ./cache/hidden_states \
     --chat-template llama3 \
@@ -40,16 +36,16 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-from tqdm import tqdm
-from transformers import AutoConfig, AutoProcessor
-
 from datasets import Dataset
-from specforge.args import SGLangBackendArgs
-from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
+from tqdm import tqdm
+from transformers import AutoConfig
+
+from specforge.data.preprocessing import build_eagle3_dataset
+from specforge.data.utils import prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
@@ -57,7 +53,10 @@ from specforge.distributed import (
     init_distributed,
     is_tp_rank_0,
 )
-from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
+from specforge.offline_capture import (
+    OfflineEagle3SGLangCapture,
+    load_offline_eagle3_capture,
+)
 from specforge.utils import (
     load_tokenizer,
     print_args_with_dots,
@@ -87,10 +86,11 @@ def parse_args():
         help="Trust remote code when loading models",
     )
     model_group.add_argument(
-        "--is-vlm", action="store_true", help="Whether the target model is a VLM"
+        "--capture-layers",
+        type=str,
+        default=None,
+        help="Three comma-separated layer ids (default: 1, middle-1, final-4)",
     )
-    model_group.add_argument("--enable-aux-hidden-states", action="store_true")
-    model_group.add_argument("--aux-hidden-states-layers", type=str, default=None)
 
     data_group = parser.add_argument_group("data")
     data_group.add_argument("--data-path", type=str, required=True)
@@ -111,12 +111,6 @@ def parse_args():
     others_group = parser.add_argument_group("others")
     others_group.add_argument("--cache-dir", type=str, default="./cache")
     others_group.add_argument("--output-path", type=str, default=None)
-    others_group.add_argument(
-        "--model-download-dir",
-        type=str,
-        default=None,
-        help="The directory to download the target model to",
-    )
     others_group.add_argument(
         "--dist-timeout",
         type=int,
@@ -157,59 +151,75 @@ def parse_args():
     )
 
     sglang_group = parser.add_argument_group("sglang")
-    SGLangBackendArgs.add_args(sglang_group)
+    sglang_group.add_argument(
+        "--sglang-attention-backend",
+        default="flashinfer",
+        help="Attention backend used by the offline SGLang capture",
+    )
+    sglang_group.add_argument("--sglang-mem-fraction-static", type=float, default=0.4)
+    sglang_group.add_argument("--sglang-context-length", type=int, default=None)
+    sglang_group.add_argument("--sglang-enable-nccl-nvls", action="store_true")
+    sglang_group.add_argument("--sglang-enable-symm-mem", action="store_true")
+    sglang_group.add_argument("--sglang-enable-torch-compile", action="store_true")
+    sglang_group.add_argument("--sglang-enable-dp-attention", action="store_true")
+    sglang_group.add_argument("--sglang-enable-dp-lm-head", action="store_true")
+    sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
     return parser.parse_args()
+
+
+def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
+    return {
+        "attention_backend": args.sglang_attention_backend,
+        "mem_fraction_static": args.sglang_mem_fraction_static,
+        "context_length": args.sglang_context_length,
+        "enable_nccl_nvls": args.sglang_enable_nccl_nvls,
+        "enable_symm_mem": args.sglang_enable_symm_mem,
+        "enable_torch_compile": args.sglang_enable_torch_compile,
+        "enable_dp_attention": args.sglang_enable_dp_attention,
+        "enable_dp_lm_head": args.sglang_enable_dp_lm_head,
+        "ep_size": args.sglang_ep_size,
+        "max_running_requests": args.batch_size,
+        "max_total_tokens": args.batch_size * args.max_length,
+    }
+
+
+def _resolve_capture_layers(
+    model_config: AutoConfig, value: Optional[str]
+) -> List[int]:
+    if value is None:
+        num_layers = model_config.num_hidden_layers
+        layers = [1, num_layers // 2 - 1, num_layers - 4]
+    else:
+        try:
+            layers = [int(layer.strip()) for layer in value.split(",")]
+        except (AttributeError, ValueError) as exc:
+            raise ValueError(
+                "--capture-layers must be three comma-separated integers"
+            ) from exc
+    if len(layers) != 3 or len(set(layers)) != 3 or any(layer < 0 for layer in layers):
+        raise ValueError(
+            "offline EAGLE3 capture requires three distinct non-negative layers"
+        )
+    return layers
 
 
 def build_target_model(
     args: argparse.Namespace, model_config: AutoConfig
-) -> Tuple[Eagle3TargetModel, Optional[AutoProcessor]]:
-    """
-    Build the target model according to the arguments.
-
-    For VLM models (Qwen2.5-VL) without TP, load directly from transformers.
-    Otherwise, use the Eagle3 target model wrapper.
-    """
-    if args.is_vlm and model_config.model_type == "qwen2_5_vl" and args.tp_size == 1:
-        # TODO: replace with sglang
-        from transformers import Qwen2_5_VLForConditionalGeneration
-
-        target_model = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=(
-                    model_config.dtype
-                    if hasattr(model_config, "dtype")
-                    else model_config.torch_dtype
-                ),
-            )
-            .eval()
-            .cuda()
-        )
-    else:
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-        target_model = get_eagle3_target_model(
-            pretrained_model_name_or_path=args.target_model_path,
-            backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
-            torch_dtype=(
-                model_config.dtype
-                if hasattr(model_config, "dtype")
-                else model_config.torch_dtype
-            ),
-            device="cuda",
-            cache_dir=args.model_download_dir,
-            trust_remote_code=args.trust_remote_code,
-            **target_model_kwargs,
-        )
-    # Set auxiliary hidden states layers if specified
-    target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
-
-    if args.is_vlm:
-        processor = AutoProcessor.from_pretrained(args.target_model_path)
-    else:
-        processor = None
-
-    return target_model, processor
+) -> OfflineEagle3SGLangCapture:
+    """Build the local target used only by this preprocessing command."""
+    capture_layers = _resolve_capture_layers(model_config, args.capture_layers)
+    target_model = load_offline_eagle3_capture(
+        args.target_model_path,
+        torch_dtype=(
+            model_config.dtype
+            if hasattr(model_config, "dtype")
+            else model_config.torch_dtype
+        ),
+        trust_remote_code=args.trust_remote_code,
+        **_sglang_kwargs(args),
+    )
+    target_model.set_capture_layers(capture_layers)
+    return target_model
 
 
 class HiddenStatesGenerator:
@@ -225,7 +235,6 @@ class HiddenStatesGenerator:
     def __init__(
         self,
         target_model,
-        enable_aux_hidden_states: bool = True,
         num_io_threads: int = 4,
         io_queue_size: int = 50,
         file_group_size: int = 2000,
@@ -235,13 +244,11 @@ class HiddenStatesGenerator:
         """
         Args:
             target_model: The model for inference.
-            enable_aux_hidden_states: Whether to save auxiliary hidden states.
             num_io_threads: Number of threads for async I/O.
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
         """
         self.model = target_model
-        self.enable_aux_hidden_states = enable_aux_hidden_states
 
         # --- Configurable parameters ---
         self.num_io_threads = num_io_threads
@@ -392,11 +399,11 @@ class HiddenStatesGenerator:
         def check_single_file(idx):
             if os.path.exists(self._get_file_path(output_path, idx)):
                 return True
-            legacy_ckpt = self._get_file_path(output_path, idx, extension=".ckpt")
+            uncompressed_ckpt = self._get_file_path(output_path, idx, extension=".ckpt")
             compressed_ckpt = self._get_file_path(
                 output_path, idx, extension=".ckpt.gz"
             )
-            return os.path.exists(legacy_ckpt) or os.path.exists(compressed_ckpt)
+            return os.path.exists(uncompressed_ckpt) or os.path.exists(compressed_ckpt)
 
         # Parallel file existence check
         with ThreadPoolExecutor(max_workers=self.num_io_threads) as executor:
@@ -507,11 +514,15 @@ class HiddenStatesGenerator:
             filtered_batch_gpu = {
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
-            _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
+            captured = self.model.capture(
                 **filtered_batch_gpu,
-                return_last_hidden_states=True,
-                return_logits=False,
             )
+            aux_hidden_states_list = captured.hidden_states
+            last_hidden_states_list = captured.last_hidden_states
+            if last_hidden_states_list is None:
+                raise RuntimeError(
+                    "offline capture did not return target last hidden states"
+                )
 
             del filtered_batch_gpu
 
@@ -583,10 +594,6 @@ class HiddenStatesGenerator:
 
 def main():
     args = parse_args()
-    if args.aux_hidden_states_layers is not None:
-        args.aux_hidden_states_layers = [
-            int(x) for x in args.aux_hidden_states_layers.split(",")
-        ]
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)
@@ -598,7 +605,7 @@ def main():
     target_model_config = AutoConfig.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    target_model, processor = build_target_model(args, target_model_config)
+    target_model = build_target_model(args, target_model_config)
 
     print_with_rank(
         f"DP Rank {dist.get_rank(get_dp_group())}, TP Rank {dist.get_rank(get_tp_group())}, "
@@ -630,7 +637,9 @@ def main():
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
-    tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
+    tokenizer = load_tokenizer(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
     cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
@@ -644,9 +653,7 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
-            is_vlm=args.is_vlm,
             is_preformatted=args.is_preformatted,
-            processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
@@ -658,7 +665,6 @@ def main():
         num_workers=args.num_workers,
         shuffle=False,
         process_group=get_dp_group(),
-        is_vlm=args.is_vlm,
     )
 
     print_with_rank(
@@ -692,7 +698,6 @@ def main():
         # Pass configurable arguments from args if needed
         with HiddenStatesGenerator(
             target_model,
-            enable_aux_hidden_states=args.enable_aux_hidden_states,
             num_io_threads=args.num_io_threads,
             io_queue_size=args.io_queue_size,
             file_group_size=args.file_group_size,

@@ -1,46 +1,30 @@
 import json
 import os
-from typing import Optional, Union
+from typing import Union
 
-import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
-from transformers import (
-    GptOssConfig,
-    Llama4Config,
-    Llama4TextConfig,
-    LlamaConfig,
-    Phi3Config,
-    PretrainedConfig,
-    Qwen2Config,
-    Qwen3Config,
-    Qwen3MoeConfig,
-    modeling_utils,
-)
+from transformers import PretrainedConfig, modeling_utils
 
-from .draft.llama3_eagle import LlamaForCausalLMEagle3
-from .target.custom_backend import (
-    GptOssForCausalLM,
-    Llama4ForCausalLM,
-    LlamaForCausalLM,
-    Phi3ForCausalLM,
-    Qwen2ForCausalLM,
-    Qwen3ForCausalLM,
-    Qwen3MoeForCausalLM,
-)
+from .draft.registry import DRAFT_REGISTRY, available_drafts
 
 
-class AutoEagle3DraftModel(AutoModelForCausalLMBase):
-    # the model mapping is currently hardcoded, we should support lazy model mapping via registry
-    _model_mapping = {
-        LlamaConfig: LlamaForCausalLMEagle3,
-    }
+class AutoDraftModel(AutoModelForCausalLMBase):
+    @classmethod
+    def _model_cls_from_config(cls, config: PretrainedConfig):
+        archs = getattr(config, "architectures", None) or []
+        if len(archs) != 1 or archs[0] not in DRAFT_REGISTRY:
+            raise ValueError(
+                "draft config must name exactly one registered architecture; "
+                f"got {archs!r}, available: {available_drafts()}"
+            )
+        return DRAFT_REGISTRY[archs[0]]
 
     @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
-        This class method takes a configuration object and create its model based on the
-        _model_mapping class variable.
+        This class method takes a configuration object and creates its model,
+        resolving the class from DRAFT_REGISTRY via ``config.architectures``.
 
         Args:
             config (PretrainedConfig): A configuration object.
@@ -48,8 +32,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         Returns:
             A model instance.
         """
-        # get the model class from the
-        _model_cls = cls._model_mapping[type(config)]
+        _model_cls = cls._model_cls_from_config(config)
         model = _model_cls(config, **config_kwargs)
 
         # Convert model to specified dtype if provided
@@ -74,7 +57,12 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         modeling_utils.logger.warning = filtered_warning
 
         try:
-            model = super().from_pretrained(
+            config = kwargs.get("config")
+            if config is None:
+                config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+            model_cls = cls._model_cls_from_config(config)
+            kwargs = {**kwargs, "config": config}
+            model = model_cls.from_pretrained(
                 pretrained_model_name_or_path, *model_args, **kwargs
             )
         finally:
@@ -83,59 +71,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         return model
 
 
-class AutoDistributedTargetModel(AutoModelForCausalLMBase):
-    # the model mapping is currently hardcoded, we should support lazy model mapping via registry
-    _model_mapping = {
-        Llama4TextConfig: [Llama4ForCausalLM],
-        Qwen3MoeConfig: [Qwen3MoeForCausalLM],
-        Qwen2Config: [Qwen2ForCausalLM],
-        LlamaConfig: [LlamaForCausalLM],
-        Qwen3Config: [Qwen3ForCausalLM],
-        Phi3Config: [Phi3ForCausalLM],
-        GptOssConfig: [GptOssForCausalLM],
-    }
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
-        torch_dtype: torch.dtype = None,
-        device: str = None,
-        cache_dir: Optional[str] = None,
-        **config_kwargs,
-    ):
-        config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path,
-        )
-
-        if isinstance(config, Llama4Config):
-            config = config.text_config
-
-        assert (
-            type(config) in cls._model_mapping
-        ), f"Unsupported config type: {type(config)}"
-        model_cls = cls._model_mapping[type(config)][0]
-        model = model_cls.from_pretrained(
-            pretrained_model_name_or_path,
-            torch_dtype=torch_dtype,
-            cache_dir=cache_dir,
-            **config_kwargs,
-        )
-
-        if device is not None:
-            model = model.to(device)
-        else:
-            model = model.cuda()
-        return model
-
-
 class AutoDraftModelConfig:
-
-    _config_mapping = {
-        "LlamaForCausalLMEagle3": LlamaConfig,
-        "PEagleDraftModel": LlamaConfig,
-    }
-
     @classmethod
     def from_file(cls, config_path: str):
         """
@@ -166,11 +102,15 @@ class AutoDraftModelConfig:
 
         architecture = architectures[0]
 
-        if architecture not in cls._config_mapping:
-            raise ValueError(f"Architecture {architecture} not supported")
+        if architecture not in DRAFT_REGISTRY:
+            raise ValueError(
+                f"Architecture {architecture} not registered; "
+                f"available: {available_drafts()}"
+            )
+        config_cls = DRAFT_REGISTRY[architecture].config_class
 
         # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
         if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
             config["draft_vocab_size"] = config.get("vocab_size", None)
 
-        return cls._config_mapping[architecture].from_dict(config)
+        return config_cls.from_dict(config)

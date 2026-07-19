@@ -1,0 +1,48 @@
+model:
+  target_model_path: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+  draft_model_config: "configs/qwen3-coder-30B-A3B-instruct-eagle3.json"
+  vocab_mapping_path: cache/vocab_mapping/qwen3-coder-30b-a3b-eagle3.pt
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "./cache/dataset/opc_regenerated.jsonl"
+  max_length: 4096
+  chat_template: "qwen"
+  build_dataset_num_proc: 64
+  cache_dir: "./cache"
+training:
+  strategy: "eagle3"
+  num_epochs: 2
+  max_steps: 10000
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  tp_size: 1
+  save_interval: 5000
+  log_interval: 50
+  dist_timeout: 60
+  seed: 0
+tracking:
+  report_to: "wandb"
+  wandb_project: "specforge-qwen3-coder"
+  wandb_name: "qwen3-coder-30b-eagle3-tp4-opc-regen"
+run_id: "qwen3-coder-30b-a3b-eagle3-online"
+output_dir: "./outputs/qwen3-coder-30b-a3b-eagle3-online"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3-coder-30b-a3b-eagle3-online/control
+    consumer_state_dir: outputs/qwen3-coder-30b-a3b-eagle3-online/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

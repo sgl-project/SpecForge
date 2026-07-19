@@ -1,101 +1,165 @@
-# Disaggregated offline EAGLE3 example
+# Disaggregated examples
 
-Runs the offline EAGLE3 training of `scripts/train_eagle3_dataflow.py`, but splits
-it across **two pools that share only a filesystem mount** — the M6 disaggregation
-seam (`SharedDirFeatureStore`). It is the runnable proof that *disaggregation
-changes where features live, not their values*: the training curve matches the
-colocated offline run.
-
-## How it works
-
-```
- producer pool (node 0)                shared mount                 training pool (node 1)
- ─────────────────────                ──────────────              ──────────────────────
- ingest_offline_features()  ──put()──▶ SharedDirFeatureStore ──get()──▶ FeatureDataLoader
- write_ref_manifest()       ──json──▶  refs.json (no tensors) ──read──▶ build_disagg_eagle3_runtime
-                                                                         TrainerController.fit()
-```
-
-The control plane carries only tensor-free `SampleRef` metadata (the manifest);
-feature tensors travel through the shared store. `build_disagg_eagle3_runtime`
-reuses the exact offline trainer assembly, so results align by construction.
-
-## Backends
-
-The feature transport is selected by `DISAGG_BACKEND` (default `shared_dir`):
-
-| backend | store | shared *data* mount? |
-|---|---|---|
-| `shared_dir` (default) | `SharedDirFeatureStore` (`torch.save` on a POSIX mount) | required |
-| `mooncake` | `MooncakeFeatureStore` (RDMA/TCP network object store) | not needed |
-
-`mooncake` is the M6 **fast path**: producer `put()`s and consumer `get()`s by key
-across nodes peer-to-peer, so feature tensors need no shared *data* mount (only the
-small ref manifest still uses `DISAGG_MANIFEST`). Each object is hard-pinned so
-Mooncake's cache LRU never drops a committed feature. Because a Mooncake object
-lives in the **producer's** memory segment, the producer must stay alive until the
-consumer finishes — the example holds it open until the consumer writes
-`<manifest>.consumed` (or `DISAGG_PRODUCER_HOLD_S` elapses). Enable with:
+Disaggregated training uses the same typed config and public command as every
+other run:
 
 ```bash
-export DISAGG_BACKEND=mooncake
-export MOONCAKE_LOCAL_HOSTNAME=<this-node-ip>
-export MOONCAKE_METADATA_SERVER=<metadata url>
-export MOONCAKE_MASTER_SERVER_ADDR=<master host:port>
-export MOONCAKE_PROTOCOL=tcp   # or rdma
+specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml
 ```
 
-Requires the `mooncake` package and a running Mooncake master/metadata service
-(verify on a Mooncake-enabled GPU host). The contract itself is unit-tested
-backend-agnostically in `tests/test_runtime/test_mooncake_store.py`.
+For a single trainer node, that command supervises the SpecForge producer and
+consumer together. The producer is one direct process; the consumer topology
+comes from `deployment.trainer` and is launched through torch distributed when
+`nproc_per_node > 1`.
 
-## Run it (rcli, 2 nodes)
-
-1. Generate offline features on node 0 (any EAGLE3 feature generator), e.g. into
-   `/root/disagg/features` as `*.ckpt` with keys
-   `input_ids,loss_mask,hidden_state,aux_hidden_state`.
-2. Drive both pools at once — node 0 ingests, node 1 trains:
-
-   ```bash
-   rcli exec --per-node <job> 'bash examples/disagg/run_qwen2.5_7b_eagle3_disagg.sh'
-   ```
-
-The wrapper branches on `RCLI_NODE_RANK`. Override paths/steps via env
-(`DISAGG_STORE_ROOT`, `FEATURES_DIR`, `MAX_STEPS`, `NPROC`, …). Both pools must
-share `DISAGG_STORE_ROOT`/`DISAGG_STORE_ID` and (if set) `DISAGG_AUTH_TOKEN`
-(B9 auth).
-
-## Single-host smoke
-
-`DISAGG_ROLE` overrides the rank-derived role, so you can run both halves on one
-host sharing a local dir — run the producer once, then the consumer:
+The scripts in this directory are optional thin examples. The single-node
+wrappers only add the config path and forward arguments to `specforge train`;
+they contain no second trainer, torchrun construction, or transport validation:
 
 ```bash
-DISAGG_ROLE=producer  python examples/disagg/run_disagg_eagle3.py <args>
-DISAGG_ROLE=consumer  torchrun --standalone --nproc_per_node 1 \
-    examples/disagg/run_disagg_eagle3.py <args>
+CONFIG=examples/configs/qwen3-8b-dflash-disaggregated.yaml \
+  examples/disagg/run_online.sh
+
+CONFIG=examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml \
+  examples/disagg/run_offline.sh
 ```
 
-The bit-exact equivalence to the colocated path is covered by
-`tests/test_runtime/test_disagg_launch.py`.
+For offline ingestion and training on separate physical nodes, invoke the same
+rank dispatcher on both nodes. The cluster launcher supplies
+`RCLI_NODE_RANK=0` for the producer and `RCLI_NODE_RANK=1` for the consumer:
 
-## Head-to-head vs colocated (Qwen2.5-7B, 2-node H200)
+```bash
+rcli exec --per-node <job> \
+  'CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+```
 
-`DISAGG_ROLE=colocated` runs the same model build + assembly through
-`build_offline_eagle3_runtime` (`LocalFeatureStore`). On identical features/seed,
-the disaggregated consumer and the colocated baseline produce the same training
-metrics to ~5 significant figures (residual ~1e-6–1e-8 is GPU run-to-run
-floating-point noise, not the transport — feature tensors are byte-identical):
+This wrapper only maps rank to `specforge train --role`; the YAML still owns
+the consumer process count and the shared `control_dir`/`store_root`. Both
+nodes must resolve those paths to the same storage and start from a fresh
+attempt directory. `NODE_RANK`/`NUM_NODES` are accepted when the scheduler does
+not expose the corresponding `RCLI_*` variables.
 
-| step | metric | disagg | colocated |
-|---|---|---|---|
-| 20 | acceptance_rate | 0.0013300 | 0.0013300 |
-| 20 | ploss | 5.386736 | 5.386740 |
-| 20 | acc | 0.0272590 | 0.0272590 |
-| 120 | acceptance_rate | 0.0223610 | 0.0223505 |
-| 180 | acceptance_rate | 0.0337013 | 0.0336982 |
+## Explicit roles
 
-acc / acceptance_rate climb over training in both (baseline direction). Per-step
-values are noisy at `batch_size=1` over 64 diverse samples. Note this is the
-training-time acceptance proxy; the serving accept-length (τ via spec-decoding) is
-a separate eval gate.
+Use the same YAML when producer and consumer belong to different pools:
+
+```bash
+specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml \
+  --role producer
+
+specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml \
+  --role consumer
+```
+
+For a multi-node consumer, `deployment.trainer.nnodes`,
+`nproc_per_node`, `master_addr`, and `master_port` remain identical on every
+node. Supply only the node-local rank at invocation time:
+
+```bash
+# Trainer node 0
+specforge train -c run.yaml --role consumer --node-rank 0
+
+# Trainer node 1
+specforge train -c run.yaml --role consumer --node-rank 1
+```
+
+Automatic `--role both` is deliberately single-node. The CLI does not SSH into
+other machines or start scheduler jobs.
+
+For the common two-physical-node demonstration (inference services + producer
+on rank 0, one DP trainer pool on rank 1), run the checked-in infrastructure
+wrapper once per node through the cluster launcher:
+
+```bash
+export DISAGG_STORE_ID=qwen3-8b-two-node-attempt-001
+export DISAGG_RUN_ROOT=/shared/specforge/$DISAGG_STORE_ID
+
+# The launcher supplies RCLI_NODE_RANK, RCLI_NUM_NODES, and RCLI_HEAD_IP.
+rcli exec --per-node <job> \
+  'bash examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh'
+```
+
+The wrapper owns Mooncake/SGLang readiness and cross-node lifecycle only. Both
+roles still execute `specforge train -c ...`; it contains no legacy Python
+trainer and constructs no `torchrun` command. Set `SERVER_GPUS`, `TRAINER_GPUS`,
+`TRAINER_NPROC`, and `CONFIG` when the allocation differs. Both nodes must see
+the fresh `DISAGG_RUN_ROOT` path. References stay under its shared `control`
+directory, while the wrapper's lifecycle markers stay at the shared run root.
+The consumer's SQLite/WAL and rank inboxes default to the trainer-node-local
+`/tmp/specforge/$DISAGG_STORE_ID/consumer-state`; override
+`DISAGG_CONSUMER_STATE_DIR` or `LOCAL_SCRATCH` when `/tmp` is unsuitable.
+Node-local consumer state currently supports one trainer node only.
+
+## External and managed-local services
+
+By default, online capture requires an already-running Mooncake deployment and
+patched SGLang capture server. Those long-lived services are not started or
+stopped by `specforge train`. Put stable, non-secret topology in the typed
+`deployment.disaggregated` section; inject authentication tokens, each node's
+Mooncake hostname, and device visibility through the deployment environment.
+The checked-in external-service recipes point at the standard local demo ports;
+replace those endpoint fields, or override them with environment values, for a
+remote deployment.
+
+For a self-contained single-node development run, the managed-local recipes
+record Mooncake, one or more capture servers, their GPU placement, and the DP
+trainer in one YAML:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+
+specforge train -c \
+  examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+```
+
+These recipes preserve the old DFlash and Domino one-server + DP7
+self-contained topologies. The genuine two-server Domino recipe is:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml
+```
+
+Qwen3.6 DFlash has both one-server and larger two-TP2-server managed recipes:
+
+```bash
+specforge train -c \
+  examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+
+specforge train -c \
+  examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+```
+
+The first command preserves the historical one-server + DP2 self-contained
+topology; the second owns two TP=2 servers plus the DP2 trainer.
+
+That opt-in profile starts, health-checks, and cleans up the owned local
+services. It does not change the default external-service boundary or attempt
+to schedule services on remote hosts.
+
+The strict e2e gate at
+`scripts/gates/run_disaggregated_overfit_gate.sh` retains full local test-stack
+automation: it starts and health-checks Mooncake and SGLang, runs the unified
+producer/consumer entry, verifies training and serving, and cleans up owned
+processes. That test harness is not the production service supervisor.
+
+Online configs use Mooncake. Offline configs may use either a typed
+`shared_dir` store or Mooncake. `deployment.disaggregated.control_dir` is the
+one attempt root from which the launcher derives the reference channel or
+manifest and lifecycle markers. An online deployment places the consumer's
+rank-0 SQLite/WAL in the node-local
+`deployment.disaggregated.consumer_state_dir`. Multi-node trainers require this
+field and keep their rank inboxes under the shared `control_dir`. Always choose
+fresh control and consumer-state directories for a new attempt. An offline
+Mooncake producer must also set a positive
+`deployment.disaggregated.producer_segment_size`; online roles and the offline
+consumer use zero because they do not own feature allocations.
+
+Use `specforge train -c run.yaml --plan` to inspect the resolved role and
+process commands without starting workers. Secret-looking override values and
+URL userinfo are redacted.
+
+See the [disaggregated training guide](../../docs/basic_usage/disaggregated_training.md)
+for service prerequisites, recovery rules, and the online/offline data-plane
+contracts.

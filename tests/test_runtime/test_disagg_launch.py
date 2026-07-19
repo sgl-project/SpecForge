@@ -7,9 +7,9 @@ from them) are aligned:
 
 * CPU, no model: the disagg store serves byte-identical tensors to the colocated
   ``LocalFeatureStore`` file:// path, and the ref manifest round-trips losslessly
-  (and carries no tensors). Since ``build_disagg_eagle3_runtime`` reuses the exact
+  (and carries no tensors). Since ``build_disagg_offline_runtime`` reuses the exact
   offline trainer assembly, identical tensors => identical training.
-* GPU: ``build_disagg_eagle3_runtime`` assembles + trains end to end through FSDP.
+* GPU: ``build_disagg_offline_runtime`` assembles + trains end to end through FSDP.
 """
 
 import os
@@ -18,6 +18,7 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.runtime.contracts import assert_no_tensors
 from specforge.runtime.data_plane import LocalFeatureStore, OfflineManifestReader
 from specforge.runtime.data_plane.disagg_ingest import (
@@ -29,6 +30,18 @@ from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeat
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
+
+
+def _ingest(store, hidden_states_path, **kwargs):
+    """Exercise transport with the application-resolved offline provider."""
+    return ingest_offline_features(
+        store,
+        hidden_states_path,
+        algorithm_name=ALGORITHM.name,
+        build_reader=ALGORITHM.providers.offline_for("text").build_reader,
+        **kwargs,
+    )
 
 
 class TestDisaggDataEquivalence(unittest.TestCase):
@@ -47,7 +60,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
 
         # Disagg path: ingest the same files into a SharedDirFeatureStore.
         shared = SharedDirFeatureStore(os.path.join(self.work, "store"), store_id="st")
-        disagg_refs = ingest_offline_features(shared, self.feat_dir, run_id="off")
+        disagg_refs = _ingest(shared, self.feat_dir, run_id="off")
 
         self.assertEqual(len(offline_refs), len(disagg_refs))
         self.assertTrue(
@@ -70,7 +83,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
         shared = SharedDirFeatureStore(
             os.path.join(self.work, "store2"), store_id="st2"
         )
-        refs = ingest_offline_features(shared, self.feat_dir, run_id="run7")
+        refs = _ingest(shared, self.feat_dir, run_id="run7")
         manifest = os.path.join(self.work, "refs.json")
         write_ref_manifest(refs, manifest)  # asserts no-tensor internally
 
@@ -102,7 +115,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
         store = SharedDirFeatureStore(
             os.path.join(self.work, "store_ro"), store_id="ro", retain_on_release=True
         )
-        refs = ingest_offline_features(store, self.feat_dir, run_id="ro")
+        refs = _ingest(store, self.feat_dir, run_id="ro")
         for _epoch in range(3):
             for r in refs:
                 t, h = store.get(r)
@@ -115,7 +128,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
         store = SharedDirFeatureStore(
             os.path.join(self.work, "store_co"), store_id="co"
         )
-        refs = ingest_offline_features(store, self.feat_dir, run_id="co")
+        refs = _ingest(store, self.feat_dir, run_id="co")
         _t, h = store.get(refs[0])
         store.release(h)
         with self.assertRaises(KeyError):
@@ -126,7 +139,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
         producer = SharedDirFeatureStore(
             root, store_id="auth", auth=AuthPolicy("s3cret"), credential="s3cret"
         )
-        ingest_offline_features(producer, self.feat_dir, run_id="a")
+        _ingest(producer, self.feat_dir, run_id="a")
         # B9: a consumer attaching with the wrong/no credential is rejected.
         with self.assertRaises(PermissionError):
             SharedDirFeatureStore(root, store_id="auth", auth=AuthPolicy("s3cret"))
@@ -140,8 +153,8 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+        from specforge.launch import build_disagg_offline_runtime
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.launch import build_disagg_eagle3_runtime
 
         TTT, ACC, MAX_OPT_STEPS, N = 3, 2, 2, 8
         work = tempfile.mkdtemp(prefix="disagg_fsdp_")
@@ -152,7 +165,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
         store = SharedDirFeatureStore(
             os.path.join(work, "shared_store"), store_id="e2e"
         )
-        refs = ingest_offline_features(store, feat_dir, run_id="e2e", max_len=512)
+        refs = _ingest(store, feat_dir, run_id="e2e", max_len=512)
         manifest = os.path.join(work, "refs.json")
         write_ref_manifest(refs, manifest)
 
@@ -168,10 +181,11 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader = build_disagg_eagle3_runtime(
+        trainer = build_disagg_offline_runtime(
+            algorithm=ALGORITHM,
             feature_store=store,
             refs=consumer_refs,
-            eagle3_model=eagle3_model,
+            draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
             run_id="e2e",
@@ -188,12 +202,11 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
             module, FSDP, "strategy must hold the FSDP-wrapped module"
         )
 
-        step = trainer.fit(loader)
+        step = trainer.fit()
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
 
-        ckpt = trainer.save_checkpoint(trainer.global_step)
-        self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
+        self.assertEqual(trainer.last_checkpoint_step, trainer.global_step)
 
 
 if __name__ == "__main__":

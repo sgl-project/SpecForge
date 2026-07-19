@@ -19,6 +19,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+from .registry import register_draft
+
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
@@ -186,7 +188,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
-        return [(num_target_layers // 2)]
+        return [num_target_layers // 2]
     start = 1
     end = num_target_layers - 3
     span = end - start
@@ -209,6 +211,46 @@ def extract_context_feature(
     return target_hidden
 
 
+def normalize_draft_head_checkpoint_keys(
+    module,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+):
+    """Map checkpoint-only nested head names onto the direct module layout.
+
+    Early Domino/DSpark checkpoints saved their auxiliary heads beneath a
+    ``logit_head`` container. The live architecture no longer owns that wrapper,
+    but those tensors remain valid and must not be dropped during warm start or
+    full resume.
+    """
+
+    del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    checkpoint_prefixes = (
+        ("logit_head.prefix_gru.", "prefix_gru."),
+        ("logit_head.embed_proj.", "embed_proj."),
+        ("logit_head.markov_head.", "markov_head."),
+        ("logit_head.confidence_head.", "confidence_head."),
+    )
+    for key in list(state_dict):
+        if not key.startswith(prefix):
+            continue
+        local_key = key[len(prefix) :]
+        for checkpoint_prefix, model_prefix in checkpoint_prefixes:
+            if not local_key.startswith(checkpoint_prefix):
+                continue
+            normalized_key = prefix + model_prefix + local_key[len(checkpoint_prefix) :]
+            if normalized_key not in state_dict:
+                state_dict[normalized_key] = state_dict[key]
+            state_dict.pop(key)
+            break
+
+
+@register_draft
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
@@ -240,26 +282,61 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
-
-        if self.projector_type == "domino":
-            self.emb_dim = dflash_config["emb_dim"]
-            self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
-            self.prefix_gru = nn.GRU(
-                input_size=config.hidden_size,
-                hidden_size=self.gru_hidden_dim,
-                num_layers=1,
-                batch_first=True,
-                bias=False,
-            )
-            in_dim = config.hidden_size + self.gru_hidden_dim
-            self.embed_proj = nn.Sequential(
-                nn.Linear(in_dim, self.emb_dim, bias=False),
-                nn.SiLU(),
-                nn.Linear(self.emb_dim, config.vocab_size, bias=False),
-            )
-        elif self.projector_type is not None:
-            raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
+        self._init_draft_head(config, dflash_config)
+        self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    def _init_draft_head(self, config, dflash_config: dict) -> None:
+        del config, dflash_config
+
+    def apply_logits_head(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+        prev_token_embeddings: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        del prev_token_ids, prev_token_embeddings, hidden_states
+        return base_logits
+
+    def apply_markov_logits(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.apply_logits_head(
+            base_logits,
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden_states,
+        )
+
+    def predict_confidence(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        del hidden_states, prev_token_ids
+        return None
+
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Sample one speculative block from the draft-model hidden states.
+
+        DFlash predicts the whole suffix in one LM-head call. Draft families
+        with an auxiliary logits head can override this boundary without
+        duplicating the target-cache and acceptance logic in ``spec_generate``.
+        """
+        del block_output_ids
+        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        return sample(draft_logits)
 
     def forward(
         self,
@@ -339,20 +416,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start + block_size
-                    ],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                    is_causal=False,
-                )[:, -block_size + 1 :, :]
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[
+                    :, past_key_values_draft.get_seq_length() : start + block_size
+                ],
+                past_key_values=past_key_values_draft,
+                use_cache=True,
+                is_causal=False,
             )
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            block_output_ids[:, 1:] = self._sample_draft_tokens(
+                target,
+                draft_hidden,
+                block_output_ids,
+            )
 
             output = target(
                 block_output_ids,
