@@ -1642,16 +1642,27 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * 3, config.hidden_size, bias=False
+        self.target_hidden_size = getattr(
+            config, "target_hidden_size", config.hidden_size
+        )
+
+        self.fc = torch.nn.Linear(
+            self.target_hidden_size * 3,
+            config.hidden_size,
+            bias=False,
+        )
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = nn.ModuleList(
+                [
+                    LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(3)
+                ]
             )
         else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * 3, config.hidden_size, bias=False
-            )
+            self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_output = getattr(config, "norm_output", True)
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
@@ -1703,7 +1714,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
 
         # fc
-        hidden_states = self.fc(hidden_states)
+        hidden_states = self.project_hidden_states(hidden_states)
         hidden_states = self.midlayer(
             input_emb=inputs_embeds,
             hidden_states=hidden_states,
@@ -1724,12 +1735,20 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        assert hidden_states.size(-1) == self.target_hidden_size * 3
+        if self.fc_norm is not None:
+            chunks = hidden_states.chunk(3, dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                dim=-1,
+            )
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        norm_hidden_states = self.norm(hidden_states)
+        if self.norm_output:
+            norm_hidden_states = self.norm(hidden_states)
+        else:
+            norm_hidden_states = hidden_states
         return self.lm_head(norm_hidden_states)
 
     def backbone(
