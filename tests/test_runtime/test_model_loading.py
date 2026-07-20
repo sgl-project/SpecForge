@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -248,7 +249,24 @@ class WarmStartTest(unittest.TestCase):
             },
             path,
         )
+        Path(directory, "_SUCCESS").touch()
         return path
+
+    def test_markerless_runtime_checkpoint_is_rejected(self):
+        source = _TinyDraft()
+        destination = _TinyDraft()
+        with tempfile.TemporaryDirectory() as directory:
+            torch.save(
+                {"draft_state_dict": source.state_dict(), "strategy": "dflash"},
+                os.path.join(directory, "training_state.pt"),
+            )
+            with self.assertRaisesRegex(ValueError, "missing _SUCCESS"):
+                warm_start_draft_model(
+                    destination,
+                    os.path.join(directory, "training_state.pt"),
+                    draft_config=object(),
+                    strategy="dflash",
+                )
 
     def test_specforge_checkpoint_loads_only_draft_weights(self):
         torch.manual_seed(1)

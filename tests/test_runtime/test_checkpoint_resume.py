@@ -15,6 +15,8 @@ from unittest import mock
 
 import torch
 
+from specforge.training.checkpoint import SUCCESS_FILE
+
 CUDA = torch.cuda.is_available()
 
 
@@ -313,6 +315,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 {"optimizer": None, "rng": {}},
                 os.path.join(d, "training_state_rank0.pt"),
             )
+            with open(os.path.join(d, SUCCESS_FILE), "xb"):
+                pass
             return d
 
         cases = [

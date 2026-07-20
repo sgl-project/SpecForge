@@ -317,27 +317,28 @@ def _has_pretrained_weights(path: str) -> bool:
 
 
 def _runtime_state_file(source: str) -> Optional[str]:
-    """Resolve SpecForge checkpoint storage without loading resume state."""
+    """Resolve a committed SpecForge runtime checkpoint without loading it."""
 
     path = os.path.abspath(os.path.expanduser(_without_file_uri(str(source))))
     if os.path.isfile(path):
-        return path if os.path.basename(path) == _STATE_FILE else None
-    if not os.path.isdir(path):
+        if os.path.basename(path) != _STATE_FILE:
+            return None
+    elif not os.path.isdir(path):
         return None
-
-    direct = os.path.join(path, _STATE_FILE)
-    if os.path.isfile(direct) and not _has_pretrained_weights(path):
-        return direct
-    has_run_pointers = bool(
-        glob.glob(os.path.join(path, "*-latest"))
-        or glob.glob(os.path.join(path, "*-step*"))
-    )
-    if not has_run_pointers:
-        return None
+    else:
+        direct = os.path.join(path, _STATE_FILE)
+        has_run_pointers = bool(
+            glob.glob(os.path.join(path, "*-latest"))
+            or glob.glob(os.path.join(path, "*-step*"))
+        )
+        if not has_run_pointers and (
+            not os.path.isfile(direct) or _has_pretrained_weights(path)
+        ):
+            return None
 
     from specforge.training.checkpoint import CheckpointManager
 
-    checkpoint_dir = CheckpointManager.resolve_resume_dir(path)
+    checkpoint_dir = CheckpointManager.resolve_committed_checkpoint_dir(path)
     return os.path.join(checkpoint_dir, _STATE_FILE)
 
 

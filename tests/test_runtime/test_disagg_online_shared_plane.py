@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -80,6 +81,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
         path = os.path.join(self.work, f"run0-step{step}")
         os.makedirs(path, exist_ok=True)
         torch.save({"global_step": step}, os.path.join(path, STATE_FILE))
+        Path(path, "_SUCCESS").touch()
         return path
 
     def _seed_ledger(self, *, acked=(), step=None) -> None:
