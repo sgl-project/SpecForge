@@ -599,13 +599,22 @@ class SGLangCaptureBackend:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
     ):
-        """DFlash extend: capture the concatenated layer hidden states, no logits.
+        """DFlash extend: concatenated aux hidden states (+ optional final hidden).
 
-        Returns ``(data_cache, hidden_states_list)`` — the per-sample raw hidden
-        states the DFlash engine stacks into a batch.
+        Routes through the shared eagle3 capture forward. The DFlash spec builds the
+        backend with ``wrap_eagle3_logits=True``, so the sglang logits processor is
+        wrapped and can surface the post-norm final hidden via
+        ``return_last_hidden_states`` — needed for DSpark's L1 / confidence losses.
+        DFlash asks for no vocab logits (``return_logits=False``), so no eagle3 vocab
+        mapping is required. Returns
+        ``(data_cache, hidden_states_list, last_hidden_states_list)`` where
+        ``hidden_states_list`` is the captured mid-layer concat DFlash trains on and
+        ``last_hidden_states_list`` is the target's post-norm final hidden (the
+        LM-head input) when requested, else ``[None] * batch``.
         """
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs, data_cache = [], []
 
         if isinstance(input_ids, torch.Tensor):
@@ -627,26 +636,21 @@ class SGLangCaptureBackend:
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.logprob_start_len = len(req.origin_input_ids) - 1
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
-        # Capture lengths before the forward: 0.5.13+ releases origin_input_ids in it.
-        input_lens = [len(req.origin_input_ids) for req in reqs]
-        output = self._forward_extend(reqs)
-        if (
-            hasattr(output, "aux_hidden_states")
-            and output.aux_hidden_states is not None
-        ):
-            hidden_states_list = torch.split(
-                output.aux_hidden_states, input_lens, dim=0
-            )
-        elif hasattr(output, "hidden_states") and output.hidden_states is not None:
-            hidden_states_list = torch.split(output.hidden_states, input_lens, dim=0)
-        else:
-            raise ValueError("SGLang output does not contain hidden states.")
-        self._clear_pools()
-
-        return data_cache, hidden_states_list
+        # Shared eagle3 capture: aux hidden concat = DFlash context;
+        # last_hidden_states = post-norm final (only when requested); no logits.
+        # (_forward_eagle3_reqs captures input lengths pre-forward and clears pools.)
+        _, hidden_states_list, last_hidden_states_list = self._forward_eagle3_reqs(
+            reqs,
+            capture_aux_hidden_states=True,
+            return_last_hidden_states=return_last_hidden_states,
+            return_logits=False,
+            shard_returns=False,
+        )
+        return data_cache, hidden_states_list, last_hidden_states_list
 
 
 __all__ = ["SGLangCaptureBackend"]
