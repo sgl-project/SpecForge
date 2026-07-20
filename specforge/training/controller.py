@@ -350,6 +350,7 @@ class TrainerController:
         num_epochs: int = 1,
         logger: Optional[Callable[[Dict[str, Any], int], None]] = None,
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
+        ack_interval: int = 1,
         start_step: int = 0,
         start_epoch: int = 0,
         start_batch: int = 0,
@@ -385,8 +386,9 @@ class TrainerController:
         self.num_epochs = num_epochs
         self.logger = logger
         # ack_fn(sample_ids, global_step) records the durable ack transaction at
-        # the optimizer-step boundary; None = the loader acks (simple runs).
+        # optimizer-step boundaries; None = the loader acks (simple runs).
         self.ack_fn = ack_fn
+        self.ack_interval = max(1, int(ack_interval))
         # global_step counts OPTIMIZER steps (increments only at a grad-accum
         # boundary) so ack/checkpoint/resume semantics are in true optimizer
         # steps; micro_step counts forward/backward micro-batches.
@@ -458,7 +460,19 @@ class TrainerController:
         eval_enabled = self._rank0_decision(
             self.eval_interval > 0 and self.eval_data_factory is not None
         )
+        # Samples become durably ackable only after the optimizer boundary that
+        # includes them. Keep in-progress accumulation separate from deferred
+        # ackable IDs so final/checkpoint flushes never ack unstepped batches.
+        accum_ack: List[str] = []
         pending_ack: List[str] = []
+
+        def flush_ack() -> None:
+            nonlocal pending_ack
+            if self.ack_fn is None or not pending_ack:
+                return
+            self.ack_fn(pending_ack, self.global_step)
+            pending_ack = []
+
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -490,7 +504,7 @@ class TrainerController:
                 self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
-                    pending_ack.extend(batch.sample_ids)
+                    accum_ack.extend(batch.sample_ids)
                 self._step_profiler.before_micro_step(self.global_step)
                 result = self.core.train_step(
                     batch,
@@ -505,10 +519,11 @@ class TrainerController:
                     continue
                 self.global_step += 1
                 self._step_profiler.after_optimizer_step(self.global_step)
-                if self.ack_fn is not None:
-                    # durable ack transaction at the optimizer-step boundary
-                    self.ack_fn(pending_ack, self.global_step)
-                    pending_ack = []
+                if accum_ack:
+                    pending_ack.extend(accum_ack)
+                    accum_ack = []
+                if self.global_step % self.ack_interval == 0:
+                    flush_ack()
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     log_metrics = dict(result.metrics)
                     optimizer = getattr(self.core.backend, "optimizer", None)
@@ -534,6 +549,7 @@ class TrainerController:
                     eval_metrics and self._checkpoint_manager().is_better(eval_metrics)
                 )
                 if interval_hit or is_best:
+                    flush_ack()
                     self.save_checkpoint(self.global_step)
                 if is_best:
                     self._checkpoint_manager().update_best(
@@ -542,7 +558,9 @@ class TrainerController:
                 if progress is not None:
                     progress.update(1)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
+                    flush_ack()
                     return self.global_step
+            flush_ack()
             self._epoch_batch = 0
             self._epoch_samples = 0
             # Persist the *next* epoch after a naturally exhausted pass.  A
@@ -558,6 +576,7 @@ class TrainerController:
                 "micro-batches after the last optimizer step; no partial "
                 "optimizer step or durable acknowledgement was committed"
             )
+        flush_ack()
         return self.global_step
 
     def close_profiler(self) -> None:

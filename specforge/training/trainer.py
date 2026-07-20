@@ -101,6 +101,7 @@ class Trainer:
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
+        ack_interval: int = 1,
         resume_from: Optional[str] = None,
         resume_state: Optional[dict] = None,
         dataset_size: Optional[int] = None,
@@ -459,6 +460,7 @@ class Trainer:
             log_interval=log_interval,
             logger=logger,
             ack_fn=ack_fn,
+            ack_interval=ack_interval,
             checkpoint_manager=CheckpointManager(
                 output_dir, run_id, max_checkpoints=max_checkpoints
             ),

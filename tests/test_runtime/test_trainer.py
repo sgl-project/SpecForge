@@ -419,6 +419,83 @@ class TestTrainerController(unittest.TestCase):
         self.assertEqual(backend.boundaries, [False, True, False])
         progress.close.assert_called_once_with()
 
+    def test_ack_interval_defers_until_interval_and_final_flush(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        acks = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=4,
+                num_epochs=1,
+                ack_fn=lambda ids, step: acks.append((list(ids), step)),
+                ack_interval=3,
+            )
+            ctrl.fit([_named_batch(i) for i in range(6)])
+        self.assertEqual(
+            acks,
+            [
+                (["b0", "b1", "b2"], 3),
+                (["b3"], 4),
+            ],
+        )
+
+    def test_save_boundary_flushes_deferred_ack_before_final_flush(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        acks = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=3,
+                num_epochs=1,
+                save_interval=2,
+                ack_fn=lambda ids, step: acks.append((list(ids), step)),
+                ack_interval=50,
+            )
+            ctrl.fit([_named_batch(i) for i in range(5)])
+        self.assertEqual(
+            acks,
+            [
+                (["b0", "b1"], 2),
+                (["b2"], 3),
+            ],
+        )
+
+    def test_incomplete_accumulation_flushes_completed_but_not_unstepped(self):
+        # Under the natural-EOS contract an incomplete trailing accumulation is
+        # a hard error; the completed optimizer step is still durably acked, but
+        # the unstepped batch's IDs are never acked.
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=2)
+        acks = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                num_epochs=1,
+                ack_fn=lambda ids, step: acks.append((list(ids), step)),
+                ack_interval=50,
+            )
+            progress = mock.Mock()
+            with (
+                mock.patch.object(ctrl, "_make_progress_bar", return_value=progress),
+                self.assertRaisesRegex(
+                    RuntimeError, "incomplete gradient accumulation"
+                ),
+            ):
+                ctrl.fit([_named_batch(i) for i in range(3)])
+        self.assertEqual(backend.steps, 1)
+        self.assertEqual(acks, [(["b0", "b1"], 1)])
+
 
 class TestBestTracking(unittest.TestCase):
     def test_best_checkpoint_does_not_require_periodic_saves(self):
