@@ -280,7 +280,16 @@ class MooncakeFeatureStore(FeatureStore):
         _require_store_api(store)
         self._store = store
         put_config.replica_num = replica_num
-        put_config.with_hard_pin = hard_pin
+        # Older/Ascend Mooncake builds expose no with_hard_pin on
+        # ReplicateConfig; objects then follow the store's default pin
+        # behavior until remove(). Set it only when the field exists.
+        if hasattr(put_config, "with_hard_pin"):
+            put_config.with_hard_pin = hard_pin
+        elif hard_pin:
+            logger.warning(
+                "Mooncake ReplicateConfig has no with_hard_pin field; "
+                "objects use the store's default pin behavior"
+            )
         self._put_config = put_config
         self.max_resident_bytes = max_resident_bytes
         self.max_hold_age_s = max_hold_age_s

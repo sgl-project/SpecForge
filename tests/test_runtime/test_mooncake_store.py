@@ -769,6 +769,25 @@ class TestMooncakeTransportDeviceBinding(unittest.TestCase):
         )
         self.assertEqual(captured["local_buffer_size"], 1 << 28)
 
+    def test_constructor_tolerates_replicate_config_without_hard_pin(self):
+        # Older/Ascend Mooncake builds expose no with_hard_pin field; the
+        # constructor must degrade to the store's default pin behavior.
+        from unittest import mock
+
+        import specforge.runtime.data_plane.mooncake_store as mc
+
+        class _ConfigWithoutHardPin:
+            def __init__(self):
+                self.replica_num = 1
+
+        fake_store = mock.Mock()
+        with mock.patch.object(
+            mc, "_connect_store", return_value=(fake_store, _ConfigWithoutHardPin)
+        ):
+            store = mc.MooncakeFeatureStore(store_id="t", setup_kwargs={})
+        self.assertEqual(store._put_config.replica_num, 1)
+        self.assertFalse(hasattr(store._put_config, "with_hard_pin"))
+
 
 @unittest.skipUnless(
     importlib.util.find_spec("mooncake") is not None,
