@@ -21,6 +21,17 @@ Multi-process configs self-launch through torch distributed:
 specforge train -c examples/configs/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
+The Qwen3-30B-A3B EAGLE3.1 variant uses the same unified entry point:
+
+```bash
+specforge train -c examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml
+```
+
+Its draft config enables per-layer RMS normalization before the three captured
+target hidden states are concatenated and projected. It remains registered as
+the `eagle3` strategy; EAGLE3.1 is a draft-model configuration variant, not a
+second runtime or launch path.
+
 The filename is the index: `*-online.yaml` performs SGLang server capture while
 training, `*-offline.yaml` consumes precomputed features, and
 `*-disaggregated.yaml` highlights a producer/consumer topology. Every online

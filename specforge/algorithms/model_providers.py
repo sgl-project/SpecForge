@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from specforge.config import Config
+    from specforge.modeling.draft.dflash_kernels import DFlashKernels
 
 
 @dataclass
@@ -148,6 +149,15 @@ def peagle_resume_contract(
     }
 
 
+def _finish_registered_draft(
+    cfg: Config,
+    draft_config: PretrainedConfig,
+    draft_model: Any,
+):
+    _warm_start(cfg, draft_model, draft_config)
+    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+
+
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
 
@@ -156,8 +166,23 @@ def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
         draft_config,
         torch_dtype=_torch_dtype(cfg),
     )
-    _warm_start(cfg, draft_model, draft_config)
-    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+    return _finish_registered_draft(cfg, draft_config, draft_model)
+
+
+def build_dflash_draft(
+    cfg: Config,
+    draft_config: PretrainedConfig,
+    kernels: Optional[DFlashKernels],
+):
+    from specforge.modeling.auto import AutoDraftModel
+
+    draft_config._attn_implementation = cfg.training.attention_backend
+    draft_model = AutoDraftModel.from_config(
+        draft_config,
+        torch_dtype=_torch_dtype(cfg),
+        dflash_kernels=kernels,
+    )
+    return _finish_registered_draft(cfg, draft_config, draft_model)
 
 
 def resolve_eagle_capture_layers(
