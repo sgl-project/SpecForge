@@ -63,10 +63,28 @@ def resume_contract(_config, draft_model, training_model):
     }
 
 
-def build_draft(config, draft_config):
-    from specforge.algorithms.model_providers import build_registered_draft
+def resolve_dflash_kernels(config):
+    if not config.model.use_liger_kernel:
+        return None
+    if config.training.strategy != "dflash":
+        raise ValueError(
+            "model.use_liger_kernel is currently supported only with "
+            "training.strategy=dflash"
+        )
 
-    return build_registered_draft(config, draft_config)
+    from specforge.modeling.draft.dflash_kernels import load_liger_dflash_kernels
+
+    return load_liger_dflash_kernels()
+
+
+def build_draft(config, draft_config):
+    from specforge.algorithms.model_providers import build_dflash_draft
+
+    return build_dflash_draft(
+        config,
+        draft_config,
+        resolve_dflash_kernels(config),
+    )
 
 
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
