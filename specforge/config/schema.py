@@ -482,6 +482,12 @@ class TrainingConfig(StrictConfigModel):
     lk_loss_type: Optional[Literal["lambda", "alpha"]] = None
     kl_scale: float = 1.0
     kl_decay: float = 1.0
+    #: Compute the teacher target_p, draft logits and loss only at supervised
+    #: (loss-masked) positions instead of over the full sequence. Mathematically
+    #: equivalent (the mean denominator is rescaled) and saves memory/compute on
+    #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
+    #: an lk_loss objective is used.
+    trim_loss_positions: bool = False
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
