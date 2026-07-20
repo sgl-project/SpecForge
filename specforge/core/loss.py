@@ -226,19 +226,3 @@ class LogSoftmaxLoss(torch.autograd.Function):
         )
         logits = logits.view(B, T, V)
         return logits, None, None
-
-
-if __name__ == "__main__":
-    device = "cuda"
-    B, T, V = 1, 1024, 16000
-    logits = torch.randn(B, T, V, device=device, requires_grad=True)
-    logits2 = logits.clone().detach().requires_grad_(True)
-    target = torch.randn(B, T, V, device=device)
-    position_mask = torch.randint(0, 2, (B, T, 1), dtype=torch.bool, device=device)
-    position_mask = torch.ones((B, T, 1), dtype=torch.bool, device=device)
-    output1 = LogSoftmaxLoss.apply(logits, target, position_mask)
-    output2 = _compute_loss(logits2, target, position_mask)
-    torch.testing.assert_close(output1, output2, rtol=1e-4, atol=1e-4)
-    output1.backward()
-    output2.backward()
-    torch.testing.assert_close(logits.grad, logits2.grad, rtol=1e-4, atol=1e-4)

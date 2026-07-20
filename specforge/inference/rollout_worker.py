@@ -8,9 +8,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """RolloutWorker: PromptTask -> features/refs -> SampleRef commit.
 
-The worker is deliberately small and strategy-agnostic: it leases prompt tasks,
-asks a ``feature_source`` (e.g. a wrapper over the target model's
-``generate_eagle3_data``, or ``SGLangAdapter``) for per-sample features,
+The worker is deliberately small and algorithm-agnostic: it leases prompt tasks,
+asks an external-server ``feature_source`` for per-sample features,
 verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. A server-side capture source may instead return already-written
@@ -23,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol
 
+from specforge.inference.batch_partition import TargetBatchPartition
 from specforge.inference.capture import (
     CaptureConfig,
     CaptureMismatchError,
@@ -60,6 +60,8 @@ class RolloutWorker:
         target_model_version: str = "unknown",
         tokenizer_version: str = "unknown",
         draft_weight_version: Optional[str] = None,
+        batch_partition: Optional[TargetBatchPartition] = None,
+        feature_source_returns_local_batch: bool = False,
     ) -> None:
         self.controller = controller
         self.feature_store = feature_store
@@ -70,6 +72,10 @@ class RolloutWorker:
         self.target_model_version = target_model_version
         self.tokenizer_version = tokenizer_version
         self.draft_weight_version = draft_weight_version
+        self.batch_partition = batch_partition or TargetBatchPartition()
+        self.feature_source_returns_local_batch = bool(
+            feature_source_returns_local_batch
+        )
         self._state = "starting"
         self._inflight = 0
         self._recent_failures: List[str] = []
@@ -96,8 +102,26 @@ class RolloutWorker:
             return []
         self._inflight = len(tasks)
         self._state = "ready"
+        # Legacy colocated target-TP training used a drop-last target batch.
+        # A partial target batch would give ranks different local batch sizes
+        # and break the all-rank draft/FSDP step contract.
+        if self.batch_partition.size > 1 and len(tasks) != max_tasks:
+            self.controller.complete_prompt_tasks(
+                self.worker_id, [task.task_id for task in tasks]
+            )
+            self._inflight = 0
+            return []
+
+        local_slice = self.batch_partition.local_slice(len(tasks))
+        local_tasks = list(tasks[local_slice])
+        peer_tasks = list(tasks[: local_slice.start]) + list(tasks[local_slice.stop :])
         produce_refs = getattr(self.feature_source, "produce_refs", None)
         if callable(produce_refs):
+            if self.batch_partition.size > 1:
+                raise NotImplementedError(
+                    "target-TP batch partitioning is supported for colocated "
+                    "feature capture only"
+                )
             return self._run_ref_source(tasks, produce_refs)
 
         try:
@@ -115,10 +139,13 @@ class RolloutWorker:
             )
             self._inflight = 0
             raise
-        if len(feats_list) != len(tasks):
+        expected_count = (
+            len(local_tasks) if self.feature_source_returns_local_batch else len(tasks)
+        )
+        if len(feats_list) != expected_count:
             reason = (
                 f"generate_features returned {len(feats_list)} feature records "
-                f"for {len(tasks)} tasks"
+                f"for {expected_count} expected records"
             )
             self._state = "unhealthy"
             self._recent_failures.append(reason)
@@ -131,9 +158,20 @@ class RolloutWorker:
             self._inflight = 0
             raise ValueError(reason)
 
+        local_feats = (
+            feats_list
+            if self.feature_source_returns_local_batch
+            else list(feats_list[local_slice])
+        )
+        if peer_tasks:
+            self.controller.complete_prompt_tasks(
+                self.worker_id, [task.task_id for task in peer_tasks]
+            )
+
         refs: List[SampleRef] = []
         capture_error: Optional[CaptureMismatchError] = None
-        for task, feats in zip(tasks, feats_list):
+        put_error: Optional[Exception] = None
+        for task, feats in zip(local_tasks, local_feats):
             sample_id = self._sample_id(task)
             recorded = feats.pop("__aux_layer_ids__", None)
             try:
@@ -162,8 +200,15 @@ class RolloutWorker:
             except Exception as exc:  # partial write -> abort, report
                 self.feature_store.abort(sample_id, reason=f"put_failed:{exc}")
                 self.controller.fail_prompt_tasks(
-                    self.worker_id, [task.task_id], reason=str(exc), retryable=True
+                    self.worker_id,
+                    [task.task_id],
+                    reason=str(exc),
+                    # A target-TP peer cannot recapture this one prompt alone
+                    # without desynchronizing the next collective target batch.
+                    retryable=self.batch_partition.size == 1,
                 )
+                if self.batch_partition.size > 1 and put_error is None:
+                    put_error = exc
                 continue
             refs.append(ref)
 
@@ -174,6 +219,9 @@ class RolloutWorker:
         if capture_error is not None:
             self._state = "unhealthy"
             raise capture_error
+        if put_error is not None:
+            self._state = "unhealthy"
+            raise RuntimeError("target-TP local feature write failed") from put_error
         return refs
 
     def _run_ref_source(self, tasks: List[PromptTask], produce_refs) -> List[SampleRef]:

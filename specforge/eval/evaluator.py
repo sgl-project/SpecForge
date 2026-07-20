@@ -164,11 +164,20 @@ class Evaluator:
 
     @staticmethod
     def _comm_device() -> torch.device:
-        """Collective device: this rank's BOUND cuda device for NCCL — via
-        current_device, not the LOCAL_RANK env var, which non-torchrun
-        launchers may not export — else CPU."""
-        if "nccl" in str(dist.get_backend()):
+        """Return the bound device required by the active collective backend."""
+        backend = str(dist.get_backend()).lower()
+        if "nccl" in backend:
             return torch.device("cuda", torch.cuda.current_device())
+        if "hccl" in backend:
+            from specforge.utils import get_local_device
+
+            device = get_local_device()
+            if device.type != "npu":
+                raise RuntimeError(
+                    "HCCL evaluation requires SPECFORGE_DEVICE=npu and a bound "
+                    f"NPU device, got {device}"
+                )
+            return device
         return torch.device("cpu")
 
     @staticmethod

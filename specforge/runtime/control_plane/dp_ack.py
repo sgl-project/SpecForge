@@ -36,7 +36,10 @@ def gather_id_union(ids: List[str]) -> List[str]:
     Identity when torch.distributed is absent/uninitialized/world=1. Dedup keeps
     first occurrence so SP-replicated shards (same ids on sp peers) collapse.
     """
-    import torch.distributed as dist
+    try:
+        import torch.distributed as dist
+    except ModuleNotFoundError:
+        return list(ids)
 
     if not (dist.is_available() and dist.is_initialized()):
         return list(ids)
@@ -55,6 +58,46 @@ def gather_id_union(ids: List[str]) -> List[str]:
     return out
 
 
+def _broadcast_authority_error(error: Optional[str]) -> Optional[str]:
+    """Return rank 0's post-commit result on every rank."""
+    try:
+        import torch.distributed as dist
+    except ModuleNotFoundError:
+        return error
+    if not (dist.is_available() and dist.is_initialized()):
+        return error
+    payload = [error]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
+def _gather_cleanup_errors(error: Optional[str]) -> Optional[str]:
+    """Return every rank's local cleanup failure on every rank.
+
+    Cleanup is intentionally a second collective after the authority's durable
+    commit broadcast.  A non-authority rank owns a distinct Mooncake client and
+    therefore can fail while rank 0 succeeds; all ranks must observe that
+    failure before any caller advances its rank-local inbox counter.
+    """
+    try:
+        import torch.distributed as dist
+    except ModuleNotFoundError:
+        return error
+    if not (dist.is_available() and dist.is_initialized()):
+        return error
+    world = dist.get_world_size()
+    if world == 1:
+        return error
+    gathered: List[Optional[str]] = [None] * world
+    dist.all_gather_object(gathered, error)
+    failures = [
+        f"rank {rank}: {rank_error}"
+        for rank, rank_error in enumerate(gathered)
+        if rank_error is not None
+    ]
+    return "; ".join(failures) or None
+
+
 class DPAckController(DataFlowController):
     """A :class:`DataFlowController` whose ``ack_train_refs`` is a DP collective.
 
@@ -64,10 +107,12 @@ class DPAckController(DataFlowController):
       collective needs every rank) and records nothing; give it a throwaway
       in-memory store.
 
-    Every rank must call ``ack_train_refs`` at every optimizer boundary — the
-    trainer's ``ack_fn`` already does exactly that. Producer backpressure is
-    NOT this class's job: the distributor mirrors the per-rank inbox acks onto
-    the source counter at micro-batch granularity.
+    Every rank owns a separate feature-store client and may have materialized
+    only its own DP shard.  Once rank 0 commits the union and broadcasts success,
+    each rank deletes only its local ``sample_ids`` through its own store.  A
+    second all-rank error collective completes before any caller may advance its
+    inbox acknowledgement; the distributor then mirrors those
+    optimizer-boundary counts onto the source counter.
     """
 
     def __init__(
@@ -76,11 +121,21 @@ class DPAckController(DataFlowController):
         *,
         is_authority: bool = True,
         gather: Callable[[List[str]], List[str]] = gather_id_union,
+        sync_error: Callable[
+            [Optional[str]], Optional[str]
+        ] = _broadcast_authority_error,
+        sync_cleanup_error: Callable[
+            [Optional[str]], Optional[str]
+        ] = _gather_cleanup_errors,
+        feature_store=None,
         **kwargs,
     ) -> None:
         super().__init__(run_id, **kwargs)
         self.is_authority = is_authority
         self._gather = gather
+        self._sync_error = sync_error
+        self._sync_cleanup_error = sync_cleanup_error
+        self.feature_store = feature_store
 
     def ack_train_refs(
         self,
@@ -90,15 +145,44 @@ class DPAckController(DataFlowController):
         global_step: Optional[int] = None,
         optimizer_durable: bool = False,
     ) -> None:
-        union = self._gather(list(sample_ids))
-        if not self.is_authority:
-            return
-        super().ack_train_refs(
-            trainer_id,
-            union,
-            global_step=global_step,
-            optimizer_durable=optimizer_durable,
-        )
+        local_ids = list(dict.fromkeys(sample_ids))
+        union = self._gather(local_ids)
+        commit_error = None
+        if self.is_authority:
+            try:
+                # The SQLite ack ids + optimizer marker are the one durable,
+                # authority-owned fact. No rank may physically delete features
+                # before this transaction succeeds.
+                super().ack_train_refs(
+                    trainer_id,
+                    union,
+                    global_step=global_step,
+                    optimizer_durable=optimizer_durable,
+                )
+            except BaseException as exc:
+                commit_error = f"{type(exc).__name__}: {exc}"
+        commit_error = self._sync_error(commit_error)
+        if commit_error is not None:
+            raise RuntimeError(f"durable DP acknowledgement failed: {commit_error}")
+
+        cleanup_error = None
+        if optimizer_durable and self.feature_store is not None:
+            failures = []
+            for sample_id in local_ids:
+                try:
+                    self.feature_store.abort(
+                        sample_id, reason="optimizer-boundary-durable-ack"
+                    )
+                except BaseException as exc:
+                    failures.append(f"{sample_id}: {type(exc).__name__}: {exc}")
+            if failures:
+                cleanup_error = ", ".join(failures)
+        cleanup_error = self._sync_cleanup_error(cleanup_error)
+        if cleanup_error is not None:
+            raise RuntimeError(
+                "durable DP acknowledgement committed, but rank-local feature "
+                f"cleanup failed: {cleanup_error}"
+            )
 
 
 __all__ = ["DPAckController", "gather_id_union"]
