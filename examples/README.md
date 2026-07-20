@@ -18,6 +18,7 @@ NPU, offline, and managed/external-service variants, is in
 | `examples/configs/qwen3-8b-eagle3-offline.yaml` | Precomputed features | EAGLE3 |
 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
+| `examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml` | Disaggregated SGLang server capture with normalized EAGLE3 inputs | EAGLE3.1 |
 | `examples/configs/qwen3-8b-dflash-online.yaml` | Disaggregated SGLang server capture | DFlash |
 | `examples/configs/qwen3-8b-dpace-online.yaml` | Online D-PACE objective | DFlash |
 | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` | Disaggregated server capture | DFlash |
