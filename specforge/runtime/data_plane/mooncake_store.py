@@ -167,6 +167,14 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
     # context; bind the local accelerator first so the transfer engine can
     # allocate its local segment (see _bind_transport_device).
     _bind_transport_device()
+    setup_kwargs = dict(setup_kwargs)
+    if _ascend_runtime_available():
+        # AscendDirectTransport rejects the store client's wildcard-location
+        # registration of the CPU staging buffer ("location:* is not
+        # supported" -> INVALID_PARAMS). SpecForge roles are pure zero-copy
+        # clients (put_from/get_into), so force the staging buffer to 0; the
+        # store client skips registration entirely when local_buffer_size == 0.
+        setup_kwargs["local_buffer_size"] = 0
     store = MooncakeDistributedStore()
     rc = store.setup(**setup_kwargs)
     if rc is not None and int(rc) != 0:

@@ -725,6 +725,50 @@ class TestMooncakeTransportDeviceBinding(unittest.TestCase):
         # The device must be bound before the transport is installed by setup().
         self.assertEqual([name for name, _ in events], ["bind", "setup"])
 
+    def _connect_store_capturing_kwargs(self, ascend_available, setup_kwargs):
+        import sys
+        from unittest import mock
+
+        import specforge.runtime.data_plane.mooncake_store as mc
+
+        captured = {}
+
+        class _FakeDistributedStore:
+            def setup(self, **kwargs):
+                captured.update(kwargs)
+                return 0
+
+        class _FakeReplicateConfig:
+            pass
+
+        fake_module = mock.Mock()
+        fake_module.MooncakeDistributedStore = _FakeDistributedStore
+        fake_module.ReplicateConfig = _FakeReplicateConfig
+
+        with (
+            mock.patch.dict(sys.modules, {"mooncake.store": fake_module}),
+            mock.patch.object(mc, "_bind_transport_device"),
+            mock.patch.object(
+                mc, "_ascend_runtime_available", return_value=ascend_available
+            ),
+        ):
+            mc._connect_store(dict(setup_kwargs))
+        return captured
+
+    def test_connect_store_zeroes_staging_buffer_on_ascend(self):
+        captured = self._connect_store_capturing_kwargs(
+            True, {"protocol": "tcp", "local_buffer_size": 1 << 28}
+        )
+        # AscendDirectTransport rejects wildcard-location CPU registration, so
+        # the zero-copy client must not register a staging buffer at all.
+        self.assertEqual(captured["local_buffer_size"], 0)
+
+    def test_connect_store_keeps_staging_buffer_off_ascend(self):
+        captured = self._connect_store_capturing_kwargs(
+            False, {"protocol": "tcp", "local_buffer_size": 1 << 28}
+        )
+        self.assertEqual(captured["local_buffer_size"], 1 << 28)
+
 
 @unittest.skipUnless(
     importlib.util.find_spec("mooncake") is not None,
