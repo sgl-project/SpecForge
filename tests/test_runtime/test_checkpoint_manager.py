@@ -48,8 +48,11 @@ class TestLayoutAndAtomicity(unittest.TestCase):
         mgr = _mgr(out)
         mgr.save(_state(1), 1)
         mgr.save(_state(2), 2)
-        # a truncated save: step dir exists but STATE_FILE never landed
-        os.makedirs(os.path.join(out, "run-step5"))
+        # A crash after the shared state lands but before collective completion
+        # must not make a directory discoverable as a checkpoint.
+        truncated = os.path.join(out, "run-step5")
+        os.makedirs(truncated)
+        torch.save(_state(5), os.path.join(truncated, STATE_FILE))
         self.assertEqual(_steps(mgr), [1, 2])
         os.remove(os.path.join(out, "run-latest"))
         self.assertEqual(
@@ -60,6 +63,63 @@ class TestLayoutAndAtomicity(unittest.TestCase):
         ]
         self.assertEqual(leftovers, [], "atomic writes must not leave .tmp files")
         self.assertTrue(os.path.isfile(os.path.join(mgr.checkpoint_dir(2), STATE_FILE)))
+
+    def test_markerless_checkpoint_is_rejected_by_direct_resume(self):
+        from specforge.training.checkpoint import (
+            STATE_FILE,
+            SUCCESS_FILE,
+            CheckpointManager,
+        )
+
+        out = tempfile.mkdtemp(prefix="ckpt_markerless_")
+        ckpt = os.path.join(out, "run-step5")
+        os.makedirs(ckpt)
+        torch.save(_state(5, world_size=1), os.path.join(ckpt, STATE_FILE))
+        torch.save(
+            {"optimizer": {}, "rng": {}}, os.path.join(ckpt, "training_state_rank0.pt")
+        )
+
+        mgr = _mgr(out)
+        self.assertEqual(_steps(mgr), [])
+        self.assertIsNone(mgr.latest_dir())
+        with self.assertRaisesRegex(ValueError, rf"missing {SUCCESS_FILE}"):
+            CheckpointManager.read_resume_state(ckpt)
+        with self.assertRaisesRegex(FileNotFoundError, "no complete checkpoint"):
+            CheckpointManager.read_resume_state(out)
+
+    def test_failed_same_step_rewrite_cannot_retain_completion_marker(self):
+        from specforge.training.checkpoint import SUCCESS_FILE, CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_rewrite_failure_")
+        mgr = _mgr(out)
+        mgr.save(_state(1), 1)
+        original = mgr._atomic_save
+        mgr._atomic_save = lambda *_args: (_ for _ in ()).throw(OSError("disk full"))
+        with self.assertRaisesRegex(RuntimeError, "checkpoint save failed"):
+            mgr.save(_state(1), 1)
+
+        ckpt = mgr.checkpoint_dir(1)
+        self.assertFalse(os.path.exists(os.path.join(ckpt, SUCCESS_FILE)))
+        self.assertEqual(_steps(mgr), [])
+        with self.assertRaisesRegex(FileNotFoundError, "no complete checkpoint"):
+            CheckpointManager.read_resume_state(ckpt)
+        mgr._atomic_save = original
+
+    def test_completion_marker_failure_never_publishes_latest(self):
+        from specforge.training.checkpoint import STATE_FILE, SUCCESS_FILE
+
+        out = tempfile.mkdtemp(prefix="ckpt_marker_failure_")
+        mgr = _mgr(out)
+        original = mgr._mark_complete
+        mgr._mark_complete = lambda _path: (_ for _ in ()).throw(OSError("disk full"))
+        with self.assertRaisesRegex(RuntimeError, "completion marker failed"):
+            mgr.save(_state(1), 1)
+        ckpt = mgr.checkpoint_dir(1)
+        self.assertTrue(os.path.isfile(os.path.join(ckpt, STATE_FILE)))
+        self.assertFalse(os.path.exists(os.path.join(ckpt, SUCCESS_FILE)))
+        self.assertFalse(os.path.lexists(os.path.join(out, "run-latest")))
+        self.assertIsNone(mgr.latest_dir())
+        mgr._mark_complete = original
 
     def test_latest_requires_symlink_and_shadow_is_repaired(self):
         from specforge.training.checkpoint import STATE_FILE
@@ -286,12 +346,17 @@ class TestReadResumeState(unittest.TestCase):
         self.assertEqual(loaded["backend"]["rng"]["torch"].item(), 1)
 
     def test_backend_passthrough_and_path_forms(self):
-        from specforge.training.checkpoint import STATE_FILE, CheckpointManager
+        from specforge.training.checkpoint import (
+            STATE_FILE,
+            SUCCESS_FILE,
+            CheckpointManager,
+        )
 
         out = tempfile.mkdtemp(prefix="ckpt_read_")
         rng = torch.get_rng_state()
         rank_state = {"optimizer": {"lr": 0.5}, "rng": {"torch": rng}, "custom": 7}
         ckpt = _mgr(out).save(_state(3, world_size=1), 3, rank_state=rank_state)
+        self.assertTrue(os.path.isfile(os.path.join(ckpt, SUCCESS_FILE)))
 
         for target in (ckpt, os.path.join(ckpt, STATE_FILE), f"file://{ckpt}"):
             st = CheckpointManager.read_resume_state(target)
@@ -304,6 +369,25 @@ class TestReadResumeState(unittest.TestCase):
 
         root_state = CheckpointManager.read_resume_state(out)
         self.assertEqual(root_state["global_step"], 3)
+
+    def test_launch_reads_only_committed_checkpoint_steps(self):
+        from specforge.launch import _checkpoint_global_step
+        from specforge.training.checkpoint import STATE_FILE
+
+        out = tempfile.mkdtemp(prefix="ckpt_launch_step_")
+        ckpt = _mgr(out).save(_state(3), 3)
+        for source in (ckpt, os.path.join(ckpt, STATE_FILE), f"file://{ckpt}", out):
+            with self.subTest(source=source):
+                self.assertEqual(_checkpoint_global_step(source), 3)
+
+        incomplete = os.path.join(out, "run-step5")
+        os.makedirs(incomplete)
+        incomplete_state = os.path.join(incomplete, STATE_FILE)
+        torch.save(_state(5), incomplete_state)
+        for source in (incomplete, incomplete_state, f"file://{incomplete}"):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, "missing _SUCCESS"):
+                    _checkpoint_global_step(source)
 
     def test_run_root_without_symlinks_uses_latest_complete_step(self):
         from specforge.training.checkpoint import CheckpointManager
@@ -451,7 +535,7 @@ class TestDistributedSaveAndResume(unittest.TestCase):
     def test_two_rank_save_and_per_rank_resume(self):
         import torch.multiprocessing as mp
 
-        from specforge.training.checkpoint import STATE_FILE
+        from specforge.training.checkpoint import STATE_FILE, SUCCESS_FILE
 
         out = tempfile.mkdtemp(prefix="ckpt_dist_")
         results = tempfile.mkdtemp(prefix="ckpt_dist_res_")
@@ -465,7 +549,12 @@ class TestDistributedSaveAndResume(unittest.TestCase):
                 loaded.append(json.load(fh))
         self.assertEqual(loaded[0]["ckpt"], loaded[1]["ckpt"])
         expected = sorted(
-            [STATE_FILE, "training_state_rank0.pt", "training_state_rank1.pt"]
+            [
+                STATE_FILE,
+                SUCCESS_FILE,
+                "training_state_rank0.pt",
+                "training_state_rank1.pt",
+            ]
         )
         for r, res in enumerate(loaded):
             self.assertEqual(res["files"], expected)

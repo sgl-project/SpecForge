@@ -317,19 +317,19 @@ def _resolve_metadata_store(
 
 
 def _checkpoint_global_step(resume_from: str) -> int:
-    """Read the shared checkpoint step without requiring a rank-state file."""
+    """Read the global step from a committed runtime checkpoint."""
     import os
 
     import torch
 
-    from specforge.training.checkpoint import STATE_FILE
+    from specforge.training.checkpoint import STATE_FILE, CheckpointManager
 
-    path = str(resume_from)
-    if path.startswith("file://"):
-        path = path[len("file://") :]
-    if os.path.basename(path) != STATE_FILE:
-        path = os.path.join(path, STATE_FILE)
-    state = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint_dir = CheckpointManager.resolve_committed_checkpoint_dir(resume_from)
+    state = torch.load(
+        os.path.join(checkpoint_dir, STATE_FILE),
+        map_location="cpu",
+        weights_only=False,
+    )
     return int(state.get("global_step", 0) or 0)
 
 
