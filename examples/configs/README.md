@@ -143,6 +143,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the server-only online path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
+| `model.use_liger_kernel` | `false` | Enable optional Liger RMSNorm/SwiGLU kernels for DFlash; install `specforge[liger]`. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
@@ -200,6 +201,7 @@ Common fields:
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
+| `training.fsdp_sharding` | `SHARD_GRAD_OP` | `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
@@ -344,6 +346,7 @@ unless tuning throughput or memory pressure.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `runtime.producer_lease` | `8` | Prompts leased to a rollout worker at once. |
+| `runtime.producer_concurrency` | `1` | Concurrent capture calls maintained by each server's logical producer. Increase to keep ingress full without duplicating producers. |
 | `runtime.in_flight_high_watermark` | `256` | Pause production at this many committed, unacknowledged refs. |
 | `runtime.in_flight_low_watermark` | `192` | Resume production at or below this count; it cannot exceed the high watermark. |
 | `runtime.resident_high_watermark_bytes` | `null` | Optional byte-level pause threshold. |
