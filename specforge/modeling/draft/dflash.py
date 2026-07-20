@@ -5,10 +5,6 @@ from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-# Resolve patchable Qwen3 classes at construction time so Liger patching is
-# independent of import order.
-from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
@@ -21,6 +17,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .registry import register_draft
 
 
@@ -46,7 +43,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 class Qwen3DFlashAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -79,12 +81,8 @@ class Qwen3DFlashAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.q_norm = modeling_qwen3.Qwen3RMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )
-        self.k_norm = modeling_qwen3.Qwen3RMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )
+        self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.sliding_window = (
             config.sliding_window
             if config.layer_types[layer_idx] == "sliding_attention"
@@ -143,16 +141,25 @@ class Qwen3DFlashAttention(nn.Module):
 
 
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
-        self.mlp = modeling_qwen3.Qwen3MLP(config)
-        self.input_layernorm = modeling_qwen3.Qwen3RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.self_attn = Qwen3DFlashAttention(
+            config=config,
+            layer_idx=layer_idx,
+            kernels=kernels,
         )
-        self.post_attention_layernorm = modeling_qwen3.Qwen3RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.mlp = kernels.make_mlp(config)
+        self.input_layernorm = kernels.make_rms_norm(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.post_attention_layernorm = kernels.make_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
 
     def forward(
@@ -263,12 +270,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
 
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        dflash_kernels: Optional[DFlashKernels] = None,
+    ) -> None:
         super().__init__(config)
         self.config = config
+        kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(config, layer_idx)
+                Qwen3DFlashDecoderLayer(config, layer_idx, kernels)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -277,17 +289,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
-        self.norm = modeling_qwen3.Qwen3RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,
             bias=False,
         )
-        self.hidden_norm = modeling_qwen3.Qwen3RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.hidden_norm = kernels.make_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)

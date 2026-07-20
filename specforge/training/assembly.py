@@ -35,7 +35,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
-from specforge.training.liger import maybe_apply_liger_kernel
 from specforge.training.provenance import (
     model_resume_provenance as _model_resume_provenance,
 )
@@ -116,9 +115,6 @@ def _load_draft(cfg: Config, algorithm: AlgorithmRegistration):
 
     provider = algorithm.providers.model
     draft_config = resolve_draft_config(cfg, provider=provider.draft_config)
-    # Liger monkey-patches Qwen3 module classes, so it must run before the
-    # DFlash draft model resolves and constructs those classes.
-    maybe_apply_liger_kernel(cfg)
     draft_model = provider.build_draft(cfg, draft_config)
     architecture = provider.draft_config.architecture
     expected_type = resolve_draft(architecture)
