@@ -3,6 +3,7 @@ name: PR Test
 on:
   pull_request:
     branches: [ main ]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 concurrency:
@@ -14,24 +15,33 @@ permissions:
 
 jobs:
   unit-test:
-    if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+    if: >-
+      github.repository == 'sgl-project/SpecForge' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted]
+    concurrency:
+      group: specforge-gpu-ci
+      cancel-in-progress: false
+      queue: max
     container:
       image: lmsysorg/sglang:v0.5.14-cu130 # we lock to this version to avoid repeated docker pull
-      options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged --pid=host
+      options: --gpus all --shm-size=16g --rm -v /dev/shm
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Restore cache
+      - name: Verify all GPUs are idle
+        shell: bash
         run: |
-          if [ -d /github/home/cache ] && [ ! -z "$(ls -A /github/home/cache/)" ]; then
-            cp -p -r /github/home/cache ./
-          fi
-
-          if [ -d /github/home/sf ] && [ ! -z "$(ls -A /github/home/sf/)" ]; then
-            cp -p -r /github/home/sf ./
+          nvidia-smi
+          gpu_processes="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader)"
+          if [[ -n "$gpu_processes" ]]; then
+            echo "All GPUs are assigned to this CI job, but existing compute processes were found:"
+            echo "$gpu_processes"
+            exit 1
           fi
 
       - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
@@ -41,19 +51,31 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          # if sf venv does not exist, create it
-          if [ ! -d sf ]; then
-            uv venv sf -p 3.11
-          fi
+          # Always use a clean environment; uv's package cache remains reusable.
+          uv venv sf -p 3.11
           source sf/bin/activate
           uv pip install wheel setuptools psutil packaging ninja
           uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
           MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
-          uv pip install -v . --prerelease=allow
+          uv pip install -v '.[data]'
           # The live server-capture gate needs the Mooncake client AND the
           # mooncake_master console script; the isolated venv cannot see the
           # container's site-packages. cu130 image -> the cuda13 wheel.
           uv pip install mooncake-transfer-engine-cuda13
+
+      - name: Apply SGLang capture patch
+        shell: bash
+        run: |
+          source sf/bin/activate
+          bash scripts/apply_sglang_spec_capture_patch.sh
+
+      - name: Run default test suite
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          source sf/bin/activate
+          export PYTHONPATH=$PWD
+          python -m unittest discover -s ./tests -p "test_*.py" -v
 
       - name: Run live server-capture numerics gate
         timeout-minutes: 15
@@ -63,19 +85,11 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
-          bash scripts/apply_sglang_spec_capture_patch.sh
           python -c 'import importlib.util, shutil, torch; assert torch.cuda.is_available(), "live capture gate requires CUDA"; assert importlib.util.find_spec("mooncake.store"), "live capture gate requires mooncake.store"; assert shutil.which("mooncake_master") or __import__("os").environ.get("MOONCAKE_MASTER_SERVER_ADDR"), "live capture gate requires mooncake_master"'
           python -m unittest tests.test_runtime.test_server_capture_gate -v
 
-      - name: Run test
-        timeout-minutes: 45
-        shell: bash
+      - name: Report final GPU state
+        if: always()
         run: |
-          source sf/bin/activate
-          export PYTHONPATH=$PWD
-          python -m unittest discover -s ./tests -p "test_*.py" -v
-
-      - name: Save cache
-        run: |
-          cp -p -r sf /github/home/
-          cp -p -r cache /github/home/
+          nvidia-smi
+          nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv
