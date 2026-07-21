@@ -22,6 +22,7 @@ class ResolvedOfflineCapture:
     """Algorithm-owned schema and layer plan for local feature preparation."""
 
     run: ResolvedRun
+    draft_config: object
     capture_method: str
     capture_layers: tuple[int, ...]
     layout: OfflineCaptureLayout
@@ -122,6 +123,7 @@ def resolve_offline_capture(
         )
     return ResolvedOfflineCapture(
         run=resolved,
+        draft_config=draft_config,
         capture_method=offline.capture_layout.capture_method,
         capture_layers=layers,
         layout=offline.capture_layout,

@@ -4,7 +4,7 @@ from pathlib import Path
 from tests.utils import (
     execute_shell_command,
     get_available_port,
-    terminate_process_group,
+    terminate_process_trees,
     wait_for_server,
 )
 
@@ -60,7 +60,7 @@ class TestRegenerateTrainData(unittest.TestCase):
                 CACHE_DIR.joinpath("dataset", "sharegpt_train_regen.jsonl").exists()
             )
         finally:
-            terminate_process_group(sglang_process)
+            terminate_process_trees(sglang_process, grace_s=30)
 
 
 if __name__ == "__main__":

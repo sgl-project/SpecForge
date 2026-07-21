@@ -1,5 +1,4 @@
 import os
-import signal
 import socket
 import subprocess
 import time
@@ -62,6 +61,27 @@ def execute_shell_command(
     )
 
 
+def terminate_process_trees(*processes: subprocess.Popen, grace_s: float = 30) -> None:
+    """Terminate subprocess sessions, including descendants of dead leaders."""
+    active = tuple(process for process in processes if process is not None)
+    if not active:
+        return
+
+    # SGLang's launcher exits independently from its scheduler/model workers.
+    # Reuse the supervisor's process-group cleanup so a dead launcher cannot
+    # leave GPU-owning descendants alive for the next test or workflow step.
+    from specforge.launch_plan import _terminate_processes
+
+    exited_group_leaders = tuple(
+        process for process in active if process.poll() is not None
+    )
+    _terminate_processes(
+        active,
+        grace_s=grace_s,
+        exited_group_leaders=exited_group_leaders,
+    )
+
+
 def wait_for_server(
     base_url: str,
     timeout: int | None = None,
@@ -110,20 +130,3 @@ def wait_for_server(
             time.sleep(1)
     finally:
         os.environ.update(saved_proxies)
-
-
-def terminate_process_group(process: subprocess.Popen, timeout: int = 30) -> None:
-    """Terminate a process started with ``start_new_session=True`` and its children."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=timeout)
