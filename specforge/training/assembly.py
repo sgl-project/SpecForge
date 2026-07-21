@@ -146,6 +146,9 @@ def _load_text_tokenizer(cfg: Config):
         tokenizer.pad_token_id = cfg.model.tokenizer_pad_token_id
     elif tokenizer.pad_token_id is None:
         fallback_id = tokenizer.eos_token_id
+        if isinstance(fallback_id, (list, tuple)):
+            fallback_id = fallback_id[0] if fallback_id else None
+
         if fallback_id is None:
             fallback_id = tokenizer.unk_token_id
         if fallback_id is None:
