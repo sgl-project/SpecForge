@@ -154,6 +154,7 @@ should make their training strategy and topology explicit.
 | `model.torch_dtype` | `bfloat16` | `bfloat16`, `float16`, or `float32`. |
 | `model.cache_dir` | `null` | Model/tokenizer download cache. This is distinct from `data.cache_dir`. |
 | `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
+| `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
 | `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
 | `model.sglang_context_length` | `null` | Positive explicit context limit. Managed capture requires at least `data.max_length + 7`; omitting it derives that value. |
@@ -165,6 +166,16 @@ should make their training strategy and topology explicit.
 | `model.sglang_ep_size` | `1` | SGLang expert-parallel size; it must divide and not exceed every managed capture server's `tp_size`. |
 | `model.sglang_max_running_requests` | `null` | Positive SGLang request-concurrency limit. |
 | `model.sglang_max_total_tokens` | `null` | Positive SGLang token-pool limit. |
+| `model.sglang_dp_size` | `null` | Optional SGLang data-parallel size. |
+| `model.sglang_moe_a2a_backend` | `null` | Optional SGLang MoE all-to-all backend name. |
+| `model.sglang_moe_runner_backend` | `null` | Optional SGLang MoE runner backend name. |
+| `model.sglang_page_size` | `null` | Optional positive SGLang KV-cache page size. |
+| `model.sglang_quantization` | `null` | Optional SGLang target quantization mode. |
+| `model.sglang_fp4_gemm_runner_backend` | `null` | Optional SGLang FP4 GEMM runner backend. |
+| `model.sglang_mamba_radix_cache_strategy` | `null` | Optional hybrid Mamba/radix cache strategy. |
+| `model.sglang_max_mamba_cache_size` | `null` | Optional positive Mamba cache size. |
+| `model.sglang_swa_full_tokens_ratio` | `null` | Optional SGLang sliding-window full-token ratio in `(0, 1]`. |
+| `model.sglang_mamba_full_memory_ratio` | `null` | Optional SGLang Mamba full-memory ratio in `(0, 1]`. |
 
 ### `data`: choose exactly one training source
 
@@ -203,9 +214,11 @@ Common fields:
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
+| `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
+| `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
@@ -226,8 +239,8 @@ Strategy-specific fields should be written only when tuning that objective:
 | Strategy | Fields and defaults |
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda` or `alpha`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
-| DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
-| DSpark | `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), `training.dspark_confidence_head_alpha` (`1.0`) |
+| DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
+| DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 
 New recipes must not write the loader-only migration fields

@@ -14,6 +14,9 @@ What is pinned here:
   agnostic), within the documented bf16 tolerance;
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
   dflash (aux only) requests, named per strategy by the client schema.
+- cache isolation: radix cache stays enabled and sequential identical prompts
+  still capture every token because each request attempt has a fresh
+  ``extra_key`` namespace.
 
 The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
 GPU, sglang patched with
@@ -148,7 +151,6 @@ class TestServerCaptureGate(unittest.TestCase):
                 "0.3",
                 "--chunked-prefill-size",
                 "-1",
-                "--disable-radix-cache",
                 "--enable-spec-capture",
                 "--spec-capture-aux-layer-ids",
                 *[str(i) for i in AUX_LAYER_IDS],
@@ -280,7 +282,7 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.inference.capture import CaptureConfig
         from specforge.runtime.contracts import SampleRef
 
-        rows = [[5, 6, 7, 8, 9, 10], [11, 12, 13, 14]]
+        rows = [[5, 6, 7, 8, 9, 10], [5, 6, 7, 8, 9, 10]]
         store = self._store("gate-eagle3")
         adapter = SGLangServerCaptureAdapter(
             f"http://localhost:{PORT}",
@@ -301,7 +303,11 @@ class TestServerCaptureGate(unittest.TestCase):
             target_repr="hidden_state",
             target_hidden_size=H,
         )
-        refs = adapter.produce_refs(self._tasks(rows), capture=contract)
+        # Submit sequentially so the second identical prompt would hit the
+        # first request's radix entry if the adapter did not isolate attempts.
+        refs = []
+        for task in self._tasks(rows):
+            refs.extend(adapter.produce_refs([task], capture=contract))
         for ref in refs:
             self.assertIsInstance(ref, SampleRef, f"expected a ref, got failure: {ref}")
 

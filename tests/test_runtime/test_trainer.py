@@ -18,7 +18,12 @@ from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.controller import Checkpoint, TrainerController, TrainerCore
+from specforge.training.controller import (
+    Checkpoint,
+    TrainerController,
+    TrainerCore,
+    _reduce_ratio_metrics,
+)
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
 
@@ -166,6 +171,58 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(result.metrics["ce_loss"], 1.25)
         self.assertEqual(result.metrics["lambda_base"], 0.75)
         self.assertNotIn("non_scalar_debug", result.metrics)
+
+    def test_ratio_metrics_override_mean_of_means_accuracy(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        result = core._result(
+            StepOutput(
+                loss=torch.tensor(2.0),
+                metrics={"accuracy": torch.tensor(0.99)},
+                ratio_metrics={
+                    "acc": (torch.tensor(2.0), torch.tensor(4.0)),
+                    "ce_position": (
+                        torch.tensor([1.0, 3.0]),
+                        torch.tensor([2.0, 6.0]),
+                    ),
+                },
+            ),
+            grad_norm=None,
+            stepped=False,
+        )
+
+        self.assertEqual(result.metrics["acc"], 0.5)
+        self.assertEqual(result.metrics["ce_position_0"], 0.5)
+        self.assertEqual(result.metrics["ce_position_1"], 0.5)
+
+    def test_ratio_metrics_sum_numerators_and_denominators_before_dividing(self):
+        remote = torch.tensor([8.0, 6.0, 3.0, 1.0, 2.0, 2.0])
+
+        def all_reduce(packed, *, group):
+            self.assertEqual(group, "dp")
+            packed.add_(remote)
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        ):
+            metrics = _reduce_ratio_metrics(
+                {
+                    "acc": (torch.tensor(2.0), torch.tensor(4.0)),
+                    "ce_position": (
+                        torch.tensor([1.0, 3.0]),
+                        torch.tensor([2.0, 6.0]),
+                    ),
+                },
+                device=torch.device("cpu"),
+                process_group="dp",
+                reduce=True,
+            )
+
+        self.assertEqual(metrics["acc"], 1.0)
+        self.assertEqual(metrics["ce_position_0"], 1.0)
+        self.assertEqual(metrics["ce_position_1"], 0.5)
 
     @staticmethod
     def _eagle_output(

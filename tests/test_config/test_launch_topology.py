@@ -15,9 +15,11 @@ EXPECTED_NPROC_PER_NODE = {
     "deepseek-v3-671b-eagle3-offline.yaml": 8,
     "deepseek-v3-671b-eagle3-online.yaml": 8,
     "gemma3-1b-eagle3-online.yaml": 1,
+    "glm-5.2-dspark-disaggregated.yaml": 1,
     "gpt-oss-120b-eagle3-online.yaml": 8,
     "gpt-oss-20b-eagle3-online.yaml": 8,
     "lfm2.5-1.2b-instruct-dflash-online.yaml": 8,
+    "inkling-dspark-disaggregated.yaml": 1,
     "ling-flash-2.0-eagle3-offline.yaml": 8,
     "ling-flash-2.0-eagle3-online.yaml": 8,
     "llama3.1-8b-eagle3-offline.yaml": 1,
@@ -50,6 +52,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-8b-domino-offline.yaml": 1,
     "qwen3-8b-domino-online.yaml": 8,
     "qwen3-8b-dpace-online.yaml": 8,
+    "qwen3-8b-dspark-disaggregated.yaml": 1,
     "qwen3-8b-eagle3-offline-disaggregated.yaml": 1,
     "qwen3-8b-eagle3-offline.yaml": 1,
     "qwen3-8b-eagle3-disaggregated.yaml": 1,
@@ -79,6 +82,18 @@ LOCAL_MOONCAKE_ENDPOINTS = {
 }
 
 EXPECTED_DISAGGREGATED = {
+    "glm-5.2-dspark-disaggregated.yaml": {
+        "control_dir": "outputs/glm-5.2-dspark-disaggregated/control",
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+    },
+    "inkling-dspark-disaggregated.yaml": {
+        "control_dir": "outputs/inkling-dspark-disaggregated/control",
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+    },
     "qwen2.5-7b-eagle3-offline-disaggregated.yaml": {
         "control_dir": ("outputs/qwen2.5-7b-eagle3-offline-disaggregated/control"),
         "backend": "shared_dir",
@@ -93,6 +108,12 @@ EXPECTED_DISAGGREGATED = {
     "qwen3-8b-dflash-disaggregated.yaml": {
         "control_dir": "outputs/qwen3-8b-dflash-disaggregated/control",
         "consumer_state_dir": ("outputs/qwen3-8b-dflash-disaggregated/consumer-state"),
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+    },
+    "qwen3-8b-dspark-disaggregated.yaml": {
+        "control_dir": "outputs/qwen3-8b-dspark-disaggregated/control",
         "backend": "mooncake",
         "server_urls": ["http://127.0.0.1:30000"],
         **LOCAL_MOONCAKE_ENDPOINTS,
@@ -270,7 +291,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 59)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 62)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
@@ -337,6 +358,42 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 self.assertEqual(config.training.role, "auto")
                 self.assertEqual(config.training.sp_ulysses_size, 1)
                 self.assertEqual(config.training.sp_ring_size, 1)
+
+    def test_migrated_dspark_recipes_match_source_training_contract(self):
+        expected_save_intervals = {
+            "qwen3-8b-dspark-disaggregated.yaml": 125,
+            "glm-5.2-dspark-disaggregated.yaml": 16,
+            "inkling-dspark-disaggregated.yaml": 8,
+        }
+        for filename, save_interval in expected_save_intervals.items():
+            with self.subTest(config=filename):
+                config = Config.from_file(str(EXAMPLE_CONFIG_DIR / filename))
+                topology = config.deployment.trainer
+                global_batch = (
+                    topology.nnodes
+                    * topology.nproc_per_node
+                    * config.training.batch_size
+                    * config.training.accumulation_steps
+                )
+                self.assertEqual(global_batch, 512)
+                self.assertEqual(config.training.num_epochs, 10)
+                self.assertIsNone(config.training.max_steps)
+                self.assertAlmostEqual(config.training.learning_rate, 6e-4)
+                self.assertEqual(config.training.num_anchors, 512)
+                self.assertEqual(config.training.loss_decay_gamma, 4.0)
+                self.assertEqual(config.training.objective_chunk_blocks, 128)
+                self.assertEqual(config.training.save_interval, save_interval)
+
+        qwen = Config.from_file(
+            str(EXAMPLE_CONFIG_DIR / "qwen3-8b-dspark-disaggregated.yaml")
+        )
+        self.assertEqual(qwen.data.chat_template, "qwen")
+
+        qwen4b = Config.from_file(
+            str(EXAMPLE_CONFIG_DIR / "qwen3-4b-dspark-disaggregated.yaml")
+        )
+        self.assertEqual(qwen4b.training.loss_decay_gamma, 4.0)
+        self.assertEqual(qwen4b.training.objective_chunk_blocks, 128)
 
 
 if __name__ == "__main__":
