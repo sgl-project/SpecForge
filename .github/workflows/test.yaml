@@ -28,7 +28,7 @@ jobs:
       queue: max
     container:
       image: lmsysorg/sglang:v0.5.14-cu130 # we lock to this version to avoid repeated docker pull
-      options: --gpus all --shm-size=16g --rm -v /dev/shm
+      options: --gpus all --shm-size=16g --rm -v /dev/shm --privileged --pid=host
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -57,7 +57,7 @@ jobs:
           uv pip install wheel setuptools psutil packaging ninja
           uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
           MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
-          uv pip install -v '.[data]'
+          uv pip install -v . --prerelease=allow
           # The live server-capture gate needs the Mooncake client AND the
           # mooncake_master console script; the isolated venv cannot see the
           # container's site-packages. cu130 image -> the cuda13 wheel.
