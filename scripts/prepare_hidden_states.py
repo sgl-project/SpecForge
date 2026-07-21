@@ -120,16 +120,6 @@ def parse_args():
         action="store_true",
         help="Trust remote code when loading models",
     )
-    model_group.add_argument(
-        "--capture-layers",
-        type=str,
-        default=None,
-        help=(
-            "EAGLE3-only override of three comma-separated layer ids; "
-            "DFlash-family layers come from the draft config"
-        ),
-    )
-
     data_group = parser.add_argument_group("data")
     data_group.add_argument("--data-path", type=str, required=True)
     data_group.add_argument("--max-length", type=int, default=2048)
@@ -323,26 +313,6 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
     }
 
 
-def _resolve_capture_layers(
-    model_config: AutoConfig, value: Optional[str]
-) -> List[int]:
-    if value is None:
-        num_layers = model_config.num_hidden_layers
-        layers = [1, num_layers // 2 - 1, num_layers - 4]
-    else:
-        try:
-            layers = [int(layer.strip()) for layer in value.split(",")]
-        except (AttributeError, ValueError) as exc:
-            raise ValueError(
-                "--capture-layers must be three comma-separated integers"
-            ) from exc
-    if len(layers) != 3 or len(set(layers)) != 3 or any(layer < 0 for layer in layers):
-        raise ValueError(
-            "offline EAGLE3 capture requires three distinct non-negative layers"
-        )
-    return layers
-
-
 def resolve_offline_capture_plan(
     args: argparse.Namespace,
     target_config: AutoConfig,
@@ -350,25 +320,12 @@ def resolve_offline_capture_plan(
     """Resolve capture layers and output keys through the algorithm registry."""
 
     strategy = getattr(args, "strategy", "eagle3")
-    explicit_layers = getattr(args, "capture_layers", None)
-    if explicit_layers is not None and strategy != "eagle3":
-        raise ValueError(
-            "--capture-layers is supported only for strategy=eagle3; "
-            "DFlash-family capture layers must match the draft config"
-        )
-
     model = {
         "target_model_path": args.target_model_path,
         "draft_model_config": getattr(args, "draft_model_config", None),
         "trust_remote_code": args.trust_remote_code,
         "cache_dir": getattr(args, "cache_dir", None),
     }
-    if explicit_layers is not None:
-        model["aux_hidden_state_layer_ids"] = _resolve_capture_layers(
-            target_config,
-            explicit_layers,
-        )
-
     cfg = Config(
         model=model,
         data={
@@ -390,12 +347,10 @@ def resolve_offline_capture_plan(
 def build_target_model(
     args: argparse.Namespace,
     model_config: AutoConfig,
-    capture_layers: Optional[List[int]] = None,
+    capture_layers: List[int],
     capture_method: str = "eagle3",
 ) -> OfflineSGLangCapture:
     """Build the local target used only by this preprocessing command."""
-    if capture_layers is None:
-        capture_layers = _resolve_capture_layers(model_config, args.capture_layers)
     target_model = load_offline_capture(
         args.target_model_path,
         torch_dtype=(

@@ -289,9 +289,9 @@ Use these strategy/model pairs for the checked-in local offline recipes:
 `--strategy` defaults to `eagle3` for compatibility. Pass it explicitly in
 reproducible jobs. `--draft-model-config` is required for Domino and DSpark;
 passing the same explicit config used by training is recommended for every
-strategy. `--capture-layers` is an EAGLE3-only override. DFlash-family layers
-always come from the draft config so feature preparation cannot silently drift
-away from the draft architecture.
+strategy. Capture layers come from the resolved draft config. EAGLE3 retains
+target-derived defaults for legacy configs that do not define
+`eagle_config.eagle_aux_hidden_state_layer_ids`.
 
 Each output record contains the strategy's exact offline feature contract:
 

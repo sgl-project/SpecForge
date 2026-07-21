@@ -11,7 +11,6 @@ import torch
 from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
-    _resolve_capture_layers,
     _resolve_draft_vocab_size,
     build_target_model,
     parse_args,
@@ -38,8 +37,9 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
         self.assertIsNone(args.draft_model_config)
         self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
         self.assertFalse(hasattr(args, "draft_block_size"))
+        self.assertFalse(hasattr(args, "capture_layers"))
 
-    def test_cli_accepts_dflash_family_capture_inputs(self):
+    def test_cli_accepts_dflash_family_config(self):
         argv = [
             "prepare_hidden_states.py",
             "--target-model-path",
@@ -50,8 +50,6 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "dspark",
             "--draft-model-config",
             "configs/qwen3-4b-dspark.json",
-            "--capture-layers",
-            "1,9,17,25,33",
         ]
         with mock.patch("sys.argv", argv):
             args = parse_args()
@@ -61,18 +59,13 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "configs/qwen3-4b-dspark.json",
             args.draft_model_config,
         )
-        self.assertEqual("1,9,17,25,33", args.capture_layers)
-
-    def test_default_and_explicit_capture_layers(self):
-        config = SimpleNamespace(num_hidden_layers=32, dtype=None)
-        self.assertEqual(_resolve_capture_layers(config, None), [1, 15, 28])
-        self.assertEqual(_resolve_capture_layers(config, "2, 7, 19"), [2, 7, 19])
+        self.assertFalse(hasattr(args, "capture_layers"))
 
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {
             "eagle3": (
                 "qwen3-8b-eagle3.json",
-                (1, 17, 32),
+                (1, 19, 36),
                 {
                     "input_ids",
                     "loss_mask",
@@ -101,7 +94,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 },
             ),
         }
-        target_config = SimpleNamespace(num_hidden_layers=36)
+        target_config = SimpleNamespace(num_hidden_layers=40)
 
         for strategy, (config_name, layers, feature_names) in expected.items():
             args = SimpleNamespace(
@@ -110,7 +103,6 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 draft_model_config=str(REPO_ROOT / "configs" / config_name),
                 trust_remote_code=False,
                 cache_dir=None,
-                capture_layers=None,
                 output_path="offline-features",
                 max_length=128,
             )
@@ -124,35 +116,11 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 self.assertEqual(layers, plan.capture_layers)
                 self.assertEqual(feature_names, set(plan.layout.output_names))
 
-    def test_non_eagle_capture_layer_override_is_rejected(self):
-        args = SimpleNamespace(
-            strategy="dflash",
-            target_model_path="target",
-            capture_layers="1,9,17,25,33",
-        )
-
-        with self.assertRaisesRegex(ValueError, "supported only.*eagle3"):
-            resolve_offline_capture_plan(
-                args,
-                SimpleNamespace(num_hidden_layers=36),
-            )
-
-    def test_invalid_capture_layers_fail_before_loading_target(self):
-        config = SimpleNamespace(num_hidden_layers=32, dtype=None)
-        invalid = ("1,2", "1,1,2", "-1,2,3", "1,,3", "one,2,3")
-        with mock.patch("scripts.prepare_hidden_states.load_offline_capture") as load:
-            for value in invalid:
-                args = SimpleNamespace(capture_layers=value)
-                with self.subTest(value=value), self.assertRaises(ValueError):
-                    build_target_model(args, config)
-        load.assert_not_called()
-
     def test_build_uses_dedicated_offline_loader(self):
         config = SimpleNamespace(num_hidden_layers=32, dtype=None)
         args = SimpleNamespace(
             target_model_path="target",
             trust_remote_code=True,
-            capture_layers="2,7,19",
             sglang_attention_backend="fa3",
             sglang_mem_fraction_static=0.4,
             sglang_context_length=4096,
@@ -170,7 +138,10 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "scripts.prepare_hidden_states.load_offline_capture",
             return_value=target,
         ) as load:
-            self.assertIs(build_target_model(args, config), target)
+            self.assertIs(
+                build_target_model(args, config, capture_layers=[2, 7, 19]),
+                target,
+            )
 
         load.assert_called_once()
         self.assertEqual(load.call_args.args, ("target",))
@@ -186,7 +157,6 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
         args = SimpleNamespace(
             target_model_path="target",
             trust_remote_code=True,
-            capture_layers=None,
             sglang_attention_backend="fa3",
             sglang_mem_fraction_static=0.4,
             sglang_context_length=4096,
