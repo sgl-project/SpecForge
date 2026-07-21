@@ -35,7 +35,7 @@ dependencies = [
 specforge = "specforge.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["specforge*"]
+exclude = ["configs*", "scripts*", "tests*"]
 
 [project.optional-dependencies]
 data = ["openai"]
