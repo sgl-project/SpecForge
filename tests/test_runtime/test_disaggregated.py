@@ -58,6 +58,24 @@ class TestDisaggregatedStore(unittest.TestCase):
         out, _ = consumer.get(ref2)  # gen2 must still be intact
         self.assertEqual(out["x"].sum().item(), 4.0)  # ones(1,4) intact
 
+    def test_fanout_reader_release_defers_free_to_lifetime_owner(self):
+        producer = SharedDirFeatureStore(self.root, store_id="st", lifetime_owner=True)
+        reader = SharedDirFeatureStore(self.root, store_id="st", lifetime_owner=False)
+        ref = producer.put({"x": torch.ones(1, 4)}, sample_id="s0", metadata={})
+
+        out, handle = reader.get(ref)
+        self.assertEqual(out["x"].sum().item(), 4.0)
+        reader.release(handle)
+        out_again, handle_again = reader.get(ref)
+        reader.release(handle_again)
+        self.assertEqual(out_again["x"].sum().item(), 4.0)
+
+        with self.assertRaisesRegex(RuntimeError, "lifetime owner"):
+            reader.reclaim(ref)
+        producer.reclaim(ref)
+        with self.assertRaises(KeyError):
+            reader.get(ref)
+
     def test_use_after_free_get_raises(self):
         store = SharedDirFeatureStore(self.root)
         ref = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})

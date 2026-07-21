@@ -38,7 +38,8 @@ training, `*-offline.yaml` consumes precomputed features, and
 recipe is disaggregated even when its historical filename only says `online`.
 VLM training is not supported, so the catalog contains text-only recipes.
 
-The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
+The `qwen3-8b-dflash-windowed-fanout.yaml`,
+`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-multiserver-disaggregated.yaml`,
 `qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`, and
@@ -114,6 +115,7 @@ assume the command runs from the repository root.
 | Colocated offline | `qwen3-8b-eagle3-offline.yaml` |
 | External-service online | `qwen3-8b-eagle3-disaggregated.yaml` |
 | Managed-local disaggregated online | `qwen3-8b-domino-multiserver-disaggregated.yaml` |
+| Independent heterogeneous consumers | `qwen3-8b-dflash-windowed-fanout.yaml` |
 | Disaggregated offline | `qwen3-8b-eagle3-offline-disaggregated.yaml` |
 
 The online/offline mode is derived from the selected `data` source, not from
@@ -310,7 +312,7 @@ Managed-local fields:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per `nproc_per_node`; trainer and capture devices must not overlap. |
+| `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per trainer rank, or one per independent `windowed_fanout` consumer; trainer and capture devices must not overlap. |
 | `deployment.disaggregated.managed_local.mooncake` | default object | Owned loopback Mooncake configuration described by the nested fields below. |
 | `deployment.disaggregated.managed_local.capture_servers` | required | One or more owned patched SGLang server definitions. |
 | `deployment.disaggregated.managed_local.shutdown_grace_s` | `30` | Positive graceful process-group shutdown window. |
@@ -335,6 +337,51 @@ server URLs and Mooncake endpoints, so do not combine it with explicit external
 endpoints, `store_root`, or `producer_segment_size`. It does not support resume,
 an existing torchrun, or `--node-rank`. All owned ports and GPU assignments must
 be disjoint.
+
+### Independent windowed fanout
+
+`deployment.disaggregated.windowed_fanout` runs one producer and multiple
+single-process consumers from the same YAML. Each child still enters through
+`specforge train`; `launch_plan` selects a consumer with `--consumer-id` and
+projects its loss, block size, anchors, optimizer schedule, seed, checkpoint,
+and output directory onto the canonical trainer configuration.
+
+This topology is intentionally different from data-parallel training. Consumers
+advance independently and may have different step costs. A shared SQLite
+registry records each cursor and bounded capture interest, while Mooncake owns
+the tensor payloads. The producer captures a sample only when a consumer's
+window requests it, reuses a live compatible capture across consumers, and
+reclaims entries outside every legal window.
+
+Required constraints are:
+
+- online DFlash with Mooncake and exactly one prompt epoch;
+- a positive fixed `data.max_prompts`, divisible by batch size times
+  accumulation;
+- `deployment.trainer` fixed at 1x1 because each consumer is its own process;
+- exactly one capture server, shared by every consumer;
+- one managed-local trainer device per consumer, or one explicit
+  `cuda_visible_device` on every external consumer;
+- `max_live_refs`, `max_live_bytes`, and `max_outstanding_per_consumer` large
+  enough for the configured batch and capture reservation.
+
+The main bounds and timing controls are:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `window_lookbehind` / `window_lookahead` | `2` / `40` | Shared default legal window around each consumer cursor. |
+| `max_prefetch_per_consumer` | `8` | Maximum speculative requests inside the lookahead window. |
+| `max_outstanding_per_consumer` | `8` | Hard per-consumer acquired-ref bound; must cover one accumulated optimizer step. |
+| `max_live_refs` / `max_live_bytes` | required byte bound | Global capture capacity shared by all consumers. |
+| `capture_reservation_bytes` | 128 MiB | Bytes reserved transactionally before a capture starts. |
+| `capture_max_sample_bytes` | 128 MiB | Server-side rejection bound for one captured sample; it cannot exceed the transactional reservation. |
+| `capture_batch_size` / `capture_batch_wait_s` | `8` / `0.002` | Producer request batching. |
+| `consumer_prefetch_batches` | `1` | Loader-side prefetch workers for each consumer. |
+
+Each consumer may override `window_lookbehind`, `window_lookahead`, and
+`max_prefetch` in addition to its required training fields. External deployments
+may resume consumers independently with `resume_from`; managed-local runs are
+fresh attempts and reject resume checkpoints.
 
 ### `runtime`: streaming backpressure
 

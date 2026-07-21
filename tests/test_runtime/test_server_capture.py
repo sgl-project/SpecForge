@@ -14,10 +14,12 @@ zero-copy ``MooncakeFeatureStore.get``. The real-server end-to-end lives in
 """
 
 import ctypes
+import dataclasses
 import os
 import tempfile
 import unittest
 from typing import Any, Dict, List
+from unittest import mock
 
 import torch
 
@@ -87,12 +89,14 @@ class _StubCaptureServer:
         self,
         backend: _FakeMooncakeStore,
         *,
+        capture_token: str = "unit-capture-token",
         hidden: int = HIDDEN,
         aux_width: int = len(AUX_LAYERS) * HIDDEN,
         aux_layer_ids=AUX_LAYERS,
         error_sample_ids=(),
     ) -> None:
         self.backend = backend
+        self.capture_token = capture_token
         self.hidden = hidden
         self.aux_width = aux_width
         self.aux_layer_ids = None if aux_layer_ids is None else list(aux_layer_ids)
@@ -107,6 +111,7 @@ class _StubCaptureServer:
         assert url.endswith("/generate")
         rows: List[Dict[str, Any]] = []
         for input_ids, spec in zip(json_body["input_ids"], json_body["spec_capture"]):
+            assert spec["auth_token"] == self.capture_token
             sid, gen = spec["sample_id"], int(spec["gen"])
             if sid in self.error_sample_ids:
                 rows.append(
@@ -282,11 +287,49 @@ def _mk(
         schema=_capture_schema(algorithm),
         request_input_adapter=request_input_adapter,
         post_fn=server,
+        capture_token="unit-capture-token",
     )
     return backend, server, store, adapter
 
 
 class TestServerCaptureAdapter(unittest.TestCase):
+    def test_capture_capability_and_namespace_are_client_guarded(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        schema = _capture_schema("eagle3")
+        with mock.patch.dict(os.environ, {"SGLANG_SPEC_CAPTURE_TOKEN": ""}):
+            with self.assertRaisesRegex(ValueError, "requires capture_token"):
+                SGLangServerCaptureAdapter(
+                    "http://server:30000",
+                    store,
+                    run_id="run0",
+                    algorithm="eagle3",
+                    schema=schema,
+                )
+        with self.assertRaisesRegex(ValueError, "run_id == store.store_id"):
+            SGLangServerCaptureAdapter(
+                "http://server:30000",
+                store,
+                run_id="other",
+                algorithm="eagle3",
+                schema=schema,
+                capture_token="unit-capture-token",
+            )
+
+    def test_request_sends_capability_and_bound_store_namespace(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+        captured = []
+
+        def inspect_request(url, json_body, timeout):
+            captured.extend(json_body["spec_capture"])
+            return server(url, json_body, timeout)
+
+        _, _, _, adapter = _mk(server=inspect_request, backend=backend)
+        adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertEqual(captured[0]["auth_token"], "unit-capture-token")
+        self.assertEqual(captured[0]["store_id"], "run0")
+
     def test_generic_adapter_inputs_merge_with_runtime_owned_request_fields(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend)
@@ -514,6 +557,71 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertIn("injected sink error", results[0].reason)
         self.assertIsInstance(results[1], SampleRef)
 
+    def test_retryable_rejection_does_not_block_the_replacement_attempt(self):
+        class BusyRemovalStore(_FakeMooncakeStore):
+            def is_exist(self, key):
+                return 1
+
+            def remove(self, key):
+                return -1
+
+        backend = BusyRemovalStore()
+        server = _StubCaptureServer(backend, error_sample_ids={"run0:t0"})
+        _, _, store, adapter = _mk(server=server, backend=backend)
+
+        (failure,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertIsInstance(failure, ServerCaptureFailure)
+        self.assertTrue(failure.retryable)
+        server.error_sample_ids.clear()
+        (replacement,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+
+        self.assertIsInstance(replacement, SampleRef)
+        self.assertEqual(store.health()["release_pending"], 0)
+
+    def test_response_feature_set_mismatch_reclaims_server_keys(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def omit_feature(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            rows[0]["meta_info"]["spec_capture"]["features"].pop("loss_mask")
+            return rows
+
+        _, _, _, adapter = _mk(server=omit_feature, backend=backend)
+        (result,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertIsInstance(result, ServerCaptureFailure)
+        self.assertFalse(result.retryable)
+        self.assertIn("feature set mismatch", result.reason)
+        self.assertFalse(backend._d)
+
+    def test_malformed_metadata_reclaims_only_the_bad_row(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+
+        def corrupt_first_row(url, json_body, timeout):
+            rows = server(url, json_body, timeout)
+            rows[0]["meta_info"]["spec_capture"]["features"]["hidden_state"].pop(
+                "shape"
+            )
+            return rows
+
+        _, _, _, adapter = _mk(server=corrupt_first_row, backend=backend)
+        results = adapter.produce_refs(
+            [_task(0, 4), _task(1, 5)], capture=_eagle3_contract()
+        )
+        self.assertIsInstance(results[0], ServerCaptureFailure)
+        self.assertIsInstance(results[1], SampleRef)
+        self.assertFalse(any("/run0:t0/g1/" in key for key in backend._d))
+        self.assertTrue(any("/run0:t1/g1/" in key for key in backend._d))
+
+    def test_health_reports_rpc_batch_profile(self):
+        _, _, _, adapter = _mk(algorithm="dflash")
+        adapter.produce_refs([_task(0, 4), _task(1, 5)], capture=_dflash_contract())
+        health = adapter.health()
+        self.assertEqual(health["rpc_calls"], 1)
+        self.assertEqual(health["rpc_tasks"], 2)
+        self.assertEqual(health["mean_batch_size"], 2.0)
+
     def test_rollout_worker_ref_path(self):
         from specforge.inference.rollout_worker import RolloutWorker
 
@@ -587,6 +695,29 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertEqual(0, store.discard_external_attempts())
         self.assertTrue(all("/g1/" in key for key in backend._d))
         self.assertFalse(any("/g2/" in key for key in backend._d))
+
+    def test_windowed_recapture_uses_the_registry_generation(self):
+        backend, server, store, adapter = _mk()
+        requests = []
+        original_post = adapter.post_fn
+
+        def record_request(url, json_body, timeout):
+            requests.append(json_body["spec_capture"][0])
+            return original_post(url, json_body, timeout)
+
+        adapter.post_fn = record_request
+        task = dataclasses.replace(
+            _task(0, 4),
+            attempt=6,
+            metadata={"capture_generation": 7},
+        )
+
+        (ref,) = adapter.produce_refs([task], capture=_eagle3_contract())
+
+        self.assertEqual(ref.metadata["generation"], 7)
+        self.assertEqual(requests[0]["gen"], 7)
+        self.assertTrue(requests[0]["replace"])
+        self.assertTrue(all("/g7/" in key for key in backend._d))
 
     def test_terminal_lost_response_is_reclaimed_without_a_ref(self):
         backend, server, store, adapter = _mk()
@@ -704,6 +835,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
                 run_id="run0",
                 algorithm="eagle3",
                 schema=object(),
+                capture_token="unit-capture-token",
             )
 
 
@@ -784,6 +916,7 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
             algorithm="dflash",
             schema=_capture_schema("dflash"),
             post_fn=server,
+            capture_token="unit-capture-token",
         )
         prompts = [
             {

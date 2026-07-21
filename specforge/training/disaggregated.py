@@ -17,9 +17,11 @@ hyperparameters.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
+from collections.abc import Mapping
 from typing import Callable, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -37,6 +39,59 @@ _ONLINE_CONTROL_SUFFIXES = (
     _ONLINE_SCHEDULE_SUFFIX,
 )
 _OFFLINE_CONTROL_SUFFIXES = (".done", ".consumed", ".failed", ".consumer_failed")
+
+
+def _stabilize_windowed_prompts(prompts):
+    """Add deterministic task ids at the fixed windowed-inventory boundary."""
+    from specforge.runtime.contracts import PromptTask
+
+    stabilized = []
+    seen_ids = set()
+    for index, prompt in enumerate(prompts):
+        if isinstance(prompt, PromptTask):
+            task_id = prompt.task_id
+            stabilized_prompt = prompt
+        elif isinstance(prompt, Mapping):
+            task_id = prompt.get("task_id")
+            stabilized_prompt = prompt
+            if task_id is None:
+                identity = {
+                    key: value for key, value in prompt.items() if key != "task_id"
+                }
+                try:
+                    encoded = json.dumps(
+                        identity,
+                        allow_nan=False,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode()
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "windowed fanout cannot derive a stable task_id from "
+                        f"prompt {index}; non-JSON prompts must provide one explicitly"
+                    ) from exc
+                digest = hashlib.sha256(encoded).hexdigest()
+                task_id = f"canonical-prompt-{index:08d}-{digest}"
+                stabilized_prompt = dict(prompt)
+                stabilized_prompt["task_id"] = task_id
+        else:
+            raise TypeError(
+                "windowed fanout prompts must be PromptTask instances or mappings; "
+                f"got {type(prompt).__name__} at index {index}"
+            )
+
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError(
+                f"windowed fanout prompt {index} has an invalid explicit task_id"
+            )
+        if task_id in seen_ids:
+            raise ValueError(
+                f"windowed fanout prompt task_id {task_id!r} is duplicated"
+            )
+        seen_ids.add(task_id)
+        stabilized.append(stabilized_prompt)
+    return stabilized
 
 
 def _write_control(path: str, value: str = "") -> None:
@@ -125,7 +180,12 @@ def _env(name: str) -> str:
     return value
 
 
-def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
+def _mooncake_store(
+    cfg: Config,
+    *,
+    retain_on_release: bool = False,
+    lifetime_owner: bool = True,
+):
     from specforge.runtime.data_plane.disaggregated import AuthPolicy
     from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
@@ -145,12 +205,24 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     ):
         if os.environ.get(env_name):
             setup_kwargs[key] = int(os.environ[env_name])
+    deployment = cfg.deployment.disaggregated
+    fanout = deployment.windowed_fanout if deployment is not None else None
+    lifecycle_db_path = (
+        os.environ.get("DISAGG_CAPTURE_LIFECYCLE_DB")
+        if fanout is not None and lifetime_owner
+        else None
+    )
     return MooncakeFeatureStore(
         store_id=os.environ.get("DISAGG_STORE_ID", cfg.run_id),
         setup_kwargs=setup_kwargs,
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
+        lifetime_owner=lifetime_owner,
+        lifecycle_db_path=lifecycle_db_path,
+        max_resident_bytes=(
+            fanout.max_live_bytes if fanout is not None and lifetime_owner else None
+        ),
     )
 
 
@@ -501,6 +573,277 @@ def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
     )
 
 
+def _build_windowed_online(
+    cfg: Config,
+    *,
+    algorithm: AlgorithmRegistration,
+    build_model_bundle: Callable,
+    prepare_prompts: Callable,
+    optimizer_factory: Callable,
+    logger: Callable,
+):
+    """Assemble one role in a bounded independent-consumer fanout."""
+    from specforge.training.assembly import TrainingRun, _load_input_tools
+
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.windowed_fanout is not None
+    fanout = deployment.windowed_fanout
+    registry_db_path = _env("DISAGG_WINDOW_REGISTRY")
+    modality = cfg.model.input_modality
+    streaming = algorithm.providers.server_streaming_for(modality)
+    layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
+        cfg, algorithm
+    )
+    from specforge.launch import build_disagg_windowed_capture_contract
+
+    capture, contract_digest = build_disagg_windowed_capture_contract(
+        strategy=algorithm,
+        modality=modality,
+        target_hidden_size=hidden_size,
+        target_model_version=cfg.model.target_model_path,
+        tokenizer_version=cfg.model.target_model_path,
+        target_vocab_size=target_vocab,
+        draft_vocab_size=draft_vocab,
+        target_repr=streaming.target_representation,
+        aux_hidden_state_layer_ids=layers,
+        vocab_map_version=cfg.model.vocab_mapping_path or None,
+    )
+
+    if cfg.training.role == "producer":
+        from specforge.inference.adapters.server_capture import (
+            ServerCaptureSchema,
+            SGLangServerCaptureAdapter,
+        )
+        from specforge.launch import build_disagg_online_windowed_producer
+        from specforge.runtime.data_plane.feature_store import (
+            drain_feature_store_removals,
+        )
+        from specforge.training.model_loading import resolve_draft_config
+
+        input_adapter = streaming.create_input_adapter(cfg)
+        input_tools = _load_input_tools(cfg, algorithm, input_adapter=input_adapter)
+        draft_config = resolve_draft_config(
+            cfg, provider=algorithm.providers.model.draft_config
+        )
+        if input_adapter is None:
+            prompts = prepare_prompts(cfg, input_tools, draft_config=draft_config)
+        else:
+            prompts = input_adapter.prepare_prompts(
+                cfg, input_tools, draft_config=draft_config
+            )
+        if len(prompts) != cfg.data.max_prompts:
+            raise ValueError(
+                "windowed_fanout prepared prompt count does not match "
+                f"data.max_prompts: {len(prompts)} != {cfg.data.max_prompts}"
+            )
+        prompts = _stabilize_windowed_prompts(prompts)
+        urls = _server_urls(cfg)
+        if len(urls) != 1:
+            raise ValueError(
+                "windowed_fanout currently requires exactly one capture server"
+            )
+        store = _mooncake_store(cfg, lifetime_owner=True)
+        layout = streaming.layout
+        adapter = SGLangServerCaptureAdapter(
+            urls[0],
+            store,
+            run_id=cfg.run_id,
+            algorithm=algorithm.name,
+            schema=ServerCaptureSchema(
+                aux_feature=layout.aux_feature,
+                last_hidden_feature=layout.last_hidden_feature,
+                passthrough=layout.passthrough,
+                attention_mask_feature=layout.attention_mask_feature,
+            ),
+            request_input_adapter=input_adapter,
+            target_model_version=cfg.model.target_model_path,
+        )
+        runtime = build_disagg_online_windowed_producer(
+            prompts=prompts,
+            feature_store=store,
+            feature_source=adapter,
+            run_id=cfg.run_id,
+            consumer_ids=tuple(consumer.consumer_id for consumer in fanout.consumers),
+            registry_db_path=registry_db_path,
+            max_live_refs=fanout.max_live_refs,
+            max_live_bytes=fanout.max_live_bytes,
+            capture_reservation_bytes=fanout.capture_reservation_bytes,
+            target_hidden_size=hidden_size,
+            target_model_version=cfg.model.target_model_path,
+            tokenizer_version=cfg.model.target_model_path,
+            strategy=algorithm,
+            modality=modality,
+            target_vocab_size=target_vocab,
+            draft_vocab_size=draft_vocab,
+            target_repr=streaming.target_representation,
+            aux_hidden_state_layer_ids=layers,
+            vocab_map_version=cfg.model.vocab_mapping_path or None,
+            capture_batch_size=fanout.capture_batch_size,
+            capture_batch_wait_s=fanout.capture_batch_wait_s,
+            max_capture_retries=fanout.max_capture_retries,
+            retry_backoff_s=fanout.capture_retry_backoff_s,
+            consumer_registration_timeout_s=(fanout.consumer_registration_timeout_s),
+            consumer_heartbeat_timeout_s=fanout.consumer_heartbeat_timeout_s,
+            registry_poll_s=fanout.registry_poll_s,
+        )
+
+        def produce() -> int:
+            produced = 0
+            primary_error: Optional[BaseException] = None
+            try:
+                produced = runtime.drive()
+            except BaseException as exc:
+                primary_error = exc
+            cleanup_errors = []
+            try:
+                runtime.close()
+            except Exception as exc:
+                cleanup_errors.append(f"registry close: {type(exc).__name__}: {exc}")
+            try:
+                store.abort_all(
+                    reason=(
+                        "windowed-attempt-failed"
+                        if primary_error is not None
+                        else "windowed-attempt-finished"
+                    ),
+                    force=True,
+                )
+                drain_feature_store_removals(store)
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"Mooncake owner cleanup: {type(exc).__name__}: {exc}"
+                )
+            if primary_error is not None and cleanup_errors:
+                raise RuntimeError(
+                    f"windowed producer failed ({type(primary_error).__name__}: "
+                    f"{primary_error}) and cleanup also failed: {cleanup_errors}"
+                ) from primary_error
+            if primary_error is not None:
+                raise primary_error
+            if cleanup_errors:
+                raise RuntimeError(
+                    f"windowed producer cleanup failed: {cleanup_errors}"
+                )
+            return produced
+
+        return TrainingRun(execute=produce)
+
+    consumer_id = _env("SPECFORGE_FANOUT_CONSUMER_ID")
+    consumer = fanout.consumer(consumer_id)
+    lookbehind, lookahead, prefetch_depth = fanout.window_for(consumer_id)
+    from specforge.runtime.data_plane.windowed_capture import (
+        SQLiteWindowedCaptureRegistry,
+    )
+    from specforge.runtime.data_plane.windowed_capture_runtime import (
+        start_windowed_consumer_control,
+    )
+
+    registry = SQLiteWindowedCaptureRegistry(
+        registry_db_path,
+        max_live_refs=fanout.max_live_refs,
+        max_live_bytes=fanout.max_live_bytes,
+        capture_reservation_bytes=fanout.capture_reservation_bytes,
+        poll_s=fanout.registry_poll_s,
+    )
+    control = None
+    try:
+        initialized = registry.wait_initialized(fanout.consumer_registration_timeout_s)
+        expected = (cfg.run_id, contract_digest, cfg.data.max_prompts)
+        observed = (
+            initialized["run_id"],
+            initialized["contract_digest"],
+            initialized["total_samples"],
+        )
+        if observed != expected:
+            raise RuntimeError(
+                "windowed fanout registry identity mismatch: "
+                f"expected={expected!r}, observed={observed!r}"
+            )
+        control = start_windowed_consumer_control(
+            registry,
+            consumer_id,
+            lookbehind=lookbehind,
+            lookahead=lookahead,
+            prefetch_depth=prefetch_depth,
+            max_outstanding=fanout.max_outstanding_per_consumer,
+            heartbeat_interval_s=fanout.consumer_heartbeat_interval_s,
+        )
+        bundle = build_model_bundle(cfg)
+        total_steps = cfg.data.max_prompts // (
+            cfg.training.batch_size * cfg.training.accumulation_steps
+        )
+        from specforge.launch import build_disagg_online_windowed_consumer
+
+        runtime = build_disagg_online_windowed_consumer(
+            consumer_id=consumer_id,
+            registry_db_path=registry_db_path,
+            max_live_refs=fanout.max_live_refs,
+            max_live_bytes=fanout.max_live_bytes,
+            capture_reservation_bytes=fanout.capture_reservation_bytes,
+            contract_digest=contract_digest,
+            total_samples=cfg.data.max_prompts,
+            feature_store=_mooncake_store(cfg, lifetime_owner=False),
+            draft_model=bundle.model,
+            optimizer_factory=optimizer_factory(cfg),
+            run_id=cfg.run_id,
+            output_dir=cfg.output_dir,
+            metadata_db_path=_env("DISAGG_DB"),
+            lookbehind=lookbehind,
+            lookahead=lookahead,
+            prefetch_depth=prefetch_depth,
+            max_outstanding=fanout.max_outstanding_per_consumer,
+            strategy=algorithm,
+            modality=modality,
+            batch_size=cfg.training.batch_size,
+            accumulation_steps=cfg.training.accumulation_steps,
+            num_epochs=1,
+            max_steps=cfg.training.max_steps,
+            total_steps=cfg.training.total_steps or total_steps,
+            save_interval=cfg.training.save_interval,
+            eval_interval=0,
+            idle_timeout_s=fanout.consumer_idle_timeout_s,
+            logger=logger,
+            log_interval=cfg.training.log_interval,
+            strategy_kwargs=dict(bundle.strategy_kwargs),
+            resume=consumer.resume_from is not None,
+            resume_from=consumer.resume_from,
+            max_checkpoints=cfg.training.max_checkpoints,
+            heartbeat_interval_s=fanout.consumer_heartbeat_interval_s,
+            initialization_timeout_s=fanout.consumer_registration_timeout_s,
+            registry_poll_s=fanout.registry_poll_s,
+            loader_prefetch_batches=fanout.consumer_prefetch_batches,
+            consumer_control=control,
+        )
+    except BaseException as exc:
+        if control is not None:
+            try:
+                control.fail(exc)
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    f"failed to report fanout consumer setup failure: "
+                    f"{cleanup_error!r}"
+                )
+            try:
+                control.close()
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    f"failed to close fanout consumer control: {cleanup_error!r}"
+                )
+        try:
+            registry.close()
+        except BaseException as cleanup_error:
+            exc.add_note(f"failed to close fanout registry: {cleanup_error!r}")
+        raise
+
+    def consume() -> int:
+        try:
+            return runtime.run()
+        finally:
+            runtime.close()
+
+    return TrainingRun(execute=consume)
+
+
 def _build_online(
     cfg: Config,
     *,
@@ -510,6 +853,16 @@ def _build_online(
     optimizer_factory: Callable,
     logger: Callable,
 ):
+    deployment = cfg.deployment.disaggregated
+    if deployment is not None and deployment.windowed_fanout is not None:
+        return _build_windowed_online(
+            cfg,
+            algorithm=algorithm,
+            build_model_bundle=build_model_bundle,
+            prepare_prompts=prepare_prompts,
+            optimizer_factory=optimizer_factory,
+            logger=logger,
+        )
     from specforge.training.assembly import (
         TrainingRun,
         _dataloader_num_workers,

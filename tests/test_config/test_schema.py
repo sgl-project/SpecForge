@@ -63,6 +63,61 @@ def _managed_local_payload(*, ep_size: int) -> dict:
     return payload
 
 
+def _windowed_fanout_payload(*, managed: bool = True) -> dict:
+    payload = _online_payload("dflash")
+    payload["data"]["max_prompts"] = 8
+    payload["training"].update(
+        {"batch_size": 2, "accumulation_steps": 1, "num_epochs": 1}
+    )
+    consumers = [
+        {
+            "consumer_id": "block-4",
+            "seed": 42,
+            "loss_type": "dflash",
+            "loss_decay_gamma": 7.0,
+            "dpace_alpha": 0.5,
+            "draft_block_size": 4,
+            "num_anchors": 128,
+            "learning_rate": 0.0006,
+            "warmup_ratio": 0.04,
+        },
+        {
+            "consumer_id": "block-16",
+            "seed": 43,
+            "loss_type": "dpace",
+            "loss_decay_gamma": None,
+            "dpace_alpha": 0.5,
+            "draft_block_size": 16,
+            "num_anchors": 256,
+            "learning_rate": 0.0006,
+            "warmup_ratio": 0.04,
+        },
+    ]
+    disaggregated = payload["deployment"]["disaggregated"]
+    disaggregated["windowed_fanout"] = {
+        "consumers": consumers,
+        "max_live_bytes": 8 << 30,
+        "max_outstanding_per_consumer": 4,
+    }
+    payload["deployment"]["trainer"] = {"nnodes": 1, "nproc_per_node": 1}
+    if managed:
+        disaggregated.pop("server_urls")
+        disaggregated["managed_local"] = {
+            "trainer_cuda_visible_devices": ["1", "2"],
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0"],
+                    "tp_size": 1,
+                }
+            ],
+        }
+    else:
+        consumers[0]["cuda_visible_device"] = "1"
+        consumers[1]["cuda_visible_device"] = "2"
+    return payload
+
+
 def _write(payload: dict, suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "w") as f:
@@ -76,6 +131,58 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_windowed_fanout_is_typed_and_bounded(self):
+        config = Config.model_validate(_windowed_fanout_payload())
+        fanout = config.deployment.disaggregated.windowed_fanout
+
+        self.assertEqual(
+            [consumer.consumer_id for consumer in fanout.consumers],
+            ["block-4", "block-16"],
+        )
+        self.assertEqual(fanout.window_for("block-4"), (2, 40, 8))
+        self.assertEqual(fanout.max_live_bytes, 8 << 30)
+
+    def test_windowed_fanout_rejects_noncanonical_topologies(self):
+        invalid = _windowed_fanout_payload()
+        invalid["deployment"]["trainer"]["nproc_per_node"] = 2
+        with self.assertRaisesRegex(ValidationError, "independent single-process"):
+            Config.model_validate(invalid)
+
+        invalid = _windowed_fanout_payload(managed=False)
+        del invalid["deployment"]["disaggregated"]["windowed_fanout"]["consumers"][1][
+            "cuda_visible_device"
+        ]
+        with self.assertRaisesRegex(ValidationError, "require cuda_visible_device"):
+            Config.model_validate(invalid)
+
+        invalid = _windowed_fanout_payload()
+        invalid["deployment"]["disaggregated"]["managed_local"][
+            "trainer_cuda_visible_devices"
+        ] = ["1"]
+        with self.assertRaisesRegex(ValidationError, "fanout consumer count"):
+            Config.model_validate(invalid)
+
+        invalid = _windowed_fanout_payload()
+        invalid["deployment"]["disaggregated"]["windowed_fanout"].update(
+            capture_reservation_bytes=128 << 20,
+            capture_max_sample_bytes=256 << 20,
+        )
+        with self.assertRaisesRegex(ValidationError, "must not exceed"):
+            Config.model_validate(invalid)
+
+        invalid = _windowed_fanout_payload()
+        invalid["deployment"]["disaggregated"]["managed_local"][
+            "capture_servers"
+        ].append(
+            {
+                "port": 30001,
+                "cuda_visible_devices": ["3"],
+                "tp_size": 1,
+            }
+        )
+        with self.assertRaisesRegex(ValidationError, "exactly one capture server"):
+            Config.model_validate(invalid)
+
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertFalse(default.model.use_liger_kernel)

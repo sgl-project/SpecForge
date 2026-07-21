@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -27,11 +28,14 @@ if TYPE_CHECKING:
 LaunchRole = Literal["auto", "all", "producer", "consumer", "both"]
 PlanKind = Literal["worker", "command", "supervisor", "managed_supervisor"]
 ReadinessKind = Literal["http", "mooncake"]
+_HTTP_READINESS_PROBE_TIMEOUT_S = 5.0
 
 _DIST_ENV = ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT")
 _MANAGED_CHILD_ENV = "SPECFORGE_MANAGED_LOCAL_CHILD"
+_FANOUT_CONSUMER_ENV = "SPECFORGE_FANOUT_CONSUMER_ID"
 _SECRET_NAMES = (
     "auth_token",
+    "capture_token",
     "password",
     "secret",
     "credential",
@@ -271,23 +275,34 @@ def _disaggregated_env(
         # Online feature objects are allocated by the external capture server.
         # SpecForge roles only read or publish references to those objects.
         values["DISAGG_CLIENT_SEGMENT_SIZE"] = "0"
-        values.update(
-            {
-                "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
-                "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
-                # SQLite/WAL stays on rank 0's local filesystem.  Inboxes are
-                # ordinary append-only channels and must remain visible to
-                # ranks on every trainer node.
-                "DISAGG_INBOX_DIR": str(
-                    (
-                        control_dir
-                        if cfg.deployment.trainer.nnodes > 1
-                        else consumer_state_dir
-                    )
-                    / "inboxes"
-                ),
-            }
-        )
+        if deployment.windowed_fanout is not None:
+            values.update(
+                {
+                    "DISAGG_WINDOW_REGISTRY": str(
+                        control_dir / "windowed-capture.sqlite"
+                    ),
+                    "DISAGG_CAPTURE_LIFECYCLE_DB": str(
+                        control_dir / "capture-lifecycle.sqlite"
+                    ),
+                }
+            )
+        else:
+            values.update(
+                {
+                    "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
+                    "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
+                    # SQLite/WAL stays on rank 0's local filesystem. Inboxes
+                    # must remain visible to ranks on every trainer node.
+                    "DISAGG_INBOX_DIR": str(
+                        (
+                            control_dir
+                            if cfg.deployment.trainer.nnodes > 1
+                            else consumer_state_dir
+                        )
+                        / "inboxes"
+                    ),
+                }
+            )
     else:
         values["DISAGG_MANIFEST"] = str(control_dir / "manifest.json")
         if deployment.backend == "mooncake":
@@ -318,6 +333,7 @@ def _disaggregated_env(
         "DISAGG_IDLE_TIMEOUT": deployment.idle_timeout_s,
         "DISAGG_PEER_WAIT_TIMEOUT": deployment.peer_wait_timeout_s,
         "DISAGG_PRODUCER_HOLD_S": deployment.producer_hold_s,
+        "SGLANG_SPEC_CAPTURE_TOKEN": base_env.get("SGLANG_SPEC_CAPTURE_TOKEN"),
     }
     for name, configured in optional_values.items():
         value = base_env.get(name, configured)
@@ -337,7 +353,9 @@ def _disaggregated_env(
     return values
 
 
-def _managed_local_environment(cfg: Config) -> dict[str, str]:
+def _managed_local_environment(
+    cfg: Config, *, capture_token: Optional[str] = None
+) -> dict[str, str]:
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
     managed = deployment.managed_local
@@ -356,6 +374,8 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
     }
     if mooncake.rdma_devices:
         values["MOONCAKE_RDMA_DEVICES"] = mooncake.rdma_devices
+    if capture_token is not None:
+        values["SGLANG_SPEC_CAPTURE_TOKEN"] = capture_token
     return values
 
 
@@ -363,6 +383,7 @@ def _managed_local_services(
     cfg: Config,
     *,
     algorithm: "AlgorithmRegistration",
+    shared_env: Optional[Mapping[str, str]] = None,
 ) -> tuple[ServiceSpec, ...]:
     from specforge.training.capture_contract import resolve_server_capture_contract
 
@@ -372,7 +393,12 @@ def _managed_local_services(
     mooncake = managed.mooncake
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
-    shared_env = _managed_local_environment(cfg)
+    shared_env = dict(shared_env or _managed_local_environment(cfg))
+    fanout = deployment.windowed_fanout
+    capture_max_sample_bytes = (
+        fanout.capture_max_sample_bytes if fanout is not None else 1 << 30
+    )
+    capture_lifecycle_db = control_dir / "capture-lifecycle.sqlite"
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
     )
@@ -436,6 +462,14 @@ def _managed_local_services(
                 "-1",
                 "--disable-radix-cache",
                 "--enable-spec-capture",
+                "--spec-capture-store-id",
+                deployment.store_id or cfg.run_id,
+                "--spec-capture-max-sample-bytes",
+                str(capture_max_sample_bytes),
+                "--spec-capture-inventory-db",
+                str(control_dir / f"capture-server-{index}-inventory.sqlite"),
+                "--spec-capture-lifecycle-db",
+                str(capture_lifecycle_db),
                 "--spec-capture-method",
                 contract.method,
                 "--spec-capture-aux-layer-ids",
@@ -490,16 +524,21 @@ def _worker_argv(
     config_path: str,
     role: Literal["all", "producer", "consumer"],
     overrides: Sequence[str],
+    *,
+    consumer_id: Optional[str] = None,
 ) -> list[str]:
-    return [
+    argv = [
         *command_prefix,
         "train",
         "--config",
         config_path,
         "--role",
         role,
-        *overrides,
     ]
+    if consumer_id is not None:
+        argv.extend(("--consumer-id", consumer_id))
+    argv.extend(overrides)
+    return argv
 
 
 def _trainer_command(
@@ -513,13 +552,20 @@ def _trainer_command(
     distributed_entry: Sequence[str],
     node_rank: Optional[int],
     env: Mapping[str, str],
+    consumer_id: Optional[str] = None,
 ) -> CommandSpec:
     topology = cfg.deployment.trainer
-    worker = _worker_argv(worker_prefix, config_path, role, overrides)
+    worker = _worker_argv(
+        worker_prefix,
+        config_path,
+        role,
+        overrides,
+        consumer_id=consumer_id,
+    )
     world_size = topology.nnodes * topology.nproc_per_node
     cfg.validate_world_size(world_size)
     if world_size == 1:
-        return CommandSpec(role, tuple(worker), env)
+        return CommandSpec(consumer_id or role, tuple(worker), env)
     if topology.nnodes == 1:
         launch = [
             *torchrun_prefix,
@@ -546,7 +592,67 @@ def _trainer_command(
             str(topology.nproc_per_node),
         ]
     worker_args = worker[len(worker_prefix) :]
-    return CommandSpec(role, tuple([*launch, *distributed_entry, *worker_args]), env)
+    return CommandSpec(
+        consumer_id or role,
+        tuple([*launch, *distributed_entry, *worker_args]),
+        env,
+    )
+
+
+def _fanout_consumer_env(
+    cfg: Config,
+    consumer_id: str,
+    base_env: Mapping[str, str],
+) -> dict[str, str]:
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.windowed_fanout is not None
+    fanout = deployment.windowed_fanout
+    consumer = fanout.consumer(consumer_id)
+    env = dict(base_env)
+    env[_FANOUT_CONSUMER_ENV] = consumer_id
+    state_root = Path(deployment.consumer_state_dir or deployment.control_dir)
+    env["DISAGG_DB"] = str(state_root / "consumers" / consumer_id / "consumer.sqlite")
+    if deployment.managed_local is not None:
+        index = [item.consumer_id for item in fanout.consumers].index(consumer_id)
+        device = deployment.managed_local.trainer_cuda_visible_devices[index]
+    else:
+        assert consumer.cuda_visible_device is not None
+        device = consumer.cuda_visible_device
+    env["CUDA_VISIBLE_DEVICES"] = device
+    return env
+
+
+def _validate_fanout_consumer_database(
+    cfg: Config,
+    consumer_id: str,
+    launch_env: Mapping[str, str],
+    *,
+    base_env: Mapping[str, str],
+    distributed: bool,
+    node_rank: Optional[int],
+) -> None:
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.windowed_fanout is not None
+    consumer = deployment.windowed_fanout.consumer(consumer_id)
+    database = launch_env["DISAGG_DB"]
+    state_owner = int(base_env["RANK"]) == 0 if distributed else node_rank in (None, 0)
+    if consumer.resume_from is not None:
+        if state_owner and not os.path.exists(database):
+            raise ValueError(
+                f"fanout consumer {consumer_id!r} resume requires retained "
+                f"metadata database: {database}"
+            )
+        return
+    stale = [
+        path
+        for path in (database, f"{database}-wal", f"{database}-shm")
+        if os.path.exists(path)
+    ]
+    if state_owner and stale:
+        raise ValueError(
+            f"fanout consumer {consumer_id!r} requires a fresh metadata path; "
+            f"found {stale}"
+        )
 
 
 def _validate_consumer_database(
@@ -564,8 +670,10 @@ def _validate_consumer_database(
         or role not in ("consumer", "both")
     ):
         return
-    database = launch_env.get("DISAGG_DB") or base_env.get("DISAGG_DB")
     deployment = cfg.deployment.disaggregated
+    if deployment is not None and deployment.windowed_fanout is not None:
+        return
+    database = launch_env.get("DISAGG_DB") or base_env.get("DISAGG_DB")
     if not database and deployment is not None:
         state_dir = deployment.consumer_state_dir or deployment.control_dir
         database = str(Path(state_dir) / "consumer.sqlite")
@@ -605,15 +713,37 @@ def _validate_capture_urls(
         return
     deployment = cfg.deployment.disaggregated
     if deployment is not None and deployment.managed_local is not None:
+        if (
+            deployment.windowed_fanout is not None
+            and len(deployment.managed_local.capture_servers) != 1
+        ):
+            raise ValueError(
+                "windowed_fanout currently requires exactly one capture server"
+            )
         return
-    if deployment is not None and deployment.server_urls:
-        return
-    if base_env.get("DISAGG_SERVER_URLS") or base_env.get("DISAGG_SERVER_URL"):
-        return
-    raise ValueError(
-        "online disaggregated producer requires server URLs in "
-        "deployment.disaggregated.server_urls or DISAGG_SERVER_URL(S)"
-    )
+    urls = list(deployment.server_urls) if deployment is not None else []
+    if not urls:
+        raw_urls = base_env.get("DISAGG_SERVER_URLS") or base_env.get(
+            "DISAGG_SERVER_URL"
+        )
+        urls = (
+            [item.strip() for item in raw_urls.split(",") if item.strip()]
+            if raw_urls
+            else []
+        )
+    if not urls:
+        raise ValueError(
+            "online disaggregated producer requires server URLs in "
+            "deployment.disaggregated.server_urls or DISAGG_SERVER_URL(S)"
+        )
+    if (
+        deployment is not None
+        and deployment.windowed_fanout is not None
+        and len(urls) != 1
+    ):
+        raise ValueError(
+            "windowed_fanout currently requires exactly one capture server"
+        )
 
 
 def build_launch_plan(
@@ -623,6 +753,7 @@ def build_launch_plan(
     config_path: str,
     overrides: Sequence[str] = (),
     requested_role: LaunchRole = "auto",
+    consumer_id: Optional[str] = None,
     node_rank: Optional[int] = None,
     env: Optional[Mapping[str, str]] = None,
     worker_prefix: Optional[Sequence[str]] = None,
@@ -643,6 +774,7 @@ def build_launch_plan(
     distributed = _distributed_state(base_env)
     deployment = cfg.deployment.disaggregated
     managed_local = deployment.managed_local if deployment is not None else None
+    fanout = deployment.windowed_fanout if deployment is not None else None
     if managed_local is not None and algorithm is None:
         raise ValueError(
             "managed_local launch planning requires a resolved algorithm registration"
@@ -675,6 +807,22 @@ def build_launch_plan(
                     f"exists: {deployment.control_dir}"
                 )
     role = _resolve_role(cfg, requested_role, distributed=distributed)
+    selected_consumer_id: Optional[str] = None
+    if fanout is None:
+        if consumer_id is not None:
+            raise ValueError("--consumer-id requires windowed_fanout")
+    elif role == "consumer":
+        if consumer_id is None:
+            if len(fanout.consumers) != 1:
+                raise ValueError(
+                    "--role consumer requires --consumer-id when windowed_fanout "
+                    "defines multiple consumers"
+                )
+            consumer_id = fanout.consumers[0].consumer_id
+        fanout.consumer(consumer_id)
+        selected_consumer_id = consumer_id
+    elif consumer_id is not None:
+        raise ValueError("--consumer-id is valid only with --role consumer")
     topology = cfg.deployment.trainer
     if role == "both" and topology.nnodes > 1:
         raise ValueError(
@@ -688,25 +836,52 @@ def build_launch_plan(
     )
     producer_env: dict[str, str] = {}
     consumer_env: dict[str, str] = {}
+    fanout_consumer_envs: dict[str, dict[str, str]] = {}
+    managed_environment: dict[str, str] = {}
     if cfg.deployment.mode == "disaggregated":
         role_base_env = base_env
-        managed_environment: dict[str, str] = {}
         if managed_local is not None:
-            managed_environment = _managed_local_environment(cfg)
+            capture_token = base_env.get("SGLANG_SPEC_CAPTURE_TOKEN")
+            if capture_token is None:
+                if managed_child:
+                    raise ValueError(
+                        "managed_local child is missing SGLANG_SPEC_CAPTURE_TOKEN"
+                    )
+                capture_token = secrets.token_urlsafe(32)
+            managed_environment = _managed_local_environment(
+                cfg, capture_token=capture_token
+            )
             role_base_env = {**base_env, **managed_environment}
         if role in ("producer", "both"):
             producer_env = _disaggregated_env(cfg, role_base_env, role="producer")
         if role in ("consumer", "both"):
-            consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
+            base_consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
         if managed_local is not None:
             producer_env.update(managed_environment)
             producer_env["CUDA_VISIBLE_DEVICES"] = ""
             producer_env[_MANAGED_CHILD_ENV] = "1"
-            consumer_env.update(managed_environment)
-            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
-                managed_local.trainer_cuda_visible_devices
-            )
-            consumer_env[_MANAGED_CHILD_ENV] = "1"
+            if role in ("consumer", "both"):
+                base_consumer_env.update(managed_environment)
+                base_consumer_env[_MANAGED_CHILD_ENV] = "1"
+        if role in ("consumer", "both"):
+            if fanout is None:
+                consumer_env = base_consumer_env
+                if managed_local is not None:
+                    consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+                        managed_local.trainer_cuda_visible_devices
+                    )
+            else:
+                ids = (
+                    [selected_consumer_id]
+                    if selected_consumer_id is not None
+                    else [consumer.consumer_id for consumer in fanout.consumers]
+                )
+                fanout_consumer_envs = {
+                    item: _fanout_consumer_env(cfg, item, base_consumer_env)
+                    for item in ids
+                }
+                if selected_consumer_id is not None:
+                    consumer_env = fanout_consumer_envs[selected_consumer_id]
 
     _validate_capture_urls(cfg, role=role, base_env=base_env)
     _validate_consumer_database(
@@ -717,6 +892,15 @@ def build_launch_plan(
         distributed=distributed,
         node_rank=resolved_rank,
     )
+    for item, item_env in fanout_consumer_envs.items():
+        _validate_fanout_consumer_database(
+            cfg,
+            item,
+            item_env,
+            base_env=base_env,
+            distributed=distributed,
+            node_rank=resolved_rank,
+        )
     if distributed:
         assert role != "both"
         if role == "producer" and int(base_env["WORLD_SIZE"]) > 1:
@@ -759,6 +943,7 @@ def build_launch_plan(
             distributed_entry=distributed_entry,
             node_rank=resolved_rank,
             env=consumer_env,
+            consumer_id=selected_consumer_id,
         )
         if command.argv[: len(worker_prefix)] == worker_prefix:
             return LaunchPlan("worker", role, worker_env=consumer_env)
@@ -776,6 +961,49 @@ def build_launch_plan(
         tuple(_worker_argv(worker_prefix, config_path, "producer", overrides)),
         producer_env,
     )
+    if fanout is not None:
+        consumers = tuple(
+            _trainer_command(
+                cfg,
+                config_path=config_path,
+                role="consumer",
+                overrides=overrides,
+                worker_prefix=worker_prefix,
+                torchrun_prefix=torchrun_prefix,
+                distributed_entry=distributed_entry,
+                node_rank=resolved_rank,
+                env=fanout_consumer_envs[item.consumer_id],
+                consumer_id=item.consumer_id,
+            )
+            for item in fanout.consumers
+        )
+        commands = (*consumers, producer)
+        if managed_local is not None:
+            return LaunchPlan(
+                "managed_supervisor",
+                "both",
+                commands=commands,
+                services=_managed_local_services(
+                    cfg,
+                    algorithm=algorithm,
+                    shared_env=managed_environment,
+                ),
+                managed_root=deployment.control_dir,
+                managed_ports=(
+                    managed_local.mooncake.rpc_port,
+                    managed_local.mooncake.metadata_port,
+                    managed_local.mooncake.metrics_port,
+                    *[server.port for server in managed_local.capture_servers],
+                ),
+                shutdown_grace_s=managed_local.shutdown_grace_s,
+            )
+        return LaunchPlan(
+            "supervisor",
+            "both",
+            commands=commands,
+            shutdown_grace_s=deployment.shutdown_grace_s,
+        )
+
     consumer = _trainer_command(
         cfg,
         config_path=config_path,
@@ -792,7 +1020,9 @@ def build_launch_plan(
             "managed_supervisor",
             "both",
             commands=(producer, consumer),
-            services=_managed_local_services(cfg, algorithm=algorithm),
+            services=_managed_local_services(
+                cfg, algorithm=algorithm, shared_env=managed_environment
+            ),
             managed_root=deployment.control_dir,
             managed_ports=(
                 managed_local.mooncake.rpc_port,
@@ -912,7 +1142,10 @@ def _managed_preflight(plan: LaunchPlan) -> None:
 
 def _http_ready(readiness: ReadinessSpec) -> bool:
     try:
-        with urllib_request.urlopen(readiness.url, timeout=1.0) as response:
+        with urllib_request.urlopen(
+            readiness.url,
+            timeout=min(_HTTP_READINESS_PROBE_TIMEOUT_S, readiness.timeout_s),
+        ) as response:
             status = getattr(response, "status", 200)
             return readiness.kind == "mooncake" or 200 <= status < 300
     except urllib_error.HTTPError as exc:

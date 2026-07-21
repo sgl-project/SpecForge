@@ -146,7 +146,9 @@ def _train(resolved) -> int:
         destroy_distributed()
 
 
-def _config_for_role(cfg: Config, role: str) -> Config:
+def _config_for_role(
+    cfg: Config, role: str, consumer_id: Optional[str] = None
+) -> Config:
     """Resolve a launch role without changing the persisted run config.
 
     A shared disaggregated config may contain trainer-only state used by the
@@ -156,11 +158,43 @@ def _config_for_role(cfg: Config, role: str) -> Config:
     raw = cfg.model_dump()
     raw["training"]["role"] = role
     disaggregated = raw["deployment"].get("disaggregated")
+    fanout = disaggregated.get("windowed_fanout") if disaggregated else None
+    managed_local = disaggregated.get("managed_local") if disaggregated else None
+    if fanout is not None and managed_local is not None:
+        devices = managed_local["trainer_cuda_visible_devices"]
+        for consumer, device in zip(fanout["consumers"], devices):
+            consumer["cuda_visible_device"] = device
     if disaggregated is not None and disaggregated.get("managed_local") is not None:
         # This field describes services owned by the parent supervisor.  A role
         # child consumes the already-derived environment and must not attempt to
         # validate or own that stack again.
         disaggregated["managed_local"] = None
+    if role == "consumer" and fanout is not None:
+        consumer_id = consumer_id or os.environ.get("SPECFORGE_FANOUT_CONSUMER_ID")
+        matches = [
+            consumer
+            for consumer in fanout["consumers"]
+            if consumer["consumer_id"] == consumer_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"unknown or missing windowed fanout consumer {consumer_id!r}"
+            )
+        consumer = matches[0]
+        raw["training"].update(
+            {
+                "seed": consumer["seed"],
+                "loss_type": consumer["loss_type"],
+                "loss_decay_gamma": consumer["loss_decay_gamma"],
+                "dpace_alpha": consumer["dpace_alpha"],
+                "num_anchors": consumer["num_anchors"],
+                "learning_rate": consumer["learning_rate"],
+                "warmup_ratio": consumer["warmup_ratio"],
+            }
+        )
+        if consumer["draft_block_size"] is not None:
+            raw["model"]["draft_block_size"] = consumer["draft_block_size"]
+        raw["output_dir"] = os.path.join(raw["output_dir"], consumer_id)
     if role == "producer":
         raw["profiling"]["enabled"] = False
     return Config.model_validate(raw)
@@ -185,6 +219,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=int,
         default=None,
         help="node-local rank for an explicit multi-node trainer launch",
+    )
+    train.add_argument(
+        "--consumer-id",
+        default=None,
+        help="select one independent consumer from windowed_fanout",
     )
     train.add_argument(
         "--plan",
@@ -224,6 +263,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             config_path=args.config,
             overrides=args.overrides,
             requested_role=args.role,
+            consumer_id=args.consumer_id,
             node_rank=args.node_rank,
         )
         if args.plan:
@@ -231,7 +271,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         if plan.kind == "worker":
             os.environ.update(plan.worker_env)
-            role_config = _config_for_role(resolved.config, plan.role)
+            role_config = _config_for_role(resolved.config, plan.role, args.consumer_id)
             try:
                 with _worker_signal_unwind():
                     _train(bind_run(role_config, resolved.algorithm))

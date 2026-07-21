@@ -247,11 +247,14 @@ CANONICAL_LAUNCH_EXPORTS = {
     "build_disagg_offline_runtime",
     "build_disagg_online_consumer",
     "build_disagg_online_producer",
+    "build_disagg_online_windowed_consumer",
+    "build_disagg_online_windowed_producer",
     "build_offline_runtime",
 }
 
 DRAFT_MODEL_BUILDERS = CANONICAL_LAUNCH_EXPORTS - {
     "build_disagg_online_producer",
+    "build_disagg_online_windowed_producer",
 }
 
 CANONICAL_DRAFT_CONFIGS = {
@@ -519,7 +522,7 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertIsInstance(assembler_returns[0].value, ast.Name)
         self.assertEqual("trainer", assembler_returns[0].value.id)
 
-        trainer_builders = CANONICAL_LAUNCH_EXPORTS - {"build_disagg_online_producer"}
+        trainer_builders = DRAFT_MODEL_BUILDERS
         for name in trainer_builders:
             returns = [
                 node

@@ -8,25 +8,27 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Server-side spec-capture rollout source (zero-copy Mooncake transport).
 
-An external SGLang server patched with
-``patches/sglang/v0.5.14/spec-capture.patch`` runs
+The *server* transport (vs the in-process ``PolicyFeatureAdapter``): a live
+SGLang server patched with ``patches/sglang/v0.5.14/spec-capture.patch`` runs
 the prefill and writes captured features straight into Mooncake in
 :class:`MooncakeFeatureStore`'s key layout. Tensors never pass through this
 process — the ``/generate`` response's ``meta_info["spec_capture"]`` carries
 only key/shape/dtype, from which :meth:`SGLangServerCaptureAdapter.produce_refs`
 builds committed-ready ``SampleRef``s.
 
-The server knows only generic artifacts (``aux`` = capture layers
-concatenated, ``last_hidden`` = post-norm final hidden) plus passthrough
-tensors.  The application composition root injects an algorithm-owned
-:class:`ServerCaptureSchema`; this transport never resolves an algorithm name.
+The server knows only generic artifacts (``aux`` = capture layers concatenated,
+``last_hidden`` = post-norm final hidden) plus passthrough tensors. The
+application composition root injects the algorithm-owned
+:class:`ServerCaptureSchema`; this transport does not resolve algorithms.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from specforge.inference.capture import (
     CaptureConfig,
@@ -120,7 +122,8 @@ class SGLangServerCaptureAdapter:
 
     ``store`` must be the run's :class:`MooncakeFeatureStore` (its ``store_id``
     namespaces the keys and ``adopt()`` registers each ref so a later
-    ``abort()``/``gc()`` on the producer side can free server-written objects).
+    generation-aware ``reclaim()``/``gc()`` on the producer side can free
+    server-written objects).
     ``post_fn`` is injectable for tests.
     """
 
@@ -136,10 +139,12 @@ class SGLangServerCaptureAdapter:
         timeout_s: float = 300.0,
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
+        capture_token: Optional[str] = None,
     ) -> None:
         required_store_api = (
             "adopt",
             "discard_external_attempts",
+            "reclaim",
             "store_id",
             "track_external_attempt",
         )
@@ -150,6 +155,11 @@ class SGLangServerCaptureAdapter:
             raise TypeError(
                 "SGLangServerCaptureAdapter needs a MooncakeFeatureStore-like "
                 f"store; missing {missing_store_api}"
+            )
+        if run_id != store.store_id:
+            raise ValueError(
+                "server capture requires run_id == store.store_id; got "
+                f"{run_id!r} != {store.store_id!r}"
             )
         self.base_url = base_url.rstrip("/")
         self.store = store
@@ -170,14 +180,26 @@ class SGLangServerCaptureAdapter:
         self.timeout_s = timeout_s
         self.post_fn = post_fn or _default_post
         self.target_model_version = target_model_version
+        self.capture_token = capture_token or os.environ.get(
+            "SGLANG_SPEC_CAPTURE_TOKEN"
+        )
+        if not self.capture_token:
+            raise ValueError(
+                "server capture requires capture_token or SGLANG_SPEC_CAPTURE_TOKEN"
+            )
         self._healthy = True
+        self._rpc_calls = 0
+        self._rpc_tasks = 0
+        self._rpc_time_s = 0.0
+        self._rpc_failures = 0
+        self._result_failures = 0
 
     # -- request construction -------------------------------------------------
     def _sample_id(self, task: PromptTask) -> str:
         return f"{self.run_id}:{task.task_id}"
 
     def _request_inputs(self, tasks: List[PromptTask]) -> Dict[str, Any]:
-        """Build only model-input fields, keeping transport keys runtime-owned."""
+        """Build model inputs while keeping transport fields runtime-owned."""
 
         if self.request_input_adapter is None:
             return {"input_ids": [list(task.payload["input_ids"]) for task in tasks]}
@@ -186,8 +208,7 @@ class SGLangServerCaptureAdapter:
             raise TypeError(
                 "ServerInputAdapter.build_request_inputs must return a mapping"
             )
-        reserved = {"sampling_params", "spec_capture"}
-        conflicts = sorted(reserved & set(request_inputs))
+        conflicts = sorted({"sampling_params", "spec_capture"} & set(request_inputs))
         if conflicts:
             raise ValueError(
                 "ServerInputAdapter cannot set runtime-owned request fields: "
@@ -202,6 +223,16 @@ class SGLangServerCaptureAdapter:
     def _spec_capture_payload(self, task: PromptTask) -> Dict[str, Any]:
         input_ids = list(task.payload["input_ids"])
         length = len(input_ids)
+        generation = task.metadata.get("capture_generation", 1)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or not 1 <= generation <= 2**31 - 1
+        ):
+            raise ValueError(
+                f"task {task.task_id}: capture_generation must be an integer "
+                "in [1, 2**31 - 1]"
+            )
         features: Dict[str, str] = {}
         if self.schema.aux_feature is not None:
             features["aux"] = self.schema.aux_feature
@@ -241,15 +272,14 @@ class SGLangServerCaptureAdapter:
                 }
             )
         return {
+            "auth_token": self.capture_token,
             "store_id": self.store.store_id,
             "sample_id": self._sample_id(task),
-            # A task id is unique within a run, and retries happen only before
-            # its ref is committed.  Keep the generation stable so a response
-            # lost after the server write cannot strand gN when the retry writes
-            # gN+1.  The server patch replaces these deterministic keys on a
-            # retry (``replace``), bounding the attempt to one namespace.
-            "gen": 1,
-            "replace": int(task.attempt) > 0,
+            # Ordinary response-loss retries keep g1. Windowed recapture supplies
+            # its durable registry generation so a cleaned sample gets a fresh
+            # physical namespace instead of attempting to resurrect g1.
+            "gen": generation,
+            "replace": int(task.attempt) > 0 or generation > 1,
             "features": features,
             "passthrough": passthrough,
         }
@@ -266,8 +296,21 @@ class SGLangServerCaptureAdapter:
         specs: Dict[str, FeatureSpec] = {}
         nbytes = 0
         for name, meta in feats.items():
-            shape = tuple(int(d) for d in meta["shape"])
-            dtype = str(meta["dtype"])
+            if not isinstance(meta, dict):
+                raise TypeError(f"feature {name!r} metadata must be an object")
+            raw_shape = meta["shape"]
+            if not isinstance(raw_shape, (list, tuple)):
+                raise TypeError(f"feature {name!r} shape must be a list or tuple")
+            if not raw_shape:
+                raise ValueError(f"feature {name!r} shape must not be empty")
+            if any(type(d) is not int or d <= 0 for d in raw_shape):
+                raise ValueError(
+                    f"feature {name!r} shape must contain positive integers"
+                )
+            shape = tuple(raw_shape)
+            dtype = meta["dtype"]
+            if not isinstance(dtype, str) or dtype not in _DTYPE_BYTES:
+                raise ValueError(f"feature {name!r} has unsupported dtype {dtype!r}")
             extra: Dict[str, Any] = {}
             if name == self.schema.last_hidden_feature:
                 extra["target_repr"] = capture.target_repr
@@ -305,6 +348,46 @@ class SGLangServerCaptureAdapter:
             },
         )
 
+    def _cleanup_ref(
+        self,
+        task: PromptTask,
+        *,
+        sample_id: str,
+        store_id: str,
+        gen: int,
+        feature_names: Iterable[str],
+    ) -> "SampleRef":  # noqa: F821
+        """Build an exact-generation ref without trusting response tensor metadata."""
+        from specforge.runtime.contracts import SampleRef
+
+        names = tuple(sorted(feature_names))
+        return SampleRef(
+            sample_id=sample_id,
+            run_id=self.run_id,
+            source_task_id=task.task_id,
+            feature_store_uri=f"mooncake://{store_id}/{sample_id}",
+            feature_keys={name: f"{sample_id}/{name}" for name in names},
+            feature_specs={},
+            strategy=self.strategy,
+            schema_version=SCHEMA_VERSION,
+            target_model_version=self.target_model_version,
+            tokenizer_version=str(task.metadata.get("tokenizer_version", "unknown")),
+            num_tokens=0,
+            estimated_bytes=0,
+            metadata={"generation": gen},
+        )
+
+    @staticmethod
+    def _aux_layer_ids_from_result(
+        result: Dict[str, Any],
+    ) -> Optional[Tuple[int, ...]]:
+        raw = result.get("aux_layer_ids")
+        if raw is None:
+            return None
+        if not isinstance(raw, (list, tuple)) or any(type(v) is not int for v in raw):
+            raise ValueError("aux_layer_ids must be a list of integers")
+        return tuple(raw)
+
     # -- the RefSource entry point ----------------------------------------------
     def produce_refs(
         self, tasks: List[PromptTask], *, capture: CaptureConfig
@@ -330,9 +413,18 @@ class SGLangServerCaptureAdapter:
                 generation=int(payload["gen"]),
                 feature_names=feature_names,
             )
-        rows = self.post_fn(
-            f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
-        )
+        self._rpc_calls += 1
+        self._rpc_tasks += len(tasks)
+        rpc_started = time.perf_counter()
+        try:
+            rows = self.post_fn(
+                f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
+            )
+        except BaseException:
+            self._rpc_failures += 1
+            raise
+        finally:
+            self._rpc_time_s += time.perf_counter() - rpc_started
         rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):
             raise RuntimeError(
@@ -340,8 +432,8 @@ class SGLangServerCaptureAdapter:
                 f"{len(tasks)} tasks"
             )
         out: List[Union[Any, ServerCaptureFailure]] = []
-        successful_refs = []
-        for task, row in zip(tasks, rows):
+        successful_refs: List["SampleRef"] = []  # noqa: F821
+        for task, request_spec, row in zip(tasks, capture_payloads, rows):
             if not isinstance(row, dict):
                 raise RuntimeError(
                     "spec-capture server returned a non-object row for task "
@@ -355,45 +447,81 @@ class SGLangServerCaptureAdapter:
                 task_id=task.task_id,
                 expected_sample_id=self._sample_id(task),
             )
+            expected_identity = {
+                "sample_id": self._sample_id(task),
+                "store_id": str(self.store.store_id),
+                "gen": int(request_spec["gen"]),
+            }
+            expected_features = set(request_spec["features"].values()) | {
+                item["name"] for item in request_spec["passthrough"]
+            }
+            cleanup_ref = self._cleanup_ref(
+                task,
+                sample_id=expected_identity["sample_id"],
+                store_id=expected_identity["store_id"],
+                gen=expected_identity["gen"],
+                feature_names=expected_features,
+            )
+
+            def reject(reason: str, *, retryable: bool) -> ServerCaptureFailure:
+                if not retryable:
+                    self.store.adopt(cleanup_ref)
+                    self.store.reclaim(cleanup_ref, reason=reason)
+                return ServerCaptureFailure(
+                    task_id=task.task_id,
+                    reason=f"server_capture:{reason}",
+                    retryable=retryable,
+                )
+
             if not result:
                 out.append(
-                    ServerCaptureFailure(
-                        task_id=task.task_id,
-                        reason=(
-                            "server_capture: response carries no spec_capture "
-                            "result — is the server patched and launched with "
-                            "--enable-spec-capture?"
-                        ),
+                    reject(
+                        "response carries no spec_capture result; is the server "
+                        "patched and launched with --enable-spec-capture?",
                         retryable=False,
                     )
                 )
                 continue
             if result.get("error"):
-                out.append(
-                    ServerCaptureFailure(
-                        task_id=task.task_id,
-                        reason=f"server_capture:{result['error']}",
-                        retryable=True,
-                    )
-                )
+                out.append(reject(str(result["error"]), retryable=True))
                 continue
-            expected_identity = {
-                "sample_id": self._sample_id(task),
-                "store_id": str(self.store.store_id),
-                "gen": 1,
-            }
-            actual_identity = {
-                "sample_id": str(result.get("sample_id")),
-                "store_id": str(result.get("store_id")),
-                "gen": int(result.get("gen", -1)),
-            }
+            try:
+                actual_identity = {
+                    "sample_id": str(result.get("sample_id")),
+                    "store_id": str(result.get("store_id")),
+                    "gen": int(result.get("gen", -1)),
+                }
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "spec-capture server returned malformed object identity for "
+                    f"task {task.task_id}: {exc}"
+                ) from exc
             if actual_identity != expected_identity:
                 raise RuntimeError(
                     "spec-capture server returned the wrong object identity for "
                     f"task {task.task_id}: {actual_identity} != "
                     f"{expected_identity}"
                 )
-            ref = self._ref_from_result(task, result, capture)
+            features = result.get("features")
+            actual_features = set(features) if isinstance(features, dict) else set()
+            if actual_features != expected_features:
+                out.append(
+                    reject(
+                        "response feature set mismatch "
+                        f"expected={sorted(expected_features)}, "
+                        f"actual={sorted(actual_features)}",
+                        retryable=False,
+                    )
+                )
+                continue
+            try:
+                ref = self._ref_from_result(task, result, capture)
+                recorded_aux_layer_ids = self._aux_layer_ids_from_result(result)
+            except (KeyError, TypeError, ValueError) as exc:
+                out.append(
+                    reject(f"malformed feature metadata: {exc}", retryable=False)
+                )
+                continue
             # A capture shorter than the prompt is corrupt (classic cause: a
             # radix-cache prefix hit skips prefilling — and capturing — the
             # cached tokens; the patched scheduler refuses that config).
@@ -404,22 +532,16 @@ class SGLangServerCaptureAdapter:
                 if len(spec.shape) >= 2 and spec.shape[1] != expected_len
             }
             if short:
-                self.store.adopt(ref)
-                self.store.abort(ref.sample_id, reason="seq-len-mismatch")
                 out.append(
-                    ServerCaptureFailure(
-                        task_id=task.task_id,
-                        reason=(
-                            f"server_capture: captured seq len != prompt len "
-                            f"{expected_len} for {short} — was the server "
-                            f"started without --disable-radix-cache?"
-                        ),
+                    reject(
+                        f"captured seq len != prompt len {expected_len} for "
+                        f"{short}; was the server started without "
+                        "--disable-radix-cache?",
                         retryable=False,
                     )
                 )
                 continue
             try:
-                recorded_aux_layer_ids = result.get("aux_layer_ids")
                 if (
                     capture.aux_hidden_state_layer_ids
                     and recorded_aux_layer_ids is None
@@ -433,24 +555,14 @@ class SGLangServerCaptureAdapter:
                     ref.feature_specs,
                     capture,
                     sample_id=ref.sample_id,
-                    recorded_aux_layer_ids=(
-                        tuple(recorded_aux_layer_ids)
-                        if recorded_aux_layer_ids is not None
-                        else None
-                    ),
+                    recorded_aux_layer_ids=recorded_aux_layer_ids,
                     aux_feature_name=self.schema.aux_feature or "hidden_state",
                     target_feature_name=self.schema.last_hidden_feature or "target",
                 )
             except CaptureMismatchError as exc:
                 # Loud boundary failure; free the server-written keys so a
                 # mismatched sample is never consumable.
-                self.store.adopt(ref)
-                self.store.abort(ref.sample_id, reason=f"contract:{exc}")
-                out.append(
-                    ServerCaptureFailure(
-                        task_id=task.task_id, reason=str(exc), retryable=False
-                    )
-                )
+                out.append(reject(f"capture contract mismatch: {exc}", retryable=False))
                 continue
             # Do not transfer a successful row out of provisional ownership
             # until every row in the response has passed structural and
@@ -461,14 +573,27 @@ class SGLangServerCaptureAdapter:
             out.append(ref)
         for ref in successful_refs:
             self.store.adopt(ref)
+        self._result_failures += sum(
+            isinstance(result, ServerCaptureFailure) for result in out
+        )
         return out
 
     def health(self) -> Dict[str, Any]:
+        mean_batch_size = self._rpc_tasks / self._rpc_calls if self._rpc_calls else 0.0
         return {
             "healthy": self._healthy,
             "backend": "sglang_server_capture",
             "base_url": self.base_url,
             "strategy": self.strategy,
+            "rpc_calls": self._rpc_calls,
+            "rpc_tasks": self._rpc_tasks,
+            "rpc_time_s": self._rpc_time_s,
+            "rpc_failures": self._rpc_failures,
+            "result_failures": self._result_failures,
+            "mean_batch_size": mean_batch_size,
+            "tasks_per_rpc_second": (
+                self._rpc_tasks / self._rpc_time_s if self._rpc_time_s else 0.0
+            ),
         }
 
 

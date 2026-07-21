@@ -78,6 +78,7 @@ class SharedDirFeatureStore(FeatureStore):
         credential: Optional[str] = None,
         max_hold_age_s: Optional[float] = None,
         retain_on_release: bool = False,
+        lifetime_owner: bool = True,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.auth = auth or AuthPolicy()
@@ -92,6 +93,9 @@ class SharedDirFeatureStore(FeatureStore):
         # LocalFeatureStore's file:// no-op release). Cleanup is whole-store at run
         # end; consume-once free (retain_on_release=False) is for online rollout.
         self.retain_on_release = retain_on_release
+        # Independent fan-out readers release only their local leases. The
+        # producer is the sole owner allowed to reclaim shared payload files.
+        self.lifetime_owner = lifetime_owner
         self._clock = clock
         # in-process liveness index (generation / put-time / active leases)
         self._generation: Dict[str, int] = {}
@@ -239,6 +243,8 @@ class SharedDirFeatureStore(FeatureStore):
         # never delete the freshly re-put current generation (different filename).
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
+            if not self.lifetime_owner:
+                return
             if self.retain_on_release:
                 return  # offline re-iterable set: keep the file for the next epoch
             sid, gen = handle.sample_id, handle.generation
@@ -251,10 +257,40 @@ class SharedDirFeatureStore(FeatureStore):
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:
+            if not self.lifetime_owner:
+                self._active_leases = {
+                    token: handle
+                    for token, handle in self._active_leases.items()
+                    if handle.sample_id != sample_id
+                }
+                return
             for gen in self._disk_gens(sample_id):
                 self._free_gen_locked(sample_id, gen)
             self._generation.pop(sample_id, None)
             self._put_time.pop(sample_id, None)
+
+    def reclaim(self, sample_ref: SampleRef, *, reason: str = "consumed") -> None:
+        """Free only the generation named by a globally consumed fan-out ref."""
+        gen = sample_ref.metadata.get("generation")
+        if gen is None:
+            raise ValueError(
+                f"cannot reclaim {sample_ref.sample_id}: ref carries no generation"
+            )
+        gen = int(gen)
+        with self._lock:
+            if not self.lifetime_owner:
+                raise RuntimeError(
+                    "only the shared-directory lifetime owner may reclaim"
+                )
+            if any(
+                handle.sample_id == sample_ref.sample_id and handle.generation == gen
+                for handle in self._active_leases.values()
+            ):
+                raise RuntimeError(
+                    f"cannot reclaim leased sample {sample_ref.sample_id} "
+                    f"generation {gen}"
+                )
+            self._free_gen_locked(sample_ref.sample_id, gen)
 
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         # Max-hold force-free tracks puts made by this process. Other processes
@@ -262,6 +298,12 @@ class SharedDirFeatureStore(FeatureStore):
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:
+            if not self.lifetime_owner:
+                return {
+                    "force_freed": 0,
+                    "force_freed_bytes": 0,
+                    "release_pending": 0,
+                }
             if self.max_hold_age_s is not None:
                 stale = [
                     sid
@@ -313,6 +355,7 @@ class SharedDirFeatureStore(FeatureStore):
             "active_leases": active_leases,
             "resident_bytes": resident_bytes,
             "auth_required": self.auth.required,
+            "lifetime_owner": self.lifetime_owner,
             "oldest_age_s": max(ages) if ages else 0.0,
             "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,
             "force_freed_total": force_freed,

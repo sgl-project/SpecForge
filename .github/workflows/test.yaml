@@ -67,7 +67,8 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
-          bash scripts/apply_sglang_spec_capture_patch.sh
+          bash scripts/apply_sglang_spec_capture_patch.sh \
+            --python "$PWD/sf/bin/python" --apply
           python -c 'import importlib.util, shutil, torch; assert torch.cuda.is_available(), "live capture gate requires CUDA"; assert importlib.util.find_spec("mooncake.store"), "live capture gate requires mooncake.store"; assert shutil.which("mooncake_master") or __import__("os").environ.get("MOONCAKE_MASTER_SERVER_ADDR"), "live capture gate requires mooncake_master"'
           python -m unittest tests.test_runtime.test_server_capture_gate -v
 

@@ -2,12 +2,15 @@
 
 SpecForge has one public training entry point, `specforge train`. A typed run
 configuration selects an algorithm and a topology; it does not select a second
-trainer. The launch layer exposes exactly four topology builders:
+trainer. The launch layer exposes canonical builders for fixed-stream and
+windowed-stream roles:
 
 - `build_offline_runtime`
 - `build_disagg_offline_runtime`
 - `build_disagg_online_producer`
 - `build_disagg_online_consumer`
+- `build_disagg_online_windowed_producer`
+- `build_disagg_online_windowed_consumer`
 
 All trainer-bearing builders converge on the same
 `Trainer -> FeatureDataLoader -> TrainerController -> TrainerCore` path. Only
@@ -20,11 +23,16 @@ the reference source and feature-store backend change.
 | Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
 | Disaggregated offline | `CONFIG=path/to/offline-disagg.yaml run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
 | Online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
+| Online independent fanout | One producer serves demand from independently scheduled consumers | Per-consumer `WindowedCaptureQueue` | Mooncake with a bounded SQLite capture registry | One fixed prompt pass; consumers may differ and advance independently; compatible live captures are shared |
 
 `training.num_epochs` on an online run controls how many prompt passes the
 producer creates. Each pass receives new task and sample ids. The consumer
 still iterates one consume-once stream exactly once; it never replays a prior
 stream as a second trainer epoch.
+
+Windowed fanout is stricter: it requires exactly one prompt pass and a fixed
+`data.max_prompts` inventory so every independent consumer has the same stable
+source index space.
 
 ## Cross-plane contracts
 
@@ -113,6 +121,38 @@ tracking when required, their feature-store objects are aborted, and the source
 counter is settled. Every inbox then closes normally after the aligned prefix;
 an actual cleanup failure still poisons the inboxes. A partial global optimizer
 step is never dispatched.
+
+## Independent windowed fanout
+
+Windowed fanout is not a data-parallel consumer. `launch_plan` starts one
+producer command and one single-process `specforge train` command per consumer.
+Every consumer uses the normal model, optimizer, loader, controller, and trainer
+assembly, but has its own cursor, checkpoint, output directory, and projected
+training parameters.
+
+```mermaid
+flowchart LR
+  P[producer] --> R[(SQLite window registry)]
+  R --> S[patched SGLang capture]
+  S --> M[Mooncake payloads]
+  R --> Q1[consumer A queue]
+  R --> Q2[consumer B queue]
+  R --> Q3[consumer C queue]
+  M -.-> Q1
+  M -.-> Q2
+  M -.-> Q3
+  Q1 --> T1[canonical trainer A]
+  Q2 --> T2[canonical trainer B]
+  Q3 --> T3[canonical trainer C]
+```
+
+Consumers register and begin heartbeats before expensive model construction.
+Moving a cursor updates its legal lookbehind/lookahead interests and schedules
+bounded prefetch. Demand, active capture, and read leases are hard interests;
+window-only entries may be reclaimed under slot or byte pressure and recaptured
+later with a new generation. The producer owns Mooncake lifetime cleanup, while
+consumer stores are non-owners. One consumer failure releases only its interests;
+the remaining consumers continue independently.
 
 The terminal tail remains committed-but-unacknowledged in the attempt's
 metadata ledger even though its feature objects are removed. A successfully

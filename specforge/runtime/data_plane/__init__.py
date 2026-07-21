@@ -21,6 +21,16 @@ __all__ = [
     "SharedDirFeatureStore",
     "MooncakeFeatureStore",
     "AuthPolicy",
+    "CaptureFailedError",
+    "CapturePriority",
+    "CaptureReadLease",
+    "CaptureRequest",
+    "SQLiteWindowedCaptureRegistry",
+    "WindowedCaptureQueue",
+    "capture_contract_digest",
+    "WindowedCaptureService",
+    "WindowedConsumerControl",
+    "start_windowed_consumer_control",
 ]
 
 _EXPORT_MODULE = {
@@ -37,6 +47,16 @@ _EXPORT_MODULE = {
     "SharedDirFeatureStore": "disaggregated",
     "MooncakeFeatureStore": "mooncake_store",
     "AuthPolicy": "disaggregated",
+    "CaptureFailedError": "windowed_capture",
+    "CapturePriority": "windowed_capture",
+    "CaptureReadLease": "windowed_capture",
+    "CaptureRequest": "windowed_capture",
+    "SQLiteWindowedCaptureRegistry": "windowed_capture",
+    "WindowedCaptureQueue": "windowed_capture",
+    "capture_contract_digest": "windowed_capture",
+    "WindowedCaptureService": "windowed_capture_runtime",
+    "WindowedConsumerControl": "windowed_capture_runtime",
+    "start_windowed_consumer_control": "windowed_capture_runtime",
 }
 
 

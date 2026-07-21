@@ -106,6 +106,58 @@ def _managed_config(control_dir, *, nproc=2, servers=None):
     return Config.model_validate(raw)
 
 
+def _windowed_fanout_config(control_dir):
+    raw = _config(mode="disaggregated").model_dump()
+    raw["data"]["max_prompts"] = 8
+    raw["training"].update({"batch_size": 2, "accumulation_steps": 1, "num_epochs": 1})
+    raw["deployment"]["trainer"] = {"nnodes": 1, "nproc_per_node": 1}
+    raw["deployment"]["disaggregated"].update(
+        {
+            "control_dir": control_dir,
+            "server_urls": [],
+            "windowed_fanout": {
+                "max_live_bytes": 8 << 30,
+                "max_outstanding_per_consumer": 4,
+                "consumers": [
+                    {
+                        "consumer_id": "block-4",
+                        "seed": 42,
+                        "loss_type": "dflash",
+                        "loss_decay_gamma": 7.0,
+                        "dpace_alpha": 0.5,
+                        "draft_block_size": 4,
+                        "num_anchors": 128,
+                        "learning_rate": 0.0006,
+                        "warmup_ratio": 0.04,
+                    },
+                    {
+                        "consumer_id": "block-16",
+                        "seed": 43,
+                        "loss_type": "dpace",
+                        "loss_decay_gamma": None,
+                        "dpace_alpha": 0.5,
+                        "draft_block_size": 16,
+                        "num_anchors": 256,
+                        "learning_rate": 0.0007,
+                        "warmup_ratio": 0.05,
+                    },
+                ],
+            },
+            "managed_local": {
+                "trainer_cuda_visible_devices": ["1", "2"],
+                "capture_servers": [
+                    {
+                        "port": 30000,
+                        "cuda_visible_devices": ["0"],
+                        "tp_size": 1,
+                    }
+                ],
+            },
+        }
+    )
+    return Config.model_validate(raw)
+
+
 CAPTURE_CONTRACT = ServerCaptureContract(
     method="dflash",
     aux_layer_ids=(1, 9, 17, 25, 33),
@@ -656,6 +708,141 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(consumer.env["MOONCAKE_MASTER_SERVER_ADDR"], "127.0.0.1:35551")
         rendered = json.loads(plan.render())
         self.assertEqual(len(rendered["services"]), 3)
+
+    def test_windowed_fanout_uses_canonical_independent_consumer_commands(self):
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            cfg = _windowed_fanout_config(control_dir)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    env={},
+                )
+
+            self.assertEqual((plan.kind, plan.role), ("managed_supervisor", "both"))
+            self.assertEqual(
+                [command.label for command in plan.commands],
+                ["block-4", "block-16", "producer"],
+            )
+            for command, consumer_id, device in zip(
+                plan.commands[:2], ("block-4", "block-16"), ("1", "2")
+            ):
+                self.assertEqual(
+                    command.env["SPECFORGE_FANOUT_CONSUMER_ID"], consumer_id
+                )
+                self.assertEqual(command.env["CUDA_VISIBLE_DEVICES"], device)
+                self.assertTrue(
+                    command.env["DISAGG_DB"].endswith(
+                        f"consumers/{consumer_id}/consumer.sqlite"
+                    )
+                )
+                self.assertEqual(
+                    command.argv[command.argv.index("--consumer-id") + 1],
+                    consumer_id,
+                )
+            producer = plan.commands[-1]
+            self.assertEqual(producer.env["CUDA_VISIBLE_DEVICES"], "")
+            capture_service = plan.services[1]
+            argv = capture_service.command.argv
+            self.assertEqual(
+                argv[argv.index("--spec-capture-store-id") + 1], cfg.run_id
+            )
+            self.assertIn("--spec-capture-inventory-db", argv)
+            self.assertIn("--spec-capture-lifecycle-db", argv)
+            self.assertEqual(
+                capture_service.command.env["SGLANG_SPEC_CAPTURE_TOKEN"],
+                producer.env["SGLANG_SPEC_CAPTURE_TOKEN"],
+            )
+            rendered = json.loads(plan.render())
+            self.assertEqual(
+                rendered["commands"][-1]["env"]["SGLANG_SPEC_CAPTURE_TOKEN"],
+                "<redacted>",
+            )
+
+            projected = _config_for_role(cfg, "consumer", "block-16")
+            self.assertEqual(projected.model.draft_block_size, 16)
+            self.assertEqual(projected.training.num_anchors, 256)
+            self.assertEqual(projected.training.loss_type, "dpace")
+            self.assertEqual(projected.training.seed, 43)
+            self.assertTrue(projected.output_dir.endswith("block-16"))
+            self.assertIsNone(projected.deployment.disaggregated.managed_local)
+
+            os.makedirs(os.path.join(control_dir, "logs"))
+            child = build_launch_plan(
+                cfg,
+                config_path="run.yaml",
+                requested_role="consumer",
+                consumer_id="block-4",
+                env=plan.commands[0].env,
+            )
+            self.assertEqual((child.kind, child.role), ("worker", "consumer"))
+
+    def test_windowed_fanout_requires_explicit_consumer_selection(self):
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            cfg = _windowed_fanout_config(control_dir)
+            os.makedirs(os.path.join(control_dir, "logs"))
+            with self.assertRaisesRegex(ValueError, "requires --consumer-id"):
+                build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    requested_role="consumer",
+                    env={"SPECFORGE_MANAGED_LOCAL_CHILD": "1"},
+                )
+
+    def test_windowed_fanout_projects_external_consumer_resume_canonically(self):
+        with tempfile.TemporaryDirectory() as root:
+            raw = _windowed_fanout_config(root).model_dump()
+            disaggregated = raw["deployment"]["disaggregated"]
+            disaggregated["managed_local"] = None
+            disaggregated["server_urls"] = ["http://capture:30000"]
+            for consumer, device in zip(
+                disaggregated["windowed_fanout"]["consumers"], ("1", "2")
+            ):
+                consumer["cuda_visible_device"] = device
+            checkpoint = os.path.join(root, "block-4-checkpoint")
+            disaggregated["windowed_fanout"]["consumers"][0]["resume_from"] = checkpoint
+            cfg = Config.model_validate(raw)
+
+            projected = _config_for_role(cfg, "consumer", "block-4")
+
+            self.assertIsNone(projected.training.resume_from)
+            self.assertEqual(
+                projected.deployment.disaggregated.windowed_fanout.consumer(
+                    "block-4"
+                ).resume_from,
+                checkpoint,
+            )
+
+    def test_windowed_fanout_rejects_multiple_environment_capture_servers(self):
+        with tempfile.TemporaryDirectory() as root:
+            raw = _windowed_fanout_config(root).model_dump()
+            disaggregated = raw["deployment"]["disaggregated"]
+            disaggregated["managed_local"] = None
+            disaggregated["server_urls"] = []
+            for consumer, device in zip(
+                disaggregated["windowed_fanout"]["consumers"], ("1", "2")
+            ):
+                consumer["cuda_visible_device"] = device
+            cfg = Config.model_validate(raw)
+
+            with self.assertRaisesRegex(ValueError, "exactly one capture server"):
+                build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    requested_role="producer",
+                    env={
+                        "DISAGG_SERVER_URLS": "http://capture-a:30000,"
+                        "http://capture-b:30000",
+                        "MOONCAKE_METADATA_SERVER": "http://metadata:8080",
+                        "MOONCAKE_MASTER_SERVER_ADDR": "master:50051",
+                    },
+                )
 
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
@@ -1304,6 +1491,18 @@ class LaunchPlanTest(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(_http_ready(readiness), expected)
+
+    def test_http_readiness_allows_slow_model_health_checks(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        readiness = ReadinessSpec("http", "http://127.0.0.1:30000/health", 1800)
+
+        with mock.patch(
+            "specforge.launch_plan.urllib_request.urlopen", return_value=response
+        ) as open_url:
+            self.assertTrue(_http_ready(readiness))
+
+        open_url.assert_called_once_with(readiness.url, timeout=5.0)
 
     def test_supervisor_terminates_a_sibling_after_child_failure(self):
         producer = _FakeProcess([None])
