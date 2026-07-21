@@ -1,7 +1,8 @@
 # SGLang patch inventory and supported version
 
-SpecForge pins `sglang==0.5.14`. There are two deliberately separate SGLang
-integration surfaces.
+SpecForge pins `sglang==0.5.14`. The online patch is also kept compatible with
+SGLang's public `inkling-support` layout. There are two deliberately separate
+SGLang integration surfaces.
 
 ## Online: external spec-capture server
 
@@ -20,6 +21,12 @@ The client boundary is
 providers map generic server artifacts (`aux`, `last_hidden`, passthrough
 inputs) to training feature names. No trainer or producer process imports
 SGLang model-runner internals or loads a target model.
+
+The same patch is dry-run validated against the v0.5.14 tag and the public
+`inkling-support` branch. Capture requests carry a unique `extra_key`, so every
+training sample executes a full prefill even when radix cache support is
+present. Capture launch configs therefore leave radix cache enabled, including
+for hybrid targets that require the unified radix tree.
 
 Apply the patch with `scripts/apply_sglang_spec_capture_patch.sh`. The
 server-capture unit and GPU gates must pass before updating the SGLang pin.

@@ -10,6 +10,7 @@
   "block_size": 7,
   "bos_token_id": 151643,
   "dflash_config": {
+    "attention_mode": "gqa",
     "mask_token_id": 151669,
     "target_layer_ids": [1, 9, 17, 25, 33],
     "projector_type": "dspark",

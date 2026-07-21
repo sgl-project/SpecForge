@@ -9,7 +9,7 @@ from transformers import PreTrainedTokenizer
 
 from .template import ChatTemplate
 
-__all__ = ["GeneralParser", "HarmonyParser", "ThinkingParser"]
+__all__ = ["GeneralParser", "GLMParser", "HarmonyParser", "ThinkingParser"]
 
 
 class Parser(ABC):
@@ -153,6 +153,29 @@ class GeneralParser(Parser):
                 + re.escape("] USER:")
                 + "|$))"
             )
+        elif chat_template.assistant_pattern_type == "inkling":
+            terminators = "|".join(
+                re.escape(token)
+                for token in (
+                    "<|message_user|>",
+                    "<|message_tool|>",
+                    "<|message_system|>",
+                )
+            )
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"([\s\S]*?(?:"
+                + terminators
+                + "|$))"
+            )
+        elif chat_template.assistant_pattern_type == "glm":
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"(?:</think>)?"
+                + r"([\s\S]*?(?:"
+                + re.escape(self.chat_template.end_of_turn_token)
+                + "|$))"
+            )
         else:
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
@@ -242,7 +265,7 @@ class GeneralParser(Parser):
                         parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
                 conversation = "".join(parts)
 
-        if not self.tokenizer.pad_token_id:
+        if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
         # get input_ids
@@ -386,7 +409,7 @@ class HarmonyParser(Parser):
                 )
             conversation = prompt_text
 
-        if not self.tokenizer.pad_token_id:
+        if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
         encoding = self.tokenizer(
@@ -444,7 +467,14 @@ class ThinkingParser(GeneralParser):
         chat_template: ChatTemplate,
     ):
         super().__init__(tokenizer, chat_template)
-        self.standard_keys = {"role", "content", "tool_calls", "reasoning_content"}
+        self.standard_keys = {
+            "role",
+            "content",
+            "tool_calls",
+            "reasoning_content",
+            "name",
+            "tool_call_id",
+        }
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         """Apply chat template to all messages, handling reasoning_content and tool_calls."""
@@ -475,3 +505,11 @@ class ThinkingParser(GeneralParser):
         return super().parse(
             conversation, max_length, preformatted, train_only_last_turn, tool, **kwargs
         )
+
+
+class GLMParser(GeneralParser):
+    """Render GLM-5.2's hybrid-thinking template consistently for training."""
+
+    def apply_chat_template(self, messages, tool, **kwargs) -> str:
+        kwargs.setdefault("enable_thinking", False)
+        return super().apply_chat_template(messages, tool, **kwargs)

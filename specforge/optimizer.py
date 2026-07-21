@@ -21,13 +21,20 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        offload_master=False,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
+        self.offload_master = bool(offload_master)
         self.fp32_params = [
-            p.detach().clone().to(torch.float32) for p in self.model_params
+            (
+                p.detach().to(device="cpu", dtype=torch.float32).clone()
+                if self.offload_master
+                else p.detach().clone().to(torch.float32)
+            )
+            for p in self.model_params
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
@@ -53,15 +60,13 @@ class BF16Optimizer:
         self._grad_norm_process_group = process_group
         self._reduce_grad_norm_across_ranks = enabled
 
-    def _clip_grad_norm(self):
-        """Clip all FSDP shards with one global L2-norm coefficient."""
-        grads = [mp.grad for mp in self.fp32_params if mp.grad is not None]
-        if grads:
-            total_norm_sq = torch.stack([grad.square().sum() for grad in grads]).sum()
-        else:
-            device = self.fp32_params[0].device if self.fp32_params else "cpu"
-            total_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
+    def _reduce_grad_norm(self, total_norm_sq):
+        """All-reduce the squared L2 norm across shard ranks and derive the
+        clip coefficient.
 
+        ``total_norm_sq`` must already live on a device the process group can
+        reduce (e.g. CUDA for NCCL). Returns ``(total_norm, clip_coef)``.
+        """
         if (
             self._reduce_grad_norm_across_ranks
             and dist.is_available()
@@ -72,27 +77,82 @@ class BF16Optimizer:
                 op=dist.ReduceOp.SUM,
                 group=self._grad_norm_process_group,
             )
-
         total_norm = total_norm_sq.sqrt()
         clip_coef = torch.clamp(self.max_grad_norm / (total_norm + 1e-6), max=1.0)
+        return total_norm, clip_coef
+
+    def _grad_norm_and_clip_coefficient(self):
+        """Compute the global grad norm from the model params on their own
+        device, where NCCL can reduce it safely, without materialising master
+        gradients first."""
+        grads = [p.grad.detach() for p in self.model_params if p.grad is not None]
+        if grads:
+            total_norm_sq = torch.stack(
+                [grad.float().square().sum() for grad in grads]
+            ).sum()
+        else:
+            device = self.model_params[0].device if self.model_params else "cpu"
+            total_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
+        return self._reduce_grad_norm(total_norm_sq)
+
+    def _clip_grad_norm(self):
+        """Clip already-populated FP32 master gradients in place.
+
+        Convenience entry point for optimizer tests and custom loops. When
+        masters are CPU-offloaded, only the scalar norm is moved to the model
+        device so a NCCL process group can still participate in the reduction.
+        """
+        grads = [master.grad for master in self.fp32_params if master.grad is not None]
+        if grads:
+            local_norm_sq = torch.stack(
+                [grad.float().square().sum() for grad in grads]
+            ).sum()
+        else:
+            master_device = self.fp32_params[0].device if self.fp32_params else "cpu"
+            local_norm_sq = torch.zeros((), dtype=torch.float32, device=master_device)
+
+        reduction_device = (
+            self.model_params[0].device if self.model_params else local_norm_sq.device
+        )
+        total_norm, clip_coef = self._reduce_grad_norm(
+            local_norm_sq.to(reduction_device)
+        )
         for grad in grads:
-            grad.mul_(clip_coef)
+            coefficient = (
+                clip_coef
+                if clip_coef.device == grad.device
+                else float(clip_coef.item())
+            )
+            grad.mul_(coefficient)
         return total_norm
 
     def step(self):
+        grad_norm, clip_coefficient = self._grad_norm_and_clip_coefficient()
+        cpu_clip_coefficient = (
+            float(clip_coefficient.item()) if self.offload_master else None
+        )
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
-                mp.grad = (
-                    p.grad.detach().to(torch.float32) if p.grad is not None else None
+                if p.grad is None:
+                    mp.grad = None
+                    continue
+                master_grad = p.grad.detach().to(
+                    device=mp.device,
+                    dtype=torch.float32,
                 )
-        grad_norm = self._clip_grad_norm()
+                master_grad.mul_(
+                    cpu_clip_coefficient
+                    if cpu_clip_coefficient is not None
+                    else clip_coefficient
+                )
+                mp.grad = master_grad
         self.last_grad_norm = grad_norm.detach()
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
-                p.data.copy_(mp.data.to(p.dtype))
+                p.data.copy_(mp.data.to(device=p.device, dtype=p.dtype))
                 p.grad = None
         return self.last_grad_norm
 
@@ -109,6 +169,9 @@ class BF16Optimizer:
                 f"{saved_max_grad_norm} but this run has "
                 f"max_grad_norm={self.max_grad_norm}"
             )
+        # offload_master is a pure device-placement choice: restored fp32
+        # masters and Adam moments are relocated to the current master device,
+        # so toggling it on resume is safe and intentionally not gated here.
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
@@ -135,7 +198,7 @@ class BF16Optimizer:
             )
             with torch.no_grad():
                 for p, mp in zip(self.model_params, self.fp32_params):
-                    mp.data.copy_(p.detach().to(torch.float32))
+                    mp.data.copy_(p.detach().to(device=mp.device, dtype=mp.dtype))
 
     def state_dict(self):
         return {
