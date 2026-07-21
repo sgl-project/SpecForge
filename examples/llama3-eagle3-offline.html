@@ -498,6 +498,7 @@ but feature storage can be much larger than the source dataset.</p>
 point:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>scripts/prepare_hidden_states.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--strategy<span class="w"> </span>eagle3<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--target-model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--draft-model-config<span class="w"> </span>configs/llama3.1-8b-eagle3.json<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--data-path<span class="w"> </span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
@@ -539,9 +540,9 @@ exists. The same recipe supports offline data parallelism through the typed
 <p>For long sequences, EAGLE3 offline can instead use USP by setting
 <code class="docutils literal notranslate"><span class="pre">training.attention_backend=usp</span></code> and choosing
 <code class="docutils literal notranslate"><span class="pre">training.sp_ulysses_size</span></code>/<code class="docutils literal notranslate"><span class="pre">training.sp_ring_size</span></code>. Offline feature training
-also supports DFlash and Domino when the feature checkpoints and draft config
-use that strategy’s contract. <code class="docutils literal notranslate"><span class="pre">training.compact_teacher:</span> <span class="pre">true</span></code> enables the
-exact lower-memory teacher projection for offline text EAGLE3. See
+also supports DFlash, Domino, and DSpark when the feature checkpoints and draft
+config use that strategy’s contract. <code class="docutils literal notranslate"><span class="pre">training.compact_teacher:</span> <span class="pre">true</span></code> enables
+the exact lower-memory teacher projection for offline text EAGLE3. See
 <a class="reference internal" href="../basic_usage/training.html#parallel-topologies"><span class="std std-ref">Parallel topologies</span></a> for the
 multi-process launch contract.</p>
 </section>

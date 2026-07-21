@@ -479,6 +479,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-pre-formatted-text-format">Option 2: Pre-formatted Text Format</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-offline-target-features">💾 Prepare offline target features</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#handling-multiple-datasets">➕ Handling Multiple Datasets</a></li>
 </ul>
             </nav>
@@ -721,27 +722,119 @@ loss mask.</p>
 specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>./my-eagle3-disaggregated.yaml
 </pre></div>
 </div>
-<p>For offline training, you can also use <code class="docutils literal notranslate"><span class="pre">--is-preformatted</span></code> when generating hidden states:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Generate hidden states from pre-formatted data</span>
-torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+</section>
+</section>
+<section id="prepare-offline-target-features">
+<h2>💾 Prepare offline target features<a class="headerlink" href="#prepare-offline-target-features" title="Link to this heading">#</a></h2>
+<p>Offline EAGLE3, DFlash, Domino, and DSpark runs consume target features created
+by <code class="docutils literal notranslate"><span class="pre">scripts/prepare_hidden_states.py</span></code>. Select the same strategy and draft
+configuration that the later training recipe uses; these values determine both
+the target layers captured and the checkpoint schema. For example, prepare the
+checked-in Qwen3-8B DFlash recipe with:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>scripts/prepare_hidden_states.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--strategy<span class="w"> </span>dflash<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--target-model-path<span class="w"> </span>Qwen/Qwen3-8B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--draft-model-config<span class="w"> </span>configs/qwen3-8b-dflash.json<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--data-path<span class="w"> </span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-path<span class="w"> </span>./cache/hidden_states/qwen3-8b-dflash-sharegpt<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--chat-template<span class="w"> </span>qwen<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-length<span class="w"> </span><span class="m">3072</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--batch-size<span class="w"> </span><span class="m">32</span>
+</pre></div>
+</div>
+<p>Use these strategy/model pairs for the checked-in local offline recipes:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Strategy</p></th>
+<th class="head"><p>Target model</p></th>
+<th class="head"><p>Draft config</p></th>
+<th class="head"><p>Output path used by the recipe</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>EAGLE3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">configs/qwen3-8b-eagle3.json</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache/hidden_states/qwen3-8b-sharegpt</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>DFlash</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">configs/qwen3-8b-dflash.json</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache/hidden_states/qwen3-8b-dflash-sharegpt</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Domino</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">configs/qwen3-8b-domino.json</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache/hidden_states/qwen3-8b-domino-sharegpt</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>DSpark</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-4B</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">configs/qwen3-4b-dspark.json</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cache/hidden_states/qwen3-4b-dspark-sharegpt</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--strategy</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">eagle3</span></code> for compatibility. Pass it explicitly in
+reproducible jobs. <code class="docutils literal notranslate"><span class="pre">--draft-model-config</span></code> is required for Domino and DSpark;
+passing the same explicit config used by training is recommended for every
+strategy. Capture layers come from the resolved draft config. EAGLE3 retains
+target-derived defaults for legacy configs that do not define
+<code class="docutils literal notranslate"><span class="pre">eagle_config.eagle_aux_hidden_state_layer_ids</span></code>.</p>
+<p>Each output record contains the strategy’s exact offline feature contract:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Strategy</p></th>
+<th class="head"><p>Tensors in each <code class="docutils literal notranslate"><span class="pre">.ckpt</span></code> or <code class="docutils literal notranslate"><span class="pre">.ckpt.gz</span></code> record</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>EAGLE3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">hidden_state</span></code>, <code class="docutils literal notranslate"><span class="pre">aux_hidden_state</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>DFlash and Domino</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>DSpark</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code>, <code class="docutils literal notranslate"><span class="pre">target_last_hidden_states</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For the DFlash family, <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code> concatenates the target layers selected
+by the draft config. DSpark additionally stores the target model’s final hidden
+state for its L1 and confidence objectives. Keep each strategy in a separate
+output directory; the offline reader validates the contract instead of
+silently adapting incompatible features.</p>
+<p>D-PACE uses <code class="docutils literal notranslate"><span class="pre">training.strategy:</span> <span class="pre">dflash</span></code> and the DFlash feature schema. DTA also
+uses <code class="docutils literal notranslate"><span class="pre">--strategy</span> <span class="pre">dflash</span></code>, but feature preparation must receive its DTA draft
+config so the captured layer contract matches the training run.</p>
+<p>For preformatted input, add <code class="docutils literal notranslate"><span class="pre">--is-preformatted</span></code> to the same command and keep
+<code class="docutils literal notranslate"><span class="pre">--chat-template</span></code> aligned with the template already applied to the text:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>scripts/prepare_hidden_states.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--strategy<span class="w"> </span>eagle3<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--target-model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--draft-model-config<span class="w"> </span>configs/llama3.1-8b-eagle3.json<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--data-path<span class="w"> </span>./your_preformatted_dataset.jsonl<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--output-path<span class="w"> </span>./cache/hidden_states<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-path<span class="w"> </span>./cache/hidden_states/llama3.1-8b-eagle3<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--chat-template<span class="w"> </span>llama3<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--is-preformatted<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max-length<span class="w"> </span><span class="m">2048</span>
 </pre></div>
 </div>
-<p>This <code class="docutils literal notranslate"><span class="pre">torchrun</span></code> command parallelizes feature preparation. The subsequent
-offline run still uses the one <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code> entry and self-launches the
-data-parallel or EAGLE3 USP topology recorded under <code class="docutils literal notranslate"><span class="pre">deployment.trainer</span></code>; its
-world size is independent of the feature-preparation job.</p>
-<p>Once the <code class="docutils literal notranslate"><span class="pre">jsonl</span></code> file is ready, use it in an online run config or generate
-hidden states for an offline config. See the <a class="reference internal" href="training.html"><span class="std std-doc">Training</span></a> guide for
-the complete run schema and supported combinations.</p>
-</section>
+<p>The preparation world size only parallelizes capture. The subsequent offline
+run still uses the one <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code> entry and self-launches the
+data-parallel or EAGLE3 USP topology recorded under <code class="docutils literal notranslate"><span class="pre">deployment.trainer</span></code>.
+Launch the matching recipe after its <code class="docutils literal notranslate"><span class="pre">data.hidden_states_path</span></code> points at the
+generated directory:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/qwen3-8b-dflash-offline.yaml
+</pre></div>
+</div>
+<p>See the <a class="reference internal" href="training.html"><span class="std std-doc">Training</span></a> guide for the complete run schema and supported
+combinations.</p>
 </section>
 <section id="handling-multiple-datasets">
 <h2>➕ Handling Multiple Datasets<a class="headerlink" href="#handling-multiple-datasets" title="Link to this heading">#</a></h2>
@@ -811,6 +904,7 @@ the complete run schema and supported combinations.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-pre-formatted-text-format">Option 2: Pre-formatted Text Format</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-offline-target-features">💾 Prepare offline target features</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#handling-multiple-datasets">➕ Handling Multiple Datasets</a></li>
 </ul>
   </nav></div>

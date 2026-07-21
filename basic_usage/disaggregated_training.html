@@ -854,8 +854,8 @@ before the transaction replays refs; a crash after it skips them.</p>
 </pre></div>
 </div>
 <p>Both paths must be visible at the same location from producer and consumer
-nodes. The producer ingests existing EAGLE3, DFlash, or Domino features and
-publishes a fixed manifest. Offline epochs remain re-iterable.</p>
+nodes. The producer ingests existing EAGLE3, DFlash, Domino, or DSpark features
+and publishes a fixed manifest. Offline epochs remain re-iterable.</p>
 <p>Set <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">mooncake</span></code> instead, omit <code class="docutils literal notranslate"><span class="pre">store_root</span></code>, and provide the Mooncake
 endpoints to use the remote store. Also set a positive
 <code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.producer_segment_size</span></code>: unlike online server-owned

@@ -394,8 +394,8 @@ deployment:
 ```
 
 Both paths must be visible at the same location from producer and consumer
-nodes. The producer ingests existing EAGLE3, DFlash, or Domino features and
-publishes a fixed manifest. Offline epochs remain re-iterable.
+nodes. The producer ingests existing EAGLE3, DFlash, Domino, or DSpark features
+and publishes a fixed manifest. Offline epochs remain re-iterable.
 
 Set `backend: mooncake` instead, omit `store_root`, and provide the Mooncake
 endpoints to use the remote store. Also set a positive

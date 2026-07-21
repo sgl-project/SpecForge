@@ -731,8 +731,14 @@ and <code class="docutils literal notranslate"><span class="pre">loss_mask</span
 <tr class="row-even"><td><p>DFlash online</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/64af86ae8e76f89e51f05dc2dcfea360/qwen3-8b-dflash-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-online.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>Domino online</p></td>
+<tr class="row-odd"><td><p>DFlash offline</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/d0c1721a7dd156ccc83f5be8b6026f79/qwen3-8b-dflash-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-offline.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-even"><td><p>Domino online</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/36ba98a0397008b5f77a7d7e56b45b24/qwen3-8b-domino-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-online.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-odd"><td><p>Domino offline</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/92414cf938071d088cb457d632b661e1/qwen3-8b-domino-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-offline.yaml</span></code></span></a></p></td>
 </tr>
 <tr class="row-even"><td><p>P-EAGLE online</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/e321e9972357ed60f0ac4d3e955659ae/qwen3-8b-peagle-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-peagle-disaggregated.yaml</span></code></span></a></p></td>
@@ -746,13 +752,16 @@ and <code class="docutils literal notranslate"><span class="pre">loss_mask</span
 <tr class="row-odd"><td><p>DSpark disaggregated</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/3b04a47840176ad95c4f194dd698d1e3/qwen3-4b-dspark-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>EAGLE3 offline disaggregated</p></td>
+<tr class="row-even"><td><p>DSpark offline</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/907990ab87710fbc1fa037fb5f0094b3/qwen3-4b-dspark-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-offline.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-odd"><td><p>EAGLE3 offline disaggregated</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/978c3354c1aa0e7c3492342dd0c48ca1/qwen3-8b-eagle3-offline-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-eagle3-offline-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>Ascend NPU DFlash online</p></td>
+<tr class="row-even"><td><p>Ascend NPU DFlash online</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/80fb60b7b4b579275dcfe77789f8b58b/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>Ascend NPU Domino online</p></td>
+<tr class="row-odd"><td><p>Ascend NPU Domino online</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/f820e4a2c09b8871f7e1152d39b78da7/qwen3.5-4b-domino-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-domino-online-npu.yaml</span></code></span></a></p></td>
 </tr>
 </tbody>
@@ -822,8 +831,8 @@ launching it.</p>
 </tr>
 <tr class="row-odd"><td><p>DSpark</p></td>
 <td><p>Yes, consumer DP</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
+<td><p>Yes, DP</p></td>
+<td><p>Yes, consumer DP</p></td>
 </tr>
 <tr class="row-even"><td><p>P-EAGLE</p></td>
 <td><p>Yes, consumer DP, batch size 1</p></td>
@@ -846,8 +855,7 @@ features through <code class="docutils literal notranslate"><span class="pre">da
 <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>;</p></li>
 <li><p>P-EAGLE requires <code class="docutils literal notranslate"><span class="pre">training.batch_size=1</span></code> and reuses EAGLE3’s server capture
 schema;</p></li>
-<li><p>DSpark requires disaggregated server capture;</p></li>
-<li><p>offline feature training supports EAGLE3, DFlash, and Domino;</p></li>
+<li><p>offline feature training supports EAGLE3, DFlash, Domino, and DSpark;</p></li>
 <li><p>every online run is disaggregated and uses <code class="docutils literal notranslate"><span class="pre">model.target_backend=sglang</span></code>;
 finite runs may omit both step fields so the producer can publish the exact
 optimizer horizon derived from the prepared prompt plan;</p></li>
