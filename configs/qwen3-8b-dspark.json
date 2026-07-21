@@ -24,8 +24,11 @@
   "initializer_range": 0.02,
   "intermediate_size": 12288,
   "layer_types": [
-    "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention"
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
   ],
   "max_position_embeddings": 40960,
   "max_window_layers": 5,

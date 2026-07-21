@@ -84,11 +84,6 @@ EXPECTED_TRACKING = {
         "wandb_project": "dpace-qwen3-8b",
         "wandb_name": "qwen3-8b-dpace",
     },
-    "qwen3-8b-dta-online.yaml": {
-        "report_to": "wandb",
-        "wandb_project": "specforge-qwen3-8b-dta",
-        "wandb_name": "qwen3-8b-dta-perfectblend",
-    },
     "qwen3-8b-eagle3-disaggregated.yaml": {"report_to": "tensorboard"},
     "qwen3-8b-peagle-disaggregated.yaml": {"report_to": "wandb"},
     "qwen3-coder-30b-a3b-eagle3-online.yaml": {
@@ -151,7 +146,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 58)
+        self.assertEqual(len(paths), 59)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths

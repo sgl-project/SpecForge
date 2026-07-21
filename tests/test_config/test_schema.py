@@ -76,6 +76,14 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_liger_kernel_flag_is_typed_and_defaults_off(self):
+        default = Config.model_validate(copy.deepcopy(MINIMAL))
+        self.assertFalse(default.model.use_liger_kernel)
+
+        payload = copy.deepcopy(MINIMAL)
+        payload["model"]["use_liger_kernel"] = True
+        self.assertTrue(Config.model_validate(payload).model.use_liger_kernel)
+
     def test_finite_online_run_can_derive_its_schedule_from_the_producer(self):
         payload = _online_payload("domino")
         payload["training"].pop("max_steps")

@@ -37,6 +37,8 @@ import unittest
 
 import torch
 
+from tests.utils import terminate_process_trees
+
 CUDA = torch.cuda.is_available()
 ENABLED = os.environ.get("SPECFORGE_RUN_SERVER_CAPTURE_TESTS") == "1"
 PORT = 30989
@@ -90,6 +92,10 @@ class TestServerCaptureGate(unittest.TestCase):
         from transformers import LlamaConfig, LlamaForCausalLM
 
         cls.workdir = tempfile.mkdtemp(prefix="spec_capture_gate_")
+        cls.addClassCleanup(shutil.rmtree, cls.workdir, True)
+        # Class cleanups still run when setUpClass raises. Register process
+        # cleanup last so it runs before the temporary log directory is removed.
+        cls.addClassCleanup(cls._cleanup_processes)
         cfg = LlamaConfig(
             hidden_size=H,
             intermediate_size=128,
@@ -154,6 +160,7 @@ class TestServerCaptureGate(unittest.TestCase):
             stdout=open(os.path.join(cls.workdir, "server.log"), "w"),
             stderr=subprocess.STDOUT,
             env=env,
+            start_new_session=True,
         )
         import requests
 
@@ -186,6 +193,7 @@ class TestServerCaptureGate(unittest.TestCase):
             [binary, "--enable-http-metadata-server=true"],
             stdout=open(os.path.join(cls.workdir, "mooncake_master.log"), "w"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         time.sleep(3)
         if cls.master.poll() is not None:
@@ -201,14 +209,8 @@ class TestServerCaptureGate(unittest.TestCase):
         os.environ.setdefault("MOONCAKE_PROTOCOL", "tcp")
 
     @classmethod
-    def tearDownClass(cls):
-        for proc in (cls.server, cls.master):
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+    def _cleanup_processes(cls):
+        terminate_process_trees(cls.server, cls.master, grace_s=30)
 
     # -- helpers ---------------------------------------------------------------
     def _store(self, store_id):
