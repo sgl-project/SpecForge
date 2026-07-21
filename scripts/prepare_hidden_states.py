@@ -3,12 +3,15 @@
 The local target exists only for this preprocessing command. Online training
 consumes features from an external server and never loads a target model in the
 trainer process. Precomputing target features removes the target model's memory
-and latency cost from the later offline training run.
+and latency cost from the later offline training run. The hidden states are saved
+in ${output_path} and the vocabulary mapping is saved in ${output_path}/vocab_mapping/vocab_mapping.pt
+which is used for the offline training.
 
 Usage:
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --draft-model-config configs/llama3.1-8b-eagle3.json \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
     --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
     --chat-template llama3 \
@@ -20,19 +23,25 @@ torchrun --nproc_per_node=8 \
 For pre-formatted data (with chat template already applied), add --is-preformatted:
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --target-model-path Qwen/Qwen3-8B \
+    --draft-model-config configs/qwen3-8b-eagle3.json \
     --data-path ./cache/dataset/preformatted_data.jsonl \
     --output-path ./cache/hidden_states \
-    --chat-template llama3 \
-    --is-preformatted \
-    --max-length 2048
+    --chat-template qwen \
+    --max-length 4096 \
+    --tp-size 1 \
+    --batch-size 32 \
+    --num-samples 2000 \
+    --is-preformatted
 """
 
 import argparse
 import gc
 import gzip
 import hashlib
+import json
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -44,7 +53,10 @@ from datasets import Dataset
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from specforge.data.preprocessing import build_eagle3_dataset
+from specforge.data.preprocessing import (
+    build_eagle3_dataset,
+    generate_vocab_mapping_file,
+)
 from specforge.data.utils import prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
@@ -80,6 +92,15 @@ def parse_args():
     # model-related arguments
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
+    model_group.add_argument(
+        "--draft-model-config",
+        type=str,
+        required=True,
+        help=(
+            "Path to a local draft config JSON file. Its draft_vocab_size "
+            "determines the generated vocabulary mapping."
+        ),
+    )
     model_group.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -165,6 +186,108 @@ def parse_args():
     sglang_group.add_argument("--sglang-enable-dp-lm-head", action="store_true")
     sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
     return parser.parse_args()
+
+
+def _resolve_draft_vocab_size(source: str) -> int:
+    """Load ``draft_vocab_size`` from one existing local JSON file."""
+
+    expanded = Path(source).expanduser()
+    if not expanded.is_file():
+        raise FileNotFoundError(
+            "--draft-model-config must point to an existing local JSON file: "
+            f"{source}"
+        )
+    if expanded.suffix.lower() != ".json":
+        raise ValueError(
+            f"--draft-model-config must point to a local .json file: {source}"
+        )
+    try:
+        with expanded.open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid draft config JSON {expanded}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"draft config JSON {expanded} must contain an object")
+    value = payload.get("draft_vocab_size", payload.get("vocab_size"))
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            f"draft model config {source!r} must define a positive "
+            f"draft_vocab_size (or vocab_size fallback), got {value!r}"
+        )
+    return value
+
+
+def _generate_shared_vocab_mapping(
+    dataset,
+    *,
+    output_path: str,
+    target_vocab_size: int,
+    draft_vocab_size: int,
+) -> str:
+    """Generate one mapping on global rank 0 and propagate failures to peers."""
+
+    mapping_dir = os.path.join(output_path, "vocab_mapping")
+    mapping_path = os.path.join(mapping_dir, "vocab_mapping.pt")
+    result = [None]
+    if dist.get_rank() == 0:
+        temporary_path = None
+        try:
+            temporary_key = f".vocab_mapping.{uuid.uuid4().hex}"
+            temporary_path = generate_vocab_mapping_file(
+                dataset=dataset,
+                target_vocab_size=target_vocab_size,
+                draft_vocab_size=draft_vocab_size,
+                cache_dir=mapping_dir,
+                cache_key=temporary_key,
+            )
+            mapping = torch.load(
+                temporary_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            d2t = mapping.get("d2t")
+            t2d = mapping.get("t2d")
+            if not isinstance(d2t, torch.Tensor) or tuple(d2t.shape) != (
+                draft_vocab_size,
+            ):
+                raise ValueError(
+                    f"{temporary_path} has invalid d2t shape; expected "
+                    f"({draft_vocab_size},), got {getattr(d2t, 'shape', None)}"
+                )
+            if not isinstance(t2d, torch.Tensor) or tuple(t2d.shape) != (
+                target_vocab_size,
+            ):
+                raise ValueError(
+                    f"{temporary_path} has invalid t2d shape; expected "
+                    f"({target_vocab_size},), got {getattr(t2d, 'shape', None)}"
+                )
+            os.replace(temporary_path, mapping_path)
+            temporary_path = None
+            result[0] = {"path": mapping_path}
+        except BaseException as exc:
+            result[0] = {
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+
+    dist.broadcast_object_list(result, src=0)
+    if result[0] is None or "error" in result[0]:
+        reason = "rank 0 did not publish a result"
+        if result[0] is not None:
+            reason = result[0]["error"]
+        raise RuntimeError(f"failed to generate vocabulary mapping: {reason}")
+    if result[0]["path"] != mapping_path:
+        raise RuntimeError(
+            "vocabulary mapping generator returned an unexpected path: "
+            f"{result[0]['path']} != {mapping_path}"
+        )
+    return mapping_path
 
 
 def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
@@ -597,6 +720,7 @@ def main():
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)
+    draft_vocab_size = _resolve_draft_vocab_size(args.draft_model_config)
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_args_with_dots(args)
@@ -605,6 +729,15 @@ def main():
     target_model_config = AutoConfig.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
+    target_text_config = getattr(
+        target_model_config, "text_config", target_model_config
+    )
+    target_vocab_size = int(target_text_config.vocab_size)
+    if draft_vocab_size > target_vocab_size:
+        raise ValueError(
+            f"draft_vocab_size={draft_vocab_size} exceeds target "
+            f"vocab_size={target_vocab_size}"
+        )
     target_model = build_target_model(args, target_model_config)
 
     print_with_rank(
@@ -657,6 +790,15 @@ def main():
             num_proc=args.build_dataset_num_proc,
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
+
+    vocab_mapping_path = _generate_shared_vocab_mapping(
+        eagle3_dataset,
+        output_path=args.output_path,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+    )
+    if dist.get_rank() == 0:
+        print(f"Vocabulary mapping ready at {vocab_mapping_path}")
 
     # Create DP-sharded dataloader
     data_loader = prepare_dp_dataloaders(
