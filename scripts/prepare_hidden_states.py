@@ -3,7 +3,9 @@
 The local target exists only for this preprocessing command. Online training
 consumes features from an external server and never loads a target model in the
 trainer process. Precomputing target features removes the target model's memory
-and latency cost from the later offline training run.
+and latency cost from the later offline training run. The hidden states are saved
+in ${output_path} and the vocabulary mapping is saved in ${output_path}/vocab_mapping/vocab_mapping.pt
+which is used for the offline training.
 
 Usage:
 torchrun --nproc_per_node=8 \

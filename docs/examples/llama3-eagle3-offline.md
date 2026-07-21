@@ -52,7 +52,7 @@ no mapping.
 ```bash
 specforge train \
   --config examples/configs/llama3.1-8b-eagle3-offline.yaml \
-  model.vocab_mapping_path=
+  model.vocab_mapping_path=./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct/vocab_mapping/vocab_mapping.pt
 ```
 
 Omit the final override when the mapping file named by the recipe already
