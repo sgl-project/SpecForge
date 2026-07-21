@@ -387,18 +387,101 @@ class ModelProvider:
 
 
 @dataclass(frozen=True)
+class OfflineCaptureLayout:
+    """Map one generic local capture onto the persisted offline schema.
+
+    Local capture always exposes the same four per-sample sources:
+    ``input_ids``, ``loss_mask``, ``aux_hidden_states``, and
+    ``last_hidden_states``. Algorithms own the names they persist so the data
+    preparation command cannot silently drift away from their storage
+    contracts.
+    """
+
+    capture_method: str
+    aux_feature: str | None
+    last_hidden_feature: str | None
+    passthrough: Tuple[Tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        _non_empty(self.capture_method, field_name="capture_method")
+        for field_name in ("aux_feature", "last_hidden_feature"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _non_empty(value, field_name=field_name)
+
+        passthrough = tuple(self.passthrough)
+        for feature_name, source_key in passthrough:
+            _non_empty(feature_name, field_name="passthrough feature name")
+            _non_empty(source_key, field_name="passthrough source key")
+        object.__setattr__(self, "passthrough", passthrough)
+
+        output_names = self.output_names
+        duplicates = sorted(
+            name for name in set(output_names) if output_names.count(name) > 1
+        )
+        if duplicates:
+            raise ValueError(
+                f"duplicate offline capture output feature names: {duplicates}"
+            )
+        if not output_names:
+            raise ValueError("offline capture layout must emit at least one feature")
+
+    @property
+    def output_names(self) -> Tuple[str, ...]:
+        """Return persisted feature names in deterministic layout order."""
+
+        names = [feature for feature, _source in self.passthrough]
+        if self.aux_feature is not None:
+            names.append(self.aux_feature)
+        if self.last_hidden_feature is not None:
+            names.append(self.last_hidden_feature)
+        return tuple(names)
+
+    def materialize(self, sources: Mapping[str, Any]) -> dict[str, Any]:
+        """Build one persisted record and fail early on missing capture data."""
+
+        mappings = list(self.passthrough)
+        if self.aux_feature is not None:
+            mappings.append((self.aux_feature, "aux_hidden_states"))
+        if self.last_hidden_feature is not None:
+            mappings.append((self.last_hidden_feature, "last_hidden_states"))
+
+        record = {}
+        for feature_name, source_key in mappings:
+            if source_key not in sources:
+                raise KeyError(
+                    f"offline capture source {source_key!r} required for "
+                    f"feature {feature_name!r} is missing"
+                )
+            value = sources[source_key]
+            if value is None:
+                raise ValueError(
+                    f"offline capture source {source_key!r} required for "
+                    f"feature {feature_name!r} is None"
+                )
+            record[feature_name] = value
+        return record
+
+
+@dataclass(frozen=True)
 class OfflineDataProvider:
-    """Reader, normalizer, and collator for one offline modality."""
+    """Reader, normalizer, collator, and capture schema for one modality."""
 
     modality: str
     normalizer_id: str
     build_reader: Factory
     build_normalizer: Factory
     build_collator: Factory
+    capture_layout: OfflineCaptureLayout | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
         _non_empty(self.normalizer_id, field_name="normalizer_id")
+        if self.capture_layout is not None and not isinstance(
+            self.capture_layout,
+            OfflineCaptureLayout,
+        ):
+            raise TypeError("capture_layout must be an OfflineCaptureLayout or None")
         _factories_are_callable(
             (
                 ("build_reader", self.build_reader),
@@ -610,6 +693,33 @@ def make_registration(
                 f"offline normalizer mismatch for {provider.modality!r}: "
                 f"{provider.normalizer_id!r} != {contract.storage.normalizer!r}"
             )
+        if provider.capture_layout is not None:
+            emitted = set(provider.capture_layout.output_names)
+            required = set(contract.storage.required_tensors)
+            if emitted != required:
+                raise ValueError(
+                    f"offline capture layout for {provider.modality!r} must "
+                    "exactly match the storage contract: "
+                    f"emitted={sorted(emitted)}, required={sorted(required)}"
+                )
+            streaming = next(
+                (
+                    candidate
+                    for candidate in providers.server_streaming
+                    if candidate.modality == provider.modality
+                ),
+                None,
+            )
+            if (
+                streaming is not None
+                and provider.capture_layout.capture_method != streaming.capture_method
+            ):
+                raise ValueError(
+                    f"offline and server capture methods differ for "
+                    f"{provider.modality!r}: "
+                    f"{provider.capture_layout.capture_method!r} != "
+                    f"{streaming.capture_method!r}"
+                )
     for provider in providers.server_streaming:
         contract = spec.feature_contract(FeatureMode.STREAMING, provider.modality)
         if provider.target_representation != contract.default_target_representation:
@@ -647,6 +757,7 @@ __all__ = [
     "MODEL_PROVENANCE_CONTRACT_KEY",
     "ModelProvider",
     "OMITTED_STATE_FINGERPRINT_CONTRACT_KEY",
+    "OfflineCaptureLayout",
     "OfflineDataProvider",
     "STEP_OPTIONS_CONTRACT_KEY",
     "ServerCaptureLayout",

@@ -111,7 +111,10 @@ assume the command runs from the repository root.
 
 | Workflow | Canonical starting point |
 | --- | --- |
-| Colocated offline | `qwen3-8b-eagle3-offline.yaml` |
+| EAGLE3 colocated offline | `qwen3-8b-eagle3-offline.yaml` |
+| DFlash colocated offline | `qwen3-8b-dflash-offline.yaml` |
+| Domino colocated offline | `qwen3-8b-domino-offline.yaml` |
+| DSpark colocated offline | `qwen3-4b-dspark-offline.yaml` |
 | External-service online | `qwen3-8b-eagle3-disaggregated.yaml` |
 | Managed-local disaggregated online | `qwen3-8b-domino-multiserver-disaggregated.yaml` |
 | Disaggregated offline | `qwen3-8b-eagle3-offline-disaggregated.yaml` |
@@ -392,7 +395,7 @@ unless tuning throughput or memory pressure.
 - USP is offline EAGLE3 only, requires `training.batch_size: 1`, and requires
   `sp_ulysses_size * sp_ring_size > 1`. Non-USP runs keep both SP sizes at 1.
 - P-EAGLE reuses the EAGLE3 server feature schema, uses `flex_attention`, and
-  requires batch size 1. DSpark is also server-only online.
+  requires batch size 1.
 - VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
   text inputs only.
 - `training.compact_teacher` is offline text EAGLE3 only.
@@ -425,7 +428,7 @@ For deeper lifecycle and recovery semantics, see the
 | EAGLE3 | consumer DP | DP + USP | consumer DP |
 | DFlash | consumer DP | DP | consumer DP |
 | Domino | consumer DP | DP | consumer DP |
-| DSpark | consumer DP | No | No |
+| DSpark | consumer DP | DP | consumer DP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |
 
 `qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the

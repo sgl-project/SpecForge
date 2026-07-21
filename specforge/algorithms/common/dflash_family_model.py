@@ -903,8 +903,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         elif self.dspark_l1_loss_alpha > 0 or self.dspark_confidence_head_alpha > 0:
             raise ValueError(
                 "DSpark L1/confidence loss requires target_last_hidden_states. "
-                "Use the disaggregated DSpark server-capture path so the "
-                "consumer receives target_last_hidden_states."
+                "Capture target final-layer states during offline preparation "
+                "or use the disaggregated DSpark server-capture path."
             )
 
         confidence_loss = ce_loss.new_zeros(())

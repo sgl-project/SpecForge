@@ -146,7 +146,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 55)
+        self.assertEqual(len(paths), 59)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths

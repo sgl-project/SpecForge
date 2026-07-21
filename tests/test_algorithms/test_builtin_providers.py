@@ -14,6 +14,7 @@ from specforge.algorithms.common.providers import (
     STEP_OPTIONS_CONTRACT_KEY,
     AlgorithmProviders,
     DraftConfigProvider,
+    OfflineDataProvider,
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepRuntimeConfig,
@@ -83,6 +84,17 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertFalse(hasattr(providers, "colocated"))
                 self.assertFalse(hasattr(providers, "target_backend"))
                 self.assertFalse(hasattr(providers, "deployment"))
+
+    def test_offline_consumer_provider_does_not_require_a_capture_layout(self):
+        provider = OfflineDataProvider(
+            modality="custom",
+            normalizer_id="custom_v1",
+            build_reader=lambda *args, **kwargs: None,
+            build_normalizer=lambda *args, **kwargs: None,
+            build_collator=lambda *args, **kwargs: None,
+        )
+
+        self.assertIsNone(provider.capture_layout)
 
     def test_draft_resolution_stays_outside_algorithm_spec(self):
         provider_fields = {field.name for field in fields(DraftConfigProvider)}
