@@ -33,41 +33,6 @@
 
 外部 fork PR 当前会运行 GitHub-hosted lint/package 检查，但不会自动获得自托管 GPU。若以后希望外部 fork 运行 GPU 测试，应优先提供一次性 Runner 或维护者审批后的隔离执行流程。
 
-### `tests/test_scripts/test_regenerate_train_data.py`
-
-这个文件验证真实 SGLang server 上的数据再生成链路。
-
-主要修改如下：
-
-1. 测试继续由普通 unittest discovery 自动发现并运行，不需要额外环境变量。
-2. 不再运行 `prepare_data.py --dataset sharegpt`，因此测试不依赖 Hugging Face 数据集网络访问。
-3. 测试在临时目录中生成一条本地 ShareGPT 格式 fixture，并在结束后自动清理。
-4. 输入规模缩小为一条样本、并发数缩小为 1；测试目标仍然是验证 server 启动、OpenAI API 请求、输出写入和进程清理。
-5. 不再只检查输出文件存在，还会解析输出并验证恰好生成一条 `status == "success"` 的记录。
-6. 保留 `--mem-frac=0.8`、动态端口、server 启动超时和进程组清理。
-
-手动运行命令：
-
-```bash
-python -m unittest tests.test_scripts.test_regenerate_train_data -v
-```
-
-### `tests/utils.py`
-
-这个文件提供测试共用的 subprocess 和 server readiness helper。
-
-主要修改如下：
-
-1. `execute_shell_command` 增加 `start_new_session`，让 SGLang server 和其子进程进入独立进程组。
-2. `wait_for_server` 可以接收 server process；如果进程在 readiness 完成前退出，测试会立即失败并报告退出码，而不是等待到超时。
-3. 新增 `terminate_process_group`，先向整个进程组发送 `SIGTERM`，超时后再发送 `SIGKILL`，避免只关闭父进程后留下 scheduler 子进程占用 GPU。
-
-这些 helper 不改变普通 subprocess 调用的默认行为；只有显式传入 `start_new_session=True` 的测试才使用进程组清理。
-
-### `tests/test_utils/test_process_utils.py`
-
-这个文件为上述 helper 提供不启动真实子进程的单元测试，验证新 session 参数、server 提前退出检测和进程组终止行为，防止后续重构重新引入 GPU 子进程泄漏。
-
 ### `.github/workflows/lint.yaml`
 
 这个文件负责快速的 GitHub-hosted 检查。
@@ -133,11 +98,9 @@ include = ["specforge*"]
 ## 已完成的验证
 
 - 所有 GitHub workflow 和 Dependabot 文件通过 YAML 解析。
-- `test_regenerate_train_data.py` 通过 Python 编译检查。
-- `test_process_utils` 和 `test_prepare_data` 共 14 个相关单元测试通过。
-- regeneration 测试通过；它会随普通 discovery 真实启动 SGLang server。
-- 真实 SGLang 1B server 成功生成一条记录；日志确认 `mem_fraction_static=0.8`，测试结束后没有 GPU compute process 遗留。
 - 干净源码快照成功构建 wheel 和 sdist；wheel 共 135 个条目，非 `specforge` 条目数量为 0。
 - `git diff --check` 通过。
+
+本次 PR 不修改 `tests/`；现有测试套件仍由 GPU workflow 的普通 unittest discovery 执行。
 
 没有执行正式 PyPI 发布。远程 H20 的 Node.js 是 v12，而文档 CI 明确使用 Node.js 20，因此文档的完整 npm/Sphinx 构建应由 GitHub-hosted workflow 验证。

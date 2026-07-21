@@ -1,5 +1,4 @@
 import os
-import signal
 import socket
 import subprocess
 import time
@@ -32,7 +31,6 @@ def execute_shell_command(
     disable_proxy: bool = False,
     enable_hf_mirror: bool = False,
     sglang_use_modelscope: bool = False,
-    start_new_session: bool = False,
 ):
     """Execute a shell command and return its process handle."""
     command = command.replace("\\\n", " ").replace("\\", " ")
@@ -54,19 +52,12 @@ def execute_shell_command(
     if sglang_use_modelscope:
         env["SGLANG_USE_MODELSCOPE"] = "true"
     return subprocess.Popen(
-        command.split(),
-        text=True,
-        stderr=subprocess.STDOUT,
-        env=env,
-        start_new_session=start_new_session,
+        command.split(), text=True, stderr=subprocess.STDOUT, env=env
     )
 
 
 def wait_for_server(
-    base_url: str,
-    timeout: int | None = None,
-    disable_proxy: bool = False,
-    process: subprocess.Popen | None = None,
+    base_url: str, timeout: int | None = None, disable_proxy: bool = False
 ) -> None:
     """Wait until a server's OpenAI-compatible models endpoint is ready."""
     started = time.perf_counter()
@@ -86,10 +77,6 @@ def wait_for_server(
 
     try:
         while True:
-            if process is not None and process.poll() is not None:
-                raise RuntimeError(
-                    f"Server process exited with code {process.returncode}"
-                )
             try:
                 response = requests.get(
                     f"{base_url}/v1/models",
@@ -110,20 +97,3 @@ def wait_for_server(
             time.sleep(1)
     finally:
         os.environ.update(saved_proxies)
-
-
-def terminate_process_group(process: subprocess.Popen, timeout: int = 30) -> None:
-    """Terminate a process started with ``start_new_session=True`` and its children."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=timeout)
