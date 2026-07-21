@@ -19,6 +19,7 @@ point:
 torchrun --standalone --nproc_per_node 8 \
   scripts/prepare_hidden_states.py \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model-config configs/llama3.1-8b-eagle3.json \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
   --chat-template llama3 \
@@ -28,7 +29,8 @@ torchrun --standalone --nproc_per_node 8 \
 ```
 
 The output directory now matches the hidden-state path in the checked-in
-recipe and contains the feature checkpoints consumed by the unified trainer.
+recipe. It contains the feature checkpoints consumed by the unified trainer
+and `vocab_mapping/vocab_mapping.pt`, derived from the same processed corpus.
 
 ## 3. Use the checked-in run config
 
@@ -50,7 +52,7 @@ no mapping.
 ```bash
 specforge train \
   --config examples/configs/llama3.1-8b-eagle3-offline.yaml \
-  model.vocab_mapping_path=
+  model.vocab_mapping_path=./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct/vocab_mapping/vocab_mapping.pt
 ```
 
 Omit the final override when the mapping file named by the recipe already
