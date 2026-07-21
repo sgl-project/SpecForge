@@ -1,8 +1,18 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from scripts.prepare_hidden_states import _resolve_capture_layers, build_target_model
+import torch
+
+from scripts.prepare_hidden_states import (
+    _generate_shared_vocab_mapping,
+    _resolve_capture_layers,
+    _resolve_draft_vocab_size,
+    build_target_model,
+)
 
 
 class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
@@ -53,6 +63,72 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
         self.assertNotIn("device", load.call_args.kwargs)
         self.assertNotIn("cache_dir", load.call_args.kwargs)
         target.set_capture_layers.assert_called_once_with([2, 7, 19])
+
+
+class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
+    def test_resolves_draft_vocab_size_from_local_json_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps({"vocab_size": 16, "draft_vocab_size": 8}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(_resolve_draft_vocab_size(str(config_path)), 8)
+
+    def test_rejects_directory_and_hugging_face_repo_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(FileNotFoundError, "local JSON file"):
+                _resolve_draft_vocab_size(directory)
+        with self.assertRaisesRegex(FileNotFoundError, "local JSON file"):
+            _resolve_draft_vocab_size("org/draft-model")
+
+    def test_resolves_vocab_size_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "draft.json"
+            config_path.write_text(json.dumps({"vocab_size": 16}), encoding="utf-8")
+
+            self.assertEqual(_resolve_draft_vocab_size(str(config_path)), 16)
+
+    def test_global_rank_zero_generates_fixed_mapping_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = Path(directory) / "vocab_mapping" / "vocab_mapping.pt"
+
+            def generate(**kwargs):
+                path = Path(kwargs["cache_dir"]) / f"{kwargs['cache_key']}.pt"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "d2t": torch.zeros(4, dtype=torch.long),
+                        "t2d": torch.zeros(8, dtype=torch.bool),
+                    },
+                    path,
+                )
+                return str(path)
+
+            with (
+                mock.patch(
+                    "scripts.prepare_hidden_states.generate_vocab_mapping_file",
+                    side_effect=generate,
+                ) as generate_mock,
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.get_rank", return_value=0
+                ),
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.broadcast_object_list"
+                ) as broadcast,
+            ):
+                actual = _generate_shared_vocab_mapping(
+                    object(),
+                    output_path=directory,
+                    target_vocab_size=8,
+                    draft_vocab_size=4,
+                )
+
+            self.assertEqual(actual, str(expected))
+            self.assertTrue(expected.is_file())
+            generate_mock.assert_called_once()
+            broadcast.assert_called_once()
 
 
 if __name__ == "__main__":
