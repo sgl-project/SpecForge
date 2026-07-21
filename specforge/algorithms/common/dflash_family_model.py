@@ -1074,7 +1074,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         if dist.is_available() and dist.is_initialized():
             world_size = dist.get_world_size()
-            dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
+            if world_size > 1:
+                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
         if float(global_loss_den) <= 0:
             raise ValueError("DSpark objective has no supervised target tokens")
         loss = (

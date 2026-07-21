@@ -473,8 +473,7 @@ def _managed_local_services(
                         else cfg.model.sglang_mem_fraction_static
                     ),
                     "sglang_attention_backend": (
-                        server.attention_backend
-                        or cfg.model.sglang_attention_backend
+                        server.attention_backend or cfg.model.sglang_attention_backend
                     ),
                 },
             )
