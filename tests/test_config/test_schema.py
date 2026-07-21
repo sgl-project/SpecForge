@@ -512,6 +512,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 },
                 "runtime": {
                     "producer_lease": 4,
+                    "producer_concurrency": 3,
                     "in_flight_high_watermark": 32,
                     "in_flight_low_watermark": 16,
                     "resident_high_watermark_bytes": 4096,
@@ -522,9 +523,11 @@ class ConfigSchemaTest(unittest.TestCase):
         )
         self.assertEqual(cfg.data.dataloader_num_workers, 3)
         self.assertEqual(cfg.profiling.num_steps, 5)
+        self.assertEqual(cfg.runtime.producer_concurrency, 3)
         self.assertEqual(cfg.runtime.in_flight_low_watermark, 16)
 
         invalid_runtime = (
+            {"producer_concurrency": 0},
             {
                 "in_flight_high_watermark": 4,
                 "in_flight_low_watermark": 5,
