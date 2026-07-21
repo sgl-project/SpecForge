@@ -262,6 +262,7 @@ For offline training, you can also use `--is-preformatted` when generating hidde
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --draft-model-config configs/llama3.1-8b-eagle3.json \
     --data-path ./your_preformatted_dataset.jsonl \
     --output-path ./cache/hidden_states \
     --chat-template llama3 \
