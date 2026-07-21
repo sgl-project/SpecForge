@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -94,6 +95,7 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    flex_block_size=None,
     sliding_window: Optional[int] = None,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
@@ -128,8 +130,17 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
+    kwargs = {}
+    if flex_block_size is not None:
+        kwargs["BLOCK_SIZE"] = flex_block_size
     return create_block_mask(
-        dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
+        dflash_mask_mod,
+        B=B,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
+        **kwargs,
     )
 
 
@@ -309,6 +320,12 @@ class OnlineDFlashModel(nn.Module):
             "block_size": self.block_size,
             "device": device,
         }
+        if (
+            self.attention_backend == "flex_attention"
+            and flex_attention_backend() == "FLASH"
+        ):
+            # FLASH requires a minimum of this block size.
+            mask_args["flex_block_size"] = (256, 128)
         full_attn_mask = mask_builder(**mask_args)
         sliding_window = self.draft_model.sliding_window
         dflash_attn_mask = full_attn_mask

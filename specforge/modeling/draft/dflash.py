@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
+from transformers.integrations.flex_attention import compile_friendly_flex_attention
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
@@ -18,6 +19,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Tuple, Unpack
 
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
+from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
 
 FULL_ATTENTION = "full_attention"
@@ -114,6 +116,10 @@ class Qwen3DFlashAttention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        if config._attn_implementation == "flex_attention":
+            assert (
+                config.attention_dropout == 0.0
+            ), "DFlash FlexAttention requires attention_dropout=0.0"
         self.is_causal = False
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -176,27 +182,44 @@ class Qwen3DFlashAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         valid_queries = None
-        attn_fn: Callable = eager_attention_forward
-        if self.config._attn_implementation == "eager":
-            attention_mask, valid_queries = _prepare_dflash_eager_mask(
-                attention_mask,
-                q.dtype,
-            )
+        if self.config._attn_implementation == "flex_attention":
+            kernel_options = dict(kwargs.pop("kernel_options", None) or {})
+            backend = flex_attention_backend()
+            if backend is not None:
+                kernel_options["BACKEND"] = backend
+
+            attn_output = compile_friendly_flex_attention(
+                q,
+                k,
+                v,
+                block_mask=attention_mask,
+                enable_gqa=True,
+                scale=self.scaling,
+                kernel_options=kernel_options or None,
+            ).transpose(1, 2)
+            attn_weights = None
         else:
-            attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attn_output, attn_weights = attn_fn(
-            self,
-            q,
-            k,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
-        if valid_queries is not None and attn_weights is not None:
-            attn_weights = attn_weights.masked_fill(~valid_queries, 0)
+            attn_fn: Callable = eager_attention_forward
+            if self.config._attn_implementation == "eager":
+                attention_mask, valid_queries = _prepare_dflash_eager_mask(
+                    attention_mask,
+                    q.dtype,
+                )
+            else:
+                attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attn_output, attn_weights = attn_fn(
+                self,
+                q,
+                k,
+                v,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
+            if valid_queries is not None and attn_weights is not None:
+                attn_weights = attn_weights.masked_fill(~valid_queries, 0)
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
         if valid_queries is not None:
