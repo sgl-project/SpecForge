@@ -1,0 +1,206 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">SpecForge online-disaggregated training architecture</title>
+  <desc id="desc">Training prompts flow through a producer controller into multiple SGLang capture servers. Sample references travel through a metadata control plane, while feature tensors travel through Mooncake. The consumer coordinator and feature loader feed distributed trainer ranks, which return optimizer acknowledgements and backpressure.</desc>
+
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8FBFF"/>
+      <stop offset="1" stop-color="#F7F5FF"/>
+    </linearGradient>
+    <linearGradient id="producerGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="trainerGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#EC4899"/>
+    </linearGradient>
+    <linearGradient id="storeGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10B981"/>
+      <stop offset="1" stop-color="#22C55E"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#172554" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L11,5.5 L0,11 Z" fill="#2563EB"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L11,5.5 L0,11 Z" fill="#F59E0B"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L11,5.5 L0,11 Z" fill="#10B981"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L11,5.5 L0,11 Z" fill="#7C3AED"/>
+    </marker>
+    <marker id="arrowPink" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L11,5.5 L0,11 Z" fill="#EC4899"/>
+    </marker>
+    <style>
+      .font { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { font-size: 32px; font-weight: 750; fill: #172554; }
+      .subtitle { font-size: 17px; fill: #64748B; }
+      .pool-title { font-size: 19px; font-weight: 750; letter-spacing: 0.02em; }
+      .card-title { font-size: 19px; font-weight: 720; }
+      .card-text { font-size: 15px; fill: #64748B; }
+      .small-title { font-size: 15px; font-weight: 700; }
+      .small-text { font-size: 13px; fill: #64748B; }
+      .edge-label { font-size: 14px; font-weight: 650; }
+      .legend { font-size: 14px; fill: #475569; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" rx="28" fill="url(#background)"/>
+
+  <g class="font">
+    <text x="70" y="64" class="title">SpecForge Online-Disaggregated Training</text>
+    <text x="70" y="94" class="subtitle">Independent inference and training pools connected by metadata and tensor data planes</text>
+
+    <!-- Pool backgrounds -->
+    <rect x="48" y="135" width="620" height="600" rx="28" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+    <rect x="932" y="135" width="620" height="600" rx="28" fill="#F5F3FF" stroke="#DDD6FE" stroke-width="2"/>
+
+    <g>
+      <rect x="76" y="158" width="260" height="38" rx="19" fill="#DBEAFE"/>
+      <circle cx="98" cy="177" r="7" fill="#2563EB"/>
+      <text x="116" y="183" class="pool-title" fill="#1E40AF">Inference / Producer Pool</text>
+    </g>
+    <g>
+      <rect x="960" y="158" width="258" height="38" rx="19" fill="#EDE9FE"/>
+      <circle cx="982" cy="177" r="7" fill="#7C3AED"/>
+      <text x="1000" y="183" class="pool-title" fill="#5B21B6">Training / Consumer Pool</text>
+    </g>
+
+    <!-- Producer-side cards -->
+    <g filter="url(#shadow)">
+      <rect x="76" y="310" width="145" height="112" rx="20" fill="#FFFFFF" stroke="#FCD34D" stroke-width="2"/>
+      <circle cx="148" cy="342" r="14" fill="#FEF3C7"/>
+      <path d="M141 342h14M148 335v14" stroke="#D97706" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="148" y="379" text-anchor="middle" class="card-title" fill="#92400E">Training</text>
+      <text x="148" y="400" text-anchor="middle" class="card-text">prompts</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="267" y="282" width="175" height="168" rx="22" fill="#FFFFFF" stroke="#93C5FD" stroke-width="2"/>
+      <rect x="292" y="304" width="48" height="48" rx="14" fill="#DBEAFE"/>
+      <path d="M305 328h22M316 317v22" stroke="#2563EB" stroke-width="3" stroke-linecap="round"/>
+      <text x="292" y="382" class="card-title" fill="#1E3A8A">Producer</text>
+      <text x="292" y="405" class="card-title" fill="#1E3A8A">controller</text>
+      <text x="292" y="428" class="small-text">leases prompts</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="488" y="228" width="150" height="278" rx="22" fill="#FFFFFF" stroke="#67E8F9" stroke-width="2"/>
+      <text x="563" y="260" text-anchor="middle" class="small-title" fill="#0E7490">SGLang capture pool</text>
+
+      <rect x="509" y="280" width="108" height="54" rx="13" fill="#ECFEFF" stroke="#A5F3FC"/>
+      <circle cx="530" cy="307" r="8" fill="#06B6D4"/>
+      <text x="547" y="312" class="small-title" fill="#155E75">Server 0</text>
+
+      <rect x="509" y="347" width="108" height="54" rx="13" fill="#ECFEFF" stroke="#A5F3FC"/>
+      <circle cx="530" cy="374" r="8" fill="#06B6D4"/>
+      <text x="547" y="379" class="small-title" fill="#155E75">Server 1</text>
+
+      <rect x="509" y="414" width="108" height="54" rx="13" fill="#ECFEFF" stroke="#A5F3FC"/>
+      <circle cx="530" cy="441" r="8" fill="#06B6D4"/>
+      <text x="547" y="446" class="small-title" fill="#155E75">Server N</text>
+
+      <text x="563" y="490" text-anchor="middle" class="small-text">target feature capture</text>
+    </g>
+
+    <!-- Bridge cards -->
+    <g filter="url(#shadow)">
+      <rect x="708" y="224" width="178" height="118" rx="22" fill="#FFFBEB" stroke="#FBBF24" stroke-width="2"/>
+      <rect x="731" y="246" width="46" height="34" rx="10" fill="#FEF3C7"/>
+      <path d="M740 257h28M740 266h20" stroke="#D97706" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="731" y="307" class="card-title" fill="#92400E">SampleRef</text>
+      <text x="731" y="327" class="small-text">metadata stream</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="708" y="461" width="178" height="132" rx="22" fill="#ECFDF5" stroke="#34D399" stroke-width="2"/>
+      <ellipse cx="751" cy="491" rx="22" ry="10" fill="#A7F3D0" stroke="#059669" stroke-width="2"/>
+      <path d="M729 491v25c0 6 10 10 22 10s22-4 22-10v-25M729 503c0 6 10 10 22 10s22-4 22-10" fill="none" stroke="#059669" stroke-width="2"/>
+      <text x="731" y="554" class="card-title" fill="#065F46">Mooncake</text>
+      <text x="731" y="575" class="small-text">feature tensors</text>
+    </g>
+
+    <!-- Consumer-side cards -->
+    <g filter="url(#shadow)">
+      <rect x="964" y="222" width="222" height="154" rx="22" fill="#FFFFFF" stroke="#C4B5FD" stroke-width="2"/>
+      <rect x="988" y="245" width="44" height="44" rx="13" fill="#EDE9FE"/>
+      <path d="M999 256h22v22h-22zM1004 263h12M1004 270h8" fill="none" stroke="#7C3AED" stroke-width="2" stroke-linecap="round"/>
+      <text x="988" y="319" class="card-title" fill="#4C1D95">Consumer coordinator</text>
+      <text x="988" y="342" class="small-text">RefDistributor · rank 0</text>
+      <text x="988" y="361" class="small-text">durable SQLite ledger</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="964" y="455" width="222" height="138" rx="22" fill="#FFFFFF" stroke="#86EFAC" stroke-width="2"/>
+      <rect x="988" y="478" width="44" height="44" rx="13" fill="#DCFCE7"/>
+      <path d="M999 489h22M999 497h16M999 505h19" stroke="#16A34A" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="988" y="552" class="card-title" fill="#14532D">FeatureDataLoader</text>
+      <text x="988" y="575" class="small-text">refs + tensors → TrainBatch</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="1242" y="298" width="270" height="224" rx="24" fill="url(#trainerGradient)"/>
+      <text x="1270" y="335" class="card-title" fill="#FFFFFF">Distributed trainer pool</text>
+
+      <rect x="1270" y="358" width="214" height="48" rx="13" fill="#FFFFFF" fill-opacity="0.16" stroke="#FFFFFF" stroke-opacity="0.35"/>
+      <circle cx="1293" cy="382" r="7" fill="#FDE68A"/>
+      <text x="1310" y="388" class="small-title" fill="#FFFFFF">Trainer rank 0</text>
+
+      <rect x="1270" y="417" width="214" height="48" rx="13" fill="#FFFFFF" fill-opacity="0.16" stroke="#FFFFFF" stroke-opacity="0.35"/>
+      <circle cx="1293" cy="441" r="7" fill="#A7F3D0"/>
+      <text x="1310" y="447" class="small-title" fill="#FFFFFF">Trainer rank 1</text>
+
+      <text x="1377" y="491" text-anchor="middle" class="small-title" fill="#F5F3FF">… Trainer rank N</text>
+    </g>
+
+    <g>
+      <rect x="1242" y="565" width="270" height="74" rx="20" fill="#FDF2F8" stroke="#F9A8D4" stroke-width="2"/>
+      <circle cx="1273" cy="602" r="15" fill="#FCE7F3"/>
+      <path d="M1266 602l5 5 10-12" fill="none" stroke="#DB2777" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="1300" y="598" class="small-title" fill="#9D174D">Optimizer-boundary ACK</text>
+      <text x="1300" y="618" class="small-text">commit · release · advance</text>
+    </g>
+
+    <!-- Main arrows -->
+    <path d="M221 366H257" fill="none" stroke="#D97706" stroke-width="4" marker-end="url(#arrowOrange)"/>
+    <path d="M442 366H478" fill="none" stroke="#2563EB" stroke-width="4" marker-end="url(#arrowBlue)"/>
+
+    <path d="M638 288H698" fill="none" stroke="#F59E0B" stroke-width="4" marker-end="url(#arrowOrange)"/>
+    <text x="668" y="273" text-anchor="middle" class="edge-label" fill="#B45309">refs</text>
+    <path d="M886 283H954" fill="none" stroke="#F59E0B" stroke-width="4" marker-end="url(#arrowOrange)"/>
+
+    <path d="M638 448C668 448 674 527 698 527" fill="none" stroke="#10B981" stroke-width="4" marker-end="url(#arrowGreen)"/>
+    <text x="666" y="477" text-anchor="middle" class="edge-label" fill="#047857">tensors</text>
+    <path d="M886 527H954" fill="none" stroke="#10B981" stroke-width="4" marker-end="url(#arrowGreen)"/>
+    <text x="920" y="512" text-anchor="middle" class="edge-label" fill="#047857">fetch</text>
+
+    <path d="M1075 376V445" fill="none" stroke="#7C3AED" stroke-width="4" marker-end="url(#arrowPurple)"/>
+    <text x="1090" y="415" class="edge-label" fill="#6D28D9">refs</text>
+    <path d="M1186 524H1210C1227 524 1222 410 1232 410" fill="none" stroke="#7C3AED" stroke-width="4" marker-end="url(#arrowPurple)"/>
+    <path d="M1377 522V555" fill="none" stroke="#EC4899" stroke-width="4" marker-end="url(#arrowPink)"/>
+
+    <!-- Feedback path -->
+    <path d="M1242 602H1218V686H354V460" fill="none" stroke="#EC4899" stroke-width="3" stroke-dasharray="10 9" marker-end="url(#arrowPink)"/>
+    <rect x="663" y="666" width="254" height="39" rx="19" fill="#FDF2F8" stroke="#FBCFE8"/>
+    <text x="790" y="691" text-anchor="middle" class="edge-label" fill="#BE185D">ACK + backpressure feedback</text>
+
+    <!-- Legend -->
+    <g transform="translate(72 790)">
+      <text x="0" y="6" class="small-title" fill="#334155">Data paths</text>
+      <line x1="96" y1="0" x2="138" y2="0" stroke="#F59E0B" stroke-width="4"/>
+      <text x="149" y="6" class="legend">metadata control plane</text>
+      <line x1="340" y1="0" x2="382" y2="0" stroke="#10B981" stroke-width="4"/>
+      <text x="393" y="6" class="legend">tensor data plane</text>
+      <line x1="548" y1="0" x2="590" y2="0" stroke="#EC4899" stroke-width="3" stroke-dasharray="8 7"/>
+      <text x="601" y="6" class="legend">lifecycle feedback</text>
+    </g>
+
+    <text x="800" y="852" text-anchor="middle" class="subtitle">Large tensors stay in Mooncake; only lightweight references and lifecycle state cross the control plane.</text>
+  </g>
+</svg>
