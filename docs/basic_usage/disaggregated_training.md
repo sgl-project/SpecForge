@@ -317,9 +317,10 @@ The online producer sends prompts to the URLs in
 with the model, capture method, and auxiliary layer ids matching the draft
 config. DFlash, Domino, and DSpark use the DFlash capture contract; EAGLE3 and
 P-EAGLE use the EAGLE3 capture contract. Capture rejects chunked prefill and
-radix-cache paths that can truncate the captured sequence. Online capture is
-text-only: VLM training, including Qwen2.5-VL, is not supported. Online
-evaluation is also not supported.
+gives every request attempt a unique radix-cache namespace so cached prefixes
+cannot truncate the captured sequence. Online capture is text-only: VLM
+training, including Qwen2.5-VL, is not supported. Online evaluation is also not
+supported.
 
 The repository's strict e2e gate remains a full local test-stack orchestrator:
 
@@ -394,8 +395,8 @@ deployment:
 ```
 
 Both paths must be visible at the same location from producer and consumer
-nodes. The producer ingests existing EAGLE3, DFlash, or Domino features and
-publishes a fixed manifest. Offline epochs remain re-iterable.
+nodes. The producer ingests existing EAGLE3, DFlash, Domino, or DSpark features
+and publishes a fixed manifest. Offline epochs remain re-iterable.
 
 Set `backend: mooncake` instead, omit `store_root`, and provide the Mooncake
 endpoints to use the remote store. Also set a positive

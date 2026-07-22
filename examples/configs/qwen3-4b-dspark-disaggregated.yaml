@@ -17,6 +17,8 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1.0
   num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
   save_interval: 1000
   dist_timeout: 30
   seed: 42

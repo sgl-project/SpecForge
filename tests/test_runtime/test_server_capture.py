@@ -326,10 +326,13 @@ class TestServerCaptureAdapter(unittest.TestCase):
             request["sampling_params"],
         )
         self.assertEqual(2, len(request["spec_capture"]))
+        self.assertEqual(2, len(request["extra_key"]))
+        self.assertEqual(2, len(set(request["extra_key"])))
+        self.assertTrue(all(len(value) == 32 for value in request["extra_key"]))
 
     def test_generic_adapter_cannot_override_runtime_owned_request_fields(self):
         task = _task(0, 4)
-        for reserved_field in ("sampling_params", "spec_capture"):
+        for reserved_field in ("extra_key", "sampling_params", "spec_capture"):
             with self.subTest(field=reserved_field):
                 input_adapter = _GenericRequestInputAdapter(
                     {
@@ -558,9 +561,11 @@ class TestServerCaptureAdapter(unittest.TestCase):
         )
         original_post = adapter.post_fn
         requests = []
+        cache_keys = []
 
         def lose_first_response(url, json_body, timeout):
             requests.append(json_body["spec_capture"][0])
+            cache_keys.append(json_body["extra_key"][0])
             response = original_post(url, json_body, timeout)
             if len(requests) == 1:
                 raise ConnectionError("response lost after server write")
@@ -584,6 +589,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
         self.assertEqual(1, ref.metadata["generation"])
         self.assertEqual([False, True], [request["replace"] for request in requests])
+        self.assertNotEqual(cache_keys[0], cache_keys[1])
         self.assertEqual(0, store.discard_external_attempts())
         self.assertTrue(all("/g1/" in key for key in backend._d))
         self.assertFalse(any("/g2/" in key for key in backend._d))
