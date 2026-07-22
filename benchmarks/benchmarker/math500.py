@@ -12,6 +12,22 @@ from .registry import BENCHMARKS
 from .utils import create_simple_sgl_function
 
 
+def get_one_example(lines: List[Dict], i: int, include_answer: bool) -> str:
+    """Format a single example."""
+    ret = "Question: " + lines[i]["problem"] + "\nAnswer:"
+    if include_answer:
+        ret += " " + lines[i]["solution"]
+    return ret
+
+
+def get_few_shot_examples(lines: List[Dict], k: int) -> str:
+    """Get few-shot examples as a string."""
+    ret = ""
+    for i in range(k):
+        ret += get_one_example(lines, i, True) + "\n\n"
+    return ret
+
+
 def extract_math_answer(output: str) -> Optional[str]:
     """Extract final answer from math problem solution.
 
@@ -61,6 +77,12 @@ class Math500Benchmarker(Benchmarker):
         dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
         questions = []
         labels = []
+
+        # Construct prompts
+        few_shot_examples = get_few_shot_examples(list(dataset), 3)
+
+        self.few_shot_examples = few_shot_examples
+
         for idx, q in enumerate(dataset):
             if self.num_samples is not None and idx >= self.num_samples:
                 break
