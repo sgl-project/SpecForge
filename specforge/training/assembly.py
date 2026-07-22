@@ -247,6 +247,16 @@ class _ConfiguredOptimizerFactory:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.total_steps = cfg.training.total_steps or cfg.training.max_steps
+        self.muon_metadata = None
+
+    def capture_parameter_metadata(self, draft_module) -> None:
+        """Record logical matrix shapes before FSDP exposes local shards."""
+
+        if self.cfg.training.optimizer != "muon":
+            return
+        from specforge.muon import capture_muon_parameter_metadata
+
+        self.muon_metadata = capture_muon_parameter_metadata(draft_module)
 
     def configure_total_steps(self, total_steps: int) -> None:
         if self.total_steps is None:
@@ -266,10 +276,19 @@ class _ConfiguredOptimizerFactory:
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
+            weight_decay=t.weight_decay,
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
+            optimizer_type=t.optimizer,
+            muon_lr=t.muon_learning_rate,
+            muon_weight_decay=t.muon_weight_decay,
+            muon_momentum=t.muon_momentum,
+            muon_nesterov=t.muon_nesterov,
+            muon_ns_steps=t.muon_ns_steps,
+            muon_adjust_lr_fn=t.muon_adjust_lr_fn,
+            muon_metadata=self.muon_metadata,
         )
 
 

@@ -486,12 +486,21 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    optimizer: Literal["adamw", "muon"] = "adamw"
     learning_rate: float = Field(default=1e-4, gt=0.0)
+    weight_decay: float = Field(default=0.0, ge=0.0)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False
+    #: Muon updates hidden linear matrices; auxiliary tensors stay on AdamW.
+    muon_learning_rate: Optional[float] = Field(default=None, gt=0.0)
+    muon_weight_decay: float = Field(default=0.1, ge=0.0)
+    muon_momentum: float = Field(default=0.95, ge=0.0, lt=1.0)
+    muon_nesterov: bool = True
+    muon_ns_steps: int = Field(default=5, gt=0, lt=100)
+    muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] = "match_rms_adamw"
     ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
@@ -548,6 +557,10 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.optimizer == "muon" and self.optimizer_cpu_offload:
+            raise ValueError(
+                "training.optimizer_cpu_offload is not supported with Muon"
+            )
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:
