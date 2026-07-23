@@ -209,7 +209,13 @@ class MooncakeFeatureStore(FeatureStore):
         _require_store_api(store)
         self._store = store
         put_config.replica_num = replica_num
-        put_config.with_hard_pin = hard_pin
+        # `with_hard_pin` exists only on newer Mooncake builds; older ROCm
+        # images expose only `with_soft_pin`. Map the hard-pin intent onto
+        # whichever pin the installed build supports.
+        if hasattr(put_config, "with_hard_pin"):
+            put_config.with_hard_pin = hard_pin
+        elif hasattr(put_config, "with_soft_pin"):
+            put_config.with_soft_pin = hard_pin
         self._put_config = put_config
         self.max_resident_bytes = max_resident_bytes
         self.max_hold_age_s = max_hold_age_s
