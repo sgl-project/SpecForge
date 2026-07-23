@@ -368,7 +368,7 @@ new file mode 100644
 index 000000000..d317b2801
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,237 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -473,7 +473,13 @@ index 000000000..d317b2801
 +            # before the trainer consumes it.
 +            cfg = ReplicateConfig()
 +            cfg.replica_num = 1
-+            cfg.with_hard_pin = True
++            # `with_hard_pin` exists only on newer Mooncake builds; older ROCm
++            # sglang images expose only `with_soft_pin`. Map the hard-pin intent
++            # onto whatever the installed build supports.
++            if hasattr(cfg, "with_hard_pin"):
++                cfg.with_hard_pin = True
++            elif hasattr(cfg, "with_soft_pin"):
++                cfg.with_soft_pin = True
 +            self._put_config = cfg
 +            self._store = store
 +            logger.info("spec-capture mooncake sink connected")
