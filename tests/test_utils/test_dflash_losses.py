@@ -7,6 +7,7 @@ They still exercise the online wrappers: anchor sampling, draft
 output, and LM head output are made deterministic.
 """
 
+import copy
 import importlib.util
 import sys
 import types
@@ -106,6 +107,26 @@ class _FixedDSparkDraft(_FixedDraft):
         return self.confidence_logits.to(device=hidden_states.device)
 
 
+class _LearnableDSparkDraft(_FixedDraft):
+    def __init__(self, hidden_size: int):
+        super().__init__(hidden_size)
+        self.signal = nn.Parameter(torch.linspace(-0.2, 0.2, hidden_size))
+        self.confidence_head = nn.Identity()
+
+    def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
+        del position_ids, target_hidden, attention_mask
+        bsz, draft_len = noise_embedding.shape[:2]
+        return self.signal.view(1, 1, -1).expand(bsz, draft_len, -1)
+
+    def apply_logits_head(self, base_logits, prev_token_ids, hidden_states):
+        del prev_token_ids, hidden_states
+        return base_logits
+
+    def predict_confidence(self, hidden_states, prev_token_ids=None):
+        del prev_token_ids
+        return hidden_states[..., 0]
+
+
 class _FixedHead(nn.Module):
     def __init__(self, logits: torch.Tensor):
         super().__init__()
@@ -120,9 +141,12 @@ class _DualFixedHead(nn.Module):
         super().__init__()
         self.register_buffer("draft_logits", draft_logits)
         self.register_buffer("target_logits", target_logits)
+        self._calls = 0
 
     def forward(self, hidden_states):
-        if hidden_states.ndim == 4:
+        use_target = self._calls % 2 == 1
+        self._calls += 1
+        if use_target:
             return self.target_logits.to(device=hidden_states.device)
         bsz, n_blocks, block_size, vocab_size = self.draft_logits.shape
         return self.draft_logits.reshape(bsz, n_blocks * block_size, vocab_size).to(
@@ -394,6 +418,76 @@ class TestDFlashLosses(unittest.TestCase):
         high_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.9)
         self.assertNotAlmostEqual(low_alpha.item(), high_alpha.item(), places=8)
 
+    def test_dflash_family_chunking_matches_full_loss_metrics_and_gradients(self):
+        for loss_type in (
+            "dflash",
+            "dpace",
+            "dpace-cumulative-confidence-only",
+            "dpace-continuation-value-only",
+        ):
+            with self.subTest(loss_type=loss_type):
+                torch.manual_seed(77)
+                head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+                full = _make_model(
+                    self.logits,
+                    self.anchors,
+                    self.keep_mask,
+                    draft_model=_LearnableDSparkDraft(4).double(),
+                    lm_head=head,
+                    loss_type=loss_type,
+                    loss_decay_gamma=3.0,
+                    objective_chunk_blocks=0,
+                )
+                chunked = _make_model(
+                    self.logits,
+                    self.anchors,
+                    self.keep_mask,
+                    draft_model=_LearnableDSparkDraft(4).double(),
+                    lm_head=copy.deepcopy(head),
+                    loss_type=loss_type,
+                    loss_decay_gamma=3.0,
+                    objective_chunk_blocks=1,
+                )
+                chunked.load_state_dict(full.state_dict())
+
+                full_loss, full_accuracy, full_metrics = full(
+                    input_ids=self.input_ids,
+                    hidden_states=self.hidden_states,
+                    loss_mask=self.loss_mask,
+                )
+                chunked_loss, chunked_accuracy, chunked_metrics = chunked(
+                    input_ids=self.input_ids,
+                    hidden_states=self.hidden_states,
+                    loss_mask=self.loss_mask,
+                )
+
+                torch.testing.assert_close(
+                    chunked_loss,
+                    full_loss,
+                    rtol=1e-6,
+                    atol=1e-8,
+                )
+                torch.testing.assert_close(chunked_accuracy, full_accuracy)
+                torch.testing.assert_close(
+                    chunked_metrics["accuracy_denom"],
+                    full_metrics["accuracy_denom"],
+                )
+
+                full_loss.backward()
+                chunked_loss.backward()
+                torch.testing.assert_close(
+                    chunked.draft_model.signal.grad,
+                    full.draft_model.signal.grad,
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+                torch.testing.assert_close(
+                    chunked.lm_head.weight.grad,
+                    full.lm_head.weight.grad,
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+
     def test_invalid_loss_type_rejected(self):
         with self.assertRaisesRegex(ValueError, "loss_type"):
             _make_model(
@@ -443,8 +537,12 @@ class TestDFlashLosses(unittest.TestCase):
         )
         neg_log_q = _neg_log_q(self.logits, targets)
         weights = eval_mask.double()
-        want = (neg_log_q * weights).sum() / (weights.sum() + 1e-6)
-        torch.testing.assert_close(loss, want, rtol=0, atol=1e-6)
+        want = (neg_log_q * weights).sum() / weights.sum()
+        torch.testing.assert_close(loss, want, rtol=0, atol=1e-10)
+        acc_num, acc_den = _metrics["ratio_metrics"]["acc"]
+        torch.testing.assert_close(acc_den, weights.sum().float())
+        torch.testing.assert_close(accuracy, acc_num / acc_den)
+        self.assertIn("ce_position", _metrics["ratio_metrics"])
 
     def test_dspark_ce_only_skips_target_distribution(self):
         target_logits = torch.randn_like(self.logits)
@@ -468,7 +566,7 @@ class TestDFlashLosses(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(loss))
 
-    def test_dspark_l1_and_confidence_match_reference(self):
+    def test_dspark_l1_and_confidence_match_token_pooled_objective(self):
         torch.manual_seed(321)
         target_logits = torch.randn_like(self.logits)
         confidence_logits = torch.randn(
@@ -504,33 +602,38 @@ class TestDFlashLosses(unittest.TestCase):
             self.logits.shape[2],
         )
         weights = eval_mask.double()
-        ce = (_neg_log_q(self.logits, targets) * weights).sum() / (weights.sum() + 1e-6)
+        denominator = weights.sum()
+        ce = (_neg_log_q(self.logits, targets) * weights).sum() / denominator
         draft_probs = torch.softmax(self.logits.float(), dim=-1)
         target_probs = torch.softmax(target_logits.float(), dim=-1)
         l1_dist = (draft_probs - target_probs).abs().sum(dim=-1).double()
-        l1 = (l1_dist * weights).sum() / (weights.sum() + 1e-6)
+        l1 = (l1_dist * weights).sum() / denominator
         accept_rate = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0)
         conf = F.binary_cross_entropy_with_logits(
             confidence_logits.float(),
             accept_rate.float(),
             reduction="none",
         ).double()
-        conf = (conf * weights).sum() / (weights.sum() + 1e-6)
+        conf = (conf * weights).sum() / denominator
         want = 0.1 * ce + 0.9 * l1 + conf
         torch.testing.assert_close(loss, want, rtol=0, atol=1e-6)
-        torch.testing.assert_close(metrics["ce_loss"], ce, rtol=0, atol=1e-6)
+        ratio_metrics = metrics["ratio_metrics"]
+        ce_num, ce_den = ratio_metrics["ce_loss"]
+        l1_num, l1_den = ratio_metrics["l1_loss"]
+        confidence_num, confidence_den = ratio_metrics["confidence_loss"]
+        torch.testing.assert_close(ce_num / ce_den, ce, rtol=0, atol=1e-6)
         torch.testing.assert_close(
-            metrics["l1_loss"], l1, rtol=0, atol=1e-6, check_dtype=False
+            l1_num / l1_den, l1, rtol=0, atol=1e-6, check_dtype=False
         )
         torch.testing.assert_close(
-            metrics["confidence_loss"],
+            confidence_num / confidence_den,
             conf,
             rtol=0,
             atol=1e-6,
             check_dtype=False,
         )
 
-    def test_dspark_requires_target_logits_for_l1_or_confidence(self):
+    def test_dspark_requires_target_hidden_states_for_l1_or_confidence(self):
         model = _make_dspark_model(
             self.logits,
             self.anchors,
@@ -545,6 +648,130 @@ class TestDFlashLosses(unittest.TestCase):
                 hidden_states=self.hidden_states,
                 loss_mask=self.loss_mask,
             )
+
+    def test_dspark_chunking_matches_full_loss_and_gradient(self):
+        torch.manual_seed(99)
+        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+        full = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=head,
+            dspark_ce_loss_alpha=0.1,
+            dspark_l1_loss_alpha=0.9,
+            dspark_confidence_head_alpha=1.0,
+            objective_chunk_blocks=0,
+        )
+        chunked = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=copy.deepcopy(head),
+            dspark_ce_loss_alpha=0.1,
+            dspark_l1_loss_alpha=0.9,
+            dspark_confidence_head_alpha=1.0,
+            objective_chunk_blocks=1,
+        )
+        chunked.load_state_dict(full.state_dict())
+        target_hidden = torch.randn_like(self.hidden_states)
+
+        full_loss, _full_acc, full_metrics = full(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=target_hidden,
+        )
+        chunked_loss, _chunked_acc, chunked_metrics = chunked(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=target_hidden,
+        )
+        torch.testing.assert_close(chunked_loss, full_loss, rtol=1e-6, atol=1e-8)
+        for name, full_pair in full_metrics["ratio_metrics"].items():
+            chunked_pair = chunked_metrics["ratio_metrics"][name]
+            torch.testing.assert_close(chunked_pair[0], full_pair[0])
+            torch.testing.assert_close(chunked_pair[1], full_pair[1])
+
+        full_loss.backward()
+        chunked_loss.backward()
+        torch.testing.assert_close(
+            chunked.draft_model.signal.grad,
+            full.draft_model.signal.grad,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+    def test_dspark_ce_only_chunking_recomputes(self):
+        torch.manual_seed(101)
+        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+        full = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=head,
+            dspark_ce_loss_alpha=1.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+            objective_chunk_blocks=0,
+        )
+        chunked = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=copy.deepcopy(head),
+            dspark_ce_loss_alpha=1.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+            objective_chunk_blocks=1,
+        )
+        chunked.load_state_dict(full.state_dict())
+
+        full_loss, _full_acc, _full_metrics = full(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
+        chunked_loss, _chunked_acc, _chunked_metrics = chunked(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
+        torch.testing.assert_close(chunked_loss, full_loss, rtol=1e-6, atol=1e-8)
+        full_loss.backward()
+        chunked_loss.backward()
+        torch.testing.assert_close(
+            chunked.draft_model.signal.grad,
+            full.draft_model.signal.grad,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+    def test_dspark_sampler_keeps_sparse_high_index_anchor(self):
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+        )
+        model.num_anchors = 2
+        sparse_mask = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            ]
+        )
+        anchors, keep = OnlineDSparkModel._sample_anchor_positions(
+            model,
+            seq_len=6,
+            loss_mask=sparse_mask,
+            device=sparse_mask.device,
+        )
+        self.assertEqual(anchors[0, 0].item(), 4)
+        self.assertEqual(keep[0].tolist(), [True, False])
 
 
 if __name__ == "__main__":

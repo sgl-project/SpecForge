@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from specforge.algorithms.common.defaults import (
     empty_options,
     no_missing_checkpoint_keys,
 )
-from specforge.algorithms.common.dflash_family_data import build_dspark_collator
+from specforge.algorithms.common.dflash_family_data import (
+    DSPARK_NORMALIZER_ID,
+    build_dspark_collator,
+    build_dspark_offline_normalizer,
+    build_dspark_offline_reader,
+)
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
     ModelProvider,
+    OfflineCaptureLayout,
+    OfflineDataProvider,
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
@@ -22,6 +31,7 @@ from specforge.algorithms.contracts import (
     DraftRequirement,
     FeatureContract,
     FeatureMode,
+    OfflineStorageContract,
 )
 
 ALGORITHM_NAME = "dspark"
@@ -93,6 +103,12 @@ def needs_input_tools(config, draft_model):
 
 
 def algorithm_spec() -> AlgorithmSpec:
+    ready = {
+        "input_ids",
+        "loss_mask",
+        "hidden_states",
+        "target_last_hidden_states",
+    }
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
@@ -101,14 +117,21 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         feature_contracts=(
             FeatureContract(
+                mode=FeatureMode.OFFLINE,
+                modality="text",
+                required_tensors=ready,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+                storage=OfflineStorageContract(
+                    format="specforge_hidden_states_v1",
+                    required_tensors=ready,
+                    normalizer=DSPARK_NORMALIZER_ID,
+                ),
+            ),
+            FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="text",
-                required_tensors={
-                    "input_ids",
-                    "loss_mask",
-                    "hidden_states",
-                    "target_last_hidden_states",
-                },
+                required_tensors=ready,
                 allowed_target_representations={"hidden_state"},
                 default_target_representation="hidden_state",
             ),
@@ -140,6 +163,24 @@ def algorithm_providers() -> AlgorithmProviders:
             minimum_loss_tokens=minimum_loss_tokens,
             needs_input_tools=needs_input_tools,
             default_dataloader_num_workers=8,
+        ),
+        offline=(
+            OfflineDataProvider(
+                modality="text",
+                normalizer_id=DSPARK_NORMALIZER_ID,
+                capture_layout=OfflineCaptureLayout(
+                    capture_method="dflash",
+                    aux_feature="hidden_states",
+                    last_hidden_feature="target_last_hidden_states",
+                    passthrough=(
+                        ("input_ids", "input_ids"),
+                        ("loss_mask", "loss_mask"),
+                    ),
+                ),
+                build_reader=partial(build_dspark_offline_reader, ALGORITHM_NAME),
+                build_normalizer=build_dspark_offline_normalizer,
+                build_collator=build_dspark_collator,
+            ),
         ),
         server_streaming=(
             ServerStreamingProvider(

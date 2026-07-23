@@ -1,6 +1,7 @@
 # coding=utf-8
 """Focused CPU regressions for Domino's auxiliary logits head."""
 
+import copy
 import unittest
 from types import MethodType
 from unittest.mock import patch
@@ -101,6 +102,123 @@ class TestDominoDraftModel(unittest.TestCase):
                 sum(gradient.abs().sum().item() for gradient in gradients),
                 0.0,
             )
+
+    def test_chunked_objective_matches_full_loss_metrics_and_gradients(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
+
+        hidden_size, vocab_size, block_size = 4, 7, 4
+        for shift_label in (False, True):
+            with self.subTest(shift_label=shift_label):
+                torch.manual_seed(19)
+                draft = _bare_domino(
+                    hidden_size=hidden_size,
+                    gru_hidden_size=3,
+                    embedding_size=2,
+                    vocab_size=vocab_size,
+                    block_size=block_size,
+                )
+                draft.shift_label = shift_label
+                target_head = nn.Linear(hidden_size, vocab_size, bias=False)
+                target_embedding = nn.Embedding(vocab_size, hidden_size)
+                target_head.requires_grad_(False)
+                target_embedding.requires_grad_(False)
+                full = OnlineDominoModel(
+                    draft_model=draft,
+                    target_lm_head=target_head,
+                    target_embed_tokens=target_embedding,
+                    mask_token_id=0,
+                    block_size=block_size,
+                    attention_backend="sdpa",
+                    num_anchors=2,
+                    objective_chunk_blocks=0,
+                    shift_label=shift_label,
+                )
+                chunked = copy.deepcopy(full)
+                chunked.objective_chunk_blocks = 1
+
+                anchors = torch.tensor([[0, 3]])
+                keep_mask = torch.ones(1, 2, dtype=torch.bool)
+                full_hidden = torch.randn(
+                    1,
+                    2 * block_size,
+                    hidden_size,
+                    requires_grad=True,
+                )
+                chunked_hidden = full_hidden.detach().clone().requires_grad_()
+
+                def fixed_blocks(output_hidden):
+                    def _forward(self, input_ids, hidden_states, loss_mask):
+                        del self, input_ids, hidden_states, loss_mask
+                        return anchors, keep_mask, output_hidden
+
+                    return _forward
+
+                full._forward_draft_blocks = MethodType(
+                    fixed_blocks(full_hidden),
+                    full,
+                )
+                chunked._forward_draft_blocks = MethodType(
+                    fixed_blocks(chunked_hidden),
+                    chunked,
+                )
+                input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 0, 1]])
+                loss_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0]])
+                hidden_states = torch.zeros(1, input_ids.shape[1], hidden_size)
+
+                full_loss, full_accuracy, full_metrics = full(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                    lambda_base=0.35,
+                )
+                chunked_loss, chunked_accuracy, chunked_metrics = chunked(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                    lambda_base=0.35,
+                )
+
+                torch.testing.assert_close(
+                    chunked_loss,
+                    full_loss,
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+                torch.testing.assert_close(chunked_accuracy, full_accuracy)
+                self.assertEqual(chunked_metrics.keys(), full_metrics.keys())
+                for name in full_metrics:
+                    torch.testing.assert_close(
+                        chunked_metrics[name],
+                        full_metrics[name],
+                        rtol=1e-6,
+                        atol=1e-7,
+                    )
+
+                full_loss.backward()
+                chunked_loss.backward()
+                torch.testing.assert_close(
+                    chunked_hidden.grad,
+                    full_hidden.grad,
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+                full_parameters = dict(full.draft_model.named_parameters())
+                chunked_parameters = dict(chunked.draft_model.named_parameters())
+                self.assertEqual(full_parameters.keys(), chunked_parameters.keys())
+                for name, parameter in full_parameters.items():
+                    chunked_parameter = chunked_parameters[name]
+                    self.assertEqual(
+                        chunked_parameter.grad is None,
+                        parameter.grad is None,
+                        name,
+                    )
+                    if parameter.grad is not None:
+                        torch.testing.assert_close(
+                            chunked_parameter.grad,
+                            parameter.grad,
+                            rtol=1e-6,
+                            atol=1e-7,
+                        )
 
     def test_npu_bf16_gru_gradients_reach_registered_weights(self):
         torch.manual_seed(7)
