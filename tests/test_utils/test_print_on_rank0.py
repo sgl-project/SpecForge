@@ -7,11 +7,11 @@ from unittest import mock
 
 def _load_utils_module():
     transformers_module = ModuleType("transformers")
-    transformers_module.AutoTokenizer = object
-    transformers_module.PreTrainedTokenizerFast = object
+    setattr(transformers_module, "AutoTokenizer", object)
+    setattr(transformers_module, "PreTrainedTokenizerFast", object)
 
     transformers_utils_module = ModuleType("transformers.utils")
-    transformers_utils_module.cached_file = mock.Mock(return_value=None)
+    setattr(transformers_utils_module, "cached_file", mock.Mock(return_value=None))
 
     sys.modules.pop("specforge.utils", None)
     with mock.patch.dict(
