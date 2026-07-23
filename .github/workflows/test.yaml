@@ -17,6 +17,10 @@ jobs:
     if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     runs-on: [self-hosted]
+    concurrency:
+      group: specforge-gpu-ci
+      cancel-in-progress: false
+      queue: max
     container:
       image: lmsysorg/sglang:v0.5.14-cu130 # we lock to this version to avoid repeated docker pull
       options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged --pid=host

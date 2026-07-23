@@ -6,9 +6,72 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
+
+
+class _RawConfigShim:
+    """Attribute view for released checkpoints with an unregistered model type."""
+
+    def __init__(self, data: dict):
+        object.__setattr__(self, "_data", data)
+
+    def __getattr__(self, name):
+        try:
+            value = self._data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        return _RawConfigShim(value) if isinstance(value, dict) else value
+
+    def to_dict(self) -> dict:
+        return dict(self._data)
+
+
+def load_target_config(
+    model_path: str,
+    *,
+    cache_dir: Optional[str] = None,
+    trust_remote_code: bool = False,
+):
+    """Load a target config, falling back to its public raw ``config.json``."""
+
+    try:
+        return AutoConfig.from_pretrained(
+            model_path,
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code,
+        )
+    except (ValueError, KeyError, OSError) as auto_error:
+        if os.path.isdir(model_path):
+            config_path = os.path.join(model_path, "config.json")
+        elif os.path.isfile(model_path):
+            config_path = model_path
+        else:
+            try:
+                config_path = hf_hub_download(
+                    repo_id=model_path,
+                    filename="config.json",
+                    cache_dir=cache_dir,
+                )
+            except Exception:
+                raise auto_error
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                return _RawConfigShim(json.load(config_file))
+        except (OSError, ValueError):
+            raise auto_error
+
+
+def target_text_config(config):
+    return getattr(config, "text_config", config)
+
+
+def target_vocab_size(config) -> int:
+    text_config = target_text_config(config)
+    return int(
+        getattr(text_config, "padded_vocab_size", None) or text_config.vocab_size
+    )
 
 
 class TargetEmbeddingsAndHead(nn.Module):
@@ -20,23 +83,15 @@ class TargetEmbeddingsAndHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # Support for MLLMs with separate text_config
-        if hasattr(config, "text_config"):
-            self.embed_tokens = nn.Embedding(
-                config.text_config.vocab_size,
-                config.text_config.hidden_size,
-                padding_idx=config.text_config.pad_token_id,
-            )
-            self.lm_head = nn.Linear(
-                config.text_config.hidden_size,
-                config.text_config.vocab_size,
-                bias=False,
-            )
-        else:
-            self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
-            )
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        text_config = target_text_config(config)
+        vocab_size = target_vocab_size(text_config)
+        hidden_size = int(text_config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            vocab_size,
+            hidden_size,
+            padding_idx=getattr(text_config, "pad_token_id", None),
+        )
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     @classmethod
     def from_pretrained(
@@ -51,8 +106,10 @@ class TargetEmbeddingsAndHead(nn.Module):
     ) -> "TargetEmbeddingsAndHead":
 
         # 1. Load Config
-        config = AutoConfig.from_pretrained(
-            model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
+        config = load_target_config(
+            model_path,
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code,
         )
         instance = cls(config)
 
@@ -78,6 +135,21 @@ class TargetEmbeddingsAndHead(nn.Module):
 
         # 4. Load Weights
         instance._load_weights(local_model_path, embed_key, lm_head_key, tie_weights)
+
+        text_config = target_text_config(config)
+        mup_multiplier = getattr(
+            text_config,
+            "logits_mup_width_multiplier",
+            getattr(config, "logits_mup_width_multiplier", None),
+        )
+        if mup_multiplier:
+            if tie_weights:
+                raise RuntimeError(
+                    "cannot fold logits_mup_width_multiplier into a tied "
+                    "embedding/LM head"
+                )
+            instance.lm_head.weight.data.div_(float(mup_multiplier))
+            instance.lm_head_mup_folded = float(mup_multiplier)
 
         # 5. Move to Device & Freeze
         instance.to(device=device, dtype=dtype)
@@ -201,3 +273,11 @@ class TargetEmbeddingsAndHead(nn.Module):
             loaded_keys.add(k)
 
         return loaded_keys
+
+
+__all__ = [
+    "TargetEmbeddingsAndHead",
+    "load_target_config",
+    "target_text_config",
+    "target_vocab_size",
+]

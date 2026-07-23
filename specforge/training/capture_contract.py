@@ -24,18 +24,21 @@ def resolve_server_capture_contract(
     algorithm: AlgorithmRegistration,
 ) -> ServerCaptureContract:
     """Resolve engine flags and feature dimensions from canonical model config."""
-    from transformers import AutoConfig
-
+    from specforge.modeling.target.target_utils import (
+        load_target_config,
+        target_text_config,
+        target_vocab_size,
+    )
     from specforge.training.model_loading import draft_config_dict
 
     streaming = algorithm.providers.server_streaming_for(cfg.model.input_modality)
 
-    target_cfg = AutoConfig.from_pretrained(
+    target_cfg = load_target_config(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
-    target_cfg = getattr(target_cfg, "text_config", target_cfg)
+    target_cfg = target_text_config(target_cfg)
     model_provider = algorithm.providers.model
     draft_cfg = draft_config_dict(cfg, provider=model_provider.draft_config)
     layers = model_provider.resolve_capture_layers(cfg, draft_cfg, target_cfg)
@@ -58,7 +61,7 @@ def resolve_server_capture_contract(
         method=streaming.capture_method,
         aux_layer_ids=tuple(layers),
         target_hidden_size=int(target_cfg.hidden_size),
-        target_vocab_size=int(target_cfg.vocab_size),
+        target_vocab_size=target_vocab_size(target_cfg),
         draft_vocab_size=int(
             draft_cfg.get("draft_vocab_size") or draft_cfg["vocab_size"]
         ),

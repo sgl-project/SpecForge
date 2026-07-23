@@ -539,7 +539,7 @@ class LaunchPlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
 
-    def test_managed_local_accepts_minimum_explicit_capture_context(self):
+    def test_managed_local_accepts_minimum_context_and_leaves_radix_enabled(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = _managed_config(os.path.join(root, "attempt"))
             raw = cfg.model_dump()
@@ -554,6 +554,7 @@ class LaunchPlanTest(unittest.TestCase):
 
         argv = plan.services[1].command.argv
         self.assertEqual(argv[argv.index("--context-length") + 1], "135")
+        self.assertNotIn("--disable-radix-cache", argv)
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
@@ -584,6 +585,16 @@ class LaunchPlanTest(unittest.TestCase):
                 sglang_enable_torch_compile=True,
                 sglang_max_running_requests=64,
                 sglang_max_total_tokens=8192,
+                sglang_dp_size=2,
+                sglang_moe_a2a_backend="deepep",
+                sglang_moe_runner_backend="triton",
+                sglang_page_size=64,
+                sglang_quantization="fp8",
+                sglang_fp4_gemm_runner_backend="cutlass",
+                sglang_mamba_radix_cache_strategy="lru",
+                sglang_max_mamba_cache_size=1024,
+                sglang_swa_full_tokens_ratio=0.5,
+                sglang_mamba_full_memory_ratio=0.25,
             )
             cfg = Config.model_validate(raw)
             with mock.patch(
@@ -647,6 +658,19 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertIn(flag, argv)
             self.assertEqual(argv[argv.index("--max-running-requests") + 1], "64")
             self.assertEqual(argv[argv.index("--max-total-tokens") + 1], "8192")
+            for flag, expected in (
+                ("--dp-size", "2"),
+                ("--moe-a2a-backend", "deepep"),
+                ("--moe-runner-backend", "triton"),
+                ("--page-size", "64"),
+                ("--quantization", "fp8"),
+                ("--fp4-gemm-runner-backend", "cutlass"),
+                ("--mamba-radix-cache-strategy", "lru"),
+                ("--max-mamba-cache-size", "1024"),
+                ("--swa-full-tokens-ratio", "0.5"),
+                ("--mamba-full-memory-ratio", "0.25"),
+            ):
+                self.assertEqual(argv[argv.index(flag) + 1], expected)
             self.assertEqual(argv[argv.index("--context-length") + 1], "2055")
         producer, consumer = plan.commands
         expected_urls = "http://127.0.0.1:30000,http://127.0.0.1:30001"

@@ -1,4 +1,4 @@
-"""Small SGLang logits-processor patch for offline EAGLE3 state capture."""
+"""Small SGLang logits-processor patch for offline state capture."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def replaced_logits_processor_forward_for_offline_eagle3(
 
     if logits_metadata.forward_mode.is_dllm_extend():
         raise RuntimeError(
-            "Offline EAGLE3 capture does not support diffusion-LLM forward mode"
+            "Offline capture does not support diffusion-LLM forward mode"
         )
     if not (
         logits_metadata.forward_mode.is_decode_or_idle()
@@ -55,7 +55,7 @@ def replaced_logits_processor_forward_for_offline_eagle3(
         or logits_metadata.forward_mode.is_draft_extend_v2()
     ):
         raise RuntimeError(
-            "Offline EAGLE3 capture received an unsupported SGLang forward mode: "
+            "Offline capture received an unsupported SGLang forward mode: "
             f"{logits_metadata.forward_mode}"
         )
 
@@ -83,7 +83,7 @@ def replaced_logits_processor_forward_for_offline_eagle3(
         logits_metadata,
     )
     if logits_metadata.extend_return_logprob:
-        raise RuntimeError("Offline EAGLE3 capture does not support log probabilities")
+        raise RuntimeError("Offline capture does not support log probabilities")
     return OfflineEagle3LogitsOutput(
         logits=None,
         aux_hidden_states=states_to_store,
@@ -107,8 +107,8 @@ class OfflineEagle3LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[list[torch.Tensor]] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ):
-        # EAGLE3 needs every token, so use the decode pruning behavior for this
-        # one offline extend pass rather than SGLang's normal prefill pruning.
+        # Offline training needs every token, so use decode pruning behavior
+        # for this one extend pass rather than SGLang's prefill pruning.
         logits_metadata.forward_mode = ForwardMode.DECODE
         return replaced_logits_processor_forward_for_offline_eagle3(
             self.logits_processor,

@@ -12,6 +12,7 @@ import socket
 import tempfile
 import unittest
 from datetime import timedelta
+from unittest import mock
 
 import torch
 
@@ -357,6 +358,55 @@ class TestReadResumeState(unittest.TestCase):
             CheckpointManager.read_resume_state(ckpt)
         st = CheckpointManager.read_resume_state(ckpt, require_full_state=False)
         self.assertEqual(st["backend"], {})
+
+    def test_resume_fails_world_wide_when_any_rank_cannot_read(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_world_read_")
+        ckpt = _mgr(out).save(
+            _state(4, world_size=2, run_id="run", strategy="dspark"),
+            4,
+            rank_state={"optimizer": {}, "rng": {}},
+        )
+
+        def gather(descriptors, local):
+            descriptors[0] = local
+            descriptors[1] = {
+                **local,
+                "error": "FileNotFoundError: rank-local checkpoint missing",
+            }
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            self.assertRaisesRegex(RuntimeError, "not readable on every rank"),
+        ):
+            CheckpointManager.read_resume_state(ckpt)
+
+    def test_resume_rejects_different_checkpoint_identity_across_ranks(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_world_identity_")
+        ckpt = _mgr(out).save(
+            _state(4, world_size=2, run_id="run", strategy="dspark"),
+            4,
+            rank_state={"optimizer": {}, "rng": {}},
+        )
+
+        def gather(descriptors, local):
+            descriptors[0] = local
+            descriptors[1] = {**local, "global_step": 3}
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            self.assertRaisesRegex(ValueError, "different training states"),
+        ):
+            CheckpointManager.read_resume_state(ckpt)
 
 
 def _dist_worker(rank, world, port, out_dir, results_dir):

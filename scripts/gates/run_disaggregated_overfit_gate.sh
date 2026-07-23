@@ -259,7 +259,6 @@ CAPTURE_COMMAND=(
     --context-length "$MAX_LENGTH"
     --mem-fraction-static "$CAPTURE_MEM_FRACTION"
     --chunked-prefill-size -1
-    --disable-radix-cache
     --enable-spec-capture
     --spec-capture-method "$CAPTURE_METHOD"
     --spec-capture-aux-layer-ids "${CAPTURE_LAYER_ARGS[@]}"

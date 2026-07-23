@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
 from specforge.distributed import init_distributed
-from specforge.offline_capture import OfflineEagle3SGLangCapture
+from specforge.offline_capture import OfflineSGLangCapture
 from tests.utils import get_available_port
 
 
@@ -41,7 +41,17 @@ def cleanup_distributed():
 
 
 @torch.no_grad()
-def _run_capture(rank, world_size, port, tp_size, model_path, **load_kwargs):
+def _run_capture(
+    rank,
+    world_size,
+    port,
+    tp_size,
+    model_path,
+    *,
+    capture_method="eagle3",
+    capture_layers=None,
+    **load_kwargs,
+):
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -53,14 +63,17 @@ def _run_capture(rank, world_size, port, tp_size, model_path, **load_kwargs):
     input_ids = torch.randint(0, 1000, (2, 256)).cuda()
     attention_mask = torch.ones_like(input_ids)
     loss_mask = torch.ones_like(input_ids)
-    target = OfflineEagle3SGLangCapture.from_pretrained(
+    target = OfflineSGLangCapture.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
         attention_backend="fa3",
         mem_fraction_static=0.4,
         **load_kwargs,
     )
-    target.set_capture_layers()
+    target.set_capture_layers(
+        capture_layers,
+        capture_method=capture_method,
+    )
     output = target.capture(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -68,13 +81,25 @@ def _run_capture(rank, world_size, port, tp_size, model_path, **load_kwargs):
     )
     assert output.hidden_states.shape[:2] == input_ids.shape
     assert output.last_hidden_states.shape[:2] == input_ids.shape
+    if capture_layers is not None:
+        assert output.hidden_states.shape[-1] == (
+            len(capture_layers) * output.last_hidden_states.shape[-1]
+        )
     print(f"[Rank {rank}] capture passed for {model_path}")
     del output, target, input_ids, attention_mask, loss_mask
     cleanup_distributed()
 
 
 def _run_dense_worker(rank, world_size, port, tp_size):
-    _run_capture(rank, world_size, port, tp_size, "unsloth/Llama-3.2-1B")
+    _run_capture(
+        rank,
+        world_size,
+        port,
+        tp_size,
+        "unsloth/Llama-3.2-1B",
+        capture_method="dflash",
+        capture_layers=[1, 4, 7, 10, 13],
+    )
 
 
 def _run_moe_worker(rank, world_size, port, tp_size):

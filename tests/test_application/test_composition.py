@@ -83,12 +83,19 @@ class ApplicationCompositionTest(unittest.TestCase):
         ):
             resolve_run(config)
 
-    def test_mode_constraints_are_derived_from_feature_contracts(self):
-        for algorithm in ("peagle", "dspark"):
-            with self.subTest(algorithm=algorithm):
-                config = Config.model_validate(_payload(algorithm, mode="offline"))
-                with self.assertRaisesRegex(ValueError, "no offline feature contract"):
-                    resolve_run(config)
+    def test_peagle_offline_remains_unsupported(self):
+        config = Config.model_validate(_payload("peagle", mode="offline"))
+
+        with self.assertRaisesRegex(ValueError, "no offline feature contract"):
+            resolve_run(config)
+
+    def test_dspark_offline_resolves_its_registered_provider(self):
+        resolved = resolve_run(
+            Config.model_validate(_payload("dspark", mode="offline"))
+        )
+
+        provider = resolved.algorithm.providers.offline_for("text")
+        self.assertEqual("dspark_offline_v1", provider.normalizer_id)
 
     def test_application_planning_defends_offline_data_parallelism(self):
         config = Config.model_validate(_payload(mode="offline"))

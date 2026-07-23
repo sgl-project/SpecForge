@@ -1,7 +1,8 @@
 # SGLang patch inventory and supported version
 
-SpecForge pins `sglang==0.5.14`. There are two deliberately separate SGLang
-integration surfaces.
+SpecForge pins `sglang==0.5.14`. The online patch is also kept compatible with
+SGLang's public `inkling-support` layout. There are two deliberately separate
+SGLang integration surfaces.
 
 ## Online: external spec-capture server
 
@@ -21,6 +22,12 @@ providers map generic server artifacts (`aux`, `last_hidden`, passthrough
 inputs) to training feature names. No trainer or producer process imports
 SGLang model-runner internals or loads a target model.
 
+The same patch is dry-run validated against the v0.5.14 tag and the public
+`inkling-support` branch. Capture requests carry a unique `extra_key`, so every
+training sample executes a full prefill even when radix cache support is
+present. Capture launch configs therefore leave radix cache enabled, including
+for hybrid targets that require the unified radix tree.
+
 Apply the patch with `scripts/apply_sglang_spec_capture_patch.sh`. The
 server-capture unit and GPU gates must pass before updating the SGLang pin.
 
@@ -33,14 +40,15 @@ version-pinned APIs required for offline EAGLE3 preprocessing:
 | Dependency | Upgrade risk |
 |---|---|
 | `CaptureHiddenMode.FULL` and logits-processor replacement | hidden-state output fields or pruning behavior may change |
-| `set_eagle3_layers_to_capture` | layer-selection API may move |
+| `set_eagle3_layers_to_capture` / `set_dflash_layers_to_capture` | strategy-specific layer-selection APIs may move |
 | `ScheduleBatch`, `ForwardBatch`, and `ModelRunner` construction | constructor and memory-pool setup may change |
 | splitting captured states by request input length | token packing conventions may change |
 | DP-attention/model-parallel initialization patches | distributed group signatures may change |
 
-This package computes no logits and supports only the text EAGLE3 state capture
-needed by the preprocessing script. It does not provide HF/custom backends,
-DFlash/VLM capture, online rollout, or a general target-engine factory.
+This package computes no logits and supports text EAGLE3 and DFlash-family
+state capture needed by the preprocessing script. It does not provide
+HF/custom backends, VLM capture, online rollout, or a general target-engine
+factory.
 
 `tests/test_runtime/test_sglang_0514_compat.py` guards the patched 0.5.14 API
 seams, and

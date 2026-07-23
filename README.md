@@ -43,10 +43,11 @@ method-specific Python training entry points.
 | Method | Description | Example config | Optimization |
 | --- | --- | --- | --- |
 | **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online](./examples/configs/qwen3-8b-eagle3-disaggregated.yaml) / [Offline](./examples/configs/qwen3-8b-eagle3-offline.yaml) / [Disaggregated offline](./examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
+| **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online](./examples/configs/qwen3-8b-peagle-disaggregated.yaml) | — |
+| **EAGLE3.1** | Feature-based autoregressive drafting with attention drift | [Online](./examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml) | — |
 | **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online](./examples/configs/qwen3-8b-dflash-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-dflash-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
 | **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online](./examples/configs/qwen3-8b-domino-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-domino-disaggregated.yaml) | — |
 | **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Disaggregated](./examples/configs/qwen3-4b-dspark-disaggregated.yaml) | — |
-| **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online](./examples/configs/qwen3-8b-peagle-disaggregated.yaml) | — |
 
 See the [training guide](./docs/basic_usage/training.md) for the supported
 method/topology matrix and the

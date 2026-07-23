@@ -17,7 +17,7 @@ code, so it is imported by training entry points, not at package load.
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -33,6 +33,7 @@ class StepOutput:
 
     loss: torch.Tensor
     metrics: Dict[str, Any]
+    ratio_metrics: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -487,6 +488,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         metrics = {
             "accuracy": accuracy.detach(),
         }
+        ratio_metrics = model_metrics.get("ratio_metrics", {})
         for name in (
             "accuracy_denom",
             "ce_loss",
@@ -496,7 +498,11 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         ):
             if name in model_metrics:
                 metrics[name] = model_metrics[name]
-        return StepOutput(loss=loss, metrics=metrics)
+        return StepOutput(
+            loss=loss,
+            metrics=metrics,
+            ratio_metrics=ratio_metrics,
+        )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         return {

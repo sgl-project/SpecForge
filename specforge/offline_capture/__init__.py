@@ -8,8 +8,11 @@ here exists only for the standalone hidden-state preparation script.
 from importlib import import_module
 
 __all__ = [
+    "OfflineCaptureBatch",
     "OfflineEagle3CaptureBatch",
     "OfflineEagle3SGLangCapture",
+    "OfflineSGLangCapture",
+    "load_offline_capture",
     "load_offline_eagle3_capture",
 ]
 

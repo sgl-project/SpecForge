@@ -198,11 +198,14 @@ The checked-in examples are the canonical starting points:
 | EAGLE3 online | [`qwen3-8b-eagle3-disaggregated.yaml`](../../examples/configs/qwen3-8b-eagle3-disaggregated.yaml) |
 | EAGLE3 offline | [`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/qwen3-8b-eagle3-offline.yaml) |
 | DFlash online | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/qwen3-8b-dflash-online.yaml) |
+| DFlash offline | [`qwen3-8b-dflash-offline.yaml`](../../examples/configs/qwen3-8b-dflash-offline.yaml) |
 | Domino online | [`qwen3-8b-domino-online.yaml`](../../examples/configs/qwen3-8b-domino-online.yaml) |
+| Domino offline | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/qwen3-8b-domino-offline.yaml) |
 | P-EAGLE online | [`qwen3-8b-peagle-disaggregated.yaml`](../../examples/configs/qwen3-8b-peagle-disaggregated.yaml) |
 | DFlash disaggregated | [`qwen3-8b-dflash-disaggregated.yaml`](../../examples/configs/qwen3-8b-dflash-disaggregated.yaml) |
 | Domino disaggregated | [`qwen3-8b-domino-disaggregated.yaml`](../../examples/configs/qwen3-8b-domino-disaggregated.yaml) |
 | DSpark disaggregated | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/qwen3-4b-dspark-disaggregated.yaml) |
+| DSpark offline | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/qwen3-4b-dspark-offline.yaml) |
 | EAGLE3 offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | Ascend NPU DFlash online | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml) |
 | Ascend NPU Domino online | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml) |
@@ -233,7 +236,7 @@ The unified runtime supports text training in these combinations:
 | EAGLE3 | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
 | DFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
-| DSpark | Yes, consumer DP | No | No |
+| DSpark | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | P-EAGLE | Yes, consumer DP, batch size 1 | No | No |
 
 Unsupported combinations fail explicitly during config validation or run
@@ -249,8 +252,7 @@ assembly. In particular:
   `flex_attention`;
 - P-EAGLE requires `training.batch_size=1` and reuses EAGLE3's server capture
   schema;
-- DSpark requires disaggregated server capture;
-- offline feature training supports EAGLE3, DFlash, and Domino;
+- offline feature training supports EAGLE3, DFlash, Domino, and DSpark;
 - every online run is disaggregated and uses `model.target_backend=sglang`;
   finite runs may omit both step fields so the producer can publish the exact
   optimizer horizon derived from the prepared prompt plan;

@@ -17,14 +17,13 @@ The checked-in recipes are:
 | Online EAGLE3 | `examples/configs/qwen3-8b-eagle3-disaggregated.yaml` |
 | Online P-EAGLE | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` |
 | Online DFlash | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` |
-| Managed-local one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
+| Online one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
 | Online Domino | `examples/configs/qwen3-8b-domino-disaggregated.yaml` |
-| Managed-local one-server + DP7 Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml` |
-| Managed-local two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
+| Online two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
 | Online DSpark | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` |
 | Online Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-disaggregated.yaml` |
-| Managed-local one-server + DP2 Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
-| Managed-local two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
+| Online one-server + DP2 Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
+| Online two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
 | Offline EAGLE3 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` |
 | Offline Qwen2.5-7B EAGLE3 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` |
 
@@ -318,9 +317,10 @@ The online producer sends prompts to the URLs in
 with the model, capture method, and auxiliary layer ids matching the draft
 config. DFlash, Domino, and DSpark use the DFlash capture contract; EAGLE3 and
 P-EAGLE use the EAGLE3 capture contract. Capture rejects chunked prefill and
-radix-cache paths that can truncate the captured sequence. Online capture is
-text-only: VLM training, including Qwen2.5-VL, is not supported. Online
-evaluation is also not supported.
+gives every request attempt a unique radix-cache namespace so cached prefixes
+cannot truncate the captured sequence. Online capture is text-only: VLM
+training, including Qwen2.5-VL, is not supported. Online evaluation is also not
+supported.
 
 The repository's strict e2e gate remains a full local test-stack orchestrator:
 
@@ -395,8 +395,8 @@ deployment:
 ```
 
 Both paths must be visible at the same location from producer and consumer
-nodes. The producer ingests existing EAGLE3, DFlash, or Domino features and
-publishes a fixed manifest. Offline epochs remain re-iterable.
+nodes. The producer ingests existing EAGLE3, DFlash, Domino, or DSpark features
+and publishes a fixed manifest. Offline epochs remain re-iterable.
 
 Set `backend: mooncake` instead, omit `store_root`, and provide the Mooncake
 endpoints to use the remote store. Also set a positive

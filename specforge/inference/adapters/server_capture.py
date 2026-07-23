@@ -25,6 +25,7 @@ tensors.  The application composition root injects an algorithm-owned
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
@@ -186,7 +187,7 @@ class SGLangServerCaptureAdapter:
             raise TypeError(
                 "ServerInputAdapter.build_request_inputs must return a mapping"
             )
-        reserved = {"sampling_params", "spec_capture"}
+        reserved = {"extra_key", "sampling_params", "spec_capture"}
         conflicts = sorted(reserved & set(request_inputs))
         if conflicts:
             raise ValueError(
@@ -317,6 +318,11 @@ class SGLangServerCaptureAdapter:
         retryable, mirroring ``generate_features`` semantics.
         """
         body = self._request_inputs(tasks)
+        # A fresh cache namespace forces a full prefill on every attempt while
+        # leaving SGLang free to use the radix data structure required by hybrid
+        # targets. Retries need a new key because the prior attempt may have
+        # populated its namespace before the response was lost.
+        body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
         body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 1}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
         body["spec_capture"] = capture_payloads
@@ -394,9 +400,9 @@ class SGLangServerCaptureAdapter:
                     f"{expected_identity}"
                 )
             ref = self._ref_from_result(task, result, capture)
-            # A capture shorter than the prompt is corrupt (classic cause: a
-            # radix-cache prefix hit skips prefilling — and capturing — the
-            # cached tokens; the patched scheduler refuses that config).
+            # A capture shorter than the prompt is corrupt: it means cache
+            # isolation or another full-prefill invariant failed despite the
+            # request's fresh namespace.
             expected_len = len(task.payload["input_ids"])
             short = {
                 name: spec.shape
@@ -411,8 +417,8 @@ class SGLangServerCaptureAdapter:
                         task_id=task.task_id,
                         reason=(
                             f"server_capture: captured seq len != prompt len "
-                            f"{expected_len} for {short} — was the server "
-                            f"started without --disable-radix-cache?"
+                            f"{expected_len} for {short}; the capture request "
+                            "did not execute a complete prefill"
                         ),
                         retryable=False,
                     )

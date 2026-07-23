@@ -31,6 +31,7 @@ def execute_shell_command(
     disable_proxy: bool = False,
     enable_hf_mirror: bool = False,
     sglang_use_modelscope: bool = False,
+    start_new_session: bool = False,
 ):
     """Execute a shell command and return its process handle."""
     command = command.replace("\\\n", " ").replace("\\", " ")
@@ -52,12 +53,40 @@ def execute_shell_command(
     if sglang_use_modelscope:
         env["SGLANG_USE_MODELSCOPE"] = "true"
     return subprocess.Popen(
-        command.split(), text=True, stderr=subprocess.STDOUT, env=env
+        command.split(),
+        text=True,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=start_new_session,
+    )
+
+
+def terminate_process_trees(*processes: subprocess.Popen, grace_s: float = 30) -> None:
+    """Terminate subprocess sessions, including descendants of dead leaders."""
+    active = tuple(process for process in processes if process is not None)
+    if not active:
+        return
+
+    # SGLang's launcher exits independently from its scheduler/model workers.
+    # Reuse the supervisor's process-group cleanup so a dead launcher cannot
+    # leave GPU-owning descendants alive for the next test or workflow step.
+    from specforge.launch_plan import _terminate_processes
+
+    exited_group_leaders = tuple(
+        process for process in active if process.poll() is not None
+    )
+    _terminate_processes(
+        active,
+        grace_s=grace_s,
+        exited_group_leaders=exited_group_leaders,
     )
 
 
 def wait_for_server(
-    base_url: str, timeout: int | None = None, disable_proxy: bool = False
+    base_url: str,
+    timeout: int | None = None,
+    disable_proxy: bool = False,
+    process: subprocess.Popen | None = None,
 ) -> None:
     """Wait until a server's OpenAI-compatible models endpoint is ready."""
     started = time.perf_counter()
@@ -77,6 +106,10 @@ def wait_for_server(
 
     try:
         while True:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Server process exited with code {process.returncode}"
+                )
             try:
                 response = requests.get(
                     f"{base_url}/v1/models",
