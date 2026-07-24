@@ -69,7 +69,7 @@ run and succeeds only when all of these conditions hold:
 - the log reaches exactly `MAX_STEPS`;
 - final loss is at most `MAX_LOSS` (`0.0001` by default);
 - final token accuracy is at least `MIN_ACCURACY` (`1.0` by default);
-- the exact final `training_state.pt` checkpoint exists.
+- the exact final checkpoint is committed (`training_state.pt` and `_SUCCESS` both exist).
 
 The real-serving stage then exports that checkpoint, launches SGLang with the
 `DFLASH` speculative algorithm, and checks one `/v1/chat/completions` response.

@@ -340,7 +340,8 @@ gate_run "$PYTHON" "$SCRIPT_DIR/check_overfit_metrics.py" \
 
 CHECKPOINT_PATH=$CONSUMER_OUTPUT_DIR/$RUN_ID-step$MAX_STEPS
 if ! gate_dry_run; then
-    gate_require_file "$CHECKPOINT_PATH/training_state.pt" final_checkpoint
+    gate_require_file "$CHECKPOINT_PATH/training_state.pt" final_checkpoint_state
+    gate_require_file "$CHECKPOINT_PATH/_SUCCESS" final_checkpoint_commit
 fi
 
 # Release the capture stack before loading the target and draft for serving.

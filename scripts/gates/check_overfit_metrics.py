@@ -5,7 +5,8 @@ Assumptions about the trainer log and output structure:
 - Metric lines match either the historical disaggregated consumer form
   ``[consumer] step <N> {<dict>}`` or the unified trainer form
   ``step <N>: {<dict>}``.
-- The checkpoint tree layout is: ``<checkpoint_root>/<run-id>-step<N>/training_state.pt``
+- A committed checkpoint contains both ``training_state.pt`` and ``_SUCCESS``
+  under ``<checkpoint_root>/<run-id>-step<N>/``.
   If a new method saves checkpoints under a different layout, adjust
   ``checkpoint_paths()`` to match.
 - The gate thresholds ``--max-loss`` and ``--min-accuracy`` are method-agnostic
@@ -46,7 +47,11 @@ def final_metrics(log_path: str) -> Tuple[int, Dict[str, float]]:
 
 def checkpoint_paths(checkpoint_root: str):
     pattern = os.path.join(checkpoint_root, "*-step*", "training_state.pt")
-    paths = glob.glob(pattern)
+    paths = [
+        path
+        for path in glob.glob(pattern)
+        if os.path.isfile(os.path.join(os.path.dirname(path), "_SUCCESS"))
+    ]
 
     def get_step(path: str) -> int:
         match = re.search(r"-step(\d+)", path)
@@ -75,7 +80,7 @@ def check_overfit(
     if accuracy < min_accuracy:
         errors.append(f"final token accuracy {accuracy} < {min_accuracy}")
     if not checkpoints:
-        errors.append(f"no training_state.pt checkpoint under {checkpoint_root}")
+        errors.append(f"no committed checkpoint under {checkpoint_root}")
     result = {
         "step": step,
         "loss": loss,

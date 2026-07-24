@@ -240,6 +240,7 @@ class TestDominoOverfitGate(unittest.TestCase):
             checkpoint = Path(tmp) / "consumer" / "run-step10"
             checkpoint.mkdir(parents=True)
             (checkpoint / "training_state.pt").touch()
+            (checkpoint / "_SUCCESS").touch()
             result = check_overfit.check_overfit(
                 log,
                 str(Path(tmp) / "consumer"),
@@ -265,6 +266,7 @@ class TestDominoOverfitGate(unittest.TestCase):
                 checkpoint = checkpoint_root / f"run-step{step}"
                 checkpoint.mkdir(parents=True)
                 (checkpoint / "training_state.pt").touch()
+                (checkpoint / "_SUCCESS").touch()
 
             result = check_overfit.check_overfit(
                 str(log),
@@ -279,6 +281,23 @@ class TestDominoOverfitGate(unittest.TestCase):
                 result["checkpoint"],
                 str(checkpoint_root / "run-step10" / "training_state.pt"),
             )
+
+    def test_ignores_markerless_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "train.log"
+            log.write_text("step 10: {'loss': 0.0, 'accuracy': 1.0}\n")
+            checkpoint = Path(tmp) / "checkpoints" / "run-step10"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "training_state.pt").touch()
+
+            with self.assertRaisesRegex(ValueError, "no committed checkpoint"):
+                check_overfit.check_overfit(
+                    str(log),
+                    str(checkpoint.parent),
+                    expected_step=10,
+                    max_loss=1e-4,
+                    min_accuracy=1.0,
+                )
 
     def test_fails_when_any_gate_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

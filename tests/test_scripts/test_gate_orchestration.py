@@ -139,6 +139,10 @@ class TestGateOrchestration(unittest.TestCase):
             'gate_require_file "$CHECKPOINT_PATH/training_state.pt"',
             overfit_source,
         )
+        self.assertIn(
+            'gate_require_file "$CHECKPOINT_PATH/_SUCCESS"',
+            overfit_source,
+        )
 
     def test_cleanup_terminates_and_reaps_an_owned_background_process(self):
         log_path = self.root / "background process.log"

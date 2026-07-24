@@ -30,6 +30,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 STATE_FILE = "training_state.pt"
+SUCCESS_FILE = "_SUCCESS"
 
 
 class CheckpointManager:
@@ -59,6 +60,16 @@ class CheckpointManager:
         return os.path.join(ckpt_dir, STATE_FILE)
 
     @staticmethod
+    def _success_path(ckpt_dir: str) -> str:
+        return os.path.join(ckpt_dir, SUCCESS_FILE)
+
+    @classmethod
+    def _is_complete_dir(cls, ckpt_dir: str) -> bool:
+        return os.path.isfile(os.path.join(ckpt_dir, STATE_FILE)) and os.path.isfile(
+            cls._success_path(ckpt_dir)
+        )
+
+    @staticmethod
     def _rank_file(rank: int) -> str:
         return f"training_state_rank{rank}.pt"
 
@@ -75,9 +86,11 @@ class CheckpointManager:
         rank_state: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Write ``step``'s checkpoint, first deleting any on-disk steps >= step
-        (fork/rollback semantics), then repoint ``{run_id}-latest`` and rotate.
-        ``state`` is the shared payload (rank0 writes it); ``rank_state`` is
-        written by every rank. Collective: any rank's failure raises on all ranks.
+        (fork/rollback semantics), then publish ``_SUCCESS``, repoint
+        ``{run_id}-latest``, and rotate. ``state`` is the shared payload (rank0
+        writes it); ``rank_state`` is written by every rank. Collective: any
+        rank's failure raises on all ranks, and markerless directories are never
+        considered resumable.
         """
         ckpt_dir = self.checkpoint_dir(step)
         err = ""
@@ -99,6 +112,13 @@ class CheckpointManager:
                     self._atomic_save(state, self._state_path(ckpt_dir))
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
+        self._all_ok(err)
+        err = ""
+        if self.is_rank0():
+            try:
+                self._mark_complete(ckpt_dir)
+            except Exception as exc:
+                err = f"completion marker failed: {type(exc).__name__}: {exc}"
         self._all_ok(err)
         if self.is_rank0():
             self._point(f"{self.run_id}-latest", ckpt_dir)
@@ -201,7 +221,7 @@ class CheckpointManager:
             or meta.get("metric") != self.best_metric
             or not isinstance(step, int)
             or not isinstance(score, (int, float))
-            or not os.path.isfile(self._state_path(self.checkpoint_dir(step)))
+            or not self._is_complete_dir(self.checkpoint_dir(step))
         ):
             logger.warning(
                 "ignoring best meta %s: run_id/metric mismatch, malformed, or its "
@@ -217,6 +237,10 @@ class CheckpointManager:
         target = self.checkpoint_dir(step) if step is not None else self.latest_dir()
         if target is None:
             raise FileNotFoundError(f"no checkpoint to load under {self.output_dir}")
+        if not self._is_complete_dir(target):
+            raise ValueError(
+                f"checkpoint is incomplete (missing {SUCCESS_FILE}): {target}"
+            )
         return torch.load(
             self._state_path(target), map_location=map_location, weights_only=False
         )
@@ -240,7 +264,7 @@ class CheckpointManager:
         local_error = None
         state = None
         try:
-            path = cls.resolve_resume_dir(path)
+            path = cls.resolve_committed_checkpoint_dir(path)
             state = torch.load(
                 os.path.join(path, STATE_FILE),
                 map_location=map_location,
@@ -320,11 +344,16 @@ class CheckpointManager:
         return state
 
     @classmethod
-    def resolve_resume_dir(cls, path: str) -> str:
-        """Resolve one unambiguous resume target to its checkpoint directory.
+    def resolve_committed_checkpoint_dir(cls, path: str) -> str:
+        """Resolve one unambiguous committed checkpoint directory.
+
+        Every runtime checkpoint consumer — resume, export, and weights-only
+        warm start — must enter through this method. A payload is consumable
+        only after its directory contains both ``training_state.pt`` and the
+        ``_SUCCESS`` marker published by :meth:`save`.
 
         A run output directory is convenient in declarative configs, but it
-        must never choose between unrelated runs silently.  Prefer its single
+        must never choose between unrelated runs silently. Prefer its single
         complete ``*-latest`` pointer; when symlinks are unavailable, fall back
         to the highest complete ``<run-id>-stepN`` directory only if all
         candidates belong to the same run id.
@@ -337,15 +366,19 @@ class CheckpointManager:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"checkpoint state file does not exist: {path}")
             path = os.path.dirname(path)
-        if os.path.isfile(os.path.join(path, STATE_FILE)):
+        if cls._is_complete_dir(path):
             return path
+        if os.path.isfile(os.path.join(path, STATE_FILE)):
+            raise ValueError(
+                f"checkpoint is incomplete (missing {SUCCESS_FILE}): {path}"
+            )
         if not os.path.isdir(path):
             raise FileNotFoundError(f"checkpoint path does not exist: {path}")
 
         latest = []
         for candidate in glob.glob(os.path.join(glob.escape(path), "*-latest")):
             resolved = os.path.realpath(candidate)
-            if os.path.isfile(os.path.join(resolved, STATE_FILE)):
+            if cls._is_complete_dir(resolved):
                 latest.append(resolved)
         latest = sorted(set(latest))
         if len(latest) == 1:
@@ -360,7 +393,7 @@ class CheckpointManager:
         pattern = re.compile(r"^(.+)-step(\d+)$")
         for candidate in glob.glob(os.path.join(glob.escape(path), "*-step*")):
             match = pattern.match(os.path.basename(candidate))
-            if match and os.path.isfile(os.path.join(candidate, STATE_FILE)):
+            if match and cls._is_complete_dir(candidate):
                 by_run.setdefault(match.group(1), []).append(
                     (int(match.group(2)), candidate)
                 )
@@ -374,12 +407,17 @@ class CheckpointManager:
         candidates = next(iter(by_run.values()))
         return max(candidates, key=lambda item: item[0])[1]
 
+    @classmethod
+    def resolve_resume_dir(cls, path: str) -> str:
+        """Backward-compatible alias for committed checkpoint resolution."""
+        return cls.resolve_committed_checkpoint_dir(path)
+
     def latest_dir(self) -> Optional[str]:
         """Directory of the newest complete checkpoint, or None."""
         link = os.path.join(self.output_dir, f"{self.run_id}-latest")
         if os.path.islink(link):
             target = os.path.realpath(link)
-            if os.path.isfile(self._state_path(target)):
+            if self._is_complete_dir(target):
                 return target
         step = self._max_step_on_disk()
         return self.checkpoint_dir(step) if step is not None else None
@@ -413,17 +451,42 @@ class CheckpointManager:
         return bool(box[0])
 
     @staticmethod
-    def _atomic_save(obj: Any, path: str) -> None:
+    def _fsync_path(path: str) -> None:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _atomic_save(cls, obj: Any, path: str) -> None:
         tmp = path + ".tmp"
         torch.save(obj, tmp)
+        cls._fsync_path(tmp)
         os.replace(tmp, path)
+        cls._fsync_path(os.path.dirname(path))
 
-    @staticmethod
-    def _atomic_json(obj: Dict[str, Any], path: str) -> None:
+    @classmethod
+    def _atomic_json(cls, obj: Dict[str, Any], path: str) -> None:
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(obj, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        cls._fsync_path(os.path.dirname(path))
+
+    @classmethod
+    def _mark_complete(cls, ckpt_dir: str) -> None:
+        if not os.path.isfile(os.path.join(ckpt_dir, STATE_FILE)):
+            raise RuntimeError("rank 0 did not write the shared checkpoint state")
+        path = cls._success_path(ckpt_dir)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        cls._fsync_path(ckpt_dir)
 
     def _point(self, name: str, ckpt_dir: str) -> None:
         link = os.path.join(self.output_dir, name)
@@ -466,9 +529,9 @@ class CheckpointManager:
                 yield int(m.group(1)), path
 
     def _all_checkpoints(self) -> Iterator[Tuple[int, str]]:
-        # Only dirs holding STATE_FILE count: a truncated save is never a target.
+        # A checkpoint is resumable only after rank 0 publishes _SUCCESS.
         for step, path in self._step_dirs():
-            if os.path.isfile(self._state_path(path)):
+            if self._is_complete_dir(path):
                 yield step, path
 
     def _max_step_on_disk(self) -> Optional[int]:
@@ -476,4 +539,4 @@ class CheckpointManager:
         return max(steps) if steps else None
 
 
-__all__ = ["CheckpointManager"]
+__all__ = ["CheckpointManager", "STATE_FILE", "SUCCESS_FILE"]
