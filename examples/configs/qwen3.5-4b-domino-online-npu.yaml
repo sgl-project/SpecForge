@@ -20,7 +20,8 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: "sdpa"
-  num_anchors: 16
+  # If OOM occurs on low-memory NPU devices, retry with a smaller num_anchors value.
+  num_anchors: 256
   loss_decay_gamma: 7
   lambda_base_start: 1
   lambda_base_decay_ratio: 1
