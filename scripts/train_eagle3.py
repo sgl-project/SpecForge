@@ -1052,6 +1052,12 @@ def main():
     # engine has profiled free memory, so the engine mem fraction does not
     # have to absorb the draft weights (single-GPU online mode).
     draft_model = draft_model.cuda()
+    if args.draft_embedding_cpu or args.optimizer_cpu_offload:
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            raise ValueError(
+                "CPU offloading options (--draft-embedding-cpu, --optimizer-cpu-offload) "
+                "are only supported in single-GPU mode (world_size=1)."
+            )
     if args.draft_embedding_cpu:
         # Frozen vocab x hidden table, used for one lookup per batch; keep it
         # in host memory to free ~2 x hidden x vocab bytes of VRAM

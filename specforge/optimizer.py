@@ -61,7 +61,7 @@ class BF16Optimizer:
         self.scheduler.step()
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
-                p.data.copy_(mp.data)
+                p.data.copy_(mp.data, non_blocking=True)
                 p.grad = None
         return self.last_grad_norm
 
