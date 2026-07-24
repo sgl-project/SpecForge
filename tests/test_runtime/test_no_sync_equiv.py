@@ -120,7 +120,7 @@ def _worker(rank, world_size, workdir, results_dir):
             {
                 "rank": rank,
                 "max_weight_diff": max_diff,
-                "gn_a": rep_a.grad_norm,
+                "gn_a": float(rep_a.grad_norm.item()),
                 "gn_b": float(gn_b.item()),
                 "no_sync_entries": no_sync_entries["n"],
                 "acc": ACC,

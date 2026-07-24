@@ -224,6 +224,32 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(metrics["ce_position_0"], 1.0)
         self.assertEqual(metrics["ce_position_1"], 0.5)
 
+    def test_scalar_metrics_remain_tensors_until_logging(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+
+        with mock.patch.object(
+            torch.Tensor,
+            "item",
+            side_effect=AssertionError("step result forced a scalar sync"),
+        ):
+            result = core._result(
+                StepOutput(
+                    loss=torch.tensor(2.0),
+                    metrics={
+                        "accuracy": torch.tensor(0.5),
+                        "ce_loss": torch.tensor(1.25),
+                    },
+                ),
+                grad_norm=torch.tensor(1.0),
+                stepped=False,
+            )
+
+        self.assertIsInstance(result.loss, torch.Tensor)
+        self.assertIsInstance(result.grad_norm, torch.Tensor)
+        self.assertIsInstance(result.metrics["acc"], torch.Tensor)
+        self.assertIsInstance(result.metrics["ce_loss"], torch.Tensor)
+
     @staticmethod
     def _eagle_output(
         *,
@@ -327,6 +353,27 @@ class TestTrainerCore(unittest.TestCase):
 
 
 class TestTrainerController(unittest.TestCase):
+    def test_logger_receives_python_scalars_only_at_log_interval(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        logged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=2,
+                num_epochs=1,
+                log_interval=2,
+                logger=lambda metrics, step: logged.append((metrics, step)),
+            )
+            ctrl.fit([_batch(), _batch()])
+
+        self.assertEqual(len(logged), 1)
+        metrics, step = logged[0]
+        self.assertEqual(step, 2)
+        self.assertTrue(all(isinstance(value, float) for value in metrics.values()))
+
     def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
