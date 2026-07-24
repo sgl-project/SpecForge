@@ -166,6 +166,62 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             param2 = dict(model2.named_parameters())[name]
             self.assertTrue(torch.equal(param1, param2))
 
+    def test_rotary_buffers_absent_from_state_dict(self):
+        """The rotary buffers are non-persistent, so a checkpoint never stores them.
+
+        inv_freq / cos_cached / sin_cached are registered with persistent=False, so
+        they are absent from state_dict() and thus from any saved checkpoint. This is
+        the property that makes warm-starting safe (see the next test): there is
+        nothing in the checkpoint that could overwrite the live model's correctly
+        initialized rotary buffers. Historically the opposite was dangerous — loading
+        a meta-device model *as* the live model left these buffers uninitialized and
+        training diverged to loss=NaN.
+        """
+        model = LlamaForCausalLMEagle3(self.config)
+        keys = model.state_dict().keys()
+        for buf in ("inv_freq", "cos_cached", "sin_cached"):
+            self.assertFalse(
+                any(k.endswith(buf) for k in keys),
+                f"{buf} unexpectedly present in state_dict (should be persistent=False)",
+            )
+
+    def test_warm_start_preserves_rotary_buffers(self):
+        """Warm-starting from a checkpoint must not disturb the rotary buffers.
+
+        The training warm-start path builds the live draft model via from_config
+        (so __init__ runs _init_rope and the rotary buffers are valid) and then loads
+        only the checkpoint's draft weights with load_state_dict(strict=False). Since
+        the checkpoint state_dict contains no rotary buffers (previous test), the live
+        model's finite buffers must survive untouched. This pins the invariant against
+        a future regression that goes back to using a from_pretrained model as the
+        live model, which would reintroduce the uninitialized-buffer loss=NaN.
+        """
+        # A checkpoint's draft weights: exactly what warm-start loads. Being
+        # persistent=False, it carries no rotary buffers.
+        checkpoint_state = LlamaForCausalLMEagle3(self.config).state_dict()
+
+        # The live model, built the normal way, with valid rotary buffers.
+        live = LlamaForCausalLMEagle3(self.config)
+        rot = live.midlayer.self_attn.rotary_emb
+        before = {
+            name: getattr(rot, name).clone()
+            for name in ("inv_freq", "cos_cached", "sin_cached")
+        }
+
+        result = live.load_state_dict(checkpoint_state, strict=False)
+
+        # The rotary buffers are not tracked by state_dict at all, so they appear in
+        # neither the checkpoint nor the missing/unexpected key sets.
+        for buf in ("inv_freq", "cos_cached", "sin_cached"):
+            self.assertFalse(any(k.endswith(buf) for k in result.missing_keys))
+        rot = live.midlayer.self_attn.rotary_emb
+        for name, ref in before.items():
+            val = getattr(rot, name)
+            self.assertTrue(
+                torch.isfinite(val).all(), f"{name} became non-finite after warm start"
+            )
+            self.assertTrue(torch.equal(val, ref), f"{name} was modified by warm start")
+
     def test_config_validation(self):
         # A dimensionally-valid config (hidden_size divisible by num_attention_heads
         # so it passes transformers' strict config validation) that is still missing
