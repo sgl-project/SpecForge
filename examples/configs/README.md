@@ -339,6 +339,7 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.global_segment_size_bytes` | `34359738368` | Owned global segment size. |
 | `deployment.disaggregated.managed_local.mooncake.local_buffer_size_bytes` | `1073741824` | Owned local client buffer. |
 | `deployment.disaggregated.managed_local.mooncake.startup_timeout_s` | `60` | Positive Mooncake readiness timeout. |
+| `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |

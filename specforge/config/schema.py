@@ -282,6 +282,12 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Master key-lease TTL (ms) forwarded to ``mooncake_master
+    #: --default_kv_lease_ttl``. The consumer's teardown drain retries for only
+    #: ~1.75s, so Mooncake's stock 5000ms lease leaves keys pinned past the
+    #: drain window and fails shutdown. Default to a value below that window so
+    #: managed_local tears down cleanly; set null to inherit Mooncake's default.
+    default_kv_lease_ttl_ms: Optional[int] = Field(default=500, gt=0)
 
     @model_validator(mode="after")
     def _validate_endpoint(self):

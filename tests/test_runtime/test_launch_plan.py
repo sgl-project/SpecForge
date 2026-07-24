@@ -626,6 +626,7 @@ class LaunchPlanTest(unittest.TestCase):
                 "--rpc_port=35551",
                 "--http_metadata_server_port=35880",
                 "--metrics_port=35903",
+                "--default_kv_lease_ttl=500",
             ),
         )
         self.assertEqual(mooncake.readiness.kind, "mooncake")
