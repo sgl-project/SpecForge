@@ -1721,6 +1721,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # The embedding table may be kept in host memory (frozen, one lookup
+        # per batch); run the lookup where the table lives and return the
+        # result on the input device.
+        weight_device = self.embed_tokens.weight.device
+        if input_ids.device != weight_device:
+            return self.embed_tokens(input_ids.to(weight_device)).to(input_ids.device)
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:

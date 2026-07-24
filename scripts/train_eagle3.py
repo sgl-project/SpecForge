@@ -4,6 +4,7 @@
 # for them: VLM (--is-vlm), USP sequence parallelism (--attention-backend usp),
 # the eval loop (--eval-*-path), --resume, and experiment trackers (--report-to).
 import argparse
+import contextlib
 import hashlib
 import math
 import os
@@ -184,6 +185,16 @@ def build_parser() -> ArgumentParser:
         type=int,
         default=7,
         help="The length for Test-Time Training (TTT).",
+    )
+    training_group.add_argument(
+        "--draft-embedding-cpu",
+        action="store_true",
+        help="Keep the frozen draft input embedding in host memory (single-GPU online mode).",
+    )
+    training_group.add_argument(
+        "--optimizer-cpu-offload",
+        action="store_true",
+        help="Keep fp32 master params and AdamW state in host memory (single-GPU online mode).",
     )
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
@@ -460,6 +471,16 @@ def sanity_check(args: Namespace) -> None:
             raise ValueError("shard_target_output is only supported for sglang backend")
         if args.is_vlm:
             raise ValueError("shard_target_output is only supported non vlm model")
+    if (
+        args.optimizer_cpu_offload or args.draft_embedding_cpu
+    ) and dist.get_world_size() > 1:
+        # both options assume unwrapped parameters; under FSDP's flat
+        # parameter groups they would misbehave silently
+        raise ValueError(
+            "--optimizer-cpu-offload and --draft-embedding-cpu are "
+            "single-GPU options (world_size 1); they are incompatible "
+            "with the FSDP wrap used at world_size > 1"
+        )
 
 
 def sp_sanity_check(args: Namespace) -> None:
@@ -527,13 +548,13 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
-        ).cuda()
+        )
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
-        ).cuda()
+        )
 
     # Load training state (optimizer, scheduler, epoch, step) for true resume
     resume_state = None
@@ -701,7 +722,12 @@ def save_checkpoints(
         os.makedirs(epoch_output_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+    sd_ctx = (
+        FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT)
+        if isinstance(eagle3_model, FSDP)
+        else contextlib.nullcontext()
+    )
+    with sd_ctx:
         model_state_dict = eagle3_model.state_dict()
         state_to_save = {
             "epoch": epoch,
@@ -1017,6 +1043,22 @@ def main():
     print_cuda_memory_debug("before build_target_model")
     target_model, processor = build_target_model(args, draft_model_config, is_online)
     print_cuda_memory_debug("after build_target_model")
+    # The draft model is built on CPU and moved to GPU only after the sglang
+    # engine has profiled free memory, so the engine mem fraction does not
+    # have to absorb the draft weights (single-GPU online mode).
+    draft_model = draft_model.cuda()
+    if args.draft_embedding_cpu or args.optimizer_cpu_offload:
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            raise ValueError(
+                "CPU offloading options (--draft-embedding-cpu, --optimizer-cpu-offload) "
+                "are only supported in single-GPU mode (world_size=1)."
+            )
+    if args.draft_embedding_cpu:
+        # Frozen vocab x hidden table, used for one lookup per batch; keep it
+        # in host memory to free ~2 x hidden x vocab bytes of VRAM
+        # (single-GPU mode only).
+        draft_model.embed_tokens = draft_model.embed_tokens.cpu()
+    print_cuda_memory_debug("after draft_model.cuda()")
 
     # ================================================
     # 3. Build dataloader
@@ -1090,16 +1132,23 @@ def main():
                 kl_scale=args.kl_scale,
                 kl_decay=args.kl_decay,
             )
-    eagle3_model = FSDP(
-        eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        process_group=dist.group.WORLD,  # the draft model should run dp for all processes
-    )
+    if dist.get_world_size() > 1:
+        eagle3_model = FSDP(
+            eagle3_model,
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            ),
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            process_group=dist.group.WORLD,  # the draft model should run dp for all processes
+        )
+    else:
+        # Single GPU: FSDP adds no sharding value here and its flat parameter
+        # groups allocate gradient storage even for frozen params (a full
+        # vocab x hidden grad for the frozen embedding), so run the module
+        # directly.
+        print_with_rank("world_size=1: running eagle3 model without FSDP wrap")
     print_with_rank("Initialized Eagle3 FSDP model")
 
     # ================================================
@@ -1111,6 +1160,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=args.total_steps,
+        cpu_offload=args.optimizer_cpu_offload,
     )
     print_with_rank("Initialized optimizer and scheduler")
 
