@@ -33,9 +33,8 @@ class TestEquivDraftGradCkpt(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        from tests.test_runtime import _fixtures as fx
-
         from specforge import AutoDraftModelConfig, AutoEagle3DraftModel
+        from tests.test_runtime import _fixtures as fx
 
         self.fx = fx
         workdir = tempfile.mkdtemp(prefix="equiv_grad_ckpt_")
