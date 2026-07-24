@@ -272,6 +272,18 @@ def build_parser() -> ArgumentParser:
         default="flex_attention",
         help="The attention backend for the draft model",
     )
+    optimization_group.add_argument(
+        "--draft-gradient-checkpointing",
+        action="store_true",
+        help=(
+            "Recompute each TTT step during backward instead of retaining its "
+            "activations. Cuts the retained graph from ~O(ttt_length * "
+            "seq * vocab/intermediate) to just the per-step hidden states and "
+            "cached k/v, at the cost of one extra draft forward per step. "
+            "Enables longer --max-length on a single card. Not supported with "
+            "the usp attention backend."
+        ),
+    )
 
     # other args
     other_group = parser.add_argument_group("others")
@@ -1101,6 +1113,11 @@ def main():
         and args.tp_size == 1
         and args.target_model_backend != "sglang"
     ):
+        if args.draft_gradient_checkpointing:
+            raise ValueError(
+                "--draft-gradient-checkpointing is not supported for the "
+                "QwenVL online path"
+            )
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
@@ -1121,6 +1138,7 @@ def main():
                 lk_loss_type=args.lk_loss_type,
                 kl_scale=args.kl_scale,
                 kl_decay=args.kl_decay,
+                gradient_checkpointing=args.draft_gradient_checkpointing,
             )
         else:
             # offline: the target_model is TargetHead not a model
@@ -1131,6 +1149,7 @@ def main():
                 lk_loss_type=args.lk_loss_type,
                 kl_scale=args.kl_scale,
                 kl_decay=args.kl_decay,
+                gradient_checkpointing=args.draft_gradient_checkpointing,
             )
     if dist.get_world_size() > 1:
         eagle3_model = FSDP(

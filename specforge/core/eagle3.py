@@ -25,6 +25,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.compact_teacher import (
@@ -40,6 +41,13 @@ from specforge.utils import padding
 
 class Eagle3Model(nn.Module):
     pass
+
+
+def _dynamic_cache_kv(cache: DynamicCache) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return the layer-0 key/value tensors across transformers versions."""
+    if hasattr(cache, "layers"):  # transformers >= 5
+        return cache.layers[0].keys, cache.layers[0].values
+    return cache.key_cache[0], cache.value_cache[0]
 
 
 def _compute_loss_and_acceptance_rate(
@@ -116,6 +124,7 @@ class OnlineEagle3Model(Eagle3Model):
         lk_loss_type: Optional[str] = None,
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
+        gradient_checkpointing: bool = False,
     ):
         """
         Args:
@@ -125,6 +134,12 @@ class OnlineEagle3Model(Eagle3Model):
             lk_loss_type: LK loss objective type. One of {"lambda", "alpha"}.
             kl_scale: Initial KL weight scale for lambda LK loss.
             kl_decay: Decay factor for adaptive KL weight in lambda LK loss.
+            gradient_checkpointing: recompute each TTT step in backward instead
+                of retaining its activations (attention probs, MLP intermediates,
+                logits, per-step teacher-p slices). Only the per-step hidden
+                states and cached k/v survive the forward, which is what makes
+                longer max_length fit on a single card. Not supported for usp:
+                it runs collectives inside the step, which is not replay-safe.
         """
         super().__init__()
         self.draft_model = draft_model
@@ -134,6 +149,12 @@ class OnlineEagle3Model(Eagle3Model):
         self.lk_loss_type = lk_loss_type
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
+        if gradient_checkpointing and attention_backend == "usp":
+            raise ValueError(
+                "gradient_checkpointing is not supported with the usp attention "
+                "backend (collectives inside the checkpointed step)"
+            )
+        self.gradient_checkpointing = gradient_checkpointing
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -231,6 +252,105 @@ class OnlineEagle3Model(Eagle3Model):
 
         position_ids = position_ids.long()
         return position_ids.view(-1, seq_length)
+
+    def _run_ttt_step(
+        self,
+        idx: int,
+        seq_length: int,
+        n_prev: int,
+        adapter: BackendAdapter,
+        global_input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        target_p_padded: torch.Tensor,
+        target_p_on_draft_padded: Optional[torch.Tensor],
+        target_token_ids_padded: Optional[torch.Tensor],
+        position_mask: torch.Tensor,
+        *prev_kv: torch.Tensor,
+    ) -> Tuple[torch.Tensor, ...]:
+        """One TTT step as a replay-safe function for activation checkpointing.
+
+        Prior steps' cached k/v enter as flat tensor args (autograd inputs, so
+        the cross-step gradient chain survives recompute) and a fresh local
+        cache — cache_hidden lists for sdpa/fa, a seeded DynamicCache for
+        flex_attention — is built per invocation, so replaying never
+        double-appends. The padded teacher tensors are sliced in here so the
+        per-step .contiguous() copies stay recompute-transient instead of being
+        retained by the loss graph.
+
+        For sdpa/fa, prev_kv is (*per_step_keys, *per_step_values) with n_prev
+        keys; for flex_attention it is the running concatenated (key, value)
+        pair with n_prev == 1, or empty on the first step.
+        """
+        if self.attention_backend == "flex_attention":
+            cache_hidden = None
+            past_key_values = DynamicCache()
+            if n_prev:
+                past_key_values.update(prev_kv[0], prev_kv[n_prev], layer_idx=0)
+        else:
+            cache_hidden = [list(prev_kv[:n_prev]), list(prev_kv[n_prev:])]
+            past_key_values = None
+        state = adapter.step_view(
+            idx=idx,
+            ttt_length=self.length,
+            global_input_ids=global_input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            target_p_padded=target_p_padded,
+            target_p_on_draft_padded=target_p_on_draft_padded,
+            target_token_ids_padded=target_token_ids_padded,
+            position_mask=position_mask,
+            seq_length=seq_length,
+        )
+        inputs_embeds = self.draft_model.embed_input_ids(state.input_ids)
+        inputs_embeds = inputs_embeds.to(state.hidden_states.dtype)
+        hidden_states_out = self.draft_model.backbone(
+            input_embeds=inputs_embeds,
+            hidden_states=state.hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=state.attention_mask,
+            position_ids=state.position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        if self.attention_backend == "flex_attention":
+            new_key, new_value = _dynamic_cache_kv(past_key_values)
+        else:
+            new_key, new_value = cache_hidden[0][-1], cache_hidden[1][-1]
+        logits = self.draft_model.compute_logits(hidden_states_out)
+        (
+            acc,
+            acceptance_rate,
+            loss,
+            correct,
+            denom,
+            metric_loss,
+            loss_denom,
+        ) = self._acc_and_loss(
+            logits=logits,
+            target_p=state.target_p,
+            target_p_on_draft=state.target_p_on_draft,
+            target_token_ids=state.target_token_ids,
+            position_mask=state.position_mask,
+            loss_mask=state.loss_mask,
+            adapter=adapter,
+        )
+        return (
+            hidden_states_out,
+            new_key,
+            new_value,
+            loss,
+            acc,
+            acceptance_rate,
+            correct,
+            denom,
+            metric_loss,
+            loss_denom,
+        )
 
     def forward(
         self,
@@ -358,7 +478,66 @@ class OnlineEagle3Model(Eagle3Model):
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
+        use_ckpt = (
+            self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        )
+        ckpt_keys: List[torch.Tensor] = []
+        ckpt_values: List[torch.Tensor] = []
         for idx in range(self.length):
+            is_last = idx == self.length - 1
+
+            if use_ckpt:
+                # Steps 5.1-5.6 replayed in backward; only step outputs retained.
+                (
+                    hidden_states,
+                    new_k,
+                    new_v,
+                    loss,
+                    acc,
+                    acceptance_rate,
+                    correct,
+                    denom,
+                    metric_loss,
+                    loss_denom,
+                ) = torch.utils.checkpoint.checkpoint(
+                    self._run_ttt_step,
+                    idx,
+                    seq_length,
+                    len(ckpt_keys),
+                    adapter,
+                    global_input_ids,
+                    attention_mask,
+                    loss_mask,
+                    position_ids,
+                    hidden_states,
+                    target_p_padded,
+                    target_p_on_draft_padded,
+                    target_token_ids_padded,
+                    position_mask,
+                    *ckpt_keys,
+                    *ckpt_values,
+                    use_reentrant=False,
+                )
+                if self.attention_backend == "flex_attention":
+                    # running concatenated cache: replace, don't append
+                    ckpt_keys, ckpt_values = [new_k], [new_v]
+                else:
+                    ckpt_keys = ckpt_keys + [new_k]
+                    ckpt_values = ckpt_values + [new_v]
+                acces.append(acc)
+                acceptance_rates.append(acceptance_rate)
+                plosses.append(loss)
+                metric_corrects.append(correct)
+                metric_denoms.append(denom)
+                metric_losses.append(metric_loss)
+                metric_loss_denoms.append(loss_denom)
+
+                if not is_last:
+                    global_input_ids = padding(global_input_ids, left=False)
+                    position_mask = padding(position_mask, left=False)
+                    loss_mask = padding(loss_mask, left=False)
+                continue
+
             state = adapter.step_view(
                 idx=idx,
                 ttt_length=self.length,
@@ -373,7 +552,6 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask=position_mask,
                 seq_length=seq_length,
             )
-            is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
             inputs_embeds = self.draft_model.embed_input_ids(state.input_ids)
