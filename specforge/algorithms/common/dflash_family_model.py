@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -78,6 +79,7 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    flex_block_size=None,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -113,8 +115,17 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
+    kwargs = {}
+    if flex_block_size is not None:
+        kwargs["BLOCK_SIZE"] = flex_block_size
     return create_block_mask(
-        dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
+        dflash_mask_mod,
+        B=B,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
+        **kwargs,
     )
 
 
@@ -294,6 +305,10 @@ class OnlineDFlashModel(nn.Module):
                 S=seq_len,
                 block_size=self.block_size,
                 device=device,
+                # FLASH requires a minimum of this block size.
+                flex_block_size=(
+                    (256, 128) if flex_attention_backend() == "FLASH" else None
+                ),
             )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
