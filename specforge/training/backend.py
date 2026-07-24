@@ -201,6 +201,14 @@ class FSDPTrainingBackend(TrainingBackend):
 
         Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
         """
+        if self._optimizer_factory is not None:
+            capture_metadata = getattr(
+                self._optimizer_factory, "capture_parameter_metadata", None
+            )
+            if callable(capture_metadata):
+                capture_metadata(
+                    optimizer_target if optimizer_target is not None else model
+                )
         if not wrap:
             self.module = model
             self._wrapped = False
