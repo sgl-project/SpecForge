@@ -252,6 +252,7 @@ def build_eagle3_model(
         lk_loss_type=cfg.training.lk_loss_type,
         kl_scale=cfg.training.kl_scale,
         kl_decay=cfg.training.kl_decay,
+        trim_loss_positions=cfg.training.trim_loss_positions,
     ).to(device=_device(), dtype=_torch_dtype(cfg))
     needs_target_head = cfg.mode == "offline" or (
         cfg.deployment.mode == "disaggregated" and cfg.training.role == "consumer"
