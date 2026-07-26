@@ -7,7 +7,7 @@ model:
   draft_model_config: "configs/qwen3.5-4b-dflash.json"
   target_backend: sglang
   trust_remote_code: true
-  embedding_key: "model.embed_tokens.weight"
+  embedding_key: "model.language_model.embed_tokens.weight"
   torch_dtype: "bfloat16"
   sglang_attention_backend: ascend
 data:
