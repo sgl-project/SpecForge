@@ -681,6 +681,65 @@ class LaunchPlanTest(unittest.TestCase):
         rendered = json.loads(plan.render())
         self.assertEqual(len(rendered["services"]), 3)
 
+    def test_managed_local_ascend_injects_npu_visibility_and_backend(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            with (
+                mock.patch(
+                    "specforge.training.capture_contract.resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+                mock.patch(
+                    "specforge.launch_plan._device_visibility_env_var",
+                    return_value="ASCEND_RT_VISIBLE_DEVICES",
+                ),
+            ):
+                plan = build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={},
+                )
+
+        mooncake_env = plan.services[0].command.env
+        self.assertEqual(mooncake_env["ASCEND_RT_VISIBLE_DEVICES"], "")
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", mooncake_env)
+        server_env = plan.services[1].command.env
+        self.assertEqual(server_env["ASCEND_RT_VISIBLE_DEVICES"], "0,1")
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", server_env)
+        argv = plan.services[1].command.argv
+        # No explicit backend and the default flashinfer -> Ascend fallback.
+        self.assertEqual(argv[argv.index("--attention-backend") + 1], "ascend")
+        producer, consumer = plan.commands
+        self.assertEqual(producer.env["ASCEND_RT_VISIBLE_DEVICES"], "")
+        self.assertEqual(consumer.env["ASCEND_RT_VISIBLE_DEVICES"], "4,5")
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", producer.env)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", consumer.env)
+
+    def test_device_visibility_env_var_selection(self):
+        from specforge.launch_plan import _device_visibility_env_var
+
+        with mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": "npu"}):
+            self.assertEqual(
+                _device_visibility_env_var(), "ASCEND_RT_VISIBLE_DEVICES"
+            )
+        with mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": "cuda"}):
+            self.assertEqual(_device_visibility_env_var(), "CUDA_VISIBLE_DEVICES")
+        with mock.patch.dict(
+            os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0,1"}, clear=True
+        ):
+            self.assertEqual(
+                _device_visibility_env_var(), "ASCEND_RT_VISIBLE_DEVICES"
+            )
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
+            self.assertEqual(_device_visibility_env_var(), "CUDA_VISIBLE_DEVICES")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("importlib.util.find_spec", return_value=None),
+        ):
+            self.assertEqual(_device_visibility_env_var(), "CUDA_VISIBLE_DEVICES")
+
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
             Path(__file__).resolve().parents[2]

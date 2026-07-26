@@ -359,6 +359,30 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
     return values
 
 
+def _device_visibility_env_var() -> str:
+    """Name of the visible-devices env var for the active accelerator.
+
+    CUDA hosts use ``CUDA_VISIBLE_DEVICES``; Ascend NPU hosts use
+    ``ASCEND_RT_VISIBLE_DEVICES``. Kept torch-free so launch planning works
+    in supervisor processes without torch: ``torch_npu`` is detected by
+    module availability (no import) after explicit env markers.
+    """
+    forced = os.environ.get("SPECFORGE_DEVICE")
+    if forced == "npu":
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if forced == "cuda":
+        return "CUDA_VISIBLE_DEVICES"
+    if os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
+        "ASCEND_VISIBLE_DEVICES"
+    ):
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "CUDA_VISIBLE_DEVICES"
+    if importlib.util.find_spec("torch_npu") is not None:
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    return "CUDA_VISIBLE_DEVICES"
+
+
 def _sglang_argv(
     model: ModelConfig,
     *,
@@ -400,6 +424,9 @@ def _managed_local_services(
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
     shared_env = _managed_local_environment(cfg)
+    #: Device ordinals from the typed config are injected through the
+    #: accelerator-appropriate visibility env var (CUDA vs Ascend NPU).
+    visibility_env = _device_visibility_env_var()
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
     )
@@ -415,7 +442,7 @@ def _managed_local_services(
                 f"--http_metadata_server_port={mooncake.metadata_port}",
                 f"--metrics_port={mooncake.metrics_port}",
             ),
-            {"CUDA_VISIBLE_DEVICES": ""},
+            {visibility_env: ""},
         ),
         readiness=ReadinessSpec(
             "mooncake",
@@ -462,6 +489,16 @@ def _managed_local_services(
                 str(server.port),
             ]
         )
+        attention_backend = (
+            server.attention_backend or cfg.model.sglang_attention_backend
+        )
+        if (
+            server.attention_backend is None
+            and attention_backend == "flashinfer"
+            and visibility_env == "ASCEND_RT_VISIBLE_DEVICES"
+        ):
+            # flashinfer does not exist on Ascend; default to the NPU backend.
+            attention_backend = "ascend"
         argv.extend(
             _sglang_argv(
                 cfg.model,
@@ -472,15 +509,13 @@ def _managed_local_services(
                         if server.mem_fraction_static is not None
                         else cfg.model.sglang_mem_fraction_static
                     ),
-                    "sglang_attention_backend": (
-                        server.attention_backend or cfg.model.sglang_attention_backend
-                    ),
+                    "sglang_attention_backend": attention_backend,
                 },
             )
         )
         service_env = {
             **shared_env,
-            "CUDA_VISIBLE_DEVICES": ",".join(server.cuda_visible_devices),
+            visibility_env: ",".join(server.cuda_visible_devices),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
@@ -716,11 +751,12 @@ def build_launch_plan(
         if role in ("consumer", "both"):
             consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
         if managed_local is not None:
+            visibility_env = _device_visibility_env_var()
             producer_env.update(managed_environment)
-            producer_env["CUDA_VISIBLE_DEVICES"] = ""
+            producer_env[visibility_env] = ""
             producer_env[_MANAGED_CHILD_ENV] = "1"
             consumer_env.update(managed_environment)
-            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            consumer_env[visibility_env] = ",".join(
                 managed_local.trainer_cuda_visible_devices
             )
             consumer_env[_MANAGED_CHILD_ENV] = "1"
