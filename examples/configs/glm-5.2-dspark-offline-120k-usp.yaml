@@ -1,0 +1,42 @@
+model:
+  target_model_path: zai-org/GLM-5.2-FP8
+  draft_model_config: configs/glm-5.2-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/glm-5.2-dspark-120k
+  max_length: 120000
+  chat_template: glm-5.2
+  cache_dir: ./cache
+
+training:
+  strategy: dspark
+  num_epochs: 10
+  batch_size: 1
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: usp
+  sp_ulysses_size: 8
+  sp_ring_size: 1
+  fsdp_sharding: FULL_SHARD
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 64
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+run_id: glm-5.2-dspark-offline-120k-usp
+output_dir: ./outputs/glm-5.2-dspark-offline-120k-usp
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

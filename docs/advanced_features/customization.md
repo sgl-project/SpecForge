@@ -57,7 +57,8 @@ strategy-specific set:
 | --- | --- |
 | EAGLE3 | `sdpa`, `flex_attention`, `fa`, offline `usp` |
 | P-EAGLE | `flex_attention` |
-| DFlash, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
+| DFlash, Domino | `eager`, `sdpa`, `flex_attention` |
+| DSpark | `eager`, `sdpa`, `flex_attention`, offline Ulysses-only `usp` |
 
 ## Target models
 
@@ -84,6 +85,8 @@ EAGLE3 offline sequence parallelism is selected with
 `training.sp_ring_size`. Evaluation, compact-teacher projection, and experiment
 tracking are also config features rather than custom launchers; see the
 [training guide](../basic_usage/training.md) for their validated combinations.
+DSpark offline uses the same switch for Ulysses sequence parallelism, but
+currently requires `training.sp_ring_size: 1`.
 
 ## Draft architectures
 

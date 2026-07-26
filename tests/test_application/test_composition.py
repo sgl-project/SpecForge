@@ -97,6 +97,22 @@ class ApplicationCompositionTest(unittest.TestCase):
         provider = resolved.algorithm.providers.offline_for("text")
         self.assertEqual("dspark_offline_v1", provider.normalizer_id)
 
+    def test_dspark_offline_supports_ulysses_but_rejects_ring_parallelism(self):
+        payload = _payload("dspark", mode="offline")
+        payload["training"].update(
+            {
+                "attention_backend": "usp",
+                "sp_ulysses_size": 2,
+                "sp_ring_size": 1,
+            }
+        )
+        resolved = resolve_run(Config.model_validate(payload))
+        self.assertIn("usp", resolved.algorithm.spec.capabilities.attention_backends)
+
+        payload["training"]["sp_ring_size"] = 2
+        with self.assertRaisesRegex(ValueError, "Ulysses.*only"):
+            resolve_run(Config.model_validate(payload))
+
     def test_application_planning_defends_offline_data_parallelism(self):
         config = Config.model_validate(_payload(mode="offline"))
         invalid_training = config.training.model_copy(update={"tp_size": 2})

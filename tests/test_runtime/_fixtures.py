@@ -420,6 +420,9 @@ def build_dspark(
     markov_rank=8,
     mask_token_id=0,
     attention_backend="sdpa",
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    max_position_embeddings=512,
 ):
     """Build a tiny OnlineDSparkModel on CUDA without model downloads."""
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
@@ -432,10 +435,10 @@ def build_dspark(
         hidden_size=hidden,
         intermediate_size=2 * hidden,
         num_hidden_layers=target_layers,
-        num_attention_heads=4,
-        num_key_value_heads=2,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
         vocab_size=vocab,
-        max_position_embeddings=512,
+        max_position_embeddings=max_position_embeddings,
         rms_norm_eps=1e-5,
         tie_word_embeddings=False,
     )
@@ -449,6 +452,7 @@ def build_dspark(
     draft_config.num_target_layers = target_layers
     draft_config.dflash_config = {
         "projector_type": "dspark",
+        "attention_backend": attention_backend,
         "mask_token_id": mask_token_id,
         "markov_rank": markov_rank,
         "markov_head_type": "vanilla",
@@ -456,7 +460,9 @@ def build_dspark(
         "enable_confidence_head": True,
         "confidence_head_with_markov": True,
     }
-    draft_config._attn_implementation = attention_backend
+    draft_config._attn_implementation = (
+        "flex_attention" if attention_backend == "usp" else attention_backend
+    )
 
     draft_model = DSparkDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
     draft_model.mask_token_id = mask_token_id

@@ -4,10 +4,12 @@
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.distributed import get_draft_sp_group
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
 try:
@@ -78,6 +80,7 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    real_context_len: Optional[int] = None,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -91,6 +94,9 @@ def create_dflash_block_mask(
       4. Invalid blocks (block_keep_mask=False) see nothing.
     """
 
+    if real_context_len is None:
+        real_context_len = S
+
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
         safe_q_block_id = q_block_id.clamp(max=N - 1)
@@ -99,7 +105,7 @@ def create_dflash_block_mask(
         is_context = kv_idx < S
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
-        mask_context = is_context & (kv_idx < anchor_pos)
+        mask_context = is_context & (kv_idx < anchor_pos) & (kv_idx < real_context_len)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
@@ -151,6 +157,7 @@ class OnlineDFlashModel(nn.Module):
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
+        self.use_usp = attention_backend == "usp"
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.objective_chunk_blocks = int(objective_chunk_blocks)
@@ -762,6 +769,226 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        self._draft_sp_group = None
+        self._draft_sp_world_size = None
+        self._draft_sp_rank = None
+
+    def _get_draft_sp_group_info(self):
+        if self._draft_sp_world_size is None:
+            group = get_draft_sp_group()
+            if group is None:
+                self._draft_sp_group = None
+                self._draft_sp_world_size = 1
+                self._draft_sp_rank = 0
+            else:
+                self._draft_sp_group = group
+                self._draft_sp_world_size = dist.get_world_size(group)
+                self._draft_sp_rank = dist.get_rank(group)
+        return (
+            self._draft_sp_group,
+            self._draft_sp_world_size,
+            self._draft_sp_rank,
+        )
+
+    def _slice_local_blocks(self, tensor: torch.Tensor) -> torch.Tensor:
+        _, sp_size, sp_rank = self._get_draft_sp_group_info()
+        if tensor.shape[1] % sp_size:
+            raise ValueError(
+                f"global DSpark block width {tensor.shape[1]} is not divisible "
+                f"by SP size {sp_size}"
+            )
+        blocks_per_rank = tensor.shape[1] // sp_size
+        start = sp_rank * blocks_per_rank
+        return tensor[:, start : start + blocks_per_rank]
+
+    def _collect_global_values(
+        self,
+        positions: torch.Tensor,
+        local_values: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Resolve sparse absolute positions from sequence-sharded values.
+
+        Each rank fills requests owned by its contiguous local shard and a SUM
+        reduction combines the disjoint partial results.  Communication scales
+        with sampled DSpark blocks rather than the 120K source sequence (except
+        for the tiny loss-mask gather used while sampling anchors).
+        """
+
+        group, sp_size, _ = self._get_draft_sp_group_info()
+        if group is None or sp_size == 1:
+            raise RuntimeError("sparse global lookup requires DSpark SP > 1")
+        if positions.shape[0] != 1 or local_values.shape[0] != 1:
+            raise ValueError("DSpark USP currently requires batch_size=1")
+
+        flat_positions = positions.reshape(-1)
+        trailing_shape = tuple(local_values.shape[2:])
+        result = local_values.new_zeros((flat_positions.numel(), *trailing_shape))
+        presence = torch.zeros(
+            flat_positions.numel(),
+            dtype=torch.long,
+            device=local_values.device,
+        )
+        valid_length = int(attention_mask[0].sum().item())
+        if valid_length > 0:
+            local_positions = position_ids[0, :valid_length]
+            local_start = int(local_positions[0].item())
+            local_stop = int(local_positions[-1].item()) + 1
+            owned = (flat_positions >= local_start) & (flat_positions < local_stop)
+            if owned.any():
+                offsets = flat_positions[owned] - local_start
+                result[owned] = local_values[0, offsets]
+                presence[owned] = 1
+
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+        dist.all_reduce(presence, op=dist.ReduceOp.SUM, group=group)
+        return (
+            result.reshape(*positions.shape, *trailing_shape),
+            presence.reshape_as(positions).bool(),
+        )
+
+    def _sample_anchor_positions_usp(
+        self,
+        loss_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample one global anchor set, then pad it evenly across SP peers."""
+
+        group, sp_size, sp_rank = self._get_draft_sp_group_info()
+        if group is None or sp_size == 1:
+            return self._sample_anchor_positions(
+                loss_mask.shape[1], loss_mask, loss_mask.device
+            )
+        if loss_mask.shape[0] != 1:
+            raise ValueError("DSpark USP currently requires batch_size=1")
+
+        loss_shards = [torch.empty_like(loss_mask) for _ in range(sp_size)]
+        valid_shards = [torch.empty_like(attention_mask) for _ in range(sp_size)]
+        dist.all_gather(loss_shards, loss_mask.contiguous(), group=group)
+        dist.all_gather(valid_shards, attention_mask.contiguous(), group=group)
+        global_loss_mask = torch.cat(loss_shards, dim=1)
+        global_valid_mask = torch.cat(valid_shards, dim=1).bool()
+        global_loss_mask = global_loss_mask * global_valid_mask.to(loss_mask.dtype)
+
+        valid = self._build_anchor_candidate_mask(
+            global_loss_mask.shape[1], global_loss_mask
+        )
+        width = min(self.num_anchors, int(valid.sum(dim=1).max().item()))
+        if width <= 0:
+            raise ValueError(
+                "DSpark found no valid global anchor with two consecutive loss tokens"
+            )
+        anchors = torch.empty((1, width), dtype=torch.long, device=loss_mask.device)
+        keep_mask = torch.empty((1, width), dtype=torch.bool, device=loss_mask.device)
+        if sp_rank == 0:
+            sampled, sampled_keep = self._sample_anchor_positions(
+                global_loss_mask.shape[1], global_loss_mask, loss_mask.device
+            )
+            anchors.copy_(sampled)
+            keep_mask.copy_(sampled_keep)
+        source_rank = dist.get_global_rank(group, 0)
+        dist.broadcast(anchors, src=source_rank, group=group)
+        dist.broadcast(keep_mask, src=source_rank, group=group)
+
+        padded_width = ((width + sp_size - 1) // sp_size) * sp_size
+        if padded_width > width:
+            anchors = F.pad(anchors, (0, padded_width - width), value=0)
+            keep_mask = F.pad(keep_mask, (0, padded_width - width), value=False)
+        return anchors, keep_mask
+
+    def _usp_context_lengths(
+        self,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[int, int]:
+        group, sp_size, _ = self._get_draft_sp_group_info()
+        local_real_end = torch.zeros((), dtype=torch.long, device=position_ids.device)
+        valid_length = int(attention_mask[0].sum().item())
+        if valid_length:
+            local_real_end.fill_(int(position_ids[0, valid_length - 1].item()) + 1)
+        dist.all_reduce(local_real_end, op=dist.ReduceOp.MAX, group=group)
+        return int(local_real_end.item()), position_ids.shape[1] * sp_size
+
+    def _create_noise_embed_from_anchor_tokens(
+        self,
+        anchor_tokens: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, num_blocks = anchor_tokens.shape
+        noise_ids = torch.full(
+            (bsz, num_blocks * self.block_size),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=anchor_tokens.device,
+        )
+        block_starts = (
+            torch.arange(num_blocks, device=anchor_tokens.device) * self.block_size
+        )
+        batch_indices = torch.arange(bsz, device=anchor_tokens.device).unsqueeze(1)
+        noise_ids[batch_indices, block_starts.unsqueeze(0)] = torch.where(
+            block_keep_mask,
+            anchor_tokens,
+            torch.full_like(anchor_tokens, self.mask_token_id),
+        )
+        return self.embed_tokens(noise_ids)
+
+    def _forward_draft_blocks_usp(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ):
+        global_anchors, global_keep = self._sample_anchor_positions_usp(
+            loss_mask, attention_mask
+        )
+        local_anchors = self._slice_local_blocks(global_anchors)
+        local_keep = self._slice_local_blocks(global_keep)
+        global_anchor_tokens, anchor_presence = self._collect_global_values(
+            global_anchors,
+            input_ids,
+            position_ids,
+            attention_mask,
+        )
+        local_anchor_tokens = self._slice_local_blocks(global_anchor_tokens)
+        local_presence = self._slice_local_blocks(anchor_presence)
+        if not bool((local_presence | ~local_keep).all().item()):
+            raise ValueError("failed to resolve one or more DSpark USP anchor tokens")
+
+        real_context_len, padded_context_len = self._usp_context_lengths(
+            position_ids, attention_mask
+        )
+        noise_embedding = self._create_noise_embed_from_anchor_tokens(
+            local_anchor_tokens, local_keep
+        )
+        draft_position_ids = self._create_position_ids(local_anchors)
+        full_position_ids = torch.cat([position_ids, draft_position_ids], dim=1)
+        attention = create_dflash_block_mask(
+            anchor_positions=global_anchors,
+            block_keep_mask=global_keep,
+            S=padded_context_len,
+            block_size=self.block_size,
+            device=input_ids.device,
+            real_context_len=real_context_len,
+        )
+        output_hidden = self.draft_model(
+            position_ids=full_position_ids,
+            noise_embedding=noise_embedding,
+            target_hidden=hidden_states,
+            attention_mask=attention,
+        )
+        return (
+            global_anchors,
+            global_keep,
+            local_anchors,
+            local_keep,
+            local_anchor_tokens,
+            real_context_len,
+            output_hidden,
+        )
 
     def _build_anchor_candidate_mask(
         self,
@@ -847,6 +1074,69 @@ class OnlineDSparkModel(OnlineDFlashModel):
         eval_mask = eval_mask & block_keep_mask.unsqueeze(-1)
         eval_mask = eval_mask.to(torch.int32).cumprod(dim=-1).bool()
         return target_ids, eval_mask, safe_label_indices
+
+    def _build_dspark_usp_targets(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        target_last_hidden_states: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        global_anchors: torch.Tensor,
+        global_keep: torch.Tensor,
+        real_context_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        offsets = torch.arange(1, self.block_size + 1, device=input_ids.device).view(
+            1, 1, -1
+        )
+        global_label_positions = global_anchors.unsqueeze(-1) + offsets
+        global_target_ids, target_presence = self._collect_global_values(
+            global_label_positions,
+            input_ids,
+            position_ids,
+            attention_mask,
+        )
+        global_target_loss, loss_presence = self._collect_global_values(
+            global_label_positions,
+            loss_mask,
+            position_ids,
+            attention_mask,
+        )
+        global_eval_mask = global_label_positions < real_context_len
+        global_eval_mask &= target_presence & loss_presence
+        global_eval_mask &= global_target_loss > 0.5
+        global_eval_mask &= global_keep.unsqueeze(-1)
+        global_eval_mask = global_eval_mask.to(torch.int32).cumprod(dim=-1).bool()
+
+        aligned_target_hidden = None
+        need_target = self.dspark_l1_loss_alpha > 0 or (
+            self.dspark_confidence_head_alpha > 0
+            and getattr(self.draft_model, "confidence_head", None) is not None
+        )
+        if need_target:
+            if target_last_hidden_states is None:
+                raise ValueError(
+                    "DSpark L1/confidence loss requires target_last_hidden_states"
+                )
+            predictor_positions = global_label_positions - 1
+            global_target_hidden, hidden_presence = self._collect_global_values(
+                predictor_positions,
+                target_last_hidden_states,
+                position_ids,
+                attention_mask,
+            )
+            if not bool((hidden_presence | ~global_eval_mask).all().item()):
+                raise ValueError(
+                    "failed to resolve one or more DSpark USP teacher states"
+                )
+            aligned_target_hidden = self._slice_local_blocks(global_target_hidden)
+
+        return (
+            self._slice_local_blocks(global_target_ids),
+            self._slice_local_blocks(global_eval_mask),
+            aligned_target_hidden,
+        )
 
     def _dspark_loss_weight_mask(
         self,
@@ -1010,8 +1300,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         target_ids: torch.Tensor,
         eval_mask: torch.Tensor,
         prev_token_ids: torch.Tensor,
-        safe_label_indices: torch.Tensor,
+        safe_label_indices: Optional[torch.Tensor],
         target_last_hidden_states: Optional[torch.Tensor],
+        aligned_target_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
         """Token-pooled DSpark objective with bounded vocab-logit memory."""
 
@@ -1028,12 +1319,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             self.dspark_confidence_head_alpha > 0
             and getattr(self.draft_model, "confidence_head", None) is not None
         )
-        aligned_target_hidden = None
-        if need_target:
+        if need_target and aligned_target_hidden is None:
             if target_last_hidden_states is None:
                 raise ValueError(
                     "DSpark L1/confidence loss requires target_last_hidden_states"
                 )
+            if safe_label_indices is None:
+                raise ValueError("DSpark target alignment requires safe label indices")
             aligned_target_hidden = self._aligned_target_hidden(
                 target_last_hidden_states,
                 safe_label_indices,
@@ -1128,29 +1420,67 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-        )
-
-        (
-            target_ids,
-            eval_mask,
-            safe_label_indices,
-        ) = self._build_dspark_labels_and_mask(
-            input_ids=input_ids,
-            loss_mask=loss_mask,
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-        )
-        anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
+        aligned_target_hidden = None
+        if self.use_usp:
+            if position_ids is None or attention_mask is None:
+                raise ValueError(
+                    "DSpark USP requires sharded position_ids and attention_mask"
+                )
+            (
+                global_anchors,
+                global_keep,
+                anchor_positions,
+                block_keep_mask,
+                anchor_token_ids,
+                real_context_len,
+                output_hidden,
+            ) = self._forward_draft_blocks_usp(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                loss_mask=loss_mask,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+            )
+            target_ids, eval_mask, aligned_target_hidden = (
+                self._build_dspark_usp_targets(
+                    input_ids=input_ids,
+                    loss_mask=loss_mask,
+                    target_last_hidden_states=target_last_hidden_states,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    global_anchors=global_anchors,
+                    global_keep=global_keep,
+                    real_context_len=real_context_len,
+                )
+            )
+            safe_label_indices = None
+        else:
+            anchor_positions, block_keep_mask, output_hidden = (
+                self._forward_draft_blocks(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                )
+            )
+            (
+                target_ids,
+                eval_mask,
+                safe_label_indices,
+            ) = self._build_dspark_labels_and_mask(
+                input_ids=input_ids,
+                loss_mask=loss_mask,
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+            )
+            anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
         prev_token_ids = torch.cat(
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
             dim=-1,
@@ -1162,6 +1492,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             prev_token_ids=prev_token_ids,
             safe_label_indices=safe_label_indices,
             target_last_hidden_states=target_last_hidden_states,
+            aligned_target_hidden=aligned_target_hidden,
         )
         accuracy = metrics.pop("accuracy")
         return loss, accuracy, metrics

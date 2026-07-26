@@ -236,7 +236,7 @@ The unified runtime supports text training in these combinations:
 | EAGLE3 | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
 | DFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
-| DSpark | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| DSpark | Yes, consumer DP | Yes, DP + Ulysses SP | Yes, consumer DP + Ulysses SP |
 | P-EAGLE | Yes, consumer DP, batch size 1 | No | No |
 
 Unsupported combinations fail explicitly during config validation or run
@@ -248,8 +248,8 @@ assembly. In particular:
   features through `data.eval_hidden_states_path`;
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, `fa`, or offline `usp`; P-EAGLE requires
-  `flex_attention`; DFlash, Domino, and DSpark accept `eager`, `sdpa`, or
-  `flex_attention`;
+  `flex_attention`; DFlash and Domino accept `eager`, `sdpa`, or
+  `flex_attention`; DSpark additionally accepts offline Ulysses-only `usp`;
 - P-EAGLE requires `training.batch_size=1` and reuses EAGLE3's server capture
   schema;
 - offline feature training supports EAGLE3, DFlash, Domino, and DSpark;
@@ -283,6 +283,11 @@ The launcher creates every process group from the typed run config:
   `training.sp_ulysses_size` and `training.sp_ring_size`. Their product must be
   greater than one, USP currently uses `training.batch_size: 1`, and SP peers
   share one sequence while draft-DP groups receive disjoint references.
+- DSpark offline can set `training.attention_backend: usp` and
+  `training.sp_ulysses_size > 1`; it currently requires
+  `training.sp_ring_size: 1`. Query and KV head counts must both be divisible
+  by the Ulysses degree. The 120K example uses Ulysses-SP8 with full-shard FSDP:
+  [`glm-5.2-dspark-offline-120k-usp.yaml`](../../examples/configs/glm-5.2-dspark-offline-120k-usp.yaml).
 
 The world size must be divisible by
 `training.sp_ulysses_size * training.sp_ring_size`. Use a shared `output_dir`

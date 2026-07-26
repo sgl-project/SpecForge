@@ -32,6 +32,7 @@ NPU, offline, and managed/external-service variants, is in
 | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` | Disaggregated SGLang server capture | P-EAGLE |
 | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
 | `examples/configs/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
+| `examples/configs/glm-5.2-dspark-offline-120k-usp.yaml` | 120K precomputed features with Ulysses-SP8 + FSDP | DSpark |
 | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
 | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
 | `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |

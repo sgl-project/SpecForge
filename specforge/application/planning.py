@@ -85,6 +85,15 @@ def _validate_algorithm_capabilities(
             f"{sorted(capabilities.attention_backends)}"
         )
     if (
+        algorithm.name == "dspark"
+        and training.attention_backend == "usp"
+        and training.sp_ring_size != 1
+    ):
+        raise ValueError(
+            "DSpark USP currently supports Ulysses sequence parallelism only; "
+            "set training.sp_ring_size=1"
+        )
+    if (
         capabilities.required_batch_size is not None
         and training.batch_size != capabilities.required_batch_size
     ):
