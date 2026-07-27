@@ -201,7 +201,13 @@ We have use lateset Specforge to train these draft models: [Qwen3.6-27B-Domino](
 
 
 ## How to verify your draft training is true?
+We provide a test to verify the consistency of training and inference, allowing users to easily verify the correctness of algorithms and try out new algorithms. We offer detailed sample [documentation](https://github.com/sgl-project/SpecForge/blob/main/scripts/gates/README.md) for Qwen3.6-27B-Dspark. Its workflow includes the following steps:
 
+1. Prepare a dataset generated using the target model and its corresponding thinking mode. If it's a `thinking mode`, it includes `reasoning_content`; otherwise, it doesn't.
+
+2. Train this dataset online using `specforge` until the `accuracy` equals 1.0. Since dspark's loss consists of both `CE loss` and `L1 loss`, it cannot reach 100%. However, it should ideally reach `0.99`.
+
+3. Deploy the trained draft model using sglang and use the trained data at `temperature=0` and the same `thinking mode` to make requests to determine if the accuracy of the first draft block is 100%.
 
 
 ## What's next
